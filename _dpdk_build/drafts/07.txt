@@ -1,0 +1,2187 @@
+# DPDK 技术资料 · 07 库与驱动模块介绍
+
+## 07-01 ethdev 库与 PMD 驱动框架（设备抽象、回调注册、驱动 probe、端口生命周期）
+
+### 1. 背景与动机
+
+要理解 `lib/ethdev/` 为什么存在，先要看清它要抹平的差异有多大。以太网控制器在寄存器布局、描述符格式、队列数量上限、RSS 哈希算法、中断与门铃寄存器、VLAN 与校验和卸载能力、多队列映射方式上几乎没有两家是完全一致的：Intel 的 ixgbe、i40e、ice 各有自己的收包描述符与写回格式，Mellanox（NVIDIA）的 mlx5 走的是完全不同的 verbs 风格数据路径， virtio 与 vhost 面向的是虚拟化前后端，ena、bnxt、cxgbe 又各有取舍，更不用说 bond、tap、pcap、memif、af_packet、ring、null 这些纯软件虚拟设备根本就没有物理寄存器。假如每个转发程序都要直接面对这些硬件，那么 `examples/l2fwd`、`examples/l3fwd`、OVS-DPDK、VPP、自研网关就都得为每一种控制器重写一套收发代码，驱动升级一次上层就要跟着改，整个生态不可能形成。因此 DPDK 从设计之初就明确需要一层与硬件无关的稳定接口，把「端口」「队列」「批量收发」「能力协商」「统计查询」「流规则下发」这些概念固化成公共 API，让应用只面对这一层，而把千差万别的硬件细节压到接口下面去。这一层就是 ethdev。
+
+内核旁路（kernel bypass）又给这层抽象追加了新的职责。DPDK 把网卡驱动从内核态搬到用户态，形成轮询模式驱动（PMD），但 PMD 只是「某个硬件的适配实现」，它本身并不负责全局状态管理：端口数组由谁维护、进程之间怎样共享设备数据、应用调用一个统一函数时怎样找到正确的驱动实现、一个 PCI 设备怎样从被扫描变成可被使用的端口，这些都不是单个 PMD 该操心的事。ethdev 恰好卡在中间，向上给 `app/test-pmd/`、`examples/` 以及第三方数据面提供统一 API，向下通过一张回调表把请求分发到具体 PMD，同时自己承担设备对象生命周期、端口索引分配、进程间共享内存布局与通用合法性校验。换句话说，PMD 提供「能力」，ethdev 提供「秩序」，两者配合才让「一个 port id 走遍所有网卡」成为可能。
+
+还需要说明本篇在整套资料中的定位。07 册是「库与驱动模块功能与组网」的唯一权威源，本篇作为开篇，只讲 ethdev 提供哪些能力、PMD 如何被注册与探测、应用应怎样按端口生命周期组织调用、以及物理设备与虚拟设备如何选型组网。结构体逐字段定义不在本篇展开，统一交给 05 册（字段见 05-04、05-05）；收发包函数链的逐帧实现、描述符环回填与 DD 位、DMA 内存屏障、RSS 与流规则编译下发等内部机制统一交给 06 册（原理见 06-04、06-05、06-06）；EAL 设备参数、devargs 语法与 testpmd 命令全集统一交给 04 册（命令见 04-02、04-03）。本篇只点名、给出真实源码路径并做交叉引用，不重列字段表与命令清单。版本基准为 DPDK 23.11 LTS、24.11 与 master 开发主线，凡涉及头文件目录层级、函数签名、注册宏名、offload 位命名之处，均应以实际源码树为准，标注「需对照实际版本核验」并给出可定位的 `lib/` 或 `drivers/` 路径，绝不以推测代替事实。
+
+### 2. 核心概念
+
+ethdev 最外层的概念是端口（port）与 port id。它把每一个可用的以太网设备抽象成一个端口，用一个 `uint16_t` 类型的 port id 作为索引；应用通过 `rte_eth_dev_count_avail()` 获知当前可用端口总数，用 `rte_eth_foreach_port` 之类的遍历宏（宏名需对照实际版本核验）逐个处理。必须强调，port id 是 ethdev 层在运行时分配的槽位索引，它既不等于 PCI 地址（如 `0000:01:00.0`），也不保证跨两次启动保持不变：EAL 的允许与阻塞列表（`-a` / `-b`，完整写法见 04-02）、虚拟设备的创建顺序、以及运行期热插拔都会改变枚举结果。因此工程上应把 port id 当作临时句柄，通过 devargs 指定目标设备、通过能力查询决定配置，而不是把「0 号端口永远是某块卡」写死在代码里。这一点在多网卡、多进程和容器化部署中尤其容易踩坑。
+
+端口之下是队列（queue）。一个端口可以配置若干对 Rx/Tx 队列，queue id 从 0 开始编号，每一对队列在软件侧对应一组 DMA 描述符环，在硬件侧对应一组收发资源。队列规划直接决定多核扩展性：常见做法是「每个转发 lcore 独占一对 Rx/Tx 队列」，配合 RSS 或 `rte_flow` 把不同流分散到不同队列，从而让各核无锁并行、避免多个核争抢同一队列带来的缓存行乒乓。热路径上应用只反复做两件事：`rte_eth_rx_burst(port_id, queue_id, mbufs, nb_pkts)` 一次取回一组 `rte_mbuf` 指针，`rte_eth_tx_burst` 一次发出一组；批量（burst）把函数调用、内存屏障和 PCIe 事务的固定开销摊薄到几十个报文上，是 DPDK 性能模型的核心手段。队列相关的结构体字段与描述符环布局见 05-04、05-05，批量语义与到 `rx_pkt_burst` 的函数链分析见 06-04。
+
+再往下是 PMD 与回调表。`drivers/net/` 下按厂商或设备类型分目录存放具体驱动，例如 ixgbe、i40e、ice、mlx5、virtio、e1000、ena、bnxt，以及 bond、tap、pcap、memif、af_packet、ring、null 等虚拟设备。每个 PMD 通过一张 `rte_eth_dev_ops` 回调表向 ethdev 注册自己的实现，典型回调包括 `dev_configure`、`rx_queue_setup`、`tx_queue_setup`、`dev_start`、`dev_stop`、`dev_close`、`rx_pkt_burst`、`tx_pkt_burst`、`flow_ops_get`、`stats_get` 等（确切成员集合需对照 `lib/ethdev/rte_ethdev_core.h` 核验）。应用调用 `rte_eth_dev_configure` 这类统一 API 时，ethdev 查到该端口绑定的 ops 表，再转发到对应 PMD 的回调；PMD 之间互不感知，新增驱动只需实现并注册自己的 ops，无需改动上层。这种「统一入口 + 回调分发」的结构，是 ethdev 能同时容纳几十种物理与虚拟设备的关键。
+
+驱动怎样被 ethdev 找到，则涉及总线与 probe。PCI 类 PMD 一般使用 `RTE_PMD_REGISTER_PCI` 系列宏（定义可查 `drivers/bus/pci/rte_bus_pci.h`）配合 `RTE_INIT` 构造函数，把一个 `rte_pci_driver` 挂进 PCI 总线的驱动链表，并声明自己支持的 vendor/device id 表；EAL 初始化阶段扫描 PCI 总线，用设备 id 与驱动表做匹配，命中后调用驱动的 probe 回调，probe 内部完成资源映射并调用 ethdev 提供的端口分配接口，最终产出一个可以被应用使用的 port id。虚拟设备不走 PCI，而是经 `drivers/bus/vdev/` 由 `--vdev` devargs 触发创建（虚拟设备能力见 07-11，参数写法见 04-02）。无论哪条路径，probe 的产物都是同一个 `rte_eth_dev` 对象，这正是抽象层收敛差异的地方。
+
+最后是端口生命周期与能力协商。端口大致经历「未配置 → 已配置 → 已启动 → 已停止 → 已关闭」几个状态。配置之前应先用 `rte_eth_dev_info_get()` 读取 `rte_eth_dev_info`，从中获知最大 Rx/Tx 队列数、描述符数量上下限、支持的 Rx/Tx offload 能力位、默认的 `rxconf` / `txconf`、设备所属 NUMA socket 等信息；应用据此协商 offload 与队列参数，而不是凭经验硬编码。`rte_eth_dev_configure` 确定队列数量与端口级配置，随后逐个 setup 收发队列，`rte_eth_dev_start` 之后端口才真正进入可收发状态；收尾时按 `rte_eth_dev_stop`、`rte_eth_dev_close` 逆序释放。字段含义见 05-04，这套状态迁移的完整图示见本节之后的图 07-01-02，配置阶段的 API 顺序见第 4 节。
+
+### 3. 关键数据结构与源码位置
+
+本节遵循 07 册的去重约定：只给出 ethdev 层关键对象的名称、职责与真实源码目录，绝不在此展开完整结构体字段表，逐字段定义一律回查 05-04 与 05-05。这样处理的意义在于，读者先建立「哪个头文件管哪件事」的地图，等真正要读内存布局或写驱动时再回到字段字典，避免在模块功能层面陷入字段细节而看不清整体分工。下面的源码职责表给出本篇需要记住的最小集合，其中命令入口只作指向、不重列。
+
+| 源码路径 | 职责定位 | 关键入口或对象 | 延伸指向 |
+|---|---|---|---|
+| `lib/ethdev/rte_ethdev.h` | 公共设备 API 与配置结构声明 | `rte_eth_dev_configure` | 字段见 05-04 |
+| `lib/ethdev/rte_ethdev.c` | 端口数组、生命周期与回调分发实现 | 端口校验与 ops 转发 | 原理见 06-04 |
+| `lib/ethdev/rte_ethdev_core.h` | 驱动可见的设备与队列数据布局 | `rte_eth_dev_data` | 字段见 05-04 |
+| `lib/ethdev/rte_flow.h` | 流规则对象与 flow API 声明 | `rte_flow_create` | 模块见 07-06 |
+| `lib/ethdev/rte_flow_driver.h` | PMD 侧 flow 回调表定义 | `rte_flow_ops` | 原理见 06-06 |
+| `drivers/net/` | 各厂商 PMD 与虚拟设备实现目录 | `rte_eth_dev_ops` 实例 | 模块见 07-10、07-11 |
+| `drivers/bus/pci/` | PCI 总线扫描、匹配与驱动注册 | `RTE_PMD_REGISTER_PCI` | 原理见 06-04 |
+| `app/test-pmd/` | 参考转发应用与运行时命令 | 交互命令见 04-03 | 命令见 04-03 |
+
+读这张表要带着层次感。`rte_ethdev.h` 是应用唯一需要直接包含的公共头文件，绝大多数端口 API、配置结构、`rte_eth_dev_info` 都在这里声明；`rte_ethdev.c` 是这些 API 的落地实现，负责参数校验、端口状态检查以及把调用转发到该端口绑定的 `rte_eth_dev_ops`；`rte_ethdev_core.h` 与 `ethdev_private.h` 更偏库内与驱动可见，前者定义 `rte_eth_dev_data`、`rte_eth_dev` 等在进程间共享的设备数据结构，字段见 05-04，后者是库内部私有声明，应用一般不涉及。`rte_flow.h` 与 `rte_flow_driver.h` 是流规则这条子系统的公共面与驱动面，模块视角在 07-06 单独展开，规则如何编译下发到硬件见 06-06。上述头文件在 23.11 LTS 到 24.11 之间目录层级大体稳定，但个别头文件可能被拆分或改名，精确路径需对照实际版本核验。
+
+驱动侧同样可以按图索骥。`drivers/net/` 下每个子目录基本对应一种 PMD，目录名本身通常就是 `RTE_PMD_REGISTER_PCI` 注册时使用的驱动名前缀（例如 `net_ixgbe`、`net_mlx5` 这类命名，具体字符串需对照 `drivers/net/<pmd>/` 下的源码核验）。想知道某个 API 最终落到哪里，最直接的办法是在对应驱动目录里搜索 `rx_pkt_burst`、`tx_pkt_burst` 或 `dev_start` 等回调赋值处，就能看到它的 ops 表。PCI 驱动注册宏与总线匹配表位于 `drivers/bus/pci/`，虚拟设备注册位于 `drivers/bus/vdev/`。`app/test-pmd/` 是学习 ethdev API 最权威的范例：几乎每一个端口配置、队列 setup、能力协商、统计读取的调用都能在那里找到可运行形态，建议把它当作本篇的配套实验代码。设备与驱动管理命令、testpmd 命令全集分别见 04-02、04-03，本篇配置段只给最典型的几条。
+
+### 4. 关键流程与调用链
+
+先明确本节边界。这里讲的是「应用怎样使用 ethdev API 组织流程」以及「PMD 怎样被注册、探测并挂到端口上」，属于模块功能与对象生命周期视角；至于描述符环怎样回填、DD 状态位怎样判定、DMA 与内存屏障在哪里配对、RSS 规则怎样编译成硬件表项、以及 `rte_eth_rx_burst` 到驱动 `rx_pkt_burst` 的逐帧函数链，全部属于内部机制，统一见 06-04、06-05、06-06，本篇不展开。把这两类视角分开，正是 06 与 07 两册分工的意义。
+
+设备侧流程从 EAL 初始化开始：`lib/eal/` 完成大页映射与总线扫描后，PCI 总线遍历已绑定到 vfio-pci 之类用户态驱动的设备，用 vendor/device id 与已注册的 `rte_pci_driver` 表做匹配；命中即调用该驱动的 probe 回调，probe 完成 BAR 映射与硬件初始化，并通过 ethdev 的端口分配接口取得一个 `rte_eth_dev` 槽位，填好 `rte_eth_dev_data` 并挂上该 PMD 的 `rte_eth_dev_ops`，最终对外呈现为一个 port id。虚拟设备则跳过 PCI 扫描，由 `--vdev` devargs 在 EAL 阶段直接创建。无论哪条路，结果都是「端口表里多了一个可用 port id」，而应用此后完全不需要知道它背后是 mlx5 还是 memif。下图把这条从探测到端口就绪的链路串起来，驱动注册与 probe 的关系见图 07-01-01。
+
+:::figure id=07-01-01 | name=PCI 驱动注册到端口就绪的链路 | dir=TD
+node n1 "EAL 扫描 PCI 设备" blue
+node n2 "总线匹配 driver" teal
+node n3 "PMD probe 回调" teal
+node n4 "分配 rte_eth_dev" amber
+node n5 "挂接 dev_ops 表" amber
+node n6 "得到 port id" purple
+node n7 "rte_eth_dev_info_get" green
+node n8 "应用配置与 start" green
+node n9 "设备能力协商" gray
+edge n1 -> n2 "按 id 匹配"
+edge n2 -> n3 "命中驱动"
+edge n3 -> n4 "申请槽位"
+edge n4 -> n5 "绑定回调"
+edge n5 -> n6 "端口可用"
+edge n6 -> n7 "查询能力"
+edge n7 -> n8 "按能力配置"
+edge n8 -> n9 "协商 offload"
+edge n9 -> n7 dashed "能力回查"
+:::
+
+应用侧则是一条相对固定的 API 顺序。典型初始化序列为：先用 `rte_eth_dev_count_avail()` 确认端口数，对每个 port id 调用 `rte_eth_dev_info_get()` 取回能力与默认队列配置；接着用 `rte_pktmbuf_pool_create()` 建好报文池（模块见 07-02）；然后调用 `rte_eth_dev_configure()` 确定 Rx/Tx 队列数量与端口级 offload，必要时用 `rte_eth_dev_adjust_nb_rx_tx_desc()` 按驱动限制修正描述符数量；再逐队列调用 `rte_eth_rx_queue_setup()` 与 `rte_eth_tx_queue_setup()`，把前面建的 mempool 绑定到 Rx 队列；`rte_eth_dev_start()` 之后进入主循环，反复执行 `rte_eth_rx_burst` → 业务逻辑 → `rte_eth_tx_burst`；退出时按 `rte_eth_dev_stop()`、`rte_eth_dev_close()` 逆序收尾。这条序列在第 5 节的代码实例里有完整可对照的形态。端口状态如何随这些调用迁移，见图 07-01-02。
+
+:::figure id=07-01-02 | name=ethdev 端口生命周期状态迁移 | dir=TD
+node n1 "端口关闭态 closed" blue
+node n2 "rte_eth_dev_configure" teal
+node n3 "队列 setup 配置" teal
+node n4 "rte_eth_dev_start" amber
+node n5 "rx_burst 与 tx_burst" green
+node n6 "rte_eth_dev_stop" purple
+node n7 "rte_eth_dev_close" gray
+edge n1 -> n2 "配置端口"
+edge n2 -> n3 "设队列数"
+edge n3 -> n4 "启动端口"
+edge n4 -> n5 "批量收发"
+edge n5 -> n6 "停止收发"
+edge n6 -> n7 "释放设备"
+edge n6 -> n4 dashed "可再次启动"
+edge n7 -> n1 dashed "回到初始"
+:::
+
+在这条链上有两处值得单独强调。其一是能力协商的时机：端口级 offload 在 `rte_eth_dev_configure` 时通过 `rte_eth_conf` 传入，队列级配置则在 `rx_queue_setup` / `tx_queue_setup` 时通过 `rxconf` / `txconf` 传入，二者都应以 `rte_eth_dev_info` 返回的 `rx_offload_capa` / `tx_offload_capa` 与 `default_rxconf` / `default_txconf` 为依据，请求驱动不支持的能力通常会在 configure 阶段报错；因此「先 info、后 configure」不是可选项而是必须遵守的顺序，具体能力位名称需对照实际版本核验。其二是 mbuf 的所有权：Rx 队列 setup 时绑定的 mempool 决定了收包缓冲区来源，PMD 从池中取对象填描述符，`rx_burst` 交还给应用的是已填好数据的 `rte_mbuf`，应用处理完通过 `rte_eth_tx_burst` 发出或显式 `rte_pktmbuf_free` 归还；发送未成功的报文必须应用自己处理，不能假设 PMD 会全部接管。mbuf 的完整生命周期与 `refcnt`、多段链的处理见 06-03，字段见 05-02。
+
+### 5. 配置/命令/代码实例
+
+本篇遵循 07 册的命令约束：配置段只给 3 条最典型的命令，用来把「设备就绪 → 启动参考应用 → 查询端口信息」这条最短链路跑通；EAL 允许与阻塞参数、devargs 语法、testpmd 全部运行时命令的统一清单见 04-02 与 04-03，此处不重列。下面命令中的 PCI 地址、驱动名、二进制路径都需对照实际环境核验。
+
+```bash
+# 1) 查看网卡当前绑定状态（设备名与 PCI 地址需按环境核验）
+sudo dpdk-devbind.py --status
+# 2) 仅允许指定 PCI 端口，启动 testpmd 交互模式（完整 EAL 参数见 04-01/04-02）
+sudo dpdk-testpmd -l 0-3 -a 0000:01:00.0 -- -i
+# 3) 在 testpmd 交互提示符下查询 0 号端口能力与链路状态
+show port info 0
+```
+
+下面给出一段完整的端口初始化 C 片段，按第 4 节的顺序演示 `info_get` → `configure` → `adjust_nb_rx_tx_desc` → `queue_setup` → `start` 的调用关系；offload 能力位与 `rte_eth_dev_info` 成员名需对照 `lib/ethdev/rte_ethdev.h` 核验。
+
+```c
+#include <string.h>
+#include <stdint.h>
+#include <rte_ethdev.h>
+#include <rte_mempool.h>
+
+#define RX_RING_SIZE 1024
+#define TX_RING_SIZE 1024
+
+int
+port_init(uint16_t port, struct rte_mempool *mbuf_pool)
+{
+    struct rte_eth_conf port_conf;
+    struct rte_eth_dev_info dev_info;
+    struct rte_eth_rxconf rxconf;
+    struct rte_eth_txconf txconf;
+    uint16_t nb_rxd = RX_RING_SIZE;
+    uint16_t nb_txd = TX_RING_SIZE;
+    int retval;
+
+    memset(&port_conf, 0, sizeof(port_conf));
+
+    retval = rte_eth_dev_info_get(port, &dev_info);
+    if (retval != 0)
+        return retval;
+
+    if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
+        port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+
+    retval = rte_eth_dev_configure(port, 1, 1, &port_conf);
+    if (retval != 0)
+        return retval;
+
+    retval = rte_eth_dev_adjust_nb_rx_tx_desc(port, &nb_rxd, &nb_txd);
+    if (retval != 0)
+        return retval;
+
+    rxconf = dev_info.default_rxconf;
+    txconf = dev_info.default_txconf;
+
+    retval = rte_eth_rx_queue_setup(port, 0, nb_rxd,
+            rte_eth_dev_socket_id(port), &rxconf, mbuf_pool);
+    if (retval < 0)
+        return retval;
+
+    retval = rte_eth_tx_queue_setup(port, 0, nb_txd,
+            rte_eth_dev_socket_id(port), &txconf);
+    if (retval < 0)
+        return retval;
+
+    retval = rte_eth_dev_start(port);
+    if (retval < 0)
+        return retval;
+
+    return 0;
+}
+```
+
+上面 `show port info 0` 的输出用于判读端口是否被正确识别与配置，示例输出如下，具体格式需对照实际版本核验。
+
+```text
+EAL: Detected 8 lcore(s)
+EAL: Probe PCI driver: net_ixgbe (8086:10fb) device: 0000:01:00.0 (socket 0)
+Interactive-mode selected
+testpmd> show port info 0
+
+********************* Infos for port 0 *********************
+MAC address: 00:1B:21:AA:BB:CC
+Device name: 0000:01:00.0
+Driver name: net_ixgbe
+Connect to socket: 0
+Link status: up
+Link speed: 10000 Mbps
+Link duplex: full-duplex
+MTU: 1500
+Promiscuous mode: enabled
+Maximum number of RX queues: 128
+Maximum number of TX queues: 64
+RX offload capabilities: VLAN_STRIP IPV4_CKSUM UDP_CKSUM TCP_CKSUM
+TX offload capabilities: VLAN_INSERT IPV4_CKSUM UDP_CKSUM TCP_CKSUM
+```
+
+对这段输出要逐行判读。首行 `EAL: Detected 8 lcore(s)` 说明 EAL 识别到 8 个可用逻辑核，是后面规划队列数与 lcore 绑定的前提，若该值远小于预期，通常是 coremask 或容器 CPU 配额限制了可见核数。第二行 `Probe PCI driver: net_ixgbe (8086:10fb)` 是整个链路最关键的信号：它表明总线已用 vendor/device id 成功匹配到 ixgbe 驱动并完成 probe，括号里的 `8086:10fb` 是设备 id，末尾 `(socket 0)` 指出设备所属 NUMA 节点，建 mempool 时应选同一 socket 以避免跨节点访存；若这里出现的是「no driver found」之类提示，说明设备未绑定到用户态驱动或缺少对应 PMD。中间 `Driver name`、`Device name`、`MAC address` 三项用于核对是不是预期那块卡，在多端口机器上尤其要确认 port 0 与目标 PCI 地址对应。`Link status: up`、`Link speed: 10000 Mbps`、`Link duplex: full-duplex` 是链路协商结果，正常应为 up 且速率与对端一致，若为 down 或速率异常，先查光模块、线缆与对端配置，而不是急着改 DPDK 参数。`Maximum number of RX/TX queues` 给出队列上限，应用配置的队列数必须落在这个范围内，超出会在 configure 阶段失败。最后两行 offload 能力位正是第 4 节强调的能力协商依据：应用只应请求这里列出的能力，请求未列出的能力会被拒绝；能力位命名随版本演进，需对照 `lib/ethdev/rte_ethdev.h` 核验。
+
+### 6. 注意事项、陷阱与最佳实践
+
+- **不要把 port id 写死**。允许/阻塞列表、vdev 创建顺序、热插拔都会改变枚举结果。工程上应遍历 `rte_eth_dev_count_avail()` 或按 devargs 指定的设备名定位端口，并把 port id 当作运行时句柄保存。多进程场景下 primary 与 secondary 看到的端口表由共享内存同步，字段与共享布局见 05-04、06-10。
+- **队列数、lcore 数与 NUMA 要一起规划**。队列数通常等于或略多于参与转发的 lcore 数，每个 lcore 独占一对队列以避免跨核竞争；端口所在 socket 可用 `rte_eth_dev_socket_id()` 取得，mempool 与 lcore 都应尽量与之同节点，跨 socket 访存代价的分析见 06-09。
+- **严格「先能力、后配置」**。调用 `rte_eth_dev_info_get()` 之后再决定 offload、描述符数与默认 `rxconf`/`txconf`；用 `rte_eth_dev_adjust_nb_rx_tx_desc()` 按驱动限制修正描述符数。硬编码 offload 位或描述符数量，是换一块网卡就 configure 失败的常见原因。能力位名称需对照实际版本核验。
+- **遵守状态顺序**。未 `rte_eth_dev_configure` 不能 setup 队列，未 setup 队列不能 `rte_eth_dev_start`，未 start 就调用 `rte_eth_rx_burst` / `rte_eth_tx_burst` 得不到有效数据；收尾必须 stop 之后才 close。重配置前一般要先 stop，必要时 close 再重新 configure。
+- **逐个检查返回值**。ethdev 绝大多数 API 用 0 表示成功、负值表示错误（`-ENODEV`、`-EINVAL`、`-ENOTSUP` 等，确切取值需核验），批量收发返回的是实际处理个数而非布尔值；`tx_burst` 返回值小于请求个数是正常现象，未发出的 mbuf 必须由应用负责重发或释放，不能假定全部发出。
+- **不同 PMD 的能力与 flow 支持度差异很大**。校验和卸载、TSO、RSS 算法、以及 `rte_flow` 支持的 item/action 集合在各驱动间并不一致。涉及流规则时务必先用 `rte_flow_validate()` 试探，再 `rte_flow_create()`，并对「不支持」做好软件回退；模块视角的规则对象与可移植性见 07-06，规则编译下发原理见 06-06。
+- **关注热插拔与多进程所有权**。设备热插拔可通过 `rte_dev_event_callback_register()` 一类接口注册回调（函数名需对照实际版本核验）；多进程下端口与 mempool 的共享语义、secondary 进程能否重置端口都有约束，见 06-10。
+- **把 `app/test-pmd/` 当回归基线**。遇到「同一套参数在这块卡能跑、那块卡跑不起来」时，先用 testpmd 的最小配置复现，再比对自研程序的 `rte_eth_conf` 与 offload 请求，通常能快速定位到能力协商或队列配置的差异。完整 testpmd 命令见 04-03。
+
+### 7. 小结与延伸阅读
+
+ethdev 是 DPDK 数据面承上启下的枢纽：向上用 port id、队列与 `rte_eth_rx_burst` / `rte_eth_tx_burst` 给应用一个与硬件无关的稳定视图，向下用 `rte_eth_dev_ops` 回调表收纳几十种物理与虚拟 PMD 的差异，中间还承担 probe 之后的端口分配、状态机与能力协商。理解本篇，关键是三句话：应用只认 port id 与统一 API；驱动只实现回调并通过总线注册；端口必须按 configure → queue setup → start → burst → stop → close 的生命周期使用。这三点构成了后面所有模块篇的共同前提，因为无论查表、流规则还是虚拟交换，最终都要落到 ethdev 端口上收发报文。
+
+延伸阅读按需展开：设备与配置结构、描述符与卸载字段的逐项定义见 05-04、05-05；PMD 轮询收发包函数链、描述符环与 DD 位、DMA 一致性见 06-04、06-05；RSS、Flow Director 与规则编译下发见 06-06；EAL 设备参数、devargs 与 testpmd 命令全集见 04-02、04-03；报文池与 mbuf 见 07-02；流规则模块视角见 07-06；vhost/virtio 数据通路见 07-10；bond、tap、pcap、memif、af_packet 等虚拟设备能力见 07-11。若想动手验证，`app/test-pmd/` 与 `examples/l2fwd/` 是最短路径，配合第 5 节的 `show port info` 输出判读即可建立从源码到运行现象的闭环。
+
+## 07-02 mempool / mbuf 库（池类型、对象构造回调、pktmbuf 与 headroom）
+
+### 1. 背景与动机
+
+在高速数据面里，「为每个报文分配一块内存」这个看似天经地义的动作，恰恰是最先被淘汰的做法。以 10 Gbps 链路上 64 字节小包线速计算，包到达速率约 14.88 Mpps，摊到单个报文只有约 67 纳秒；而一次通用 `malloc` / `free` 往往要经历分配器锁竞争、空闲链表或 slab 元数据维护、可能的系统调用与页错误、TLB 与缓存行污染，以及长期运行后不可避免的碎片整理，任何一个环节都不是几十纳秒能收场的。更糟的是这些开销抖动极大：平时可能几百纳秒，遇到缓存失效或锁冲突就窜到微秒级，直接破坏转发时延的可预测性。DPDK 的结论很明确——动态内存分配根本不属于热路径，必须在启动时把所需内存一次性备好，运行时只做「取一个对象、还一个对象」这种确定成本的轻量操作。
+
+于是有了 mempool：一个基于大页内存、预分配定长对象、无锁取还与每逻辑核缓存（per-lcore cache）的对象池。它解决了「分配成本」问题，但还差一步。报文不是一块裸内存，它需要携带大量元数据：当前段长度与整包长度、所属端口、RSS 哈希值、校验和与各类卸载标志、引用计数、分段链指针、以及可供应用或协议栈扩展的动态字段。如果让每个应用自己定义报文头，PMD、库与应用之间就无法互操作。因此 DPDK 在 mempool 之上定义了 `rte_mbuf`——池中存放的不是原始字节，而是带标准头部、指向数据区的报文缓冲对象；把 mempool 的通用定长池能力与 mbuf 的报文语义结合起来，就得到最常用的 `rte_pktmbuf_pool_create()` 一站式接口。mempool 提供「秩序与效率」，mbuf 提供「语义与互操作」，二者分层但通常成套使用。
+
+还要理解「为什么是定长对象」。定长让池可以用简单的环形索引与批量取还实现无锁化，也让每个对象的数据区大小固定、便于 DMA 预映射；代价是必须按最大可能报文（或 jumbo frame）预留空间，存在一定内存浪费，且超长报文要靠多段 `rte_mbuf` 链（nb_segs）表达。这套取舍与「零拷贝」「引用计数」「间接 mbuf」「外部缓冲区 extbuf」等机制一起，构成了 DPDK 内存模型的特色，其内部实现与内存序分析见 06-03、06-07。本篇作为 07 册模块篇，只讲「有哪些池类型、怎样选、对象构造回调做什么、pktmbuf 的 headroom 与数据区怎么用、典型组网里池该建在哪」，结构体逐字段定义见 05-02、05-03，命令与大页参数见 04-01，不重列字段表与命令全集。版本基准 23.11 LTS / 24.11 / master，凡宏名、默认 headroom 值、ops 名称均以实际源码为准，标注「需对照实际版本核验」。
+
+### 2. 核心概念
+
+mempool 本身是通用的定长对象池，与报文没有必然绑定。`rte_mempool_create()` 允许创建存放任意定长对象的池，调用方可以指定对象大小、每核缓存大小、私有数据大小，以及两个对象构造回调：一个在池创建时对整池做一次初始化（pool init cb），一个在池内每个对象首次初始化时逐对象调用（obj init cb），回调类型通常为 `rte_mempool_obj_cb_t`（确切签名需对照 `lib/mempool/rte_mempool.h` 核验）。`rte_pktmbuf_pool_create()` 正是利用这套机制：它把 `rte_mbuf` 作为对象类型，把 `rte_pktmbuf_pool_init()` 与 `rte_pktmbuf_init()` 注册为构造回调，于是池里每个对象一出生就带好了 `buf_addr`、`data_off`、`refcnt` 等初始状态，应用取出来即可当报文用。理解「构造回调」这一层，就能明白为什么 mempool 可以承载非报文对象（例如会话表项、自定义任务结构），也能明白扩展自有对象类型时该从哪里下手。
+
+mempool 的后端是可插拔的 ops（操作表）。默认后端通常基于 ring 实现对象的入队出队，此外还有基于栈的 `stack`、无锁栈 `lf_stack` 等实现，以及面向特定硬件或外部内存池的自定义后端；应用可通过 `rte_mempool_set_ops_byname()`（函数名需核验）或创建参数指定 ops 名称，注册机制集中在 `lib/mempool/rte_mempool_ops.c`。创建时还可带若干 `MEMPOOL_F_*` 标志控制对象分布、缓存对齐与单生产者单消费者假设（具体标志名需对照实际版本核验）。这意味着「池」并不是只有一种：同样是 `rte_pktmbuf_pool_create`，背后可能是默认 ring 后端，也可能被换成更适合某类负载的栈式或硬件后端。选型时要问的不是「能不能用」，而是「在本次的核数、生产消费者模型与 NUMA 布局下，哪种后端与缓存配置最合适」。
+
+再看 mbuf 的数据区布局。`rte_mbuf` 头部之后是数据区，对象起始处留出一段 **headroom**（默认由 `RTE_PKTMBUF_HEADROOM` 决定，经典值为 128 字节，需核验），`data_off` 指向真正数据的起点，其后依次是当前段的 `data_len`、整包的 `pkt_len`、末尾剩余的 **tailroom**。`buf_len` 是数据区总长，通常对应 `RTE_MBUF_DEFAULT_BUF_SIZE`。这种布局的价值在于「双向扩展」：收到报文后若要在前面加 VLAN、VxLAN、GRE 或自定义隧道头，用 `rte_pktmbuf_prepend()` 把 `data_off` 前移、向 headroom 借空间；若要在后面追加数据，用 `rte_pktmbuf_append()` 向 tailroom 借空间；剥离头部用 `rte_pktmbuf_adj()`，裁掉尾部用 `rte_pktmbuf_trim()`；`rte_pktmbuf_mtod()` 则把当前数据起点转换成指定类型的指针。这些操作都不搬移已有数据，只调整指针与长度，是零拷贝改包的基础。headroom 留得够不够，直接决定多层封装能不能原地完成，详见第 5 节的实例判读。
+
+除单段报文外，模块层面还需知道几类扩展：`nb_segs` 与 `next` 把多个 mbuf 串成分段链以承载 jumbo 或分散数据；`refcnt` 配合「间接 mbuf」实现零拷贝共享；外部缓冲区（extbuf，`RTE_MBUF_EXTERNAL` 类标志与 `rte_pktmbuf_attach_extbuf()` 一类接口，名称需核验）让 mbuf 的数据区指向应用自有或 DMA 映射的内存；`dynfield` / `dynflag`（`lib/mbuf/rte_mbuf_dyn.h`）允许在运行时注册自定义元数据字段与标志位，供 mark、时间戳、分类结果等使用，而无需改动 `rte_mbuf` 定义。字段逐项含义见 05-02，它们的生命周期、`refcnt` 与分片链归还逻辑见 06-03。下表把常见的池与对象形态做横向对照，便于按场景选型。
+
+| 池或对象形态 | 主要用途 | 典型接口 | 选型关注点 |
+|---|---|---|---|
+| 通用 mempool 对象池 | 存放自定义定长对象 | `rte_mempool_create` | 对象大小与构造回调 |
+| pktmbuf 报文池 | 网卡收发与转发主路径 | `rte_pktmbuf_pool_create` | 容量、headroom、socket |
+| 多段 mbuf 链 | jumbo frame 与分散数据 | `rte_pktmbuf_chain` | `nb_segs` 与 `pkt_len` 一致 |
+| 间接 mbuf | 零拷贝共享与报文克隆 | `rte_pktmbuf_clone` | `refcnt` 归还语义 |
+| 外部缓冲区 extbuf | 零拷贝接入外部内存 | 接口名需核验 | 释放回调与 DMA 映射 |
+| dynfield 扩展 | 自定义元数据与标志 | `rte_mbuf_dynfield_register` | 多进程注册顺序一致 |
+
+### 3. 关键数据结构与源码位置
+
+按 07 册去重约定，本节只做「点名、定位、交出去」，不列完整字段表；`rte_mempool`、`rte_mempool_cache`、`rte_mempool_memhdr`、`rte_pktmbuf_pool_private` 与 `rte_mbuf` 的逐字段定义分别见 05-03、05-02。下表给出本篇涉及的源码职责地图，命令入口只作指向。
+
+| 源码路径 | 职责定位 | 关键接口或宏 | 延伸指向 |
+|---|---|---|---|
+| `lib/mempool/rte_mempool.h` | 对象池公共 API 与结构声明 | `rte_mempool_create` | 字段见 05-03 |
+| `lib/mempool/rte_mempool.c` | 池创建、缓存与对象初始化实现 | 构造回调调用点 | 原理见 06-03 |
+| `lib/mempool/rte_mempool_ops.c` | 后端 ops 注册与选择 | ops 表注册 | 模块见本篇 |
+| `lib/mempool/rte_mempool_ring.c` | 默认 ring 后端实现 | 入队出队 ops | 原理见 06-07 |
+| `lib/mbuf/rte_mbuf.h` | mbuf 结构与内联操作声明 | `rte_pktmbuf_prepend` | 字段见 05-02 |
+| `lib/mbuf/rte_mbuf.c` | pktmbuf 池创建与构造回调实现 | `rte_pktmbuf_pool_create` | 模块见本篇 |
+| `lib/mbuf/rte_mbuf_dyn.h` | 动态字段与动态标志注册 | `rte_mbuf_dynfield_register` | 字段见 05-02 |
+| `app/test-pmd/` 与 `examples/` | 池创建与 mbuf 用法范例 | 运行方式见 04-03 | 命令见 04-03 |
+
+梳理这份地图时，建议按「通用池 → 报文封装 → 扩展能力」三层来看。`lib/mempool/` 是与业务无关的底座：`rte_mempool.h` 声明公共 API 与 `rte_mempool` 等结构，`rte_mempool.c` 落地池创建、per-lcore cache 管理与构造回调调用，`rte_mempool_ops.c` 维护可插拔后端表，`rte_mempool_ring.c`、`rte_mempool_stack.c` 等是具体后端实现（目录内文件名需对照实际版本核验）。`lib/mbuf/` 是面向报文的封装层：`rte_mbuf.h` 定义 mbuf 结构与 `prepend`/`append`/`adj`/`trim`/`mtod` 等内联操作，`rte_mbuf.c` 实现 `rte_pktmbuf_pool_create()` 以及 `rte_pktmbuf_pool_init()`、`rte_pktmbuf_init()` 这两个构造回调，`rte_mbuf_pool_ops.c` 处理与池相关的辅助操作，`rte_mbuf_dyn.h` 提供 dynfield/dynflag 注册。常见的 `RTE_PKTMBUF_HEADROOM`、`RTE_MBUF_DEFAULT_BUF_SIZE`、`RTE_PKTMBUF_POOL_NAME_MAX` 等宏集中在 `lib/mbuf/` 下，取值与命名需对照实际版本核验。
+
+从使用场景反查源码，也有固定套路：想知道池怎么建，看 `lib/mbuf/rte_mbuf.c` 里的 `rte_pktmbuf_pool_create()`，顺着它调用的 `rte_mempool_create_empty()` 与回调注册就能看清「通用池 + 报文构造」的拼接关系；想知道对象怎么初始化，看 `rte_pktmbuf_init()`；想知道取还路径，看 `rte_pktmbuf_alloc()` / `rte_pktmbuf_free()` 与 `lib/mempool/` 的 `rte_mempool_generic_get()` / `rte_mempool_generic_put()`（函数名需核验）。`app/test-pmd/` 几乎展示了所有常见池参数，`examples/l2fwd/`、`examples/l3fwd/` 则给出最小可用形态，建议对照阅读。大页预留与 `--socket-mem` 等参数见 04-01，本篇配置段只给最典型的几条命令。
+
+### 4. 关键流程与调用链
+
+同样先划边界：本节讲「应用怎样创建池、对象在池中怎样流转、mbuf 数据区怎样随封装操作变化」，属于模块功能与 API 使用视角；per-lcore cache 命中与回填的判定、无锁取还用到的 CAS 与 acquire/release 内存序、伪共享与 cache line 对齐、以及 `refcnt` 与分片链在释放时的完整状态机，属于内部机制，统一见 06-03、06-07，本篇不展开。
+
+池的创建是一条自顶向下的拼接链。以 `rte_pktmbuf_pool_create(name, nb_mbufs, cache_size, priv_size, data_room_size, socket_id)` 为例：它先根据 `data_room_size` 与 `RTE_PKTMBUF_HEADROOM` 算出每个对象的实际大小，调用 `rte_mempool_create_empty()` 建出空池骨架；随后设置 `rte_pktmbuf_pool_private`（保存 data_room 等池级私有信息）、通过 `rte_mempool_set_ops_byname()` 一类接口选定后端（默认 ring），再调用 `rte_mempool_populate_default()` 从大页 memzone 真正分配内存并对每个对象调用构造回调 `rte_pktmbuf_init()`，把 `buf_addr`、`data_off`、`refcnt` 等置为初值；最后对象被挂入池与 per-lcore cache，池进入可用状态。私有数据 `priv_size` 会在每个对象头部预留一段应用自有空间，可用于存放自定义元数据，其对齐要求需核验。下图把这条创建链与后续对象流转串在一起，池创建与 alloc/free 的关系见图 07-02-01。
+
+:::figure id=07-02-01 | name=pktmbuf 池创建与对象流转 | dir=TD
+node n1 "rte_pktmbuf_pool_create" blue
+node n2 "申请大页 memzone" teal
+node n3 "对象构造回调 init" teal
+node n4 "挂入 mempool 池" amber
+node n5 "per-lcore cache" amber
+node n6 "rte_pktmbuf_alloc" green
+node n7 "应用封装报文" purple
+node n8 "rte_pktmbuf_free" purple
+edge n1 -> n2 "populate 内存"
+edge n2 -> n3 "逐对象初始化"
+edge n3 -> n4 "对象入池"
+edge n4 -> n5 "预取缓存"
+edge n5 -> n6 "取对象"
+edge n6 -> n7 "改写数据区"
+edge n7 -> n8 "归还对象"
+edge n8 -> n5 dashed "回到缓存"
+edge n8 -> n4 dashed "缓存满回填"
+:::
+
+对象流转是热路径的主线。应用通过 `rte_pktmbuf_alloc()`（或热路径更推荐的 `rte_pktmbuf_alloc_bulk()`）从 per-lcore cache 取对象，取到后 `data_len` 与 `pkt_len` 为 0、`data_off` 指向 headroom 之后；网卡收包时其实也是由 PMD 从 Rx 队列绑定的池里取对象填描述符，`rte_eth_rx_burst` 交回应用的已是写好数据的 mbuf。应用随后用 `prepend` / `append` / `adj` / `trim` 改包，用 `rte_pktmbuf_mtod()` 取数据指针做解析；处理完通过 `rte_eth_tx_burst` 发出，或 `rte_pktmbuf_free()` / `rte_pktmbuf_free_bulk()` 归还。归还对象优先回到当前 lcore 的 cache，cache 满再批量回填池，因此「同核分配、同核释放」命中率最高，跨核返还会引入额外同步（机制见 06-03、06-07）。
+
+mbuf 数据区随封装操作的变化，是理解 headroom 的关键，图 07-02-02 给出布局与两类扩展方向。
+
+:::figure id=07-02-02 | name=mbuf 数据区布局与扩展操作 | dir=TD
+node n1 "mbuf 数据区 buf" blue
+node n2 "headroom 预留头" teal
+node n3 "data_off 数据起点" amber
+node n4 "pkt_len 与 data_len" amber
+node n5 "tailroom 尾部空间" teal
+node n6 "prepend 加封装" green
+node n7 "append 追加数据" green
+node n8 "多段 nb_segs 链" purple
+edge n1 -> n2 "起始留白"
+edge n2 -> n3 "起点偏移"
+edge n3 -> n4 "当前段长度"
+edge n4 -> n5 "剩余空间"
+edge n2 -> n6 "向左借空间"
+edge n5 -> n7 "向右借空间"
+edge n1 -> n8 dashed "多段引用"
+edge n3 -> n6 dashed "指针前移"
+:::
+
+从图 07-02-02 可以看出两个重要事实。第一，`prepend` 只把 `data_off` 前移、增加 `data_len` 与 `pkt_len`，并不搬移数据，也不消耗 tailroom；`append` 才向 tailroom 借空间。因此「前面加几层隧道头」与「后面追加载荷」是两种互不影响的操作，能否原地完成分别取决于 headroom 与 tailroom 是否够用。第二，当单段数据区放不下整包（例如 jumbo frame），就要用 `nb_segs` 把多个 mbuf 串成链，此时 `pkt_len` 表示全包总长而每个段的 `data_len` 只表示本段长度，两者必须保持一致，否则后续校验和卸载、分片或发送都会出错。dynfield、extbuf、间接 mbuf 的使用都建立在「先认清数据区边界」之上，字段细节见 05-02。
+
+### 5. 配置/命令/代码实例
+
+本节只给 3 条最典型命令，覆盖「预留大页 → 指定 mbuf 数据区大小启动 → 查询配置」这条最短链路；大页参数、`--socket-mem`、testpmd 全部运行时命令见 04-01 与 04-03，此处不重列。命令中的路径、参数名与选项写法需对照实际版本核验。
+
+```bash
+# 1) 预留大页供 mempool 的 memzone 后端使用（写法见 04-01）
+sudo dpdk-hugepages.py --setup 2G
+# 2) 启动 testpmd 时指定每包 mbuf 数据区大小（选项名需核验）
+sudo dpdk-testpmd -l 0-3 -- --mbuf-size=2048 -i
+# 3) 交互模式下查看当前转发与端口配置
+show config fwd
+```
+
+下面给出一段完整的 C 片段，演示创建 pktmbuf 池、分配一个 mbuf、用 `prepend` 原地加一层 14 字节以太网头，并打印前后的数据区参数。相关宏与字段名需对照 `lib/mbuf/rte_mbuf.h` 核验。
+
+```c
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include <rte_mbuf.h>
+#include <rte_mempool.h>
+
+#define NUM_MBUFS       8191
+#define MBUF_CACHE_SIZE 250
+#define PRIV_SIZE       0
+#define SOCKET_ID       0
+
+int
+mbuf_pool_demo(void)
+{
+    struct rte_mempool *pool;
+    struct rte_mbuf *m;
+    char *eth_hdr;
+
+    pool = rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS,
+            MBUF_CACHE_SIZE, PRIV_SIZE,
+            RTE_MBUF_DEFAULT_BUF_SIZE, SOCKET_ID);
+    if (pool == NULL) {
+        fprintf(stderr, "Cannot create mbuf pool\n");
+        return -1;
+    }
+
+    m = rte_pktmbuf_alloc(pool);
+    if (m == NULL) {
+        fprintf(stderr, "Cannot alloc mbuf\n");
+        return -1;
+    }
+
+    printf("after alloc: data_off=%u data_len=%u pkt_len=%u "
+           "buf_len=%u headroom=%u tailroom=%u\n",
+           (unsigned)m->data_off, (unsigned)m->data_len,
+           (unsigned)m->pkt_len, (unsigned)m->buf_len,
+           rte_pktmbuf_headroom(m), rte_pktmbuf_tailroom(m));
+
+    eth_hdr = rte_pktmbuf_prepend(m, 14);
+    if (eth_hdr == NULL) {
+        fprintf(stderr, "Not enough headroom\n");
+        rte_pktmbuf_free(m);
+        return -1;
+    }
+    memset(eth_hdr, 0, 14);
+
+    printf("after prepend: data_off=%u data_len=%u pkt_len=%u "
+           "headroom=%u tailroom=%u\n",
+           (unsigned)m->data_off, (unsigned)m->data_len,
+           (unsigned)m->pkt_len,
+           rte_pktmbuf_headroom(m), rte_pktmbuf_tailroom(m));
+
+    rte_pktmbuf_free(m);
+    return 0;
+}
+```
+
+该片段运行后的关键输出如下，示例输出，具体格式需对照实际版本核验。
+
+```text
+after alloc: data_off=128 data_len=0 pkt_len=0 buf_len=2176 headroom=128 tailroom=2048
+after prepend: data_off=114 data_len=14 pkt_len=14 headroom=114 tailroom=2048
+```
+
+对这两行要做细致判读。第一行是刚从池中取出的 mbuf：`data_off=128` 正是 `RTE_PKTMBUF_HEADROOM` 的典型默认值，表示数据起点前预留了 128 字节，供后续加封装头使用；`data_len=0` 与 `pkt_len=0` 说明对象已初始化但尚未写入任何报文数据，这是 `rte_pktmbuf_init()` 构造回调置好的初值，若这里出现非零值就要怀疑池是否被复用过或未正确初始化。`buf_len=2176` 是整个数据区长度，`headroom=128` 与 `tailroom=2048` 相加再加上初始 `data_len=0` 恰好等于 `buf_len`，三者的恒等关系（headroom + data_len + tailroom = buf_len）是判断 mbuf 布局是否被破坏的简易公式，任何时刻不成立都意味着长度字段被写错。第二行是 `rte_pktmbuf_prepend(m, 14)` 之后：`data_off` 从 128 降到 114，`data_len` 与 `pkt_len` 同时变成 14，`headroom` 相应从 128 减到 114，而 `tailroom` 保持 2048 不变——这正印证了第 4 节的结论：向前扩展只借 headroom，不动尾部空间，也无需搬移数据。正常取值范围上，`data_len` 与 `pkt_len` 应始终不超过 `buf_len`，`headroom` 不应为负；若 `prepend` 返回空指针，说明要加的头超过了剩余 headroom，此时应改用更大的 `RTE_PKTMBUF_HEADROOM` 重新编译、或改用 `rte_pktmbuf_copy` 一类方式先搬迁再封装。多层隧道（VLAN + VxLAN + 外层 IP）场景尤其要在设计阶段就按最大封装层数估算 headroom，否则会在运行时以「偶发 prepend 失败、报文被丢」的形式暴露，且很难在线定位。
+
+### 6. 注意事项、陷阱与最佳实践
+
+- **池容量要按最坏情况估算，留足余量**。`nb_mbufs` 至少要覆盖所有 Rx 描述符、Tx 描述符、各 lcore 的 per-lcore cache、应用暂存队列以及一次 burst 的在途报文，常见经验公式与端口数、队列数、lcore 数成正比，具体取值需按拓扑核算。池耗尽时 PMD 取不到对象就会静默丢包，且往往只表现为吞吐上不去，建议用 `rte_mempool_avail_count()` 一类接口（函数名需核验）与遥测持续观察水位（监控见 08-02）。
+- **headroom 与 tailroom 都要按业务预留**。需要加 VLAN、VxLAN、GRE、自定义隧道头就放大 headroom（`RTE_PKTMBUF_HEADROOM`），需要追加载荷或做封装就关注 tailroom；`prepend` / `append` 返回空指针是空间不足的明确信号，必须检查而不是直接使用返回值。
+- **池要建在正确的 NUMA socket**。`rte_pktmbuf_pool_create()` 的 `socket_id` 应与使用该池的端口、lcore 同节点，可用 `rte_eth_dev_socket_id()`（见 07-01）取得；跨 socket 分配对象会让每次收发都付出远端访存代价，分析见 06-09。
+- **cache_size 是折中量**。每核缓存太大浪费内存并拉长回填批量，太小则频繁回池、加剧跨核同步；一般取几十到几百量级并按实测调整，无固定最优值。
+- **热路径用批量接口**。优先 `rte_pktmbuf_alloc_bulk()` / `rte_pktmbuf_free_bulk()` 与 `rx_burst` / `tx_burst` 配合，把取还的固定成本摊薄；避免在循环里逐个 `malloc` 或跨函数频繁分配释放。
+- **归还必须走对接口，不能把对象直接塞回池**。多段链、间接 mbuf、`refcnt`>1 的对象必须经 `rte_pktmbuf_free()` 由库按引用计数与分段关系正确释放；直接 `rte_mempool_put()` 会泄漏或破坏共享语义，机制见 06-03。使用 extbuf 时还要正确设置释放回调与外部内存生命周期。
+- **保持长度字段一致**。多段报文里 `pkt_len` 是全包总长、各段 `data_len` 是段长，`nb_segs` 是段数；手工改包后务必同步更新，否则校验和卸载、分片与发送都会读到错误长度。字段含义见 05-02。
+- **多进程要小心 dynfield 与池共享**。primary 与 secondary 用同名池时应通过 `rte_mempool_lookup()` 取得同一对象（函数名需核验），且 dynfield/dynflag 的注册顺序在各进程必须一致，否则同一偏移会被解释成不同含义；多进程共享内存语义见 06-10。
+- **用调试选项抓越界**。DPDK 提供编译期的 mbuf 调试与一致性检查选项（选项名需对照实际版本核验），在开发阶段打开可尽早发现 `data_off` 越界、长度不一致与重复释放；生产环境再关闭以保性能。
+
+### 7. 小结与延伸阅读
+
+mempool 与 mbuf 是 DPDK 内存模型的两块基石：前者用「大页预分配 + 定长对象 + 无锁取还 + per-lcore cache」把每包分配成本压到可忽略，后者用「标准头 + headroom/tailroom + 分段链 + 引用计数 + 动态字段」给报文提供统一语义与零拷贝改包能力。`rte_pktmbuf_pool_create()` 把两者拼成应用最常用的一站式入口，其背后是「通用池 + 对象构造回调」的清晰分层——理解这一点，既能正确选型池类型与后端，也能在需要自定义对象或扩展元数据时找对扩展点。热路径上请记住三条：池按最坏容量建在正确 socket、封装操作只借 headroom/tailroom 不搬数据、归还一律走 `rte_pktmbuf_free`。
+
+延伸阅读：池与 mbuf 的逐字段定义见 05-02、05-03；对象生命周期、per-lcore cache 与无锁取还的内存序见 06-03、06-07；大页与 `--socket-mem` 等参数见 04-01；端口如何绑定 mempool 见 07-01；查表库如何以对象池承载表项见 07-04；ring 与 mempool 的后端关系见 07-03。动手验证时，`examples/l2fwd/` 给出最小池创建形态，`app/test-pmd/` 可配合第 5 节的命令观察不同 `--mbuf-size` 下的行为差异。
+
+## 07-03 ring 库（使用模式、容量与批量接口、典型生产者消费者组网）
+
+### 1. 背景与动机
+
+把一个报文从「收进来」到「发出去」拆成多个处理阶段，是数据面最常见的组织方式：一组 lcore 专责从网卡收包，一组做解析与查表，一组做封装与发送，阶段之间需要一条队列来传递在途报文或任务。问题在于，这条队列本身很容易成为瓶颈。传统基于互斥锁的队列在 10 Mpps 量级下会暴露出多重代价：生产者与消费者争抢同一把锁导致缓存行在核间反复失效，锁竞争激烈时触发自旋甚至 futex 休眠与上下文切换，队列头尾指针的伪共享让每次入出队都要同步相邻核的缓存，而且这些开销随核数增加不是线性下降而是急剧放大。DPDK 的应对是彻底放弃「通用阻塞队列」思路，改用固定容量、无锁、支持批量的环形缓冲 `rte_ring`，让阶段间交接的每包成本压到几次原子操作与一次缓存行写入。
+
+`rte_ring` 的设计取舍值得先说清楚。它是**有界**的（创建时确定容量），存的是**指针或定长元素**而非数据本身，且**不做内存分配**——入队出队只在预分配的环上移动索引。这三点换来了确定性与零系统调用，但也把责任交给了调用方：容量要自己按突发量估算，对象生命周期要自己管理，队列满时要有明确的背压或丢弃策略。它不试图取代消息队列中间件，只解决「同一进程（或共享同一大页内存的多个进程）内、多核之间高速传递已分配对象引用」这一件事。一旦接受这个定位，很多使用上的疑问就有了答案。
+
+ring 在 DPDK 内部的地位也说明了它的重要性：`lib/mempool/` 的默认后端 `rte_mempool_ring.c` 就是用 ring 存放空闲对象（见 07-02），多进程 primary/secondary 之间常通过具名 ring 传递消息（见 06-10），pipeline 类应用与 `examples/` 中的多阶段示例用它串接处理阶段，报文捕获、分发、遥测等辅助路径也大量依赖它。可以说 ring 是「连接各模块的那根线」。本篇作为 07 册模块篇，只讲使用模式（单/多生产者消费者组合）、容量规划、批量接口语义、以及典型生产者消费者组网与选型；`rte_ring`、`rte_ring_headtail` 的逐字段定义见 05-06，无锁 CAS、head/tail 更新与 acquire/release 内存序、伪共享与 cache line 对齐等机制见 06-07，诊断工具命令见 04-05，本篇不重列字段表与命令全集。版本基准 23.11 LTS / 24.11 / master，凡标志名、函数名与容量取整行为均需对照 `lib/ring/rte_ring.h` 核验。
+
+### 2. 核心概念
+
+ring 的基本模型是一个有界环形缓冲，槽位里存放 `void *` 指针；较新版本通过 `lib/ring/rte_ring_elem.h` 也支持按定长元素大小入出队（`rte_ring_enqueue_elem` 一类接口，名称需核验），但「传指针」仍是最典型用法。环上有两套游标：生产者侧的 head/tail 与消费者侧的 head/tail，合称 `rte_ring_headtail`（字段见 05-06）。生产者和消费者各自推进自己的游标，只在必要时通过原子操作与内存屏障协调，从而避免互斥锁。理解 ring 不必先钻进 CAS 细节（那属于 06-07），只要记住「生产者写 prod、消费者写 cons、双方都要读对方游标来判断空与满」即可。
+
+**使用模式**由生产者与消费者的数量决定，创建时通过标志声明：`RING_F_SP_ENQ` 表示单生产者入队，`RING_F_SC_DEQ` 表示单消费者出队，二者都不设置即为多生产者多消费者（MPMC），只设一个则是 MPSC 或 SPMC。声明必须与实际拓扑严格一致：单生产者标志允许实现省掉生产者间的原子竞争，是性能最优路径；若实际有多个线程入队却谎报 SP，会直接造成数据竞争与丢数据；反过来在确实只有一个生产者时忘记设 SP，则白白付出不必要的原子开销。标志名需对照实际版本核验，但「按真实拓扑声明」这条原则不变。
+
+**批量接口**是 ring 性能的关键，也最容易混淆。以入队为例，`rte_ring_enqueue()` 是单个对象；`rte_ring_enqueue_bulk()` 请求入队 n 个，语义是「全部成功或全部不成功」，返回布尔式结果；`rte_ring_enqueue_burst()` 也是请求 n 个，但会**尽可能多**地入队，返回实际入队个数，可能小于 n。出队侧 `rte_ring_dequeue()`、`rte_ring_dequeue_bulk()`、`rte_ring_dequeue_burst()` 与之一一对应。热路径几乎总应选 burst：ring 满或空是常态，burst 能按当前可用空间/数据尽量处理而不整批失败，也天然和 `rx_burst` / `tx_burst` 的批量节奏对齐；bulk 更适合「要么整批提交、要么整批回滚」的强一致场合。三者都还有带 `free_space` 出参的变体，可在一次调用里顺带取回剩余空间，避免再查一次计数（确切签名需核验）。
+
+**容量与计数**需要单独建立概念。`rte_ring_create(name, count, socket_id, flags)` 中的 `count` 是请求的槽位数；经典实现会把它向上取整到 2 的幂以便用位掩码取模，并且为了区分「空」与「满」会保留一个槽位不用，因此实际可用容量常比请求值少 1，若需要精确容量可考虑 `RING_F_EXACT_SZ` 一类标志（名称与行为需对照实际版本核验）。运行期用 `rte_ring_count()` 得到当前对象数、`rte_ring_free_count()` 得到剩余空间、`rte_ring_get_capacity()` 得到总容量、`rte_ring_full()` / `rte_ring_empty()` 做状态判断（函数名均需核验）；这些接口已经处理了游标回绕与容量取整，应用不要自己去算 `(prod - cons)`。此外 ring 有名字，`rte_ring_lookup()` 可按名找回已创建的 ring，`rte_ring_free()` 释放——这正是多进程共享的基础：primary 创建具名 ring，secondary 用同名 lookup 取得指向共享内存里同一对象的指针，见 06-10。
+
+### 3. 关键数据结构与源码位置
+
+本节按 07 册惯例只做定位与交出去，不列完整字段表；`rte_ring` 与 `rte_ring_headtail` 的逐字段、标志位布局与缓存对齐见 05-06，下表给出本篇涉及的源码职责地图。
+
+| 源码路径 | 职责定位 | 关键接口或标志 | 延伸指向 |
+|---|---|---|---|
+| `lib/ring/rte_ring.h` | ring 公共 API 与内联入出队操作 | `rte_ring_enqueue_burst` | 字段见 05-06 |
+| `lib/ring/rte_ring.c` | 创建、查找与释放实现 | `rte_ring_create` | 模块见本篇 |
+| `lib/ring/rte_ring_core.h` | 结构与游标布局定义 | `rte_ring_headtail` | 字段见 05-06 |
+| `lib/ring/rte_ring_elem.h` | 定长元素入出队扩展接口 | 元素型入队接口需核验 | 模块见本篇 |
+| `lib/mempool/rte_mempool_ring.c` | ring 作为 mempool 默认后端 | 对象入队出队 ops | 模块见 07-02 |
+| `lib/eal/` | 具名对象查找与共享内存支撑 | 具名 memzone 分配 | 原理见 06-10 |
+| `examples/` 与 `app/test-pmd/` | 多阶段流水线与收发范例 | 运行方式见 04-03 | 命令见 04-03 |
+
+读这张表时建议按「公共面 → 实现面 → 消费面」三层理解。`rte_ring.h` 是应用唯一需要直接包含的头文件，绝大多数入出队操作以内联函数形式放在这里以获得最佳性能；`rte_ring_core.h` 定义 `rte_ring` 与 `rte_ring_headtail` 的内存布局，是 05-06 字段字典的主要对象；`rte_ring.c` 负责 `rte_ring_create()`、`rte_ring_lookup()`、`rte_ring_free()` 这些需要 memzone 分配与具名表维护的慢路径；`rte_ring_elem.h` 是较新引入的定长元素接口，允许把任意定长结构而非仅仅指针放进环里，适用场景与函数名需对照实际版本核验。标志如 `RING_F_SP_ENQ`、`RING_F_SC_DEQ`、`RING_F_EXACT_SZ` 以及环大小掩码 `RTE_RING_SZ_MASK` 一类宏集中在 `lib/ring/` 下，命名需核验。
+
+消费面最能说明 ring 的通用性。`lib/mempool/rte_mempool_ring.c` 把 ring 注册成 mempool 的一种 ops 后端，池里的空闲对象指针就存放在一个 ring 中，`rte_mempool_generic_get/put` 最终落到 ring 的批量入出队（见 07-02 与 06-03）。`lib/eal/` 提供的具名 memzone 让 ring 对象本身位于共享内存，从而支撑 `rte_ring_lookup()` 跨进程找回。`examples/` 中多阶段流水线类示例与 `app/test-pmd/` 的转发循环则展示了 ring 在应用侧的典型串接方式。诊断侧可用 procinfo 或 telemetry 观察已创建的 ring 与统计，命令全集见 04-05。想知道某个 API 最终落到哪里，在 `lib/ring/` 下按函数名检索即可，目录层级在 23.11 LTS 到 24.11 之间大体稳定。
+
+### 4. 关键流程与调用链
+
+先划边界：本节讲「应用怎样创建 ring、按什么顺序调用入出队 API、以及不同生产者消费者模式下怎样组网」，属于模块功能与使用视角；prod/cons 游标的 CAS 推进、acquire/release 屏障配对、伪共享与 cache line 对齐、单生产者标志为何能省原子操作等内部机制，统一见 06-07，本篇不展开。
+
+创建与使用是一条很直的链。`rte_ring_create()` 在指定 NUMA socket 的具名 memzone 中分配 ring 对象与槽位数组，按 flags 设置单/多生产者消费者模式，初始化 prod/cons 两套游标，并把名字登记进可查找表；此后任意线程或进程可用 `rte_ring_lookup()` 按名取得同一个 ring。生产者在热路径把一批对象指针交给 `rte_ring_enqueue_burst()`，消费者用 `rte_ring_dequeue_burst()` 取出同批处理；处理完的对象通常由消费者归还到 mempool（见 07-02），形成「池 → 生产者 → ring → 消费者 → 池」的闭环。下图把最简的单生产者单消费者流水线与这条闭环画出来，SPSC 组网与对象回收关系见图 07-03-01。
+
+:::figure id=07-03-01 | name=单生产者单消费者流水线组网 | dir=TD
+node n1 "RX lcore 收包" blue
+node n2 "rte_ring_enqueue_bulk" teal
+node n3 "ring 有界队列" amber
+node n4 "rte_ring_dequeue_burst" teal
+node n5 "Worker lcore 处理" purple
+node n6 "TX lcore 发包" green
+node n7 "mempool 供给" gray
+edge n1 -> n2 "封装指针"
+edge n2 -> n3 "批量入队"
+edge n3 -> n4 "批量出队"
+edge n4 -> n5 "取一批对象"
+edge n5 -> n6 "处理后提交"
+edge n7 -> n1 dashed "mbuf 来源"
+edge n6 -> n7 dashed "释放归还"
+edge n3 -> n1 dashed "满则背压"
+:::
+
+把 SP/SC 换成 MP/MC，就得到生产规模更大的组网：多个 RX lcore 竞争同一个 ring 入队、多个 Worker lcore 竞争出队，代价是入出队都要走多生产者/多消费者路径。下表把四种模式与典型拓扑做对照，选型时按真实并发度对号入座。
+
+| 使用模式 | 典型拓扑 | 创建标志 | 选型关注点 |
+|---|---|---|---|
+| SPSC | 两阶段流水线一对一交接 | SP 与 SC 标志都设 | 开销最低，优先选用 |
+| MPSC | 多收包核汇聚到单出口 | 仅 SC 标志 | 多生产者竞争入队 |
+| SPMC | 单分发核到多 worker | 仅 SP 标志 | 多消费者竞争出队 |
+| MPMC | 多生产者多消费者通用池 | 两个标志都不设 | 竞争最大，谨慎评估 |
+| 跨进程 | primary 与 secondary 共享 | 按名 lookup | 指针须指向共享内存 |
+| 池后端 | mempool 空闲对象管理 | 由 mempool 管理 | 见 07-02 |
+
+多生产者多消费者与跨进程共享的组合形态见图 07-03-02：两侧 RX lcore 并发入队、多个 Worker 竞争出队，secondary 进程通过 `rte_ring_lookup()` 按名访问同一个 ring。
+
+:::figure id=07-03-02 | name=MPMC 与跨进程共享组网 | dir=TD
+node n1 "RX lcore 0" blue
+node n2 "RX lcore 1" blue
+node n3 "共享 ring 队列" teal
+node n4 "Worker 0" amber
+node n5 "Worker 1" amber
+node n6 "TX 汇聚" green
+node n7 "rte_ring_lookup" purple
+node n8 "secondary 进程" purple
+edge n1 -> n3 "并发入队"
+edge n2 -> n3 "并发入队"
+edge n3 -> n4 "竞争出队"
+edge n3 -> n5 "竞争出队"
+edge n4 -> n6 "处理后提交"
+edge n5 -> n6 "处理后提交"
+edge n7 -> n3 "按名共享"
+edge n8 -> n7 "跨进程查找"
+:::
+
+从两张图能读出容量规划与背压的要点。ring 深度要能吸收阶段间的速率差与突发：太浅会在瞬时突发时频繁满、迫使生产者丢包或忙等，太深则让槽位数组超出缓存、增加访存成本并拉长对象在途时延。工程上常以「一次 burst 大小的若干倍 × 阶段数」为起点，再用 `rte_ring_count()` / `rte_ring_free_count()` 观测水位后调整（监控见 08-02）。队列满时生产者必须显式决策：`enqueue_burst` 返回值小于请求数是正常现象，要么稍后重试、要么对低优先级流量丢弃、要么向上游施加背压，绝不能忽略返回值假装全部入队成功。这些返回值语义正是第 5 节实例要判读的重点。
+
+### 5. 配置/命令/代码实例
+
+本节只给 3 条最典型命令，覆盖「观察已创建 ring → 查询统计 → 用 ring 虚拟端口验证收发」这条最短链路；procinfo、telemetry 与 testpmd 的完整命令与参数见 04-05、04-03，此处不重列。命令中的选项名、telemetry 接口路径与 devargs 写法都需对照实际版本核验。
+
+```bash
+# 1) 查看进程已创建的具名 ring（procinfo 选项名需核验）
+sudo dpdk-procinfo -- --show-ring
+# 2) 进入 telemetry 交互端查询 ring 统计（接口路径需核验）
+dpdk-telemetry
+# 3) 用基于 ring 的虚拟端口验证批量收发（devargs 需核验）
+sudo dpdk-testpmd -l 0-3 --vdev net_ring0 -- -i
+```
+
+下面给出一段完整的 C 片段，演示创建 SPSC ring、批量入队 32 个指针、批量出队，并打印计数与容量。标志名与计数函数名需对照 `lib/ring/rte_ring.h` 核验。
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+#include <rte_ring.h>
+
+#define RING_SIZE 1024
+#define BURST 32
+
+int
+ring_demo(void)
+{
+    struct rte_ring *r;
+    void *objs[BURST];
+    void *deq[BURST];
+    char dummy[BURST];
+    unsigned int i, n;
+
+    r = rte_ring_create("DEMO_RING", RING_SIZE, SOCKET_ID_ANY,
+            RING_F_SP_ENQ | RING_F_SC_DEQ);
+    if (r == NULL) {
+        fprintf(stderr, "Cannot create ring\n");
+        return -1;
+    }
+
+    for (i = 0; i < BURST; i++)
+        objs[i] = &dummy[i];
+
+    n = rte_ring_enqueue_burst(r, objs, BURST, NULL);
+    printf("enqueued=%u count=%u free=%u capacity=%u\n",
+           n, rte_ring_count(r), rte_ring_free_count(r),
+           rte_ring_get_capacity(r));
+
+    n = rte_ring_dequeue_burst(r, deq, BURST, NULL);
+    printf("dequeued=%u count=%u free=%u\n",
+           n, rte_ring_count(r), rte_ring_free_count(r));
+
+    rte_ring_free(r);
+    return 0;
+}
+```
+
+该片段运行后的关键输出如下，示例输出，具体格式需对照实际版本核验。
+
+```text
+enqueued=32 count=32 free=992 capacity=1023
+dequeued=32 count=0 free=1023 capacity=1023
+```
+
+对这两行要逐项判读。第一行是入队后：`enqueued=32` 表示 `rte_ring_enqueue_burst()` 把请求的 32 个指针全部放入环中，由于请求量远小于可用空间，返回值等于请求数，这是正常满负荷前的典型结果；若返回值小于 32，说明可用空间不足，此时应按第 4 节的背压策略处理，而不能假设剩余对象也已入队。`count=32` 与 `free=992` 相加得到 1024，看似与创建时的 `RING_SIZE=1024` 一致，但 `capacity=1023` 揭示了一个关键实现细节：经典 ring 会把请求容量向上取整到 2 的幂，并保留一个槽位用于区分「空」与「满」，因此实际可存对象数比请求值少 1，判断水位时应以 `rte_ring_get_capacity()` 与 `rte_ring_free_count()` 为准，不要自己用 count 与请求值相减（该取整与保留行为需对照实际版本核验，可用 `RING_F_EXACT_SZ` 一类标志调整）。第二行是出队后：`dequeued=32` 表示批量取回全部对象，`count` 归零、`free` 恢复到 1023，说明环已空且对象已交还调用方负责后续释放或归还 mempool。这里还要强调 bulk 与 burst 的差别：本例用 burst，返回值是「实际处理个数」；若换成 `enqueue_bulk`，语义会变成「要么 32 个全进、要么一个都不进」，在环半满时很可能整批失败。正常范围上 `count` 应始终介于 0 与 `capacity` 之间，`free + count` 应恒等于 `capacity`；若出现 `count` 为负、超过 capacity 或 dequeue 返回值大于此前 count，则几乎可以断定创建标志与实际并发模型不匹配（例如谎报 SP/SC）导致游标被并发写坏，这是 ring 最隐蔽也最严重的一类故障。
+
+### 6. 注意事项、陷阱与最佳实践
+
+- **创建标志必须与实际拓扑一致**。单生产者却漏设 `RING_F_SP_ENQ` 会白白多付原子操作；多个生产者却设了 SP 标志会造成数据竞争与静默丢数据。多进程共享时各进程的并发模型也要一并纳入判断。标志名需对照实际版本核验。
+- **容量取整与「保留槽位」要心里有数**。默认会把 count 向上取整到 2 的幂且实际容量少 1，需要精确容量时用 `RING_F_EXACT_SZ` 一类标志并核验行为；水位判断一律用官方计数接口，不要自行用请求值推算。
+- **始终检查 burst 返回值**。`enqueue_burst` / `dequeue_burst` 返回实际处理个数，小于请求数是常态；`bulk` 则是全成或全败。忽略返回值会造成「以为入队了其实没有」的对象丢失或重复处理。
+- **ring 只传引用，不管理对象生命周期**。槽位里通常是 `rte_mbuf *` 或 mempool 对象指针，归还必须走 `rte_pktmbuf_free()` 等正确接口（见 07-02、06-03）；跨进程传递的指针必须指向共享内存中的对象，不能把某进程本地堆地址塞给另一个进程。
+- **建在正确 NUMA socket**。生产者和消费者所在核与 ring 所在 socket 尽量一致，跨节点访问 ring 游标会引入远端访存与缓存一致性流量，分析见 06-09。
+- **名字全局唯一且要规划好**。具名 ring 由 `rte_ring_create()` 登记、`rte_ring_lookup()` 查找，重名会创建失败；secondary 进程应按名 lookup 而非重复创建。多进程共享与 `--file-prefix` 隔离见 06-10、04-01。
+- **批量大小与预取对齐**。burst 大小常与 `rx_burst` 保持一致（如 32 或 64），一次搬一批既摊薄原子操作成本又利于缓存预取；过小失去批量收益，过大则一次占用太多临时数组并拉长尾时延，批量收益原理见 06-08。
+- **明确队列满的策略**。是重试、丢弃还是背压，要在设计阶段写死并可观测；持续高水位的 ring 往往意味着下游阶段处理能力不足，应结合 08-02 的指标定位，而不是一味加深队列。
+- **释放时机要串行化**。`rte_ring_free()` 之前必须确保没有线程还在入出队，否则会访问已释放内存；通常在所有 lcore 停止后再统一释放。
+
+### 7. 小结与延伸阅读
+
+ring 是 DPDK 里「把各模块连起来」的那根线：固定容量、无锁、批量、传指针，用最小的确定性成本完成多核与多进程间的对象交接。理解本篇，抓住三组对照就够了——SPSC / MPSC / SPMC / MPMC 四种模式要与真实并发度严格对应；`enqueue`（单个）、`bulk`（全成或全败）、`burst`（尽量多）三种语义要按场景选，热路径首选 burst 并逐一检查返回值；请求容量、实际 capacity 与实时 count/free 三者要用官方接口读，不能自己推算。它同时是 mempool 的默认后端（见 07-02），因此池与队列其实共享同一套无锁思想。
+
+延伸阅读：`rte_ring` 与 `rte_ring_headtail` 的逐字段、标志位与缓存对齐见 05-06；无锁 CAS、内存序、伪共享与单生产者为何能省原子操作见 06-07；批量与预取的收益来源见 06-08；primary/secondary 共享 ring 的指针有效性与 `--file-prefix` 见 06-10、04-01；procinfo / telemetry 诊断命令见 04-05；NUMA 跨节点代价见 06-09。动手时可用第 5 节的片段先跑通 SPSC，再逐步改成 MPMC 观察标志位与返回值的变化，配合 `examples/` 中的多阶段示例建立完整印象。
+
+## 07-04 LPM / FIB / hash 查表库（最长前缀匹配、FIB 与 nexthop、哈希查表适用场景对照）
+
+### 1. 背景与动机
+
+数据面最核心、也最频繁的动作之一，是「按报文里的某个关键字查一张表，得到下一步该做什么」。三层转发按目的 IP 查路由表得到出端口与下一跳，二层交换按目的 MAC 查转发表，隧道网关按 VNI 或标签查映射，负载均衡按五元组查会话，策略路由还要按源地址、协议、端口的组合查规则。这些「查表」看起来相似，语义却差别很大：路由是**最长前缀匹配**（一个地址可能同时落在多条前缀里，要选掩码最长的那条），MAC 与会话是**精确键值匹配**，策略类则是**多字段范围或掩码匹配**（那是 07-05 的 ACL 与 `rte_flow` 领地）。用一张通用哈希表去硬套最长前缀匹配，要么把每条前缀展开成海量主机路由、内存爆炸，要么退化成逐条线性比较、在几十万条前缀下完全不可行。
+
+DPDK 的对策是按查表语义提供专门的库，让每种语义都有为它优化过的数据结构与批量接口：`lib/lpm/` 面向 IPv4/IPv6 最长前缀匹配，`lib/fib/` 在此基础上引入更贴近转发面的「下一跳对象」抽象与可替换数据面算法，`lib/hash/` 面向精确键值查找（含 cuckoo hash、一致性哈希等变体）。三者共用「控制面建表与更新、数据面批量查询」这一范式，但返回值、更新成本、内存占用与适用规模各不相同。选错库的代价往往不是「跑不起来」而是「吞吐上不去」：用 hash 去做前缀路由会在功能上出错，用 LPM 去做纯精确匹配则白白承担前缀表的内存与查表开销。
+
+本篇作为 07 册模块篇，聚焦三者的能力边界、API 使用顺序、典型组网（以 `examples/l3fwd/` 为代表）与选型对照；`rte_lpm`、`rte_fib`、`rte_hash`、`rte_acl_ctx` 等的逐字段定义见 05-09；tbl24/tbl8 多级表结构、cuckoo hash 的键值对布局与搬迁、以及 SIMD 批量查表的实现原理见 06-08；testpmd 与示例程序的命令参数见 04-04、04-03，本篇不重列字段表与命令全集。版本基准 23.11 LTS / 24.11 / master，凡配置结构成员、函数名与算法后端名称均需对照对应 `lib/` 头文件核验。另需说明：多元组规则匹配由 07-05 的 ACL 与 `classify` 承接，硬件规则卸载由 07-06 的 `rte_flow` 承接，本篇只讲软件查表库。
+
+### 2. 核心概念
+
+**LPM（Longest Prefix Match）**解决的是「目的地址命中多条前缀时取掩码最长者」。`lib/lpm/rte_lpm.h` 的 IPv4 实现以 `rte_lpm` 为对象，典型调用是 `rte_lpm_create()` 建表、`rte_lpm_add(ip, depth, next_hop)` 加一条前缀、`rte_lpm_lookup()` 单查或 `rte_lpm_lookup_bulk()` 批量查、`rte_lpm_delete()` 与 `rte_lpm_free()` 收尾；IPv6 由 `lib/lpm/rte_lpm6.h` 单独提供 `rte_lpm6` 系列接口。返回值 `next_hop` 是一个应用自定义的小整数（常见是下一跳或出端口的索引）。其内部经典实现用 tbl24 + tbl8 两级表把一次查表压缩到少数几次数组访问（结构见 06-08），因此建表时要通过 `rte_lpm_config` 估算 `max_rules` 与 `number_tbl8s`（成员名需核验）——前缀数量多、深度分布碎，tbl8 需求就大。注意 IP 参数的字节序约定，通常为主机字节序的 `uint32_t`，需对照头文件核验。
+
+**FIB（Forwarding Information Base）**可以看作「为转发面重新包装过的 LPM」。`lib/fib/rte_fib.h` 的 `rte_fib` 同样做最长前缀匹配，但把返回值抽象成 **nexthop id**，并鼓励把「出端口、二层重写、计量」等动作放进一张独立的 nexthop 动作表里，用查表得到的 id 去索引。这样路由前缀与转发动作用解耦：改下一跳 MAC 不必动路由表，换数据面算法也不必改控制面。FIB 提供 `rte_fib_create()`（通过 `rte_fib_conf` 指定规模、socket 与算法后端，成员名需核验）、`rte_fib_add()`、`rte_fib_lookup_bulk()`、`rte_fib_delete()` 等；IPv6 由 `lib/fib/rte_fib6.h` 提供 `rte_fib6`。相较 LPM，FIB 更强调**批量查表**与**可替换的数据面实现**，适合路由规模较大、动作需要解耦、或希望按硬件能力切换算法的场景；后端名称与可用算法需对照实际版本核验。
+
+**hash** 面向精确键值匹配。`lib/hash/rte_hash.h` 的 `rte_hash` 基于 cuckoo hash，创建时通过 `rte_hash_parameters` 指定条目数、键长、哈希函数、socket 以及读写并发等额外标志（成员名需核验）；用 `rte_hash_add_key_data()` / `rte_hash_lookup_data()` 存取「键 → 数据」，并有 `rte_hash_lookup_bulk()` 做批量查询，`rte_hash_del_key()` 删除。同目录下还有面向特定用途的变体：`rte_fbk_hash.h` 的四字节键哈希（较早期实现）、`rte_thash.h` 的 Toeplitz 一致性哈希（常用于 RSS 对称哈希与流量分发，见 06-06）、以及 cuckoo hash 内部实现 `rte_cuckoo_hash.h`。它最适合二层 MAC 转发表、会话表、隧道映射、五元组到动作的精确查找等场景。
+
+三者的边界可以用一句话概括：LPM / FIB 回答「这个地址该走哪条路由（最长前缀）」，hash 回答「这个键在不在表里、对应的值是什么（精确）」，ACL 回答「这个报文匹配哪条多元组规则（范围/掩码）」。下表把选型维度摊开，组网时先按「匹配语义」定位库，再按规模、更新频率与动作复杂度细化。
+
+| 维度 | LPM | FIB | hash |
+|---|---|---|---|
+| 匹配语义 | 最长前缀匹配 | 最长前缀匹配 | 精确键值匹配 |
+| 典型输入 | 目的 IPv4/IPv6 地址 | 目的 IPv4/IPv6 地址 | MAC、五元组、隧道键 |
+| 返回值 | 应用自定义 next_hop | nexthop id 与动作表 | 与键关联的数据 |
+| 批量接口 | `rte_lpm_lookup_bulk` | `rte_fib_lookup_bulk` | `rte_hash_lookup_bulk` |
+| 动作解耦 | 弱，值即动作 | 强，动作独立成表 | 中，值即数据 |
+| 代表场景 | 轻量三层转发 | 大规模路由与动作解耦 | 二层转发与会话表 |
+| 主要约束 | tbl8 容量与前缀深度 | 算法后端与 nexthop 规模 | 键长与冲突/表满 |
+
+### 3. 关键数据结构与源码位置
+
+本节只做定位与交出去，不列完整字段表；查表结构的关键成员与生命周期见 05-09，下表给出本篇涉及的源码职责地图。
+
+| 源码路径 | 职责定位 | 关键接口或对象 | 延伸指向 |
+|---|---|---|---|
+| `lib/lpm/rte_lpm.h` | IPv4 最长前缀匹配公共 API | `rte_lpm_lookup_bulk` | 字段见 05-09 |
+| `lib/lpm/rte_lpm6.h` | IPv6 最长前缀匹配 API | `rte_lpm6` 系列 | 模块见本篇 |
+| `lib/fib/rte_fib.h` | FIB 转发表与 nexthop 抽象 | `rte_fib_create` | 字段见 05-09 |
+| `lib/fib/rte_fib6.h` | IPv6 FIB 接口 | `rte_fib6` 系列 | 模块见本篇 |
+| `lib/hash/rte_hash.h` | cuckoo hash 精确查找 API | `rte_hash_lookup_bulk` | 字段见 05-09 |
+| `lib/hash/rte_thash.h` | 一致性哈希与 RSS 辅助 | 对称哈希接口需核验 | 原理见 06-06 |
+| `examples/l3fwd/` | 三层转发查表组网范例 | 运行参数见 04-04 | 命令见 04-04 |
+
+梳理地图时，按「一个库一个目录、IPv4 与 IPv6 分文件」的规律记最省力。`lib/lpm/` 下 `rte_lpm.h` / `rte_lpm.c` 是 IPv4，`rte_lpm6.h` / `rte_lpm6.c` 是 IPv6；`lib/fib/` 下 `rte_fib.h` / `rte_fib.c` 与 `rte_fib6.h` 对应；`lib/hash/` 下 `rte_hash.h`、`rte_cuckoo_hash.h`（内部实现）、`rte_fbk_hash.h`、`rte_thash.h` 各有分工。配置结构如 `rte_lpm_config`、`rte_fib_conf`、`rte_hash_parameters` 一般与对应公共头文件同处，成员集合需对照实际版本核验。`examples/l3fwd/` 是理解三库如何落进真实转发程序的最佳入口：它展示了从控制面构造路由表、到数据面批量查表、再到按 nexthop 重写二层头并发包的完整链路；较新版本还提供不同查表模式的切换选项（选项名需核验），正好用来做横向对比。
+
+从使用场景反查源码也有固定套路：想知道「加一条路由发生了什么」，从 `lib/lpm/rte_lpm.c` 的 `rte_lpm_add()` 入手；想知道「批量查表返回什么」，看 `rte_lpm_lookup_bulk()` 与 `lib/fib/` 同名批量接口；想知道「键怎么存」，看 `lib/hash/rte_cuckoo_hash.h` 的桶与键槽布局（字段见 05-09）。三个库都把「控制面慢路径」与「数据面热路径」分得很清楚：建表、加删表项可以带锁、可以慢，查询则强调无锁、批量、可向量化（机制见 06-08）。testpmd 与示例程序的参数写法见 04-03、04-04，本篇配置段只给最典型的几条命令。
+
+### 4. 关键流程与调用链
+
+先划边界：本节讲「建表 → 加表项 → 数据面批量查表 → 更新与释放」的 API 顺序，以及三库在转发流水线中的位置与典型组网；tbl24/tbl8 多级表如何压缩查表、cuckoo hash 的桶布局与冲突搬迁、以及 SIMD 批量查表实现统一见 06-08，本篇不展开。
+
+三库的调用骨架高度同构，差别在参数与返回语义。LPM 是 `rte_lpm_create()` → `rte_lpm_add()`（逐条前缀）→ 主循环 `rte_lpm_lookup_bulk()` → 需要时 `rte_lpm_delete()` / `rte_lpm_free()`；FIB 是 `rte_fib_create()`（含 `rte_fib_conf` 与最大 nexthop 数）→ `rte_fib_add()` → `rte_fib_lookup_bulk()` 拿到 nexthop id → 再查动作表 → `rte_fib_delete()`；hash 是 `rte_hash_create()` → `rte_hash_add_key_data()` → `rte_hash_lookup_data()` / `rte_hash_lookup_bulk()` → `rte_hash_del_key()`。三者都遵循「初始化阶段一次性把表建好并填充，热路径只做批量查询」这一 DPDK 通用范式，控制面更新（增删路由、会话老化）应与数据面查询分离，必要时借助 RCU 或双表切换（协同调度见 06-12）。下图把三库在一条转发流水线中的候选位置画出来：解析出关键字后按语义选择其中一个查表，结果汇聚到 nexthop 动作表再驱动发包，三库的分工位置见图 07-04-01。
+
+:::figure id=07-04-01 | name=三库在转发流水线中的位置 | dir=TD
+node n1 "rte_eth_rx_burst" blue
+node n2 "解析 L3 关键字" teal
+node n3 "rte_lpm 查路由" amber
+node n4 "rte_fib 查动作" amber
+node n5 "rte_hash 精确匹配" amber
+node n6 "nexthop 动作表" purple
+node n7 "rte_eth_tx_burst" green
+node n8 "ACL 分类补判" gray
+edge n1 -> n2 "取一批 mbuf"
+edge n2 -> n3 "目的 IP 前缀"
+edge n2 -> n5 "精确键值"
+edge n2 -> n4 "带动作前缀"
+edge n3 -> n6 "查到下一跳"
+edge n4 -> n6 "查到动作"
+edge n5 -> n6 "命中表项"
+edge n6 -> n7 "重写并发包"
+edge n2 -> n8 "需精细分类"
+edge n8 -> n6 "优先级结果"
+:::
+
+以 `examples/l3fwd/` 为代表的三层转发组网，最能体现「控制面与数据面分离 + 批量查表」的落地形态，其处理链路见图 07-04-02。
+
+:::figure id=07-04-02 | name=l3fwd 三层转发查表组网 | dir=TD
+node n1 "端口 0 收包" blue
+node n2 "lcore 解析报文" teal
+node n3 "rte_lpm_lookup_bulk" amber
+node n4 "最长前缀匹配" amber
+node n5 "nexthop 表项" purple
+node n6 "查 MAC 与出端口" green
+node n7 "端口 1 发包" green
+node n8 "控制面下发路由" gray
+edge n1 -> n2 "批量取包"
+edge n2 -> n3 "批量查表"
+edge n3 -> n4 "前缀深度"
+edge n4 -> n5 "命中下一跳"
+edge n5 -> n6 "取转发动作"
+edge n6 -> n7 "重写后发出"
+edge n8 -> n3 "建表与更新"
+edge n8 -> n5 "更新动作表"
+:::
+
+从图 07-04-02 能读出两个性能要点。其一，热路径上必须是**批量**查表：一次把一批目的地址交给 `rte_lpm_lookup_bulk()` 或 `rte_fib_lookup_bulk()`，让库内部用连续访存与向量化指令摊薄成本，逐包单查会显著损失吞吐（原理见 06-08）。其二，控制面在初始化或路由更新时才调用 `add` / `delete`，与数据面查询在时间上解耦；规模较大或更新频繁时，应设计好「更新期间旧表继续服务、新表构建完再原子切换」的方案，避免数据面读到半更新状态。至于 hash，虽然图上未单独画，它在二层转发、会话表、隧道映射里的位置与 LPM 平行，只是输入从「目的 IP」换成「精确键」、返回值从「next_hop」换成「关联数据」。多字段范围匹配则不在三者职责内，由 07-05 的 ACL 与 `rte_flow` 承接。
+
+### 5. 配置/命令/代码实例
+
+本节只给 3 条最典型命令，用来「以不同查表模式运行 l3fwd → 观察转发统计」；l3fwd 的完整参数、testpmd 命令与统计命令见 04-04、04-03，此处不重列。示例中的 `--config`、`--lookup` 等选项名与取值需对照实际版本核验。
+
+```bash
+# 1) 以 LPM 查表模式启动 l3fwd（参数写法见 04-04，选项需核验）
+sudo ./build/examples/dpdk-l3fwd -l 0-3 -- -P -p 0x3 --lookup lpm
+# 2) 切换到精确匹配模式做横向对比（选项名需核验）
+sudo ./build/examples/dpdk-l3fwd -l 0-3 -- -P -p 0x3 --lookup em
+# 3) 进入 telemetry 交互端观察转发统计（接口路径需核验）
+dpdk-telemetry
+```
+
+下面给出一段完整的 C 片段，演示 LPM 建表、加入两条不同深度的前缀与一条默认路由、批量查三个目的地址并打印结果，用来直观验证「最长前缀匹配」。字段名、字节序与函数名需对照 `lib/lpm/rte_lpm.h` 核验。
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+#include <arpa/inet.h>
+#include <rte_lpm.h>
+
+#define MAX_RULES 1024
+#define SOCKET_ID 0
+
+static uint32_t
+ipv4(const char *s)
+{
+    return ntohl(inet_addr(s));
+}
+
+int
+lpm_demo(void)
+{
+    struct rte_lpm *lpm;
+    struct rte_lpm_config conf;
+    uint32_t ips[3], hops[3];
+    int ret;
+
+    conf.max_rules = MAX_RULES;
+    conf.number_tbl8s = 256;
+    conf.flags = 0;
+
+    lpm = rte_lpm_create("LPM_DEMO", SOCKET_ID, &conf);
+    if (lpm == NULL) {
+        fprintf(stderr, "Cannot create LPM\n");
+        return -1;
+    }
+
+    ret = rte_lpm_add(lpm, ipv4("10.0.0.0"), 8, 1);
+    if (ret < 0)
+        return ret;
+    ret = rte_lpm_add(lpm, ipv4("10.1.0.0"), 16, 2);
+    if (ret < 0)
+        return ret;
+    ret = rte_lpm_add(lpm, ipv4("0.0.0.0"), 0, 100);
+    if (ret < 0)
+        return ret;
+
+    ips[0] = ipv4("10.1.2.3");
+    ips[1] = ipv4("10.2.3.4");
+    ips[2] = ipv4("192.168.1.1");
+
+    ret = rte_lpm_lookup_bulk(lpm, ips, hops, 3);
+    printf("lookup ret=%d hops=%u %u %u\n",
+           ret, hops[0], hops[1], hops[2]);
+
+    rte_lpm_free(lpm);
+    return 0;
+}
+```
+
+该片段运行后的关键输出如下，示例输出，具体格式需对照实际版本核验。
+
+```text
+lookup ret=0 hops=2 1 100
+```
+
+这一行虽短，却完整印证了最长前缀匹配的语义，值得逐项判读。`ret=0` 表示 `rte_lpm_lookup_bulk()` 对三个地址全部查到结果；由于插入了 `0.0.0.0/0` 默认路由，任何地址都至少能命中一条前缀，因此不会出现未命中（未命中时的返回值语义与 `hops` 中对应槽位的取值需对照实际版本核验）。第一个地址 `10.1.2.3` 同时落在 `10.0.0.0/8`（next_hop=1）与 `10.1.0.0/16`（next_hop=2）里，输出 `hops=2` 证明库选择了掩码更长的 /16，正是 LPM 区别于普通哈希查找的核心行为；若这里返回 1，说明前缀被错误覆盖或加表顺序有问题。第二个地址 `10.2.3.4` 只匹配 `10.0.0.0/8`，得到 `hops=1`，符合预期。第三个地址 `192.168.1.1` 不匹配任何具体前缀，落到默认路由得到 `hops=100`，这既是默认路由生效的证据，也说明 `next_hop` 完全由应用自定义含义（本例里 1、2、100 只是三个编号，真实系统中通常指向出端口或下一跳表索引）。正常范围上 `next_hop` 应是建表时写入过的合法值，若批量查询返回未命中或 `next_hop` 为异常值，常见原因是 IP 字节序写反（例如把网络字节序地址直接传给期望主机字节序的接口）、前缀 depth 超出范围、或 `number_tbl8s` 配置过小导致更深层前缀无法容纳。FIB 的用法与此同构，只是把 `next_hop` 换成 nexthop id 再去索引动作表；hash 则要求键完全相同才命中，不存在「最长匹配」这一层。
+
+### 6. 注意事项、陷阱与最佳实践
+
+- **先按匹配语义选库，再谈性能**。需要最长前缀匹配就用 LPM 或 FIB，需要精确键值才用 hash；用 hash 强行做路由会在语义上出错，用 LPM 做纯精确匹配则白付多级表的内存与查表成本。多字段范围/掩码匹配应交给 07-05 的 ACL 或 07-06 的 `rte_flow`。
+- **LPM 要按前缀规模估算 tbl8**。`rte_lpm_config` 的 `max_rules` 与 `number_tbl8s`（成员名需核验）决定能容纳多少条、多深的前缀；前缀深度分布越碎，tbl8 消耗越大，估算不足会导致 `rte_lpm_add()` 失败或被迫扩容。
+- **注意 IP 字节序与 depth 取值**。传给 `rte_lpm_add()` / `rte_lpm_lookup_bulk()` 的地址字节序需按头文件约定处理，depth 对 IPv4 是 0 到 32、对 IPv6 是 0 到 128；字节序写反是「路由全不命中」最常见的根因，可用第 5 节的小片段先验证。
+- **优先批量接口**。`lookup_bulk` 才能摊薄查表成本并配合向量化，逐包单查会明显拉低吞吐；批量大小常与 `rx_burst` 保持一致，收益原理见 06-08。
+- **控制面与数据面分离，更新要可切换**。建表、加删表项属控制面，可以慢；热路径只做查询。更新频繁或规模大时设计 RCU 或双表原子切换，避免数据面读到半更新状态，协同调度见 06-12。
+- **FIB 用好 nexthop 解耦**。把出端口、二层重写、计量放进独立动作表，用查得的 nexthop id 索引；不要把所有动作塞回前缀表里，否则失去 FIB 相对 LPM 的主要收益。算法后端名称与能力需对照实际版本核验。
+- **hash 关注键长、哈希函数与表满**。`rte_hash_create()` 的键长、条目数与额外标志一旦确定难以在线调整，创建前应估算容量并留余量；`add_key_data` 返回失败要处理（表满或键冲突），删除与老化要在控制面串行化。成员名与额外标志需核验。
+- **IPv4 与 IPv6 用对应接口**。`rte_lpm` / `rte_fib` 与 `rte_lpm6` / `rte_fib6` 是不同对象，双栈程序要分别建表、分别查询，不要混用。
+- **表要建在正确 NUMA socket，并复用 mempool 思路**。查表在数据面每包都发生，表所在 socket 应与处理 lcore 一致；跨节点访存代价见 06-09。诊断与统计命令见 04-04、04-05。
+
+### 7. 小结与延伸阅读
+
+LPM、FIB、hash 三库把「查表」这件高频动作按语义拆开：LPM 用多级表把最长前缀匹配压到少数几次访存，FIB 在同样语义上引入 nexthop 抽象与可替换数据面算法、把转发动作解耦出来，hash 用 cuckoo hash 解决精确键值查找。三者共享「控制面建表更新、数据面批量查询」的范式，选型的唯一第一原则是匹配语义——前缀用 LPM/FIB、精确用 hash、多字段规则用 ACL 与 `rte_flow`。工程上再叠加三条：热路径一律批量查询、控制面更新与数据面查询解耦、表与 lcore 同 NUMA socket。
+
+延伸阅读：`rte_lpm`、`rte_fib`、`rte_hash`、`rte_acl_ctx` 的关键成员与生命周期见 05-09；tbl24/tbl8 结构、cuckoo hash 桶布局与 SIMD 批量查表见 06-08；RSS 与一致性哈希见 06-06；RCU 与双表切换见 06-12；l3fwd 与 testpmd 的参数、统计命令见 04-04、04-03；ACL 与分类维度见 07-05；`rte_flow` 规则对象见 07-06；NUMA 亲和见 06-09。建议以 `examples/l3fwd/` 为实验床，先用第 5 节的 LPM 片段验证最长前缀语义，再切换查表模式对比批量查询带来的吞吐差异。
+
+## 07-05 ACL 与 classify（规则编译、分类维度、与 `rte_flow` 的分工边界）
+
+### 1. 背景与动机
+
+07-04 讲的三库回答的是「这个键或地址对应什么」，但现实中还有一大类转发逻辑无法用它们表达：防火墙要按「源地址段 + 目的地址段 + 源端口范围 + 目的端口范围 + 协议」的组合决定放行还是丢弃，策略路由要按多元组选路，QoS 要按 DSCP 与五元组打标记，隧道网关要按外层与内层字段联合判断。这类需求有三个共同特征：字段是**多维**的，字段值常常是**范围或掩码**而非精确值，规则之间存在**优先级**（命中多条时取最优先的那条）。把它们交给 hash 会因为无法表达范围而失效，交给 LPM 只能覆盖其中一维，逐条线性比对则在几百上千条规则下每包要做成千次比较，根本不可能上线速数据面。
+
+DPDK 的 `lib/acl/` 正是为此而生。它的核心思路是**预编译**：控制面先把一整套规则集编译成一棵便于快速遍历的分类结构（决策树 / trie 类结构），数据面运行时每个报文只做少量连续内存访问就能得到「命中了哪条规则」，从而把「N 条规则」的线性成本摊薄成与规则数弱相关的固定成本。这与 LPM 把前缀预编译成多级表、与 06-08 讲的查表向量化是同一种工程哲学——把昂贵工作挪到初始化阶段，热路径只留确定性访存。代价是规则集不能随意增量修改：变更规则通常意味着重新编译，因此 ACL 更适合「规则相对稳定、查询极其频繁」的策略类负载。
+
+还要澄清 `classify` 这一侧的定位。DPDK 历史上提供过 `lib/flow_classify/`（以 `rte_flow_classify` 为代表）之类的库，思路是把 `rte_flow` 风格的 pattern/action 描述转成 ACL 规则，用软件完成分类，从而在没有硬件卸载能力时提供一条统一语义的回退路径；该库在不同版本中的存续状态、头文件路径与接口集合差异较大，需对照实际版本核验。本篇把它与 `lib/acl/` 放在一起讲，是为了说明「软件分类」这一层的共同能力与边界。
+
+本篇最需要讲清的是与 `rte_flow` 的**分工边界**：ACL / classify 是 CPU 侧的软件分类，灵活、与硬件无关、能表达复杂多元组，但每个报文都要消耗 CPU 周期；`rte_flow` 是把规则下发到网卡或交换芯片硬件，命中后由硬件直接完成分流、丢弃、标记，几乎不占 CPU，但表达能力与规则条数受具体 PMD 限制（模块视角见 07-06）。二者并非替代关系，而是常在同一系统里级联：硬件先处理能卸载的简单规则，未命中的流量上送 CPU 由 ACL 做精细分类。本篇作为 07 册模块篇，讲规则编译流程、分类维度、典型组网与这条分工边界；`rte_acl_ctx`、`rte_acl_rule`、`rte_acl_field_def` 等结构逐字段定义见 05-09，分类结构构建与 SIMD 分类实现见 06-08、06-06，规则与统计命令见 04-04，本篇不重列字段表与命令全集。版本基准 23.11 LTS / 24.11 / master，凡宏名、结构体成员与库路径均需对照 `lib/acl/` 核验。
+
+### 2. 核心概念
+
+ACL 的第一层概念是**规则与字段定义**。规则不是「一个五元组字符串」，而是由一组字段定义（field definition）来规定「每个维度怎么比」：每个字段描述包含类型、大小、在规则中的字段序号、在输入报文中的 input 序号，以及相对报文起始的偏移。常见字段类型有三类（宏名需对照 `lib/acl/rte_acl.h` 核验）：`RTE_ACL_FIELD_TYPE_MASK` 做带掩码匹配，适合源/目的 IP 前缀；`RTE_ACL_FIELD_TYPE_RANGE` 做数值区间匹配，适合端口范围；`RTE_ACL_FIELD_TYPE_BITMASK` 做位掩码匹配，适合协议号、TCP 标志等。字段定义由应用按报文内存布局自行组装，因此「偏移写对、字节序对上」是 ACL 能否正确分类的前提，字段逐项含义与 `rte_acl_field_def` 成员见 05-09。
+
+第二层是**分类维度与结果**。经典 ACL 用五元组——源 IP、目的 IP、源端口、目的端口、协议——但维度并不固定，VLAN ID、DSCP、入端口、隧道标志等都可以作为字段加入，只要提供对应的字段定义与报文布局。规则还可以带 `priority`（优先级，数值语义需核验）与 `category_mask`（类别掩码），后者支持**多分类**：一次 `rte_acl_classify()` 可以在多个 category 上各自返回匹配结果，例如同一批报文同时给出「安全策略结果」与「QoS 类别结果」，而不必建两套规则集跑两遍。每条规则携带一个 `userdata`（通常是应用自定义的动作编号），分类命中后返回的就是它，应用再用这个编号去索引动作表，这与 07-04 里 FIB 的 nexthop id 思路一致。
+
+第三层是**编译与分类两阶段 API**。控制面依次做：`rte_acl_create()` 建上下文、`rte_acl_add_rules()` 导入规则数组、`rte_acl_build()` 一次性把规则集编译成运行时结构；数据面在热路径反复调用 `rte_acl_classify()`（或 `rte_acl_classify_alg()` 指定分类算法实现，名称需核验）对一批报文做批量分类，结果写进 `results` 数组；规则变更时用 `rte_acl_reset()` 清空后重建，`rte_acl_free()` 释放上下文。这里最关键的认知是：**build 昂贵，classify 廉价**。把 `rte_acl_build()` 放进转发循环是典型误用，它本就该只在初始化或规则变更时执行一次。分类结果的组织方式见第 4 节图 07-05-01。
+
+下表把 ACL 与 `rte_flow` 的分工摊开，选型与级联设计时按此对照；表中提到的 `rte_flow` 模块细节见 07-06。
+
+| 维度 | ACL 与 classify | `rte_flow` |
+|---|---|---|
+| 执行位置 | CPU 软件分类 | 网卡或交换芯片硬件 |
+| 规则表达 | 字段定义加规则数组 | pattern 与 action 链 |
+| 匹配能力 | 多维范围与掩码灵活 | 受具体 PMD 能力限制 |
+| 规则条数 | 受编译内存与构建时间约束 | 受硬件表项资源约束 |
+| 变更成本 | 通常需重新 build | 单条 create 或 destroy |
+| 每包开销 | 消耗 CPU 周期 | 命中后几乎不占 CPU |
+| 典型角色 | 精细策略与软件回退 | 高速分流与动作卸载 |
+| 可移植性 | 与硬件无关 | 需逐 PMD 验证能力 |
+
+### 3. 关键数据结构与源码位置
+
+按 07 册去重约定，本节只定位、不列完整字段表；`rte_acl_ctx`、`rte_acl_rule`、`rte_acl_field_def`、`rte_acl_config` 等关键成员与生命周期见 05-09，下表给出本篇涉及的源码职责地图。
+
+| 源码路径 | 职责定位 | 关键接口或对象 | 延伸指向 |
+|---|---|---|---|
+| `lib/acl/rte_acl.h` | ACL 公共 API 与结构声明 | `rte_acl_classify` | 字段见 05-09 |
+| `lib/acl/rte_acl.c` | 上下文创建、规则导入与构建 | `rte_acl_build` | 模块见本篇 |
+| `lib/acl/acl_run.h` | 运行时分类实现相关头文件 | 分类内核需核验 | 原理见 06-08 |
+| `lib/flow_classify/` | 软件 flow 分类库（存续需核验） | 接口名需核验 | 模块见本篇 |
+| `examples/l3fwd-acl/` | ACL 规则转发组网范例 | 规则文件与运行参数 | 命令见 04-04 |
+| `app/test-pmd/` | flow 与统计命令范例 | 交互命令见 04-04 | 命令见 04-04 |
+| `drivers/net/` 各 PMD | 硬件 flow 卸载实现对照 | `rte_flow_ops` | 模块见 07-06 |
+
+梳理地图时，按「公共面 → 构建面 → 运行面 → 范例」四层记最省力。`lib/acl/rte_acl.h` 是应用唯一需要直接包含的头文件，声明 `rte_acl_create()`、`rte_acl_add_rules()`、`rte_acl_build()`、`rte_acl_classify()` 以及各类结构；`lib/acl/rte_acl.c` 落地上下文管理与规则集编译；运行时分类的具体内核（含按指令集优化的变体，目录内文件名与宏开关需核验）追求每包最少访存，属于 06-08 的机制范畴。`RTE_ACL_RULE_SZ(num_fields)`、`RTE_ACL_MAX_FIELDS`、`RTE_ACL_MAX_CATEGORIES` 一类宏用于计算变长规则大小与限制维度，取值需核验。`lib/flow_classify/` 是否包含在所用版本、以及它提供的 `rte_flow_classify_*` 接口集合差异较大，务必先确认目录存在再引用，避免按旧版本资料写出不存在的头文件。
+
+`examples/l3fwd-acl/` 是理解 ACL 落地的最佳入口：它展示了规则文件如何被解析成 `rte_acl_rule` 数组、字段定义如何与报文布局对齐、build 之后数据面怎样按批量结果选择转发或丢弃动作，正好与 `examples/l3fwd/`（见 07-04）形成「精确/前缀查表」与「多元组分类」的对照。`app/test-pmd/` 的 flow 命令则属于 `rte_flow` 一侧，用作分工边界的参照（见 07-06、04-04）。相关命令与规则文件格式见 04-04，本篇配置段只给最典型的几条。
+
+### 4. 关键流程与调用链
+
+先划边界：本节讲「规则集怎样被编译、运行时怎样批量分类、结果怎样驱动动作」的 API 序列与组网；决策树/trie 的构建细节、按指令集优化的分类内核与内存访问模式见 06-08，规则如何下发到硬件见 06-06，本篇不展开。
+
+编译阶段是一条严格串行的链，且全部在控制面完成。应用先按 `rte_acl_param`（含名字、socket、规则大小与最大规则数，成员名需核验）调用 `rte_acl_create()` 得到 `rte_acl_ctx *`；随后把控制面构造好的规则数组交给 `rte_acl_add_rules()`；再用 `rte_acl_config`（category 数、字段数、字段定义数组）调用 `rte_acl_build()` 一次性生成运行时结构。build 的耗时与规则数、维度数、深度分布正相关，可能达到毫秒乃至更久，因此必须放在初始化、配置加载或规则批量变更时，绝不能出现在转发循环里。规则集若需变更，常规做法是 `rte_acl_reset()` 后重新 add 与 build，或在控制面另建一个 ctx、构建完成后再原子切换数据面指针，避免热路径读到半构建状态。图 07-05-01 把这条「一次编译、多次分类」的链路与动作闭环画了出来。
+
+:::figure id=07-05-01 | name=ACL 规则编译与批量分类链路 | dir=TD
+node n1 "控制面规则集" blue
+node n2 "rte_acl_add_rules" teal
+node n3 "rte_acl_build 编译" teal
+node n4 "分类结构 tries" amber
+node n5 "报文批量输入" purple
+node n6 "rte_acl_classify" green
+node n7 "results 结果数组" green
+node n8 "动作查表或丢弃" gray
+edge n1 -> n2 "导入规则"
+edge n2 -> n3 "一次性构建"
+edge n3 -> n4 "生成决策树"
+edge n5 -> n6 "按字段组织"
+edge n4 -> n6 "运行时查询"
+edge n6 -> n7 "批量分类"
+edge n7 -> n8 "驱动动作"
+edge n3 -> n1 dashed "规则变更重建"
+:::
+
+运行阶段的输入组织值得单独强调。`rte_acl_classify()` 接收的不是 `rte_mbuf` 数组，而是一个「按字段定义组织的报文数据指针数组」：应用要把每个报文中参与分类的字段按 `input_index` 对应的布局准备好，通常以连续内存块（如解析后的五元组结构）传入，字段定义里的 `offset` 决定从块内何处取值。分类结果写进 `results` 数组，每个元素对应该报文在某个 category 上的 `userdata`（命中）或 0（未命中）；应用再用这个编号去动作表决定放行、丢弃、入队列还是打标记，形成一个与 07-04「查表 → nexthop → 动作」同构的闭环。因为输入布局必须与字段定义**逐字节对齐**，任何结构体 packing、字节序（网络序与主机序）或偏移写错，都会表现为「规则全部不命中」这种极难排查的静默故障。
+
+ACL 与 `rte_flow` 的典型级联组网见图 07-05-02：报文先经硬件 `rte_flow` 卸载匹配，命中的直接由硬件完成动作，未命中的上送 CPU 走 ACL 软件分类，再辅以 LPM / hash 查表补判，最后统一收敛到转发或丢弃。
+
+:::figure id=07-05-02 | name=ACL 与 rte_flow 的分工边界 | dir=TD
+node n1 "报文进入端口" blue
+node n2 "硬件 rte_flow 卸载" teal
+node n3 "命中硬件规则" teal
+node n4 "上送 CPU 软件路径" amber
+node n5 "ACL 软件分类" amber
+node n6 "查表 LPM 或 hash" purple
+node n7 "丢弃或转发" green
+node n8 "控制面规则下发" gray
+edge n1 -> n2 "优先硬件匹配"
+edge n2 -> n3 "命中即动作"
+edge n2 -> n4 "未命中上送"
+edge n4 -> n5 "精细分类"
+edge n5 -> n6 "查表补判"
+edge n3 -> n7 "硬件动作"
+edge n6 -> n7 "软件动作"
+edge n8 -> n2 "下发流规则"
+edge n8 -> n5 "下发 ACL 规则"
+:::
+
+从图 07-05-02 可以读出工程上的取舍原则：能由硬件卸载的简单规则（按五元组分流到队列、按明确特征丢弃）尽量交给 `rte_flow`，把 CPU 省给必须软件处理的复杂策略；而 ACL 的价值恰在于「与硬件无关、维度灵活」，因此它既是策略主力，也是 PMD 不支持某些 flow 能力时最自然的回退层。`classify` 一类库的意义，是让这条软件回退尽量复用 `rte_flow` 风格的规则描述，减少两套规则语言的维护成本（具体能力需核验）。规则与统计命令见 04-04。
+
+### 5. 配置/命令/代码实例
+
+本节只给 3 条最典型命令，覆盖「以 ACL 规则启动示例程序 → 用 flow 命令做硬件侧对照 → 观察统计」这条链路；l3fwd-acl 参数与 testpmd flow 命令全集见 04-04、04-03，此处不重列。选项名、规则文件路径与 flow 语法需对照实际版本核验。
+
+```bash
+# 1) 以规则文件启动 l3fwd-acl（参数见 04-04，选项需核验）
+sudo ./build/examples/dpdk-l3fwd-acl -l 0-3 -- -p 0x3 --rule_ipv4 ./ipv4_rules
+# 2) testpmd 中下发一条硬件丢弃规则做能力对照（命令见 04-04）
+flow create 0 ingress pattern eth / ipv4 / end actions drop / end
+# 3) 进入 telemetry 交互端观察分类统计（接口路径需核验）
+dpdk-telemetry
+```
+
+下面给出一段完整的 C 片段，演示「创建上下文 → 导入规则 → 编译 → 批量分类」的调用骨架。字段定义、规则数组与输入数据由控制面按报文布局构造（字段见 05-09，范例见 `examples/l3fwd-acl/`），此处以 `extern` 引入以保持片段自洽；结构体成员与函数名需对照 `lib/acl/rte_acl.h` 核验。
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <rte_acl.h>
+
+/* 字段定义、规则数组与输入布局由控制面构造 */
+extern struct rte_acl_field_def ipv4_defs[5];
+extern struct rte_acl_rule *rule_array[2];
+extern const uint8_t *packet_data[4];
+
+#define SOCKET_ID  0
+#define MAX_RULES  1024
+#define RULE_SIZE  RTE_ACL_RULE_SZ(5)
+#define CATEGORIES 1
+
+int
+acl_demo(void)
+{
+    struct rte_acl_param prm;
+    struct rte_acl_config cfg;
+    struct rte_acl_ctx *ctx;
+    uint32_t results[4];
+    int ret;
+
+    memset(&prm, 0, sizeof(prm));
+    prm.name = "ACL_DEMO";
+    prm.socket_id = SOCKET_ID;
+    prm.rule_size = RULE_SIZE;
+    prm.max_rule_num = MAX_RULES;
+
+    ctx = rte_acl_create(&prm);
+    if (ctx == NULL) {
+        fprintf(stderr, "Cannot create ACL context\n");
+        return -1;
+    }
+
+    ret = rte_acl_add_rules(ctx,
+            (const struct rte_acl_rule **)rule_array, 2);
+    if (ret != 0)
+        return ret;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.num_categories = CATEGORIES;
+    cfg.num_fields = 5;
+    memcpy(cfg.defs, ipv4_defs, sizeof(ipv4_defs));
+
+    ret = rte_acl_build(ctx, &cfg);
+    if (ret != 0)
+        return ret;
+
+    ret = rte_acl_classify(ctx, packet_data, results, 4, CATEGORIES);
+    printf("classify ret=%d results=%u %u %u %u\n",
+           ret, results[0], results[1], results[2], results[3]);
+
+    rte_acl_free(ctx);
+    return 0;
+}
+```
+
+该片段中 `rte_acl_classify()` 的输出示例如下，示例输出，具体格式需对照实际版本核验。
+
+```text
+classify ret=0 results=101 0 102 0
+```
+
+对这一行要逐项判读。`ret=0` 表示分类调用本身正常完成，四个报文都已被处理；`rte_acl_classify()` 的返回值语义（是否表示「全部成功」、以及部分未命中时如何返回）需对照实际版本核验，不能想当然当作「命中条数」。`results` 数组按报文顺序给出每个 category 的匹配结果：本例只用了 1 个 category，因此四个值依次对应四个输入报文。`101` 与 `102` 是命中规则的 `userdata` 应用自定义编号——它们通常是动作表索引，例如 101 代表「允许并转发到端口 0」、102 代表「允许并打某类 QoS 标记」；`0` 表示没有命中任何规则，按策略惯例一般走默认丢弃或默认路由。也就是说，第 1、3 个报文命中了规则，第 2、4 个报文未命中，这正是防火墙「按规则集放行、其余默认处理」的典型结果分布。正常范围上，`results` 中的非零值应落在建表时写入过的 `userdata` 集合内，出现未定义值往往意味着输入布局与字段定义错位、或 `results` 数组长度小于「报文数 × category 数」导致越界写。异常特征方面，若四个值全为 0，最常见的三个根因依次是：忘记调用 `rte_acl_build()`（规则集尚未编译）、字段定义里的 `offset` / `size` / `input_index` 与 `packet_data` 实际布局不一致、以及 IP 或端口的字节序与规则中的掩码方向不匹配（例如把主机序地址与网络序地址直接相比）。多 category 场景下还要按「每报文 category 数」的步长去读 `results`，否则会把第二个 category 的结果误当成第二个报文的，这类串位错误在多分类里格外常见。
+
+### 6. 注意事项、陷阱与最佳实践
+
+- **`rte_acl_build()` 只能在控制面调用**。它把规则集编译成运行时结构，耗时随规则数与维度增长，放进转发循环会直接拖垮吞吐；规则变更应重建 ctx 或在控制面另建后原子切换数据面指针，避免读到半构建状态。
+- **字段定义与报文布局必须逐字节对齐**。`rte_acl_field_def` 的 `offset`、`size`、`input_index`、`field_index` 任一写错，或结构体 packing 与规则字节序不一致，都会表现为「规则全部不命中」的静默故障；上线前用第 5 节的小片段以已知报文做回归验证最划算。字段逐项含义见 05-09。
+- **按 `RTE_ACL_RULE_SZ(num_fields)` 计算规则大小，留足 `max_rule_num`**。ACL 规则是变长结构，规则大小与维度数绑定；`rte_acl_param` 中的规则大小与最大规则数（成员名需核验）估算不足会导致 add 失败或内存浪费。
+- **分清 priority、category 与 userdata**。priority 决定同报文命中多条时取哪条（数值方向需核验），category 支持一次分类产出多组结果，`userdata` 是结果里返回给应用去索引动作表的编号；把这三者混用会让多分类结果串位。
+- **批量分类并按正确步长读结果**。`rte_acl_classify()` 的 `results` 数组应按「报文数 × category 数」组织，读取时按 category 步长取值；批量大小与 `rx_burst` 对齐以摊薄调用成本（批量收益见 06-08）。
+- **厘清与 `rte_flow` 的边界，准备软件回退**。能硬件卸载的简单规则交给 `rte_flow`（见 07-06），复杂多元组策略与 PMD 不支持的场景由 ACL 承接；两者级联时明确「硬件未命中才上送 CPU」，避免同一流量被两套规则重复处理。
+- **`classify` 类库的存续与接口先核验再用**。`lib/flow_classify/` 在不同版本中的包含情况与 `rte_flow_classify_*` 接口集合差异较大，引用前确认目录与头文件存在，不要按旧资料照抄。
+- **ctx 与规则内存要建在正确 socket，并管好生命周期**。分类在数据面每包发生，ctx 所在 NUMA 节点应与处理 lcore 一致（见 06-09）；`rte_acl_free()` 之前确保无线程仍在 classify，规则变更与重建应在控制面串行化。
+
+### 7. 小结与延伸阅读
+
+ACL 与 classify 把「按多元组规则决定报文命运」这件事从线性比对变成了可上线速的批量分类：控制面用字段定义描述维度、用规则数组描述策略、`rte_acl_build()` 一次性编译成运行时结构，数据面用 `rte_acl_classify()` 批量返回每报文每 category 的 `userdata`，再由应用索引动作表。理解本篇，抓住三组对照即可：build 昂贵、classify 廉价，因此编译只在控制面做；维度靠字段定义、结果靠 userdata 与 category，因此输入布局必须逐字节对齐；ACL 是 CPU 软件分类、`rte_flow` 是硬件卸载，二者级联而非替代，ACL 同时是 flow 能力不足时最自然的软件回退层。
+
+延伸阅读：`rte_acl_ctx`、`rte_acl_rule`、`rte_acl_field_def`、`rte_acl_config` 的关键成员与生命周期见 05-09；决策树构建、分类内核与 SIMD 向量化见 06-08；RSS、Flow Director 与规则编译下发到硬件见 06-06；`rte_flow` 的规则对象、分组与可移植性见 07-06；LPM / FIB / hash 的查表语义与动作解耦见 07-04；l3fwd-acl 与 testpmd 的规则文件、命令与统计见 04-04、04-03；NUMA 亲和见 06-09。建议以 `examples/l3fwd-acl/` 为实验床，先用第 5 节片段验证「命中/未命中」的结果分布，再逐步加入范围字段与多 category，体会优先级与结果步长的处理。
+
+## 07-06 `rte_flow` 与 flow API（模块视角：规则对象、分组与优先级、可移植性注意事项）
+
+### 1. 背景与动机
+
+在 07-01 里我们看到 ethdev 用 `rte_eth_dev_ops` 抹平了不同网卡在「端口配置与批量收发」上的差异；但在「让网卡按规则处理报文」这件事上，硬件差异远比收发更棘手。RSS 靠哈希把流分散到队列，Intel Flow Director 用一组过滤器把特定流导向指定队列，ntuple filter 与 ethertype filter 各有各的配置结构，Mellanox mlx5 走的是一套更接近交换机流表的模型，还有 TCAM 表项、隧道封装卸载、计量与老化等能力——它们在「能匹配哪些字段」「能执行哪些动作」「表项有多少条」「规则能否级联」上几乎没有交集。如果应用直接调用各家驱动的私有接口，那么「把来自 10.0.0.1 的 TCP 80 流量导到队列 2」「把某类报文丢弃并计数」「给 VxLAN 报文做解封装后按内层五元组分流」这些需求，就要为每种网卡各写一套代码，且换卡即失效。
+
+`rte_flow` 正是对这一乱象的统一回答。它定义了一套与 PMD 无关的**规则描述语言**：用 `rte_flow_attr` 声明规则的属性（方向、分组、优先级），用一串 `rte_flow_item` 组成 pattern 描述「匹配什么」，用一串 `rte_flow_action` 描述「匹配后做什么」，再由 `rte_flow_create()` 把这套描述交给 PMD 编译成硬件表项。应用从此只写一份规则逻辑，由各 PMD 的 `rte_flow_ops` 决定怎样落地；PMD 不支持的能力通过 `rte_flow_validate()` 与 `rte_flow_error` 明确反馈，而不是悄悄给出错误行为。这一层的意义，是把「配置网卡」提升为「编程数据面」：转发逻辑的一部分从 CPU 搬到了硬件，命中流量几乎不消耗 CPU 周期。
+
+需要在一开始就区分两个视角，这也是本篇立篇的前提。06 册从**机制**视角讲 RSS 哈希与队列映射、Flow Director 表项怎样编译到硬件、规则下发过程中的卸载协商与内存交互（原理见 06-06）；本篇从**模块功能**视角讲 `rte_flow` 对外呈现哪些规则对象、怎样用分组与优先级组织规则、怎样在真实组网里选用、以及跨 PMD 移植时要注意什么。两者不重叠：本篇不展开规则如何变成硬件表项，只讲应用如何正确描述、验证、创建与维护规则。结构体逐字段定义见 05-08，testpmd 的 flow 子命令与统计命令全集见 04-03、04-04，本篇不重列字段表与命令全集。
+
+版本口径同样要先行说明。全册以 DPDK 23.11 LTS、24.11 与 master 为基准，而 `rte_flow` 恰恰是 DPDK 中演进最活跃的 API 之一：item / action 类型不断新增，个别类型被标记废弃，group、priority、transfer 等语义在不同 PMD 上的实现细节也有差别。凡涉及具体枚举名、结构体成员、命令语法与「哪个 PMD 支持哪些 action」之处，都必须以实际源码树为准，标注「需对照实际版本核验」，并给出 `lib/ethdev/rte_flow.h` 或对应 `drivers/net/<pmd>/` 的可定位路径，绝不凭印象编造。带着这个前提，下面进入规则对象本身。
+
+### 2. 核心概念
+
+一条 `rte_flow` 规则由**三要素**构成。第一是属性 `rte_flow_attr`：其中的方向位声明规则作用于 ingress（入端口流量）、egress（出端口流量）还是 transfer（经交换/代表端口的流量），`group` 指定规则所属的分组编号，`priority` 指定组内优先级。第二是 pattern：一个 `rte_flow_item` 数组，按协议层次从外到内依次描述要匹配的报文字段，以 `RTE_FLOW_ITEM_TYPE_END` 收尾；常见 item 包括 `ETH`、`VLAN`、`IPV4`、`IPV6`、`TCP`、`UDP`、`SCTP`、`ICMP`、`GRE`、`VXLAN`、`MARK`、`META`、`TAG`、`PORT_ID`、`RAW`、`ANY`、`VOID` 等（确切枚举集合需核验）。第三是 actions：一个 `rte_flow_action` 数组，以 `RTE_FLOW_ACTION_TYPE_END` 收尾，描述匹配后的动作，如 `QUEUE`、`RSS`、`DROP`、`PASSTHRU`、`MARK`、`FLAG`、`COUNT`、`PORT_ID`、`JUMP`、`SET_MAC_SRC` / `SET_MAC_DST`、`SET_IPV4_SRC` / `SET_IPV4_DST`、`SET_TP_SRC` / `SET_TP_DST`、`DEC_TTL`、`VXLAN_ENCAP` / `VXLAN_DECAP`、`METER`、`AGE`、`SAMPLE`、`INDIRECT`（确切枚举集合与部分类型的存续状态需核验）。`rte_flow_attr`、`rte_flow_item`、`rte_flow_action`、`rte_flow_error` 的逐字段定义见 05-08。
+
+pattern 中 spec / last / mask 三者构成匹配语义的核心，值得单独说明。每个 item 可以带 `spec`（期望值）、`mask`（关心哪些位）、`last`（范围上界，配合 mask 表达区间）；当 `spec` 与 `mask` 都为 NULL 时通常表示「匹配该协议类型的任意报文」，当 `spec` 非空而 `mask` 为 NULL 时一般按该 item 的默认掩码处理（具体语义需对照 `lib/ethdev/rte_flow.h` 核验）。因此「匹配源 IP 为 10.0.0.1 的 IPv4 报文」与「匹配任意 IPv4 报文」的写法差别，就在 spec 与 mask 怎么填。item 顺序必须符合协议栈层次——以太头之后才是 IP、IP 之后才是 TCP/UDP，顺序错乱会被 `rte_flow_validate()` 拒绝。action 侧同理，终结类动作（如 `QUEUE`、`DROP`）与可叠加动作（如 `COUNT`、`MARK`）的组合规则也要按 PMD 能力来。
+
+规则的**句柄与生命周期**是第二组概念。`rte_flow_create()` 成功时返回一个不透明的 `struct rte_flow *` 句柄，应用必须保存它，后续 `rte_flow_destroy()` 按句柄删除单条规则、`rte_flow_flush()` 清空端口上所有规则、`rte_flow_query()` 查询 `COUNT` / `AGE` / `METER` 之类动作的状态、`rte_flow_isolate()` 控制端口是否只接受显式规则（函数名与可用 action 需核验）。任何一步失败都应读取 `rte_flow_error`：它携带 `type`（错误类别，如 `RTE_FLOW_ERROR_TYPE_ITEM`、`RTE_FLOW_ERROR_TYPE_ACTION`、`RTE_FLOW_ERROR_TYPE_ATTR` 之类，名称需核验）、`cause` 与 `message`，是判断「不支持」还是「参数写错」的唯一可靠依据。「先 validate、再 create、出错读 error」是 `rte_flow` 编程的基本纪律。
+
+**分组与优先级**是 `rte_flow` 相对传统过滤器最有表达力的部分。规则按 `group` 分成多级表：硬件从 group 0 开始匹配，某条规则的动作可以是 `JUMP` 跳到更高编号的 group 继续匹配，从而把「粗分类 → 细分类 → 终结动作」拆成流水线；同一 group 内由 `priority` 决定匹配顺序（数值越小还是越大优先需对照实际版本核验）。`transfer` 属性配合代表端口（representor）则把这套模型延伸到 SR-IOV VF 与虚拟交换场景，让规则作用于主机侧可见的 VF 流量。理解分组，就能明白为什么复杂策略不应塞进一条巨型规则，而应分级组织。模块视角的规则对象与分组关系会在第 4 节配图展开。
+
+最后要重申与 07-05 的边界：`rte_flow` 是硬件规则卸载，`ACL` 是 CPU 软件分类。前者受 PMD 能力与硬件表项资源限制但几乎不占 CPU，后者与硬件无关且维度灵活但每包消耗周期。工程上通常让 `rte_flow` 处理能卸载的部分，未命中或 PMD 不支持的流量上送 CPU 由 ACL 兜底，二者级联而非二选一。
+
+### 3. 关键数据结构与源码位置
+
+本节按 07 册惯例只定位、不列完整字段表；流规则相关结构逐字段定义见 05-08，下表给出本篇涉及的源码职责地图，命令入口只作指向。
+
+| 源码路径 | 职责定位 | 关键接口或对象 | 延伸指向 |
+|---|---|---|---|
+| `lib/ethdev/rte_flow.h` | 规则对象与 flow API 公共声明 | `rte_flow_create` | 字段见 05-08 |
+| `lib/ethdev/rte_flow.c` | 参数校验与到 PMD ops 的分发 | 规则分发入口 | 原理见 06-06 |
+| `lib/ethdev/rte_flow_driver.h` | PMD 侧 flow 回调表定义 | `rte_flow_ops` | 字段见 05-08 |
+| `drivers/net/mlx5/` | flow 实现较完整的 PMD 参考 | mlx5 flow 驱动 | 模块见 07-01 |
+| `drivers/net/ixgbe/` 等 | 能力较有限的 PMD 对照 | 各自 ops 实现需核验 | 模块见 07-01 |
+| `app/test-pmd/` | flow 子命令与规则验证范例 | 交互命令见 04-04 | 命令见 04-04 |
+| `examples/` | flow 用法演示程序 | 运行方式见 04-03 | 命令见 04-03 |
+
+梳理地图时，按「公共面 → 分发面 → 驱动面 → 消费面」四层最省力。`lib/ethdev/rte_flow.h` 是应用唯一需要直接包含的头文件，所有 item / action 枚举、attr / item / action / error 结构以及 `rte_flow_validate()`、`rte_flow_create()`、`rte_flow_destroy()`、`rte_flow_flush()`、`rte_flow_query()` 等 API 都在这里声明；`lib/ethdev/rte_flow.c` 负责公共参数检查并把调用转发到端口绑定 PMD 的 `rte_flow_ops`；`lib/ethdev/rte_flow_driver.h` 定义驱动侧回调表，是「统一描述 → 各 PMD 落地」的接缝。这个结构与 07-01 里 `rte_ethdev.c` 通过 `rte_eth_dev_ops` 分发端口 API 完全同构——`rte_flow` 本质上就是挂在同一套回调机制下的一组子能力。
+
+驱动面的差异是本篇反复强调的重点。`drivers/net/mlx5/` 的 flow 实现通常被认为覆盖面较广（group、transfer、隧道封装、meter、age 等较完整），而 `drivers/net/ixgbe/`、`i40e/`、`ice/` 等 PMD 支持的 item / action 集合与表项资源各不相同，且随版本演进；具体「哪个 PMD 支持什么」绝不能凭印象断言，最可靠的办法是在对应 `drivers/net/<pmd>/` 下检索 `rte_flow_ops` 的实现与它接受的 item/action 白名单，并用 `rte_flow_validate()` 实测（见 06-06、05-08）。`app/test-pmd/` 的 flow 子命令几乎逐条对应上述 API，是学习与验证规则语法最方便的工具；相关命令全集见 04-03、04-04，本篇配置段只给最典型的几条。
+
+### 4. 关键流程与调用链
+
+先划边界：本节讲「规则怎样被描述、验证、创建、查询与销毁」的 API 序列，以及分组与优先级如何组织成流水线；规则怎样编译成硬件表项、RSS 哈希与队列映射、Flow Director 与卸载协商流程属于机制，统一见 06-06，本篇不展开。
+
+规则的生命周期是一条很清晰的链。应用先按协议层次填好 `rte_flow_attr`、pattern 数组与 action 数组；第一步永远是 `rte_flow_validate(port_id, &attr, pattern, actions, &error)`——它只检查「这套描述在该 PMD 上能否被接受」，不真正占用硬件资源，是避免 create 阶段才失败的关键；通过后再调用 `rte_flow_create()` 得到 `struct rte_flow *` 句柄；运行中可用 `rte_flow_query()` 读取 `COUNT` 等动作的状态；规则不再需要时用 `rte_flow_destroy()` 删除单条，或在端口重置前用 `rte_flow_flush()` 清空；任何一步出错都读 `rte_flow_error` 的 type 与 message 定位。这里要特别强调 validate 的价值：由于不同 PMD 支持度差异巨大，同一条规则在 mlx5 上通过、在 ixgbe 上被拒是常态，validate 让这种差异在「不产生副作用」的前提下暴露出来，是可移植性实践的第一道闸门。规则对象的创建与销毁链路见图 07-06-01。
+
+:::figure id=07-06-01 | name=rte_flow 规则生命周期与 API 序列 | dir=TD
+node n1 "构造 attr 与 pattern" blue
+node n2 "构造 action 链" teal
+node n3 "rte_flow_validate" amber
+node n4 "rte_flow_create" amber
+node n5 "rte_flow 规则句柄" purple
+node n6 "rte_flow_query" green
+node n7 "rte_flow_destroy" gray
+node n8 "rte_flow_error 回查" red
+edge n1 -> n3 "描述匹配"
+edge n2 -> n3 "描述动作"
+edge n3 -> n4 "校验通过"
+edge n4 -> n5 "返回句柄"
+edge n5 -> n6 "查询计数"
+edge n5 -> n7 "删除规则"
+edge n3 -> n8 "失败取错误"
+edge n4 -> n8 "失败取错误"
+:::
+
+分组与优先级把多条规则组织成流水线，是复杂策略的落地方式，其典型形态见图 07-06-02。硬件从 group 0 开始，按 priority 逐条匹配：高优先规则命中后直接执行终结动作（如 `QUEUE` 分流或 `DROP`），未终结的可以通过 `JUMP` 跳到 group 1 继续做更细的分类，次级表里再决定计数、丢弃或进一步动作。这样「先按大类别粗分、再按细粒度精分」的逻辑不必写成一条巨型规则，也便于控制面按组增删。
+
+:::figure id=07-06-02 | name=group 与 priority 分级规则流水线 | dir=TD
+node n1 "group 0 入口规则" blue
+node n2 "prio 0 高优先" teal
+node n3 "prio 1 次优先" teal
+node n4 "JUMP 跳转" amber
+node n5 "group 1 次级表" purple
+node n6 "QUEUE 分流" green
+node n7 "DROP 终结" red
+node n8 "COUNT 统计" gray
+edge n1 -> n2 "优先匹配"
+edge n1 -> n3 "低优先匹配"
+edge n2 -> n6 "命中动作"
+edge n3 -> n4 "未终结跳转"
+edge n4 -> n5 "跨 group"
+edge n5 -> n7 "次级丢弃"
+edge n5 -> n8 "次级计数"
+edge n2 -> n8 "附带统计"
+:::
+
+从两张图能读出典型组网的几种范式。最简单的是 ingress 五元组分流：pattern 用 `ETH / IPV4 / TCP` 加源或目的地址与端口掩码，action 用 `QUEUE` 把命中流导到指定 Rx 队列，再配合 07-01 的多队列与 RSS 完成「特定流走特定 lcore」。其次是过滤与观测：action 用 `DROP` 丢弃、或 `COUNT` 计数后用 `rte_flow_query()` 读命中量，是排障与计费的常用手段。更复杂的是标记与级联：`MARK` 给报文打标记供后续软件识别，`JUMP` 跨 group 做多级分类，隧道封装/解封装类 action 则用于 VxLAN 网关。涉及 VF 与虚拟交换时，`transfer` 属性配合代表端口把规则作用到 VF 流量，这部分与 vhost / virtio 组网（见 07-10）关系密切。无论哪种范式，都要记住分组与优先级是「规则之间的组织方式」，而规则是否真能被硬件执行，仍取决于 PMD 能力——这正是下一节与第 6 节要处理的可移植性问题。
+
+### 5. 配置/命令/代码实例
+
+本节只给最典型的命令，覆盖「启动多队列 testpmd → validate 试探能力 → create 下发规则 → list / query 验证」这条最短链路；flow 子命令全集与 testpmd 参数见 04-04、04-03，此处不重列。命令语法、选项名与输出格式均需对照实际版本核验。
+
+```bash
+# 1) 启动 testpmd 并指定多队列（参数见 04-03）
+sudo dpdk-testpmd -l 0-3 -a 0000:01:00.0 -- -i --rxq=4 --txq=4
+# 2) 校验规则能否被 PMD 接受（命令见 04-04，语法需核验）
+flow validate 0 ingress pattern eth / ipv4 / end actions drop / end
+# 3) 下发五元组分流规则并附带计数（命令见 04-04）
+flow create 0 group 0 priority 1 ingress pattern eth / ipv4 src is 10.0.0.1 / end actions queue index 2 / count / end
+# 4) 列出与查询规则命中（命令见 04-04）
+flow list 0
+flow query 0 0 count
+```
+
+下面给出一段完整的 C 片段，演示构造一条「匹配源 IP 为 10.0.0.1 的 IPv4 报文并丢弃」的规则，先 validate 再 create，失败时打印 `rte_flow_error`。枚举名与结构体成员需对照 `lib/ethdev/rte_flow.h` 核验。
+
+```c
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include <netinet/in.h>
+#include <rte_ethdev.h>
+#include <rte_flow.h>
+
+static struct rte_flow *
+create_drop_rule(uint16_t port_id, struct rte_flow_error *error)
+{
+    struct rte_flow_attr attr;
+    struct rte_flow_item pattern[3];
+    struct rte_flow_action action[2];
+    struct rte_flow_item_ipv4 ip_spec;
+    struct rte_flow_item_ipv4 ip_mask;
+    struct rte_flow *flow;
+
+    memset(&attr, 0, sizeof(attr));
+    attr.ingress = 1;
+    attr.group = 0;
+    attr.priority = 1;
+
+    memset(pattern, 0, sizeof(pattern));
+    memset(action, 0, sizeof(action));
+
+    /* spec/mask/last 全为 NULL，表示匹配任意以太头 */
+    pattern[0].type = RTE_FLOW_ITEM_TYPE_ETH;
+
+    memset(&ip_spec, 0, sizeof(ip_spec));
+    memset(&ip_mask, 0, sizeof(ip_mask));
+    ip_spec.hdr.src_addr = htonl(0x0A000001);
+    ip_mask.hdr.src_addr = 0xFFFFFFFF;
+    pattern[1].type = RTE_FLOW_ITEM_TYPE_IPV4;
+    pattern[1].spec = &ip_spec;
+    pattern[1].mask = &ip_mask;
+    pattern[1].last = NULL;
+
+    pattern[2].type = RTE_FLOW_ITEM_TYPE_END;
+
+    action[0].type = RTE_FLOW_ACTION_TYPE_DROP;
+    action[1].type = RTE_FLOW_ACTION_TYPE_END;
+
+    if (rte_flow_validate(port_id, &attr, pattern, action, error) != 0)
+        return NULL;
+
+    flow = rte_flow_create(port_id, &attr, pattern, action, error);
+    if (flow == NULL)
+        fprintf(stderr, "flow create failed: %s\n",
+                error->message ? error->message : "unknown");
+
+    return flow;
+}
+```
+
+上面命令序列在 testpmd 中的典型输出如下，示例输出，具体格式需对照实际版本核验。
+
+```text
+testpmd> flow validate 0 ingress pattern eth / ipv4 / end actions drop / end
+Flow rule validated
+testpmd> flow create 0 group 0 priority 1 ingress pattern eth / ipv4 src is 10.0.0.1 / end actions queue index 2 / count / end
+Flow rule #0 created
+testpmd> flow list 0
+ID      Group   Prio    Attr    Rule
+0       0       1       i-      ETH IPV4 => QUEUE COUNT
+testpmd> flow query 0 0 count
+COUNT:
+ hits_set: 1
+ bytes_set: 0
+ bytes: 0
+ hits: 12345
+```
+
+对这段输出要逐行判读，它同时验证了「能力试探」「规则创建」「规则查询」三个环节。第一行 `Flow rule validated` 说明 `flow validate` 对应的 `rte_flow_validate()` 判定该 pattern 与 action 组合能被当前 PMD 接受——注意 validate **只校验、不创建**，因此它不会占用硬件表项，也不会出现在后续 list 里；若这里返回 `not supported` 一类错误，就表明 PMD 不支持某个 item 或 action（常见于 `COUNT`、`JUMP`、隧道类 action），此时应精简规则或改走 07-05 的 ACL 软件回退，而不是反复重试 create。第二行 `Flow rule #0 created` 中的 `#0` 是本端口内规则句柄的编号，应用侧的 `struct rte_flow *` 与之对应，`flow destroy 0 rule 0` 用它删除单条规则；句柄由 PMD 分配，不应假定跨端口或跨启动稳定。随后 `flow list 0` 的表头 `ID Group Prio Attr Rule` 逐列对应规则属性：本例 `Group=0`、`Prio=1` 与 create 时一致，`Attr` 列的 `i-` 表示 ingress 方向生效（egress / transfer 会有不同标记，具体字符需核验），`Rule` 列的 `ETH IPV4 => QUEUE COUNT` 是 pattern 到 action 的概要，正好用来核对规则是不是按预期编译——若这里少了 `COUNT`，说明叠加动作未被接受。最后 `flow query 0 0 count` 返回计数动作的状态：`hits=12345` 是该规则累计命中报文数，`bytes` 为命中字节数，`hits_set` / `bytes_set` 标志该 action 是否提供对应维度的计数（本例只开了 hits 维度，故 `bytes_set: 0` 且 `bytes: 0`，属正常而非故障）。正常范围上 hits 应随匹配流量单调增长；若规则刚建好就长期为 0，常见根因有三类：attr 方向写反（流量是 ingress 却配了 egress）、pattern 里的地址字节序或掩码与真实流量不符、以及队列或端口未启动导致报文根本没到。掌握这段判读，就能把「规则下发成功但业务不生效」这类问题快速收敛到方向、字段或路径三者之一。
+
+### 6. 注意事项、陷阱与最佳实践
+
+- **永远先 validate 再 create**。`rte_flow_validate()` 不占硬件资源，是跨 PMD 可移植性的第一道闸门；直接 create 会把「PMD 不支持」混杂在「参数写错」里，且可能留下需要手动清理的半成品规则。
+- **不要假定各 PMD 能力一致**。mlx5、ixgbe、i40e、ice 等支持的 item / action 集合、group 深度、表项条数与 transfer 支持度差异很大，且随版本演进。以 `rte_flow_validate()` 实测为准，并在对应 `drivers/net/<pmd>/` 检索 `rte_flow_ops` 确认；为「不支持」路径准备好 ACL 软件回退（见 07-05）。
+- **正确读取 `rte_flow_error`**。失败时看 `type`（错误类别）、`cause`（出错对象）与 `message`（可读描述），据此区分「能力不支持」「item 顺序错」「attr 非法」还是「资源不足」；忽略 error 只判断返回值是否为 NULL，会让排障失去唯一可靠线索。枚举名需核验。
+- **attr 的方向与分组要写对**。ingress / egress / transfer 决定规则作用于哪类流量，`transfer` 还要配合代表端口使用；方向写反是「规则创建成功但完全不命中」最常见的根因。`group` 与 `priority` 的优先级数值方向（越小越优先还是相反）需对照实际版本核验。
+- **pattern 与 action 都要以 END 收尾，item 顺序符合协议层次**。以太头 → VLAN → IP → TCP/UDP 的层次不能乱序；`spec` / `mask` / `last` 的 NULL 语义（全匹配与默认掩码）要按头文件约定使用，掩码写错通常表现为「匹配过宽或过窄」。字段见 05-08。
+- **谨慎使用 JUMP 与多 group**。跨 group 流水线要设计明确的终结动作，避免规则在组间形成环路或落到「无动作」的悬空状态；分组越多，对 PMD 能力与调试的要求越高，先用单 group 跑通再逐步拆分。
+- **带资源的 action 要管理生命周期**。`COUNT`、`METER`、`AGE`、`INDIRECT` 之类会占用额外硬件对象，需配合 `rte_flow_query()` 读取状态、按句柄销毁；端口 `rte_eth_dev_close()` 或 `rte_flow_flush()` 前的规则清理顺序要规划好，避免残留表项影响后续配置。
+- **规则更新用「先建后删」**。改动已生效的规则时，先 create 新规则、确认流量切换后再 destroy 旧规则，避免中间出现匹配空窗；批量变更时注意硬件表项容量上限。
+- **`rte_flow_isolate()` 会改变默认行为**。它控制端口是否只接受显式规则，开启后原有隐式转发路径可能变化，务必在明确意图下使用（函数名与语义需核验）；配合 07-01 的端口生命周期，隔离设置应在 start 前后按文档顺序完成。
+- **留意多进程与端口重置的影响**。规则由 primary 进程下发、secondary 进程共享的行为、以及端口 stop / close 后规则是否保留，都有版本与 PMD 相关约束（见 06-10）；生产变更应有回归清单。
+
+### 7. 小结与延伸阅读
+
+`rte_flow` 把「让硬件按规则处理报文」统一成一套与 PMD 无关的描述语言：`rte_flow_attr` 声明方向、分组与优先级，pattern 用 item 链描述匹配，action 链描述动作，validate → create → query → destroy / flush 构成完整生命周期，group 与 priority 再把多条规则组织成分级流水线。理解本篇，抓住三条主线即可：其一，规则对象是「attr + pattern + action」三要素，句柄与 error 是维护与排障的抓手；其二，分组与优先级是规则之间的组织方式，让粗分类与细分类可以级联而不必塞进一条巨型规则；其三，可移植性是这套 API  贯穿始终的头号约束——先 validate、按 PMD 实测能力、为不支持的路径准备 ACL 软件回退，是可移植性实践的固定动作。它与 07-05 的 ACL 恰成互补：硬件卸载省 CPU，软件分类保灵活，二者级联构成完整的规则处理体系。
+
+延伸阅读：`rte_flow_attr`、`rte_flow_item`、`rte_flow_action`、`rte_flow_error` 与常用 item/action 结构的逐字段定义见 05-08；RSS 哈希与队列映射、Flow Director、规则编译下发到硬件与卸载协商见 06-06；ethdev 的回调分发与端口生命周期见 07-01；ACL 与 classify 的规则编译、分类维度及分工边界见 07-05；LPM / FIB / hash 查表见 07-04；vhost / virtio 与代表端口组网见 07-10；bond、tap、memif 等虚拟设备的 flow 支持差异见 07-11；testpmd 的 flow 子命令、统计与启动参数见 04-03、04-04；多进程共享与端口重置约束见 06-10；规则编译的向量化与批处理见 06-08。动手时建议以 `app/test-pmd/` 为实验床，按第 5 节顺序先 validate、再 create、再 list / query，随后换一块不同厂商的网卡重复同一组命令，直观体会 validate 在可移植性上的价值。
+
+## 07-07 cryptodev / security 库（对称/非对称操作、session、IPsec 与 TLS 卸载路径）
+
+### 1. 背景与动机
+
+在网关、VPN 集中器、5G 用户面以及边缘 TLS 卸载这类负载里，密码学运算往往取代查表成为每包最大的一笔固定开销。以 64 字节小包线速转发为例，单包预算只有几十纳秒，而一次 AES-GCM 认证加密、一次 SHA-256 HMAC 或一次椭圆曲线验签，动辄消耗成百上千个时钟周期；若全部由通用 CPU 串行完成，加密网关的吞吐会相对明文转发出现成倍下降，时延抖动也会因不同包的密钥长度、认证标签长度不一致而难以预测。更麻烦的是加密负载对「保序」与「状态」有天然要求：同一条安全关联里的报文必须按序处理，抗重放窗口必须连续推进，序列号与显式初始化向量不能错乱，这与纯转发里「一个包一路跑完」的松散模型并不相同。于是 DPDK 面临一个与当年抽象网卡 PMD 时高度相似的问题：市面上存在指令集加速、软件多缓冲、专用加速卡、网卡内联卸载等形态迥异的加密硬件，应用不该为每一种设备各写一套代码。
+
+cryptodev 库给出的答案是把「一次加密操作」抽象成设备、队列对与操作对象三件套，把「算法与密钥」抽象成可预先固化的 session，让厂商 PMD 去适配具体硬件；security 库则在此之上再叠一层协议语义，用统一的会话描述 IPsec、TLS、PDCP 这类「带包头、带状态、带抗重放」的安全协议，使网卡能在收包时直接识别 ESP 或 TLS 记录，在发包时直接封装并加密。二者合起来覆盖了从「只卸载一个 AES 运算」到「整条协议由硬件处理」的完整频谱。把这两层分开还带来一个工程好处：只做批量加解密的应用不必理解 SA 与协议状态机，只做 IPsec 网关的应用也不必逐包拼装 cipher 与 auth 变换链，选型时可以按「要性能还是要可移植」独立决策。
+
+还需要说明本册的定位边界。07 册是库与驱动模块功能、典型用法与组网的唯一权威源，本篇只讲 cryptodev 与 security 各自提供什么能力、对外暴露哪些关键 API、怎样用最典型的命令与代码把它们跑起来，以及在 IPsec 与 TLS 场景下如何组网选型。结构体逐字段定义由 05 册承担（字段见 05-10），EAL 参数与工具命令全集由 04 册承担（命令见 04-02、04-05），描述符环、内存序、ethdev 收发与流规则下发等内部机制由 06 册承担（原理见 06-04、06-06），本篇一律点名后交叉引用，不重列字段表、不展开驱动内部实现、不重列命令清单。版本基准为 DPDK 23.11 LTS、24.11 与 master，凡 API 签名、能力标志、协议结构体成员与示例输出不确定处，均标注「需对照实际版本核验」并给出可定位的 `lib/`、`drivers/` 路径，绝不以推测代替事实。
+
+### 2. 核心概念
+
+cryptodev 的第一层抽象是「设备」。它与 ethdev 的思路一致：一个由 dev_id 标识的加密设备暴露若干 queue pair，应用通过 `rte_cryptodev_info_get` 查询能力，通过 `rte_cryptodev_configure` 指定队列对数量，通过 `rte_cryptodev_queue_pair_setup` 建立提交环，通过 `rte_cryptodev_start` 启动设备。设备既可能是 PCI 加速卡（例如 `drivers/crypto/qat/` 下的 QAT PMD），也可能是由 CPU 指令集实现的软件虚拟设备（`drivers/crypto/aesni_mb/`、`drivers/crypto/openssl/`、`drivers/crypto/null/` 等，具体目录需对照实际版本核验），还可能是嵌在网卡内部的加密引擎。第二层抽象是操作对象 `rte_crypto_op`：它把「对哪段数据、用哪个 session、做什么变换、结果写回哪里」打包成一个可从内存池批量分配的对象，热路径上由 `rte_cryptodev_enqueue_burst` 与 `rte_cryptodev_dequeue_burst` 批量提交和回收（字段见 05-10）。第三层抽象是会话 session：把算法、密钥、初始向量长度、认证标签长度、操作方向等一次性固化，避免每个包重新做密钥编排。需要注意 session 相关接口在 22.11 之后经历过调整，创建与按设备初始化是否分两步、是否需要传入会话内存池，须对照 `lib/cryptodev/rte_cryptodev.h` 核验，不能照搬旧版示例。
+
+按操作类型划分，cryptodev 提供对称与非对称两大类。对称侧通过 `rte_crypto_sym_xform` 描述 cipher、auth 与 AEAD：cipher 覆盖 AES-CBC、AES-CTR、AES-XTS、3DES、NULL 等，auth 覆盖 SHA1-HMAC、SHA2-HMAC、MD5-HMAC、NULL 等，AEAD 覆盖 AES-GCM、ChaCha20-Poly1305 等；多个 xform 可以串成链，表达「先加密后认证」或「先认证后加密」的组合语义，链的方向与数据在 mbuf 中的偏移都由 op 携带。非对称侧通过 `rte_crypto_asym_xform` 描述 RSA、Diffie-Hellman、ECDSA、ECDH 与模幂等运算，主要服务于握手、密钥交换与证书验签，其特点是单次耗时远高于对称运算、操作数尺寸与算法参数强相关，通常不放在每包热路径上。应用提交 op 之前应先用能力查询接口（如 `rte_cryptodev_sym_capability_get`、`rte_cryptodev_asym_capability_get` 及对应的 check 系列）确认目标设备确实支持所选算法与密钥长度，而不是等到入队后才发现能力不匹配；能力标志与 capability 结构体的确切命名需对照实际版本核验。
+
+security 库站在更高一层。它用 `rte_security_session` 描述一条带协议状态的安全关联，协议类型涵盖 IPsec、TLS/DTLS、PDCP、MACsec、DOCSIS 等；会话的 action_type 决定卸载位置：`RTE_SECURITY_ACTION_TYPE_NONE` 表示 lookaside，应用仍需调用 cryptodev；`INLINE_CRYPTO` 表示网卡只做加解密而协议头由软件处理；`INLINE_PROTOCOL` 表示整个协议封装与状态机由硬件承担；`LOOKASIDE_PROTOCOL` 表示协议处理在加速卡完成但仍经队列对提交。IPsec 会话涉及隧道与传输模式、ESP 封装、序列号与扩展序列号 ESN、抗重放窗口、UDP 封装与流量保密填充等参数；TLS 会话涉及记录层版本、密钥材料、IV 与内容类型（具体成员需对照 `lib/security/rte_security.h` 核验）。与 security 配套的还有 `lib/ipsec/` 这个纯软件协议层：它负责 SA 查找、ESP 头尾构造、抗重放与 ESN 推进，把「协议」与「加密设备」解耦，使同一份网关代码既能跑 lookaside cryptodev，也能切换到 inline offload。选型时可以把 `lib/ipsec` 看成协议粘合层、把 cryptodev 看成算力层、把 security 看成卸载层，三者职责不重叠。
+
+此外还有两个贯穿始终的概念。一是「能力先于配置」：无论软件设备还是硬件设备，都应当先 `rte_cryptodev_info_get` / `rte_security_capability_get` 拿到 capability 列表与 feature_flags，再决定用哪条路径，否则同一份二进制换一台机器就可能静默降级。二是「卸载位置决定编程模型」：lookaside 路径下应用持有 mbuf、自己控制收包与发包顺序，只需插入一次 op 提交与回收；inline 路径下加解密发生在 ethdev 收发内部，应用要靠 mbuf 的卸载标志与安全元数据（例如 `rte_security_set_pkt_metadata` 一类接口）把 SA 信息带给驱动，还要与 `rte_flow` 的 security 动作配合。这两条路径的取舍是本篇组网部分的主线，具体驱动内部如何搬运描述符、如何维护 DMA 一致性，统一归 06 册（原理见 06-04、06-06）。
+
+下图把 lookaside 与 inline 两条卸载路径并列展示，便于判断报文在哪一层被加密、由谁触发加解密，两条路径的模块关系见图 07-07-01。
+
+:::figure id=07-07-01 | name=cryptodev 旁路卸载与 security 内联卸载路径 | dir=TD
+node n1 "应用构造 rte_crypto_op" blue
+node n2 "enqueue_burst 提交" teal
+node n3 "crypto PMD 执行" teal
+node n4 "dequeue_burst 取回" amber
+node n5 "security 会话创建" purple
+node n6 "rte_flow security 动作" purple
+node n7 "ethdev 内联加解密" green
+node n8 "网卡线速收发" gray
+edge n1 -> n2 "旁路路径"
+edge n2 -> n3 "提交 op"
+edge n3 -> n4 "状态回填"
+edge n4 -> n1 dashed "结果回查"
+edge n5 -> n6 "内联路径"
+edge n6 -> n7 "SA 绑定"
+edge n7 -> n8 "收包解密"
+edge n1 -> n5 dashed "共用密钥"
+:::
+
+### 3. 关键数据结构与源码位置
+
+本节采用「点名、定位、交出去」的处理方式：只给出对象名、它所在的真实源码目录以及后续字段字典的篇号，不在此展开逐字段表格。cryptodev 的主头文件在 `lib/cryptodev/rte_cryptodev.h`，其中定义设备配置、队列对配置、信息查询、统计与设备生命周期相关接口；对称与非对称操作类型、xform、op 状态常量分别在 `lib/cryptodev/rte_crypto.h`、`rte_crypto_sym.h`、`rte_crypto_asym.h`；操作内存池的创建入口 `rte_crypto_op_pool_create` 位于 `lib/cryptodev/rte_crypto.h`（字段见 05-10）。PMD 侧需要实现的驱动接口集中在 `lib/cryptodev/rte_cryptodev_pmd.h` 与 `cryptodev_driver.h` 一类头文件，其注册与 probe 机制和 ethdev 同源（模块见 07-01，原理见 06-01）。
+
+security 侧的主头文件是 `lib/security/rte_security.h`，定义协议类型、动作类型、会话创建与销毁、能力查询、SA 更新以及报文元数据读写等接口；驱动侧接口在 `lib/security/rte_security_driver.h`，由支持卸载的网卡 PMD 实现，源码散落在 `drivers/net/` 下各厂商驱动目录（例如 mlx5、ixgbe、cnxk 等，具体支持矩阵需对照实际版本与 PMD 文档核验）。IPsec 的软件协议层位于 `lib/ipsec/`，主头文件 `rte_ipsec.h` 暴露 SA 初始化、会话准备、加密前准备与收包处理等入口；ESP 与 IPv6 扩展头相关定义位于 `lib/net/rte_esp.h` 等头文件。参考实现方面，`examples/l2fwd-crypto/` 是最小加密转发示例，`examples/ipsec-secgw/` 是完整的 IPsec 网关，`app/test/test_cryptodev.c` 与 `app/test/test_security.c` 是能力自测入口，这几处源码是核对 API 真实签名最可靠的落点。
+
+下表汇总本篇需要记住的最小源码地图，其中命令与参数的完整清单统一见 04 册，结构体字段统一见 05 册。
+
+| 源码目录 | 职责定位 | 代表入口或头文件 | 延伸指向 |
+|---|---|---|---|
+| `lib/cryptodev/` | 设备抽象、op 与 session | `rte_cryptodev.h` | 字段见 05-10 |
+| `lib/cryptodev/` | 对称/非对称 xform 定义 | `rte_crypto_sym.h` | 字段见 05-10 |
+| `lib/cryptodev/` | PMD 驱动注册接口 | `rte_cryptodev_pmd.h` | 模块见 07-01 |
+| `lib/security/` | 协议会话与能力查询 | `rte_security.h` | 字段见 05-10 |
+| `lib/security/` | 卸载驱动侧接口 | `rte_security_driver.h` | 模块见 07-01 |
+| `lib/ipsec/` | ESP 与 SA 软件协议层 | `rte_ipsec.h` | 模块见 07-07 |
+| `lib/net/` | ESP 与 IPv6 扩展头 | `rte_esp.h` | 字段见 05-02 |
+| `drivers/crypto/` | 软件与硬件加密 PMD | 具体目录需核验 | 模块见 07-07 |
+| `drivers/net/` | 支持内联卸载的网卡 PMD | 具体驱动需核验 | 模块见 07-01 |
+| `examples/ipsec-secgw/` | IPsec 网关参考实现 | 参数见 04-05 | 见 07-07 |
+
+读这张表时应当带着层次感：`lib/cryptodev/` 提供算力抽象，`lib/security/` 提供协议与卸载抽象，`lib/ipsec/` 提供纯软件协议实现，`drivers/` 提供具体硬件适配，`examples/` 消费以上全部能力。安全关联的字段布局、op 的状态位含义与会话内存布局分别见 05-10 与 05-02，本篇只建立名字与分工。下表再从能力维度做一次对照，便于按业务挑选路径，其中「或」关系用转义竖线表示。
+
+| 能力类别 | 典型算法 \| 协议 | 承载对象 | 适用场景 |
+|---|---|---|---|
+| 对称 cipher | AES-CBC \| AES-CTR \| NULL | `rte_crypto_sym_xform` | 批量加解密 |
+| 对称 auth | SHA1-HMAC \| SHA256-HMAC | 链式 xform | 完整性校验 |
+| AEAD | AES-GCM \| ChaCha20-Poly1305 | 单个 aead xform | IPsec ESP \| TLS 记录 |
+| 非对称 | RSA \| ECDSA \| ECDH \| 模幂 | `rte_crypto_asym_xform` | 握手与验签 |
+| 协议会话 | IPsec \| TLS \| PDCP \| MACsec | `rte_security_session` | 网卡内联卸载 |
+| 动作类型 | NONE \| INLINE_CRYPTO \| INLINE_PROTOCOL | 会话 action_type | 决定卸载位置 |
+
+### 4. 关键流程与调用链
+
+从模块视角看，一条 lookaside 加密链路的调用序列是固定且可预期的。初始化阶段先调用 `rte_cryptodev_info_get` 拿到设备能力与 feature_flags，确认对称/非对称能力和最大队列对数；再调用 `rte_cryptodev_configure` 设置队列对数量与 socket，调用 `rte_cryptodev_queue_pair_setup` 为每个队列对配置描述符数量与会话内存池，调用 `rte_cryptodev_start` 启动设备；随后用 `rte_crypto_op_pool_create` 建一个对称或非对称类型的 op 内存池，用 xform 链调用 session 创建接口把算法与密钥固化下来。热路径上应用从 mbuf 里取出待处理数据，批量 `rte_crypto_op_bulk_alloc` 分配 op，把 op 关联到 session 并填好数据源、长度、IV、摘要与目的地，然后 `rte_cryptodev_enqueue_burst` 提交；稍后 `rte_cryptodev_dequeue_burst` 取回已完成的 op，逐一检查 `op->status` 是否为成功，处理认证失败等异常，最后把 op 归还内存池、把 mbuf 继续转发或释放。这条序列里每个函数的确切签名、参数顺序以及 session 与 queue pair 的绑定方式须对照 `lib/cryptodev/` 头文件核验，本篇只给模块级骨架。
+
+inline 卸载链路则把加解密挪进 ethdev 收发内部。应用先用 `rte_security_capability_get` 确认 PMD 支持目标协议与动作类型，再用 `rte_security_session_create` 建立会话，必要时用 `rte_security_session_update` 更新 SA 参数；随后通过 `rte_flow` 下发一条带 security 动作的规则，把匹配 ESP 或 TLS 记录的流量导向该会话，并在端口配置里启用相应的 Rx/Tx 卸载能力（卸载位名称需对照 `lib/ethdev/` 与 04 册核验）。发包时应用设置 mbuf 的安全卸载标志并调用 `rte_security_set_pkt_metadata` 一类接口写入 SA 索引，驱动在 Tx 路径里完成封装、加密与序列号推进；收包时驱动在 Rx 路径里解密并置位接收侧安全标志，应用据此跳过软件解密。全程不出现 op 的提交与回收，这是 inline 与 lookaside 最直观的差别（原理见 06-04、06-06，模块见 07-01、07-06）。
+
+把两条链路放在一起比较，可以得出三条组网结论。其一，lookaside 可移植性最好，软件 cryptodev 虚拟设备在任何机器上都能跑，适合功能验证、CI 回归与中小吞吐场景；其二，inline 时延与吞吐最优，但强依赖具体 PMD 的能力矩阵，换网卡就要重新核验 capability，适合确定硬件形态的 IPsec/TLS 网关；其三，`lib/ipsec/` 软件协议层与 cryptodev 组合是一条折中路径，用软件承担 SA 与抗重放、用硬件承担 AES 运算，既保留协议可控性又拿到算力收益。至于驱动内部如何把 op 翻译成描述符、如何做 DMA 同步、如何维护抗重放窗口的原子更新，属于机制范畴，本册不展开，统一归 06 册（原理见 06-04、06-05）。
+
+### 5. 配置/命令/代码实例
+
+本篇配置段只给三条最典型的命令，目的是把「软件设备起步、换设备、跑加密转发链」这条最小路径走通；完整命令族见 04-02 与 04-05，devargs 语法与加密示例的参数全集不在此重列。二进制名、虚拟设备名与示例参数需对照实际版本核验。
+
+```bash
+# 1) 以 null 软件设备起步，仅验证 cryptodev API 通路
+sudo ./build/app/dpdk-testpmd -l 0-2 --vdev "crypto_null0" -- -i
+# 2) 换成 AES-NI 多缓冲软件设备，观察同一应用的设备切换
+sudo ./build/app/dpdk-testpmd -l 0-2 --vdev "crypto_aesni_mb0" -- -i
+# 3) 运行 l2fwd-crypto 示例，串起一条带加密的转发链
+sudo ./build/examples/dpdk-l2fwd-crypto -l 0-3 --vdev "crypto_aesni_mb0" -- -p 0x1 --chain CIPHER_HASH
+```
+
+下面给出示例输出，具体格式需对照实际版本核验。这段输出是按 `app/test/test_cryptodev.c` 的设备信息打印与 telemetry 回调整理出的示意结果，用来判读设备是否被正确识别、能力是否与预期一致。
+
+```text
+EAL: Detected 8 lcore(s)
+CRYPTODEV: device crypto_aesni_mb0 probed, driver crypto_aesni_mb
+CRYPTODEV: max_nb_queue_pairs=8, feature_flags=SYM_CPU_CRYPTO
+CRYPTODEV: sym caps AES-CBC 128/192/256, AES-GCM 128/192/256
+CRYPTODEV: auth caps SHA1-HMAC SHA256-HMAC, aead AES-GCM
+TELEMETRY: {"/cryptodev/list":[0]}
+CRYPTODEV: qpair 0 setup ok, nb_descriptors=2048
+CRYPTODEV: enq=4096 deq=4096, op status=SUCCESS
+```
+
+对上面这段输出逐行判读如下。第一行 `Detected 8 lcore(s)` 是 EAL 探测到的可用逻辑核数，正常值应不小于 `-l` 指定的核数，若明显偏小通常是容器 cpuset 配额或亲和性掩码把核藏起来了。第二行确认 `crypto_aesni_mb0` 已被 probe 且绑定到预期驱动，正常应显示虚拟设备名与驱动名一一对应；若这一行缺失或显示 `No cryptodev devices`，说明 vdev 名称拼写、构建期驱动开关或依赖库没有就绪，应回到 02-03 与 04-02 核验，而不是反复改应用逻辑。第三行的 `max_nb_queue_pairs` 给出可配置队列对上限，正常应大于等于应用规划的并发队列数，值为 0 表示设备能力异常；`feature_flags` 中的 `SYM_CPU_CRYPTO` 一类标志说明该设备支持对称 CPU 加密路径，是否支持 session-less 或硬件卸载要看具体标志，需对照 `lib/cryptodev/rte_cryptodev.h` 核验。第四、五行是能力清单：正常应包含业务实际使用的算法与密钥长度，例如打算跑 AES-GCM-128 却只列出 AES-CBC，就必须在下发 xform 前改算法或换设备，否则 enqueue 会返回能力不匹配。`TELEMETRY` 一行给出设备 id 列表，`[0]` 表示当前仅有一个加密设备，多个设备应按 id 逐个核对。第六行确认队列对建立成功且描述符数量与规划一致，描述符过小会在突发流量下抬高入队失败率。最后一行 `enq=4096 deq=4096` 表示提交与回收数量相等，是最关键的健康指标：两者长期相等且 `op status=SUCCESS` 说明链路通畅；若 `deq` 明显小于 `enq`，可能是应用没有持续调用 dequeue、设备背压或队列对未启动；若状态出现 `AUTH_FAILED`，应检查密钥、IV 与认证标签长度是否一致，而不是当成传输丢包处理。以上输出为示例，具体格式需对照实际版本核验。
+
+下面给出一个概念骨架，只示意 lookaside 路径的模块级调用顺序，不展开任何驱动内部实现；真实函数签名、结构体字段与参数需对照 `lib/cryptodev/` 核验，端口与内存池相关原理见 06-01、06-03。
+
+```c
+/* 概念骨架：cryptodev 旁路路径的模块级调用序列
+ * 函数签名与字段需对照 lib/cryptodev/rte_cryptodev.h 核验
+ * 字段见 05-10 ｜ 命令见 04-05 ｜ 原理见 06-04 */
+#include <rte_cryptodev.h>
+#include <rte_crypto.h>
+
+int
+crypto_dev_init(uint8_t dev_id, uint8_t qp_id, int socket_id)
+{
+    struct rte_cryptodev_info info;
+    struct rte_cryptodev_config conf = {0};
+    struct rte_cryptodev_qp_conf qp_conf = {0};
+
+    if (rte_cryptodev_info_get(dev_id, &info) != 0)
+        return -1;
+    conf.nb_queue_pairs = 1;
+    conf.socket_id = socket_id;
+    if (rte_cryptodev_configure(dev_id, &conf) != 0)
+        return -1;
+    qp_conf.nb_descriptors = 2048;
+    if (rte_cryptodev_queue_pair_setup(dev_id, qp_id,
+            &qp_conf, socket_id) != 0)
+        return -1;
+    return rte_cryptodev_start(dev_id);
+}
+```
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是能力与环境类陷阱。最常见的错误是「先写业务逻辑、后查设备能力」：把一套 AES-GCM-256 的 xform 直接提交给只支持 AES-CBC 的软件设备，或在未启用内联卸载的 PMD 上强行创建 `INLINE_PROTOCOL` 会话，结果都是 enqueue 阶段才失败甚至静默降级。最佳实践是把 capability 查询放在初始化最前面，把「算法、密钥长度、动作类型、协议类型」四项作为运行前门禁逐项比对，并把比对结果写进启动日志。软件 vdev 与 PCI 加速卡的绑定方式不同：前者靠 `--vdev` 创建，后者往往需要先做设备绑定与 IOMMU 配置（命令见 04-02、03-03），把两类设备混在同一套自动化脚本里容易漏掉前置条件。另外，QAT 一类硬件设备对大页与 NUMA 敏感，队列对、op 内存池与 session 内存池应尽量建在设备所属 socket 上，否则跨 socket 访存会吃掉一部分卸载收益（原理见 06-09）。
+
+第二类是 session 与 op 生命周期陷阱。session 固化了密钥编排，创建成本较高，应当按「每条 SA 或每类算法」复用，而不是每包创建；与之相对，op 是从内存池批量分配的一次性对象，必须在 dequeue 后检查状态再归还，遗漏归还会迅速耗尽 op 池并表现为吞吐断崖式下跌。旧版本 session 接口分「创建」与「按设备初始化」两步，较新版本合并为带内存池参数的一次调用，跨版本迁移时不要照搬旧示例，须对照 `lib/cryptodev/rte_cryptodev.h` 核验。还有一点容易被忽略：非对称运算的操作数缓冲区尺寸必须按模长或曲线参数预留，缓冲区不足会造成越界或状态异常；对称运算里 mbuf 数据区若要原地加密，必须确认它是可写的、引用计数为 1，且数据长度按分组大小对齐，链式 mbuf 场景尤其要小心（字段见 05-02，原理见 06-03）。
+
+第三类是 inline 卸载与协议语义陷阱。inline 路径下应用看不到 op，很容易误以为「加解密已经成功」：实际上必须检查 mbuf 的接收侧安全标志与会话状态，认证失败或抗重放拒绝的报文会被驱动标记，应用若一律转发出去就会把非法流量放进内网。抗重放窗口、ESN 与序列号由谁推进，取决于 action_type 是 `INLINE_CRYPTO` 还是 `INLINE_PROTOCOL`，两种模式下 `lib/ipsec/` 的参与度完全不同，混用会造成序列号错乱。TLS/DTLS 与 MACsec 卸载在 24.11 与 master 上仍属持续演进能力，支持矩阵随 PMD 变化，务必以 `drivers/net/` 下具体驱动与 `lib/security/rte_security.h` 为准，不要依据第三方博客下结论。此外，lookaside 与 inline 之间切换时，`rte_flow` 规则、安全元数据与卸载标志要成套增删，残留的旧规则常导致「一半流量走软件、一半走硬件」的诡异现象（模块见 07-06，原理见 06-06）。
+
+第四类是安全与可观测性实践。密钥材料、IV 与会话参数不应出现在日志、telemetry 输出或 core dump 里，调试时只打印算法名与设备 id；用完后及时销毁会话并清零密钥缓冲区。压测阶段建议同时采集设备统计、队列对入队失败计数、op 状态分布与端口收发计数，用「入队量、回收量、成功量」三者是否对齐作为第一判据，出现偏差再按「先能力、再 session、后元数据」的顺序收敛。最后再强调一次方法论：遇到参数问题回查 04，遇到字段问题回查 05，遇到调度与 DMA 机制问题回查 06，遇到模块能力问题留在本册，遇到线上排障方法回查 08，不要在加密篇里堆满所有细节。
+
+### 7. 小结与延伸阅读
+
+本篇回答了「DPDK 怎样卸载密码学运算」：cryptodev 用设备、队列对、op 与 session 四件套把对称与非对称运算抽象成可批量提交的接口，software vdev 与硬件加速卡共享同一套编程模型；security 在其上补齐 IPsec、TLS、PDCP 等协议语义，用 action_type 在 lookaside 与 inline 之间选择卸载位置；`lib/ipsec/` 则提供纯软件协议层作为可移植的粘合件。三者组合出三条典型路径：软件协议层加 cryptodev 的折中路径、纯 lookaside 的可移植路径、纯 inline 的高性能路径，选型的主要依据是硬件能力矩阵与可移植性要求，而不是抽象的「谁更快」。
+
+延伸阅读建议按需要回查：想核对 session、op 与安全会话的字段布局，读 05-10；想查 `--vdev`、devargs 与 telemetry 命令全集，读 04-02 与 04-05；想深入 ethdev 收发、描述符环与 `rte_flow` 下发机制，读 06-04 与 06-06；想按模块了解 ethdev 与 flow API 的对外能力，读 07-01 与 07-06；想上手完整网关实现，直接读 `examples/l2fwd-crypto/` 与 `examples/ipsec-secgw/`。官方 API 说明在源码树 `doc/` 与 `lib/cryptodev/`、`lib/security/` 头文件注释中，精确签名与版本差异需对照实际版本核验。下一篇 07-08 转到另一类调度抽象：eventdev 如何把「包」变成「事件」，用队列、端口与调度类型替代固定轮询模型，并与本篇的 crypto adapter 形成衔接。
+
+## 07-08 eventdev 库与事件调度（事件队列/端口、原子/有序/并行调度、与轮询模型取舍）
+
+### 1. 背景与动机
+
+传统 DPDK 应用普遍采用 run-to-completion 模型：一个 lcore 从收包、查表、改包到发包一路做完，再取下一批。这个模型在负载均匀、每包处理代价相近时非常高效，因为数据结构核内独占、几乎没有跨核同步。但它有两个结构性弱点。第一是负载倾斜：RSS 把流静态哈希到固定队列，一旦出现大象流或流量在核间分布不均，某些 lcore 会长期满载而另一些空闲，整体吞吐被最慢的核卡住，单纯增加核数并不线性提升容量。第二是多阶段流水线的表达困难：一旦业务拆成「解密、查表、封装、加密」等多个代价不同的阶段，run-to-completion 要么让每个核重复做全部阶段、浪费缓存，要么自己用 `rte_ring` 手工搭流水线，又不得不处理阶段间保序、背压、批量与核间同步，复杂度迅速失控。
+
+eventdev 库给出的思路是把「报文」提升为「事件」，把调度权交给一个统一的事件设备。设备内部维护事件队列与事件端口，worker lcore 只从自己的端口 dequeue 一批事件、处理完再 enqueue 回去或转发，至于「哪个事件给哪个核」由调度器按流标识与队列配置动态决定。这样既能在运行时做负载均衡，又能用调度类型显式表达「同一条流必须串行」「处理可以乱序但放行必须保序」「完全无需保序」三种语义，还能通过 adapter 把网卡收发、定时器与 cryptodev 直接接入事件流，免去手写 ring 流水线。硬件事件设备（如 `drivers/event/` 下的各厂商 PMD）还能把调度放到网卡或专用引擎里，进一步降低核间同步成本。
+
+这里要明确与 06 册的分工。eventdev 的调度器内部如何维护流表、如何做原子调度与有序放行、如何用内存序保证事件不丢不重，属于机制与协同调度范畴（原理见 06-12，另见 06-07 的无锁队列讨论）；本篇作为 07 册模块篇，只讲 eventdev 提供哪些对象与能力、暴露哪些 API、怎样用最典型的命令与代码把一条事件流水线跑起来、以及与轮询模型之间如何取舍。结构体字段见 05-10，命令与参数全集见 04-02、04-03，本篇不重列字段表、不展开调度器内部实现、不重列命令清单。版本基准仍为 23.11 LTS、24.11 与 master，凡能力标志、adapter 接口与示例输出不确定处均标注「需对照实际版本核验」并给出 `lib/`、`drivers/` 路径。
+
+### 2. 核心概念
+
+eventdev 的对象模型可以拆成四个层次。最底层是事件 `rte_event`：它是一个轻量描述符，承载流标识、队列 id、调度类型、优先级、事件类型与数据指针（通常指向 mbuf，或指向聚合后的事件向量），字段见 05-10。其上是事件队列（event queue）：事件的暂存与调度单元，队列有调度类型与优先级配置，可设置 QoS 与权重。再上是事件端口（event port）：worker lcore 与设备之间的出入口，一个端口通过 `rte_event_port_link` 链接到若干队列，决定该核能消费哪些队列；端口还有「隐式释放」与「独立入队」等行为开关。最上层是设备：由 dev_id 标识，通过 `rte_event_dev_configure` 配置队列数、端口数与超时，通过 `rte_event_dev_start` 启动，通过 `rte_event_dequeue_burst` 与 `rte_event_enqueue_burst` 完成热路径交互。事件在队列与端口之间的流动，配合 `RTE_EVENT_OP_NEW`、`FORWARD`、`RELEASE` 三种 op 语义，构成完整的生命周期。
+
+三种调度类型是 eventdev 的灵魂。`RTE_SCHED_TYPE_ATOMIC` 保证同一 flow_id 的事件在同一时刻只被一个端口处理，天然适合需要严格串行、有共享状态的表项更新；代价是若某条流特别重，会形成队头阻塞，且调度器要维护流到端口的归属。`RTE_SCHED_TYPE_ORDERED` 允许同一流的事件被并行处理，但在放行到下一阶段时恢复原顺序，兼顾并行度与保序，最适合「多核并行查表、出口按序发包」这类流水线，是很多转发场景的默认选择。`RTE_SCHED_TYPE_PARALLEL` 不做任何保序与互斥，调度开销最低、并行度最高，适合无状态、可乱序的统计或采样类处理。理解三者的取舍，比记住 API 名字更重要：ATOMIC 用串行换正确，ORDERED 用调度开销换并行且保序，PARALLEL 用放弃保序换吞吐。
+
+第三组概念是 adapter。eventdev 之所以能替代手写 ring 流水线，靠的是把外部数据源直接变成事件：`rte_event_eth_rx_adapter` 把网卡 Rx 队列收到的 mbuf 包装成 NEW 事件注入事件队列，并支持按队列设置 flow_id、事件优先级与向量聚合；`rte_event_eth_tx_adapter` 把 worker 提交的事件还原成 `rte_eth_tx_burst` 发包；`rte_event_timer_adapter` 把定时器超时变成事件，用于超时重传与老化；`rte_event_crypto_adapter` 把 cryptodev 的 op 完成事件接回事件流（接口名与能力标志需对照 `lib/eventdev/` 各 adapter 头文件核验）。adapter 有「内部端口」与「外部端口」两种实现：支持内部端口的硬件设备可以由设备自己收包入队，软件实现则通常跑在一个 service lcore 上，通过 `rte_service_*` 系列接口拉起服务（原理见 06-12）。事件向量 `rte_event_vector` 则把多个 mbuf 聚合为一个事件，降低调度器 per-packet 开销，是否支持要看 capability。
+
+最后一组是能力标志与运行模式。`rte_event_dev_info_get` 返回的 capability 决定设备是否支持分布式调度、运行时端口链接、单链路队列端口对、事件 QoS、独立入队、免维护模式等能力；`RTE_EVENT_DEV_CFG_PER_DEQUEUE_TIMEOUT` 等配置标志影响 dequeue 的超时行为，`rte_event_dev_config` 里的 `dequeue_timeout_ns` 与 `nb_single_link_event_port_queue_pairs` 等参数决定设备资源规模（字段见 05-10）。软件事件设备 `drivers/event/sw/` 以 `--vdev event_sw0` 创建，适合功能验证；`drivers/event/dsw/` 是分布式软件调度器；其余为硬件 PMD。应用必须「先查能力、再定配置」，因为 ATOMIC/ORDERED 是否真正由硬件加速、是否支持运行时链接，直接决定流水线能否按设计工作。
+
+下图把 Rx adapter、事件队列、端口、worker 与 Tx adapter 串起来，并标出三种调度类型的分叉，事件调度与调度类型的模块关系见图 07-08-01。
+
+:::figure id=07-08-01 | name=eventdev 事件调度与三种调度类型 | dir=TD
+node n1 "Rx adapter 收包入队" blue
+node n2 "event queue 暂存" teal
+node n3 "event port 出队" amber
+node n4 "worker lcore 处理" purple
+node n5 "ATOMIC 同流串行" green
+node n6 "ORDERED 保序放行" green
+node n7 "PARALLEL 完全并行" green
+node n8 "Tx adapter 发包" gray
+edge n1 -> n2 "NEW 事件"
+edge n2 -> n3 "调度分发"
+edge n3 -> n4 "dequeue_burst"
+edge n4 -> n5 "flow_id 锁定"
+edge n4 -> n6 "放行仍保序"
+edge n4 -> n7 "无保序约束"
+edge n5 -> n2 "FORWARD 回队"
+edge n6 -> n2 "FORWARD 回队"
+edge n7 -> n8 "提交发送"
+edge n8 -> n1 dashed "回压反馈"
+:::
+
+### 3. 关键数据结构与源码位置
+
+eventdev 的主头文件是 `lib/eventdev/rte_eventdev.h`，定义设备配置、队列配置、端口配置、事件结构、调度类型、op 类型、能力标志、统计与 xstats 接口，以及 `rte_event_dev_info_get`、`rte_event_dev_configure`、`rte_event_queue_setup`、`rte_event_port_setup`、`rte_event_port_link`、`rte_event_dev_start`、`rte_event_dequeue_burst`、`rte_event_enqueue_burst`、`rte_event_dev_dump` 等核心入口（字段见 05-10）。PMD 侧接口在 `lib/eventdev/rte_eventdev_pmd.h` 与相关驱动头文件，设备通过构造函数注册，probe 机制与 ethdev 同源（模块见 07-01，原理见 06-01）。事件环 `lib/eventdev/rte_event_ring.h` 提供基于 `rte_ring` 的事件传递辅助结构，供纯软件流水线使用（模块见 07-03，原理见 06-07）。
+
+adapter 头文件按数据源分列：`rte_event_eth_rx_adapter.h`、`rte_event_eth_tx_adapter.h`、`rte_event_timer_adapter.h`、`rte_event_crypto_adapter.h`（还可能有 DMA 类 adapter，存在性需对照实际版本核验）。每个 adapter 都遵循「创建、加队列、配置、启动、统计、销毁」的相似套路，例如 Rx adapter 的 `rte_event_eth_rx_adapter_create`、`queue_add`、`start`、`stats_get`、`free`，Tx adapter 的 `create`、`queue_add`、`start`，timer adapter 的 `create`、`arm_burst`、`cancel_burst`、`stats_get`。设备实现位于 `drivers/event/`，常见目录包括 `sw/`、`dsw/`、`skeleton/`、`octeontx/`、`cnxk/` 等，具体清单需对照实际版本核验。参考实现集中在 `examples/eventdev_pipeline/` 与 `examples/l2fwd-event/`，自测入口在 `app/test/test_eventdev.c`，这三处是核对 API 真实签名与最小可运行配置的最佳落点。
+
+下表汇总本篇的最小源码地图与职责分工，命令与参数全集见 04 册，字段见 05 册。
+
+| 源码目录 | 职责定位 | 代表入口或头文件 | 延伸指向 |
+|---|---|---|---|
+| `lib/eventdev/` | 设备、队列、端口与事件 | `rte_eventdev.h` | 字段见 05-10 |
+| `lib/eventdev/` | Rx/Tx/timer/crypto adapter | `rte_event_eth_rx_adapter.h` | 模块见 07-08 |
+| `lib/eventdev/` | 事件环辅助结构 | `rte_event_ring.h` | 模块见 07-03 |
+| `lib/eventdev/` | PMD 驱动注册接口 | `rte_eventdev_pmd.h` | 模块见 07-01 |
+| `drivers/event/` | 软件与硬件事件设备 | 具体目录需核验 | 模块见 07-08 |
+| `examples/eventdev_pipeline/` | 事件流水线参考实现 | 参数需核验 | 见 07-08 |
+| `examples/l2fwd-event/` | 事件模式二层转发 | 参数需核验 | 见 07-08 |
+| `app/test/test_eventdev.c` | 能力与调度自测 | 命令见 04-05 | 见 07-08 |
+
+读表时要抓住一条主线：`lib/eventdev/` 定义抽象，`drivers/event/` 提供调度器实现，`adapter` 负责把网卡、定时器与加密设备接入事件流，`examples/` 把这些零件拼成可运行流水线。事件结构、设备配置与端口配置的逐字段含义见 05-10，本篇不重列。下表再从「组件与选型」角度做一次对照，便于按业务特征挑调度类型，其中「或」关系用转义竖线表示。
+
+| 组件 \| 维度 | 可选形态 | 主要收益 | 主要代价 |
+|---|---|---|---|
+| 调度类型 | ATOMIC \| ORDERED \| PARALLEL | 按语义保序或提并行 | ATOMIC 易队头阻塞 |
+| 设备形态 | 软件 vdev \| 硬件 PMD | 可移植 \| 硬件加速 | 软件占 service lcore |
+| Rx adapter | 内部端口 \| 外部端口 | 免手写收包入队 | 依赖设备 capability |
+| 事件粒度 | 单事件 \| 事件向量 | 向量摊薄调度开销 | 向量需能力支持 |
+| 端口链接 | 静态 \| 运行时链接 | 灵活调整核间分工 | 运行时链接需能力 |
+| 背压处理 | 队列深度 \| 回压反馈 | 防止过载丢事件 | 深度需按流量估算 |
+
+### 4. 关键流程与调用链
+
+一条典型事件流水线的模块级调用序列如下。初始化阶段先用 `rte_event_dev_info_get` 查询设备的最大队列数、最大端口数、capability 与 `dequeue_timeout_ns` 默认值；再用 `rte_event_dev_configure` 设置 `nb_event_queues`、`nb_event_ports` 与单链路端口队列对数；接着对每条队列 `rte_event_queue_setup` 指定调度类型与优先级，对每个 worker 端口 `rte_event_port_setup` 配置入队深度与隐式释放开关，并用 `rte_event_port_link` 把端口映射到队列集合；然后创建并配置 Rx/Tx adapter，把目标 ethdev 的 Rx 队列加入 Rx adapter、把 Tx 队列加入 Tx adapter；最后 `rte_event_dev_start` 与 adapter 的 `start` 一起启动。热路径上每个 worker lcore 循环调用 `rte_event_dequeue_burst` 取一批事件，按事件类型做业务处理，再用 `RTE_EVENT_OP_FORWARD` 或 `RTE_EVENT_OP_RELEASE` 通过 `rte_event_enqueue_burst` 把事件交还设备或直接发往 Tx adapter。以上函数名与参数顺序需对照 `lib/eventdev/` 头文件核验，本篇只给骨架。
+
+三种调度类型在这条链上的差别集中在「事件从队列到端口」与「事件从端口回队列」两个环节。ATOMIC 下调度器按 flow_id 把同一流钉在同一端口，直到该端口 RELEASE，因此 worker 里可以放心更新共享计数与表项；ORDERED 下多个端口可以并行处理同一流，但设备会在事件被 FORWARD 到下一队列时按原始入队顺序重排，出口天然保序，适合多阶段流水线；PARALLEL 下既不锁定也不重排，worker 提交什么顺序设备就放行什么顺序。无论哪种类型，enqueue 的返回值都可能是「部分成功」：一批 32 个事件只入队 20 个是合法结果，应用必须把剩余事件保留到下轮重试或直接释放，否则会静默丢事件。这一点与 ethdev 的 `rte_eth_tx_burst` 语义类似，是事件流水线最常见的正确性陷阱（原理见 06-04）。
+
+再看 adapter 与轮询模型的边界。启用 Rx adapter 后，收包不再由 worker 自己 `rte_eth_rx_burst`，而是由设备或 service lcore 把 mbuf 变成 NEW 事件；启用 Tx adapter 后，发包也不再由 worker 直接 `rte_eth_tx_burst`。如果设备支持内部端口，整个收包入队路径由硬件完成，软件只看到事件；若是软件事件设备，adapter 通常跑在 service lcore 上，需要显式拉起 service core 并映射到空闲 lcore（原理见 06-12）。由此可得出取舍结论：流量均匀、阶段单一、追求极致每核效率的负载，run-to-completion 仍最简单高效；流量倾斜明显、阶段多且代价不均、需要动态扩缩核或严格保序的负载，eventdev 更合适。至于调度器内部如何维护流归属、如何用原子操作与内存序实现有序放行，统一归 06 册（原理见 06-12、06-07），本册不展开。
+
+### 5. 配置/命令/代码实例
+
+本篇配置段只给三条最典型的命令，覆盖「软件设备起步、跑通用流水线、跑二层转发事件模式」；完整命令族见 04-02 与 04-03，示例程序的全部启动参数不在此重列。二进制名、vdev 名与示例参数需对照实际版本核验。
+
+```bash
+# 1) 创建软件事件设备并进入 testpmd 交互环境
+sudo ./build/app/dpdk-testpmd -l 0-3 --vdev "event_sw0" -- -i
+# 2) 运行通用事件流水线示例，验证队列/端口/调度类型
+sudo ./build/examples/dpdk-eventdev_pipeline -l 0-7 --vdev "event_sw0" -- -w 0 -w 1 -w 2 -w 3
+# 3) 运行事件模式二层转发示例，检查保序与吞吐
+sudo ./build/examples/dpdk-l2fwd-event -l 0-3 --vdev "event_sw0" -- -p 0x3
+```
+
+下面给出示例输出，具体格式需对照实际版本核验。这段输出是按 `rte_event_dev_dump` 与示例程序统计打印整理出的示意结果，用来判读设备能力、端口链接与调度是否按预期生效。
+
+```text
+EVENTDEV: device event_sw0 probed, driver event_sw
+EVENTDEV: max_event_queues=64 max_event_ports=64
+EVENTDEV: caps DISTRIBUTED_SCHED RUNTIME_PORT_LINK EVENT_QOS
+EVENTDEV: configured queues=8 ports=4 dequeue_timeout_ns=100000
+EVENTDEV: port 0 linked to queues 0-3, sched ORDERED
+EVENTDEV: rx_adapter 0 started, eth port 0 queues 0-1
+EVENTDEV: worker 0 deq=2048 enq=2048 fwd=2048 rel=0
+EVENTDEV: worker 1 deq=1984 enq=1984 fwd=1984 rel=0
+PIPELINE: tx adapters drained 4096 packets, 0 drops
+```
+
+对上面这段输出逐行判读如下。前两行确认 `event_sw0` 已被正确 probe 并给出设备上界，正常值应大于等于应用规划的队列数与端口数；若 `max_event_queues` 或 `max_event_ports` 小于配置值，`rte_event_dev_configure` 会直接失败，此时应减小规划或换用硬件设备。第三行的 capability 列表最关键：`DISTRIBUTED_SCHED` 说明调度可分布在多个核上，`RUNTIME_PORT_LINK` 说明端口链接可以运行时调整，`EVENT_QOS` 说明支持队列级 QoS；若设计里依赖运行时改链接而设备不支持，必须在启动前静态链接，否则流水线行为会与预期不符，能力标志的确切命名需对照 `lib/eventdev/rte_eventdev.h` 核验。第四行给出实际生效的配置：`queues=8 ports=4` 与 `dequeue_timeout_ns` 应和应用传入的 `rte_event_dev_config` 一致，超时值过小会让 dequeue 频繁空转、过大则抬高空闲时延。第五行说明端口 0 链接到队列 0 到 3 且调度类型为 ORDERED，正常应覆盖所有 worker 端口且链接关系无遗漏；若某个端口链接为空，该核会一直空转。第六行确认 Rx adapter 已接管 ethdev 端口 0 的两个队列，若缺失说明 adapter `queue_add` 或 `start` 未成功，worker 将永远收不到 NEW 事件。第七、八行是核心健康指标：每个 worker 的 `deq` 与 `enq` 应基本相等，`fwd` 与 `rel` 之和应等于 `enq`；本例中 `rel=0` 且全部 `fwd`，说明事件都转发到下一阶段而非直接释放，符合流水线预期。若 `deq` 长期为 0，优先检查 service lcore 是否拉起；若各 worker 的 `deq` 差距过大，说明流量倾斜或 flow_id 分布不均，应调整 Rx adapter 的 flow_id 生成方式。最后一行 `0 drops` 表示 Tx adapter 没有因队列满而丢包，非零值通常意味着下游端口带宽不足或队列深度偏小。以上输出为示例，具体格式需对照实际版本核验。
+
+下面给出一个概念骨架，只示意事件流水线的模块级调用顺序，不展开调度器内部实现；真实函数签名、参数与能力标志需对照 `lib/eventdev/` 核验，字段见 05-10。
+
+```c
+/* 概念骨架：eventdev 流水线的模块级调用序列
+ * 函数签名与能力标志需对照 lib/eventdev/rte_eventdev.h 核验
+ * 字段见 05-10 ｜ 命令见 04-03 ｜ 原理见 06-12 */
+#include <rte_eventdev.h>
+
+int
+event_pipeline_init(uint8_t dev_id, uint16_t nb_workers)
+{
+    struct rte_event_dev_config cfg = {0};
+    struct rte_event_queue_conf qcfg = {0};
+
+    cfg.nb_event_queues = 8;
+    cfg.nb_event_ports = nb_workers;
+    cfg.nb_single_link_event_port_queue_pairs = 0;
+    if (rte_event_dev_configure(dev_id, &cfg) < 0)
+        return -1;
+    qcfg.schedule_type = RTE_SCHED_TYPE_ORDERED;
+    if (rte_event_queue_setup(dev_id, 0, &qcfg) < 0)
+        return -1;
+    return rte_event_dev_start(dev_id);
+}
+
+static inline void
+event_worker_loop(uint8_t dev_id, uint8_t port_id)
+{
+    struct rte_event ev[32];
+    uint16_t nb_rx, nb_tx, i;
+
+    nb_rx = rte_event_dequeue_burst(dev_id, port_id,
+            ev, 32, 0);
+    if (nb_rx == 0)
+        return;
+    for (i = 0; i < nb_rx; i++)
+        ev[i].op = RTE_EVENT_OP_FORWARD;
+    nb_tx = rte_event_enqueue_burst(dev_id, port_id,
+            ev, nb_rx);
+    if (nb_tx < nb_rx) {
+        /* 部分入队须保留剩余事件下轮重试，具体处理见 06-12 */
+        rte_event_dev_dump(dev_id, 0, stdout);
+    }
+}
+```
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是能力先行与配置规划陷阱。eventdev 的灵活性建立在 capability 之上，最典型的错误是照搬示例的队列数、端口数与调度类型，却在目标设备上不支持 ORDERED 或不支持运行时端口链接，结果流水线要么启动失败，要么静默退化成 PARALLEL 而破坏保序。最佳实践是初始化第一步就 `rte_event_dev_info_get`，把「调度类型、最大队列/端口、单链路端口对、事件向量、内部端口 adapter」逐项比对，并把不支持的能力在启动日志里显式告警。队列与端口数量也要按「worker 核数 × 每核队列数」估算并留余量，过少会限制并行度，过多则抬升调度器维护成本；`dequeue_timeout_ns` 不宜盲目调小，软件设备上过小的值会让空转占用大量 CPU（原理见 06-12）。
+
+第二类是语义与正确性陷阱。最容易被低估的是 enqueue 的部分成功：一批事件只入队一部分是合法返回，应用必须保留未入队事件重试或释放，直接丢弃会造成难以复现的少量丢包。第二种是 op 用错：ATOMIC 下若忘记 RELEASE，同一流的后续事件会被一直钉在原端口，形成人为队头阻塞；ORDERED 下若把事件直接发往 Tx 而不经过保序队列，出口顺序仍可能错乱。第三种是隐式释放开关：启用隐式释放时设备会自动回收 ORDERED/ATOMIC 上下文，关闭后应用必须显式 RELEASE，否则上下文泄漏会逐步耗尽调度资源。第四种是 flow_id 生成：Rx adapter 默认按 RSS 哈希或其他规则生成 flow_id，若所有包落到同一个 flow_id，ATOMIC 与 ORDERED 都会退化成单核串行，吞吐骤降；应在 adapter 的 queue_conf 里核验 flow_id 来源与覆盖度（字段见 05-10，命令见 04-03）。
+
+第三类是组网与运行形态陷阱。软件事件设备 `event_sw0` 与分布式软件调度器通常依赖 service lcore：若没有把服务映射到空闲 lcore 并拉起，Rx adapter 不会生产任何事件，现象是「设备起来了但收不到包」，排查时应先用 `rte_service_*` 相关接口与 `dpdk-procinfo` 一类工具确认服务状态（命令见 04-05）。内网口与事件设备的 NUMA 亲和也要对齐，跨 socket 搬运事件会显著抬高尾时延（原理见 06-09）。另一个常见误区是把 eventdev 当成「永远更快的轮询替代品」：在流量均匀、单阶段、每包处理极轻的转发里，事件调度的固定开销反而可能让吞吐低于 run-to-completion；正确做法是用同一套压测方法分别测两种模型，再按负载特征选型，而不是凭印象切换（方法学见 08-01）。
+
+第四类是可观测性与调试实践。`rte_event_dev_dump`、设备 xstats、adapter stats 与 per-worker 的 deq/enq/fwd/rel 计数应当在上线前就接进 telemetry，形成「入队量、出队量、转发量、丢事件量」四层指标；出现性能回退时按「先能力、再端口链接、后 flow_id 分布」的顺序收敛。调试阶段建议先固定为 PARALLEL 验证吞吐上界，再切到 ORDERED 验证保序，最后针对有状态的阶段局部启用 ATOMIC，避免一上来就用最严格的调度类型掩盖真实瓶颈。最后仍要守住唯一权威源：参数回查 04，字段回查 05，调度与内存序机制回查 06，模块能力留在本册，排障方法回查 08，不要在事件篇里重列命令全集或展开调度器内部实现。
+
+### 7. 小结与延伸阅读
+
+本篇回答了「eventdev 何时以及怎样替代轮询模型」：它用事件、事件队列、事件端口与 adapter 把「收包—处理—发包」变成可动态调度的流水线，用 ATOMIC、ORDERED、PARALLEL 三种调度类型显式表达串行、保序并行与无序并行三种语义，从而在流量倾斜、多阶段、需动态扩缩核的场景里优于固定的 run-to-completion；代价是引入调度开销、能力依赖与更复杂的正确性约束。取舍的关键不是「事件一定更快」，而是「负载是否需要动态负载均衡与保序抽象」。
+
+延伸阅读建议按主线推进：想核对 event、设备与端口配置的字段布局，读 05-10；想查 `--vdev`、adapter 与示例程序参数全集，读 04-02、04-03、04-05；想深入流归属、有序放行、service lcore 与无锁队列的内存序机制，读 06-12 与 06-07；想按模块了解 ethdev、ring 与 cryptodev 的对外能力，读 07-01、07-03 与 07-07；想上手可运行流水线，直接读 `examples/eventdev_pipeline/`、`examples/l2fwd-event/` 与 `app/test/test_eventdev.c`。精确 API 签名、capability 标志与示例输出格式需对照 `lib/eventdev/` 头文件与实际版本核验。下一篇 07-09 转向另一种流水线组织方式：graph / node 库如何用节点注册、边与邻接以及 graph walk，把转发功能拆成可复用的图节点，并与本篇的事件调度形成对照。
+
+## 07-09 graph / node 库（node 注册、边与邻接、graph walk 与可观测性）
+
+### 1. 背景与动机
+
+在 07-08 讨论的事件模型之外，DPDK 还提供另一种组织转发流水线的方式：图节点模型。要理解它的动机，先看传统 run-to-completion 应用长什么样。一个 l3fwd 式程序往往在主循环里写成一串硬编码的判断：收包后先判二层类型，再判三层协议，查路由，改 MAC 与 TTL，重算校验和，最后从某个端口发出；每加一个新特性，就在这条链里插一段 if-else 或一次回调。随着功能增多，这条链会变成难以复用的「意大利面」：同一段查表逻辑在 IPv4、IPv6、隧道路径里各写一遍，想统计某个阶段的每包周期数得手工埋点，想临时跳过某个特性只能改代码重编译，想把某个阶段单独放到别的核上更是牵一发而动全身。更根本的问题是，这种写法把「控制流」和「数据面功能」焊死在一起，功能块之间既没有显式接口，也没有统一的观测入口。
+
+graph / node 库借鉴了 VPP 已经验证过的思路：把每个转发功能封装成独立的节点，节点只负责「收一批对象、处理、把它们投给下游节点」，节点之间的可能走向用边预先声明，运行时由 graph walk 沿边批量搬运对象。这样一来，新增功能只是注册一个新节点并连几条边，已有节点的内部实现不用动；拓扑在启动时一次性确定，热路径上只剩批量流转，几乎没有分支预测失败与函数指针跳转的额外代价；每个节点天然成为统计与抓包的埋点单位，可观测性从「事后补」变成「自带」。DPDK 从 20.11 起引入 `lib/graph/`，随后把一批常用转发节点沉淀到 `lib/node/`，逐渐形成可组合的转发图生态。
+
+需要区分它与 eventdev 的定位，避免在选型时混淆。eventdev 的核心是「动态调度」：事件在运行时按流标识与负载被分派到不同 worker，强调负载均衡与保序；graph 的核心是「静态拓扑 + 批量流转」：拓扑在建图时固定，对象沿预先声明的边在节点间流动，强调功能复用、可组合与低开销。两者并非互斥，较新版本里也能看到 graph 节点与事件、service core 协同的讨论（原理见 06-12）。本篇作为 07 册模块篇，只讲 graph / node 提供哪些对象与能力、暴露哪些 API、怎样注册节点与建图、怎样观测与抓包、以及典型组网与用法；结构体字段见 05-10，命令与参数全集见 04 册，graph walk 的内部调度、stream 搬运与预取机制归 06 册（原理见 06-12），本篇不重列字段表、不展开内部实现、不重列命令清单。版本基准为 23.11 LTS、24.11 与 master，凡 API 与节点清单不确定处均标注「需对照实际版本核验」。
+
+### 2. 核心概念
+
+graph 库的对象模型有三个基本单位。第一个是节点 node：一个具备名字、处理函数、标志与出边列表的处理单元，用 `RTE_NODE_REGISTER` 宏或 `rte_node_register` 注册到全局节点表，注册信息里包含节点名、process 回调、标志（例如 source 节点标志）以及 `next_nodes` 名字数组（字段见 05-10）。第二个是边 edge：不是独立对象，而是节点出边列表中的一项，表示「本节点处理完的对象可以投递给哪个下游节点」；`next_nodes` 数组的顺序决定边的索引，节点在 process 里用 `rte_node_enqueue_x1`、`x2`、`x4` 或 `rte_node_next_stream_move` 一类接口按索引投递，索引写错就会把对象送错下游，这是最典型的编码错误。第三个是图 graph：由 `rte_graph_create` 按节点名模式集合构建出的运行时对象，把注册节点、边与邻接关系固化成可走的结构，返回 `rte_graph_t` 句柄，`rte_graph_walk` 沿它逐轮驱动。
+
+节点按角色可分为三类。source 节点是每轮 walk 的起点，典型如 `ethdev_rx`，它从端口批量收包并投递给下游；sink 节点是终点，典型如 `ethdev_tx` 与 `pkt_drop`，它们消费对象而不再向下游投递；中间节点承担实际业务，例如 `ip4_lookup`、`ip4_rewrite`、`pkt_cls`。`lib/node/` 预置的节点大致覆盖二层收包与分类、IPv4/IPv6 查表与改写、邻居解析、丢包与空节点，具体清单与参数需对照实际版本核验。节点之间通过 stream（一批对象指针）批量传递，而非一次一个包，这正是 graph 低开销的来源：一次 process 调用处理几十个对象，把函数调用、分支与缓存失效摊薄（原理见 06-08、06-12）。
+
+可观测性是 graph 的一等公民。`rte_graph_param` 可以在建图时开启 pcap 抓包，指定 `pcap_filename` 与 `num_pkt_to_capture`，把经过图的报文落盘用于回归比对；`rte_graph_cluster_stats_create` 与 `rte_graph_cluster_stats_get` 提供节点级统计，能算出每个节点的调用次数、处理对象数与每对象周期数（cycles/obj），是定位热点节点最直接的手段；`rte_graph_dump` 与 `rte_graph_stats_dump` 把图拓扑与计数打印到文件流，便于核对边是否连对。24.11 与 master 上还出现了 feature arc 一类能力，允许运行时按接口启停特性节点，避免为「某端口要不要走防火墙」重建整张图，相关 API 名称与可用范围需对照 `lib/graph/` 核验。以上接口的字段名与回调签名一律见 05-10 与 `lib/graph/` 头文件，本篇不展开。
+
+建图与走图的关系可以这样概括：注册阶段把所有节点放进全局表，建图阶段按 `node_patterns` 选出参与本图的节点并把名字解析成邻接索引，走图阶段由 `rte_graph_walk` 在一轮里从 source 出发、按 process 的投递结果沿边流转、直到 sink 收尾，然后开始下一轮。整个热路径没有动态拓扑决策，也没有按包调度，只有固定邻接上的批量搬运。理解这一点，就能明白为什么 graph 适合「功能多但拓扑稳定」的转发设备，而 eventdev 适合「负载波动大、需要动态分派」的场景（模块见 07-08）。
+
+下图把节点注册、建图、连边、walk 与统计观测串成一条模块级链路，graph 的节点注册、建图与走图关系见图 07-09-01。
+
+:::figure id=07-09-01 | name=graph 节点注册建图与 walk 链路 | dir=TD
+node n1 "RTE_NODE_REGISTER 注册" blue
+node n2 "rte_graph_create 建图" teal
+node n3 "边与 next_nodes 邻接" teal
+node n4 "rte_graph_walk 走图" amber
+node n5 "source 节点收包" green
+node n6 "业务节点处理" purple
+node n7 "sink 节点发包" green
+node n8 "cluster stats 观测" gray
+edge n1 -> n2 "节点清单"
+edge n2 -> n3 "按名连边"
+edge n3 -> n4 "拓扑就绪"
+edge n4 -> n5 "每轮起点"
+edge n5 -> n6 "stream 搬运"
+edge n6 -> n7 "next 流转"
+edge n7 -> n4 dashed "下一轮"
+edge n6 -> n8 "统计埋点"
+:::
+
+### 3. 关键数据结构与源码位置
+
+graph 的核心头文件在 `lib/graph/`：`rte_graph.h` 定义图的创建、销毁、查找、导出、dump、stats 与 cluster stats 以及 `rte_graph_param`、`rte_graph_cluster_stats_param` 等配置结构；`rte_graph_worker.h` 定义热路径上的 `rte_graph`、`rte_node`、stream 操作与 `rte_graph_walk` 内联实现所需的类型；`rte_node.h` 定义 `struct rte_node_register`、注册宏 `RTE_NODE_REGISTER`、`rte_node_process_t` 回调类型、节点 id 与名字互查、边查询与更新接口（字段见 05-10）。节点注册依赖构造函数节区，这与 PMD 注册同源，静态链接时要注意把节点所在库完整链入（模块见 02-04，原理见 06-01）。较新版本可能还有 `rte_graph_feature_arc.h` 之类头文件，存在性需对照实际版本核验。
+
+预置节点集中在 `lib/node/`，按功能分文件组织：收包与发包侧有 `ethdev_rx`、`ethdev_tx`，分类与丢弃有 `pkt_cls`、`pkt_drop`、`null`，三层处理有 `ip4_lookup`、`ip4_rewrite`、`ip6_lookup`、`ip6_rewrite`，邻居与二层解析有 `ether_lookup`、`arp` 等，具体目录与节点名需对照实际版本核验。每个预置节点都带自己的初始化参数，例如 `ethdev_rx` 需要绑定端口与队列、`ip4_lookup` 需要路由表，这些参数如何通过 node 配置传入，须对照 `lib/node/` 源码与 `examples/l3fwd-graph/` 的初始化代码。上层消费方包括 `examples/l3fwd-graph/`（图模式三层转发）、较新版本的 `app/graph/` 交互式应用（存在性与命令需对照实际版本核验）、以及 `app/test/test_graph.c` 与 `app/test/test_graph_perf.c` 一类自测入口。
+
+下表汇总本篇的最小源码地图与职责分工，命令全集见 04 册，字段见 05 册。
+
+| 源码目录 | 职责定位 | 代表入口或头文件 | 延伸指向 |
+|---|---|---|---|
+| `lib/graph/` | 图创建、walk、统计与导出 | `rte_graph.h` | 字段见 05-10 |
+| `lib/graph/` | 热路径类型与 stream 操作 | `rte_graph_worker.h` | 原理见 06-12 |
+| `lib/graph/` | 节点注册与边管理 | `rte_node.h` | 字段见 05-10 |
+| `lib/node/` | 预置转发节点集合 | 具体文件需核验 | 模块见 07-09 |
+| `examples/l3fwd-graph/` | 图模式三层转发示例 | 参数需核验 | 见 07-09 |
+| `app/graph/` | 交互式图命令行应用 | 存在性需核验 | 命令见 04-05 |
+| `app/test/` | graph 与 graph_perf 自测 | 命令见 04-05 | 见 07-09 |
+
+读这张表时要抓住「注册—建图—走图—观测」四段：`lib/graph/` 提供框架，`lib/node/` 提供可复用功能块，`examples/` 与 `app/graph/` 负责拼装与交互，`app/test/` 负责回归。`rte_node_register`、`rte_graph_param` 与 `rte_graph_cluster_stats_param` 的逐字段含义见 05-10，本篇不重列。下表再从节点角色与观测手段两个维度做一次对照，便于按功能选型，其中「或」关系用转义竖线表示。
+
+| 维度 | 可选形态 | 主要用途 | 主要代价 |
+|---|---|---|---|
+| 节点角色 | source \| 中间 \| sink | 决定每轮起止 | 角色写错会断流 |
+| 出边投递 | enqueue_x1 \| x2 \| x4 | 按索引批量投递 | 索引须与 next_nodes 对齐 |
+| 建图输入 | node_patterns 名模式 | 选节点组图 | 名字拼写错误即缺节点 |
+| 抓包方式 | pcap_enable \| 关闭 | 报文落盘回归比对 | 抓包显著抬高每包开销 |
+| 统计方式 | cluster stats \| dump | 节点级 cycles/obj | 高频采集有额外成本 |
+| 拓扑变更 | 重建图 \| feature arc | 增减特性节点 | 重建需停流，arc 需核验 |
+
+### 4. 关键流程与调用链
+
+从模块视角看，一条图转发链路的调用序列分四段。第一段是注册：每个节点在自己的源文件里通过 `RTE_NODE_REGISTER` 把 `struct rte_node_register`（含名字、process 回调、flags、`nb_edges` 与 `next_nodes` 名字数组）登记进全局节点表，这一步由构造函数在进程启动时自动完成。第二段是建图：应用填充 `rte_graph_param`，设置 `node_patterns` 与 `nb_node_patterns`、socket_id 以及 pcap 相关参数，调用 `rte_graph_create(name, &param)` 得到 `rte_graph_t`；随后可用 `rte_graph_lookup` 按名字取回句柄，用 `rte_graph_dump` 或 `rte_graph_export` 一类接口核对拓扑。第三段是走图：在每个工作 lcore 上循环调用 `rte_graph_walk(graph)`，source 节点批量收包，中间节点按 process 结果与边索引把对象投递到下游 stream，sink 节点发包或丢弃，一轮结束后回到起点。第四段是观测：用 `rte_graph_cluster_stats_create` 建立统计上下文，周期性 `rte_graph_cluster_stats_get` 读取每节点对象数与周期数，必要时 `rte_graph_stats_dump` 打印，程序退出时 `rte_graph_destroy` 与 `rte_graph_cluster_stats_destroy` 释放。以上函数名与参数顺序需对照 `lib/graph/` 核验，本篇只给骨架。
+
+graph walk 内部如何组织 stream、如何做批量预取、如何在一轮里避免重复入队，以及为何它能在固定拓扑上逼近手写流水线的性能，属于机制范畴，本册不展开，统一归 06 册（原理见 06-08、06-12）。这里只强调模块级契约：process 回调拿到一批对象指针，处理完必须明确把每个对象投递到某个下游边或当场释放，既不能悬空也不能重复投递；source 节点必须由框架标记为每轮入口；sink 节点不应再产生下游投递。契约破坏的表现通常是「图能建起来但吞吐为零」或「报文在某一节点后消失」，用 `rte_graph_dump` 与节点统计能很快定位到出问题的那一条边。
+
+与 07-08 的事件流水线相比，图模型的调用链更短也更静态：没有 adapter、没有端口链接、没有调度类型，只有注册、建图、walk 与统计四组接口；相应地，它不提供运行时的动态负载均衡，扩容靠的是把整张图复制到更多 lcore、每个核各走一份（每核独立图实例与独立 stream，原理见 06-12）。因此典型组网是「每 worker lcore 一张图 + 每核绑定固定 Rx/Tx 队列」，与 07-01 的 ethdev 队列规划一脉相承。若业务需要在运行时按流量把包分给不同核，应回到 eventdev；若业务是功能多、拓扑稳定、要求可复用与可观测的转发设备，graph 更合适。两组能力也可以组合，但组合方式涉及协同调度机制，仍归 06 册。
+
+### 5. 配置/命令/代码实例
+
+本篇配置段只给三条最典型的命令，覆盖「跑自测、跑图模式转发、开交互式图应用」；完整命令族见 04-03 与 04-05，示例程序与图应用的全部启动参数不在此重列。二进制名、autotest 名称与参数需对照实际版本核验。
+
+```bash
+# 1) 运行 graph 自测，确认节点注册与建图通路
+sudo ./build/app/dpdk-test -- graph_autotest
+# 2) 运行图模式三层转发示例，验证节点流水线
+sudo ./build/examples/dpdk-l3fwd-graph -l 0-3 -- -p 0x3 --config "(0,0,0),(1,0,1)"
+# 3) 启动交互式 graph 应用观察节点统计（命令族见 04-05）
+sudo ./build/app/dpdk-graph -l 0-3
+```
+
+下面给出示例输出，具体格式需对照实际版本核验。这段输出是按 `rte_graph_dump` 与 `rte_graph_cluster_stats_get` 的打印内容整理出的示意结果，用来判读拓扑是否连对、节点是否都在处理对象、以及抓包与统计是否按预期开启。
+
+```text
+GRAPH: graph l3fwd-graph created, nb_nodes=8 socket_id=0
+GRAPH: node ethdev_rx-0 edges=2 next=pkt_cls,ip4_lookup flags=SOURCE
+GRAPH: node ip4_lookup edges=3 next=ip4_rewrite,pkt_drop,arp
+GRAPH: node ip4_rewrite edges=1 next=ethdev_tx-0
+GRAPH: node ethdev_tx-0 edges=0 flags=SINK
+GRAPH: cluster stats ip4_lookup objs=1048576 calls=32768 cycles/obj=42
+GRAPH: cluster stats ethdev_tx-0 objs=1044480 calls=32640 cycles/obj=11
+GRAPH: pcap enabled file=/tmp/graph_rx.pcap cap=1024 captured=1024
+WALK: graph 0 walked 32768 rounds, 0 objs lost
+```
+
+对上面这段输出逐行判读如下。第一行确认图已创建并给出节点总数与所在 socket，正常值应等于 `node_patterns` 选中的节点数，若明显偏少说明名字模式没匹配到预期节点，应核对节点注册名与拼写。第二行的 `ethdev_rx-0` 被标为 `SOURCE` 且出边为 2，正常应指向分类与查表节点；`flags=SOURCE` 缺失会导致该节点不会被当作每轮入口，现象是整张图收不到任何包。第三、四行给出中间节点的出边列表，读的时候要逐项对照 `next_nodes` 数组顺序：例如 `ip4_lookup` 的三条边依次是改写、丢包、ARP，process 里 `enqueue_x1(graph, node, obj, 0)` 就应当投递到 `ip4_rewrite`，边索引错位会把报文送进错误分支，这也是图应用最常见的隐性 bug。第五行 `ethdev_tx-0` 标为 `SINK` 且 `edges=0`，符合终点节点契约，若它还有出边说明注册信息写错。第六、七行是核心健康指标：`objs` 应沿节点链逐级递减但不出现突兀断崖，`calls` 与每轮批量大小相乘应约等于 `objs`，`cycles/obj` 给出每对象周期数，本例 `ip4_lookup` 为 42 远高于 `ethdev_tx-0` 的 11，说明查表是热点节点，优化应优先针对它；若某节点 `objs=0`，该节点实际未被走到，多半是上游边索引或投递路径有问题。第八行确认 pcap 已按 `rte_graph_param` 开启并抓满上限，抓包数达到 `cap` 后会停止写入，回归比对时要留意；生产环境长期开启抓包会显著抬高每包开销。最后一行 `0 objs lost` 表示走图过程中没有对象悬空或丢失，非零值通常意味着某个 process 回调既没投递也没释放对象。以上输出为示例，具体格式需对照实际版本核验。
+
+下面给出一个概念骨架，只示意节点注册与建图的模块级写法，不展开任何 walk 内部实现；真实宏签名、回调类型与字段需对照 `lib/graph/rte_node.h` 与 `rte_graph.h` 核验，字段见 05-10。
+
+```c
+/* 概念骨架：自定义节点注册与建图
+ * 宏签名与字段需对照 lib/graph/rte_node.h 核验
+ * 字段见 05-10 ｜ 命令见 04-05 ｜ 原理见 06-12 */
+#include <rte_node.h>
+#include <rte_graph.h>
+
+static uint16_t
+demo_node_process(struct rte_graph *graph,
+        struct rte_node *node, void **objs, uint16_t nb_objs)
+{
+    uint16_t i;
+
+    for (i = 0; i < nb_objs; i++)
+        rte_node_enqueue_x1(graph, node, 0, objs[i]);
+    return nb_objs;
+}
+
+static struct rte_node_register demo_node = {
+    .name = "demo_node",
+    .process = demo_node_process,
+    .nb_edges = 1,
+    .next_nodes = { "pkt_drop" },
+};
+RTE_NODE_REGISTER(demo_node);
+
+int
+demo_graph_create(const char **patterns, uint16_t nb)
+{
+    struct rte_graph_param prm = {0};
+    rte_graph_t g;
+
+    prm.node_patterns = patterns;
+    prm.nb_node_patterns = nb;
+    prm.socket_id = SOCKET_ID_ANY;
+    prm.pcap_enable = 0;
+    g = rte_graph_create("demo_graph", &prm);
+    return g == RTE_GRAPH_ID_INVALID ? -1 : 0;
+}
+```
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是拓扑与出边陷阱。最典型的是 `next_nodes` 顺序与 process 里使用的边索引不一致：节点注册时把三条边按「改写、丢包、 ARP」排列，处理时却用索引 0 投递到「丢包」语义，报文会被静默丢弃且很难从统计上一眼看出原因。最佳实践是把边索引用具名常量或枚举固定下来，注册数组与投递代码共用同一份定义，并在建图后用 `rte_graph_dump` 逐节点核对出边名字。第二类问题是节点名拼写：`node_patterns` 按名字模式匹配，预置节点名带端口或队列后缀（例如 `ethdev_rx-0`），写错或缺后缀会导致该节点根本没进图，表现为 `nb_nodes` 偏小。第三类是 source 与 sink 标志：source 节点漏标会让 walk 没有入口，sink 节点误设出边会让对象在终点之后继续流转，二者都应作为启动自检项。节点清单与命名需对照 `lib/node/` 与实际版本核验。
+
+第二类是对象生命周期与性能陷阱。process 回调必须为收到的每个对象给出明确去向：投递到某条边，或当场释放；既悬空又重复投递都会破坏 stream 一致性，轻则统计异常，重则内存越界。批量语义也要守住：尽量一次处理整批对象、用 `enqueue_x2`、`enqueue_x4` 或 stream 批量搬运接口，而不是在循环里做逐包分支与逐包函数调用，否则会抵消 graph 模型的主要收益（原理见 06-08）。pcap 抓包与 cluster stats 虽是一等公民，但都有成本：抓包要落盘、统计要读周期计数器，生产环境应按需开启、限制抓取数量，并把高频采集放到独立 lcore 或降频，避免观测动作本身成为瓶颈。还有一点容易被忽略：每 worker lcore 应持有独立的图实例与独立 stream，跨核共用一张图会引入同步开销，与模型设计初衷相悖（原理见 06-12）。
+
+第三类是构建与版本陷阱。节点注册依赖构造函数节区，静态链接时若没有把含节点的库完整链入，注册不会发生，建图时就会报「节点不存在」；这与 PMD 注册的链接要求一致，排查时回查 02-04 的链接方式（模块见 02-04，原理见 06-01）。预置节点在不同版本间会增删与改名，feature arc 这类较新能力在 23.11 LTS 上可能不可用，跨版本迁移时不要假设同一套 `node_patterns` 直接可移植，须对照 `lib/graph/` 与 `lib/node/` 核验。另外，graph 的拓扑在建图时固定，运行中增减特性节点通常要重建图并短暂停流；若业务要求不停机按接口启停特性，应先确认目标版本是否提供 feature arc 一类机制，而不是自行在 process 里塞运行期分支，那会把静态拓扑的优势重新退化成硬编码判断。
+
+第四类是可观测性与选型实践。上线前应把「节点级 objs、calls、cycles/obj」三项接进 telemetry，形成按节点的热点排序；出现吞吐回退时先找 cycles/obj 最高的节点，再核对它的出边分布是否符合预期，最后才看整体拓扑。选型上记住一条简单规则：功能多、拓扑稳定、要求功能块可复用且需要细粒度观测，选 graph；负载波动大、需要运行时按流动态分派与保序，选 eventdev（模块见 07-08）；单阶段、每包极轻的转发，run-to-completion 仍最省事。三者不是替代关系，而是不同抽象层级，混用前先用 08-01 的方法学做基线对比。最后守住唯一权威源：参数回查 04，字段回查 05，walk 与 stream 机制回查 06，节点能力留在本册，排障方法回查 08。
+
+### 7. 小结与延伸阅读
+
+本篇回答了「graph / node 怎样组织转发流水线」：它把每个转发功能封装成带名字、process 回调与出边列表的节点，用 `next_nodes` 声明边与邻接，用 `rte_graph_create` 在启动时固化拓扑，用 `rte_graph_walk` 沿固定邻接批量搬运对象，并把 pcap 抓包、cluster stats 与 graph dump 做成内建观测手段。相较 eventdev 的动态调度，graph 以静态拓扑换取低开销、功能复用与天然可观测，适合功能丰富且拓扑稳定的转发设备。
+
+延伸阅读建议按主线推进：想核对 `rte_node_register`、`rte_graph_param` 与统计结构的字段布局，读 05-10；想查示例程序与图应用的参数全集，读 04-03、04-05；想深入 graph walk、stream 搬运、批量预取与协同调度机制，读 06-08 与 06-12；想按模块了解 ethdev 队列规划与事件调度，读 07-01 与 07-08；想上手可运行实现，直接读 `examples/l3fwd-graph/`、`app/test/test_graph.c` 与较新版本的 `app/graph/`。精确 API 签名、节点清单与示例输出格式需对照 `lib/graph/`、`lib/node/` 与实际版本核验。下一篇 07-10 转到虚拟化数据通路：vhost、virtio-user 与 virtio PMD 如何协作，把虚机与容器的报文高效送进 DPDK 应用。
+
+## 07-10 vhost / virtio-user 与 virtio PMD（虚机与容器数据通路、vring 与零拷贝、典型组网）
+
+### 1. 背景与动机
+
+DPDK 应用常常不是数据的终点，而是虚拟化网络里的一个中间节点。在 OpenStack、KVM 与容器云环境里，虚机通过半虚拟化的 virtio-net 网卡收发包，容器则通过 veth、vhost-user 或 memif 之类接口接到虚拟交换机；如果每次报文都要经过 QEMU 进程、内核 TAP 设备与内核协议栈层层搬运，用户态 PMD 好不容易省下的开销会在虚拟化边界被重新吃掉。早期方案是内核 vhost-net：把 virtio 后端的数据面挪进内核线程，减少一次用户态与内核态切换，但后端仍在内核，无法与 DPDK 的轮询、大页与零拷贝模型对接。于是 vhost-user 协议应运而生：它把 vhost 后端从内核搬到用户态进程，用 Unix 域套接字传递控制面消息，让 QEMU 或容器里的 virtio 驱动与 DPDK 应用直接共享内存队列。
+
+这套体系里有三个角色需要分清。`lib/vhost/` 是「后端库」：DPDK 应用（或 OVS-DPDK）调用它注册一个 vhost-user 套接字，处理前端发来的特性协商、内存表与 vring 地址，并通过 `rte_vhost_enqueue_burst` / `rte_vhost_dequeue_burst` 在 vring 上收发 mbuf。`drivers/net/virtio/` 是「前端驱动」：它既包含虚机里驱动 virtio-pci 设备的 virtio PMD，也包含 `virtio_user/` 子目录下的 virtio-user 虚拟设备，后者让一个 DPDK 应用在没有 QEMU 的情况下以 virtio 驱动身份连到 vhost-user 后端，常用于容器与本机回环测试。`drivers/net/vhost/` 则把 vhost 后端包装成一个 ethdev 端口（`net_vhost` vdev），使 testpmd 这类标准工具无需改代码就能充当 vhost 后端。三者合起来，覆盖了「虚机到物理网卡」「容器到容器」「容器到虚机」几类主要通路。
+
+此外还有 vDPA（vhost Data Path Acceleration）：把数据面进一步卸载到支持 virtio 的硬件，控制面仍走 vhost-user，从而在保留 virtio 生态的同时获得接近 SR-IOV 的性能，相关实现在 `drivers/vdpa/`（支持矩阵需对照实际版本核验）。本篇作为 07 册模块篇，只讲这几类模块提供什么能力、暴露哪些关键 API、怎样用最典型的命令把一条虚机或容器数据通路搭起来、以及零拷贝与典型组网如何选型；vring 描述符的内部搬运、DMA 映射与内存序属于机制范畴（原理见 06-04、06-05、06-10），结构体字段见 05-04 与 05-10，devargs 与命令全集见 04-02、04-03，本篇不重列字段表、不展开驱动内部实现、不重列命令清单。版本基准为 23.11 LTS、24.11 与 master，凡接口、标志与驱动名不确定处均标注「需对照实际版本核验」。
+
+### 2. 核心概念
+
+理解这条通路，先要理解 virtio 的前后端模型与 vring。前端（虚机里的 virtio-net 驱动或 virtio-user）与后端（vhost 应用）通过一组环形队列交换描述符：descriptor 表描述报文缓冲区地址与长度，avail 环由前端放入待处理描述符，used 环由后端回填已完成的描述符；split 与 packed 是两种环布局，后者在较新版本里通过特性位协商启用。控制面走 vhost-user 协议：前端与后端在 Unix 域套接字上交换 `VHOST_USER_*` 消息，完成 `GET_FEATURES` / `SET_FEATURES`、`SET_MEM_TABLE`（把前端内存区域映射给后端）、`SET_VRING_NUM` / `SET_VRING_ADDR` / `SET_VRING_KICK` / `SET_VRING_CALL`、`SET_VRING_BASE`、`SET_VRING_ENABLE` 等步骤；消息名在不同版本可能有调整（例如后端请求 fd 相关命名），须对照 `lib/vhost/vhost_user.c` 与 `lib/vhost/vhost_user.h` 核验。协商出来的特性位决定很多行为：`VIRTIO_NET_F_MRG_RXBUF` 影响接收缓冲区合并，`VIRTIO_F_VERSION_1` 决定现代布局，`VIRTIO_RING_F_PACKED` 决定 packed vq，`VIRTIO_F_IN_ORDER` 决定按序完成，`VIRTIO_F_IOMMU_PLATFORM` / `VIRTIO_F_ACCESS_PLATFORM` 决定 IOMMU 与内存注册方式，`VIRTIO_NET_F_MQ` 决定多队列（确切位名需对照 `lib/vhost/` 与 `drivers/net/virtio/` 核验）。
+
+vhost-user 的连接模式是第二个要点。后端可以工作在 server 模式（监听 socket，等待前端连接）或 client 模式（主动连接前端监听的 socket），分别对应 `rte_vhost_driver_register` 的标志位（如 `RTE_VHOST_USER_CLIENT`，需核验）；配合 `RTE_VHOST_USER_NO_RECONNECT` 一类标志可控制断链重连行为。生产里通常让 OVS-DPDK 或后端应用做 client、QEMU 做 server（或反之，取决于编排系统），关键是两端角色不能配反，重连与多实例隔离还要靠 `--file-prefix` 区分运行时目录（命令见 04-01）。第三个要点是零拷贝：`RTE_VHOST_USER_DEQUEUE_ZERO_COPY` 一类标志让后端 dequeue 时把 mbuf 的数据区直接指向前端（guest）内存页，避免一次 memcpy；代价是这些 mbuf 在前端消费完之前不能被释放或改写，且对线性缓冲区、外部缓冲区与部分卸载有约束，属于收益与风险都很高的开关。异步拷贝（`rte_vhost_async_*`）与 inflight 缓冲区、postcopy 迁移则是更高阶的能力，接口与可用范围需对照 `lib/vhost/rte_vhost_async.h` 等头文件核验。
+
+前端侧的两个形态也要分清。virtio PMD（`drivers/net/virtio/virtio_ethdev.c`、`virtio_pci.c` 等）驱动的是虚机内真实的 virtio-pci 设备，需要设备已被 QEMU 呈现并绑定用户态驱动；virtio-user（`drivers/net/virtio/virtio_user/`）则是一个纯虚拟设备，用 `--vdev net_virtio_user0,path=<socket>` 指定要连接的 vhost-user 套接字，或用 `path=/dev/vhost-net` 对接内核 vhost-net，常用于容器数据面与本机回环压测。`drivers/net/vhost/` 的 `net_vhost` vdev 把后端包装成 ethdev，用 `iface=<socket>`、`queues=`、`client=` 等 devargs 创建（devargs 全集见 04-02，参数名需对照 `drivers/net/vhost/rte_eth_vhost.c` 核验）。把这几个 devargs 组合起来，就能在一台机器上用两个 testpmd 进程完整模拟「前端 virtio-user—vhost-user 后端」的闭环，而不依赖 QEMU。
+
+下图把 vhost-user 的建连、特性协商、内存表与 vring 地址配置，以及后端收发 burst 的模块级链路串起来，建连协商与数据通路的关系见图 07-10-01。
+
+:::figure id=07-10-01 | name=vhost-user 建连协商与数据通路 | dir=TD
+node n1 "QEMU 或 virtio-user 前端" blue
+node n2 "UNIX socket 连接" teal
+node n3 "VHOST_USER 特性协商" teal
+node n4 "内存表与 vring 地址" amber
+node n5 "enqueue_burst 入队" green
+node n6 "dequeue_burst 出队" green
+node n7 "mbuf 与 guest 页零拷贝" purple
+node n8 "后端 DPDK 应用" gray
+edge n1 -> n2 "发起连接"
+edge n2 -> n3 "GET_FEATURES"
+edge n3 -> n4 "SET_MEM_TABLE"
+edge n4 -> n5 "队列就绪"
+edge n4 -> n6 "队列就绪"
+edge n5 -> n7 "guest 页映射"
+edge n6 -> n7 "guest 页映射"
+edge n7 -> n8 "交付后端"
+edge n8 -> n1 dashed "callfd 通知"
+:::
+
+### 3. 关键数据结构与源码位置
+
+vhost 后端库的主头文件是 `lib/vhost/rte_vhost.h`，定义驱动注册与注销、特性与协议特性设置、回调注册、启动与停止、设备与 vring 状态查询，以及 `rte_vhost_enqueue_burst` / `rte_vhost_dequeue_burst` / `rte_vhost_rx_queue_count` 等数据面入口；回调集合通常通过 `rte_vhost_driver_callback_register` 传入一个含 `new_device`、`destroy_device`、`vring_state_changed` 等成员的结构体（成员名需对照头文件核验）。内部实现文件包括 `lib/vhost/vhost_user.c`（协议消息处理）、`lib/vhost/virtio_net.c`（数据通路）、`lib/vhost/vdpa.c`（vDPA 关联）；异步与加密扩展分别在 `rte_vhost_async.h`、`rte_vhost_crypto.h`，存在性与接口需对照实际版本核验。
+
+前端与 ethdev 包装层在 `drivers/` 下：`drivers/net/virtio/` 含 virtio PMD 主体、`virtio_pci.*` 的 PCI 传输层、`virtio_rxtx.*` 的收发路径，以及 `virtio_user/` 子目录（含 `virtio_user_dev.c`、`vhost_user.c`、`vhost_kernel.c` 等，具体文件需核验）；`drivers/net/vhost/` 是 `net_vhost` 虚拟设备 PMD；`drivers/vdpa/` 是各厂商 vDPA 驱动。参考实现包括 `examples/vhost/`（vhost 交换机）、`examples/vhost_blk/` 与 `examples/vhost_crypto/`（块设备与加密后端），以及 `app/test-pmd/` 对 vdev 的通用支持。OVS-DPDK 的 `dpdkvhostuser` / `dpdkvhostuserclient` 端口是这套库最常见的生产消费方，配置方式属外部项目范畴，本篇不展开。
+
+下表汇总本篇的最小源码地图，devargs 与命令全集见 04 册，字段见 05 册。
+
+| 源码目录 | 职责定位 | 代表入口或头文件 | 延伸指向 |
+|---|---|---|---|
+| `lib/vhost/` | 后端库：注册、协商、收发 | `rte_vhost.h` | 字段见 05-10 |
+| `lib/vhost/` | vhost-user 协议消息处理 | `vhost_user.c` | 原理见 06-10 |
+| `lib/vhost/` | vring 数据通路实现 | `virtio_net.c` | 原理见 06-04 |
+| `drivers/net/virtio/` | virtio PMD 与 PCI 传输 | `virtio_ethdev.c` | 模块见 07-01 |
+| `drivers/net/virtio/virtio_user/` | virtio-user 前端 vdev | 具体文件需核验 | 命令见 04-02 |
+| `drivers/net/vhost/` | 后端 ethdev 包装 | `rte_eth_vhost.c` | 命令见 04-02 |
+| `drivers/vdpa/` | vDPA 硬件数据面 | 支持矩阵需核验 | 模块见 07-10 |
+| `examples/vhost/` | vhost 交换机参考实现 | 参数需核验 | 见 07-10 |
+
+读表时应按「控制面—数据面—前端」三层理解：`lib/vhost/` 同时承担控制面协商与数据面收发，`drivers/net/vhost/` 把数据面包装成 ethdev，`drivers/net/virtio/` 及其 `virtio_user/` 实现前端，`drivers/vdpa/` 提供硬件卸载路径。vring、mbuf 与设备结构的字段布局分别见 05-02、05-04、05-10，本篇不重列。下表再从组网形态角度做一次对照，便于按虚机或容器场景选型，其中「或」关系用转义竖线表示。
+
+| 组网形态 | 前端 \| 后端 | 主要收益 | 主要约束 |
+|---|---|---|---|
+| 虚机到物理网 | virtio-pci \| QEMU + vhost-user | 通用虚机网络 | 需 QEMU 配合 |
+| 容器回环 | virtio-user \| net_vhost | 免虚机可压测 | 依赖 socket 路径 |
+| 用户态交换 | OVS-DPDK \| vhost-user 端口 | 与现有编排集成 | 角色与重连要配对 |
+| 零拷贝通路 | dequeue zero-copy \| 外部 buf | 省一次 memcpy | mbuf 生命周期受限 |
+| 硬件卸载 | vDPA \| virtio 数据面 | 接近透传性能 | 支持矩阵需核验 |
+| 内核后端 | virtio-user \| vhost-net | 无需 DPDK 后端 | 性能受内核限制 |
+
+### 4. 关键流程与调用链
+
+一条 vhost-user 通路的模块级序列分控制面与数据面两段。控制面从后端调用 `rte_vhost_driver_register(path, flags)` 开始：注册 socket 路径与工作模式，可选地用 `rte_vhost_driver_set_features` / `rte_vhost_driver_set_protocol_features` 限定可协商特性，用 `rte_vhost_driver_callback_register` 注册设备生命周期回调，最后 `rte_vhost_driver_start(path)` 启动监听或连接。前端连上后，双方通过 `VHOST_USER_*` 消息完成特性协商、内存表下发、vring 数目与地址设置、kick/call fd 传递与队列使能；`new_device` 回调被触发时，后端拿到一个 vid（vhost device id），此后所有数据面调用都以 vid 与 queue_id 为索引。具体消息顺序与回调成员名需对照 `lib/vhost/vhost_user.c` 与 `rte_vhost.h` 核验。
+
+数据面则由后端应用在自己的 lcore 循环里调用 `rte_vhost_dequeue_burst(vid, queue_id, mbuf_pool, pkts, count)` 从 vring 取前端发来的报文，处理后调用 `rte_vhost_enqueue_burst(vid, queue_id, pkts, count)` 把报文放回 vring，必要时通过 call 通知前端；`rte_vhost_rx_queue_count` 可查待处理描述符数。若使用 `net_vhost` ethdev 包装，这些调用被藏进 PMD 的 `rx_pkt_burst` / `tx_pkt_burst` 里，应用只看到标准 `rte_eth_rx_burst` / `rte_eth_tx_burst`（模块见 07-01，原理见 06-04）。前端 virtio-user 一侧则由 `drivers/net/virtio/virtio_user/` 把同一组 vring 操作实现为 ethdev 收发，两端通过共享内存与 eventfd 互相通知。vring 描述符如何回填、DMA 地址如何映射、内存屏障在哪里配对，统一归 06 册（原理见 06-04、06-05、06-10），本篇不展开。
+
+典型组网可以分成三类，第二张图把它们并列展示，虚机、容器与共享内存后端的典型组网见图 07-10-02。第一类是虚机通路：QEMU 以 vhost-user 方式把 virtio-net 后端接到 OVS-DPDK 或自研网关，网关再从物理网卡 PMD 收发；第二类是容器通路：Pod 内的 DPDK 应用用 `net_virtio_user` 连到宿主机上的 vhost-user socket，与虚拟交换或其他 Pod 互通；第三类是共享内存通路：用 `memif` 与 VPP 或另一容器直连，绕过 vhost-user 协议（模块见 07-11）。三类通路的共同点是「前后端共享报文缓冲区、控制面走 Unix socket、数据面走共享内存」，差别主要在前端形态、是否需要 QEMU、以及卸载程度。
+
+:::figure id=07-10-02 | name=vhost-user 与 virtio-user 典型组网 | dir=TD
+node n1 "虚机 QEMU virtio-net" blue
+node n2 "vhost-user socket" teal
+node n3 "OVS-DPDK 或后端应用" teal
+node n4 "物理网卡 PMD" green
+node n5 "容器 Pod" blue
+node n6 "virtio-user vdev" amber
+node n7 "memif 或 vhost 后端" purple
+node n8 "另一容器或 VPP" purple
+node n9 "物理网络" gray
+edge n1 -> n2 "virtio-pci"
+edge n2 -> n3 "用户态后端"
+edge n3 -> n4 "转发上送"
+edge n5 -> n6 "容器内 PMD"
+edge n6 -> n2 "连同一 socket"
+edge n6 -> n7 "直连后端"
+edge n7 -> n8 "共享内存队列"
+edge n4 -> n9 "出主机"
+edge n8 -> n3 dashed "旁路回查"
+:::
+
+### 5. 配置/命令/代码实例
+
+本篇配置段只给三条最典型的命令，用两个 testpmd 进程在一台机器上搭出「net_vhost 后端 + virtio-user 前端」的闭环；完整命令族见 04-02 与 04-03，devargs 全集与示例程序参数不在此重列。虚拟设备名、devargs 名称与参数需对照实际版本核验。
+
+```bash
+# 1) 进程一：net_vhost 作为 vhost-user 后端（client 模式连前端）
+sudo ./build/app/dpdk-testpmd -l 0-3 --vdev "net_vhost0,iface=/tmp/vhu0.sock,client=1,queues=2" -- -i
+# 2) 进程二：virtio-user 作为前端连同一 socket，需隔离运行时目录
+sudo ./build/app/dpdk-testpmd -l 4-7 --file-prefix=vuser --vdev "net_virtio_user0,path=/tmp/vhu0.sock,server=1,queues=2" -- -i
+# 3) 运行 vhost 交换机示例，观察多端口后端转发
+sudo ./build/examples/dpdk-vhost -l 0-3 --socket-mem 1024 -- -p 0x1
+```
+
+下面给出示例输出，具体格式需对照实际版本核验。这段输出是按 `lib/vhost/` 的协商日志与 `examples/vhost/` 的统计打印整理出的示意结果，用来判读建连是否成功、特性是否协商一致、零拷贝与数据通路是否按预期生效。
+
+```text
+VHOST: driver registered path=/tmp/vhu0.sock flags=CLIENT
+VHOST: new connection vid=0, client mode accepted
+VHOST: negotiated features 0x30002000 MRG_RXBUF VERSION_1
+VHOST: protocol features REPLY_ACK CONFIGURE_MEM_SLOTS
+VHOST: mem table 2 regions mapped, gpa base 0x7f0000000000
+VHOST: vring 0 size=256 desc=0x7f0000001000 avail=0x7f0000002000
+VHOST: vring 0 kickfd=23 callfd=24 enabled=1
+VHOST: dequeue zero-copy enabled for vid 0
+VHOST: enq=2048 deq=2048, 0 mbuf alloc failures
+VIRTIO_USER: /tmp/vhu0.sock connected, queues=2
+```
+
+对上面这段输出逐行判读如下。第一行确认后端已按 `CLIENT` 标志注册 socket 路径，正常应显示与实际传入一致的 path 与工作模式；若缺失这一行，通常是 socket 目录权限、路径冲突或上一个进程遗留的 socket 文件未清理。第二行 `new connection vid=0` 表示前端已连上并分配了设备 id，后续所有数据面调用都以 vid=0 为索引；长时间没有这一行说明两端角色配反（server/client 混淆）或前端根本没启动。第三、四行是特性协商结果：`MRG_RXBUF`、`VERSION_1` 等标志必须与前端能力一致，缺失 `VIRTIO_F_VERSION_1` 一类关键位会导致后续内存布局解释错误；`protocol features` 中的 `CONFIGURE_MEM_SLOTS`、`REPLY_ACK` 等决定内存槽与消息确认能力，具体位名需对照 `lib/vhost/` 核验。第五行确认内存表已映射并给出 guest 物理地址基址，正常应有与前端内存规模相符的区域数；区域数异常偏少会导致后端访问前端缓冲区时越界。第六、七行给出 vring 的大小与各环地址，以及 kick/call 事件 fd 与使能状态，正常应 `enabled=1`；`enabled=0` 表示前端还没把队列置为可用，此时收发 burst 会一直返回 0。第八行确认 dequeue 零拷贝已开启，这是高收益也是高风险的开关：开启后 mbuf 直接引用前端页，后端在这些页被前端消费前不能释放或改写，若同时启用需要线性缓冲区的卸载会出问题。第九行 `enq=2048 deq=2048` 与 `0 mbuf alloc failures` 是核心健康指标：收发数量相等说明通路闭环，分配失败非零通常指向 mbuf 池过小或零拷贝下 mbuf 被长期占用。最后一行确认 virtio-user 前端以两队列连上。以上输出为示例，具体格式需对照实际版本核验。
+
+下面给出一个概念骨架，只示意后端注册、回调与数据面 burst 的模块级调用顺序，不展开任何 vring 内部实现；真实函数签名、标志位与回调成员需对照 `lib/vhost/rte_vhost.h` 核验。
+
+```c
+/* 概念骨架：vhost-user 后端注册与数据面 burst
+ * 函数签名与标志位需对照 lib/vhost/rte_vhost.h 核验
+ * 字段见 05-10 ｜ 命令见 04-02 ｜ 原理见 06-10 */
+#include <rte_vhost.h>
+
+static int
+on_new_device(int vid)
+{
+    /* 记录 vid 与队列映射，启动该设备的数据面 lcore */
+    return 0;
+}
+
+static int
+on_destroy_device(int vid)
+{
+    /* 停止数据面并释放与 vid 关联的资源 */
+    return 0;
+}
+
+static const struct virtio_net_device_ops demo_ops = {
+    .new_device = on_new_device,
+    .destroy_device = on_destroy_device,
+};
+
+int
+demo_vhost_start(const char *path, uint16_t qid,
+        struct rte_mempool *mp, struct rte_mbuf **pkts)
+{
+    uint16_t nb_rx, nb_tx;
+
+    if (rte_vhost_driver_register(path, 0) != 0)
+        return -1;
+    if (rte_vhost_driver_callback_register(path, &demo_ops) != 0)
+        return -1;
+    if (rte_vhost_driver_start(path) != 0)
+        return -1;
+    nb_rx = rte_vhost_dequeue_burst(0, qid, mp, pkts, 32);
+    if (nb_rx == 0)
+        return 0;
+    nb_tx = rte_vhost_enqueue_burst(0, qid, pkts, nb_rx);
+    return nb_tx == nb_rx ? 0 : -1;
+}
+```
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是连接与角色陷阱。server/client 配反是 vhost-user 最常见的故障：两端都监听或都主动连接，现象是 socket 文件存在但 `new_connection` 与 `new_device` 回调始终不触发。最佳实践是在编排层固定角色，并用 `rte_vhost_driver_register` 的标志位与前端 devargs 成对核验（标志名需对照 `lib/vhost/rte_vhost.h` 核验）。重连策略也要显式设计：后端崩溃后 QEMU 是否自动重连、内存表与 inflight 缓冲区能否恢复，取决于协议特性与实现，生产环境不要依赖默认行为。多个 DPDK 进程共用默认运行时目录时，务必用 `--file-prefix` 隔离 socket 与大页文件，否则后启动的进程会抢同名资源（命令见 04-01，原理见 06-10）。socket 文件与目录权限、SELinux 或容器挂载点也要纳入上线检查清单。
+
+第二类是零拷贝与缓冲区陷阱。`RTE_VHOST_USER_DEQUEUE_ZERO_COPY` 一类开关能让 dequeue 免一次 memcpy，但代价是 mbuf 数据区指向前端内存页、生命周期受前端约束：后端必须保证在这些页被消费前不释放、不改写、不做需要线性缓冲区的操作，也不能把它们长时间压在队列里。若应用会做分片、封装或加密原地改写，零拷贝往往得不偿失甚至引发数据损坏。inflight 缓冲区、postcopy 迁移与 IOMMU 特性同样成对影响内存注册方式，启用前要确认 PMD 与前端都支持（能力位需对照 `lib/vhost/` 与 04-02 核验）。多队列场景还要让 `queues=` 与前端 `VIRTIO_NET_F_MQ`、RSS 配置一致，否则会出现「只用一个队列」的隐性性能瓶颈。
+
+第三类是特性协商与版本陷阱。特性位是双方能力的交集，后端用 `rte_vhost_driver_set_features` 限定、前端用 devargs 或 QEMU 参数表达，任一侧不支持 packed vq、in-order、IOMMU platform 等特性就会静默回退到较保守布局，吞吐与行为随之变化；上线前应把协商结果写进启动日志并与预期逐项比对。virtio-user 的 devargs 在不同版本会增删（例如 `packed_vq`、`in_order`、`mrg_rxbuf`、`server`、`queues`、`mac` 等），`net_vhost` 的 `iface`、`client`、`queues` 等参数名也可能调整，一律以 `drivers/net/virtio/virtio_user/` 与 `drivers/net/vhost/rte_eth_vhost.c` 为准，完整 devargs 见 04-02。vDPA 的可用设备与能力矩阵随版本与硬件变化，选型时须对照 `drivers/vdpa/` 核验，不能照搬其他发行版的结论。前后端角色命名在部分文档里用 master/slave，较新资料改用 server/client，含义需对照实际版本核验，避免把新旧术语混为一谈。
+
+第四类是可观测性与测试实践。建连阶段重点看「socket 是否创建、连接是否建立、特性是否协商一致、内存表区域数、vring 是否 enabled」五件事；运行阶段重点看「enq 与 deq 是否相等、mbuf 分配失败是否为零、队列深度与丢包、零拷贝下 mbuf 是否及时回收」。抓包可以借助 virtio-user 侧接 pcap PMD 或用 `dpdk-pdump` 在 ethdev 包装层旁路抓取，但要注意零拷贝下 mbuf 数据区在前端内存里，旁路复制才有意义（模块见 07-11，命令见 04-05）。压测时先关闭零拷贝与高阶特性拿到功能基线，再逐项开启并对比，避免多变量同时变化导致无法归因（方法学见 08-01）。最后仍守唯一权威源：参数回查 04，字段回查 05，vring 与 DMA 机制回查 06，模块能力留在本册，排障方法回查 08。
+
+### 7. 小结与延伸阅读
+
+本篇回答了「虚机与容器的报文怎样高效进出 DPDK」：`lib/vhost/` 用 vhost-user 协议把 virtio 后端搬到用户态，以 Unix socket 传控制面、以共享 vring 传数据面；`drivers/net/virtio/` 既实现虚机内的 virtio PMD，也通过 `virtio_user/` 让 DPDK 应用直接充当 virtio 前端；`drivers/net/vhost/` 把后端包装成 ethdev，`drivers/vdpa/` 提供硬件卸载路径。零拷贝、packed vq、多队列与重连策略是性能与稳定性的关键旋钮，典型组网则覆盖虚机到物理网、容器回环与共享内存直连三类。
+
+延伸阅读建议按主线推进：想核对 vring、mbuf 与 ethdev 结构的字段布局，读 05-02、05-04、05-10；想查 `--vdev`、`--file-prefix` 与 devargs 全集，读 04-01、04-02、04-03；想深入描述符回填、DMA 映射与多进程共享内存机制，读 06-04、06-05、06-10；想按模块了解 ethdev、memif 与抓包设备，读 07-01 与 07-11；想上手可运行实现，直接读 `examples/vhost/`、`examples/vhost_blk/` 与 `app/test-pmd/`。精确 API 签名、标志位、devargs 与示例输出格式需对照 `lib/vhost/`、`drivers/net/virtio/` 与实际版本核验。下一篇 07-11 把视角收束到本机虚拟设备：bond、tap、pcap、memif 与 af_packet 各自解决什么问题，怎样创建，以及它们在抓包与测试场景里的分工。
+
+## 07-11 虚拟设备：bond / tap / pcap / memif / af_packet（各设备用途、创建参数、抓包与测试场景）
+
+### 1. 背景与动机
+
+并非每一次 DPDK 开发或部署都能拿到一块真实网卡，也并非每一种流量都需要经过物理端口。CI 流水线里要在没有硬件的容器里跑转发回归；开发者要在笔记本上验证解析逻辑；运维要把线上抓到的一段异常流量原样回放复现；虚拟交换机要把两个用户态进程用共享内存连起来；边缘环境没有大页、没有 IOMMU、也不允许绑定 PCI 设备，却仍需要把报文送进 DPDK 应用。这些场景的共同诉求是：对外仍然是一块「以太网端口」，应用照旧调用 `rte_eth_rx_burst` / `rte_eth_tx_burst`，但端口后端不是物理网卡，而是内核 TAP 设备、pcap 文件、共享内存环或内核 socket。DPDK 用虚拟设备（vdev）满足这一诉求，本篇讨论的五类设备就是最常用的几种。
+
+把它们放在一起讲，是因为它们共享同一套抽象，却解决完全不同的问题。bond 把多块物理或虚拟端口聚合成一个逻辑端口，解决带宽与冗余；tap 把 DPDK 接到内核网络协议栈与网桥，解决与 Linux 网络生态互通；pcap 用文件或实时接口做抓包与回放，解决可复现测试；memif 用共享内存在两个用户态进程之间传包，主要面向与 VPP 或另一个 DPDK 进程对接；af_packet 通过 Linux `AF_PACKET` 与 `PACKET_MMAP` 环形缓冲区收发，适合没有大页与绑卡条件的容器环境。它们都属于 ethdev 端口，创建方式都是 EAL 的 `--vdev` 参数加一组 devargs（命令见 04-02），因此从应用视角看几乎没有差别，差别全在后端实现与适用边界。
+
+需要先划清与相邻篇目的边界。07-10 讨论的 `net_vhost` 与 `net_virtio_user` 也是虚拟设备，但它们服务于「虚机或容器的前后端数据通路」，协议与协商复杂，因此单列一篇；本篇聚焦「本机功能型」虚拟设备，重点是用途、创建参数、抓包与测试场景。结构体逐字段定义见 05-04 与 05-10，devargs 与命令全集见 04-02、04-03，ethdev 收发与构造函数注册机制见 06-01、06-04，本篇不重列字段表、不展开驱动内部实现、不重列命令清单。版本基准为 23.11 LTS、24.11 与 master，凡 devargs 名称、模式常量与设备行为不确定处均标注「需对照实际版本核验」并给出 `drivers/net/` 下可定位的目录。
+
+### 2. 核心概念
+
+五类设备共享的底座是 vdev 模型。EAL 在初始化阶段解析 `--vdev name,key=value,...`，由对应驱动的 probe 入口创建一个 `rte_eth_dev` 实例并分配端口 id；应用随后用与物理端口完全相同的 `rte_eth_dev_configure`、队列设置、`rte_eth_rx_burst` / `rte_eth_tx_burst` 与统计接口操作它（字段见 05-04，原理见 06-01、06-04）。因为不占 PCI 地址，vdev 不需要 `dpdk-devbind.py` 绑定；但它们大多仍从大页内存池分配 mbuf，只有少数后端把数据缓冲区放在内核或共享内存里。理解这一点很重要：「虚拟设备」虚拟的是后端数据源，不是内存模型，规划 mempool 时仍要按端口与队列规模估算。
+
+bond 是其中最接近「真实设备」的一个。`drivers/net/bonding/` 提供运行时 API `rte_eth_bond_create(name, mode, socket_id)`，也支持用 `--vdev net_bonding0,...` 直接创建。模式常量覆盖轮询（round-robin）、主备（active-backup）、均衡（balance）、广播（broadcast）、802.3ad 动态链路聚合（LACP）、自适应发送负载均衡（TLB）与自适应负载均衡（ALB），具体常量名与取值需对照 `drivers/net/bonding/rte_eth_bond.h` 核验。创建后用 `rte_eth_bond_slave_add` / `rte_eth_bond_slave_remove` 增删成员端口，用 `rte_eth_bond_primary_set` 指定主口，用 `rte_eth_bond_xmit_policy_set` 选择二层、三层或四层散列策略，802.3ad 模式还有 `rte_eth_bond_8023ad_*` 一组 LACP 配置与聚合器信息查询接口。bond 口对外表现为单一 MAC 与单一端口统计，成员口的链路状态变化由 bonding 层汇总。
+
+tap 与 pcap 都属于「与 Linux 或文件打交道」的后端。`drivers/net/tap/` 通过打开 `/dev/net/tun` 创建 TUN/TAP 设备，用 netlink 配置 MAC、MTU 与队列，并把 `rte_flow` 规则翻译成内核 TC flower 规则（`tap_flow.c`），因此它能把 DPDK 端口接到内核网桥、OVS 或普通 IP 栈上；devargs 常见有 `iface=`、`mac=`、`remote=`、`persist=`、`speed=` 等，确切名称需对照 `drivers/net/tap/rte_eth_tap.c` 核验。`drivers/net/pcap/` 基于 libpcap，既可以用 `rx_pcap=<file>` 从文件回放报文、`tx_pcap=<file>` 把发出的报文落盘，也可以用 `rx_iface=<iface>` / `tx_iface=<iface>` 对真实接口实时抓包与注入，`infinite_rx=1` 一类参数可让文件循环回放（需核验）。两者的分工很清楚：tap 解决「互通」，pcap 解决「复现与取证」。
+
+memif 与 af_packet 则代表两类极端的性能与依赖取舍。`drivers/net/memif/` 用一段共享内存里的环形队列在两个用户态进程之间传报文，双方通过 Unix socket 协商角色、ring size、buffer size 与 region，devargs 常见有 `id=`、`socket=`、`role=`、`bsize=`、`rsize=`、`mac=`、`secret=` 等（需对照 `drivers/net/memif/rte_eth_memif.c` 核验）；角色命名在不同版本可能是 master/slave 或 server/client，含义需对照实际版本核验。它是与 VPP 互操作的主力通路，接近零拷贝但要求两端参数严格一致。af_packet 在 `drivers/net/af_packet/`，用 `AF_PACKET` 加 `PACKET_MMAP` 环形缓冲区从内核拿帧，devargs 常见有 `iface=`、`qpairs=`、`framecnt=`、`framesz=`、`blocksz=`、`qdisc_bypass=` 等（需核验）；它不需要大页与设备绑定，只需要抓包权限，因此是容器与受限环境里最易部署的选择，代价是性能在五类设备里最低。旁边还有 `drivers/net/null/` 的 `net_null` 与 `drivers/net/af_xdp/` 等邻居设备，前者常用于纯转发性能基线，存在性与参数需对照实际版本核验（模块见 07-01）。
+
+下图把五类虚拟设备放在「应用—ethdev—后端」三层里并列展示，五类虚拟设备的数据通路分层见图 07-11-01。
+
+:::figure id=07-11-01 | name=五类虚拟设备的数据通路分层 | dir=TD
+node n1 "应用 rte_eth_rx_burst" blue
+node n2 "ethdev 统一端口抽象" teal
+node n3 "bond 聚合多 slave" green
+node n4 "tap 对接内核协议栈" amber
+node n5 "pcap 文件或实时抓包" purple
+node n6 "memif 共享内存环" green
+node n7 "af_packet mmap 环" purple
+node n8 "真实网卡或文件" gray
+edge n1 -> n2 "统一收发"
+edge n2 -> n3 "端口聚合"
+edge n2 -> n4 "TUN/TAP fd"
+edge n2 -> n5 "libpcap 回放"
+edge n2 -> n6 "进程间队列"
+edge n2 -> n7 "PF_PACKET 环"
+edge n3 -> n8 "slave 端口"
+edge n4 -> n8 "内核 bridge"
+edge n5 -> n8 "pcap 文件"
+edge n6 -> n8 "对端进程"
+edge n7 -> n8 "内核 socket"
+edge n8 -> n2 dashed "状态回查"
+:::
+
+### 3. 关键数据结构与源码位置
+
+五类设备的驱动全部位于 `drivers/net/` 下以设备名命名的子目录，对外头文件与 devargs 解析也都在各自目录里。`drivers/net/bonding/` 含 `rte_eth_bond.h`（对外 API）、`rte_eth_bond_api.c`（创建与 slave 管理）、`rte_eth_bond_pmd.c`（收发路径）、`rte_eth_bond_8023ad.c`（LACP）与 `rte_eth_bond_alb.c`；`drivers/net/tap/` 含 `rte_eth_tap.c`、`tap_flow.c`、`tap_netlink.c`、`tap_tcmsgs.c` 等；`drivers/net/pcap/` 含 `rte_eth_pcap.c` 与平台相关的 `pcap_osdep.*`；`drivers/net/memif/` 含 `rte_eth_memif.c` 与 `memif_socket.*`；`drivers/net/af_packet/` 含 `rte_eth_af_packet.c`。每个目录的确切文件清单需对照实际版本核验，但「一个 vdev 一个 `drivers/net/<name>/` 目录」这一组织方式在 23.11 LTS 与 24.11 之间是稳定的。
+
+与这些驱动配套的还有几类辅助位置：`lib/ethdev/` 提供统一的端口抽象与 devargs 解析框架（模块见 07-01），`lib/mbuf/` 提供报文对象（字段见 05-02），`app/test-pmd/` 是验证所有 vdev 最常用的上层工具，参考示例里 `examples/bond/` 演示聚合、`examples/ip_pipeline/` 一类程序演示 tap 与 pcap 的接法（存在性需核验）。用户态工具侧，`dpdk-devbind.py --status` 看不到 vdev，因为它们没有 PCI 地址；诊断 vdev 应靠 `rte_eth_dev_info_get`、端口统计与 `dpdk-procinfo` 一类工具（命令见 04-05）。
+
+下表汇总本篇的最小源码地图，devargs 与命令全集见 04 册，字段见 05 册。
+
+| 源码目录 | 设备用途 | 代表入口或头文件 | 延伸指向 |
+|---|---|---|---|
+| `drivers/net/bonding/` | 链路聚合与冗余 | `rte_eth_bond.h` | 字段见 05-04 |
+| `drivers/net/tap/` | 对接内核网络栈 | `rte_eth_tap.c` | 命令见 04-02 |
+| `drivers/net/pcap/` | 抓包与文件回放 | `rte_eth_pcap.c` | 模块见 07-11 |
+| `drivers/net/memif/` | 进程间共享内存队列 | `rte_eth_memif.c` | 模块见 07-10 |
+| `drivers/net/af_packet/` | 内核 socket 收发 | `rte_eth_af_packet.c` | 命令见 04-02 |
+| `drivers/net/null/` | 空设备性能基线 | 参数需核验 | 模块见 07-01 |
+| `lib/ethdev/` | 端口抽象与 devargs | `rte_ethdev.h` | 模块见 07-01 |
+| `app/test-pmd/` | vdev 通用验证工具 | 命令见 04-03 | 见 07-11 |
+
+读表时应带着「后端决定边界」的意识：bond 的后端是别的 ethdev 端口，tap 的后端是内核 TUN/TAP，pcap 的后端是文件或 libpcap 接口，memif 的后端是另一个进程，af_packet 的后端是内核 socket。端口结构、设备配置与 mbuf 的字段布局见 05-04 与 05-02，本篇不重列。下表再从「用途与选型」维度做一次对照，便于按场景挑设备，其中「或」关系用转义竖线表示。
+
+| 设备 | 创建方式 \| 典型后端 | 典型场景 | 主要约束 |
+|---|---|---|---|
+| bond | `net_bonding0` \| 多 slave 端口 | 带宽聚合与冗余 | 成员口规格需一致 |
+| tap | `net_tap0` \| TUN/TAP fd | 与内核网桥互通 | 需 CAP_NET_ADMIN |
+| pcap | `net_pcap0` \| 文件 \| iface | 回归回放与取证 | 不适合性能基准 |
+| memif | `net_memif0` \| 共享内存 | 与 VPP \| 另一进程对接 | 两端参数须一致 |
+| af_packet | `net_af_packet0` \| 内核环 | 无大页容器环境 | 性能最低 |
+| 组合 | testpmd \| 多 vdev 共存 | 抓取与拓扑仿真 | 端口 id 需规划 |
+
+### 4. 关键流程与调用链
+
+从模块视角看，五类设备的初始化序列是统一的：EAL 解析 `--vdev` 并调用对应驱动的 probe → 驱动创建 `rte_eth_dev`、解析 devargs、建立后端资源（bond 绑定成员口、tap 打开 fd 并发 netlink、pcap 打开文件或接口、memif 建立 socket 与共享内存、af_packet 建立 mmap 环）→ 应用 `rte_eth_dev_configure` 配置队列 → `rte_eth_rx_burst` / `rte_eth_tx_burst` 在热路径上收发 → 退出时 `rte_eth_dev_close` 释放后端资源。这条链与物理 PMD 完全一致，差异只隐藏在驱动内部的 `rx_pkt_burst` / `tx_pkt_burst` 实现里（原理见 06-04，模块见 07-01）。以 tap 为例，收包最终落到 TAP fd 的 `read`，发包落到 `write`，并可能经过 TC flower 规则做分类；以 af_packet 为例，收发落在 `PACKET_MMAP` 环的帧状态位上，多队列靠 fanout 机制分发；以 pcap 为例，收包是 `pcap_next_ex` 一类调用从文件或接口读帧，发包是 `pcap_dump` 落盘。这些内部实现统一归 06 册，本篇不展开。
+
+bond 的调用链多一层聚合逻辑。用运行时 API 时，序列是 `rte_eth_bond_create` 得到 bond 端口 id → 对成员端口完成配置但保持停止状态 → `rte_eth_bond_slave_add` 逐个加入 → 需要时用 `rte_eth_bond_primary_set` 与 `rte_eth_bond_xmit_policy_set` 设定主口与散列策略 → 对 bond 口（而非成员口）调用 `rte_eth_dev_start` 与 `rte_eth_rx_burst` / `rte_eth_tx_burst`。802.3ad 模式下还要用 `rte_eth_bond_8023ad_setup` 一类接口配置 LACP 参数、用 `rte_eth_bond_8023ad_aggregator_info_get` 观察协商状态，且对端交换机必须开启 LACP，否则聚合组无法收敛（接口名需对照 `drivers/net/bonding/rte_eth_bond.h` 核验）。用 `--vdev` 创建时，`slave=` 与 `mode=` 等 devargs 会在 probe 阶段完成等价的成员绑定，命令见 04-02。
+
+memif 的调用链则多一次控制面握手。两端进程各自创建 `net_memif` vdev，通过 `socket=` 指定的 Unix 域套接字交换角色、id、ring 与 buffer 尺寸、共享内存区域信息；协商一致后，数据面直接读写共享内存里的描述符环，几乎不经过系统调用（原理见 06-10）。因此它的关键不在 ethdev API，而在两端参数必须一致：`id`、`socket`、`role`、`bsize`、`rsize`、`secret` 任一项不匹配都可能导致建连失败或数据错乱。相较之下，af_packet 完全没有用户态握手，直接依赖内核环，部署最简单但每包都要经过内核路径。把这几条链放在一起，可以归纳出选型主线：要性能且两端可控选 memif，要互通选 tap，要复现选 pcap，要零依赖选 af_packet，要带宽与冗余选 bond。
+
+### 5. 配置/命令/代码实例
+
+本篇配置段只给四条最典型的命令，覆盖五类设备中的四种创建方式；完整命令族见 04-02 与 04-03，devargs 全集与 testpmd 参数不在此重列。虚拟设备名、devargs 名称与角色术语需对照实际版本核验。
+
+```bash
+# 1) 创建 802.3ad 聚合口，成员口在 probe 阶段绑定（devargs 见 04-02）
+sudo ./build/app/dpdk-testpmd -l 0-3 --vdev "net_bonding0,mode=4,slave=0000:02:00.0,slave=0000:02:00.1,xmit_policy=l3" -- -i
+# 2) 创建 tap 口，之后可挂到内核网桥（命令见 04-05）
+sudo ./build/app/dpdk-testpmd -l 0-3 --vdev "net_tap0,iface=dtap0" -- -i
+# 3) 用 pcap 文件循环回放做可复现回归
+sudo ./build/app/dpdk-testpmd -l 0-3 --vdev "net_pcap0,rx_pcap=/tmp/in.pcap,tx_pcap=/tmp/out.pcap,infinite_rx=1" -- -i
+# 4) 创建 memif 口与 VPP 或另一进程对接（角色名需核验）
+sudo ./build/app/dpdk-testpmd -l 0-3 --vdev "net_memif0,id=0,socket=/run/memif.sock,role=client" -- -i
+```
+
+下面给出示例输出，具体格式需对照实际版本核验。这段输出是按 testpmd 的端口信息打印与 `rte_eth_dev_info_get` 类诊断整理出的示意结果，用来判读 vdev 是否被正确 probe、devargs 是否生效、以及收发计数是否闭环。
+
+```text
+EAL: vdev net_bonding0 probed, driver net_bonding
+PORT 0: net_bonding0 mode=8023AD slaves=2 xmit=l3
+PORT 0: slave 0000:02:00.0 link UP speed 10000
+PORT 0: slave 0000:02:00.1 link UP speed 10000
+PORT 1: net_tap0 iface=dtap0 fd=18
+PORT 2: net_pcap0 rx=/tmp/in.pcap tx=/tmp/out.pcap
+PORT 3: net_memif0 id=0 socket=/run/memif.sock role=client
+PORT 3: memif connected ring=1024 buffer=2048 zero-copy=0
+PORT 2: replay loop=1 linktype=EN10MB
+testpmd> show port stats all
+  RX-packets: 1048576  TX-packets: 1048576  RX-dropped: 0
+```
+
+对上面这段输出逐行判读如下。第一行确认 `net_bonding0` 已被 probe 并绑定到预期驱动，若缺失说明构建期未启用该 PMD 或 devargs 名称拼错，应回到 02-03 与 04-02 核验，而不是改应用逻辑。第二行给出聚合模式与成员口数量，正常 `slaves=2` 应与传入数量一致，`mode=8023AD` 表示 LACP，此时对端交换机必须同步开启 LACP，否则后续两行虽然显示 `link UP` 也可能聚合不收敛；`xmit=l3` 表示按三层信息散列，若业务需要按四层端口打散应改用对应策略。第三、四行显示成员口链路状态与速率，正常应全部 UP 且速率一致，速率或双工不一致会导致散列不均与吞吐抖动。第五行 `net_tap0` 给出 iface 名与 fd，正常应能在宿主机 `ip link` 里看到同名接口；看不到通常是权限不足（`CAP_NET_ADMIN`）或 iface 名冲突。第六、七行分别确认 pcap 的输入输出文件与 memif 的 id、socket、角色，读的时候要逐项对照传入 devargs，任何偏差都说明 probe 阶段解析未按预期进行。第八行 `memif connected` 是 memif 的关键健康指标：只有两端参数一致并握手成功才会出现，`ring=1024 buffer=2048` 应与对端配置相同，`zero-copy=0` 表示当前未启用零拷贝，若业务依赖零拷贝需确认两端能力。第九行 `replay loop=1` 说明 pcap 文件循环回放已开启，回归测试里这会让统计持续增长，做定量对比时必须关闭或限定抓取数量；`linktype=EN10MB` 决定解析二层头的方式，与真实链路类型不符会造成解析错位。最后一行 `RX-packets` 与 `TX-packets` 相等且 `RX-dropped: 0` 表示转发闭环正常；若 RX 远大于 TX，优先检查 bond 是否收敛、tap 是否挂到网桥、memif 对端是否在线。以上输出为示例，具体格式需对照实际版本核验。
+
+下面给出一个概念骨架，只示意运行时用 bonding API 创建端口并添加成员口，不展开任何驱动内部实现；真实函数签名与模式常量需对照 `drivers/net/bonding/rte_eth_bond.h` 核验，端口配置与收发原理见 06-04。
+
+```c
+/* 概念骨架：运行时创建 bonding 端口
+ * 函数签名与模式常量需对照 drivers/net/bonding/rte_eth_bond.h 核验
+ * 字段见 05-04 ｜ 命令见 04-02 ｜ 原理见 06-04 */
+#include <rte_eth_bond.h>
+
+int
+demo_bond_create(uint16_t slave0, uint16_t slave1, int socket_id)
+{
+    int bond_id;
+
+    bond_id = rte_eth_bond_create("net_bonding_demo",
+            BONDING_MODE_8023AD, socket_id);
+    if (bond_id < 0)
+        return -1;
+    if (rte_eth_bond_slave_add((uint8_t)bond_id, slave0) != 0)
+        return -1;
+    if (rte_eth_bond_slave_add((uint8_t)bond_id, slave1) != 0)
+        return -1;
+    if (rte_eth_bond_primary_set((uint8_t)bond_id, slave0) != 0)
+        return -1;
+    return bond_id;
+}
+```
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是创建与参数陷阱。vdev 不占 PCI，因此 `dpdk-devbind.py --status` 里看不到它们，误以为「设备没起来」而反复绑卡是常见的时间浪费；正确做法是看 EAL 的 probe 日志与 `rte_eth_dev_count_avail`。devargs 名称在不同版本会增删与改名，例如 memif 的角色可能从 master/slave 改为 server/client、pcap 的 `infinite_rx` 与 `rx_pcap` 组合行为可能调整，一律以 `drivers/net/<name>/` 源码与 04-02 为准，不要照搬旧博客。多 vdev 共存时端口 id 按创建顺序分配，脚本里硬编码 port id 容易在增删设备后错位，应通过 `rte_eth_dev_get_port_by_name` 一类接口按名字反查（接口名需核验）。bond 的成员口在加入前一般应处于已配置但未启动状态，加入后应只对 bond 口做收发，直接操作成员口会绕过聚合逻辑。
+
+第二类是各设备特有的陷阱。bond 方面：成员口应尽量同型号、同速率、同 NUMA socket，LACP 模式要对端交换机配合，`xmit_policy` 与 RSS 配置需协同，否则会出现「带宽没聚合、流量全挤在一个成员口」；主备模式切换有收敛时间，不能当零中断冗余。tap 方面：创建需要 `CAP_NET_ADMIN`，iface 名不能与已有接口冲突，`persist` 决定进程退出后接口是否保留；TC flower 规则依赖内核版本与流量控制子系统，规则下发失败时 `rte_flow` 会报错而非静默降级；性能明显低于 PMD，不要拿它做吞吐基准。pcap 方面：构建需要 libpcap 开发包，文件回放不还原原始时间间隔，`infinite_rx` 会让统计无限增长，`tx_pcap` 落盘有 I/O 开销，链路类型与校验和处理要和真实流量一致。memif 方面：两端 `id`、`socket`、`role`、`bsize`、`rsize`、`secret` 必须一致，socket 文件权限与目录要预建，零拷贝下缓冲区生命周期受对端约束；与 VPP 互通要核对双方版本支持的特性。af_packet 方面：需要 `CAP_NET_RAW`，`framesz` 要覆盖 MTU，`qdisc_bypass` 会改变内核队列行为，多队列依赖 fanout 配置，性能在五类里最低，适合功能验证而非生产高吞吐。
+
+第三类是测试与选型陷阱。最容易犯的错是把 pcap 回放或 af_packet 测出的吞吐当成真实网卡性能，这两类后端各有 I/O 与内核路径瓶颈，得出的数字没有代表性，性能基准应回到 08-01 的方法学用真实 PMD 与流量发生器。抓包与取证场景里，要区分「在 DPDK 端口上抓」与「用 `dpdk-pdump` 旁路抓」：前者改变数据通路，后者更接近线上观测（命令见 04-05，模块见 07-11）。功能回归建议优先用 pcap 文件回放，因为输入确定、可版本化、易复现；互通测试用 tap；跨进程对接用 memif；受限容器环境用 af_packet；带宽与冗余验证用 bond。组合多类 vdev 时，务必把端口 id、队列数与 mempool 规模一起规划，避免池子过小造成周期性丢包（原理见 06-03）。
+
+第四类是可观测性与运维实践。上线前把「vdev probe 日志、端口 link 状态、devargs 生效值、收发计数四元组」纳入启动自检，出现问题时按「先 probe、再 devargs、后后端资源」的顺序收敛。bond 要额外监控成员口链路与 LACP 聚合器状态，memif 要监控建连状态与 ring 占用，tap 要关注 iface 是否被内核侧误删。最后仍要守住唯一权威源：参数与命令回查 04，字段回查 05，probe 与收发机制回查 06，设备能力留在本册，抓包与排障方法回查 08，不要在虚拟设备篇里重列命令全集或展开驱动内部实现。
+
+### 7. 小结与延伸阅读
+
+本篇回答了「没有物理网卡时 DPDK 怎样收发包、怎样做测试与互通」：五类虚拟设备共享 ethdev 端口抽象，用 `--vdev` 创建，差别全在后端。bond 聚合多端口做带宽与冗余，tap 对接内核网络栈，pcap 做文件回放与取证，memif 用共享内存直连另一个用户态进程，af_packet 借内核 `PACKET_MMAP` 环在受限环境里跑通数据面。选型口诀是「要互通用 tap、要复现用 pcap、要跨进程用 memif、要零依赖用 af_packet、要聚合用 bond」。
+
+延伸阅读建议按主线推进：想核对端口与 mbuf 的字段布局，读 05-02 与 05-04；想查 `--vdev`、devargs 与 testpmd 命令全集，读 04-02、04-03、04-05；想深入 probe、构造函数注册与 ethdev 收发机制，读 06-01 与 06-04；想按模块了解 ethdev 框架、抓包与虚拟化通路，读 07-01、07-10；想上手可运行验证，直接读 `examples/bond/` 与 `app/test-pmd/` 的 `--vdev` 用法。精确 devargs、模式常量与示例输出格式需对照 `drivers/net/` 下各目录与实际版本核验。下一篇 07-12 收束本册：timer、alarm、telemetry、metrics、ip_frag 与 reorder 这组辅助库，如何为数据面补上定时、观测、分片重组与保序能力。
+
+## 07-12 辅助库：timer / alarm / telemetry / metrics / ip_frag / reorder（定时器、遥测、指标、分片重组与保序）
+
+### 1. 背景与动机
+
+一个能上生产的 DPDK 应用，绝大部分代码并不在「收包—处理—发包」这条热路径上。它还需要按周期老化转发表项、按超时重传与清理会话、在运行时被外部工具查询内部状态、把自定义计数暴露给监控系统、把被分片的大报文还原后再交给业务、以及把被多个 lcore 并行处理而乱序的报文恢复成发送顺序。这些能力单看都不产生吞吐，却共同决定了系统的可运维性与正确性：没有定时器，会话表会无限膨胀；没有遥测，线上排障只能靠加日志重启；没有分片重组，隧道与 IPsec 网关遇到大包就丢；没有保序，多核并行处理会破坏上层协议假设。DPDK 把这类能力沉淀成一组位于 `lib/` 下的辅助库，本篇把它们放在一起讨论。
+
+把它们归为一组还有一层方法论上的理由。这些库的共同约束是「不能拖累热路径」：定时器回调与遥测查询跑在控制面或旁路线程，指标更新要按批累计而不是每包一次，分片重组与保序缓冲区虽然在数据面上，却必须控制容量与超时，避免成为新的瓶颈或攻击面。因此理解它们，关键不是记住函数签名，而是理解「谁触发、在哪触发、开销由谁承担」：timer 由应用主循环主动驱动，alarm 由 EAL 中断线程驱动，telemetry 由外部客户端连接驱动，metrics 由应用埋点驱动，ip_frag 与 reorder 由报文到达驱动。触发方式不同，适用的精度、并发约束与陷阱也完全不同。
+
+先划清边界。本篇作为 07 册模块篇，只讲这六个库各自提供什么能力、暴露哪些关键 API、怎样用最典型的命令与代码把它们接进应用、以及常见的选型与组网；结构体逐字段定义见 05-02 与 05-10，命令与工具全集见 04-05、04-07，定时器内部组织、无锁队列与协同调度机制见 06-07、06-11、06-12，指标分层与监控闭环见 08-02，本篇不重列字段表、不展开内部机制与调用链、不重列命令清单。版本基准为 23.11 LTS、24.11 与 master，凡 API 名、字段名、命令名与示例输出不确定处均标注「需对照实际版本核验」并给出可定位的 `lib/` 路径。
+
+### 2. 核心概念
+
+定时类有两个库，容易混用。`lib/timer/` 提供 per-lcore 定时器：`rte_timer_subsystem_init` 初始化子系统，`rte_timer_init` 初始化单个定时器对象，`rte_timer_reset` 设定单次或周期触发的回调与周期，`rte_timer_manage` 在某个 lcore 上推进到期检查并调用回调，`rte_timer_stop` / `rte_timer_stop_sync` 停止定时器。它的时基是 TSC，精度高，但前提是该 lcore 的主循环必须周期性调用 `rte_timer_manage`；定时器归属调用 `rte_timer_reset` 的那个 lcore，不能随意迁移，非 EAL 线程场景要用 alt timer data 一类接口（接口名需对照 `lib/timer/rte_timer.h` 核验）。`rte_alarm` 则是 `lib/eal/include/rte_alarm.h`（实现在 `lib/eal/linux/eal_alarm.c` 一类路径，需核验）提供的一次性或周期性微秒级回调，`rte_eal_alarm_set` 注册、`rte_eal_alarm_cancel` 取消，回调由 EAL 的中断/定时器线程执行，不依赖应用主循环，但上下文受限，不能做重活或阻塞操作。两者的取舍很直接：需要在数据面 lcore 上精确、批量地驱动老化逻辑用 timer；需要在任意时刻触发一个轻量控制面动作用 alarm。
+
+观测类有三个层次。`lib/telemetry/` 提供运行时查询通道：EAL 启动时初始化 telemetry，库把一组命令注册到一个 Unix 域套接字（路径与运行时目录相关，受 `--file-prefix` 影响，命令见 04-01、04-07），外部客户端连上后发送命令，回调通过 `struct rte_tel_data` 组织字典或数组，由库序列化成 JSON 返回。应用侧用 `rte_telemetry_register_cmd` 注册自定义命令，用 `rte_tel_data_start_dict`、`rte_tel_data_add_dict_uint`、`rte_tel_data_add_array_*`、`rte_tel_data_string` 一类接口填充数据（字段名与函数签名需对照 `lib/telemetry/rte_telemetry.h` 核验）。`lib/metrics/` 则是一个轻量的命名计数器注册表：`rte_metrics_init` 初始化共享内存区，`rte_metrics_reg_name` / `rte_metrics_reg_names` 注册指标名并拿到 key，`rte_metrics_update_value(s)` 按端口 id 更新数值，`rte_metrics_get_names` / `rte_metrics_get_values` 读取；它通常再经 telemetry 暴露给外部（命令名需对照 `lib/metrics/` 与 04-05 核验）。`rte_eth_xstats` 与 metrics 不是一回事：前者是驱动提供的扩展统计，后者是应用自定义、按端口组织的命名计数，两者互补而非替代（模块见 07-01）。
+
+数据处理类有两个库。`lib/ip_frag/` 处理 IP 分片：`rte_ip_frag_table_create` 建重组表，`rte_ipv4_frag_reassemble_packet` / `rte_ipv6_frag_reassemble_packet` 把分片还原成完整报文，`rte_ipv4_fragment_packet` / `rte_ipv6_fragment_packet` 在发侧按 MTU 分片，`rte_ip_frag_table_del_expired_entries` 定期清理超时分片并归入 death row（字段名与函数签名需对照 `lib/ip_frag/rte_ip_frag.h` 核验）。它只做 IP 层分片重组，不做 TCP 流重组，也不负责 MTU 决策。`lib/reorder/` 处理序号保序：`rte_reorder_create` 建保序缓冲区，`rte_reorder_min_seqn_set` 设定起始序号，`rte_reorder_insert` 把带序号的 mbuf 插入，`rte_reorder_drain` 按序取出连续序号的报文。序号由应用赋值（旧版本用 `rte_mbuf::seqn`，较新版本改用 mbuf 动态字段，注册方式与字段名需对照 `lib/reorder/rte_reorder.h` 与 `lib/mbuf/rte_mbuf_dyn.h` 核验，字段见 05-02、05-10）。它与 eventdev 的 ORDERED 调度有本质区别：reorder 是库级缓冲区，靠应用主动 insert/drain 重排；ORDERED 是调度器语义，在事件放行时自动保序（模块见 07-08）。
+
+下图把六个库放在「应用—辅助能力—底层资源」三层里，并标出触发与数据流方向，辅助库的分层与数据流关系见图 07-12-01。
+
+:::figure id=07-12-01 | name=辅助库分层与数据流关系 | dir=TD
+node n1 "DPDK 应用主循环" blue
+node n2 "timer 与 alarm 定时" teal
+node n3 "telemetry 运行时查询" purple
+node n4 "metrics 指标注册表" purple
+node n5 "ip_frag 分片重组" green
+node n6 "reorder 序号保序" green
+node n7 "mbuf 与 mempool" amber
+node n8 "socket 与共享内存" gray
+edge n1 -> n2 "周期驱动"
+edge n1 -> n5 "分片报文"
+edge n1 -> n6 "乱序报文"
+edge n2 -> n7 "超时释放"
+edge n5 -> n7 "重组后 mbuf"
+edge n6 -> n7 "按序放行"
+edge n1 -> n4 "埋点更新"
+edge n4 -> n3 "导出指标"
+edge n3 -> n8 "socket 应答"
+edge n4 -> n8 "共享内存"
+edge n8 -> n3 dashed "读取回查"
+:::
+
+### 3. 关键数据结构与源码位置
+
+六个库的源码目录相当集中。`lib/timer/` 含 `rte_timer.h` 与 `rte_timer.c`；alarm 的头文件在 `lib/eal/include/rte_alarm.h`，实现文件在 `lib/eal/` 下按操作系统分目录（具体路径需对照实际版本核验）。`lib/telemetry/` 含 `rte_telemetry.h`、`telemetry.c`、`telemetry_data.c` 与 JSON 相关辅助文件；`lib/metrics/` 含 `rte_metrics.h` 与 `rte_metrics.c`，较新版本可能还有 telemetry 集成文件（存在性需核验）。`lib/ip_frag/` 含 `rte_ip_frag.h`、`rte_ipv4_fragmentation.c`、`rte_ipv4_reassembly.c`、`rte_ipv6_fragmentation.c`、`rte_ipv6_reassembly.c` 与 `ip_frag_common.h`；`lib/reorder/` 含 `rte_reorder.h` 与 `rte_reorder.c`。与之强相关的还有 `lib/mbuf/rte_mbuf_dyn.h`（动态字段注册）与 `lib/net/` 下的 IP/ESP 头定义。
+
+验证与消费这些库的落点也很明确：`app/test/test_timer.c`、`test_alarm.c`、`test_telemetry.c`、`test_metrics.c`、`test_ipfrag.c`、`test_reorder.c` 是自测入口（文件名与 autotest 名称需核验）；`examples/ip_fragmentation/` 与 `examples/ip_reassembly/` 演示分片与重组；`usertools/dpdk-telemetry.py` 是官方 telemetry 客户端；`examples/ipsec-secgw/` 在收包路径里用到重组（模块见 07-07）。命令与工具全集见 04-05、04-07。
+
+下表汇总本篇的最小源码地图，字段见 05 册，命令全集见 04 册。
+
+| 源码目录 | 能力定位 | 代表入口或头文件 | 延伸指向 |
+|---|---|---|---|
+| `lib/timer/` | per-lcore 定时器 | `rte_timer.h` | 字段见 05-10 |
+| `lib/eal/` | 微秒级 alarm 回调 | `rte_alarm.h` | 命令见 04-01 |
+| `lib/telemetry/` | 运行时 JSON 查询 | `rte_telemetry.h` | 命令见 04-07 |
+| `lib/metrics/` | 命名指标注册表 | `rte_metrics.h` | 字段见 05-10 |
+| `lib/ip_frag/` | IPv4 \| IPv6 分片重组 | `rte_ip_frag.h` | 原理见 06-12 |
+| `lib/reorder/` | 序号保序缓冲区 | `rte_reorder.h` | 模块见 07-08 |
+| `lib/mbuf/` | 序号动态字段 | `rte_mbuf_dyn.h` | 字段见 05-02 |
+| `usertools/` | telemetry 客户端 | `dpdk-telemetry.py` | 命令见 04-05 |
+
+读这张表时要按「触发方式」归类：timer 与 alarm 是时间触发，telemetry 是外部查询触发，metrics 是应用埋点触发，ip_frag 与 reorder 是报文到达触发。`rte_timer`、`rte_tel_data`、`rte_ip_frag_tbl`、`rte_reorder_buffer` 等结构的逐字段含义见 05-10 与 05-02，本篇不重列。下表再从「能力与选型」角度做一次对照，便于按需求挑库，其中「或」关系用转义竖线表示。
+
+| 需求 | 选用库 | 触发方式 | 主要约束 |
+|---|---|---|---|
+| 周期老化表项 | timer \| alarm | 主循环 \| 中断线程 | timer 绑 lcore |
+| 运行时状态查询 | telemetry | 客户端连接 | 回调不可阻塞 |
+| 自定义计数上报 | metrics | 应用埋点 | 按批累计勿每包更新 |
+| 大包还原 | ip_frag | 分片到达 | 表容量与超时须规划 |
+| 并行后恢复顺序 | reorder | 报文插入 | 序号缺口会阻塞 |
+| 事件级保序 | eventdev ORDERED | 调度放行 | 模块见 07-08 |
+
+### 4. 关键流程与调用链
+
+把六个库的模块级调用序列依次串起来，可以清楚看到「谁驱动谁」。timer 的序列是 `rte_timer_subsystem_init` → `rte_timer_init(&timer)` → `rte_timer_reset(&timer, ticks, PERIODICAL, lcore_id, callback, arg)` → 每个持有定时器的 lcore 在主循环里周期性 `rte_timer_manage()` → 到期回调执行 → 退出前 `rte_timer_stop_sync`。这里最关键的契约是「manage 必须被调用」：没有它，定时器永不触发；而 manage 的调用频率直接决定定时精度与抖动（内部组织与迁移限制见 06-11）。alarm 的序列更短：`rte_eal_alarm_set(us, callback, arg)` → EAL 定时器线程到期执行回调 → `rte_eal_alarm_cancel(callback, arg)`；回调运行在中断线程上下文，不能做阻塞、长临界区或大量计算，否则会影响 EAL 的事件处理（机制见 06-11）。
+
+观测类的序列是「注册—填充—应答」。应用启动时 `rte_metrics_init(socket_id)` 建指标区，`rte_metrics_reg_name("name")` 拿到 key，运行中用 `rte_metrics_update_value(s)` 按端口累计；同时 `rte_telemetry_register_cmd("/demo/stats", cb, help)` 注册命令。外部客户端连接 telemetry socket 并发送命令后，库调用回调，回调内 `rte_tel_data_start_dict`、`rte_tel_data_add_dict_uint` 等组织返回值，库序列化成 JSON 回写。整个查询不进入数据面热路径，但回调若读取被多个 lcore 同时更新的数据，需要适当的同步或采用最终一致的快照（原理见 06-07、06-11，命令见 04-07）。ip_frag 的序列是：建表 `rte_ip_frag_table_create` → 收包后判断是否分片 → 分片走 `rte_ipv4_frag_reassemble_packet` 或 IPv6 对应接口，得到完整 mbuf 后继续业务处理 → 发侧若超过 MTU 用 `rte_ipv4_fragment_packet` 切成多个 mbuf → 定期 `rte_ip_frag_table_del_expired_entries` 把超时分片移入 death row 并释放。reorder 的序列是：建缓冲区 `rte_reorder_create` → `rte_reorder_min_seqn_set` 设定起始序号 → 各 worker 处理完给 mbuf 打序号并 `rte_reorder_insert` → 出口 `rte_reorder_drain` 按序取出连续报文。以上所有函数名、参数顺序与字段名需对照对应 `lib/` 头文件核验，本篇只给骨架，内部哈希、跳表、环形缓冲与内存序机制统一归 06 册（原理见 06-07、06-12）。
+
+把这六条链放在一起，能得出一条贯穿全册的实践原则：辅助库应尽量待在热路径之外或临界区之外。timer 的 manage、metrics 的更新、telemetry 的回调都是低频动作，可以按批累计、按周期驱动；ip_frag 与 reorder 虽在数据面上，但也应通过表容量、超时与缓冲区大小设上限，避免被异常流量拖垮。至于 `rte_timer` 的 per-lcore 跳表如何组织、`rte_ip_frag_tbl` 的哈希桶与超时回收如何做、`rte_reorder_buffer` 如何判定连续序号，属于机制与内部实现，本册不展开（原理见 06-11、06-12）。
+
+### 5. 配置/命令/代码实例
+
+本篇配置段只给四条最典型的命令，覆盖 telemetry 查询与分片重组示例；完整命令族见 04-05 与 04-07，工具参数与示例程序选项不在此重列。telemetry 协议细节、命令名与示例输出需对照实际版本核验。
+
+```bash
+# 1) 查询 telemetry 全局信息（协议与命令族见 04-05、04-07）
+printf '/info\n' | socat - UNIX-CONNECT:/var/run/dpdk/rte/dpdk_telemetry.v2
+# 2) 查询 0 号端口扩展统计
+printf '/ethdev/xstats,0\n' | socat - UNIX-CONNECT:/var/run/dpdk/rte/dpdk_telemetry.v2
+# 3) 运行分片示例，验证 ip_frag 发侧分片
+sudo ./build/examples/dpdk-ip_fragmentation -l 0-3 -- -p 0x3
+# 4) 运行重组示例，验证 ip_frag 收侧重合
+sudo ./build/examples/dpdk-ip_reassembly -l 0-3 -- -p 0x3
+```
+
+下面给出示例输出，具体格式需对照实际版本核验。这段输出前半是按 telemetry 客户端回包整理出的示意 JSON，后半是示例程序与库初始化的诊断打印，用来判读遥测是否可用、指标是否合理、分片与保序缓冲区是否按预期工作。
+
+```text
+{"/info":{"version":"DPDK 23.11.0","pid":24117,"hostname":"node01","lcore_count":8}}
+{"/ethdev/xstats,0":{"rx_good_packets":1048576,"tx_good_packets":1048576,"rx_missed_errors":0,"rx_mbuf_allocation_errors":0}}
+IP_FRAG: table entries=65536 bucket_entries=8 max_cycles=10000000
+IP_FRAG: reassembled=4096 death_row_drained=0 expired=0
+REORDER: buffer size=1024 min_seqn=1 drained=4096 pending=0
+TIMER: subsystem init, 2 periodic timers armed
+METRICS: registered names=4, telemetry export enabled
+```
+
+对上面这段输出逐行判读如下。第一行是 `/info` 的回包，正常应包含版本、进程 id、主机名与 lcore 数量；`lcore_count` 应与 EAL 启动时探测到的核数一致，若明显偏小，通常是容器 cpuset 限制或 `--lcores` 配置把核藏起来了。第二行是端口扩展统计，`rx_good_packets` 与 `tx_good_packets` 应基本相等且持续增长，`rx_missed_errors` 非零说明收包侧队列或描述符不足，`rx_mbuf_allocation_errors` 非零说明 mempool 耗尽，这两项是判断遥测读数是否可信的前置条件；命令名、参数形式与字段名需对照 `lib/telemetry/` 与 04-05 核验。第三行给出重组表配置：`entries` 是可容纳的分片条目数，`bucket_entries` 是每桶条目数，`max_cycles` 决定分片超时用多少个时钟周期衡量，三项都应按并发分片流数量与预期时延估算，表过小会在突发大包时直接丢分片。第四行 `reassembled=4096` 表示成功重组的数据报数，`death_row_drained=0` 与 `expired=0` 表示没有超时分片被清理，属于健康状态；若 `expired` 持续增长，说明有分片始终凑不齐，可能是分片丢失、乱序严重或 `max_cycles` 设得太短。第五行 `REORDER` 给出保序缓冲区大小、起始序号与放行数量，`drained=4096` 且 `pending=0` 表示没有序号缺口造成的积压；`pending` 长期不为零说明某个序号的报文迟迟未到，出口会被队头阻塞，此时要检查序号赋值是否连续、是否有 worker 漏插。第六行确认 timer 子系统初始化并挂了两个周期定时器，若应用依赖老化逻辑却看不到这一行，应检查主循环是否调用了 `rte_timer_manage`。第七行 `METRICS` 确认已注册四个指标名且 telemetry 导出可用；注册数量为零通常意味着 `rte_metrics_init` 或 `rte_metrics_reg_name` 未成功，查询端会拿不到自定义指标。以上输出为示例，具体格式需对照实际版本核验。
+
+下面给出一个概念骨架，只示意注册一个 telemetry 命令并初始化 metrics，不展开任何库内部实现；真实函数签名、字段名与返回值需对照 `lib/telemetry/rte_telemetry.h` 与 `lib/metrics/rte_metrics.h` 核验。
+
+```c
+/* 概念骨架：注册 telemetry 命令与 metrics 指标
+ * 函数签名与字段名需对照 lib/telemetry/ 与 lib/metrics/ 核验
+ * 字段见 05-10 ｜ 命令见 04-05 ｜ 原理见 06-11 */
+#include <rte_telemetry.h>
+#include <rte_metrics.h>
+
+static int
+demo_stats_cb(const char *cmd, const char *params,
+        struct rte_tel_data *d)
+{
+    RTE_SET_USED(cmd);
+    RTE_SET_USED(params);
+    rte_tel_data_start_dict(d);
+    rte_tel_data_add_dict_uint(d, "demo_pkts", 4096);
+    return 0;
+}
+
+int
+demo_observability_init(int socket_id)
+{
+    if (rte_metrics_init(socket_id) != 0)
+        return -1;
+    if (rte_metrics_reg_name("demo_pkts") < 0)
+        return -1;
+    if (rte_telemetry_register_cmd("/demo/stats",
+            demo_stats_cb, "demo packet counters") != 0)
+        return -1;
+    return 0;
+}
+```
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是定时器类陷阱。timer 最常见的故障是「定时器不触发」：根因几乎总是某个 lcore 的主循环没有周期性调用 `rte_timer_manage`，或把定时器 reset 到一个不跑 manage 的 lcore 上；由于 `rte_timer` 归属于 reset 时所在的 lcore，跨核迁移会破坏这一契约，非 EAL 线程场景要改用 alt timer data 一类接口（名称需对照 `lib/timer/rte_timer.h` 核验）。周期回调里不能做阻塞或重计算，否则会拖慢整个主循环、抬高收包时延；停止定时器优先用带同步语义的接口，避免回调正在执行时对象被释放。alarm 的单位是微秒，回调运行在 EAL 的中断线程上下文，同样不能阻塞、不能长时间持锁，且 `rte_eal_alarm_set` 与 `rte_eal_alarm_cancel` 必须按 callback 与 arg 配对，否则回调会在预期之外继续触发。两者的精度都不等于硬实时，TSC 依赖不变时钟，容器与节能调频环境要额外核验（原理见 06-11）。
+
+第二类是观测类陷阱。telemetry 的命令回调可能被外部客户端在任意时刻触发，若它直接读取被多个 lcore 高频更新的计数器而没有同步或快照，读数会抖动甚至出现不一致；正确做法是按批累计到独立结构，或用最终一致的采样。回调里不要做重计算、磁盘 I/O 或长临界区，否则一次查询就会拖慢数据面。metrics 与 xstats 的分工要分清：metrics 是应用自定义命名计数，xstats 是驱动扩展统计，混用会让指标口径混乱，监控侧应分别采集（模块见 07-01，方法学见 08-02）。还要避免每包更新 metrics：注册表基于共享内存，逐包更新的开销与竞争都不可接受，应按批或按周期累加。telemetry socket 路径受 `--file-prefix` 影响，多实例共存时必须隔离；命令名、参数格式与 v1/v2 协议差异需对照 `lib/telemetry/` 与 04-07 核验。
+
+第三类是分片与保序类陷阱。ip_frag 的重组表容量、桶深度与超时周期要按并发分片流估算，过小会在突发大包时丢分片，过大会浪费内存并给恶意分片攻击留下空间；`rte_ip_frag_table_del_expired_entries` 必须被周期性调用，否则超时分片与 death row 里的 mbuf 长期不释放，最终耗尽 mempool。它只负责 IP 层分片，不做 TCP 流重组，也不替应用决定 MTU；链式 mbuf、间接 mbuf 与分片后的校验和卸载要按 `lib/mbuf/` 的约定处理（字段见 05-02，原理见 06-03）。reorder 要记住序号是应用自己赋的，不是 TCP 序号：`rte_reorder_min_seqn_set` 设错起点会导致所有报文被判为缺口而永久积压；`rte_reorder_insert` 在缓冲区满时可能失败，应用必须处理返回值而不是假设一定成功；`rte_reorder_drain` 只放行连续序号，一个缺失序号就会造成队头阻塞，因此要配合超时或旁路策略。它与 eventdev 的 ORDERED 调度定位不同，不要用来替代调度器（模块见 07-08）。mbuf 序号动态字段的注册在所有进程里必须一致，多进程场景尤其容易出错（字段见 05-02、05-10）。
+
+第四类是共性实践与版本差异。六个库都应尽量待在热路径之外：定时与遥测放在控制面或独立 lcore，指标按批累计，分片与保序设容量上限并接入超时清理。上线前把「定时器触发次数、telemetry 可连接、metrics 注册数、重组成功与超时数、reorder 放行与积压数」做成启动自检与持续指标，出现回退时按「先触发链、再容量、后同步」的顺序收敛。跨版本迁移要特别注意 mbuf 序号从固定字段改为 dynfield、telemetry 协议与命令族、以及 alarm 头文件目录的调整，一律以实际 `lib/` 头文件与 `app/test/` 自测为准，不要照搬旧示例。最后守住唯一权威源：参数与命令回查 04，字段回查 05，跳表、哈希与内存序机制回查 06，模块能力留在本册，指标分层与排障方法回查 08，不要在辅助库篇里重列命令全集或展开内部实现。
+
+### 7. 小结与延伸阅读
+
+本篇回答了「数据面之外还需要哪些库」：timer 与 alarm 提供时间触发能力，前者由主循环驱动、精度高且绑 lcore，后者由 EAL 线程驱动、使用简单但上下文受限；telemetry 与 metrics 提供运行时可观测性，一个负责对外查询通道，一个负责应用自定义计数注册表；ip_frag 负责 IPv4/IPv6 分片与重组，reorder 负责把并行处理打乱的报文按应用序号恢复顺序。六者的共同设计约束是不拖累热路径，因此触发方式、容量上限与超时清理比函数签名更值得记住。
+
+延伸阅读建议按主线推进：想核对 `rte_timer`、`rte_tel_data`、`rte_ip_frag_tbl`、`rte_reorder_buffer` 与 mbuf 动态字段的布局，读 05-02 与 05-10；想查 telemetry、procinfo 与示例程序命令全集，读 04-05、04-07；想深入 per-lcore 跳表、无锁队列、事件线程与协同调度机制，读 06-07、06-11、06-12；想按模块了解 ethdev 扩展统计、事件保序与 IPsec 网关，读 07-01、07-08 与 07-07；想上手可运行实现，直接读 `examples/ip_fragmentation/`、`examples/ip_reassembly/`、`app/test/test_reorder.c` 与 `usertools/dpdk-telemetry.py`。精确 API 名、字段名、命令名与示例输出格式需对照对应 `lib/` 头文件与实际版本核验。至此 07 册从 ethdev 与 mempool 等核心库，到 cryptodev、eventdev、graph、vhost 与虚拟设备，再到本篇的辅助库，完整覆盖了库与驱动模块的功能、用法与组网选型；参数、字段、机制与排障方法分别由 04、05、06、08 各册作为唯一权威源承接，读者可按「模块见 07-xx ｜ 命令见 04-xx ｜ 字段见 05-xx ｜ 原理见 06-xx」的交叉引用回查。

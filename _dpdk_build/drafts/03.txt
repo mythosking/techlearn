@@ -1,0 +1,1427 @@
+# DPDK 技术资料 · 03 部署与环境配置
+
+> 本册定位：部署实战。全部 6 篇采用 C 实战型骨架（目标与拓扑 / 前置条件与环境 / 分步操作 / 验证方法与预期结果 / 常见失败与排错 / 小结），每步给出可复制的真实命令、配置片段、典型输出与判读。
+> 版本基准：DPDK 23.11 LTS / 24.11 / master。内核参数、sysfs 路径、脚本名与 CRD 名称随发行版和版本变化处均标注「需对照实际版本核验」并给出可定位路径。
+> 去重约定：EAL 运行时参数「完整参数见 04-01」；`dpdk-devbind.py` / `dpdk-hugepages.py` 等工具「完整命令族见 04-05」；大页与 IOVA 内部机制「原理见 06-02」，内存结构体「字段见 05-07」；vhost / virtio 模块功能「模块见 07-10」。本册只给本场景必需的最小命令，不重列命令全集与字段表。
+
+## 03-01 硬件要求与 NUMA 拓扑规划
+
+### 1. 目标与拓扑
+
+DPDK 之所以能在通用服务器上做到每核数百万甚至上千万包每秒的转发能力，根源在于它用轮询取代中断、用用户态驱动旁路内核协议栈、让网卡通过 DMA 直接读写应用预先分配的内存。这三条设计把数据路径上的软件开销压到极低，但也带来一个直接后果：性能不再主要由 CPU 主频与核心数量决定，而是由「网卡、内存、CPU 核心」三者之间的物理距离决定。在多路服务器上，这个距离就是 NUMA 拓扑。因此部署 DPDK 的第一步不是安装软件包，也不是急于运行任何一个 `dpdk-*` 工具，而是把硬件拓扑看清楚，并据此制定一份「哪个端口由哪些核心处理、内存从哪个节点分配」的规划表。如果这一步做错，后续所有调优都只是在错误的基础上做修补，最典型的表现就是大页配足了、卡也绑好了，吞吐却始终达不到预期，最后才发现报文跨越了两颗 CPU 之间的互连链路。
+
+NUMA 的含义是非一致性内存访问。在一台双路服务器里，每个物理 CPU 封装（Socket，也叫 Package）都带有自己直连的内存控制器、本地内存条、最后一级缓存以及 PCIe 根复合体（Root Complex）。插在某个根复合体下游槽位上的网卡，与这个 Socket 之间是一条短而宽的 PCIe 链路；而它要访问挂在另一个 Socket 上的内存，就必须经过两颗 CPU 之间的 UPI（Intel）或 xGMI / Infinity Fabric（AMD）互连。这条互连链路的延迟通常是本地访存的数倍，带宽也只是本地内存带宽的一部分，并且会与另一个 Socket 上的其他流量共享。DPDK 的轮询主循环每处理一个包都要反复读写 mbuf 头部、描述符环、mempool 的 per-lcore 缓存与队列元数据，如果这些访存持续跨越互连，累积的延迟会直接表现为转发吞吐下降和尾延迟抖动。所谓「同 Socket 原则」，就是让处理某端口的 lcore、该端口所在的 PCIe 设备、以及承载报文的 mempool 与 mbuf 全部落在同一个 NUMA 节点上，把跨节点访问尽量压缩到控制面与旁路流量。
+
+本篇的具体目标可以拆成四项。第一，确认 BIOS 与内核都真正启用了 NUMA，而不是把两个节点做内存交错（Node Interleaving / Memory Interleaving）之后伪装成一个均匀的大节点，这种伪装在 `numactl -H` 里只会显示一个节点，是后续一切 NUMA 优化失效的根源。第二，用工具把 CPU 核心、内存节点、PCIe 设备三者的归属关系完整读出来，尤其是每个网卡端口的 `numa_node` 值，以及超线程兄弟核的配对关系。第三，基于这份拓扑生成一份可执行的资源规划表，明确每个端口对应的 lcore 集合、每个节点的内存配额以及预留给内核与系统进程的 housekeeping 核心。第四，把规划结果落成后续篇章的输入：大页按节点预留承接 03-02，网卡按 BDF 绑定承接 03-03，核心隔离承接 03-04，运行时参数承接 04-01（完整参数见 04-01），跨节点访存代价的定量分析则属机制范畴（原理见 06-09）。
+
+双路服务器的物理拓扑与设备归属关系如图 03-01-01 所示，图中两颗 Socket 各自直连本地内存、本地 PCIe 根复合体与本地核心，中间的互连链路承担跨节点访存。在此基础上把「网卡—节点—内存—核心」的正确绑定关系与跨节点反例对照画出，见图 03-01-02。
+
+:::figure id=03-01-01 | name=双路服务器 NUMA 拓扑与设备归属 | dir=TD
+node n1 "Socket 0" blue
+node n2 "Socket 1" blue
+node n3 "本地内存 Node0" teal
+node n4 "本地内存 Node1" teal
+node n5 "PCIe RC0<br/>网卡 P0" amber
+node n6 "PCIe RC1<br/>网卡 P1" amber
+node n7 "lcore 0-15<br/>HT 16-31" purple
+node n8 "lcore 32-47<br/>HT 48-63" purple
+node n9 "UPI 互连<br/>跨节点访存" gray
+edge n1 -> n3 "直连本地"
+edge n1 -> n5 "PCIe 归属"
+edge n1 -> n7 "本地核心"
+edge n2 -> n4 "直连本地"
+edge n2 -> n6 "PCIe 归属"
+edge n2 -> n8 "本地核心"
+edge n9 -> n1 "互连"
+edge n9 -> n2 "互连"
+edge n9 -> n1 dashed "回查距离"
+:::
+
+同 Socket 绑定的资源关系如图 03-01-02 所示：网卡、lcore 与大页内存应尽量落在同一 NUMA 节点。
+
+:::figure id=03-01-02 | name=网卡-lcore-内存同 Socket 绑定规划 | dir=TD
+node n1 "端口 P0<br/>BDF 0000:3b:00.0" amber
+node n2 "numa_node 0" teal
+node n3 "socket-mem<br/>Node0 独占" green
+node n4 "lcore 2-9<br/>同 Socket" purple
+node n5 "端口 P1<br/>BDF 0000:af:00.0" amber
+node n6 "numa_node 1" teal
+node n7 "socket-mem<br/>Node1 独占" green
+node n8 "lcore 34-41<br/>同 Socket" purple
+node n9 "跨 Socket 收发<br/>UPI 代价高" red
+edge n1 -> n2 "sysfs 读取"
+edge n2 -> n3 "就近分配"
+edge n3 -> n4 "本地轮询"
+edge n1 -> n4 "直接归属"
+edge n5 -> n6 "sysfs 读取"
+edge n6 -> n7 "就近分配"
+edge n7 -> n8 "本地轮询"
+edge n5 -> n8 "直接归属"
+edge n9 -> n1 dashed "反例回查"
+:::
+
+### 2. 前置条件与环境
+
+动手之前需要把硬件、固件、内核与用户态工具四条线各自确认到位，任何一条不满足都会让后面的判读失真。硬件层面要求一台开启 NUMA 的多路服务器，常见为 Intel Xeon Scalable 或 AMD EPYC 双路机型，至少一块支持 DPDK PMD 的 PCIe 网卡（如 Intel X710 / XL710 / E810 系列或 Mellanox ConnectX 系列，具体 PMD 支持列表见 07-10，模块见 07-10）。网卡的物理槽位必须与目标 Socket 直连，这一点不能凭直觉，需要查主板手册里 PCIe lane 与 CPU 的归属表，不同机型差异很大，需对照实际机型核验。
+
+固件层面进入 BIOS 需要确认三件事：其一，NUMA / Node Interleaving 必须设置为「禁用交错」，也就是让每个 Socket 保留独立的内存节点；其二，VT-d（Intel）或 AMD-Vi / IOMMU（AMD）必须开启，虽然本步只做拓扑判读，但 03-03 绑定 vfio-pci 强依赖它，提前打开可避免二次重启；其三，超线程（HT / SMT）按需决定开关，DPDK 场景通常保留超线程但只把物理核的主线程分配给轮询 lcore，兄弟线程留给 housekeeping，若关闭超线程则核心编号会整体变化，规划表要重做。以上选项名称随 BIOS 厂商不同，需对照实际机型核验。
+
+内核层面需要 `CONFIG_NUMA=y`、`CONFIG_ACPI_NUMA=y`、`CONFIG_X86_64_ACPI_NUMA=y` 以及 `CONFIG_NUMA_EMU` 之类非必需项，检查方式是读取当前内核配置文件；同时确认内核启动命令行里没有 `numa=off`。用户态工具层面需要 `hwloc`（提供 `lstopo` / `lstopo-no-graphics`）、`numactl`（提供 `numactl -H`）、`pciutils`（提供 `lspci`）、`util-linux`（提供 `lscpu`），用发行版包管理器安装即可。所有读取 `/sys` 的操作普通用户可执行，但后续修改绑定与隔离参数需要 root。本篇依赖的工具与内核能力对照见下表，安装前请逐项确认；表中「或」关系用转义竖线书写，避免表格错列。
+
+| 工具 / 能力 | 作用 | 安装或核验命令 | 备注 |
+|---|---|---|---|
+| numactl | 查看节点与距离矩阵 | dnf install numactl \| apt install numactl | 提供 numactl -H |
+| hwloc / lstopo | 图形化拓扑与 PCI 归属 | dnf install hwloc \| apt install hwloc | 无图形环境用 lstopo-no-graphics |
+| pciutils / lspci | 枚举 PCI 设备与 BDF | lspci -nnk | 读扩展配置空间需 root |
+| util-linux / lscpu | CPU 与 NUMA 概览 | lscpu -e=CPU,NODE,SOCKET | 字段名随版本变化，需核验 |
+| 内核 NUMA 配置 | 多节点是否生效 | grep CONFIG_NUMA /boot/config-$(uname -r) | 期望值为 =y |
+| 内核启动参数 | 排除 numa=off | cat /proc/cmdline | 出现 numa=off 必须删除 |
+
+软件版本基准统一为 DPDK 23.11 LTS / 24.11 / master。需要注意的是 `lstopo` 的输出层级、`numactl -H` 的距离矩阵数值、`lscpu -e` 支持的列名都会随 hwloc、numactl、util-linux 的版本变化，本篇给出的输出均为示例，具体格式需对照实际版本核验。另外，如果部署目标是虚拟机或云实例，Guest 看到的 NUMA 拓扑取决于 Hypervisor 是否透传 vNUMA 与 PCIe 亲和，扁平化的单节点视图会让本篇的规划方法失去意义，这类场景的注意点放到 03-05 展开。
+
+### 3. 分步操作
+
+**第一步：确认内核与命令行层面 NUMA 生效。** 先读内核编译配置与启动参数，排除「内核没编 NUMA」和「启动参数把 NUMA 关掉」两类硬伤，再读 `/sys/devices/system/node/` 目录看实际枚举出的节点数量。这三步是后续所有判读的前提，只要其中任意一步显示单节点，就应回到 BIOS 检查交错设置，而不是继续往下配大页。
+
+```bash
+grep -E 'CONFIG_(NUMA|ACPI_NUMA|X86_64_ACPI_NUMA)=' /boot/config-$(uname -r)
+cat /proc/cmdline
+ls -1 /sys/devices/system/node/
+lscpu | grep -i 'NUMA node'
+```
+
+**第二步：用 numactl 读取节点与距离矩阵。** 这是判读 NUMA 拓扑最权威的一步，输出里同时包含每个节点的 CPU 列表、内存容量、空闲量以及节点间距离。以下为示例输出，具体格式需对照实际版本核验。
+
+```bash
+numactl -H
+```
+
+```text
+available: 2 nodes (0-1)
+node 0 cpus: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47
+node 0 size: 128933 MB
+node 0 free: 120441 MB
+node 1 cpus: 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63
+node 1 size: 129018 MB
+node 1 free: 121004 MB
+node distances:
+node   0   1
+  0:  10  21
+  1:  21  10
+```
+
+判读说明（150 字以上）：首行 `available: 2 nodes (0-1)` 表明内核确实枚举出两个 NUMA 节点，若这里只有 `1 nodes (0)` 则多半是 BIOS 开启了内存交错或命令行带了 `numa=off`，必须先修正。`node 0 cpus` 与 `node 1 cpus` 两行给出每个节点管辖的逻辑 CPU 编号，注意本例中编号并非连续分段：0 到 15 与 32 到 47 属于节点 0，16 到 31 与 48 到 63 属于节点 1，这正是超线程与双路交织编号的典型形态，规划 lcore 时必须按这份列表而不是想当然地按编号对半切分。`size` 与 `free` 以 MB 为单位，反映本地内存总量与当前可用量，规划大页数量时不能超过 `free`。最后的 `node distances` 距离矩阵是相对代价：本地到自身为 10，跨节点为 21（不同机型可能是 20 或 32，需对照实际版本与机型核验），数值越大代表跨节点访存越贵；只要矩阵非对角元素明显大于 10，就说明「同 Socket 原则」在这台机器上有实际收益，反之若全为 10 则要怀疑拓扑被扁平化。
+
+**第三步：用 lstopo 生成可读拓扑并定位 PCIe 层级。** 有图形环境可直接 `lstopo` 输出 PNG 或窗口；服务器通常只有字符终端，用 `lstopo-no-graphics` 输出文本树或 `.xml`，重点看 Package、NUMANode、Core、PU 四层以及挂在 HostBridge / PCIBridge 下的网卡设备。`lstopo` 能把网卡归到某个 Package 之下，是判断槽位归属的直观依据。输出文件名与参数随 hwloc 版本变化，需对照实际版本核验。
+
+```bash
+lstopo-no-graphics --of txt topology.txt
+lstopo-no-graphics --of xml topology.xml
+lstopo --of png topology.png
+grep -n -i 'Net\|PCI 0000:3b\|Package\|NUMANode' topology.txt | head -n 40
+```
+
+**第四步：读取每个网卡端口的 BDF 与 numa_node。** 这是把拓扑落到具体设备上的关键一步。先用 `lspci -nn` 找到网卡的 PCI 地址（BDF，格式 `域:总线:设备.功能`），再用 `lspci -tv` 看它挂在哪个 PCIe 树分支，最后直接读 sysfs 里的 `numa_node`。对多端口网卡，每个 PF 是独立 BDF，要逐个读取；对 SR-IOV 场景，VF 同样各有 BDF，放到 03-05 处理。sysfs 路径中的 `0000:3b:00.0` 需替换为本机实测值。
+
+```bash
+lspci -nn | grep -i 'Ethernet controller'
+lspci -tv
+readlink -f /sys/class/net/ens1f0/device
+cat /sys/class/net/ens1f0/device/numa_node
+cat /sys/bus/pci/devices/0000:3b:00.0/numa_node
+```
+
+**第五步：核对核心与节点、超线程的配对关系。** 读取每个节点的 `cpulist`，再用 `lscpu -e` 输出 CPU 编号、节点、Socket、物理核的对照表，最后抽查某个 CPU 的 `thread_siblings_list` 确认超线程兄弟核。规划 lcore 时，同一物理核的两个兄弟线程不要同时分配给两个高负载轮询线程，否则它们会争抢同一套执行单元；通常把兄弟线程留给内核、中断与 housekeeping 进程。`lscpu -e` 的列名写法在不同 util-linux 版本里可能是 `-e=CPU,NODE,SOCKET,CORE,ONLINE` 或 `--extended`，需对照实际版本核验。
+
+```bash
+cat /sys/devices/system/node/node0/cpulist
+cat /sys/devices/system/node/node1/cpulist
+lscpu -e=CPU,NODE,SOCKET,CORE,ONLINE
+cat /sys/devices/system/cpu/cpu2/topology/thread_siblings_list
+cat /sys/devices/system/cpu/cpu2/topology/core_id
+```
+
+**第六步：形成资源规划表。** 把前五步的结果汇总成一张表，明确每个端口的 BDF、`numa_node`、负责的 lcore 集合以及该节点的内存配额。下表是双路双端口网卡的示例规划，读者应按本机实测的 `numactl -H` 与 `numa_node` 值重填，切勿照抄编号。表中 lcore 集合后续会传给 03-04 的隔离参数与运行时参数（完整参数见 04-01），内存配额则传给 03-02 的按节点大页预留。超长命令串不塞进表格，统一移到表后代码块。
+
+| 端口 | BDF | numa_node | 处理 lcore | 内存节点 | 说明 |
+|---|---|---|---|---|---|
+| P0 | 0000:3b:00.0 | 0 | 2-9, 34-41 | Node0 独占 | 同 Socket 直连 |
+| P1 | 0000:af:00.0 | 1 | 18-25, 50-57 | Node1 独占 | 同 Socket 直连 |
+| housekeeping | 不适用 | 0 | 0-1, 32-33 | 任意 | 留给内核与中断 |
+| 内存配额 | 不适用 | 0 / 1 | 见下方命令示例 | 各 8 GB | 按节点预留 |
+
+规划表落成后，可用下面这组命令把结果固化成一份文本，供后续篇章引用，也便于变更评审时对比。
+
+```bash
+{
+  echo "== 端口归属 =="
+  for p in /sys/class/net/ens1f*; do
+    printf '%s -> %s\n' "$(basename "$p")" "$(cat "$p/device/numa_node" 2>/dev/null)"
+  done
+  echo "== 节点 CPU =="
+  for n in /sys/devices/system/node/node*/cpulist; do
+    printf '%s : %s\n' "$n" "$(cat "$n")"
+  done
+} | tee /root/numa_plan.txt
+```
+
+### 4. 验证方法与预期结果
+
+规划完成后必须做一轮闭环验证，验证的判据不是「命令能跑通」，而是「每一项都落在预期值上」。验证分四组：节点数、距离矩阵、网卡归属、核心映射。任何一项不符，都回到第 2 节或 BIOS 重新确认，而不是带着错误拓扑进入大页配置。
+
+第一组验证内核与节点数。预期结果是 `/proc/cmdline` 不含 `numa=off`、`/boot/config-$(uname -r)` 中三个 NUMA 配置项均为 `=y`、`/sys/devices/system/node/` 至少列出 `node0` 与 `node1`。第二组验证距离矩阵。预期 `numactl -H` 首行为 `available: 2 nodes (0-1)`，且 `node distances` 的对角元素为 10、非对角元素明显大于 10（典型 20 或 21，具体需对照实际机型核验）；若全为 10 说明拓扑被扁平化。第三组验证网卡归属。预期每个端口的 `numa_node` 返回 0 或 1 这样的有效节点号，绝不能是 `-1`；同时 `lstopo` 文本树里该网卡出现在对应 Package 的 HostBridge 分支下。第四组验证核心映射。预期 `lscpu -e` 中每个 CPU 的 NODE 列与 `numactl -H` 的 `node X cpus` 一致，且 `thread_siblings_list` 成对出现。下面给出一组组合验证命令及其预期输出，示例输出，具体格式需对照实际版本核验。
+
+```bash
+echo "node count: $(ls -d /sys/devices/system/node/node[0-9]* | wc -l)"
+for p in /sys/class/net/ens1f0 /sys/class/net/ens1f1; do
+  printf '%s numa_node=%s\n' "$p" "$(cat "$p/device/numa_node")"
+done
+numactl -H | sed -n '1p;/node distances/,$p'
+cat /sys/devices/system/cpu/cpu2/topology/thread_siblings_list
+```
+
+```text
+node count: 2
+/sys/class/net/ens1f0 numa_node=0
+/sys/class/net/ens1f1 numa_node=1
+node distances:
+node   0   1
+  0:  10  21
+  1:  21  10
+2,34
+```
+
+判读说明（150 字以上）：`node count: 2` 与预期一致，说明内核枚举出两个节点；若输出 1，则 BIOS 交错或 `numa=off` 未排除。两行 `numa_node=` 分别返回 0 与 1，说明两个端口分别挂在两个 Socket 的 PCIe 根复合体上，且都返回了有效节点号而非 `-1`，这是同 Socket 规划成立的前提；这里若出现 `-1`，意味着固件没提供 ACPI SRAT / 设备的 NUMA 亲近性信息，需要升级 BIOS 或检查 `dmesg` 中的 NUMA 相关告警。距离矩阵对角 10、非对角 21，确认跨节点访存确有额外代价。`2,34` 是 `cpu2` 的超线程兄弟列表，说明 2 号与 34 号逻辑核共享同一物理核，规划时必须避免把二者同时作为两个满载轮询 lcore。把这份输出与第 6 步的规划表逐项比对，全部吻合才算通过；随后即可进入 03-02 按节点预留大页。
+
+### 5. 常见失败与排错
+
+**现象一：`numactl -H` 只显示一个节点。** 最常见原因是 BIOS 开启了 Node Interleaving / Memory Interleaving，把两个节点的内存按 cache line 交错编址，内核因此只看到一个均匀节点；其次是内核命令行带了 `numa=off`，或虚拟机没有透传 vNUMA。定位顺序是先看 `cat /proc/cmdline`，再用 `dmesg | grep -i -E 'numa|srat|slit'` 检查 ACPI 表是否完整，最后进 BIOS 关闭交错。修改 BIOS 后必须冷重启， warmth reboot 有时不会重新枚举。
+
+**现象二：网卡 `numa_node` 返回 -1。** 这表示内核拿不到该 PCI 设备的 NUMA 亲近性，常见于主板 BIOS 未正确填充 SRAT / SLIT、较旧内核、或设备挂在未声明亲和性的第三方 PCIe 交换芯片下游。可先 `dmesq | grep -i numa`（注意命令拼写为 dmesg）与 `lspci -vvv -s <BDF>` 交叉确认，再尝试更新 BIOS 与内核；若短期内无法解决，可退回按 `lstopo` 的 Package 归属手工规划，并在规划表里标注「亲和性未知，需压测确认」。
+
+**现象三：网卡与 lcore 跨 Socket 导致吞吐不达标。** 表现是大页、绑卡、隔离都做对了，但 pps 明显低于同机型基准，且 `numactl -H` 显示跨节点距离大于 10。定位方法是核对第 6 步规划表里端口的 `numa_node` 与实际分配 lcore 所属节点是否一致，再用 `numastat -p <pid>` 观察进程的跨节点访存分布（numastat 由 numactl 包提供）。处理办法优先是换 PCIe 槽位让网卡落到目标 Socket，其次才是把 lcore 与内存配额整体迁移到网卡所在节点，因为前者不牺牲内存带宽。跨节点访存的定量代价属机制范畴（原理见 06-09）。
+
+**现象四：超线程兄弟核被同时当作独立轮询核。** 表现为加了核数却不涨吞吐，甚至下降，且 `lstopo` 显示两个 lcore 落在同一个 Core 下。用 `thread_siblings_list` 逐核抽查，把每对兄弟核拆成「一个给 DPDK、一个给系统」。此外还要确认 housekeeping 核心没有被划进 DPDK 的 lcore 集合，否则内核定时器、RCU 回调与网卡中断会周期性地打断轮询循环，造成尾延迟毛刺，这与 03-04 的 `nohz_full` / `rcu_nocbs` 配置直接相关。
+
+**现象五：云上或虚拟机拓扑扁平。** Guest 里 `numactl -H` 只有一个节点、网卡 `numa_node=-1`、距离矩阵缺失，说明 Hypervisor 没有透传 vNUMA 与 PCIe 亲和。这类环境不应强行套用本篇的物理规划，而应按 03-05 的云上注意点处理，或改用支持 SR-IOV 与 vNUMA 透传的裸金属实例。下表把现象、根因、定位命令与处理动作汇总，表中「或」关系均以转义竖线书写。
+
+| 现象 | 根因 | 定位命令 | 处理 |
+|---|---|---|---|
+| 只有 node0 | BIOS 交错 \| numa=off | cat /proc/cmdline \| dmesg -i numa | 关交错 \| 删参数后冷重启 |
+| numa_node=-1 | ACPI SRAT 缺失 | dmesg -i srat \| lspci -vvv | 升级 BIOS 与内核 |
+| 吞吐偏低 | 网卡与 lcore 跨节点 | numastat -p PID | 换槽位或迁移 lcore |
+| 加核不涨 | 超线程兄弟同用 | cat thread_siblings_list | 拆分兄弟核 |
+
+#### 陷阱与最佳实践
+
+其一，永远不要按 CPU 编号的奇偶或前后半段想当然地划分节点，双路机器的编号往往被超线程打散，必须以 `numactl -H` 的 `node X cpus` 列表为准。其二，先规划再动手：把端口、BDF、`numa_node`、lcore 集合、内存配额写进 `numa_plan.txt` 并纳入变更评审，避免上线后凭记忆改参数。其三，BIOS 里一次性把 NUMA、VT-d、超线程三项都确认到位，减少反复重启。其四，`lstopo` 的图形输出适合归档，字符输出适合脚本解析，两者都保留一份作为交付证据。其五，本篇只做观测与规划，不修改任何运行时状态，所有「写」操作留给后续篇章；涉及 EAL 参数时一律回查权威源（完整参数见 04-01），不在本册重列。
+
+### 6. 小结
+
+本篇把部署的第一步收敛为一件事：在看清楚硬件拓扑之后，产出一份「端口—节点—内存—核心」四者对齐的规划表。核心结论是 NUMA 距离决定数据面效率，任何大页、绑卡与隔离配置都必须建立在这份规划之上。操作上依次完成内核与命令行检查、`numactl -H` 距离矩阵判读、`lstopo` 层级确认、网卡 `numa_node` 读取、核心与超线程配对核对，最后汇总成表并通过四组验证闭环。`numa_node=-1`、单节点假象、超线程误配、跨节点访存是四类高频失败，均有明确的定位命令与修正路径。带着这份规划表，即可进入 03-02 按节点预留大页、03-03 按 BDF 绑定网卡、03-04 按 lcore 集合做 CPU 隔离；跨节点代价的原理分析与模块功能分别回查（原理见 06-09 ｜ 模块见 07-10），运行时参数统一回查（完整参数见 04-01）。
+
+## 03-02 大页内存配置与验证
+
+### 1. 目标与拓扑
+
+DPDK 不使用普通的 4 KiB 页来承载报文缓冲区，而是依赖 hugetlbfs 提供的大页（HugePages）。原因有三：其一，2 MiB 甚至 1 GiB 的页大幅减少 TLB 条目需求，轮询循环里频繁的 mbuf 访存因此更少触发 TLB miss；其二，hugetlb 页在物理内存上连续且不会被换出，便于网卡 DMA 直接寻址；其三，大页在 EAL 初始化时被一次性映射并长期持有，避免运行期缺页带来的抖动。这些都属于内存机制的范畴（原理见 06-02，字段见 05-07），本篇不展开内部映射调用链，只解决部署侧的问题：怎样在正确的 NUMA 节点上预留出足够数量、正确尺寸的大页，怎样把它们挂载成 EAL 能识别的目录，怎样让配置在重启后依然生效，以及怎样用 `dpdk-hugepages.py` 与 `/proc/meminfo` 快速验证水位。
+
+需要区分两种预留时机。运行时预留通过向 sysfs 写 `nr_hugepages` 完成，适合 2 MiB 页，优点是即时生效、不需要重启，缺点是内核需要在运行时凑出连续物理内存，系统运行久了碎片化严重时会失败或只满足一部分。启动时预留通过 GRUB 内核参数在内存尚未碎片化之前把大页圈出来，是 1 GiB 大页几乎唯一可靠的方式，也是生产环境的推荐做法，缺点是必须重启且参数顺序有讲究。二者可以叠加使用：1 GiB 页用启动参数，2 MiB 页用 sysfs 按节点补充。另一个必须提前澄清的概念是显式 hugetlb 页与透明大页（THP）不是一回事，DPDK 用的是前者；THP 由内核在后台异步合并，可能带来不可预期的停顿，低延迟场景通常把 THP 设为 never 或 madvise，此项需对照实际内核与业务压测结果核验。
+
+本篇目标可拆成五项：确认 CPU 与内核支持所需页尺寸；按 03-01 的规划表在每个 NUMA 节点上预留大页；挂载对应的 hugetlbfs 目录并做持久化；配置权限使 DPDK 进程（含非 root 与容器场景）能锁定并映射这些页；最后用工具验证水位与 EAL 实际可用量。大页预留、挂载与 EAL 使用之间的链路关系如图 03-02-01 所示，图中同时标出 `dpdk-hugepages.py` 作为水位回查工具的位置。
+
+:::figure id=03-02-01 | name=大页预留挂载与使用链路 | dir=TD
+node n1 "GRUB 启动参数<br/>1G 预留" blue
+node n2 "sysfs nr_hugepages<br/>2M 运行时预留" teal
+node n3 "hugetlbfs 挂载<br/>/mnt/huge" amber
+node n4 "/proc/meminfo<br/>HugePages_Free" green
+node n5 "EAL socket-mem<br/>按 Node 取页" purple
+node n6 "mempool 与 mbuf<br/>物理连续" purple
+node n7 "验证脚本<br/>dpdk-hugepages" gray
+edge n1 -> n4 "启动即生效"
+edge n2 -> n4 "写入即申请"
+edge n4 -> n3 "可用大页"
+edge n3 -> n5 "huge-dir"
+edge n5 -> n6 "分配对象"
+edge n7 -> n4 dashed "回查水位"
+:::
+
+### 2. 前置条件与环境
+
+首先是 CPU 与内核能力。1 GiB 大页需要 CPU 支持 1GB 页表项，Intel 平台对应 `pdpe1gb` 标志位，AMD 平台同样有相应能力位，检查方式是读 `/proc/cpuinfo` 的 flags；没有该标志就无法使用 1 GiB 页，只能退回 2 MiB。内核需要 `CONFIG_HUGETLBFS=y`、`CONFIG_HUGETLB_PAGE=y`，并检查 `/proc/sys/vm/nr_hugepages` 可写。其次是 root 权限：写 sysfs、改 GRUB、挂载文件系统都需要 root 或等价的 capability。第三是引导工具：RHEL / Fedora / CentOS 系提供 `grubby`，可原地修改某个内核条目；Debian / Ubuntu 系通常改 `/etc/default/grub` 再运行 `update-grub` 或 `grub2-mkconfig` 生成配置，输出路径在 UEFI 与 BIOS 机器上不同，需对照实际版本核验。第四是 DPDK 侧工具：`dpdk-hugepages.py` 在源码树中通常位于 `usertools/`（较老版本）或构建输出目录（较新版本），脚本名与参数在不同版本间有差异，需对照实际版本核验，本篇只给最小必要用法，完整命令族见 04-05。最后是承接 03-01 的 NUMA 规划：每个节点要预留多少页、给哪个端口用，都应来自 `numa_plan.txt`，而不是平均分配。
+
+2 MiB 与 1 GiB 两种页尺寸的选择对照见下表，表中「或」关系以转义竖线书写。选择时不仅看单页大小，还要考虑预留时机、TLB 收益、碎片敏感度与是否需要 `--socket-mem` 按节点精细切分（完整参数见 04-01）。
+
+| 维度 | 2 MiB 大页 | 1 GiB 大页 | 选择建议 |
+|---|---|---|---|
+| 单页容量 | 2048 kB | 1048576 kB | 2M \| 1G 按容量定 |
+| 预留时机 | 启动或运行时均可 | 建议启动参数 | 1G 必须启动预留 |
+| 碎片敏感 | 较低 | 很高 | 长运行机器优先 1G |
+| TLB 收益 | 明显 | 极显著 | 大内存池选 1G |
+| node 粒度 | 可按 node 写 | 可按 node 写 | 与 03-01 规划对齐 |
+
+内核与 sysfs 的可定位路径见下表，长路径按要求只写语义化简述，完整清单移到表后代码块。
+
+| sysfs / 配置路径 | 含义 | 用法 |
+|---|---|---|
+| /proc/meminfo | 全局大页水位与页尺寸 | grep Huge 读取 |
+| /proc/sys/vm/nr_hugepages | 默认尺寸大页总数 | echo 写入 |
+| sysfs hugepages-2048kB/nr_hugepages | 2M 页全局数量 | 见下方命令示例 |
+| sysfs hugepages-1048576kB/nr_hugepages | 1G 页全局数量 | 见下方命令示例 |
+| nodeX/hugepages/.../nr_hugepages | 指定节点的大页数量 | 见下方命令示例 |
+| /proc/sys/vm/hugetlb_shm_group | 允许映射的 gid | 非 root 场景配置 |
+
+版本方面仍以 DPDK 23.11 LTS / 24.11 / master 为基准，但大页相关的内核接口属于 Linux 而非 DPDK，不同发行版内核的 sysfs 目录命名（例如 `hugepages-1048576kB` 是否存在）、`grubby` 是否存在、`/etc/default/grub` 的字段名称都可能不同，本文所有路径与输出均标注需对照实际版本核验，读者应以本机 `ls` 实际枚举结果为准。若部署目标是容器，还需确认 cgroup 的 memory 限制没有把大页计入并提前耗尽，这一点在 03-06 展开。
+
+### 3. 分步操作
+
+**第一步：确认页尺寸支持与内核配置。** 先读 CPU flags 判断是否支持 1 GiB 页，再读内核配置确认 hugetlbfs 编入内核，最后看当前默认大页尺寸。若 `pdpe1gb` 缺失，后面所有关于 1 GiB 的步骤都应跳过，改为纯 2 MiB 方案。此步骤只做只读检查，不改动系统。
+
+```bash
+grep -m1 -o 'pdpe1gb' /proc/cpuinfo
+grep -E 'CONFIG_HUGETLB(FS|_PAGE)=' /boot/config-$(uname -r)
+cat /proc/meminfo | grep -i huge
+cat /sys/kernel/mm/transparent_hugepage/enabled
+```
+
+**第二步：读取当前大页水位并建立基线。** 在改动之前先记录 `HugePages_Total`、`HugePages_Free`、`Hugepagesize` 三项，作为后续验证的对比基线。以下为示例输出，具体格式需对照实际版本核验。
+
+```bash
+grep -i '^Huge\|^Hugetlb' /proc/meminfo
+```
+
+```text
+HugePages_Total:       0
+HugePages_Free:        0
+HugePages_Rsvd:        0
+HugePages_Surp:        0
+Hugepagesize:       2048 kB
+Hugetlb:               0 kB
+```
+
+判读说明（150 字以上）：`HugePages_Total` 是内核当前已预留的默认尺寸大页总数，基线为 0 说明尚未做任何预留；`HugePages_Free` 是尚未被分配出去的页数，DPDK 启动时实际能拿到的是 Free 而非 Total；`HugePages_Rsvd` 是已被预留承诺但尚未真正分配的数量，若它持续不为 0，说明有进程申请了却没释放；`HugePages_Surp` 是超出 `nr_hugepages` 的过量池页数，生产上一般期望为 0。`Hugepagesize: 2048 kB` 表明当前默认页尺寸为 2 MiB，这一项由启动参数 `default_hugepagesz` 决定，若改为 1G 会显示 `1048576 kB`。`Hugetlb` 是所有大页池占用的总内存量，等于各尺寸页数乘以页尺寸之和，可用于快速核对预留总量是否符合 `numa_plan.txt` 的配额。注意这套字段只反映默认尺寸池，1 GiB 池需要分别读对应 sysfs 目录才能看到，不能只看这里。
+
+**第三步：运行时按节点预留 2 MiB 页。** 直接向每个节点的 `nr_hugepages` 写入目标数量，比写全局 `/proc/sys/vm/nr_hugepages` 更可控，能保证页落在指定 NUMA 节点上，与 03-01 的同 Socket 原则一致。写入后立即回读，确认数字没有被内核因内存不足而压低；若回读值小于写入值，说明运行时碎片化已经严重，应改用启动参数预留并安排重启窗口。路径中的 `node0` / `node1` 与页尺寸目录名需按本机实际枚举替换，需对照实际版本核验。
+
+```bash
+echo 4096 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
+echo 4096 > /sys/devices/system/node/node1/hugepages/hugepages-2048kB/nr_hugepages
+for n in /sys/devices/system/node/node[0-9]*/hugepages/hugepages-2048kB/nr_hugepages; do
+  printf '%s = %s\n' "$n" "$(cat "$n")"
+done
+```
+
+**第四步：用 GRUB 启动参数预留 1 GiB 页。** 1 GiB 页必须在内核启动、内存尚未碎片化时预留，因此只能通过内核命令行完成。RHEL 系可用 `grubby` 直接给当前内核条目追加参数，Debian 系则改 `/etc/default/grub` 的 `GRUB_CMDLINE_LINUX` 再重新生成配置。参数顺序有一个容易踩的坑：`hugepages=N` 只作用于紧邻其前、或由 `default_hugepagesz` 指定的那个页尺寸池，混合两种尺寸时必须写成 `hugepagesz=1G hugepages=8 hugepagesz=2M hugepages=1024` 这样成对出现。`grub2-mkconfig` 的输出路径在 UEFI 机器上通常是 `/boot/efi/EFI/<发行版>/grub.cfg`，在 BIOS 机器上是 `/boot/grub2/grub.cfg`，需对照实际版本核验。修改后必须重启，重启前用 `grubby --info` 或 `grep` 确认参数已写入。
+
+```bash
+grubby --update-kernel=ALL --args="default_hugepagesz=1G hugepagesz=1G hugepages=8 hugepagesz=2M hugepages=1024"
+grubby --info=ALL | grep args
+```
+
+```ini
+GRUB_CMDLINE_LINUX="default_hugepagesz=1G hugepagesz=1G hugepages=8 hugepagesz=2M hugepages=1024 iommu=pt intel_iommu=on"
+GRUB_DEFAULT=saved
+GRUB_TIMEOUT=5
+```
+
+```bash
+grub2-mkconfig -o /boot/grub2/grub.cfg
+grep -o 'hugepagesz=[^ ]*\|hugepages=[0-9]*\|default_hugepagesz=[^ ]*' /boot/grub2/grub.cfg | head
+```
+
+**第五步：挂载 hugetlbfs 并持久化。** 预留出来的大页需要一个挂载点才能被 EAL 以文件形式映射。为不同页尺寸分别建目录并用 `-o pagesize=` 指定尺寸，避免混挂导致 EAL 取到错误页尺寸。挂载选项是 `nodev` 还是 `none` 取决于发行版习惯，用 `mount -t hugetlbfs` 时两者均可，需对照实际版本核验。持久化写入 `/etc/fstab`，其中 `pagesize=1G` 这类写法在部分 fstab 解析器里需要写成 `pagesize=1G` 或 `pagesize=1048576kB`，需对照实际版本核验。EAL 通过 `--huge-dir` 指向该目录（完整参数见 04-01）。
+
+```bash
+mkdir -p /mnt/huge_1G /mnt/huge_2M
+mount -t hugetlbfs -o pagesize=1G none /mnt/huge_1G
+mount -t hugetlbfs -o pagesize=2M none /mnt/huge_2M
+mount | grep hugetlbfs
+```
+
+```ini
+none /mnt/huge_1G hugetlbfs pagesize=1G,defaults 0 0
+none /mnt/huge_2M hugetlbfs pagesize=2M,defaults 0 0
+```
+
+**第六步：配置权限与非 root 映射。** 若 DPDK 进程以非 root 运行，需要把 hugetlbfs 挂载点的属组设为一个专用组，并把该组 gid 写入 `vm.hugetlb_shm_group`，同时通过 `ulimit -l` 或 `/etc/security/limits.conf` 放开 memlock 限制。容器场景还要显式挂载 `/dev/hugepages` 并授予 IPC_LOCK capability，放到 03-06 处理。此处只给最小必要配置，脚本与参数的完整清单属权威源（完整命令族见 04-05）。
+
+```bash
+groupadd -f dpdk
+chgrp dpdk /mnt/huge_2M
+chmod 1770 /mnt/huge_2M
+echo "$(getent group dpdk | cut -d: -f3)" > /proc/sys/vm/hugetlb_shm_group
+ulimit -l unlimited
+grep -i 'hugetlb_shm_group' /etc/sysctl.conf
+```
+
+**第七步：用 dpdk-hugepages.py 做统一查看与补页。** 该脚本把「查看各尺寸池水位」和「按节点申请页」封装成一条命令，适合收尾时统一核对。脚本名、参数与所在目录随版本变化，若 `dpdk-hugepages.py` 不存在可尝试 `dpdk-hugepages.py` 的构建输出路径或源码 `usertools/` 下的同名脚本，需对照实际版本核验；本篇只用到查看与最简单的申请两个用法，其余子命令完整命令族见 04-05。
+
+```bash
+dpdk-hugepages.py -s
+dpdk-hugepages.py --setup 2M --pages 1024 --node 0
+```
+
+### 4. 验证方法与预期结果
+
+验证要覆盖「数量、尺寸、节点、挂载、EAL 可用」五个维度，每一项都给出明确预期。第一，数量与尺寸：`/proc/meminfo` 的 `HugePages_Total` 等于规划值，`HugePages_Free` 不小于应用需求，`Hugepagesize` 与 `default_hugepagesz` 一致；1 GiB 池数量通过对应 sysfs 目录核对。第二，节点分布：每个 `nodeX/hugepages/.../nr_hugepages` 的回读值等于写入值，没有出现因碎片被压低的情况。第三，启动参数：`/proc/cmdline` 含 `hugepagesz=1G hugepages=8`，说明 1G 页确实在启动时预留。第四，挂载：`mount | grep hugetlbfs` 出现两条，且 `pagesize` 分别为 1G 与 2M。第五，EAL 可用：启动 DPDK 应用时日志显示成功从指定节点拿到大页且无 `No free hugepages` 报错（完整参数见 04-01）。下面给出组合验证命令与预期输出，示例输出，具体格式需对照实际版本核验。
+
+```bash
+grep -i '^Huge\|^Hugetlb' /proc/meminfo
+cat /proc/cmdline | grep -o 'hugepagesz=[^ ]*\|hugepages=[0-9]*'
+mount | grep hugetlbfs
+for d in /sys/kernel/mm/hugepages/hugepages-*; do printf '%s = %s\n' "$d" "$(cat "$d/nr_hugepages")"; done
+```
+
+```text
+HugePages_Total:    1024
+HugePages_Free:      768
+HugePages_Rsvd:        0
+HugePages_Surp:        0
+Hugepagesize:       2048 kB
+Hugetlb:        10485760 kB
+hugepagesz=1G
+hugepages=8
+none on /mnt/huge_1G type hugetlbfs (rw,relatime,pagesize=1G)
+none on /mnt/huge_2M type hugetlbfs (rw,relatime,pagesize=2M)
+/sys/kernel/mm/hugepages/hugepages-2048kB = 1024
+/sys/kernel/mm/hugepages/hugepages-1048576kB = 8
+```
+
+判读说明（150 字以上）：`HugePages_Total: 1024` 与启动参数 `hugepages=1024` 对应，说明 2 MiB 池已按预期预留；`HugePages_Free: 768` 表明已有 256 页被占用（可能是已运行的 DPDK 实例或预留承诺），只要 Free 仍大于新应用的 `socket-mem` 需求即可，`HugePages_Rsvd: 0` 与 `HugePages_Surp: 0` 是健康状态。`Hugepagesize: 2048 kB` 说明默认池是 2 MiB，而 `Hugetlb: 10485760 kB` 约等于 8 个 1 GiB 页加 1024 个 2 MiB 页的合计，可用来交叉验算总量。两行 `hugepagesz=1G` 与 `hugepages=8` 成对出现，证明 1 GiB 页确实由启动参数预留而非运行时凑出。两条 `mount` 输出分别带 `pagesize=1G` 与 `pagesize=2M`，确认挂载尺寸没有混淆。最后两行 sysfs 回读把 2M 池 1024 页、1G 池 8 页分别坐实。若其中任一项缺失，按第 5 节定位；全部吻合即可进入 03-03 绑定网卡。
+
+### 5. 常见失败与排错
+
+**现象一：运行时写 1 GiB `nr_hugepages` 回显变小或直接失败。** 根因是系统长时间运行后物理内存碎片化，内核凑不出连续的 1 GiB 区域。定位用 `echo 8 > .../hugepages-1048576kB/nr_hugepages` 后立即 `cat` 回读，并 `dmesg | tail -n 30` 看是否有 `hugepages` 分配失败记录。处理办法只有一个：改用第四步的 GRUB 启动参数预留并重启，重启窗口应选在业务低峰。
+
+**现象二：`hugepages=N` 数量算错。** 混合尺寸时 `hugepages=N` 只作用于紧邻的 `hugepagesz` 或默认池，若写成 `hugepagesz=1G hugepagesz=2M hugepages=1024`，1024 会落到 2M 池甚至被覆盖，导致 1G 页一个都没预留。定位方式是重启后 `cat /proc/cmdline` 与两个 sysfs 目录逐一核对，处理办法是让 `hugepagesz` 与 `hugepages` 严格成对出现。
+
+**现象三：EAL 报 `No free hugepages` 或 `cannot get hugepage information`。** 常见原因有三：`--huge-dir` 指向的目录没挂载或尺寸不符、`Free` 已被其他实例吃光、非 root 进程没有 `hugetlb_shm_group` 与 memlock 权限。定位顺序为 `mount | grep hugetlbfs`、`grep Huge /proc/meminfo`、`id` 与 `ulimit -l` 三项，再对照启动日志里 EAL 报告的实际取得页数（完整参数见 04-01）。
+
+**现象四：按节点预留后大页仍集中在一个节点。** 写全局 `/proc/sys/vm/nr_hugepages` 时内核可能就近分配，与 03-01 的规划不符。应改为逐个写 `nodeX/hugepages/.../nr_hugepages`，并用 `numastat -m` 观察各节点大页占用是否均衡。`numastat -m` 的输出格式随 numactl 版本变化，需对照实际版本核验。
+
+**现象五：容器或 cgroup 里大页莫名消失。** 宿主机预留充足，但容器内 DPDK 起不来，多为 cgroup memory 限制把 hugetlb 计入、`/dev/hugepages` 未挂载或缺少 `IPC_LOCK`。这类问题归容器章节处理，见 03-06。下表把五类现象汇总为排错矩阵，表中「或」关系以转义竖线书写。
+
+| 现象 | 根因 | 定位命令 | 处理 |
+|---|---|---|---|
+| 1G 运行时预留失败 | 内存碎片 | dmesg -i hugepages | 改启动参数并重启 |
+| 1G 页数量为 0 | 参数未成对 | cat /proc/cmdline | 成对写 hugepagesz \| hugepages |
+| EAL 无可用页 | 未挂载 \| 权限不足 | mount -t hugetlbfs \| ulimit -l | 挂载并放开 memlock |
+| 页落在单节点 | 写了全局 nr_hugepages | numastat -m | 改按 node 写入 |
+| 容器内取不到页 | cgroup \| /dev 未挂 | cat /proc/self/cgroup | 见 03-06 处理 |
+
+#### 陷阱与最佳实践
+
+其一，1 GiB 页一律走启动参数，不要指望运行时补页，生产机器上线前就把 `default_hugepagesz=1G` 写进基线镜像。其二，`hugepagesz` 与 `hugepages` 必须成对，改完用 `grubby --info` 回读再重启。其三，2M 与 1G 分别挂载、分别命名目录，避免 EAL 取错尺寸。其四，按 NUMA 节点逐个写 `nr_hugepages`，与 03-01 的规划表保持一致，不要用全局写入图省事。其五，把 `HugePages_Free` 纳入监控并设置水位告警，多实例共存时用 `--file-prefix` 隔离避免互相吞页（完整参数见 04-01）。其六，涉及工具完整子命令与大页内部机制时分别回查权威源（完整命令族见 04-05 ｜ 原理见 06-02 ｜ 字段见 05-07），本册不重列。
+
+### 6. 小结
+
+本篇完成了大页从规划到可用再到可验证的闭环：先确认 CPU 的 `pdpe1gb` 与内核 `CONFIG_HUGETLBFS`，再用 sysfs 按节点预留 2 MiB 页、用 GRUB 启动参数预留 1 GiB 页，随后分别挂载 hugetlbfs 并写入 `/etc/fstab` 持久化，补齐非 root 的 `hugetlb_shm_group` 与 memlock 权限，最后用 `/proc/meminfo`、`/proc/cmdline`、`mount` 与 `dpdk-hugepages.py` 五个维度验证水位。1 GiB 页的碎片敏感、`hugepages=N` 的顺序陷阱、按节点分配与 cgroup 限制是四类高频失败，均有对应的定位命令与修正路径。大页到位后，网卡还需要从内核驱动解绑并交给用户态驱动，这是 03-03 的任务；运行时如何指定 `--socket-mem` / `--huge-dir` 统一回查（完整参数见 04-01），大页映射的内部调用链与结构体字段分别回查（原理见 06-02 ｜ 字段见 05-07），`dpdk-hugepages.py` 的其余用法回查（完整命令族见 04-05）。
+
+## 03-03 网卡绑定：vfio-pci / uio_pci_generic / igb_uio
+
+### 1. 目标与拓扑
+
+网卡绑定的本质是把一个 PCI 设备从 Linux 内核驱动手里「借」出来，交给一个只负责暴露设备资源、不参与协议栈处理的用户态桩驱动，让 DPDK 的 PMD 能够直接映射设备的 BAR 空间、配置描述符环并接管 DMA。理解这一点很重要：DPDK 并不是「替换」了内核驱动的功能，而是彻底绕开它——绑定之后内核不再有 `if=ens1f0` 这样的网络接口，`ip` / `ethtool` 对该端口失效，收发包完全由用户态轮询循环驱动。因此绑定是一个有明确边界的动作，必须能干净地做、也能干净地退回，否则一旦配置出错，机器上的管理网口可能一起失联。
+
+Linux 侧可选的用户态桩驱动主要有三种。`vfio-pci` 是当前推荐方案，它基于 VFIO（Virtual Function I/O）框架，依赖 IOMMU 提供 DMA 隔离与地址转换，设备被组织进 IOMMU Group 并通过 `/dev/vfio/<group>` 暴露给用户态，安全性最好，支持 MSI-X 中断，也是唯一能在非 root、容器与虚机透传场景里规范落地的方案。`uio_pci_generic` 是内核自带的通用 UIO 驱动，优点是无需额外编译、随主线内核提供，缺点是不依赖 IOMMU、不支持 MSI-X 中断、对很多现代网卡的寄存器布局兼容性有限，只适合功能简单或没有 IOMMU 的测试环境。`igb_uio` 是 DPDK 早期的配套模块，功能强于 `uio_pci_generic`，但它已不随 DPDK 主源码树发布，需要从独立的 `dpdk-kmods` 仓库单独按当前内核头文件编译，属于历史方案，新部署不建议优先选用（仓库位置与模块名需对照实际版本核验）。三者的完整功能对比与模块内部分工见 07-10（模块见 07-10），本篇只从部署角度给最小必要的取舍结论。
+
+本篇目标可拆成五项：确认 BIOS 与内核的 IOMMU 已开启；加载所需的 vfio / uio 内核模块；查看设备当前由哪个驱动占用；把目标端口从内核驱动解绑并绑定到 `vfio-pci`；最后核对 IOMMU Group、`/dev/vfio` 节点与权限，并保留一条可执行的回退路径。整个过程的状态迁移如图 03-03-01 所示：设备从「内核驱动占用」经 sysfs 的 `unbind` 进入「无驱动」，再经 `bind` 交给 `vfio-pci`，随后被纳入 IOMMU Group、暴露为 `/dev/vfio/N`，最终由 DPDK PMD 探测接管；图中的虚线是回退与回查关系，对应把设备重新绑回 `ixgbe` / `i40e` 等内核驱动。
+
+:::figure id=03-03-01 | name=网卡设备驱动绑定状态迁移 | dir=TD
+node n1 "内核驱动<br/>ixgbe 等" blue
+node n2 "sysfs unbind<br/>解绑" gray
+node n3 "无驱动<br/>空闲设备" amber
+node n4 "vfio-pci<br/>用户态驱动" teal
+node n5 "IOMMU Group<br/>DMA 隔离" purple
+node n6 "/dev/vfio/N<br/>容器句柄" green
+node n7 "DPDK PMD<br/>probe 接管" purple
+node n8 "回退到内核<br/>bind ixgbe" red
+edge n1 -> n2 "写 unbind"
+edge n2 -> n3 "驱动清空"
+edge n3 -> n4 "写 bind"
+edge n4 -> n5 "加入组"
+edge n5 -> n6 "暴露设备"
+edge n6 -> n7 "DPDK 打开"
+edge n7 -> n8 dashed "回查回退"
+edge n8 -> n1 dashed "恢复"
+:::
+
+### 2. 前置条件与环境
+
+第一道门槛是 IOMMU。BIOS 里 VT-d（Intel）或 AMD-Vi / IOMMU（AMD）必须开启，这一步在 03-01 已要求提前打开；内核命令行需要 `intel_iommu=on iommu=pt`（AMD 平台为 `amd_iommu=on`，具体参数名需对照实际内核版本核验），其中 `iommu=pt` 让仍归内核管理的设备走 passthrough，避免 IOMMU 给非 DPDK 流量增加无谓转换开销。注意 `vfio-pci` 的 DMA 隔离不因 `iommu=pt` 失效，它仍通过 `vfio_iommu_type1` 建立独立的 IOMMU 域。重启后应能在 `dmesg` 里看到 `DMAR: Intel(R) Virtualization Technology for Directed I/O` 一类日志，且 `/sys/kernel/iommu_groups/` 目录非空；若目录为空，说明 IOMMU 没有真正启用，绑定 `vfio-pci` 会失败。
+
+第二道门槛是内核模块与配置。需要 `CONFIG_VFIO=y`、`CONFIG_VFIO_PCI=y`、`CONFIG_VFIO_IOMMU_TYPE1=y`、`CONFIG_IOMMU_SUPPORT=y`，以及 UIO 路线的 `CONFIG_UIO=y`、`CONFIG_UIO_PCI_GENERIC=y`，检查方式同样是读 `/boot/config-$(uname -r)`。运行时用 `modprobe` 加载 `vfio`、`vfio_pci`、`vfio_iommu_type1`（三者常由依赖关系自动带出），或者加载 `uio` 与 `uio_pci_generic`。`igb_uio` 不在主线内核，需要从 `dpdk-kmods` 仓库取源码、装好当前内核的 `kernel-devel` / `kernel-headers` 后用 `make` 编译，模块签名与 Secure Boot 冲突时还要处理签名或临时关闭 Secure Boot，这一路径步骤多、易出错，本篇不作为默认方案（源码仓库地址、模块名与编译步骤需对照实际版本核验）。
+
+第三道门槛是设备占用状态。目标端口在绑定前必须不再被内核网络栈使用：先 `ip link set <iface> down`，并确认 NetworkManager、`ifcfg`、`network` 脚本或云初始化服务不会把它重新拉起，必要时对管理网口以外的端口永久停用相关服务。`dpdk-devbind.py` 会自动完成 `unbind` 与 `bind`，但前提是 `unbind` 时设备没有被进程以文件句柄占用。特别提醒：永远不要把承载 SSH 的管理网口绑进 `vfio-pci`，应先用 `lspci -nn` 与 `ip -br link` 把 BDF 与接口名一一对应，并在规划表里标注「保留口」，否则绑定完成即失联。
+
+第四是工具与权限。`dpdk-devbind.py` 在源码树中通常位于 `usertools/`（较老版本）或构建输出目录（较新版本），脚本名与参数在版本间有差异，需对照实际版本核验；本篇只用到 `-s`（查看）、`-b`（绑定）、`-u`（解绑）三个最小用法，完整命令族见 04-05。绑定动作本身需要 root；若 DPDK 应用以非 root 运行，则要通过 `/dev/vfio` 属组与 udev 规则授权。三种用户态桩驱动的取舍对照见下表，表中「或」关系以转义竖线书写。
+
+| 驱动 | 依赖 IOMMU | 中断支持 | 获取方式 | 适用场景 |
+|---|---|---|---|---|
+| vfio-pci | 必须开启 | 支持 MSI-X | 内核自带模块 | 生产 \| 容器 \| 透传 |
+| uio_pci_generic | 不需要 | 不支持 | 内核自带模块 | 无 IOMMU 的测试机 |
+| igb_uio | 不需要 | 部分支持 | dpdk-kmods 单独编译 | 历史环境 \| 需核验 |
+
+内核配置与关键 sysfs 路径的对照见下表，长命令串不塞入单元格，统一移到表后代码块。
+
+| 路径 / 配置项 | 含义 | 用法 |
+|---|---|---|
+| /sys/kernel/iommu_groups/ | IOMMU 组枚举 | ls 查看是否非空 |
+| /sys/bus/pci/drivers/<drv>/unbind | 从驱动解绑设备 | echo BDF 写入 |
+| /sys/bus/pci/drivers/vfio-pci/bind | 绑定到 vfio-pci | echo BDF 写入 |
+| /sys/bus/pci/devices/<BDF>/iommu_group | 设备所属组 | readlink -f 查看 |
+| /dev/vfio/vfio \| /dev/vfio/<N> | 容器与组句柄 | chown 授权 |
+| CONFIG_VFIO_PCI 等 | 内核能力开关 | grep /boot/config 核验 |
+
+版本基准为 DPDK 23.11 LTS / 24.11 / master，但 IOMMU 参数、sysfs 目录、`dpdk-devbind.py` 的输出排版都属于内核与发行版范畴，不同环境差异明显，本文所有路径与输出均标注「需对照实际版本核验」，读者应以本机 `ls` 与 `modinfo` 的实测结果为准。云上实例可能整体没有 IOMMU 或不支持 VFIO，这类限制放到 03-05 讨论。
+
+### 3. 分步操作
+
+**第一步：开启并确认 IOMMU。** 用 `grubby` 给全部内核条目追加参数，或改 `/etc/default/grub` 后重新生成配置；重启后同时检查命令行、`dmesg` 与 iommu_groups 目录三处，三者都到位才算 IOMMU 真正启用。若 `dmesg` 出现 `DMAR` 初始化失败或目录为空，回到 BIOS 检查 VT-d / AMD-Vi 与 `intel_iommu=on` 是否被其他参数覆盖。
+
+```bash
+grubby --update-kernel=ALL --args="intel_iommu=on iommu=pt"
+cat /proc/cmdline
+dmesg | grep -i -E 'DMAR|IOMMU|AMD-Vi' | head -n 20
+ls -d /sys/kernel/iommu_groups/[0-9]* | head
+```
+
+```ini
+GRUB_CMDLINE_LINUX="default_hugepagesz=1G hugepagesz=1G hugepages=8 intel_iommu=on iommu=pt"
+```
+
+**第二步：加载所需内核模块。** 优先加载 VFIO 三件套，用 `lsmod` 确认；若走 UIO 路线再加载 `uio` 与 `uio_pci_generic`。模块参数（如 `enable_unsafe_noiommu_mode`）只在明确知道后果的测试环境使用，生产环境不要开启，具体参数名需对照实际版本核验。
+
+```bash
+modprobe vfio-pci
+modprobe vfio_iommu_type1
+lsmod | grep -E 'vfio|uio'
+modinfo vfio-pci | grep -E '^filename|^version|^description'
+```
+
+**第三步：查看设备当前状态。** 先用 `lspci -nn` 拿到 BDF 与厂商设备号，再用 `lspci -k` 看 `Kernel driver in use`，最后用 `dpdk-devbind.py -s` 得到 DPDK 视角的分类视图，把三者交叉核对，避免把管理网口误当成目标端口。以下为示例输出，具体格式需对照实际版本核验。
+
+```bash
+lspci -nn | grep -i 'Ethernet controller'
+lspci -k -s 0000:3b:00.0
+dpdk-devbind.py -s
+```
+
+```text
+Network devices using DPDK-compatible driver
+============================================
+0000:3b:00.0 'Ethernet Controller X710 for 10GbE SFP+ 1572' drv=vfio-pci unused=i40e
+0000:3b:00.1 'Ethernet Controller X710 for 10GbE SFP+ 1572' drv=vfio-pci unused=i40e
+
+Network devices using kernel driver
+===================================
+0000:af:00.0 'Ethernet Controller XL710 for 40GbE QSFP+ 1583' if=ens2f0 drv=i40e unused=vfio-pci *Active*
+
+Other 'network' devices
+=======================
+<none>
+```
+
+判读说明（150 字以上）：输出按「已被 DPDK 兼容驱动接管」「仍由内核驱动使用」「其他网络设备」三段分类，这种分段是判断绑定是否成功的最直观依据。第一段里两行 `drv=vfio-pci` 表示这两个端口已经成功绑定到 `vfio-pci`，`unused=i40e` 是内核原本可用的驱动名，回退时要用它；注意这段里的设备没有 `if=` 字段，因为绑定后内核不再创建网络接口。第二段 `0000:af:00.0` 带 `if=ens2f0 drv=i40e unused=vfio-pci *Active*`，说明它还在内核驱动手里且处于活动状态，`*Active*` 标记提示该接口当前是 up 的，绑定前必须先 `ip link set down`，这也是管理网口的典型形态，绝不能误绑。第三段 `<none>` 表示没有未分类设备。若目标端口出现在第二段，则说明尚未绑定；若绑定后 `drv=` 为空或报 `not managed by any driver`，需要查 `dmesg` 里的 vfio 报错。设备名中的 `1572`、`1583` 是厂商设备号，`lspci -nn` 可交叉核对。
+
+**第四步：down 接口并解绑。** 如果目标端口仍被内核驱动占用且带 `if=`，先 down 掉；随后可直接用 `dpdk-devbind.py -u` 解绑到「无驱动」状态，或直接进入第五步让脚本自动处理。手工写 sysfs 的方式也列在下方，两条路径等价，但脚本方式会同时处理 `driver_override` 与 `new_id`，更稳妥。停止 NetworkManager 等可能重新拉起接口的服务时要确认不会影响管理口。
+
+```bash
+ip link set ens2f0 down
+systemctl stop NetworkManager
+dpdk-devbind.py -u 0000:af:00.0
+echo 0000:af:00.0 > /sys/bus/pci/drivers/i40e/unbind
+```
+
+**第五步：绑定到 vfio-pci。** 这是本篇的核心动作，可以一次传多个 BDF。脚本会为每个设备写 `driver_override`、触发 `bind`，并在失败时给出提示。绑定完成后立即用 `dpdk-devbind.py -s` 复核，确认目标端口已移动到第一段。若选择 UIO 路线，把 `-b vfio-pci` 换成 `-b uio_pci_generic`；`igb_uio` 需先完成模块编译与 `insmod`，此处不展开（需对照实际版本核验）。完整命令族见 04-05。
+
+```bash
+dpdk-devbind.py -b vfio-pci 0000:3b:00.0 0000:3b:00.1 0000:af:00.0
+dpdk-devbind.py -s
+lspci -k -s 0000:3b:00.0
+```
+
+**第六步：核对 IOMMU Group 与 /dev/vfio 节点。** `vfio-pci` 要求同属一个 IOMMU Group 的设备要么全部交给 vfio、要么全部从内核解绑，否则打开 `/dev/vfio/<N>` 会报组不完整。因此绑定后必须逐个查看组归属与 `/dev/vfio/` 内容，并确认 `dmesg` 没有 DMAR fault。非 root 场景下还要给组节点授权，下面一并给出 udev 规则片段，规则语法与属组名需对照实际版本核验。
+
+```bash
+readlink -f /sys/bus/pci/devices/0000:3b:00.0/iommu_group
+for g in /sys/kernel/iommu_groups/*/devices/*; do
+  printf 'group %s -> %s\n' "$(basename "$(dirname "$(dirname "$g")")")" "$(basename "$g")"
+done
+ls -l /dev/vfio/
+dmesg | grep -i -E 'vfio|DMAR' | tail -n 20
+```
+
+```ini
+SUBSYSTEM=="vfio", GROUP="dpdk", MODE="0660"
+KERNEL=="vfio", SUBSYSTEM=="misc", GROUP="dpdk", MODE="0660"
+```
+
+```bash
+groupadd -f dpdk
+chown root:dpdk /dev/vfio/vfio
+chmod 660 /dev/vfio/vfio
+udevadm control --reload-rules
+udevadm trigger --subsystem-match=vfio
+```
+
+**第七步：回退到内核驱动。** 任何变更都要能撤销。用 `-u` 解绑后再 `-b` 绑回原内核驱动（驱动名取自第三步 `unused=` 字段），最后 `ip link` 确认接口恢复。若接口名发生变化，可用 `ip -br link` 与 `lspci -nn` 重新对应。回退属于同一工具的常规用法，完整命令族见 04-05。
+
+```bash
+dpdk-devbind.py -u 0000:3b:00.0
+dpdk-devbind.py -b i40e 0000:3b:00.0
+ip link set ens1f0 up
+ip -br link
+```
+
+### 4. 验证方法与预期结果
+
+绑定是否成功，要用「脚本视图、内核视图、设备节点视图、应用视图」四层交叉验证，任何一层不一致都说明配置有隐患。第一层脚本视图：`dpdk-devbind.py -s` 中目标端口应全部出现在「Network devices using DPDK-compatible driver」段，且 `drv=vfio-pci`、`unused=` 为原内核驱动名，不应残留 `if=` 与 `*Active*`。第二层内核视图：`lspci -k -s <BDF>` 的 `Kernel driver in use:` 应为 `vfio-pci`，`Kernel modules:` 仍列出原驱动。第三层设备节点视图：`/dev/vfio/` 下应存在 `vfio` 与对应组号节点，同组设备齐全，`dmesg` 无 `vfio: error` 与 DMAR fault。第四层应用视图：启动 DPDK 应用时 EAL 日志应能枚举到该端口并完成 probe，不报「设备未绑定」类错误（完整参数见 04-01）。下面给出组合验证命令与预期输出，示例输出，具体格式需对照实际版本核验。
+
+```bash
+dpdk-devbind.py -s | sed -n '1,12p'
+lspci -k -s 0000:3b:00.0
+ls -l /dev/vfio/
+readlink -f /sys/bus/pci/devices/0000:3b:00.0/iommu_group
+dmesg | grep -i 'DMAR:.*fault' | tail -n 5
+```
+
+```text
+Network devices using DPDK-compatible driver
+============================================
+0000:3b:00.0 'Ethernet Controller X710 for 10GbE SFP+ 1572' drv=vfio-pci unused=i40e
+0000:3b:00.1 'Ethernet Controller X710 for 10GbE SFP+ 1572' drv=vfio-pci unused=i40e
+
+Network devices using kernel driver
+===================================
+0000:af:00.0 'Ethernet Controller XL710 for 40GbE QSFP+ 1583' if=ens2f0 drv=i40e unused=vfio-pci
+3b:00.0 Ethernet controller: Intel Corporation Ethernet Controller X710 for 10GbE SFP+ (rev 02)
+        Kernel driver in use: vfio-pci
+        Kernel modules: i40e
+total 0
+crw-rw---- 1 root dpdk 236,   0 Nov 10 09:12 vfio
+crw-rw---- 1 root dpdk 236,   1 Nov 10 09:12 42
+/sys/kernel/iommu_groups/42
+```
+
+判读说明（150 字以上）：`dpdk-devbind.py -s` 首段两行均显示 `drv=vfio-pci unused=i40e` 且没有 `if=` 字段，说明两个目标端口已被用户态驱动接管；第二段保留的 `0000:af:00.0` 带 `if=ens2f0 drv=i40e`，是刻意保留的管理口，且不再带 `*Active*`，证明已按要求 down 掉，符合「保留口不绑定」的规划。`lspci -k` 的 `Kernel driver in use: vfio-pci` 与 `Kernel modules: i40e` 从内核视角确认驱动确实换成了 vfio，而原内核模块仍可供回退使用。`/dev/vfio/` 下的 `vfio` 与组号 `42` 两个字符设备属 `root:dpdk`、权限 `660`，说明非 root 的 dpdk 组用户已具备打开容器的条件；若这里只有 `vfio` 而没有组号节点，通常意味着组不完整或没有设备成功绑定。`readlink` 回显 `/sys/kernel/iommu_groups/42` 把设备与组号对应起来。最后一条 `DMAR:.*fault` 无输出是预期结果，一旦出现 DMA 重映射错误，应立刻停止并排查 IOMMU 组与 ACS 配置。四层全部吻合即可进入 03-04 做核心隔离。
+
+### 5. 常见失败与排错
+
+**现象一：`/sys/kernel/iommu_groups/` 为空或绑定时报 `vfio: error, group is not viable`。** 根因是 IOMMU 未启用，或同一 IOMMU Group 里混有未解绑的内核设备（常见于 PCIe 下游没有开启 ACS 的交换芯片，多个端口被迫共享一个组）。定位用 `dmesg | grep -i -E 'DMAR|ACS|IOMMU'`、逐组列出 `/sys/kernel/iommu_groups/*/devices/`，以及 `lspci -vvv -s <BDF> | grep -i ACSCtl`。处理办法优先是换到支持 ACS 隔离的槽位、在 BIOS 开启 ACS 相关选项，或把同组设备一并绑到 vfio；`vfio_iommu_type1.allow_unsafe_interrupts=1` 与 `enable_unsafe_noiommu_mode=1` 这类放宽参数只应在隔离的测试环境使用，生产环境不要开启，参数名需对照实际版本核验。
+
+**现象二：设备 busy，解绑失败。** 表现是 `dpdk-devbind.py` 报设备正在使用，`unbind` 写入后 `drv=` 仍未清空。常见原因是接口还 up、NetworkManager 反复拉起、或某进程持有该设备的文件句柄。处理顺序为 `ip link set <iface> down`、停用相关网络服务、`lsof` / `fuser` 排查占用，再重新执行解绑。管理口误绑导致失联时，应通过 BMC / IPMI 带外恢复，并把 BDF—接口对应表提前写进变更单。
+
+**现象三：`modprobe vfio-pci` 失败或模块不存在。** 可能是内核未编 `CONFIG_VFIO_PCI`、模块名在当前发行版是 `vfio_pci`（下划线）、或 Secure Boot 拒绝了未签名模块。定位用 `modinfo vfio-pci`、`grep CONFIG_VFIO /boot/config-$(uname -r)`、`dmesg | tail`；处理办法是装对应版本的 `kernel-modules-extra` 之类的模块包，或改用发行版提供的签名模块。`igb_uio` 编译失败则多因 `kernel-devel` 版本与运行内核不一致，需对照实际版本核验。
+
+**现象四：绑定后 EAL 仍看不到端口。** 三种可能：`-b` 写错了 BDF、设备被 04 章的 `--allow` / `--block` 列表排除、或 `--iova-mode` 与 IOMMU 状态不匹配。前两者用 `dpdk-devbind.py -s` 与启动参数核对（完整参数见 04-01），第三者结合 `dmesg` 中的 IOMMU 日志与 VA/PA 模式判断（原理见 06-02）。另外 `uio_pci_generic` 在部分网卡上不支持 MSI-X，表现为端口能起来但中断相关功能异常，此时应改用 `vfio-pci`。
+
+**现象五：云上实例无 IOMMU。** 部分虚拟机与云实例不暴露 IOMMU 或不允许 VFIO 透传，只能走 `uio_pci_generic` / `igb_uio` 或云厂商提供的专用 PMD（如 ENA），这类限制与替代方案在 03-05 展开。下表把五类现象汇总，表中「或」关系以转义竖线书写。
+
+| 现象 | 根因 | 定位命令 | 处理 |
+|---|---|---|---|
+| group 不可用 | IOMMU 未开 \| ACS 未开 | dmesg -i DMAR \| lspci -vvv | 换槽位 \| 开 ACS |
+| 解绑失败 | 接口 up \| 服务占用 | ip -br link \| fuser | down 口并停服务 |
+| modprobe 失败 | 模块缺失 \| 签名拒绝 | modinfo vfio-pci | 装模块包或换签名 |
+| EAL 看不到端口 | BDF 错 \| 被 allow 排除 | dpdk-devbind.py -s | 核对参数见 04-01 |
+| 无 IOMMU | 虚拟化限制 | ls /sys/kernel/iommu_groups | 见 03-05 替代方案 |
+
+#### 陷阱与最佳实践
+
+其一，绑定前先把「BDF—接口名—用途」做成表，明确哪个口是管理口并永久保留，宁可多花十分钟核对，也不要带外救机。其二，生产一律用 `vfio-pci`，把 `uio_pci_generic` 与 `igb_uio` 留给没有 IOMMU 的测试机；后者的编译、签名与内核升级后的重编译成本都要计入运维预算。其三，每次绑定后立即准备回退命令，把原内核驱动名从 `unused=` 字段抄下来，避免回退时凭记忆写错。其四，非 root 场景用 udev 规则固化 `/dev/vfio` 属组，不要在启动脚本里临时 `chmod`，否则重启即失效。其五，绑定动作与运行时设备白名单是两件事，前者归本篇，后者归 EAL 参数（完整参数见 04-01），排错时要分层定位。其六，工具子命令、设备模块功能与 DMA 映射机制分别回查权威源（完整命令族见 04-05 ｜ 模块见 07-10 ｜ 原理见 06-02 ｜ 字段见 05-07），本册不重列。
+
+### 6. 小结
+
+本篇把网卡绑定收敛为一条可撤销的状态迁移链：确认 IOMMU → 加载 vfio 模块 → 查看设备归属 → down 口解绑 → 绑定到 `vfio-pci` → 核对 IOMMU Group 与 `/dev/vfio` 权限 → 必要时回退。三种桩驱动中 `vfio-pci` 因具备 IOMMU DMA 隔离、MSI-X 支持与非 root / 容器友好性而成为生产默认，`uio_pci_generic` 与 `igb_uio` 各适用于受限环境。验证采用脚本视图、内核视图、设备节点视图、应用视图四层交叉，任何一层缺失都不算通过。IOMMU 组不独立、设备 busy、模块缺失、EAL 看不到端口、云上无 IOMMU 是五类高频失败，均有明确的定位命令与修正顺序。网卡就绪后，还需要把处理它的 CPU 核心从内核调度与中断里隔离出来，这是 03-04 的任务；EAL 侧的设备白名单与 IOVA 模式统一回查（完整参数见 04-01 ｜ 原理见 06-02），`dpdk-devbind.py` 的其余用法回查（完整命令族见 04-05）。
+
+## 03-04 CPU 隔离、lcore 亲和性与调度
+
+### 1. 目标与拓扑
+
+DPDK 的轮询模型有一个隐含但强硬的假设：某个 lcore 一旦开始跑主循环，就应当一直独占一个物理核，直到进程退出。任何一次被内核调度器抢占、被本地定时器中断打断、被 RCU 回调或内核线程占用，都会让轮询循环出现空档，而这个空档期间网卡仍在持续收包，轻则增加尾延迟，重则直接丢包。普通 Linux 默认配置恰恰与这个假设相反：调度器会在所有 CPU 之间做负载均衡，周期性调度 tick 每毫秒级触发一次，RCU 回调、工作队列、中断与各类内核线程随时可能落到任何一个核上。因此部署 DPDK 的第四步，就是把一部分 CPU 从内核的通用调度域里「摘」出来，专门留给轮询 lcore，同时保留少数 CPU 承载系统必需的工作。
+
+这件事由三类内核启动参数协同完成。`isolcpus` 把指定 CPU 从调度器的负载均衡域里移除，使普通进程不再被自动迁移到这些核上；`nohz_full` 在指定核上关闭周期性调度 tick（仅保留必要的计时），把定时器噪声降到最低；`rcu_nocbs` 把指定核上的 RCU 回调卸载到专门的内核线程，避免回调在轮询核上同步执行。三者通常对同一组 CPU 一起配置，再配合 `irqaffinity` 把外设中断约束到 housekeeping 核。需要特别强调两点：第一，`isolcpus` 只是把核从负载均衡里摘除，并不禁止显式绑核，也不自动迁移已经存在的中断，所以 IRQ 与服务的处理必须单独做；第二，`nohz_full` 要求系统中至少保留一个非隔离核承担 timekeeping 等全局工作，把全部核都设为 `nohz_full` 会导致内核告警甚至计时异常，配置时必须留出 housekeeping 区间。
+
+本篇目标可拆成五项：基于 03-01 的规划表确定隔离区间与 housekeeping 区间；处理会覆盖隔离配置的 `irqbalance` / `tuned` 等服务；写入并生效 `isolcpus` / `nohz_full` / `rcu_nocbs` / `irqaffinity` 参数；迁移中断与残余进程，把轮询核真正腾空；最后把隔离核映射为 lcore 并验证绑定结果。CPU 隔离与 lcore 分配关系如图 03-04-01 所示：左侧 housekeeping 承载内核调度器与中断，右侧隔离区间叠加三个参数后划给端口 P0 / P1 的轮询 lcore，虚线表示对超线程兄弟核的回查关系。
+
+:::figure id=03-04-01 | name=CPU 隔离与 lcore 分配 | dir=TD
+node n1 "CPU 0-1<br/>housekeeping" blue
+node n2 "内核调度器<br/>定时器 RCU" blue
+node n3 "isolcpus<br/>2-15, 18-31" teal
+node n4 "nohz_full<br/>关闭周期 tick" teal
+node n5 "rcu_nocbs<br/>回调卸载" teal
+node n6 "lcore 2-9<br/>P0 轮询" purple
+node n7 "lcore 18-25<br/>P1 轮询" purple
+node n8 "irqaffinity<br/>中断留 0-1" amber
+node n9 "SMT 兄弟核<br/>留系统侧" green
+edge n1 -> n2 "承载系统"
+edge n3 -> n4 "叠加参数"
+edge n3 -> n5 "叠加参数"
+edge n1 -> n8 "中断亲和"
+edge n3 -> n6 "划给 DPDK"
+edge n3 -> n7 "划给 DPDK"
+edge n6 -> n9 dashed "回查兄弟"
+edge n7 -> n9 dashed "回查兄弟"
+:::
+
+### 2. 前置条件与环境
+
+第一项前置是 03-01 产出的 `numa_plan.txt` 与规划表。隔离区间不是随便挑一段编号，必须满足三个条件：与端口的 `numa_node` 对齐（处理 P0 的 lcore 落在 node 0）、避开管理网口中断所在的核、并保留至少两个 housekeeping 核（一般取每 Socket 的前两个物理核）。第二项是超线程配对数据，来自 `thread_siblings_list`；隔离一段 CPU 时，其超线程兄弟核要么一并纳入同一用途、要么明确留给系统，不能出现「2 号核给了 DPDK、34 号核还在跑内核线程」这种半隔离状态，因为兄弟核共享物理执行单元，干扰依然会传导。
+
+第二项前置是内核能力。`nohz_full` 依赖 `CONFIG_NO_HZ_FULL=y`，`rcu_nocbs` 依赖 `CONFIG_RCU_NOCB_CPU=y`（不同内核版本的配置项名称与是否内建可能不同，需对照实际版本核验），并且需要稳定的时钟源，`/sys/devices/system/clocksource/clocksource0/current_clocksource` 通常应为 `tsc`；若时钟源不稳定，`nohz_full` 会退化并打印告警。`isolcpus` 在较新内核里支持带标志位的写法如 `isolcpus=domain,managed_irq,<cpulist>`，其中 `domain` 表示从调度域隔离、`managed_irq` 表示同时隔离受管理中断；较老内核只支持纯 cpulist 写法，标志位会被忽略或报错，因此参数写法必须对照实际内核版本核验，不能照抄。
+
+第三项前置是引导与服务管理。参数通过 `grubby`（RHEL 系）或 `/etc/default/grub` + `grub2-mkconfig`（Debian 系）写入，改动后必须重启才生效，输出路径在 UEFI / BIOS 机器上不同，需对照实际版本核验。同时要处理三类会覆盖隔离配置的服务：`irqbalance` 会动态迁移中断、`tuned` 或厂商性能配置集可能重写内核参数与 CPU 亲和、部分云镜像的初始化脚本会重新拉起网络服务。建议在正式写入前先停用或配置它们，并把变更纳入启动脚本或配置管理，避免重启后失效。
+
+第四是运行时映射。隔离是内核侧的事，把哪个 lcore 放到哪个核上是 EAL 侧的事，由 `-l` / `--lcores` 等参数决定（完整参数见 04-01）。本篇只给一条最小示例并说明「隔离区间与 lcore 集合必须一致」，不展开参数全集；lcore 编号与线程亲和的内部机制回查（原理见 06-01）。三个核心参数的对照见下表，表中「或」关系以转义竖线书写。
+
+| 参数 | 作用 | 是否必须 | 注意点 |
+|---|---|---|---|
+| isolcpus | 移出调度负载均衡域 | 建议 | 新内核支持 domain \| managed_irq 标志 |
+| nohz_full | 关闭周期性调度 tick | 低延迟必备 | 至少留一个 housekeeping 核 |
+| rcu_nocbs | 卸载 RCU 回调 | 与 nohz_full 配套 | 需内核 CONFIG_RCU_NOCB_CPU |
+| irqaffinity | 约束外设中断 | 建议 | 与 irqbalance 二选一处理 |
+| skew_tick | 错开各核 tick | 可选 | 多核低延迟 \| 需核验 |
+
+内核与服务检查项对照见下表，长命令串移到表后代码块。
+
+| 检查项 | 期望 | 定位路径 |
+|---|---|---|
+| NO_HZ_FULL 配置 | =y | grep /boot/config-$(uname -r) |
+| 时钟源 | tsc | clocksource0/current_clocksource |
+| irqbalance | 已停用 | systemctl status irqbalance |
+| tuned 配置 | 不覆盖参数 | /etc/tuned/ 需核验 |
+| 兄弟核配对 | 成对出现 | thread_siblings_list |
+
+版本基准为 DPDK 23.11 LTS / 24.11 / master，但本篇绝大部分内容属于 Linux 内核启动参数，随发行版内核版本差异较大，所有参数写法、sysfs 路径与输出均标注「需对照实际版本核验」。容器场景下的 CPU 隔离由 cpuset / cgroup 承担，与本篇的宿主机隔离是不同层次，放到 03-06 说明。
+
+### 3. 分步操作
+
+**第一步：确认核心拓扑与确定区间。** 复用 03-01 的方法读取每个 CPU 的 NODE、SOCKET、CORE 与兄弟核列表，结合规划表定下隔离区间与 housekeeping 区间。以下示例假设双路共 64 个逻辑核，node 0 为 0-15 与 32-47、node 1 为 16-31 与 48-63，留 0-1 与 16-17 作 housekeeping，隔离 2-15 与 18-31，并让 34-49 等兄弟核留给系统侧。读者务必按本机实测值重填。
+
+```bash
+lscpu -e=CPU,NODE,SOCKET,CORE,ONLINE
+cat /sys/devices/system/node/node0/cpulist
+cat /sys/devices/system/node/node1/cpulist
+cat /sys/devices/system/cpu/cpu2/topology/thread_siblings_list
+cat /sys/devices/system/clocksource/clocksource0/current_clocksource
+grep -E 'CONFIG_(NO_HZ_FULL|RCU_NOCB_CPU)=' /boot/config-$(uname -r)
+```
+
+**第二步：停用会覆盖隔离的服务。** 先停 `irqbalance`，否则它会把中断重新撒到隔离核；再检查 `tuned` 当前配置集是否含 `isolcpus` 之类的重写逻辑，必要时切到不干预 CPU 亲和的配置集或按需定制（配置路径与配置集名称需对照实际版本核验）。这一步只处理服务，不写内核参数。
+
+```bash
+systemctl stop irqbalance
+systemctl disable irqbalance
+systemctl status irqbalance
+tuned-adm active
+grep -r -i 'isolcpus\|nohz_full\|rcu_nocbs' /etc/tuned/ 2>/dev/null | head
+```
+
+**第三步：写入 GRUB 启动参数。** 把四个参数一次性写进内核命令行。注意 `isolcpus` 的标志位写法需按内核版本取舍：较新内核可用 `domain,managed_irq`，较老内核直接写 cpulist；`nohz_full` 与 `rcu_nocbs` 的 cpulist 应与隔离区间一致；`irqaffinity` 指向 housekeeping 核。`nmi_watchdog=0`、`skew_tick=1` 等可选参数是否加入需对照实际版本与压测结果核验。写完后用 `grubby --info` 或重新生成配置回读，确认参数落在当前默认启动条目上，再重启。
+
+```bash
+grubby --update-kernel=ALL --args="isolcpus=domain,managed_irq,2-15,18-31 nohz_full=2-15,18-31 rcu_nocbs=2-15,18-31 irqaffinity=0-1,16-17 nmi_watchdog=0 skew_tick=1"
+grubby --info=ALL | grep args
+```
+
+```ini
+GRUB_CMDLINE_LINUX="default_hugepagesz=1G hugepagesz=1G hugepages=8 intel_iommu=on iommu=pt isolcpus=domain,managed_irq,2-15,18-31 nohz_full=2-15,18-31 rcu_nocbs=2-15,18-31 irqaffinity=0-1,16-17 nmi_watchdog=0 skew_tick=1"
+```
+
+```bash
+grub2-mkconfig -o /boot/grub2/grub.cfg
+grep -o 'isolcpus=[^ ]*\|nohz_full=[^ ]*\|rcu_nocbs=[^ ]*\|irqaffinity=[^ ]*' /boot/grub2/grub.cfg | head
+```
+
+**第四步：重启并读取生效参数。** 重启后首先确认 `/proc/cmdline` 里四个参数齐全，再读 sysfs 的 `isolated` 与 `nohz_full` 接口，这两个接口是内核实际解析结果的权威视图，能暴露「参数写了但被内核忽略」的问题。以下为示例输出，具体格式需对照实际版本核验。
+
+```bash
+cat /proc/cmdline
+cat /sys/devices/system/cpu/isolated
+cat /sys/devices/system/cpu/nohz_full
+cat /sys/devices/system/cpu/possible
+```
+
+```text
+BOOT_IMAGE=(hd0,gpt2)/vmlinuz-5.14.0-362.el9.x86_64 root=/dev/mapper/rhel-root ro crashkernel=1G-4G:192M,4G-64G:256M,64G-:512M default_hugepagesz=1G hugepagesz=1G hugepages=8 hugepagesz=2M hugepages=1024 intel_iommu=on iommu=pt isolcpus=domain,managed_irq,2-15,18-31 nohz_full=2-15,18-31 rcu_nocbs=2-15,18-31 irqaffinity=0-1,16-17 nmi_watchdog=0 skew_tick=1 quiet
+2-15,18-31
+2-15,18-31
+0-63
+```
+
+判读说明（150 字以上）：`/proc/cmdline` 一行里可以逐项确认 `isolcpus`、`nohz_full`、`rcu_nocbs`、`irqaffinity` 都已写入，同时还能看到 03-02 的大页参数与 03-03 的 IOMMU 参数仍在，说明多次 `grubby --update-kernel=ALL --args` 是追加而非覆盖，这一点很容易踩坑：若某次误用了覆盖式写法，先前的 `hugepagesz` 与 `intel_iommu=on` 会一起丢失。`isolcpus=domain,managed_irq,2-15,18-31` 中的标志位表示当前内核接受了带语义的写法，若实际内核较老、只认纯 cpulist，sysfs 的 `isolated` 可能为空或 `dmesg` 会给出忽略参数的提示，此时必须改成 `isolcpus=2-15,18-31`。`cat /sys/devices/system/cpu/isolated` 回显 `2-15,18-31` 与写入区间完全一致，证明隔离真正生效；`nohz_full` 接口回显同一区间，说明 tick 关闭也生效，且 housekeeping 区间 0-1 与 16-17 未被纳入，满足「至少保留一个非 nohz_full 核」的要求。`possible` 显示 `0-63` 说明系统共 64 个逻辑核，与规划表一致。任一接口回显为空或区间不符，都要回到参数写法与内核版本核验。
+
+**第五步：迁移中断与残余进程。** `isolcpus` 不自动搬中断，因此要显式把 IRQ 亲和性收敛到 housekeeping 核。遍历 `/proc/irq/*/smp_affinity_list` 写入 housekeeping 列表时，部分 IRQ 不可写属正常现象（它们由内核固定管理），忽略即可；完成后观察 `/proc/interrupts` 在隔离核对应列是否停止增长。同时把 sshd、监控 agent、日志采集等非 DPDK 进程用 `taskset` 或 systemd 的 `AllowedCPUs` 约束到 housekeeping，避免它们被手工绑到隔离核（systemd 属性名与写法需对照实际版本核验）。
+
+```bash
+for f in /proc/irq/[0-9]*/smp_affinity_list; do
+  echo 0-1 > "$f" 2>/dev/null
+done
+grep -E 'CPU0|^[[:space:]]*[0-9]+:' /proc/interrupts | head -n 15
+taskset -pc $$
+```
+
+**第六步：把隔离核映射为 lcore。** 内核腾空之后，运行时通过 `-l` 或 `--lcores` 指定 DPDK 使用的核心（完整参数见 04-01）。这里只给一条最小示例：让 `dpdk-testpmd` 使用 node 0 的隔离核 2-9，并强调「lcore 集合必须是隔离区间的子集」，否则要么把噪声带进轮询核，要么浪费已隔离的核。`--lcores` 还能把 lcore 编号显式映射到物理 CPU，适合编号不连续的拓扑，具体语法见权威源，不在本册重列。内部线程亲和机制回查（原理见 06-01）。
+
+```bash
+dpdk-testpmd -l 2-9 -n 4 -- --forward-mode=io --stats-period=1
+```
+
+**第七步：把配置固化。** 将 `grubby` 命令、服务停用动作、IRQ 迁移脚本与 lcore 映射写成一份部署清单并纳入配置管理，确保后续内核升级或镜像重建后参数不丢失。可把 IRQ 迁移做成 systemd unit 在每次启动后执行，因为 `/proc/irq` 的设置在重启后不保留。unit 写法与启动顺序需对照实际版本核验。
+
+```ini
+[Unit]
+Description=Pin non-DPDK IRQs to housekeeping CPUs
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'for f in /proc/irq/[0-9]*/smp_affinity_list; do echo 0-1 > "$f" 2>/dev/null; done'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 4. 验证方法与预期结果
+
+验证要同时覆盖「内核参数生效」「中断与进程确实腾空」「lcore 正确绑定」三条线，缺一不可。第一条线：`/proc/cmdline` 含四个参数，`/sys/devices/system/cpu/isolated` 与 `nohz_full` 回显隔离区间，`dmesg` 无「nohz_full 缺少 housekeeping」一类告警。第二条线：`/proc/interrupts` 在隔离核列几乎不增长，`taskset -pc <pid>` 显示非 DPDK 进程落在 housekeeping 区间，`pidstat` 观察隔离核上没有意外的内核线程活动。第三条线：DPDK 应用启动日志里每个 lcore 报告的主频与 `rte_lcore_id` 对应关系符合规划，`ps -eLo pid,tid,psr,comm | grep` 能看到 DPDK 线程稳定运行在隔离核上（线程命名与 lcore 对应关系需对照实际版本核验）。下面给出组合验证命令与预期输出，示例输出，具体格式需对照实际版本核验。
+
+```bash
+printf 'isolated=%s\n' "$(cat /sys/devices/system/cpu/isolated)"
+printf 'nohz_full=%s\n' "$(cat /sys/devices/system/cpu/nohz_full)"
+printf 'clocksource=%s\n' "$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource)"
+watch -n 2 'grep -E "^[[:space:]]*[0-9]+:" /proc/interrupts | awk "{print \$1, \$3, \$4}" | head -n 8'
+ps -eLo pid,tid,psr,comm | grep -i testpmd | head
+taskset -pc 1
+```
+
+```text
+isolated=2-15,18-31
+nohz_full=2-15,18-31
+clocksource=tsc
+  9:      0          0   IO-APIC   9-fasteoi   acpi
+ 24:  14203          0   PCI-MSI 524288-edge      i40e-ens2f0-TxRx-0
+  1: pid 1's current affinity list: 0-1
+```
+
+判读说明（150 字以上）：前两行 `isolated` 与 `nohz_full` 均回显 `2-15,18-31`，与规划区间完全一致，说明内核真正解析并应用了两项隔离；`clocksource=tsc` 表明时钟源稳定，这是 `nohz_full` 能正常关闭周期 tick 的前提，若这里显示 `hpet` 或 `acpi_pm`，应检查 BIOS 的 TSC 相关选项与内核 `tsc=reliable` 一类参数（需对照实际版本核验）。`/proc/interrupts` 抽样里 `i40e-ens2f0-TxRx-0` 这一行的计数集中在 CPU0 列（14203），隔离核对应列为 0，说明第五步的 IRQ 迁移生效，网卡中断被约束在 housekeeping 侧，没有打扰轮询核；注意保留口仍有中断是预期行为，DPDK 接管的口本身不使用中断。`taskset -pc 1` 回显 PID 1 的亲和列表为 `0-1`，代表 systemd 及由它派生的系统进程被限制在 housekeeping 区间。`ps` 一行用于核对 DPDK 线程的 `psr`（当前运行的 CPU）是否落在隔离区间，若出现轮询线程跑在 0-1 上，说明 lcore 映射与隔离区间不一致，需回查（完整参数见 04-01）。三项全部吻合，核心隔离才算完成。
+
+### 5. 常见失败与排错
+
+**现象一：重启后 `/proc/cmdline` 里参数丢失或被覆盖。** 常见原因是 `grubby` 改了非默认内核条目、UEFI 与 BIOS 的 `grub.cfg` 路径写错、`tuned` 或云初始化脚本重写了命令行。定位用 `grubby --info=ALL`、`grub2-mkconfig` 的实际输出路径、`grep -r isolcpus /etc/default/grub /etc/tuned/`，并把多次 `--args` 改成一次性写入完整参数串。处理时务必像第四步判读那样，顺带确认 03-02 的大页参数与 03-03 的 IOMMU 参数没被一起冲掉。
+
+**现象二：`isolated` 或 `nohz_full` 回显为空。** 多半是 `isolcpus=domain,managed_irq,...` 这类标志位被较老内核忽略，或 `CONFIG_NO_HZ_FULL` 未编入。定位用 `dmesg | grep -i -E 'isolcpus|nohz|rcu_nocb'` 与 `grep CONFIG_NO_HZ_FULL /boot/config-$(uname -r)`；处理办法是退回纯 cpulist 写法、确认内核配置，必要时换用支持 `NO_HZ_FULL` 的发行版内核。
+
+**现象三：全部核都设为 `nohz_full` 导致告警或计时异常。** 典型日志是内核提示没有 housekeeping CPU 承担 timekeeping。处理办法是从 `nohz_full` 列表里剔除至少两个核（一般每 Socket 留一个），并同步调整 `irqaffinity` 与 housekeeping 服务亲和，保持三处一致。
+
+**现象四：隔离核仍有中断或进程噪声。** 表现为延迟毛刺，但 `isolated` 回显正常。根因通常是 IRQ 迁移遗漏了 `managed_irq`（例如 NVMe 队列中断由内核自动管理）、超线程兄弟核未一并隔离、或某服务被手工绑到了隔离核。定位用 `cat /proc/interrupts`、`cat /sys/devices/system/cpu/cpuN/topology/thread_siblings_list` 与 `ps -eLo pid,psr,comm`；处理办法是把兄弟核纳入同一用途、把 `managed_irq` 交给 `isolcpus` 标志位处理，并把残余进程重新绑到 housekeeping。
+
+**现象五：容器内隔离无效。** 宿主机参数正确，但 Pod 里的 DPDK 进程仍被调度到非隔离核，这是 cpuset / cgroup 与宿主机隔离叠加的问题，属 03-06 范畴。下表把五类现象汇总，表中「或」关系以转义竖线书写。
+
+| 现象 | 根因 | 定位命令 | 处理 |
+|---|---|---|---|
+| 参数丢失 | 改错条目 \| tuned 覆盖 | grubby --info=ALL | 一次性写完整参数串 |
+| isolated 为空 | 标志位不支持 \| 未编 NO_HZ_FULL | dmesg -i isolcpus | 改纯 cpulist \| 换内核 |
+| 计时告警 | 无 housekeeping 核 | dmesg -i nohz | 至少留两个核 |
+| 仍有毛刺 | 兄弟核未隔离 \| managed_irq | cat thread_siblings_list | 成对隔离并迁中断 |
+| 容器内无效 | cpuset 未对齐 | cat /proc/self/status | 见 03-06 处理 |
+
+#### 陷阱与最佳实践
+
+其一，隔离区间、IRQ 亲和、housekeeping 服务亲和、lcore 集合四者必须写在同一份清单里同步修改，任何一处单独变更都会造成半隔离。其二，`grubby --args` 是追加语义，但多次追加容易漏项，建议一次写全，并在重启后用 `/proc/cmdline` 逐项核对历史参数。其三，`nohz_full` 永远保留 housekeeping 核，且先确认时钟源是 `tsc`。其四，超线程要按 `thread_siblings_list` 成对处理，不要把兄弟核留给系统却把主核给 DPDK 后以为万事大吉。其五，参数写法与 sysfs 路径高度依赖内核版本，升级内核后必须重跑一遍第四步验证。其六，隔离是内核侧、lcore 映射是 EAL 侧，两者职责不同，排错时分层定位（完整参数见 04-01 ｜ 原理见 06-01 ｜ 完整命令族见 04-05），本册不重列参数全集。
+
+### 6. 小结
+
+本篇完成了轮询核的「腾空」工作：以 03-01 的规划表为输入确定隔离区间与 housekeeping 区间，停用 `irqbalance` 并检查 `tuned`，用 `grubby` 一次性写入 `isolcpus` / `nohz_full` / `rcu_nocbs` / `irqaffinity`，重启后通过 `/proc/cmdline` 与 sysfs 接口确认生效，再迁移中断、约束残余进程，最后把隔离核映射为 lcore。验证覆盖参数生效、中断腾空、线程绑定三条线，任一条不符都不算完成。参数被覆盖、标志位不被支持、无 housekeeping 核、超线程半隔离、容器内 cpuset 未对齐是五类高频失败，均有明确修正路径。至此单机部署的硬件、大页、绑卡、核心四要素齐备；接下来 03-05 把视角从裸机扩展到虚拟化与云，03-06 扩展到容器与 K8s。EAL 侧参数、工具命令族与线程模型机制分别回查（完整参数见 04-01 ｜ 完整命令族见 04-05 ｜ 原理见 06-01），本册不重列。
+
+## 03-05 虚拟化与云：SR-IOV / virtio / vhost-user
+
+### 1. 目标与拓扑
+
+当 DPDK 从裸机走进虚拟化与云环境，数据通路不再是一段简单的「网卡—lcore—内存」，而要先回答一个架构问题：报文从物理网卡进入之后，最终由谁轮询、经过几次拷贝、跨不跨虚拟机边界。不同答案对应三类典型方案，性能、可迁移性与运维复杂度差别很大。第一类是 SR-IOV 硬件直通：物理网卡的 PF 在宿主侧被切分成多个 VF，每个 VF 是拥有独立 BDF 的 PCI 设备，透传进虚拟机后由虚拟机内的 DPDK 应用直接驱动，路径最短、接近裸机线速，代价是 VF 数量受硬件限制、热迁移困难、且每个 VF 都要单独做大页与绑定配置。第二类是 virtio 与 vhost-user：宿主侧的 DPDK 应用（常见为 OVS-DPDK 或一个 vhost 后端进程）通过 Unix domain socket 与 QEMU 里的 virtio-net 前端协商 vring，报文经由共享的大页内存零拷贝传递，牺牲一点性能换来灵活的软件交换与可迁移性；virtio-user 则是把前端也搬到用户态 DPDK 进程里的一种变体，常用于容器间的对接。第三类是公有云场景：多数通用云实例不向 Guest 暴露标准的 SR-IOV 与 IOMMU，改由云厂商的专用 PMD（如 AWS 的 ENA）或受限的 UIO 驱动接管，配置方法与裸机明显不同。
+
+理解这三条通路的关键在于「谁持有设备、谁持有内存」。SR-IOV 里 VF 被透传，Guest 同时持有设备与自己的大页，宿主几乎不参与数据面；vhost-user 里设备仍在宿主、内存由宿主的大页池提供并通过 socket 共享给 QEMU，Guest 只持有 virtio 前端与 vring 视图；云上则可能是设备由宿主的厂商 PMD 虚拟出来、Guest 里看到的是一个半虚拟化设备。三种方案的模块归属与功能分工统一回查（模块见 07-10），大页与 IOVA 的内部机制回查（原理见 06-02），本篇不展开这两部分，只解决部署侧的可落地问题：怎样创建并配置 VF、怎样绑定与透传、怎样起一个 vhost-user 后端并与 QEMU 对接、云上有哪些必须提前核验的差异，以及怎样验证数据通路确实打通。
+
+SR-IOV 与 vhost-user 两条通路在同一台宿主机上的组件关系如图 03-05-01 所示：上半部是 PF 切出 VF、经 vfio-pci 透传到 VM 内由 PMD 直驱；下半部是宿主 DPDK 后端经 vhost-user socket 与 QEMU 的 virtio-net 前端共享 vring 与大页内存；虚线标出云上专用 PMD 作为替代路径的回查关系。三条通路从「多次拷贝」到「零拷贝」再到「硬件直通」的演进与各自特征如图 03-05-02 所示，便于按性能与可迁移性做选型。
+
+:::figure id=03-05-01 | name=SR-IOV 与 vhost-user 双通路拓扑 | dir=TD
+node n1 "物理网卡 PF<br/>宿主可见" blue
+node n2 "SR-IOV VF<br/>独立 BDF" teal
+node n3 "vfio-pci 透传<br/>VM 内绑定" amber
+node n4 "VM 内 DPDK<br/>直接轮询 VF" purple
+node n5 "vhost-user<br/>Unix socket" green
+node n6 "virtio-net 前端<br/>QEMU vring" amber
+node n7 "宿主 DPDK 后端<br/>OVS-DPDK" purple
+node n8 "大页共享内存<br/>零拷贝" gray
+node n9 "云厂商 PMD<br/>ENA 等" red
+edge n1 -> n2 "切出 VF"
+edge n2 -> n3 "透传设备"
+edge n3 -> n4 "VM 直驱"
+edge n7 -> n5 "backend"
+edge n5 -> n6 "协商 vring"
+edge n6 -> n7 "共享内存"
+edge n8 -> n6 "映射"
+edge n8 -> n7 "映射"
+edge n1 -> n9 dashed "云上替代回查"
+edge n9 -> n4 dashed "同类性能回查"
+:::
+
+四种虚拟化数据通路的路径与性能特征对比见图 03-05-02。
+
+:::figure id=03-05-02 | name=虚拟化数据通路与性能特征对比 | dir=TD
+node n1 "纯 virtio-net<br/>内核转发" gray
+node n2 "vhost-net<br/>内核加速" teal
+node n3 "vhost-user<br/>用户态零拷贝" green
+node n4 "SR-IOV 透传<br/>接近裸机" purple
+node n5 "Guest 内核栈" blue
+node n6 "宿主内核栈" blue
+node n7 "宿主 DPDK" amber
+node n8 "VM 内 PMD" amber
+edge n1 -> n5 "多次拷贝"
+edge n2 -> n6 "卸载到内核"
+edge n3 -> n7 "共享 vring"
+edge n4 -> n8 "VF 直驱"
+edge n1 -> n2 dashed "演进回查"
+edge n2 -> n3 dashed "演进回查"
+edge n3 -> n4 dashed "演进回查"
+:::
+
+### 2. 前置条件与环境
+
+SR-IOV 路线的前置条件最多。BIOS 必须开启 VT-d / AMD-Vi 与 SR-IOV 相关选项，内核命令行带 `intel_iommu=on iommu=pt`（AMD 平台参数名需对照实际版本核验），这两项在 03-01 与 03-03 已完成。网卡与 PF 驱动必须支持 SR-IOV，可用 `sriov_totalvfs` 与 `modinfo` 的驱动参数确认，Intel X710 / XL710 / E810 与 Mellanox ConnectX 系列通常支持，但最大 VF 数、每个 PF 的上限与是否需要驱动模块参数（如 `max_vfs`）因驱动而异，需对照实际版本核验。VF 创建后，Guest 侧仍需按 03-03 的方法把 VF 绑到 `vfio-pci`，并按 03-02 在 Guest 内预留大页——注意大页是「宿主一份、Guest 一份」各自独立的，宿主的大页不会自动变成 Guest 的。透传工具链需要 QEMU / libvirt（`virsh`）或云管平台，QEMU 版本决定 vhost-user 与 `vhostforce` 等选项是否可用，需对照实际版本核验。
+
+vhost-user 路线的重点是内存共享。宿主 DPDK 后端使用的大页必须能被 QEMU 以 `memory-backend-file` 的 `mem-path` 打开，且要带 `share=on`，否则 vring 与报文内存无法在前后端之间共享；这组内存最好与后端 lcore 落在同一 NUMA 节点（承接 03-01）。socket 文件路径、属主、SELinux / AppArmor 策略都要提前确认，容器场景还要把 socket 所在目录挂进容器。前端可以是 QEMU 的 `virtio-net-pci`，也可以是另一个 DPDK 进程里的 `virtio_user` 虚拟设备，两种形态的 devargs 写法不同，需对照实际版本核验（完整参数见 04-01）。
+
+云上路线必须先做能力核验而不是照搬裸机命令。很多通用实例不暴露 IOMMU，`/sys/kernel/iommu_groups/` 为空，`vfio-pci` 无法使用；部分实例提供的加速网卡是半虚拟化设备而非标准 PCIe SR-IOV，需要云厂商对应的 PMD。AWS 的 ENA、Azure 的加速网络与相应 PMD、GCP 的相关网卡各有差异，源码可定位到 DPDK 的 `drivers/net/` 下相应目录（目录名与是否随版本提供需对照实际版本核验）；裸金属实例通常更接近物理机，可完整套用 03-01 到 03-04。三类方案的选型对照见下表，表中「或」关系以转义竖线书写。
+
+| 方案 | 设备持有方 | 拷贝次数 | 可迁移性 | 适用 |
+|---|---|---|---|---|
+| SR-IOV 透传 | Guest 持有 VF | 最少 | 较差 | 高性能 \| 裸金属 |
+| vhost-user | 宿主持有 PF | 零拷贝 | 较好 | 软件交换 \| NFV |
+| 云厂商 PMD | 宿主虚拟化 | 视实现 | 由云平台定 | 公有云 \| 需核验 |
+
+SR-IOV 相关 sysfs 与工具路径见下表，长命令串不塞进表格，完整清单移到表后代码块。
+
+| 路径 / 配置项 | 含义 | 用法 |
+|---|---|---|
+| sriov_totalvfs | 硬件支持的 VF 上限 | cat 只读 |
+| sriov_numvfs | 当前启用的 VF 数 | echo 写入创建 |
+| sriov_drivers_autoprobe | VF 是否自动绑宿主驱动 | 透传场景置 0 |
+| /sys/bus/pci/devices/<BDF>/ | VF 的 PCI 设备目录 | 绑定与透传用 |
+| drivers/net/<pmd>/ | 云厂商 PMD 源码 | 需对照版本核验 |
+| vhost socket | 前后端协商通道 | 权限与挂载需确认 |
+
+版本基准为 DPDK 23.11 LTS / 24.11 / master。`net_vhost` 与 `virtio_user` 虚拟设备的名称、devargs 键名、QEMU 的 vhost-user 命令行选项、SR-IOV Network Operator 的 CRD 名称都可能随版本变化，本篇所有不确定处均标注「需对照实际版本核验」并给出可定位路径；`dpdk-devbind.py` 的完整子命令回查（完整命令族见 04-05）。
+
+### 3. 分步操作
+
+**第一步：确认网卡的 SR-IOV 能力。** 先读 PF 的 `sriov_totalvfs` 得知硬件上限，再用 `lspci -vvv` 查看 SR-IOV Capability，最后确认 PF 驱动模块参数。若 `sriov_totalvfs` 不存在或为 0，说明该端口或固件不支持 SR-IOV，应改走 vhost-user 或云厂商 PMD 路线。此步只读，不改状态。
+
+```bash
+cat /sys/class/net/ens1f0/device/sriov_totalvfs
+cat /sys/class/net/ens1f0/device/sriov_numvfs
+lspci -vvv -s 0000:3b:00.0 | grep -i -A4 'SR-IOV'
+modinfo i40e | grep -i -E 'max_vfs|sriov'
+```
+
+**第二步：创建 VF 并核对枚举结果。** 向 `sriov_numvfs` 写入目标数量即可让 PF 驱动生成 VF，写入值不能超过 `sriov_totalvfs`。创建后立即用 `lspci -nn` 确认 VF 都以独立 BDF 出现，并检查 `sriov_drivers_autoprobe`：若它为 1，PF 驱动会自动给 VF 绑上宿主侧驱动（如 `iavf`），透传前需要先置 0 或从宿主驱动解绑。以下为示例输出，具体格式需对照实际版本核验。
+
+```bash
+echo 0 > /sys/class/net/ens1f0/device/sriov_drivers_autoprobe
+echo 4 > /sys/class/net/ens1f0/device/sriov_numvfs
+cat /sys/class/net/ens1f0/device/sriov_numvfs
+lspci -nn | grep -i 'Virtual Function'
+```
+
+```text
+4
+3b:10.0 Ethernet controller [0200]: Intel Corporation X710 Virtual Function [8086:154c] (rev 02)
+3b:10.1 Ethernet controller [0200]: Intel Corporation X710 Virtual Function [8086:154c] (rev 02)
+3b:10.2 Ethernet controller [0200]: Intel Corporation X710 Virtual Function [8086:154c] (rev 02)
+3b:10.3 Ethernet controller [0200]: Intel Corporation X710 Virtual Function [8086:154c] (rev 02)
+```
+
+判读说明（150 字以上）：首行 `4` 是 `sriov_numvfs` 的回读值，与写入值一致，说明 PF 驱动成功创建了 4 个 VF；若回读值小于写入值，通常是固件限制、PF 驱动模块参数或该 PF 已把 VF 配额分配给其他端口，需要回查 `dmesg` 与 `sriov_totalvfs`。随后四行 `lspci` 输出显示 4 个 VF 各自拥有独立 BDF（`3b:10.0` 到 `3b:10.3`），设备号 `[8086:154c]` 是 Intel X710 VF 的厂商与设备 ID，与 PF 的 `[8086:1572]` 不同，这一点很重要：VF 在 PCI 层是独立设备，后续绑定、透传、IOMMU Group 划分都以这些新 BDF 为准，不能再用 PF 的 BDF。括号里的 `(rev 02)` 是硬件修订号，正常。`sriov_drivers_autoprobe` 提前置 0 保证了 VF 不会自动绑定宿主侧 `iavf` 驱动，从而可以直接交给 `vfio-pci`；若这一步漏做，`dpdk-devbind.py -s` 里 VF 会挂在内核驱动段，需要先解绑。创建 VF 后务必把这四个 BDF 记入规划表，后续透传与验证都用得上。
+
+**第三步：配置 VF 的二层属性。** 创建出的 VF 默认 MAC 往往全零或随机，且不信任、未设 VLAN，直接透传会导致 Guest 内链路不通或 VLAN 冲突。用 `ip link set <pf> vf <N>` 逐项设置 MAC、VLAN、trust 与 spoofchk，再用 `ip link show` 回读确认。这些设置通常在 PF 上完成，部分驱动要求先 down PF 或按顺序执行，具体行为需对照实际驱动版本核验；持久化要写进网络配置脚本或 udev 规则，因为重启后 VF 属性会重置。
+
+```bash
+ip link set ens1f0 vf 0 mac 52:54:00:11:22:01 vlan 100 trust on spoofchk off
+ip link set ens1f0 vf 1 mac 52:54:00:11:22:02 vlan 100 trust on spoofchk off
+ip link set ens1f0 vf 2 mac 52:54:00:11:22:03 vlan 200 trust on spoofchk off
+ip link set ens1f0 vf 3 mac 52:54:00:11:22:04 vlan 200 trust on spoofchk off
+ip link show dev ens1f0
+```
+
+**第四步：把 VF 绑定到 vfio-pci。** 与 03-03 完全相同的动作，只是对象换成 VF 的 BDF。绑定后用 `dpdk-devbind.py -s` 确认 VF 出现在「DPDK-compatible driver」段，`unused=` 一般为 `iavf`，这个驱动名在回退时要用到。完整命令族见 04-05。
+
+```bash
+dpdk-devbind.py -b vfio-pci 0000:3b:10.0 0000:3b:10.1 0000:3b:10.2 0000:3b:10.3
+dpdk-devbind.py -s
+readlink -f /sys/bus/pci/devices/0000:3b:10.0/iommu_group
+```
+
+**第五步：把 VF 透传进虚拟机。** 两种常见写法：libvirt 在 domain XML 里加一段 `hostdev`，或 QEMU 命令行用 `-device vfio-pci,host=<BDF>`。前者适合生产编排，后者适合快速验证。以下为 libvirt 的 `hostdev` 配置片段，用 `virsh attach-device` 热插或写进 domain XML；字段与 `managed` 属性的行为随 libvirt 版本变化，需对照实际版本核验。透传完成后 Guest 内应能通过 `lspci -nn` 看到该 VF，并在 Guest 内按 03-02、03-03 配置大页与绑定。
+
+```bash
+virsh attach-device vm-dpdk vfio-hostdev.xml --live --config
+qemu-system-x86_64 -enable-kvm -m 4096 \
+  -device vfio-pci,host=0000:3b:10.0 \
+  -object memory-backend-file,id=mem,size=4096M,mem-path=/mnt/huge_1G,share=on,prealloc=yes \
+  -numa node,memdev=mem
+```
+
+```text
+<hostdev mode='subsystem' type='pci' managed='yes'>
+  <driver name='vfio'/>
+  <source>
+    <address domain='0x0000' bus='0x3b' slot='0x10' function='0x0'/>
+  </source>
+  <address type='pci' domain='0x0000' bus='0x00' slot='0x06' function='0x0'/>
+</hostdev>
+```
+
+**第六步：启动 vhost-user 后端并与 QEMU 对接。** 宿主侧用 testpmd 或 OVS-DPDK 起一个 vhost-user 后端，虚拟设备名与 devargs 键名随版本变化（完整参数见 04-01），需对照实际版本核验；关键是 `iface` 指向一个双方都能访问的 socket 路径，并让 QEMU 用 `-chardev socket` 连上它。QEMU 侧必须用 `memory-backend-file` 指向宿主 hugetlbfs 挂载点且带 `share=on`，否则 vring 无法共享。`client=0/1` 决定谁是 socket 的客户端，前后端必须一致，否则连接建立不起来。virtio-user 作为纯 DPDK 前端的写法一并给出，适合容器间对接（devargs 需核验）。
+
+```bash
+dpdk-testpmd -l 2-9 -n 4 \
+  --vdev 'net_vhost0,iface=/tmp/vhost.sock,client=1' \
+  -- --forward-mode=io --stats-period=1
+```
+
+```bash
+qemu-system-x86_64 -enable-kvm -m 4096 \
+  -object memory-backend-file,id=mem,size=4096M,mem-path=/mnt/huge_1G,share=on,prealloc=yes \
+  -numa node,memdev=mem -mem-prealloc \
+  -chardev socket,id=char0,path=/tmp/vhost.sock \
+  -netdev type=vhost-user,id=mynet1,chardev=char0,vhostforce \
+  -device virtio-net-pci,netdev=mynet1,mac=52:54:00:00:00:01
+```
+
+```bash
+dpdk-testpmd -l 10-17 -n 4 \
+  --vdev 'virtio_user0,path=/tmp/vhost.sock' \
+  -- --forward-mode=io
+```
+
+**第七步：云上实例的能力核验与驱动选择。** 云上先判断 IOMMU 是否可用、看到的是标准 PCIe 设备还是半虚拟化设备，再决定用 `vfio-pci`、`uio_pci_generic` 还是厂商 PMD。以下命令给出可定位的核验路径，具体设备名、PMD 目录与驱动绑定方式需对照实际版本与云厂商文档核验（模块见 07-10）。裸金属实例则可直接套用 03-01 到 03-04。
+
+```bash
+ls -d /sys/kernel/iommu_groups/[0-9]* 2>/dev/null | head
+lspci -nn | grep -i -E 'Ethernet|ENA|Amazon|Mellanox'
+modprobe vfio-pci
+modinfo ena
+ls drivers/net/ena/ drivers/net/mana/
+```
+
+### 4. 验证方法与预期结果
+
+虚拟化场景的验证必须分层：宿主侧确认 VF 与后端就绪，Guest 侧确认设备与内存可用，数据面确认收发包确实打通。宿主侧的预期是 `sriov_numvfs` 回读等于目标值、VF 出现在 `lspci` 且已绑 `vfio-pci`、每个 VF 的 IOMMU Group 完整、vhost socket 文件存在且属主正确、宿主 hugetlbfs 挂载点可读写并带 `share=on` 语义。Guest 侧的预期是 `lspci -nn` 能看到透传的 VF、`dpdk-devbind.py -s` 显示 Guest 内 VF 已绑 `vfio-pci`、`/proc/meminfo` 的 `HugePages_Free` 满足应用需求。数据面的预期是后端与前端的端口都 up，testpmd 的收发包计数持续增长且不丢包，Guest 内能 ping 通对端或跑通转发。下面给出宿主侧组合验证命令与预期输出，示例输出，具体格式需对照实际版本核验。
+
+```bash
+printf 'numvfs=%s\n' "$(cat /sys/class/net/ens1f0/device/sriov_numvfs)"
+dpdk-devbind.py -s | sed -n '1,9p'
+ls -l /tmp/vhost.sock
+mount | grep hugetlbfs
+readlink -f /sys/bus/pci/devices/0000:3b:10.0/iommu_group
+dmesg | grep -i -E 'vhost|DMAR:.*fault' | tail -n 10
+```
+
+```text
+numvfs=4
+Network devices using DPDK-compatible driver
+============================================
+0000:3b:10.0 'X710 Virtual Function 154c' drv=vfio-pci unused=iavf
+0000:3b:10.1 'X710 Virtual Function 154c' drv=vfio-pci unused=iavf
+0000:3b:10.2 'X710 Virtual Function 154c' drv=vfio-pci unused=iavf
+0000:3b:10.3 'X710 Virtual Function 154c' drv=vfio-pci unused=iavf
+srw------- 1 dpdk dpdk 0 Nov 10 10:24 /tmp/vhost.sock
+none on /mnt/huge_1G type hugetlbfs (rw,relatime,pagesize=1G)
+/sys/kernel/iommu_groups/51
+```
+
+判读说明（150 字以上）：`numvfs=4` 与第二步写入一致，说明 VF 数量保持有效，没有被后续操作重置。`dpdk-devbind.py -s` 首段四行全部是 `X710 Virtual Function 154c` 且 `drv=vfio-pci unused=iavf`，证明 4 个 VF 都已绑定到用户态驱动，`unused=iavf` 是回退到宿主内核驱动时要用的名字；注意这里没有 `if=` 字段，符合透传前不应有宿主网络接口的要求。`/tmp/vhost.sock` 的类型以 `s` 开头，是 socket 文件而非普通文件，属 `dpdk:dpdk`、权限 `600`，说明后端已建立监听且属主正确，QEMU 需以同用户或同组运行才能连上；若该文件不存在，说明后端进程未起或 `iface` 路径写错。`mount` 回显 `/mnt/huge_1G` 挂载为 `pagesize=1G` 的 hugetlbfs，正是 QEMU `mem-path` 指向的目录，配合 `share=on` 才能零拷贝共享。`readlink` 显示 VF 归属 `iommu_groups/51`，组号存在即透传前提成立。最后一条 `vhost|DMAR:.*fault` 无错误输出是预期结果，一旦出现 DMA 重映射错误或 vhost 协商失败，按第 5 节定位。宿主侧四项吻合后，再进 Guest 侧用相同思路核对设备、大页与收发计数，两端都通过才算打通。
+
+### 5. 常见失败与排错
+
+**现象一：`sriov_numvfs` 写入失败或回读变小。** 常见原因是 BIOS 未开 SR-IOV、写入值超过 `sriov_totalvfs`、PF 驱动需要模块参数（如 `max_vfs`）而非 sysfs、或 PF 已处于 up 状态不允许变更。定位用 `cat .../sriov_totalvfs`、`dmesg | grep -i -E 'sriov|vf'`、`modinfo <pf_drv>`；处理顺序是先确认 BIOS 与内核 IOMMU，再 `ip link set <pf> down`，必要时按驱动文档设置模块参数并重启（参数名需对照实际版本核验）。
+
+**现象二：VF 创建后 `dpdk-devbind.py -s` 仍显示内核驱动占用。** 根因是 `sriov_drivers_autoprobe=1` 让 PF 驱动自动给 VF 绑了 `iavf` 一类驱动。处理办法是把该 sysfs 值置 0 后重新创建 VF，或直接用 `dpdk-devbind.py -u` 解绑再 `-b vfio-pci` 绑定（完整命令族见 04-05）。
+
+**现象三：透传后 Guest 里看不到设备或报 IOMMU 组不完整。** 前者多为 BDF 写错、`hostdev` 的 bus / slot / function 换算错误、或 `virsh attach-device` 未带 `--config` 导致重启丢失；用 `lspci -nn` 在宿主与 Guest 两侧对照 BDF，并按 03-03 第六步核对 IOMMU Group。后者通常是同组还有别的设备未解绑，处理办法是把同组设备一并交给 vfio 或换槽位（原理见 06-02）。
+
+**现象四：vhost-user 连接建立不起来或端口不 up。** 高频原因有三：socket 路径不一致或权限不足、`client=0/1` 前后端设置相反、`memory-backend-file` 忘了 `share=on` 或 `mem-path` 指向的目录不是 hugetlbfs。定位用 `ls -l /tmp/vhost.sock`、两端进程的启动日志、`dmesg | grep -i vhost`，并确认 QEMU 以能访问该 socket 与大页目录的用户运行。devargs 选项名与 QEMU 命令写法需对照实际版本核验（完整参数见 04-01）。
+
+**现象五：云上实例无法使用 vfio-pci。** 通用实例常不暴露 IOMMU，`/sys/kernel/iommu_groups/` 为空，此时 `vfio-pci` 不可用，需改用 `uio_pci_generic` 或云厂商专用 PMD；另一类问题是云厂商网卡的 PMD 未编进当前 DPDK 构建（-Ddisable_drivers 之类的构建选项），表现为 EAL 探测不到端口，需对照 `drivers/net/` 下对应目录与构建配置核验（模块见 07-10）。下表把五类现象汇总，表中「或」关系以转义竖线书写。
+
+| 现象 | 根因 | 定位命令 | 处理 |
+|---|---|---|---|
+| VF 创建失败 | BIOS \| 超过 totalvfs | cat sriov_totalvfs | 开 SR-IOV 并 down PF |
+| VF 被内核占用 | autoprobe=1 | dpdk-devbind.py -s | 置 0 后重建或解绑 |
+| Guest 看不到 VF | BDF 错 \| 组不完整 | lspci -nn 双侧对比 | 核对透传与 IOMMU 组 |
+| vhost 连不上 | 路径 \| client \| share | ls -l socket \| dmesg | 统一路径与内存共享 |
+| 云上 vfio 不可用 | 无 IOMMU \| PMD 缺失 | ls iommu_groups \| lspci | 用厂商 PMD 或 UIO |
+
+#### 陷阱与最佳实践
+
+其一，先确认能力再选方案：云上与虚拟机环境里 IOMMU、SR-IOV、厂商 PMD 三件事都可能是缺失的，不要照搬裸机命令。其二，宿主与 Guest 的大页是两套独立资源，任何一侧 `HugePages_Free` 不足都会让应用起不来，验证时要分别在两侧读 `/proc/meminfo`。其三，`sriov_drivers_autoprobe` 置 0 应放在创建 VF 之前，避免刚创建就被宿主驱动抢走。其四，VF 的 MAC、VLAN、trust、spoofchk 必须显式配置并持久化，全零 MAC 与 VLAN 冲突是链路不通的常见原因。其五，vhost-user 的三要素——socket 路径与权限、`client` 两端一致、大页 `share=on`——逐一核对，能省掉大半排错时间。其六，VF BDF、透传 XML 与 Guest 内绑定结果要写进同一张清单，避免 VF 编号与 VM 对应关系混乱。其七，模块功能、内存机制、EAL 参数与工具命令分别回查权威源（模块见 07-10 ｜ 原理见 06-02 ｜ 完整参数见 04-01 ｜ 完整命令族见 04-05 ｜ 字段见 05-07），本册不重列。
+
+### 6. 小结
+
+本篇把虚拟化与云环境的部署收敛为三条通路：SR-IOV 通过 `sriov_numvfs` 创建 VF、配置二层属性、绑定 `vfio-pci` 并透传给 Guest，由 Guest 内 DPDK 直驱；vhost-user 由宿主 DPDK 后端经 Unix socket 与 QEMU 的 virtio-net 前端共享大页 vring，virtio-user 则把前端也搬到用户态；云上先核验 IOMMU 与设备形态，再决定用 `vfio-pci`、UIO 还是厂商 PMD。验证按宿主设备与后端、Guest 设备与大页、数据面收发三层展开，VF 创建失败、autoprobe 抢占、透传 BDF / IOMMU 组错误、vhost 协商失败、云上能力缺失是五类高频失败，均有明确修正顺序。至此单机与虚拟化部署完成，最后一类形态是把上述资源交给容器与 K8s 编排，见 03-06。模块功能、内部机制、EAL 参数与工具命令分别回查（模块见 07-10 ｜ 原理见 06-02 ｜ 完整参数见 04-01 ｜ 完整命令族见 04-05），本册不重列。
+
+## 03-06 容器化与 K8s 部署
+
+### 1. 目标与拓扑
+
+把 DPDK 应用放进容器，表面上只是换了一种进程封装方式，实际上要同时解决四类资源透传问题，而且每一类都与前五篇的配置强耦合。第一是大页：容器默认看不到宿主预留的 hugetlbfs，必须把挂载点或 `/dev/hugepages` 挂进容器，并放开 `IPC_LOCK` 与 memlock 限制，否则 EAL 初始化就会报取不到大页。第二是设备：`vfio-pci` 通过 `/dev/vfio/vfio` 与 `/dev/vfio/<group>` 暴露设备，容器要么拿到这些字符设备的访问权，要么通过 Device Plugin 由 K8s 自动分配，不能只挂目录不授权。第三是 CPU：宿主做的 `isolcpus` / `nohz_full` 隔离只是内核侧，容器里还要靠 cpuset / cgroup 把进程钉在正确的核上，并避免与 K8s 的 CPU Manager 策略打架。第四是多实例隔离：同一台宿主上跑多个 DPDK primary 进程时，它们默认会共用同一套运行时目录与 memzone，必须靠 `--file-prefix` 之类参数把配置空间分开，否则第二个实例起不来（完整参数见 04-01，机制见 06-10）。
+
+K8s 层把这几件事拆成了标准对象。大页由 kubelet 识别为 `hugepages-2Mi` / `hugepages-1Gi` 这类可分配资源，Pod 通过 `resources.requests` / `limits` 申请，kubelet 再以 `emptyDir.medium: HugePages` 的形式挂进容器。VFIO / SR-IOV 设备由 Device Plugin（如 `k8snetworkplumbingwg/sriov-network-device-plugin`）注册成扩展资源，例如 `intel.com/intel_sriov_netdevice`，调度器据此把 Pod 放到有空闲 VF 的节点。第二张网卡由 Multus CNI 提供，网络定义写在 `NetworkAttachmentDefinition`（NAD）里，Pod 用 `k8s.v1.cni.cncf.io/networks` 注解引用；SR-IOV 场景下常由 SR-IOV Network Operator 通过 `SriovNetworkNodePolicy` 创建 VF 并生成对应 NAD。以上 CRD 名称、API group 与字段名随版本变化，本篇一律标注「需对照实际版本核验」并给出可定位路径。
+
+本篇目标可拆成六项：确认宿主前置已经按 03-01 到 03-04 完成；用 `docker run` 给出最小可用的透传命令并解释每个挂载与 capability 的作用；说明多实例 `--file-prefix` 隔离的场景与冲突表现；配置 kubelet 的 HugePages 资源并让 Pod 正确申请；部署 Device Plugin / SR-IOV Operator / Multus 三件套；最后给出一份可直接套用的 Pod YAML 并做端到端验证。K8s 侧组件与资源透传关系如图 03-06-01 所示，控制面经 kubelet 分配大页、Device Plugin 分配设备、Multus 附加第二张网卡，最终汇聚到 DPDK Pod。多个 DPDK 实例共享大页池与 `/dev/vfio`、却必须各自持有独立运行时配置的关系如图 03-06-02 所示，虚线标出前缀冲突导致 secondary 启动失败的回查路径。
+
+:::figure id=03-06-01 | name=K8s DPDK Pod 组件与资源透传拓扑 | dir=TD
+node n1 "K8s 控制面<br/>API Server" blue
+node n2 "kubelet<br/>HugePages 特性" teal
+node n3 "Device Plugin<br/>暴露 VFIO 资源" amber
+node n4 "SR-IOV 插件<br/>VF 资源池" amber
+node n5 "Multus CNI<br/>第二张网卡" purple
+node n6 "NAD 网络定义<br/>macvlan 或 SR-IOV" purple
+node n7 "DPDK Pod<br/>多实例容器" green
+node n8 "宿主 hugetlbfs<br/>/dev/hugepages" gray
+node n9 "宿主 /dev/vfio<br/>IOMMU 组" gray
+edge n1 -> n2 "调度 Pod"
+edge n2 -> n7 "分配大页"
+edge n3 -> n7 "分配设备"
+edge n4 -> n6 "生成 VF"
+edge n5 -> n6 "附加网络"
+edge n6 -> n7 "第二网卡"
+edge n8 -> n7 "挂载大页"
+edge n9 -> n7 "挂载设备"
+edge n1 -> n3 dashed "注册回查"
+:::
+
+多实例场景下 file-prefix 与共享资源的隔离关系如图 03-06-02 所示。
+
+:::figure id=03-06-02 | name=多实例 file-prefix 隔离与共享资源 | dir=TD
+node n1 "实例 A<br/>prefix=appA" blue
+node n2 "实例 B<br/>prefix=appB" teal
+node n3 "共享大页池<br/>hugetlbfs" amber
+node n4 "共享 /dev/vfio<br/>不同组" amber
+node n5 "运行时目录<br/>/var/run/dpdk" gray
+node n6 "appA 配置<br/>独立 memzone" purple
+node n7 "appB 配置<br/>独立 memzone" purple
+node n8 "冲突报错<br/>secondary 失败" red
+edge n1 -> n6 "写独立配置"
+edge n2 -> n7 "写独立配置"
+edge n5 -> n6 "按前缀分目录"
+edge n5 -> n7 "按前缀分目录"
+edge n3 -> n1 "取大页"
+edge n3 -> n2 "取大页"
+edge n4 -> n1 "取设备"
+edge n4 -> n2 "取设备"
+edge n8 -> n5 dashed "冲突回查"
+:::
+
+### 2. 前置条件与环境
+
+宿主机侧必须已完整走完前五篇：NUMA 规划表就绪、按节点预留了 2M 与 1G 大页并挂载 hugetlbfs、目标网卡 / VF 已绑定到 `vfio-pci`、轮询核已从内核调度与中断里隔离。容器化不会替你做这些事，它只是把资源「递」进来；宿主上 `HugePages_Free` 为 0 或 `/dev/vfio` 没有组节点时，容器里再怎么加参数也起不来。建议先用 03-02 与 03-03 的验证命令在宿主上跑一遍，确认基线健康再进容器。
+
+容器运行时层面需要 docker / podman / containerd 之一，K8s 场景还需要一个已就绪的集群（kubelet、containerd、CNI 插件目录 `/opt/cni/bin` 可读）。kubelet 要能识别大页资源，涉及 `--feature-gates` 中的大页相关开关与 `/var/lib/kubelet/config.yaml` 的配置，不同 K8s 版本的开关名与是否默认开启差别很大，需对照实际版本核验；容器运行时还要允许 `IPC_LOCK` 与足够的 memlock，否则 EAL 无法锁定大页。镜像层面应内置 DPDK 应用、依赖的共享库、`dpdk-devbind.py` / `dpdk-hugepages.py` 等诊断脚本，并把运行用户加入能访问 `/dev/vfio` 的属组，或用 udev 规则固化属主（承接 03-03 第六步）。
+
+K8s 组件层面需要三个角色。其一，Device Plugin，本篇以 `k8snetworkplumbingwg/sriov-network-device-plugin` 为例，它按 ConfigMap 里的 selector 发现 VF 并注册扩展资源；早期 Intel 版本仓库路径不同，镜像名与 ConfigMap 字段名需对照实际版本核验。其二，SR-IOV Network Operator（或等价的手工 VF 管理），通过 `SriovNetworkNodePolicy` / `SriovNetwork` 等 CRD 创建 VF 与 NAD；这些 CRD 属于 `sriovnetwork.openshift.io` 一类 API group，名称与字段随 Operator 版本变化，需对照实际版本核验。其三，Multus CNI 与配套 CNI（sriov / macvlan / host-device）及可选 IPAM（whereabouts / host-local），负责给 Pod 附加第二张网卡。三者的部署顺序通常是先装 Multus 与 CNI 二进制，再装 Device Plugin / Operator，最后创建 NAD 与 Pod。容器与 K8s 侧的透传项对照见下表，表中「或」关系以转义竖线书写。
+
+| 透传项 | 宿主来源 | 容器 / K8s 写法 | 常见缺失 |
+|---|---|---|---|
+| 大页 | hugetlbfs 挂载点 | emptyDir HugePages \| volumes 挂载 | kubelet 未开特性 |
+| VFIO 设备 | /dev/vfio/<N> | device 挂载 \| Device Plugin 资源 | 组号节点权限 |
+| 锁内存 | memlock 限制 | IPC_LOCK \| ulimit -l | 默认被拒 |
+| CPU | isolcpus 区间 | cpuset \| CPU Manager static | 与宿主区间不符 |
+| 第二网卡 | VF 或 macvlan | Multus NAD + annotation | CNI 二进制缺失 |
+| 多实例 | 运行时目录 | file-prefix 区分 | 前缀冲突 |
+
+K8s 侧关键对象与可定位路径见下表，长 YAML 与命令不塞进单元格，完整示例移到表后代码块。
+
+| 对象 / 路径 | 作用 | 核验方式 |
+|---|---|---|
+| hugepages-2Mi 资源 | kubelet 大页可分配量 | kubectl describe node |
+| NetworkAttachmentDefinition | Multus 网络定义 | kubectl get net-attach-def |
+| SriovNetworkNodePolicy | 创建 VF 并选卡 | kubectl get sriovnetworknodepolicies |
+| resourceName 扩展资源 | Device Plugin 注册名 | kubectl get node -o json |
+| /opt/cni/bin/ | CNI 二进制目录 | ls 核验 |
+| /var/run/dpdk/ | 运行时配置目录 | 多实例需分前缀 |
+
+版本基准仍为 DPDK 23.11 LTS / 24.11 / master，但 K8s 与 Operator 属于独立演进的生态，CRD 版本、feature gate 名称、资源名前缀都可能变化，本篇所有不确定处标注「需对照实际版本核验」并给出 `kubectl` 可查的对象名。EAL 运行时参数统一回查（完整参数见 04-01），诊断脚本用法回查（完整命令族见 04-05），多进程配置空间机制回查（原理见 06-10）。
+
+### 3. 分步操作
+
+**第一步：复核宿主前置。** 在动手写 Pod 之前，用一组只读命令确认大页水位、挂载、设备绑定与隔离区间四项都在预期状态，这一步能避免把宿主侧问题误判成容器配置问题。任何一项不符都应回到对应篇章修正，而不是在容器里加参数绕过。
+
+```bash
+grep -i '^Huge\|^Hugetlb' /proc/meminfo
+mount | grep hugetlbfs
+ls -l /dev/vfio/
+cat /sys/devices/system/cpu/isolated
+dpdk-devbind.py -s | sed -n '1,6p'
+```
+
+**第二步：用 docker run 做最小透传验证。** 先给一条「宽权限」命令用于快速打通：挂 hugetlbfs、挂 `/dev/vfio`、加 `IPC_LOCK` / `SYS_ADMIN`、放开 memlock、加大共享内存。跑通之后再收紧为第二条「最小权限」命令：只挂必要的字符设备与 `/dev/hugepages`、只加 `IPC_LOCK` 与 `NET_ADMIN`、用 `--group-add` 让进程加入宿主 dpdk 组、必要时用 `--security-opt` 放宽 seccomp。生产推荐后者，`--privileged` 只用于排障定位。容器内随后执行诊断命令查看大页与设备，以下为示例输出，具体格式需对照实际版本核验。
+
+```bash
+docker run --rm -it --privileged \
+  -v /mnt/huge_2M:/mnt/huge_2M \
+  -v /dev/vfio:/dev/vfio \
+  --ulimit memlock=-1:-1 \
+  --shm-size=1g \
+  dpdk-app:23.11 /bin/bash
+```
+
+```bash
+docker run --rm -it \
+  --device /dev/vfio/vfio \
+  --device /dev/vfio/42 \
+  -v /dev/hugepages:/dev/hugepages \
+  --cap-add IPC_LOCK --cap-add NET_ADMIN \
+  --ulimit memlock=-1:-1 \
+  --group-add "$(getent group dpdk | cut -d: -f3)" \
+  --security-opt seccomp=unconfined \
+  dpdk-app:23.11 /bin/bash
+```
+
+```bash
+docker exec -it dpdk-a sh -c 'dpdk-hugepages.py -s; ls -l /dev/vfio/; ulimit -l'
+```
+
+```text
+HugePages_Total:    1024
+HugePages_Free:      768
+Hugepagesize:       2048 kB
+total 0
+crw-rw---- 1 root dpdk 236, 0 Nov 10 09:12 vfio
+crw-rw---- 1 root dpdk 236, 1 Nov 10 09:12 42
+unlimited
+```
+
+判读说明（150 字以上）：容器内 `dpdk-hugepages.py -s` 回显的 `HugePages_Total: 1024` 与 `HugePages_Free: 768` 和宿主基线一致，说明 hugetlbfs 已正确挂进容器、且容器看到的是同一个大页池；若这里全是 0，多半是挂载点写错或 kubelet / runtime 没有把 `emptyDir.medium: HugePages` 落下来。`Hugepagesize: 2048 kB` 表明容器内默认池是 2 MiB，与宿主 `default_hugepagesz` 一致。`/dev/vfio/` 下出现 `vfio` 与组号 `42` 两个字符设备，且属 `root:dpdk`、权限 `660`，印证 `--device` 与 `--group-add` 生效，非 root 的 dpdk 组用户已能打开容器；只看到 `vfio` 而缺组号节点是最常见的失败形态，通常意味着宿主侧 IOMMU Group 不完整或 `--device` 漏写了组号。`ulimit -l` 回显 `unlimited` 说明 memlock 已放开，EAL 才能锁定大页；若显示默认的 64（KB 单位）之类有限值，即使 `IPC_LOCK` 加了也会初始化失败。四项都符合预期，容器侧透传才算打通；诊断脚本其余子命令见（完整命令族见 04-05）。
+
+**第三步：多实例用 file-prefix 隔离。** 同一宿主上跑两个 DPDK primary 进程时，它们默认共享同一套运行时配置与 memzone 命名空间，第二个进程会因「配置已被占用」而启动失败，或更糟地与前一个实例互相踩内存。解决办法是给每个实例一个独立的 `--file-prefix`，让各自的运行时文件、共享内存配置落在不同的命名空间；同时为每个实例分配互不重叠的 lcore 集合、不同的设备组与大页配额。这里只讲场景与隔离原则，参数的完整写法与语义回查（完整参数见 04-01），多进程共享内存机制回查（原理见 06-10）。
+
+```bash
+docker run -d --name dpdk-a dpdk-app:23.11 \
+  dpdk-testpmd -l 2-9 -n 4 --file-prefix=appA -- --forward-mode=io
+docker run -d --name dpdk-b dpdk-app:23.11 \
+  dpdk-testpmd -l 10-17 -n 4 --file-prefix=appB -- --forward-mode=io
+docker logs dpdk-a | grep -i -E 'EAL|hugepage|lcore'
+docker logs dpdk-b | grep -i -E 'EAL|hugepage|lcore'
+```
+
+**第四步：让 kubelet 暴露 HugePages 资源。** 确认 kubelet 配置里大页已启用，并在节点状态里能看到 `hugepages-2Mi` 与 `hugepages-1Gi` 的 Allocatable 容量。feature gate 名称随版本变化（如 `HugePageStorageMediumSize` 一类开关是否默认开启需对照实际版本核验），`/etc/default/kubelet` 与 `/var/lib/kubelet/config.yaml` 哪个生效也因发行版而异，需对照实际版本核验。改完 kubelet 要重启服务，再用 `kubectl describe node` 验证。
+
+```ini
+KUBELET_EXTRA_ARGS="--feature-gates=HugePageStorageMediumSize=true"
+```
+
+```bash
+systemctl restart kubelet
+kubectl describe node worker-01 | grep -A8 'Allocatable:'
+kubectl get node worker-01 -o json | grep -i 'hugepages'
+```
+
+**第五步：部署 Device Plugin 并注册 VFIO / SR-IOV 资源。** 以 `k8snetworkplumbingwg/sriov-network-device-plugin` 为例，先写 ConfigMap 定义资源名与 selector（按 vendor / device / driver 过滤 VF），再以 DaemonSet 部署到目标节点。selector 字段名、资源名前缀与镜像标签随项目版本变化，需对照实际版本核验。部署成功后节点 Allocatable 里应出现自定义扩展资源，`kubectl` 能查到它。
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sriovdp-config
+  namespace: kube-system
+data:
+  config.json: |
+    {
+      "resourceList": [
+        {
+          "resourceName": "intel_sriov_netdevice",
+          "selectors": {
+            "vendors": ["8086"],
+            "devices": ["154c"],
+            "drivers": ["vfio-pci"]
+          }
+        }
+      ]
+    }
+```
+
+```bash
+kubectl apply -f sriovdp-configmap.yaml
+kubectl apply -f sriov-network-device-plugin-daemonset.yaml
+kubectl get daemonset -n kube-system
+kubectl get node worker-01 -o json | grep -i 'intel.com/intel_sriov_netdevice'
+```
+
+**第六步：用 SR-IOV Operator 创建 VF 与网络定义。** 若采用 Operator 路线，`SriovNetworkNodePolicy` 负责在选中网卡上创建指定数量的 VF 并把 `deviceType` 设为 `vfio-pci`，`SriovNetwork`（或等价的 NAD 生成逻辑）负责给出网络定义。CRD 的 API group、字段名（如 `nicSelector.pfNames`、`numVfs`、`deviceType`）与命名空间随 Operator 版本变化，需对照实际版本核验；若不用 Operator，也可按 03-05 手工创建 VF，再直接写 NAD。下面给出示意清单。
+
+```yaml
+apiVersion: sriovnetwork.openshift.io/v1
+kind: SriovNetworkNodePolicy
+metadata:
+  name: dpdk-vf-policy
+  namespace: sriov-network-operator
+spec:
+  nodeSelector:
+    feature.node.kubernetes.io/network-sriov.capable: "true"
+  resourceName: intel_sriov_netdevice
+  priority: 90
+  mtu: 1500
+  numVfs: 8
+  nicSelector:
+    vendor: "8086"
+    deviceID: "1572"
+    pfNames:
+      - ens1f0#0-3
+  deviceType: vfio-pci
+```
+
+**第七步：定义 Multus 网络并写 Pod。** NAD 用 `k8s.cni.cncf.io/v1`，`config` 里指定 CNI 类型（sriov / macvlan / host-device 之一）、VLAN、trust 与 IPAM，并用 `k8s.v1.cni.cncf.io/resourceName` 注解把它与 Device Plugin 的扩展资源关联。Pod 侧同时申请 `hugepages-2Mi` 与扩展资源、挂 `emptyDir.medium: HugePages` 与 `/dev/vfio`、在 `securityContext` 加 `IPC_LOCK`、用 annotation 引用 NAD，并在 `args` 里带上 `--file-prefix` 做实例隔离。CNI 类型与 `config` 字段、资源名前缀、annotation 键名需对照实际版本核验。
+
+```yaml
+apiVersion: "k8s.cni.cncf.io/v1"
+kind: NetworkAttachmentDefinition
+metadata:
+  name: sriov-net1
+  namespace: dpdk
+  annotations:
+    k8s.v1.cni.cncf.io/resourceName: intel.com/intel_sriov_netdevice
+spec:
+  config: '{
+    "type": "sriov",
+    "vlan": 100,
+    "spoofchk": "off",
+    "trust": "on",
+    "ipam": {
+      "type": "host-local",
+      "subnet": "192.168.100.0/24"
+    }
+  }'
+```
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: dpdk-app-a
+  namespace: dpdk
+  annotations:
+    k8s.v1.cni.cncf.io/networks: dpdk/sriov-net1
+spec:
+  containers:
+  - name: dpdk
+    image: dpdk-app:23.11
+    imagePullPolicy: IfNotPresent
+    command: ["dpdk-testpmd"]
+    args:
+      - "-l"
+      - "2-9"
+      - "-n"
+      - "4"
+      - "--file-prefix=appA"
+      - "--"
+      - "--forward-mode=io"
+    securityContext:
+      capabilities:
+        add: ["IPC_LOCK", "NET_ADMIN"]
+    resources:
+      requests:
+        memory: 512Mi
+        cpu: "8"
+        hugepages-2Mi: 512Mi
+        intel.com/intel_sriov_netdevice: "1"
+      limits:
+        memory: 512Mi
+        cpu: "8"
+        hugepages-2Mi: 512Mi
+        intel.com/intel_sriov_netdevice: "1"
+    volumeMounts:
+    - name: hugepage
+      mountPath: /dev/hugepages
+    - name: vfio
+      mountPath: /dev/vfio
+  volumes:
+  - name: hugepage
+    emptyDir:
+      medium: HugePages
+  - name: vfio
+    hostPath:
+      path: /dev/vfio
+      type: Directory
+```
+
+```bash
+kubectl apply -f nad-sriov.yaml
+kubectl apply -f dpdk-pod.yaml
+kubectl get net-attach-def -n dpdk
+kubectl get pod dpdk-app-a -n dpdk -o wide
+```
+
+### 4. 验证方法与预期结果
+
+K8s 场景的验证按「节点可分配 → 调度落地 → 容器内资源可见 → 应用跑通」四层递进，每层都有明确预期。第一层节点可分配：`kubectl describe node` 的 Allocatable 里应同时出现 `hugepages-2Mi` / `hugepages-1Gi` 与 Device Plugin 注册的扩展资源（如 `intel.com/intel_sriov_netdevice`），且数值与宿主实际 VF 数、大页数匹配；若缺大页资源，回到第四步查 kubelet feature gate，若缺扩展资源，回到第五步查 DaemonSet 与 ConfigMap selector。第二层调度落地：Pod 状态为 Running 且被调度到具备资源的节点，Events 里没有 `Insufficient hugepages-2Mi` 或 `Insufficient intel.com/...` 这类调度失败。第三层容器内可见：`kubectl exec` 进容器后能看到 `/dev/hugepages` 挂载、`/dev/vfio/<group>` 节点与 memlock 放开，第二张网卡（如 `net1`）存在。第四层应用跑通：DPDK 启动日志完成 EAL 初始化、成功取得大页并 probe 到端口，转发计数持续增长（完整参数见 04-01）。下面给出组合验证命令与预期输出，示例输出，具体格式需对照实际版本核验。
+
+```bash
+kubectl describe node worker-01 | grep -A9 'Allocatable:'
+kubectl get pod dpdk-app-a -n dpdk -o wide
+kubectl exec -n dpdk dpdk-app-a -- sh -c 'ls -l /dev/vfio/; cat /proc/meminfo | grep -i huge; ip -br link'
+kubectl logs -n dpdk dpdk-app-a | tail -n 20
+```
+
+```text
+Allocatable:
+  cpu:                        64
+  ephemeral-storage:          472685624Ki
+  hugepages-1Gi:              8Gi
+  hugepages-2Mi:              2Gi
+  intel.com/intel_sriov_netdevice:  4
+  memory:                     128Gi
+  pods:                       110
+NAME          READY   STATUS    RESTARTS   AGE   IP           NODE
+dpdk-app-a    1/1     Running   0          2m   10.244.1.7  worker-01
+crw-rw---- 1 root dpdk 236, 0 Nov 10 11:02 vfio
+crw-rw---- 1 root dpdk 236, 1 Nov 10 11:02 51
+HugePages_Free:      768
+lo               UNKNOWN        127.0.0.1/8
+net1             UP             192.168.100.12/24
+```
+
+判读说明（150 字以上）：`Allocatable` 段里 `hugepages-1Gi: 8Gi` 与 `hugepages-2Mi: 2Gi` 同时出现，说明 kubelet 已把两种尺寸的大页都注册成可调度资源，数值与 03-02 的启动参数（8 个 1G 页、1024 个 2M 页）相符；`intel.com/intel_sriov_netdevice: 4` 表明 Device Plugin 成功注册了 4 个 VF 资源，与 03-05 创建的 VF 数量一致，若这里为 0 要回查 ConfigMap 的 `vendors` / `devices` / `drivers` selector 是否匹配实际 VF 的设备号与绑定驱动。Pod 行 `1/1 Running` 且落在 `worker-01`，说明调度器找到了同时满足大页、扩展资源与 CPU 需求的节点，Events 里不会有 `Insufficient` 类失败。容器内 `/dev/vfio/` 出现 `vfio` 与组号 `51`、属 `root:dpdk`、权限 `660`，证明设备透传与属组授权到位；`HugePages_Free: 768` 说明 Pod 申请的 `hugepages-2Mi: 512Mi` 从同一个大页池里扣减，`emptyDir.medium: HugePages` 生效。`ip -br link` 里除 `lo` 外出现 `net1` 且状态 UP、带 IPAM 分配的地址，证明 Multus NAD 附加的第二张网卡已就绪。四层全部吻合，再用 `kubectl logs` 确认 EAL 初始化与转发计数，才算端到端打通。
+
+### 5. 常见失败与排错
+
+**现象一：节点 Allocatable 里没有 hugepages 资源。** 根因是 kubelet 未启用大页特性、配置写在了不生效的文件、或宿主本身没有预留大页。定位用 `kubectl describe node`、`ps -ef | grep kubelet` 看实际启动参数、`grep -i huge /var/lib/kubelet/config.yaml`，并确认 `feature-gates` 开关名与当前 K8s 版本匹配（需对照实际版本核验）。处理顺序是先确认宿主 `/proc/meminfo`，再修 kubelet 配置并重启服务。
+
+**现象二：Device Plugin 注册的资源数为 0 或 Pod 报 `Insufficient`。** 多为 ConfigMap 的 selector 与 VF 实际情况不符（`devices` 写成 PF 的设备号而非 VF 的 `154c`、`drivers` 写成 `iavf` 而非 `vfio-pci`）、DaemonSet 未跑在目标节点、或资源名前缀与 NAD 注解里的 `resourceName` 不一致。定位用 `kubectl get pod -n kube-system`、`kubectl logs <device-plugin-pod>`、`kubectl get node -o json`，逐项比对 selector 与 `lspci -nn` 的实测值（完整命令族见 04-05）。
+
+**现象三：容器里取不到大页或报 `cannot mlock`。** 常见原因是 `emptyDir` 没写 `medium: HugePages`、`IPC_LOCK` 未加、memlock ulimit 仍是默认值、`securityContext` 被 PodSecurity 策略剥离，或 cgroup memory 限制把 hugetlb 计入并提前耗尽。定位用 `kubectl exec -- ulimit -l`、`mount | grep hugetlb`、`cat /proc/meminfo | grep Huge`，并核对 `resources.limits.memory` 是否误设得过小。处理办法是补齐 capability 与挂载，把大页与常规内存限额分开评估。
+
+**现象四：Multus 第二张网卡没起来。** 表现为 Pod Running 但只有 `eth0`，或 `net1` 缺失。根因通常是 Multus 未安装、`/opt/cni/bin/` 缺对应 CNI 二进制、NAD 与 Pod 不在同一命名空间、annotation 的 `资源名` 与 Device Plugin 注册名对不上。定位用 `kubectl get net-attach-def -A`、`kubectl describe pod`、`ls /opt/cni/bin/`、`kubectl logs <multus-pod>`；CRD 版本与 `config` 字段需对照实际版本核验。
+
+**现象五：多实例第二个进程起不来。** 表现为第二个 Pod 反复 CrashLoopBackOff，日志里出现配置空间已被占用或无法创建 memzone 一类错误。根因是没给 `--file-prefix`、两个实例用了同一 prefix、或 lcore / 设备 / 大页配额重叠。处理办法是按第三步给每个实例独立 prefix 与非重叠资源，并回查多进程机制（原理见 06-10 ｜ 完整参数见 04-01）。下表把六类现象汇总，表中「或」关系以转义竖线书写。
+
+| 现象 | 根因 | 定位命令 | 处理 |
+|---|---|---|---|
+| 无 hugepages 资源 | kubelet 未开特性 | kubectl describe node | 修 feature-gates 并重启 |
+| 扩展资源为 0 | selector 不匹配 \| DS 未就绪 | kubectl logs device-plugin | 核对设备号与驱动 |
+| 取不到大页 | 未挂 \| 无 IPC_LOCK | kubectl exec -- ulimit -l | 补 capability 与挂载 |
+| net1 缺失 | Multus \| NAD \| CNI 未就绪 | kubectl get net-attach-def | 装 CNI 并对齐命名空间 |
+| 第二实例失败 | file-prefix 冲突 | kubectl logs pod | 分配独立前缀 |
+| CRD 报错 | apiVersion 不匹配 | kubectl explain | 对照实际版本核验 |
+
+#### 陷阱与最佳实践
+
+其一，容器化不替代宿主前置：先在宿主上跑通 03-02 到 03-04 的验证命令，再写 Pod，能把一半以上的「容器问题」直接排除在宿主层。其二，生产不要用 `--privileged`，按第二步的第二条命令做最小 capability 与设备授权，把 dpdk 属组用 udev 规则固化。其三，大页、VFIO 设备、lcore、第二网卡四类资源要在同一份 Pod 清单里对齐，任何一类单独扩缩容都会破坏同 Socket 原则。其四，每个 DPDK 实例一个独立 `--file-prefix`，且 lcore、设备组、大页配额互不重叠，这是多实例共存的硬前提。其五，把 kubelet 配置、Device Plugin ConfigMap、SriovNetworkNodePolicy、NAD、Pod 五份 YAML 都纳入版本管理与变更评审，CRD 升级时先 `kubectl explain` 核对字段再 apply。其六，把 `HugePages_Free`、扩展资源可分配量、Pod 重启次数纳入监控告警，资源水位下降或 CrashLoopBackOff 要能第一时间发现。其七，EAL 参数、诊断脚本、多进程机制与模块功能分别回查权威源（完整参数见 04-01 ｜ 完整命令族见 04-05 ｜ 原理见 06-10 ｜ 模块见 07-10 ｜ 字段见 05-07），本册不重列。
+
+### 6. 小结
+
+本篇完成了 DPDK 从裸机到编排平台的最后一跳：先用 `docker run` 验证大页、`/dev/vfio`、memlock 与 capability 四类透传，再用 `--file-prefix` 解决多实例配置空间冲突；随后在 K8s 侧让 kubelet 暴露 `hugepages-2Mi` / `hugepages-1Gi` 资源，部署 Device Plugin 与 SR-IOV Operator 注册并生成 VF，用 Multus NAD 附加第二张网卡，最后给出同时申请大页、扩展资源、`IPC_LOCK` 与 NAD 注解的完整 Pod 清单。验证按「节点可分配 → 调度落地 → 容器内可见 → 应用跑通」四层递进，大页资源缺失、selector 不匹配、memlock 受限、Multus 网卡未起、多实例前缀冲突、CRD 版本不符是六类高频失败，均有明确的定位命令与修正顺序。至此 03 册六篇形成完整闭环：拓扑规划 → 大页 → 绑卡 → 隔离 → 虚拟化云 → 容器与 K8s，每一步都以可复制命令、典型输出判读与排错矩阵落地。EAL 运行时参数、工具命令全集、内部机制、模块功能与结构体字段分别回查唯一权威源（完整参数见 04-01 ｜ 完整命令族见 04-05 ｜ 原理见 06-10 ｜ 模块见 07-10 ｜ 字段见 05-07），本册不重列任何命令全集与字段表。
+
+
+
