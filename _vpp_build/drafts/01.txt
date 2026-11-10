@@ -1,0 +1,570 @@
+# VPP 技术资料 · 01 基础与概述
+
+> 本文件是全套资料的「概述层」，负责建立全局认知。涉及结构体逐字段定义一律引用 05 全册，涉及 CLI / startup.conf 全参数一律引用 04 全册，涉及机制、调度与调用链一律引用 06 全册，涉及功能模块与组网一律引用 07 全册；本文件不展开字段表、不重列命令全集。版本基准 VPP 23.06 / master。统一交叉引用写法：（字段见 05-xx ｜ 命令见 04-xx ｜ 原理见 06-xx）。
+
+---
+
+## 01-01 VPP 是什么：高性能用户态数据包处理引擎概览
+
+### 1. 背景与动机
+
+要理解 VPP 为什么存在，必须先理解它打算替换的那条路径到底慢在哪里。传统 Linux 内核网络栈是为「通用性」而不是为「线速转发」设计的：网卡收包触发硬中断，NAPI 把后续收包收敛到软中断，每个报文被封装成 sk_buff，依次穿越 netfilter 钩子、桥接或路由查找、qdisc 队列规则，最后再经驱动发送出去。这条路径上有四类难以消除的、以「每包」为单位固定付出的开销——中断与上下文切换、跨核跨层的锁竞争、skb 元数据与报文缓冲的反复分配与拷贝、以及为兼容性保留的大量间接调用与分支。在 10Gbps 乃至 100Gbps 链路上，64 字节小包的到达间隔只有几十纳秒，任何按包固定摊销的成本都会被放大成吞吐天花板，表现出来就是 PPS 上不去、时延随负载陡增、抖动不可控。
+
+与此同时，虚拟化、NFV、云数据中心与 5G 用户面又提出了一组彼此牵制的要求：把交换、路由、NAT、防火墙、隧道封装这些原本由专用 ASIC 承担的功能搬到通用 x86 服务器上，且要同时满足线速吞吐、微秒级时延和可编程可编排。DPDK 在 2010 年前后给出了第一层答案——把网卡驱动搬进用户态、用轮询取代中断、用大页内存与 rte_mbuf 池取代 skb 的动态分配，从而把「收包」这一件事做到线速。但 DPDK 的定位始终是 I/O 与内存库：它并不提供一套完整的网络协议栈、转发图与特性编排，也不提供统一的控制面接口，于是每一个基于 DPDK 的项目都要自行重写二层学习、三层查表、邻居解析、隧道封装与配置通道，重复劳动且质量参差。
+
+VPP 正是为补上这一层而出现的。它把 Cisco 内部长期使用、已在商用产品上验证过的向量包处理（Vector Packet Processing）技术在 2016 年以开源形式贡献给 Linux Foundation 旗下的 fd.io（Fast Data – Input/Output）项目，目标非常明确：在 DPDK 提供的用户态高速 I/O 之上，构建一个自带完整 vnet 协议栈、可编程处理图与标准化控制面 API 的转发引擎。换句话说，VPP 要解决的不是「能不能把包收进来」，而是「收进来之后如何以接近线速、可编排、可扩展、可维护的方式把包按网络语义处理完」。理解这个动机，后面所有设计取舍——向量批处理、图节点调度、数据面与控制面分离、插件化——都有了统一的解释框架。
+
+### 2. 核心概念
+
+VPP 的第一个核心概念是「向量包处理」。标量（scalar）模型是「取一个包，从头到尾走完整条流水线，再取下一个包」；向量（vector）模型则是「一次取一批包，让这批包一起经过某一个处理阶段，再一起进入下一阶段」。VPP 把一批包组织成帧（frame，对应 vlib_frame_t），一个帧默认可容纳约 256 个包（宏 `VLIB_FRAME_SIZE`，取值需对照实际版本核验，可定位 `src/vlib/node.h`）。这样做带来三重收益：同一段节点代码被连续执行上百次，指令缓存（I-cache）命中率极高；同一批包的元数据被集中访问，数据缓存（D-cache）局部性好，并可配合 `CLIB_PREFETCH` 在上一批包处理时预取下一批；分支预测器面对的是成批同类型报文，预测成功率远高于「每包都换一个处理上下文」的标量模型。这三点合起来，把「每包固定开销」摊薄成了「每帧固定开销」，是 VPP 高 PPS 的根本来源（原理见 06-01 ｜ 缓存设计见 06-04）。
+
+第二个核心概念是「处理图」（processing graph）。VPP 把转发功能拆成一个个图节点（node，对应 vlib_node_t）：`dpdk-input` 负责从网卡批量收包，`ethernet-input` 解析二层头并按类型分流，`ip4-lookup` / `ip6-lookup` 做最长前缀匹配，`ip4-rewrite` 完成邻接改写，`interface-output` 与 `dpdk-output` 负责发送，NAT、ACL、IPsec、VXLAN 等则作为可插拔节点挂在相应的 feature arc 上。节点之间通过帧传递衔接，调度器按「节点 + 待处理帧」驱动，而不是为每一个包做一次函数调用分发。节点大致分为 input 节点（生产帧）、internal 节点（消费并生产帧）、process 节点（可阻塞、协作式调度的慢路径）与 pre-input 节点，注册通过 `VLIB_REGISTER_NODE` / `VLIB_NODE_REGISTRATION` 系列宏完成（注册与调度机制见 06-02 ｜ 主循环见 06-05）。第三个核心概念是「用户态轮询」：VPP 借用 DPDK 的 PMD，以无中断轮询方式收发，配合大页、NUMA 亲和与无锁结构，规避内核路径上的中断、系统调用与锁。第四个核心概念是「数据面与控制面分离」：VPP 本体只做高速转发，路由表、接口、隧道等配置由外部控制面通过 Binary API 下发，本文件第 3 篇会专门展开。
+
+:::figure id=01-01-01 | name=VPP 定位与核心数据流 | dir=TD
+node app "业务与编排<br/>云 · NFV · 5G · 容器网络" purple
+node cp "外部控制面<br/>CLI / Binary API / Agent" gray
+node vpp "VPP 数据面<br/>用户态向量包处理引擎" blue
+node graph "处理图 Processing Graph<br/>图节点逐层批处理" teal
+node pmd "DPDK PMD<br/>无中断轮询收发" amber
+node nic "网卡 NIC<br/>10G / 25G / 100G" green
+edge app -> cp "策略 / 配置"
+edge cp -> vpp "API 下发"
+edge vpp -> graph "帧 frame 传递"
+edge graph -> pmd "批处理结果"
+edge pmd -> nic "发送 / 收包"
+edge vpp -> cp dashed "统计 / 事件"
+:::
+
+把定位说清楚同样重要：VPP **不是**一个更快的 Linux 协议栈替代品，它 bypass 内核，普通 socket 应用默认并不经过 VPP；VPP **不是**内核模块，它是一个或多个用户态进程/线程；VPP **也不等于** DPDK，DPDK 只是它最常用的收包后端之一，VPP 还支持 af_packet、virtio、vhost-user、netmap 等接口类型（接口层见 07-01）。准确的一句话定位是：VPP 是一个运行在用户态、以向量批处理为内核、以处理图为组织方式、自带完整 vnet 协议栈、并通过标准 API 接受外部控制面编排的可编程转发引擎。
+
+衡量这类引擎的指标口径也需要先统一，否则后文所有数字都会被误读。下表给出概述层最常用的四个维度。
+
+| 指标 | 含义 | 常见口径 | 主要影响因素 |
+|---|---|---|---|
+| 吞吐 / 线速 | 单位时间转发的比特数或是否能跑满端口速率 | Gbps、是否达到端口线速 | 包长、端口数、feature 组合、CPU 核数 |
+| PPS | 每秒转发报文数，衡量小包处理能力 | Mpps（百万包/秒） | 向量帧大小、查表算法、缓存命中、批处理深度 |
+| 时延 | 单包穿越引擎的耗时 | 平均/百分位时延，微秒级 | 队列深度、批处理等待、NUMA 跨节点访问 |
+| 抖动与丢包 | 时延稳定性与零丢包速率 | 时延分布、NDR / RFC2544 零丢包速率 | 突发流量、缓冲池大小、调度公平性 |
+
+| 典型场景 | VPP 承担的角色 | 之所以适合 |
+|---|---|---|
+| vRouter / vSwitch | 三层路由、二层桥接、VRF | 完整 vnet 协议栈 + 可编程转发 |
+| NFV 服务链 | NAT、ACL、IPsec、LB、防火墙 | feature arc 可组合、插件化 |
+| 5G UPF / 边缘 | GTP-U 隧道、转发规则、计费 | 高 PPS + 隧道封装性能 |
+| 云原生容器网络 | vhost-user 接虚机、CNI 数据面 | 用户态高性能 + API 可编排 |
+| 网关与边界 | CGN、IPsec 网关、负载均衡 | 线速加密/哈希/会话表能力 |
+
+### 3. 关键数据结构与源码位置
+
+作为概述层，本节只点名结构、说明职责并给出可定位的源码路径，逐字段定义统一留给 05 全册（字段见 05-01 的跨文档索引）。这样既满足「能定位到真实源码」，又不与工具书重复。
+
+VPP 的运行时骨架是 `vlib_main_t`（`src/vlib/main.h`），它握有节点主结构、帧队列、主循环计数与计时等全局状态；每个线程持有一份运行时实例，多 worker 下的同步与 barrier 由线程模型统管（字段见 05-02 ｜ 原理见 06-06）。图调度相关的最小集合是 `vlib_node_t`、`vlib_node_runtime_t`、`vlib_frame_t` 与 `vlib_pending_frame_t`，集中在 `src/vlib/node.h`：前者描述节点本身与注册信息，中间者保存节点在某一线程上的运行时状态与统计数据，后两者分别承载「一批待处理包的索引数组」与「待调度帧的递交关系」（字段见 05-03 ｜ 机制见 06-02、06-07）。报文在引擎里一律以 `vlib_buffer_t`（`src/vlib/buffer.h`）描述，它用 current_data / current_length、flags、next_buffer、opaque 等元数据刻画一包在各节点间的游走与链式缓冲，缓冲池由 `vlib_buffer_pool_t` / `vlib_buffer_main_t` 管理（字段见 05-04 ｜ 生命周期见 06-09）。
+
+网络语义层则落在 vnet：`vnet_main_t`（`src/vnet/vnet.h`）统领接口与主配置，`vnet_hw_interface_t` / `vnet_sw_interface_t`（`src/vnet/interface.h`）分别刻画物理/虚拟接口与软件子接口，三层查表相关的 `fib_table_t`、`fib_entry_t`、`load_balance_t`、`dpo_id_t` 位于 `src/vnet/ip/` 及 `src/vnet/dpo/` 下（字段见 05-05、05-07 ｜ 转发流程见 07-03）。基础容器（`vec`、`pool`、`hash`、`clib_bihash`、`bitmap`、timer wheel）来自 `src/vppinfra/`，是上述所有结构赖以构建的底座（字段见 05-09 ｜ 实现原理见 06-08）。最外层启动与装配逻辑在 `src/vpp/main.c` 与 `src/vlib/unix/main.c`，插件源码按功能分布于 `src/plugins/`（如 `src/plugins/dpdk/`、`src/plugins/nat/`、`src/plugins/acl/`）。需要强调：以上结构体名与头文件路径用于「定位」，具体字段名、类型、宏与函数签名请一律以实际版本源码为准，不确定的签名写「需对照实际版本核验」，不要在概述层凭印象补字段表。
+
+### 4. 关键流程与调用链
+
+从进程启动到一包被转发出去，概述层的链条可以压缩成四段。第一段是装配：`src/vpp/main.c` 的 `main()` 进入 `src/vlib/unix/main.c` 的 `vlib_unix_main()`，解析 startup.conf、初始化大页与 DPDK EAL、装载插件、注册所有节点与 CLI/API handler，最终把控制权交给 `src/vlib/main.c` 的 `vlib_main_loop`（启动与配置装配细节见 02、04）。第二段是建图：各模块通过注册宏把节点挂进处理图，feature arc 按接口把可选特性串成子链，形成从 input 到 output 的有向图（注册机制见 06-02、06-03、06-11）。第三段是收包与调度：`dpdk-input` 节点在一次轮询中批量收取最多一个帧容量的包，为每个包分配/取得 vlib_buffer_t，构造帧，然后调度器按「帧 + 节点」依次 dispatch，节点函数拿到的是「包索引数组」而非单个包（PMD 与批处理调度见 06-12，主循环与 dispatch 见 06-05）。第四段是转发与发送：一条最简 IPv4 单播路径可概括为 `dpdk-input → ethernet-input → ip4-input → ip4-lookup → ip4-rewrite → interface-output → dpdk-output`，其中查表命中后由 DPO/邻接提供改写头，未命中或需 ARP/ND 解析时转入对应慢路径（完整转发语义见 07-03，节点错误计数判读见 08-03）。
+
+:::figure id=01-01-02 | name=向量批处理与最简转发链路 | dir=LR
+node rx "dpdk-input<br/>PMD 批量收包" green
+node frame "帧 frame<br/>包索引数组 ≤ VLIB_FRAME_SIZE" teal
+node eth "ethernet-input<br/>二层解析与分流" blue
+node lk "ip4-lookup<br/>FIB 最长前缀匹配" blue
+node rw "ip4-rewrite<br/>邻接 / DPO 改写" blue
+node tx "interface-output<br/>dpdk-output 发送" amber
+edge rx -> frame "批量填充"
+edge frame -> eth "整帧递交"
+edge eth -> lk "IPv4 分支"
+edge lk -> rw "命中 adjacency"
+edge rw -> tx "改写后帧"
+edge lk -> frame dashed "未命中转慢路径"
+:::
+
+请特别注意，本节给出的是「为了建立全局认知」的概略链路，真正的调度细节、帧递交、barrier、线程间 handoff 都属于 06 全册的权威范围（原理见 06-02、06-05、06-07），本篇不展开；把概述层当成实现细节来背，是初学者最常见的效率陷阱之一。
+
+### 5. 配置/命令/代码实例
+
+概述层只需要一个「能跑起来并确认版本」的最小示例，全量参数与命令族分别见 04 全册。下面是示意性的 startup.conf 片段：`dpdk { dev ... }` 的键名层级、接口命名规则与实际字段需对照实际版本核验，官方样本可定位 `src/vpp/conf/startup.conf`（配置体系与全参数见 04-01）。
+
+```bash
+unix {
+  cli-listen /run/vpp/cli.sock
+}
+cpu {
+  main-core 0
+  workers 2
+}
+dpdk {
+  dev 0000:06:00.0 {
+    name eth0
+  }
+}
+```
+
+启动后可用 `vppctl` 做最基本的确认，下面几条是最常用、也最不容易随版本漂移的只读命令：
+
+```bash
+vppctl show version
+vppctl show interface
+vppctl show runtime
+vppctl show ip fib
+```
+
+`show version` 用来核对版本基准与构建信息，`show interface` 看接口是否 up 及收发计数，`show runtime` 看节点级耗时与每包指令数，`show ip fib` 看转发表是否按控制面预期填满。命令注册机制见 04-02，接口/链路层命令族见 04-03，完整 `show` 子命令族与 `clear`/`trace` 见 04-06；本篇不重列命令清单。若 `show interface` 看不到预期接口，先回到 03-02 检查网卡绑定与大页，而不是急着改转发配置。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是定位错位：把 VPP 当成「更快的 Linux 协议栈」，于是试图用普通 socket 程序去压测它，结果发现流量根本没进 VPP。VPP bypass 内核，流量必须经过绑定到 VPP 的物理口、vhost-user 虚机口或 host-interface / af_packet 等显式创建的接口才会进入处理图（接口类型见 07-01）。第二个陷阱是把某个 PPS 数字当成引擎的恒定属性：同一套二进制在 64 字节小包与 1500 字节大包、单 worker 与多 worker、纯转发与挂满 NAT/ACL/IPsec 的情况下，结果可以相差一个数量级；任何性能结论都必须绑定「包长 + 核数 + NUMA + feature 组合 + 测试方法学」这五个前提（方法学见 08-01）。第三个陷阱是把 VPP 和 DPDK 画等号，进而在选型时误以为「引入 DPDK 就自动得到协议栈与可编程数据面」——事实恰恰相反，DPDK 只解决 I/O，VPP 才提供图、协议栈与 API。第四个陷阱是忽视控制面：VPP 本体并不运行 OSPF/BGP 这类路由守护进程，FIB、接口、隧道都要由外部 agent 下发，若没有配套控制面，VPP 只能靠静态配置工作（控制面与 API 集成见 04-07）。第五个陷阱是版本漂移：23.06 与 master 在插件名、API 消息、startup.conf 键上可能存在差异，照抄旧博客的命令片段往往失败。
+
+对应的最佳实践有四条。其一，先回答「我要的是收包库、交换机、还是完整可编程转发引擎」再选型，避免层次错位比较。其二，先按 03 全册把环境跑通、用 04 全册的命令确认接口与表项，再谈性能与调优，顺序不要反过来。其三，把性能基线以文档化方式记录（拓扑、版本、CPU、大页、feature、测试工具与结果），便于升级与回归。其四，涉及结构体字段、命令参数、机制细节时养成回查 05 / 04 / 06 的习惯，概述层只负责建立地图，不负责替代工具书。
+
+### 7. 小结与延伸阅读
+
+本篇给出三句话结论：VPP 是运行于用户态、以向量批处理与处理图为内核的高性能转发引擎；它在 DPDK 的高速 I/O 之上补齐了完整 vnet 协议栈、特性编排与标准控制面 API；它 bypass 内核协议栈，因此需要显式的接口接入与外部控制面配合。理解这三点，后续所有篇目都是对其中某一句的展开。
+
+建议的延伸路径：想知道怎么把源码变成可运行产物，读 02 全册；想知道网卡绑定、大页、NUMA、容器化怎么落地，读 03 全册；想查 startup.conf 与 CLI 全参数，读 04 全册；想逐个结构体回查字段，读 05-01 的索引再按需跳读；想深挖向量、图调度、缓存、多线程与 API 消息机制，读 06 全册；想按功能模块了解接口、二层、三层、NAT、隧道、IPsec，读 07 全册；想做基准、调优与排障，读 08 全册。本篇刻意不展开任何字段表与命令全集，正是为了把这四类内容留给各自的唯一权威源。
+
+---
+
+## 01-02 VPP 与 DPDK / OVS / 内核协议栈的架构对比
+
+### 1. 背景与动机
+
+几乎每个初次接触 VPP 的工程师都会问同一组问题：VPP 和 DPDK 是什么关系？既然有了 OVS-DPDK，为什么还要 VPP？它和 Linux 内核协议栈比到底快在哪、又牺牲了什么？这些问题之所以容易纠缠，是因为四个对象根本不在同一个抽象层次上：Linux 内核协议栈是通用操作系统自带的完整网络栈，OVS 是一台「虚拟交换机」的产品化实现，DPDK 是一组用户态高速 I/O 与内存库，而 VPP 是一个自带协议栈与处理图的转发引擎。把不同层次的东西放进同一张对比表，若维度选错，得出的结论必然似是而非。
+
+从演进脉络看，这条线索其实很清晰：最早一切流量都走内核协议栈，通用但重；为了在虚拟化环境里获得可编程的交换语义，出现了 OVS——内核 datapath 做快速转发、用户态 ovs-vswitchd 处理控制与慢路径；为了摆脱中断与 skb 开销，人们先用 DPDK 把 OVS 的 datapath 搬到用户态（OVS-DPDK），再进一步出现大量「DPDK 裸应用」，各自手写转发逻辑；而这些裸应用反复重写 L2/L3、隧道、特性编排与控制面，最终催生了 VPP 这种「把协议栈、图调度、插件与控制面一次性做全」的引擎。也就是说，对比的动机不是分出谁好谁坏，而是搞清楚：**每一层各自解决什么问题、把复杂度留在了哪里、以及在什么边界上应该换用另一种方案**。本篇就把四种架构放在同一组维度上对齐，给出对比表和对比图，并明确适用边界。
+
+### 2. 核心概念
+
+先把四个对象的运行态与职责边界钉死。
+
+**Linux 内核协议栈**：运行在内核态，以硬中断 + NAPI 软中断收包，报文载体是 `sk_buff`，路径上串着 netfilter、bridge、路由、qdisc、socket 等通用子系统。优点是功能最完整、与主机应用天然互通、运维工具成熟；代价是每包中断/软中断、锁、skb 分配与拷贝、以及为通用性保留的间接调用，PPS 与小包时延难以做到线速。
+
+**OVS（Open vSwitch）**：产品定位是虚拟交换机，经典形态由内核 `openvswitch.ko` datapath + 用户态 `ovs-vswitchd` + `ovsdb-server` 组成，OpenFlow / OVSDB 作为控制面。内核 datapath 用 megaflow 缓存做快速匹配，未命中（miss）的流上送用户态慢路径下发新流表，因此存在「首包延迟」与「流表规模 vs 命中率」的固有张力。OVS-DPDK 变体把 datapath 换成用户态 PMD，解决了 I/O 瓶颈，但交换机语义、流缓存模型与控制面协议基本保留。
+
+**DPDK（Data Plane Development Kit）**：不是转发产品，而是一组库——EAL、PMD 轮询驱动、`rte_mbuf`、`rte_ring`、大页内存、无锁队列、定时器与哈希等。它把网卡收包做到用户态线速、零拷贝、无中断，但刻意不提供网络协议栈、转发图、特性编排与统一控制面；「收包之后怎么转发」完全交给应用自己写。
+
+**VPP**：用户态进程 + 向量批处理 + 处理图 + 完整 vnet 协议栈 + 插件体系 + Binary API 控制面。它通常以 DPDK 作为收包后端，因此在 I/O 层与 OVS-DPDK / DPDK 裸应用站在同一起跑线，差异集中在「I/O 之上」：是否有图调度、是否自带 L2/L3/隧道/服务链、是否有标准化 API 与统计段。
+
+下表按七个维度把四者对齐。表中「可编程性」指数据面转发行为可编程的粒度与方式，「协议栈完整度」指是否自带可独立工作的网络语义实现。
+
+| 对比维度 | Linux 内核协议栈 | OVS（含 OVS-DPDK） | DPDK 裸应用 | VPP |
+|---|---|---|---|---|
+| 抽象层次 | 通用 OS 网络栈 | 虚拟交换机产品 | 用户态 I/O / 内存库 | 可编程转发引擎 + 协议栈 |
+| 运行态 | 内核态 | 内核 datapath + 用户态（DPDK 变体全用户态） | 全用户态 | 全用户态 |
+| 收包方式 | 中断 + NAPI 软中断 | 内核钩子 / PMD 轮询（DPDK 变体） | PMD 轮询 | PMD 轮询（亦可 af_packet/virtio） |
+| 报文载体 | `sk_buff` | `dp_packet` / `rte_mbuf` | `rte_mbuf` | `vlib_buffer_t`（字段见 05-04） |
+| 性能模型 | 每包开销高，通用优先 | 流缓存命中快、miss 慢，首包上送 | 取决于自写逻辑，可达线速 | 向量批处理摊薄每包开销，图调度 |
+| 可编程性 | netfilter / tc / eBPF / qdisc | OpenFlow 流表、ovsdb | 完全自由，但全部自研 | 处理图节点 + feature arc + 插件 |
+| 协议栈完整度 | 最完整（含 socket/TCP） | 交换/流表为主，L3 有限 | 无，需自写 | 完整 vnet：L2/L3/VRF/隧道/服务 |
+| 控制面 | sysctl / iproute2 / netlink | OpenFlow / OVSDB / ovs-vsctl | 无统一控制面 | Binary API / CLI / 外部 agent |
+| 适用边界 | 主机网络、通用业务 | 虚机/容器二层交换、流表编排 | 极简专线转发、定制设备 | NFV、vRouter、UPF、CNI 数据面 |
+
+:::figure id=01-02-01 | name=四种转发架构的数据路径对比 | dir=TD
+node app "应用 / 业务流量" purple
+node ks "Linux 内核协议栈<br/>中断 + 软中断 + socket + 锁" gray
+node ovsk "OVS 内核 datapath<br/>megaflow 缓存 / miss 上送" teal
+node ovsd "ovs-vswitchd 用户态<br/>OpenFlow 控制 / 慢路径" teal
+node dpdk "DPDK 裸应用<br/>PMD 轮询 + 自研转发" amber
+node vppg "VPP 处理图<br/>向量批处理 + vnet 协议栈" blue
+node vpppmd "DPDK PMD + Binary API<br/>数据面 / 控制面分离" blue
+node nic "网卡 RX / TX · 大页内存" green
+edge app -> ks "socket"
+edge app -> ovsk "tap / vhost"
+edge app -> dpdk "直连"
+edge app -> vppg "接口接入"
+edge ovsk -> ovsd "miss 上送"
+edge vppg -> vpppmd "帧 / API"
+edge ks -> nic
+edge ovsk -> nic
+edge dpdk -> nic
+edge vpppmd -> nic
+:::
+
+读这张图要抓住一条主线：越往下越接近硬件，越往上越接近业务；四个架构的真正差异不在「能不能碰到网卡」，而在中间那一层「报文被如何组织、由谁决定去向」。内核栈用 skb + 通用子系统，OVS 用流缓存 + 慢路径上送，DPDK 裸应用把中间层几乎清空，VPP 则用一个显式处理图把中间层做厚、做规范、做得可编排。
+
+### 3. 关键数据结构与源码位置
+
+对比架构时，最能暴露设计差异的往往是「一个报文在内存里长什么样」。本节点名四者的代表性载体结构并给出定位路径，只讲职责与差异，不展开任何字段表（VPP 结构体逐字段见 05 全册）。
+
+Linux 内核侧是 `sk_buff`（内核源码 `include/linux/skbuff.h`，属内核仓库而非 VPP 仓库），它为通用协议栈服务，元数据庞大、支持分片/GSO/校验和卸载等大量特性，灵活但重。OVS 侧是 `dp_packet`（OVS 仓库 `lib/dp-packet.h` 一类，路径需对照 OVS 版本核验），在 OVS-DPDK 形态下它可直接封装 `rte_mbuf`，以适配用户态 PMD。DPDK 侧是 `rte_mbuf`（DPDK 仓库 `lib/mbuf/rte_mbuf.h` 一类，路径需对照 DPDK 版本核验），结构紧凑、位于大页 mempool、以引用计数与链式为扩展手段，专为高速 I/O 设计。这三者都不属于 VPP 源码树，列在这里仅为对齐「报文载体」这一维度。
+
+VPP 侧的代表结构是 `vlib_buffer_t`（`src/vlib/buffer.h`，字段见 05-04）、承载批处理的 `vlib_frame_t` 与节点运行时的 `vlib_node_runtime_t`（`src/vlib/node.h`，字段见 05-03）、接口侧的 `vnet_hw_interface_t` / `vnet_sw_interface_t`（`src/vnet/interface.h`，字段见 05-05），以及 DPDK 设备侧的 `dpdk_device_t`（`src/plugins/dpdk/`，字段见 05-11）。把 `vlib_buffer_t` 与 `rte_mbuf` 对照最有启发：前者不直接持有报文数据指针，而是以缓冲池索引 + current_data/current_length 偏移量描述「当前协议头在哪」，并携带 trace_index、opaque、feature 位图等供处理图使用的元数据；后者更贴近「一块报文内存」本身。这正是「I/O 库」与「转发引擎」在数据结构层的分野——VPP 的 buffer 是为「在多节点间被反复改写和传递」而设计的（缓冲池与生命周期见 06-09）。再次强调：以上头文件路径用于定位，具体字段名、类型与函数签名请以实际版本核验，不确定的写「需对照实际版本核验」。
+
+### 4. 关键流程与调用链
+
+把四种架构的「收包 → 决策 → 发送」压成可对照的链条，差异会非常直观。
+
+内核协议栈：网卡硬中断 → NAPI 收包 → `netif_receive_skb` → netfilter/bridge/路由查找 → qdisc → `dev_queue_xmit` → 驱动发送。每一步都围绕单个 skb 展开，中断与软中断、锁与 skb 分配贯穿始终。
+
+OVS 内核 datapath：网卡 → `openvswitch.ko` 提取 flow key → 查 megaflow 缓存，命中则直接按 action 转发；未命中则上送用户态 `ovs-vswitchd`，由 ofproto 走 OpenFlow 流水线并下发新流表，后续包走快速路径。OVS-DPDK 把最外层换成 PMD 轮询，但「缓存命中 / miss 上送」的模型不变。
+
+DPDK 裸应用：`rte_eth_rx_burst` 一次收一批 `rte_mbuf` → 应用自写的查表/改写逻辑（可能就是一张哈希表或几条 if）→ `rte_eth_tx_burst` 发送。链路极短，性能上限高，但「查表、邻居、隧道、ACL」全部需要自己实现，且没有标准控制面。
+
+VPP：`dpdk-input` 节点一次轮询批量收包并构造帧 → 帧按处理图依次经过 `ethernet-input`、`ip4-lookup`、`ip4-rewrite`、`interface-output` 等节点 → 每节点对整帧做同构处理，命中/未命中统一由 DPO 与邻接机制衔接 → `dpdk-output` 批量发送。与 DPDK 裸应用相比，VPP 多出的不是 I/O，而是「图调度 + 协议栈 + 特性编排 + 控制面」这一整层；与 OVS 相比，VPP 没有「流缓存 miss 上送用户态」的快慢路径割裂，而是把转发决策做成常驻的图与表（FIB / DPO），首包与后续包走同一条路径。
+
+:::figure id=01-02-02 | name=四种架构的收包决策发送链路 | dir=LR
+node k1 "中断 / 软中断" gray
+node k2 "skb 逐包穿栈" gray
+node k3 "qdisc 发送" gray
+node o1 "PMD / 内核收包" teal
+node o2 "megaflow 命中" teal
+node o3 "miss 上送 ovs-vswitchd" teal
+node d1 "rx_burst 批量" amber
+node d2 "自研查表逻辑" amber
+node d3 "tx_burst 发送" amber
+node v1 "dpdk-input 成帧" blue
+node v2 "处理图逐节点" blue
+node v3 "DPO / 邻接改写" blue
+node v4 "批量 output" blue
+edge k1 -> k2
+edge k2 -> k3
+edge o1 -> o2
+edge o2 -> o3 "未命中"
+edge d1 -> d2
+edge d2 -> d3
+edge v1 -> v2
+edge v2 -> v3
+edge v3 -> v4
+:::
+
+VPP 侧的完整调度机制、帧递交、barrier 与 API 消息机制分别属于 06 全册（原理见 06-01、06-02、06-05、06-12、06-13），各功能模块的内部转发流程属于 07 全册（见 07-02、07-03、07-05），本篇只做架构级对照，不展开实现。
+
+### 5. 配置/命令/代码实例
+
+为了让「同一件事在四种架构下分别怎么做」有体感，下面给出「让一个接口 up 并具备基本转发能力」的对照式片段。这些命令只作示意，各项目参数以其官方文档为准；VPP 侧完整命令族见 04-03 / 04-04，startup.conf 全参数见 04-01，`show`/`clear`/`trace` 全集见 04-06，本篇不重列清单。
+
+VPP 侧（startup.conf 片段，语法需对照实际版本核验，样本见 `src/vpp/conf/startup.conf`）：
+
+```ini
+dpdk {
+  dev 0000:06:00.0 {
+    name eth0
+  }
+}
+```
+
+配合只读确认命令：`vppctl show version`、`vppctl show interface`、`vppctl show ip fib`（命令见 04-02、04-03、04-06）。Linux 内核栈侧是通用工具：`ip link set <dev> up`、`ip addr add <addr>/<prefix> dev <dev>`（语法以 iproute2 版本为准）。OVS 侧是 `ovs-vsctl add-br br0`、`ovs-vsctl add-port br0 <port>` 一类（语法以 OVS 版本为准）。DPDK 裸应用则没有「配置命令」这一概念——要么用 `testpmd` 之类自带工具做转发验证，要么由应用自己在启动时解析参数并初始化 EAL 与端口。
+
+| 目标动作 | 内核协议栈 | OVS | DPDK 裸应用 | VPP |
+|---|---|---|---|---|
+| 接口 up | `ip link set ... up` | `ovs-vsctl add-port` | EAL 初始化端口 | `set interface state ... up`（见 04-03） |
+| 配置地址 | `ip addr add` | 交换机端口通常不配 L3 | 应用自行维护 | `set interface ip address`（见 04-03） |
+| 下发转发表 | `ip route add` / 路由守护进程 | OpenFlow 流表 / OVSDB | 应用自写查表 | FIB 由控制面经 Binary API 下发（见 04-07） |
+| 观察状态 | `ip -s link`、`ss` | `ovs-ofctl dump-flows` | 应用自埋点 | `show interface` / `show runtime`（见 04-06） |
+| 可编程扩展 | tc / eBPF / netfilter | OpenFlow action | 任意 C 代码 | 图节点 + feature arc + 插件（见 06-11、07 全册） |
+
+上面是「怎么配置」的对照，下面再补一组「怎么观察运行态」的可执行命令：用同一套统计口径，把 VPP 的向量批处理与 Linux 网卡 / 内核侧的逐包处理特征摆在一起看（命令全集见 04-06，本篇不重列清单）。
+
+```bash
+# 观察命令组合（命令实现可定位到 src/vlib/ 与 src/vnet/ 下的 CLI 定义；
+# 节点运行时统计结构见 src/vlib/node.h 的 vlib_node_runtime_t，字段逐项见 05-03）
+# <dev> 为实际接口名：VPP 侧如 GigabitEthernet0/6/0/0，Linux 侧如 eth0；语法以各工具版本为准
+vppctl show runtime            # 图节点运行时统计：批量大小、周期开销、挂起次数
+vppctl show interface          # 各接口收发计数与丢包
+vppctl show interface <dev>    # 单接口明细
+ethtool -S <dev>               # 网卡侧逐包统计（Linux 工具，语法以 ethtool 版本为准）
+ip -s link show <dev>          # 内核协议栈侧逐包统计
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（以下为片段，仅示意）
+--- vppctl show runtime（片段）---
+             Name                 State         Calls      Vectors    Suspends     Clocks   Vectors/Call
+dpdk-input                       polling         10240      2621440           0   8.21e1         256.00
+ethernet-input                   active          10240      2621440           0   2.10e1         256.00
+ip4-lookup                       active          10240      2621440           0   3.45e1         256.00
+ip4-rewrite                      active           9800      2508800           0   2.80e1         256.00
+dpdk-output                      active          10240      2621440           0   4.10e1         256.00
+--- vppctl show interface（片段）---
+              Name               Idx    State          Counter          Count
+GigabitEthernet0/6/0/0            1      up       rx packets           2621440
+                                                  rx bytes           157286400
+                                                  tx packets           2621440
+                                                  drops                      0
+                                                  ip4                  2621440
+--- ethtool -S <dev>（片段，计数项随驱动而异）---
+     rx_packets: 2621440
+     tx_packets: 2621440
+     rx_dropped: 0
+     tx_dropped: 0
+```
+
+这段命令把「向量批处理 vs 逐包处理」落到可测数字上，逐项判读如下：`Calls` 是节点被调度调用次数，`Vectors` 是累计处理报文总数，`Vectors/Call` 为二者之比（平均每次调用吃进几个包），是批处理是否成形的第一指标——持续流量下应显著大于 1、随负载趋近单帧上限（`vlib_frame_t` 常量见 `src/vlib/node.h`，需对照实际版本核验），长期贴近 1 即退化为逐包；`Clocks` 反映节点 CPU 周期开销，越低越好，向量模型靠摊薄固定开销把它压低；`Suspends` 为挂起次数，正常应近 0。`show interface` 的 `rx packets`/`tx packets` 是接口累计收发数，`drops` 等丢包计数器在零丢包速率内应不增长，随流量持续抬升即异常。`ethtool -S <dev>`、`ip -s link` 给出网卡 / 内核侧逐包视角的同类计数，用于确认包是否真进了引擎。字段名与计数项随版本、驱动而异，需对照实际版本核验（命令全集见 04-06，节点运行时字段见 05-03，调度机制见 06-02、06-05）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个、也是最常见的陷阱是**层次错位对比**：把「DPDK vs VPP」当成两个竞品，或把「OVS-DPDK vs VPP」的差异全部归因于 DPDK。事实上前者的 I/O 层可能完全相同，真正的差异在处理图、协议栈、特性编排与控制面；正确的比较方式是「在同一 I/O 后端之上，比中间层与上层能力」。第二个陷阱是**性能测试口径不一致**：拿 iperf/netperf 去压 VPP 却发现流量没进引擎，或拿 64 字节小包与 1500 字节大包的 PPS 混着比，或用开了 NAT/ACL 的 VPP 去比纯转发的 DPDK 裸应用，结论都无效。任何对比都要固定包长、核数、NUMA、feature 组合与测试方法学（见 08-01）。第三个陷阱是**忽视首包与慢路径差异**：OVS 系有「miss 上送」造成的首包时延与流表规模依赖，VPP 则是常驻 FIB/DPO、首包即走同一路径，用短流突发去比两者会得出误导性结论。第四个陷阱是**忽视控制面集成成本**：DPDK 裸应用与 VPP 都需要外部控制面，但 VPP 至少有标准化 Binary API、统计段与多语言绑定，裸应用往往要从零造轮子；选型时若把「开发一套控制面」的成本漏算，估算会严重偏乐观。第五个陷阱是**把「协议栈完整」等同于「能跑主机业务」**：VPP 自带的是转发面协议栈，普通主机 socket 应用默认不经过它，需要 VCL/LDP 或 host-interface 才能接入（见 07-12）。
+
+还有一个容易被忽略的维度是内存与状态模型。内核协议栈的每包状态附着在 skb 上、随包穿栈；OVS 把「流」的状态留在用户态流表与内核缓存两处，靠 miss 上送保持一致；DPDK 裸应用的状态完全由应用自己组织，通常就是几张放在大页内存里的哈希表；VPP 则把「转发所需状态」明确收敛到 vnet 的各类表（FIB、邻接、桥域、隧道、会话表）里，而把「包的瞬时状态」放在 vlib_buffer_t 与帧里随处理图流动。这个区分很重要：VPP 的向量批处理之所以成立，正是因为同一批包共享同一类查表状态，状态与报文被分离而非绑死，才可能把查表与改写做成批量同构的操作。反过来，如果一个场景的状态粒度极细、每包都要走完全不同的分支（例如复杂的应用层七层处理），向量模型摊薄固定开销的收益就会被削弱，此时 VPP 未必比一个精心定制的标量实现更划算。把「状态放在哪、粒度有多细」纳入对比，才能解释为什么同样是用户态 PMD、同样能跑到线速，不同引擎在小包混合业务下的表现仍会分道扬镳。
+
+最佳实践可以浓缩成「三问选型法」。第一问：我需要的只是线速收包库，还是一台可编程交换机，还是一个自带协议栈的转发引擎？对应 DPDK / OVS / VPP 三种不同起点。第二问：控制面由谁提供、是否已有 OpenFlow/OVSDB 体系或 NETCONF/govpp 体系？这决定集成成本。第三问：性能目标按什么口径验收？把包长、核数、NUMA、feature、工具与零丢包速率写进验收文档，再谈数字。补充一条工程习惯：对比结论务必标注版本基准（本套资料为 23.06 / master），OVS、DPDK、内核与 VPP 都在持续演进，跨大版本的对照表很容易过期。
+
+### 7. 小结与延伸阅读
+
+本篇的核心结论是：四者不在同一层，DPDK 解决「怎么把包高速收进来」，内核协议栈与 OVS 分别代表「通用完整」与「可编排交换」两种既有形态，VPP 则在用户态高速 I/O 之上补齐了「向量处理图 + 完整 vnet 协议栈 + 标准控制面 API」，把原本每个项目都要自研的中间层产品化。差异最大的地方不是网卡，而是网卡之上那一层报文如何被组织、由谁决策去向、以及配置如何下发。
+
+延伸阅读建议：想深挖「为什么向量批处理更快」「图节点如何调度」「PMD 如何与批处理配合」，读 06-01、06-02、06-05、06-12；想了解 VPP 具体提供哪些接口类型与 L2/L3/服务链模块，读 07-01、07-02、07-03、07-05；想建立可复现的性能对比方法，读 08-01；想落地网卡绑定与部署，读 03-02、03-03；命令与配置全集回查 04 全册，结构体字段回查 05 全册。本篇所有对比表与对比图只做架构级对齐，具体实现细节一律交给对应权威源，避免与后续篇目重复。
+
+---
+
+## 01-03 整体架构：数据面与控制面分离
+
+### 1. 背景与动机
+
+把「决定包去哪」与「真正把包送走」拆成两套彼此独立、通过明确接口通信的系统，并不是 VPP 的首创，但 VPP 是把这条原则贯彻得最彻底、也最依赖它来换取性能的开源实现之一。要理解为什么必须分离，先看不分离会怎样。在通用操作系统里，控制逻辑与转发逻辑共享同一内核、同一批锁、同一套内存管理：路由守护进程重算 FIB 时要拿锁，iptables 规则变更要同步到每 CPU 副本，一个配置动作可能短暂抬高转发时延；转发面被绑死在内核里，无法单独绑核、单独重启或单独升级；控制协议只能用内核提供的机制实现，很难换语言、换进程、换部署位置。而在 NFV / 云 / 5G 场景里，数据面往往需要独占若干 CPU 核做无中断轮询，控制面却更适合跑在通用容器里、由编排系统统一管理、用 Go 或 Java 编写——这两类工作负载对确定性、生命周期与开发栈的要求根本不同。
+
+VPP 的答案是把边界画得非常干净：数据面是一个（或多 worker 线程的）用户态进程，只做一件事——以向量批处理方式把包按既有表项转发出去，全程轮询、无中断、尽量无锁、独占核；控制面是完全独立的外部实体，可以是 `vppctl` 这种调试 CLI，也可以是 govpp、Honeycomb、Ligato、路由守护进程适配层或自研 agent，通过 Binary API 下发配置、通过统计段读取指标。这样做换来四个直接收益：数据面性能可预测，不被控制面动作干扰；控制面崩溃、重启、升级不影响在转发的流量；控制面可以用任意语言、部署在任意进程甚至远端；配置与查询全部走标准化消息，天然适合编排。代价是必须认真设计消息契约、共享内存同步与版本兼容，也必须处理「配置变更如何安全同步到所有 worker」这一新问题——这正是 06 全册里 barrier 与 RPC 机制要解决的（原理见 06-06、06-07、06-13）。本篇负责把这张分层与交互的地图画清楚，机制细节一律引用权威源。
+
+### 2. 核心概念
+
+**分层架构**自底向上可以分为六层。最底层是 `src/vppinfra/`，提供 vec、pool、hash、clib_bihash、bitmap、timer wheel、原子操作与缓存行对齐宏，是所有上层结构的底座（字段见 05-09 ｜ 实现见 06-08）。其上是 `src/vlib/`，VPP 的图引擎核心：节点注册与调度、帧与 pending frame、缓冲池、主循环 `vlib_main_loop`、计时与错误处理（字段见 05-02、05-03、05-04 ｜ 机制见 06-02、06-05、06-09）。再往上是 `src/vlibapi/`、`src/vlibmemory/` 与 `src/svm/`，它们共同实现 Binary API 与共享内存消息队列，是控制面与数据面之间的实际通道（字段见 05-10、05-12 ｜ 机制见 06-10、06-13）。网络语义层是 `src/vnet/`，提供接口模型、二层桥接、三层 FIB / DPO、邻接、隧道与各类协议（字段见 05-05、05-07、05-08 ｜ 流程见 07 全册）。功能层是 `src/plugins/`，DPDK、NAT、ACL、IPsec、LB、VXLAN 等以插件形式注册节点、CLI 与 API handler（加载机制见 06-11 ｜ 模块见 07 全册）。最外层是 `src/vpp/`，包含 `main()` 与启动装配逻辑，负责解析 startup.conf、初始化 EAL 与大页、装载插件、拉起主线程与 worker（配置见 04-01 ｜ 启动见 02 全册）。外部控制面不在这六层之内，它位于图的另一侧，通过 API 与 VPP 进程对话。
+
+:::figure id=01-03-01 | name=VPP 分层架构与源码目录 | dir=TD
+node ext "外部控制面<br/>CLI · govpp · Honeycomb · Ligato" purple
+node api "vlibapi / vlibmemory / svm<br/>Binary API · 共享内存 · 消息队列" gray
+node vppmain "src/vpp<br/>main() · startup.conf 解析 · 插件装载" green
+node plugins "src/plugins<br/>dpdk · nat · acl · ipsec · lb" amber
+node vnet "src/vnet<br/>接口 · L2 · L3 · 隧道 · 协议" teal
+node vlib "src/vlib<br/>图引擎 · 节点调度 · buffer · 主循环" blue
+node infra "src/vppinfra<br/>vec · pool · hash · bihash · 原子操作" blue
+node hw "硬件层<br/>NIC · CPU · 大页 · NUMA" green
+edge ext -> api "控制 / 查询"
+edge api -> vppmain "配置加载"
+edge vppmain -> plugins "插件装载"
+edge plugins -> vnet "注册节点 / 特性"
+edge vnet -> vlib "构建处理图"
+edge vlib -> infra "基础容器"
+edge api -> vlib "API 消息 / RPC"
+edge vnet -> hw "af_packet / virtio"
+edge plugins -> hw "DPDK PMD 轮询"
+:::
+
+| 层次 | 源码目录 | 主要职责 | 权威源 |
+|---|---|---|---|
+| 基础容器 | `src/vppinfra/` | vec/pool/hash/bihash/原子/对齐 | 字段见 05-09，原理见 06-08 |
+| 图引擎 | `src/vlib/` | 节点、帧、缓冲池、主循环 | 字段见 05-02/03/04，原理见 06-02/05/09 |
+| API 与共享内存 | `src/vlibapi/`、`src/vlibmemory/`、`src/svm/` | Binary API、消息队列、共享内存 | 字段见 05-10/12，原理见 06-10/13 |
+| 网络语义 | `src/vnet/` | 接口、L2/L3、隧道、协议 | 字段见 05-05/07/08，流程见 07 全册 |
+| 功能插件 | `src/plugins/` | DPDK/NAT/ACL/IPsec/LB 等 | 加载见 06-11，功能见 07 全册 |
+| 启动装配 | `src/vpp/`、`src/vlib/unix/` | main、startup.conf、插件装载 | 配置见 04-01，构建见 02 全册 |
+
+**三条控制面通道**需要分清。第一条是 CLI：`vppctl` 通过 `unix { cli-listen ... }` 指定的 Unix socket 连入，适合人工调试与一次性查询，命令注册与分发见 04-02。第二条是 Binary API：控制面进程与 VPP 通过共享内存消息队列交换序列化消息，是程序化配置的主通道，消息格式由 `.api` 文件定义、`vppapigen` 生成多语言绑定（编程用法见 04-07 ｜ 消息机制见 06-13）。第三条是统计段（statseg）：VPP 把节点计数器写进共享内存，外部进程可直接映射读取，避免高频查询打扰数据面（字段见 05-12 ｜ 判读见 08-02）。三者的分工是「人工调试 / 程序配置 / 高频指标采集」，把它们混用是常见的架构错误。
+
+| 通道 | 承载内容 | 传输方式 | 典型使用方 | 权威源 |
+|---|---|---|---|---|
+| CLI（`vppctl`） | 人工命令、一次性查询 | Unix socket + 文本 | 运维、调试 | 04-02 / 04-06 |
+| Binary API | 配置下发、表项、事件订阅 | 共享内存消息队列 | govpp / Honeycomb / Ligato / 自研 agent | 04-07 / 06-13 |
+| statseg 统计段 | 节点计数器、接口统计 | 共享内存只读映射 | 监控、遥测、性能分析 | 05-12 / 08-02 |
+
+理解分离架构还有一条更本质的判据：边界两侧对「状态」的读写权限是不对称的。控制面是**写方**——它创建接口、增删 FIB 表项、建立隧道、启停特性，产出的是转发所需的全部状态；数据面是**读方**——它在热路径上只读这些表，几乎不回写，唯一的例外是统计计数器与接口收发计数这类原子累加，而这些也落在共享内存里、不与配置状态耦合。正因为写方与读方分离，VPP 才能把数据面做成「无锁、无系统调用、无阻塞」的纯轮询循环，也才能允许控制面用任意语言、任意进程模型甚至跨主机部署；反过来，一旦某个节点试图在转发热路径上做配置查询或跨线程同步，就打破了这条不对称性，性能确定性随之下降。这条判据也解释了架构里几个看似多余的设计：为什么需要 barrier / RPC（把控制面的一次写安全地广播到所有读方），为什么需要消息 crc 与版本校验（保证写方与读方对状态结构的理解一致），以及为什么 statseg 要独立成共享内存段（把高频但无关的读彻底挪出热路径）。把「谁写、谁读、何时同步」想清楚，分层图上的每一条连线都有了解释。
+
+### 3. 关键数据结构与源码位置
+
+本节只做「定位 + 职责」的概述，不展开任何字段表（VPP 结构体逐字段定义统一见 05 全册）。数据面运行状态由 `vlib_main_t` 与 `vlib_global_main`（`src/vlib/main.h`，字段见 05-02）承载，每个 worker 线程持有自己的运行时实例，`vlib_thread_main_t` 描述线程拓扑与亲和（字段见 05-02 ｜ 线程模型见 06-06）。图相关结构 `vlib_node_t`、`vlib_node_runtime_t`、`vlib_frame_t`、`vlib_pending_frame_t` 位于 `src/vlib/node.h`（字段见 05-03），报文载体 `vlib_buffer_t` 与缓冲池结构位于 `src/vlib/buffer.h`（字段见 05-04）。网络侧 `vnet_main_t`（`src/vnet/vnet.h`）、`vnet_hw_interface_t` / `vnet_sw_interface_t`（`src/vnet/interface.h`）分别对应全局网络主结构与接口模型（字段见 05-05）。
+
+控制面一侧的关键结构集中在三个目录：`src/vlibapi/` 下的 API 主结构与消息头（如 `vlib_api_main_t` 一类，字段见 05-12），`src/svm/` 下的 `svm_region_t` / `svm_queue_t`（字段见 05-10），以及 `src/vpp/stats/` 下的统计段主结构（如 `stat_segment_main_t` 一类，字段见 05-12）。消息契约本身不是 C 结构，而是分布在各源码目录的 `.api` 定义文件（例如 `src/vnet/interface.api`、`src/vnet/ip/ip.api` 一类，具体路径与内容需对照实际版本核验），由 `src/tools/vppapigen/` 下的生成器转成 C/JSON/Python/Go 绑定与消息表。启动与装配相关入口在 `src/vpp/main.c` 与 `src/vlib/unix/main.c`；官方 startup.conf 样本可定位 `src/vpp/conf/startup.conf`。再次说明：以上头文件与目录用于定位，具体结构体字段名、消息签名、宏与生成物命名请以实际版本源码为准，不确定的写「需对照实际版本核验」，概述层不补字段表。
+
+### 4. 关键流程与调用链
+
+把四条链分开看，分离架构就一目了然。
+
+**启动装配链**：`src/vpp/main.c` 的 `main()` 进入 `src/vlib/unix/main.c` 的 `vlib_unix_main()`，解析 startup.conf（含 `unix{}`、`cpu{}`、`dpdk{}`、`socksvr{}`、`api-trace{}` 等块，全参数见 04-01），初始化大页与 DPDK EAL，`dlopen` 装载插件，遍历注册宏把节点、CLI 命令与 API handler 挂进各自注册表，建好处理图与 feature arc，最后拉起 main thread 与若干 worker 线程进入 `vlib_main_loop`（`src/vlib/main.c`；调度见 06-05，插件加载见 06-11）。
+
+**数据面转发链**：worker 线程独占 CPU 核轮询，`dpdk-input` 批量收包成帧，帧沿处理图经过 `ethernet-input`、`ip4-lookup`、`ip4-rewrite`、`interface-output` 等节点，全程**只读** FIB / 邻接 / 接口表，不发起控制面调用，不阻塞，不拿跨线程锁（机制见 06-02、06-05、06-12；转发语义见 07-03）。
+
+**控制面下发链**：外部 agent 通过 Binary API 把序列化消息写入共享内存队列 → `vlibapi` / `vlibmemory` 取出并按消息 ID 分发到模块注册的 handler（如接口、FIB、隧道各类 handler，具体函数签名需对照实际版本核验，可定位 `src/vlibapi/`、`src/vlibmemory/`）→ handler 调用 vnet 配置函数写表 → 若变更需要所有 worker 一致可见，则经 barrier / RPC 同步（线程同步与帧递交见 06-06、06-07；API 消息机制见 06-13；编程用法见 04-07）。
+
+**统计与事件链**：节点在处理包时原子更新 statseg 共享内存计数器 → 外部监控进程直接映射读取 → CLI 的 `show runtime` 等命令或监控面板展示（判读见 08-02，命令族见 04-06）。事件（接口 up/down 等）则通过 API 的 event 订阅机制推送给控制面（见 04-07、06-13）。
+
+:::figure id=01-03-02 | name=控制面与数据面分离及交互通道 | dir=LR
+node cli "vppctl / VAT<br/>调试 CLI" purple
+node agent "控制面 Agent<br/>govpp / Honeycomb / Ligato" purple
+node binapi "Binary API<br/>*.api → vppapigen 生成" gray
+node shm "共享内存通道<br/>svm queue / 消息队列" teal
+node stats "统计段 statseg<br/>共享内存计数器" teal
+node dataplane "VPP 数据面进程<br/>worker 线程 · 图节点转发" blue
+node pmdrx "DPDK PMD<br/>轮询 RX / TX" green
+edge cli -> binapi "命令"
+edge agent -> binapi "API 调用"
+edge binapi -> shm "序列化消息"
+edge shm -> dataplane "配置 / 表项下发"
+edge dataplane -> stats "计数更新"
+edge stats -> agent dashed "读取指标"
+edge dataplane -> pmdrx "收发包"
+:::
+
+这四条链的关键分界在于：只有「下发链」会改变数据面状态，且必须经过同步机制；「转发链」与「统计链」是单向、只读或原子写的热路径；把控制面动作塞进热路径，等于亲手把分离架构换来的确定性还回去。本篇到此为止，具体调度、barrier、消息序列化细节分别见 06 全册（原理见 06-05、06-06、06-07、06-13），不在此展开。
+
+### 5. 配置/命令/代码实例
+
+概述层只需给出「打开通道、确认通道」的最小示例。下面是示意性 startup.conf 片段，键名与默认值需对照实际版本核验，官方样本见 `src/vpp/conf/startup.conf`，配置体系与全参数见 04-01，`socksvr{}` / `api-trace{}` / `stats{}` 等块的逐项说明同样见 04-01。
+
+```bash
+unix {
+  cli-listen /run/vpp/cli.sock
+}
+api-trace {
+  on
+}
+cpu {
+  main-core 0
+  workers 2
+}
+```
+
+用只读命令确认进程、线程与节点状态：`vppctl show version`、`vppctl show threads`、`vppctl show interface`、`vppctl show runtime`（命令注册见 04-02，接口命令见 04-03，完整 `show`/`clear`/`trace` 族见 04-06）。`api-trace { on }` 会把 API 消息记入追踪，便于核对控制面到底下发了什么（用法见 04-07）。程序化下发的示意伪代码如下，**消息名、字段与绑定 API 需对照 `.api` 文件与实际版本核验**（编程用法见 04-07 ｜ 消息机制见 06-13）：
+
+```text
+# 示意伪代码：控制面经 Binary API 下发接口配置
+channel = connect_binary_api("/run/vpp/api.sock")   # 默认路径需对照实际版本核验
+channel.call("sw_interface_set_flags", {"sw_if_index": 1, "flags": 1})
+channel.dump("sw_interface_dump")                    # 查询接口列表
+```
+
+统计段的使用方式是共享内存只读映射而非 CLI 轮询，示例客户端与判读方法见 04-07 与 08-02；本篇不重列命令清单，也不展开 `.api` 字段表。若 `show interface` 为空或 API 连接失败，先按 03-02 检查进程与网卡绑定，再按 04-01 检查 socket 路径与 `socksvr{}` 配置。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是**把控制面与数据面塞进同一颗核**：控制面进程、日志、监控采集若和 worker 抢核，会直接打断无中断轮询，造成时延尖刺与丢包；正确做法是用 `cpu { main-core ... workers ... }` 配合 CPU 隔离与 NUMA 绑定，把控制面进程放到非数据面核上（见 03-01、08-02）。第二个陷阱是**误以为 VPP 自带路由协议**：VPP 本体不跑 OSPF/BGP，FIB、接口、隧道全靠外部控制面或静态配置，缺少控制面时它只是一台按固定表项转发的设备（集成方式见 04-07）。第三个陷阱是**用 CLI 轮询做高频监控**：`show` 命令每次都要走一遍 VPP 内部查询，高频调用会打扰数据面；指标采集应走 statseg 共享内存（判读见 08-02）。第四个陷阱是**忽视 API 版本配对**：`.api` 消息带版本与 crc，客户端 binding 必须与服务侧版本一致，否则连接被拒或字段错位（见 04-07、06-13）。第五个陷阱是**以为数据面完全不受控制面影响**：配置变更需要经 barrier / RPC 同步到所有 worker，同步期间可能出现极短暂的性能抖动，批量变更应避开业务高峰（机制见 06-07）。第六个陷阱是**配置不持久化**：只靠交互式 CLI 做的配置，VPP 重启后即丢失，生产环境必须依赖 startup.conf、`exec` 启动脚本或可重放的控制面（取舍见 04-07）。
+
+最佳实践有五条。其一，先规划 CPU/线程拓扑再写配置，把「数据面核」「控制面进程」「监控采集」三类负载在物理上分开。其二，配置下发统一走 Binary API，CLI 只保留给人工调试。其三，高频指标一律走 statseg，且为采集端做版本配对与重连。其四，所有配置以「可重放」形式纳入版本管理（startup.conf / exec / 控制面状态），并验证重启后可复现。其五，把大规模表项变更安排在维护窗口，配合 08-02 的节点耗时与 08-03 的错误计数判读，观察是否有同步抖动。养成回查习惯：字段找 05、命令找 04、机制找 06、模块找 07、排障找 08，概述层只负责画边界。
+
+### 7. 小结与延伸阅读
+
+本篇的结论可以压缩成一句话：VPP 把「决定包去哪」完全交给外部控制面，把「把包送走」完全留给独占核、无中断、只读表项的数据面，两者之间用 Binary API（配置）、CLI（调试）、statseg（指标）三条通道连接，并用 barrier / RPC 保证配置变更的一致性。理解这条边界，就能理解为什么 VPP 既是「一个进程」又是「一个可被任意语言编排的系统」。
+
+延伸阅读建议：控制面与 API 集成、`exec` 脚本、配置持久化、govpp / Honeycomb / Ligato / VCL 编程入门，读 04-07；线程模型、同步、帧递交与 barrier，读 06-06、06-07；Binary API 消息序列化与事件机制，读 06-13；共享内存与内存堆布局，读 06-10、05-10；相应结构体字段，读 05-02、05-05、05-10、05-12；statseg 输出判读与性能监控，读 08-02；CPU 隔离与 NUMA 落地，读 03-01；各功能模块如何通过 API 暴露配置，读 07 全册。本篇的分层图与交互图是后续所有篇目的「总地图」，机制与字段细节一律交给唯一权威源，不在此重复。
+
+---
+
+## 01-04 版本演进、fd.io 社区与生态
+
+### 1. 背景与动机
+
+一篇讲「版本与社区」的概述文章看似离技术最远，实际上恰恰决定了这套资料能不能被正确使用。VPP 是一个持续高频演进的开源项目：`.api` 消息定义会增删字段，插件名与 startup.conf 键会调整，CLI 子命令会重构，节点与 feature arc 会新增，编译器与构建系统（历史上从 Makefile/autotools 体系逐步迁移）也在变化。于是同一个技术点，在 19.xx、20.xx、23.06 与 master 上可能对应不同的命令片段、不同的结构体字段、甚至不同的模块归属。如果读者不知道「版本从哪来、谁在维护、怎么发布、哪些版本适合生产」，就很容易照抄一篇旧博客的命令却怎么也跑不通，或者把 master 上的行为误当成稳定版契约。这也正是本套资料反复强调「版本基准 23.06 / master」「不确定的版本号、字段名、CLI 语法写需对照实际版本核验并给出可定位路径」的原因。
+
+第二层动机是生态复用。VPP 本体只提供数据面与 API，真正落到一个生产系统里，还需要控制面 agent、多语言绑定、主机栈接入、容器网络插件、编排集成与硬件卸载支持。这些能力大多由 fd.io 社区及上下游项目提供，而不是 VPP 核心仓库。搞清楚「VPP 核心、Honeycomb/Ligato、govpp、VCL、Contiv-VPP 各自是什么关系」，工程师才知道遇到需求该去复用哪个项目、遇到问题该去哪个仓库和邮件列表找答案、想贡献代码该走什么流程。本篇因此把三件事讲清楚：版本与 LTS 策略、社区治理与贡献流程、以及围绕 VPP 的生态版图；涉及具体版本号的地方一律按规范标注核验，不编造发布清单。
+
+### 2. 核心概念
+
+**版本号方案**。VPP 采用 `YY.MM`（年.月）形式命名稳定发布，例如本套资料的基准 `23.06`；`master` 指开发主线，稳定发布时从主线切出发布分支，之后该分支原则上只收缺陷修复与必要回溯。开源早期（2016 年 fd.io 成立、VPP 首次对外开源）版本节奏较密，随后逐步收敛为大致每年若干个 `YY.MM` 稳定发布（历史上出现过 01/04/07/10 的季度节奏，也出现过 02/06/10 之类的三段式节奏，具体月份、清单与变更内容需对照 fd.io 官方发布页核验，本概述层不列具体版本清单）。对读者最实用的判断是：看到 `YY.MM` 就应意识到它绑定了某一年的若干个月份，跨年份的命令/API 片段不可直接照搬。
+
+**LTS 策略**。fd.io 会从稳定发布中挑选长期支持版本，维护周期明显长于普通发布，主要用于生产部署；普通发布与 master 更适合开发、尝鲜与验证新特性。LTS 的挑选年份、具体版本清单、维护年限与 EOL 时间会随社区决议调整，**必须以 fd.io Release / LTS 页面为准核验**，本篇不编造具体 LTS 版本号。生产选型的经验法则是：优先 LTS、固定小版本与 commit、记录包来源；开发环境与生产环境版本对齐；升级前对照 release notes 做兼容性验证（升级与迁移见 08-05）。
+
+:::figure id=01-04-01 | name=VPP 版本演进主线 | dir=LR
+node e0 "2016<br/>fd.io 成立 · VPP 开源" purple
+node e1 "17.xx–18.xx<br/>季度版本 · 图引擎 / DPDK 插件" blue
+node e2 "19.xx–20.xx<br/>YY.MM 节奏 · VCL 主机栈 / vhost-user" teal
+node e3 "21.xx–22.xx<br/>多线程 / SRv6 / 5G UPF / 容器网络" amber
+node e4 "23.06<br/>本资料版本基准 · LTS 维护线" green
+node e5 "master / 24.xx+<br/>持续演进 · 新插件与硬件卸载" green
+edge e0 -> e1 "首个开源版本"
+edge e1 -> e2 "节奏定型"
+edge e2 -> e3 "云原生 / 5G"
+edge e3 -> e4 "稳定化"
+edge e4 -> e5 "主线"
+edge e4 -> e2 dashed "LTS 缺陷回溯维护"
+:::
+
+| 版本时代 | 主线特征（演进脉络，具体特性清单需核验） | 对使用者的意义 |
+|---|---|---|
+| 开源初期（2016 起） | VPP 贡献给 fd.io、图引擎与 DPDK 插件成型 | 奠定向量 + 处理图架构 |
+| YY.MM 季度/多段发布期 | L2/L3、NAT/ACL/IPsec、vhost-user、VCL 主机栈逐步完善 | 功能面快速铺开 |
+| 云原生 / 5G 期 | 多线程、SRv6、UPF 相关能力、容器网络集成 | 面向 NFV 与 5G 用户面 |
+| 稳定化与 LTS 期 | 发布节奏与维护策略稳定、API/配置趋于收敛 | 生产选型与长期维护 |
+| master 持续演进 | 新插件、硬件卸载、构建与工具链更新 | 尝鲜与贡献，不宜直接上生产 |
+
+**发布与维护流程**可以概括为：开发者向 Gerrit 提交变更 → 代码评审 + CI 验证 → 合入 master → 到发布窗口切 `YY.MM` 分支 → 候选版本（RC）→ 正式发布（deb/rpm 包、容器镜像、源码归档）→ 发布分支进入维护期只收 bugfix → LTS 分支长期回溯修复。具体流程、门禁与产物清单以 fd.io 发布文档为准（构建产物与打包见 02-03、02-04，升级见 08-05）。**版本标识链**则是：构建系统读取 git 描述与版本元数据 → 生成版本宏/头文件（生成物命名需对照实际版本核验，可定位 `build-root/` 生成目录与 `src/vpp/`、`src/vlib/unix/` 启动代码）→ `main()` 初始化时记录 → `show version` 命令输出版本号、构建时间、源码 commit 与编译信息（命令见 04-06）。**API 版本化**同样关键：`.api` 定义带 `option version`，消息带 crc，客户端 binding 必须与服务侧匹配，否则连接校验失败或字段错位（编程用法见 04-07 ｜ 消息机制见 06-13）。
+
+**社区治理与生态**。fd.io 是 Linux Foundation 旗下项目，由技术指导委员会（TSC）与维护者（maintainer）团队管理，代码评审走 Gerrit，CI 与发布由社区基础设施支撑，讨论通过邮件列表与项目会议进行。生态上，VPP 核心仓库是数据面引擎；Honeycomb（Java 控制面 agent，NETCONF/RESTCONF）与 Ligato（Go 云原生控制面框架）提供上层编排；govpp / GoVPP 提供 Go 语言绑定，Python 侧有 `vpp_papi` 一类绑定，VAT 用于 API 与测试交互；VCL / LDP 让主机应用透明接入 VPP 主机栈（见 07-12）；Contiv-VPP 一类项目把 VPP 用作 Kubernetes CNI 数据面；OpenStack、ONAP、Akraino 等上游项目与 5G UPF 场景把 VPP 作为转发组件；硬件侧则有 Intel、Cisco 等厂商贡献的 PMD 驱动、SmartNIC、cryptodev / QAT 卸载与各类 offload（部署见 03-05）。下表把生态角色对齐到「解决什么问题」。
+
+| 生态层次 | 代表项目 / 组件 | 解决的问题 | 权威源 |
+|---|---|---|---|
+| 数据面核心 | VPP 核心仓库 | 向量转发引擎 + 协议栈 + API | 本套 05/06/07 全册 |
+| 控制面框架 | Honeycomb / Ligato | NETCONF/RESTCONF、云原生编排 | 04-07 |
+| 语言绑定 | govpp / GoVPP、`vpp_papi`、VAT | 多语言调用 Binary API | 04-07 / 06-13 |
+| 主机栈接入 | VCL / LDP / session 层 | 让 socket 应用接入 VPP | 07-12 |
+| 容器网络 | Contiv-VPP 一类 CNI | K8s / 虚机 vhost-user 接入 | 03-04 / 07-01 |
+| 上游集成 | OpenStack / ONAP / Akraino / UPF | 编排系统与 5G 场景集成 | 07-13 |
+| 硬件与卸载 | PMD / SmartNIC / QAT / offload | 线速加密与硬件加速 | 03-05 |
+
+:::figure id=01-04-02 | name=fd.io 社区与生态项目关系 | dir=TD
+node lf "Linux Foundation<br/>fd.io 项目治理" purple
+node vppcore "VPP 核心仓库<br/>数据面引擎" blue
+node honey "Honeycomb / Ligato<br/>控制面 Agent · NETCONF / RESTCONF" teal
+node govpp "govpp / GoVPP<br/>Go 语言绑定与 API 客户端" teal
+node vcl "VCL / LDP / VPP 主机栈<br/>应用透明接入" gray
+node cni "Contiv-VPP / CNI<br/>Kubernetes 容器网络" amber
+node vendor "厂商与硬件生态<br/>Intel / Cisco / NIC / SmartNIC" green
+node upstream "上游集成<br/>OpenStack · ONAP · Akraino · 5G UPF" green
+edge lf -> vppcore "托管 / 发布"
+edge vppcore -> honey "Binary API"
+edge vppcore -> govpp "*.api 生成"
+edge vppcore -> vcl "Session / 传输层"
+edge vppcore -> cni "vhost-user / 接口"
+edge vendor -> vppcore "驱动 / 卸载贡献"
+edge honey -> upstream "编排集成"
+edge cni -> upstream "编排集成"
+:::
+
+### 3. 关键数据结构与源码位置
+
+版本与生态这一主题「数据结构」不多，但仍有若干必须能定位的源码落点，概述层只给路径与职责，不展开字段（字段见 05 全册）。启动与版本打印相关入口在 `src/vpp/main.c` 与 `src/vlib/unix/main.c`；版本字符串、构建时间与 commit 由构建系统在 `build-root/` 下生成，具体生成头文件名与宏名需对照实际版本核验（可定位 `src/vpp/` 与 `src/vlib/unix/` 启动代码）。官方配置样本在 `src/vpp/conf/startup.conf`，配置体系与全参数见 04-01。
+
+API 契约与绑定的落点是：分布各目录的 `.api` 定义文件（如 `src/vnet/interface.api`、`src/vnet/ip/ip.api` 一类，具体路径需核验）、生成器 `src/tools/vppapigen/`、以及 `src/vlibapi/` 下的 API 主结构与消息头（如 `vlib_api_main_t` 一类，字段见 05-12）。统计与版本相关的共享内存结构在 `src/vpp/stats/`（如 `stat_segment_main_t` 一类，字段见 05-12），共享内存底座在 `src/svm/`（字段见 05-10），全局运行时在 `src/vlib/main.h`（字段见 05-02）。社区流程相关的文档（CONTRIBUTING、README、docs、CI 与打包脚本）位于仓库根目录与 `src/tools/`、`build-data/` 一带，具体文件名需对照实际版本核验（构建系统见 02-04）。请始终记住：本套资料以 23.06 / master 为基准，任何字段名、消息签名、命令语法、版本号只要不确定，就写「需对照实际版本核验」并给出上面这些可定位路径，不要在概述层凭印象补全。
+
+### 4. 关键流程与调用链
+
+四条流程串起「版本从源码到用户手上」的全过程。
+
+**发布流程**：开发者在 Gerrit 上提交变更 → 维护者评审 + CI 构建与测试 → 合入 master → 到发布窗口切 `YY.MM` 发布分支 → RC 验证 → 正式发布 deb/rpm 包、容器镜像与源码归档 → 发布分支进入维护期，只收缺陷修复 → LTS 分支长期回溯修复。具体门禁、时间表与产物以 fd.io 发布页与发布文档为准（打包见 02-03，升级见 08-05）。
+
+**版本标识链**：构建系统读取 git 描述、版本文件与编译环境 → 生成版本宏/头文件 → `main()` → `vlib_unix_main()` 初始化时记录 → `show version` 的 CLI handler 读取并输出版本号、构建时间、commit 与编译主机信息（命令注册见 04-02，`show` 族见 04-06）。排查「跑的到底是不是我以为的版本」时，应当把 `show version` 输出与部署清单里的版本号、包来源、commit 三者对齐，而不是只看一个 `YY.MM` 标签。
+
+**API 兼容链**：`.api` 定义（`option version` + 消息 crc）→ `vppapigen` 生成 C/JSON/Python/Go binding 与消息表 → 客户端与 VPP 在连接/调用时校验版本与 crc → 不匹配则拒绝或告警（编程用法见 04-07 ｜ 消息机制见 06-13）。这条链解释了为什么「换了 VPP 版本却忘了升级控制面绑定」会直接导致配置下发失败。
+
+**贡献与集成链**：从 fd.io Gerrit 或 GitHub 镜像获取源码 → 按 02 全册完成本地编译与依赖准备 → 修改并跑单测/构建验证 → 通过 Gerrit 提交评审（提交命令与规范以 fd.io CONTRIBUTING 文档为准，需对照核验）→ 评审迭代后合入 → 进入下一次发布。测试方法学与基线记录见 08-01，构建类型与优化见 02-06。
+
+需要强调，本节描述的是**流程形态**而非某一版本的精确命令清单；Gerrit 提交命令、CI 门禁名、发布产物命名都可能随社区实践调整，一律「需对照实际版本核验」。涉及二进制/命令族/字段表的内容分别归 04 / 05 全册，涉及机制与调用链的归 06 全册，本篇不越界。
+
+### 5. 配置/命令/代码实例
+
+概述层给出「确认版本 + 获取源码 + 核对产物」的最小片段即可。获取源码可使用 fd.io 官方 Gerrit 仓库或 GitHub 镜像（地址以 fd.io 官方文档公布为准）：
+
+```bash
+git clone https://gerrit.fd.io/r/vpp
+# 或镜像：https://github.com/FDio/vpp
+```
+
+编译与构建命令（`make build` / `make build-release` 一类，具体目标与版本差异需对照实际版本核验）见 02-02、02-04、02-06，本篇不展开。部署后第一件事是核对版本基准，示意输出字段与格式需对照实际版本核验（命令见 04-06）：
+
+```bash
+vppctl show version
+# 示意输出：版本号、构建时间、源码 commit、编译主机信息
+# 字段与格式以实际版本为准；请把三者与部署清单对齐
+```
+
+若需要以源码方式确认 commit，可在本地仓库用 `git log -1` 之类命令与 `show version` 输出的 commit 比对。程序化配置的版本配对示例（govpp / Python binding、消息名与签名需核验）见 04-07，startup.conf 全参数模板见 04-01，`exec` 启动脚本与配置持久化见 04-07，升级与配置迁移见 08-05。贡献流程示意（具体命令以 fd.io CONTRIBUTING 为准，需核验）：
+
+```text
+# 示意：Gerrit 评审提交（命令与规范需对照 fd.io CONTRIBUTING 核验）
+git review
+```
+
+再次说明，以上命令片段只用于建立「版本—产物—源码」的对应关系：完整构建命令归 02、完整 CLI 与配置归 04、完整 API 编程归 04-07、升级迁移归 08-05，概述层不重列任何清单。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是**把 master 或最新稳定版直接上生产**：master 的 API、`.api` 消息、插件名与行为都可能变，生产应锁定 LTS 或已验证的稳定 `YY.MM` 小版本（LTS 清单需对照 fd.io 页面核验）。第二个陷阱是**版本配对错乱**：VPP 服务端与 govpp / `vpp_papi` / 自研客户端 binding 版本不一致，会因消息 crc 校验失败而无法下发配置；升级 VPP 时必须同步升级控制面绑定（见 04-07、06-13）。第三个陷阱是**照抄旧版本资料**：19.xx / 20.xx 时代的 startup.conf 键、接口命名、插件名与 23.06 / master 可能不同，遇到命令报错先怀疑版本漂移，再怀疑配置错误。第四个陷阱是**只看标签不看 commit**：同一个 `23.06` 可能有多个补丁构建，安全修复与缺陷回溯都体现在 commit 与包版本上，部署清单必须记录版本号 + commit + 包来源。第五个陷阱是**忽略 LTS 维护窗口**：超过维护期的版本不再获得缺陷与安全回溯，长期运行要提前规划升级路径（见 08-05）。第六个陷阱是**跨大版本升级不做兼容验证**：`.api` 变更、配置键废弃、插件拆分都可能导致启动失败或配置丢失，必须先按 08-05 做迁移与回滚演练。第七个陷阱是**生态项目版本与 VPP 版本脱节**：Honeycomb / Ligato / govpp / CNI 各自有发布节奏，与 VPP 核心版本存在兼容矩阵，混搭前需查各自文档。
+
+最佳实践归纳为六条。其一，生产环境固定 LTS 或已验证稳定版，并把「版本号 + commit + 包来源 + 构建时间」写入部署清单。其二，开发、测试、生产三套环境版本对齐，至少保证大版本与 `.api` 契约一致。其三，升级前对照 release notes 与 08-05 完成配置/API 兼容性验证与回滚演练。其四，把 startup.conf、`exec` 脚本与控制面状态纳入版本管理，确保重启可重放。其五，为 API 客户端建立版本配对测试，把 crc 校验失败当作版本不一致的第一信号。其六，关注 fd.io 发布页、邮件列表与 LTS/EOL 公告，贡献代码前先读 CONTRIBUTING 并遵循 Gerrit 评审规范。贯穿全篇的一条纪律：任何不确定的版本号、字段名、函数签名、CLI 语法都标注「需对照实际版本核验」并附可定位路径——这既是本套资料的撰写规范，也是阅读快速演进开源项目时最可靠的习惯。
+
+### 7. 小结与延伸阅读
+
+本篇给出三层结论：版本层面，VPP 以 `YY.MM` 命名稳定发布、以 master 承载开发、以 LTS 支撑生产，具体发布清单与 LTS 版本必须对照 fd.io 官方页面核验；流程层面，Gerrit 评审 + CI + 发布分支 + 维护回溯构成从提交到产物的完整链条，`show version` 是把运行实例与源码 commit 对齐的锚点；生态层面，VPP 核心只做数据面，控制面框架、语言绑定、主机栈接入、容器网络、上游集成与硬件卸载由 fd.io 及上下游项目共同补齐。理解这三层，读者才能判断「手上这个命令属于哪个版本、这个需求该复用哪个生态项目、这个变更该走什么贡献流程」。
+
+延伸阅读建议：版本产物、deb/rpm 打包、容器镜像与构建系统，读 02-03、02-04；startup.conf 全参数与 CLI 全集，读 04-01、04-06；控制面与 API 集成、绑定版本配对、配置持久化与 `exec` 脚本，读 04-07；Binary API 消息版本与 crc 机制，读 06-13；API / 统计相关结构体字段，读 05-12；VCL / session 层与主机栈接入，读 07-12；5G UPF 场景，读 07-13；硬件卸载与加速，读 03-05；升级、配置迁移与回滚，读 08-05；性能基线的方法学与可复现记录，读 08-01。至此「01 基础与概述」四篇完成：从 01-01 的定位与指标、01-02 的架构对比、01-03 的分层与数据面/控制面分离，到本篇的版本、社区与生态，读者应已建立一张可导航的全局地图；后续所有字段、命令、机制、模块与运维细节，均按（字段见 05-xx ｜ 命令见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）的统一写法回查各自的唯一权威源。
+
+

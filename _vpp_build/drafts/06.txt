@@ -1,0 +1,2309 @@
+# VPP 技术资料 · 06 技术原理
+
+> **本册定位**：全套资料「机制、调度、调用链」的**唯一权威源**。本册只讲「为什么这样设计」「代码怎么跑」「函数怎么串」，不重列结构体逐字段定义（一律写「字段见 05-xx」），不重列 CLI 命令清单（一律写「命令见 04-xx」）。阅读本册前建议先看 `05-01` 建立数据结构总览认知，再按需回查 `05` 其余各篇。
+> **版本基准**：VPP 23.06 / master。部分函数名、宏签名、节点名随版本演进可能微调，凡本文未能确认到具体行号处，均标注「需对照实际版本核验」并给出可定位的头文件路径，请结合本地源码树 `src/` 目录核对。
+> **骨架**：全册 15 篇统一采用 A 论述型 7 段式：背景与动机 → 核心概念 → 关键数据结构与源码位置 → 关键流程与调用链 → 配置/命令/代码实例 → 注意事项、陷阱与最佳实践 → 小结与延伸阅读。
+
+---
+
+## 06-01 向量包处理核心原理
+
+### 1. 背景与动机
+
+要理解 VPP 为什么能在通用 x86 CPU 上把单核包转发推到千万 PPS 量级，必须先理解它要对抗的到底是什么。传统网络设备与基于内核协议栈（Linux `netfilter`/`bridge`/`ip_route`）或早期用户态转发框架的数据面，采用的基本范式是「标量包处理」（scalar packet processing）：从网卡收到一个报文，就从头到尾完整地走一遍处理流水线——解析以太网头、判断协议类型、查 FIB、匹配 ACL、做 NAT 转换、重写二层头、选出接口、入队发送——全部执行完，才回过头去取下一个报文。这个范式在软件工程上最自然：一条 `while` 循环里调用一串函数，逻辑清晰、易于调试，但它在现代超标量 CPU 上会同时撞上三堵墙。
+
+第一堵墙是**指令缓存（I-cache）抖动**。一条完整的 L3 转发路径涉及的模块代码量远超 L1 I-cache 的典型容量（32KB，部分架构 64KB）。标量模式下，处理第 N 个包时依次把 `ethernet_input`、`ip4_lookup`、`ip4_rewrite` 等函数载入 I-cache；处理第 N+1 个包时，这一串函数又要被重新取指一遍，而在这两次取指之间往往还夹杂着收包、统计、锁操作等其它代码，把刚热起来的缓存行冲刷掉。结果是前端取指停顿（front-end stall）成为主要瓶颈，CPU 的乱序执行引擎经常「无指令可发」。第二堵墙是**间接分支与数据相关分支的预测失败**。报文处理里充满依赖数据内容的分支：这个包是 IPv4 还是 IPv6、TTL 是否减到 0、ACL 是否命中、是否需要分片。在一条混合流量里，这些分支的结果分布相当杂乱，现代 CPU 十几级到二十级的流水线一旦预测失败就要清空重填，单次代价可达十几个到几十个时钟周期，按包累计极为可观。第三堵墙是**每包固定开销无法摊薄**：函数调用与返回、栈帧建立、时间戳读取、每节点计数器更新、trace 判定、可能的自旋锁，这些开销按包计几乎是常数。包越小、PPS 越高，这部分占比越大，最终吞吐被「每包成本」而不是「有效工作」封顶。
+
+VPP 的破局点在于：既然 I-cache 和分支预测器的敌人是「频繁地在不同代码段之间来回跳」，那就换一种遍历顺序——不是「对每个包，走完所有阶段」，而是「对每个阶段，一次性处理一整批包」。这就是向量包处理（vector packet processing）。它借用超级计算中向量化循环的思想，但并非用 SIMD 指令去并行计算报文内容，而是在**软件结构层面**把处理对象从单个 packet 换成 packet 的向量。VPP 把这个向量叫做「帧」（frame，`vlib_frame_t`），一帧最多容纳 `VLIB_FRAME_SIZE` 个报文（该宏定义在 `src/vlib/node.h`，典型值 256，需对照实际版本核验）。图节点的回调函数被调用一次，拿到的是「一批 buffer 索引的数组」，节点内部用一个紧凑循环对这一批包执行**同一个**操作。这样一来，`ip4_lookup` 的代码被载入 I-cache 一次，就连续处理 256 个包；查表这类数据相关分支，因为同批次内代码路径高度一致，分支预测器也能稳定命中。这正是 VPP 名字里 "Vector" 的由来，也是整套架构的第一性原理。
+
+理解了这个动机，后续所有设计都能顺理成章地推导出来：为什么要有「图节点」而不是自由函数调用（因为要把处理阶段切成一个个可批量、可调度的单元）；为什么要有一帧最多 256 个包的限制（帧太大反而撑爆数据缓存、增加时延，256 是指令复用与缓存驻留之间经验性的平衡点）；为什么调度器要尽量凑满帧再 dispatch（包数越少，向量收益越薄）；为什么强调「标量回退路径」是性能杀手（一旦某个包需要走特殊逻辑，就会打断批量循环）。本篇把这条主线讲透，后续 06-02 到 06-15 都是它在不同子系统上的展开。
+
+### 2. 核心概念
+
+**帧（frame）与向量**。VPP 里「向量」并非 C 数组里存着 256 个完整报文，而是存着 256 个 `u32` 类型的 buffer 索引（buffer index）。真正的报文数据放在 `vlib_buffer_t` 及其后的数据区里（字段见 05-04）。帧结构 `vlib_frame_t`（字段见 05-03）本质上是一个「索引数组 + 少量元数据」，`vlib_frame_t` 之后紧跟一段可变长度的 `u32` 数组，长度为 `n_vectors`，每个元素是一个 buffer index。节点处理时通过 `vlib_get_buffer(vm, bi[i])` 把索引换成 `vlib_buffer_t *`。这种「间接索引」设计很关键：帧在节点之间传递时只需要搬运索引数组，报文本体始终留在原地不动，避免任何报文拷贝；同时索引是定长 `u32`，循环体可以做成规整的、便于编译器向量化与预取的形式。
+
+**标量循环与向量循环的对照**。标量节点的核心循环形如「取一个包 → 分支判断 → 处理 → 送下一节点」，向量节点则是「for (i = 0; i < frame->n_vectors; i++) { b = vlib_get_buffer(...); /* 对 b 做同一操作 */ }」。二者的本质差别不在循环语法，而在**代码局部性的时间尺度**：标量循环里，两次执行同一段代码之间隔着一整个包的全流程（时间跨度大、中间代码多），向量循环里，同一段代码连续执行 256 次（时间跨度极小、I-cache 常驻）。VPP 官方常引用一个经验数字：向量化后单节点每包的指令缓存缺失可从「每包数次」降到「每帧一次」，IPC（每周期指令数）从标量模式常见的 0.6~0.8 提升到 1.5 以上。
+
+**IPC 与摊销模型**。可以用一个简化公式理解收益：设一段处理逻辑有 `C_code` 字节代码、每次冷启动 I-cache 的换入代价为 `M` 个周期、每包有效计算为 `W` 个周期、每包固定开销（调用、计数、分支刷新）为 `F`。标量模式每包成本 ≈ `M + W + F`；向量模式每帧成本 ≈ `M + N·(W + F')`，摊到每包 ≈ `M/N + W + F'`，其中 `F' ≤ F` 因为分支预测更准、循环开销被摊薄。当批大小 `N` 足够大时，`M/N` 趋近于 0，性能逼近 `W` 这个物理下限。这也是为什么 VPP 在 64 字节小包、高 PPS 场景相对传统方案优势最大——`M` 和 `F` 占比越高的场景，摊销收益越明显。
+
+**分支预测与「每包同路径」假设**。向量化的第二个收益来自分支预测器。批量里的包如果大多走同一条代码路径（例如都是 IPv4、都命中同一类邻接），那么循环里的 `if (is_ipv4)` 这类分支结果高度一致，预测器几乎全中。VPP 的节点划分因此倾向于「按处理阶段切分、让每个节点内的分支尽量单一」，例如把 `ip4-input` 和 `ip6-input` 拆成两个节点，而不是在一个大节点里用 `switch` 区分。当业务流量天然混杂（v4/v6 各半、部分要走特殊封装）时，向量收益会打折，这正是「陷阱与最佳实践」要讨论的问题。
+
+**软件预取隐藏内存延迟**。报文处理是典型的「指针追逐」：读报文头 → 查 FIB 表 → 读邻接 → 改写报文，每一步都可能是 L2/L3 缓存缺失（上百周期）。向量循环给了预取发挥空间：在处理第 `i` 个包时，提前对第 `i+K` 个包的 buffer 头或查表键发起 `CLIB_PREFETCH`，让内存加载与当前计算重叠。06-04 会专门展开缓存与预取，本篇只需记住：预取之所以有效，前提正是「有一批可预取的未来包」，标量模式没有这种「未来」可言。
+
+**图节点是向量的载体**。有了向量，还需要一个把「一批包」从一个阶段送到下一个阶段的机制，这就是图节点与帧队列（06-02 主题）。节点不是被逐包调用的普通函数，而是「接收一帧、产出一帧到若干下一节点」的调度单元。向量、节点、帧、调度器，四者构成了 VPP 数据面的骨架。
+
+### 3. 关键数据结构与源码位置
+
+本节的目的是把向量处理涉及的源码位置指清楚，便于按图索骥；**结构体逐字段定义属于 05 册权威源，这里一律引用，不重列表**。
+
+- `vlib_frame_t`（帧，索引数组 + `n_vectors` 等元数据）：定义与字段全表见 **05-03**，头文件 `src/vlib/node.h`。`VLIB_FRAME_SIZE`、`VLIB_FRAME_ALIGN`、`vlib_frame_t` 的柔性数组布局也在此头文件，需对照实际版本核验具体数值。
+- `vlib_buffer_t` / `vlib_buffer_pool_t` / `vlib_buffer_main_t`：报文载体与缓冲池，字段见 **05-04**，头文件 `src/vlib/buffer.h`。向量里存的 `u32` 索引即指向这些结构。
+- `vlib_node_t` / `vlib_node_runtime_t` / `vlib_node_registration_t`：节点静态定义与运行时状态，字段见 **05-03**，头文件 `src/vlib/node.c`、`src/vlib/node.h`。节点函数指针类型 `vlib_node_fn_t`（签名形如 `uword node_fn(vlib_main_t*, vlib_node_runtime_t*, vlib_frame_t*)`）定义在 `src/vlib/node.h`。
+- 取帧/放帧辅助：`vlib_get_next_frame`、`vlib_put_next_frame`、`vlib_get_frame`、`vlib_put_frame` 等，声明在 `src/vlib/node_funcs.h` 与 `src/vlib/global_funcs.h`（内联实现），实现分散在 `src/vlib/node.c`。这些是节点函数里组装「下一帧」的核心 API。
+- 主循环与 dispatch：`vlib_main`、`vlib_main_loop` 在 `src/vlib/main.c`；`dispatch_node` / `vlib_dispatch_node` 相关逻辑在 `src/vlib/main.c` 与 `src/vlib/node.c`，06-05 会逐行展开。
+- buffer 索引到指针：`vlib_get_buffer`（内联）在 `src/vlib/buffer.h` / `src/vlib/global_funcs.h`，内部通过 `vlib_buffer_main_t` 的 `buffer_mem_start` 加偏移换算，需注意它在不同 VPP 版本里可能是宏也可能是内联函数。
+- 帧队列与 pending frame：`vlib_pending_frame_t` 及 `vlib_node_main_t.pending_frames` 见 **05-03**，`src/vlib/node.h`。
+
+从源码组织看，向量处理不是一个独立模块，而是一种**贯穿式约定**：`node.h` 定义帧的表示，`main.c` 决定何时凑帧、如何 dispatch，各功能节点（在 `src/vnet/`、`src/plugins/`）遵守「接收一帧、批量处理、产出下一帧」的约定。因此读 VPP 源码时，判断某段代码是不是数据面热路径，一个简单标准是看它是否出现 `vlib_frame_t *frame` 与 `n_vectors` 循环。
+
+### 4. 关键流程与调用链
+
+下面把「一批包从网卡到处理完毕」在向量视角下的调用链串起来，重点是**帧在哪里形成、在哪里被 dispatch、批量循环在哪里执行**。
+
+1. **收包成帧**。以 DPDK input 节点为例（详见 06-12），`dpdk-input` 的节点函数通过 `rte_eth_rx_burst` 一次取出最多 `VLIB_FRAME_SIZE` 个 `rte_mbuf`，把每个 mbuf 换算为 VPP 的 buffer index，填进一个 `vlib_frame_t` 的索引数组。此时「向量」第一次成形：一帧里是 N 个待处理的包索引。
+2. **放入下一节点的帧**。节点通过 `vlib_get_next_frame(vm, node, next_index, vectors, n_vectors)` 拿到指向「下一节点帧」的可写索引数组，把本节点产出的 buffer index 写进去，再用 `vlib_put_next_frame` 提交。提交动作并不立即调用下一节点，而是把「哪个节点、哪个 next、有多少包待处理」记成一个 `vlib_pending_frame_t`，挂到 `vlib_node_main_t` 的 pending 队列。
+3. **主循环 dispatch**。`vlib_main_loop`（`src/vlib/main.c`）在每轮循环里先跑 input/pre-input 节点收包，然后不断从 pending 队列取出 `vlib_pending_frame_t`，调用 `dispatch_node`（或等价的 `vlib_dispatch_node`）→ 找到 `vlib_node_runtime_t` → 调用 `node->function(vm, rt, frame)`。关键点是：**一次 dispatch 处理的是整整一帧**，节点函数拿到完整向量。
+4. **节点内的向量循环**。节点函数内部是本篇的核心，典型骨架如下（伪代码，风格贴近真实 VPP 节点函数，具体写法需对照实际源码核验）：
+
+```bash
+uword
+my_node_fn (vlib_main_t * vm, vlib_node_runtime_t * node,
+            vlib_frame_t * frame)
+{
+  u32 *from = vlib_frame_vector_args (frame);   /* 帧内 buffer index 数组 */
+  u32 n_left = frame->n_vectors;                 /* 本帧包数 */
+  u32 *to_next[2] = {0};  u32 n_to_next[2] = {0};
+
+  while (n_left > 0) {
+    vlib_get_next_frame (vm, node, NEXT_DROP, to_next[0], n_to_next[0]);
+    vlib_get_next_frame (vm, node, NEXT_OK,   to_next[1], n_to_next[1]);
+    while (n_left > 0 && n_to_next[1] < VLIB_FRAME_SIZE) {
+      u32 bi0 = from[0];
+      vlib_buffer_t *b0 = vlib_get_buffer (vm, bi0);
+      /* 预取未来包，见 06-04 */
+      if (PREDICT_TRUE (n_left > 4))
+        clib_prefetch_store (vlib_get_buffer (vm, from[4])->data);
+      /* 对 b0 做同一操作：解析 / 查表 / 改写 */
+      u32 next0 = classify_one (b0);            /* 尽量无数据相关分支 */
+      to_next[next0][n_to_next[next0]++] = bi0; /* 按结果分流到下一节点 */
+      from += 1;  n_left -= 1;
+    }
+    vlib_put_next_frame (vm, node, NEXT_DROP, n_to_next[0]);
+    vlib_put_next_frame (vm, node, NEXT_OK,   n_to_next[1]);
+  }
+  return frame->n_vectors;
+}
+```
+
+这段骨架浓缩了向量处理的全部要点：`from` 是本帧输入向量，`to_next[]` 是按处理结果分流的输出向量，`while` 内层是「对一批包执行同一操作」，节点末尾用 `vlib_put_next_frame` 把输出向量提交成下游的 pending frame。`PREDICT_TRUE` / `PREDICT_FALSE` 是 `src/vppinfra/compiler.h` 里基于 `__builtin_expect` 的分支提示宏，用来进一步巩固分支预测。
+5. **逐节点推进**。下游节点（如 `ethernet-input` → `ip4-lookup` → `ip4-rewrite` → `interface-output`）依次被 dispatch，每个都重复「拿一帧、批量处理、产出一帧」，直到出接口节点把包交给网卡发送、buffer 被释放回池（06-09）。整条链上报文本体零拷贝，流动的是索引向量。
+
+:::figure id=06-01-01 | name=标量逐包处理与向量批处理流程对比 | dir=TD
+node s1 "标量循环: 每次取一个包" gray
+node s2 "包N: 解析 查表 改写 发送 全流程" gray
+node s3 "包N+1: 重走全流程 I-cache反复换入" gray
+node v1 "向量循环: 取一帧 frame[0..N]" blue
+node v2 "节点A 对整帧执行操作A" teal
+node v3 "节点B 对整帧执行操作B" teal
+node v4 "节点C 对整帧执行操作C" amber
+edge s1 -> s2 "一次一包"
+edge s2 -> s3 "重新取指"
+edge v1 -> v2 "批量输入"
+edge v2 -> v3 "frame推进"
+edge v3 -> v4 "frame推进"
+:::
+
+> **图 06-01-01 文字兜底**：左侧标量模式是「每包纵向走完所有阶段」，同一段代码在相邻两次执行之间隔着一整个包的全流程，I-cache 被反复冲刷；右侧向量模式是「按阶段横向批量处理」，节点 A 的代码载入一次即连续处理整帧的 N 个包，随后才切到节点 B。箭头 `frame推进` 表示帧作为整体在节点之间交接，而非逐包交接。
+
+| 维度 | 标量逐包处理 | VPP 向量批处理 |
+|---|---|---|
+| 处理对象 | 单个 packet | 一帧（最多 `VLIB_FRAME_SIZE` 个 buffer index） |
+| I-cache 行为 | 每包重新热一遍全路径代码 | 每帧热一次，批量复用 |
+| 分支预测 | 数据相关分支命中率低 | 同批次路径一致，命中率高 |
+| 每包固定开销 | 全额承担 | 被 `N` 摊薄 |
+| 内存延迟隐藏 | 难以预取「未来包」 | 可用 `CLIB_PREFETCH` 提前加载 |
+| 适用流量 | 逻辑简单、路径单一 | 高 PPS、小包、路径可批量归一 |
+| 主要代价 | — | 帧不满时收益下降、尾时延略增 |
+
+### 5. 配置/命令/代码实例
+
+本节只给与「向量原理」直接相关的观察与验证手段，**完整命令族见 04-06、startup 全参数见 04-01**，这里不重列清单。
+
+- **观察每节点处理包数与向量效率**。节点运行时会统计每帧平均包数、每包周期数，可通过 `show node runtime`、`show vlib graph`（命令族见 04-06）读取；判读方法见 08-02。若某节点「calls 很多但 vectors/call 接近 1」，说明它长期处理不满帧，向量收益被浪费，通常意味着上游分流过碎或收包 burst 太小。
+- **startup.conf 中影响向量的参数示意**（全参数见 04-01）：`buffers{}` 的 `buffers-per-numa`、`dpdk{}` 的收包 burst 相关项、以及 `cpu{}` 的 worker 配置，都会间接决定帧能否凑满。这里只给示意，不展开参数语义：
+
+```ini
+cpu {
+  main-core 0
+  corelist-workers 1-3
+}
+dpdk {
+  # 收包批量大小等项的完整说明见 04-01
+}
+```
+
+- **编写自定义向量节点的最小骨架**。注册节点用 `VLIB_REGISTER_NODE`（宏定义在 `src/vlib/node.h`），节点函数按第 4 节的 `vlib_frame_t` 循环写。注意 `VLIB_REGISTER_NODE` 里要声明 `.type`、``.n_next_nodes`、`.next_nodes`（06-02 展开）。下面给出「批量给报文打标记」的最小示例片段（用于演示向量循环写法，真实节点还需处理 trace、error、计数等，需对照 `src/vnet/` 下同类节点核验）：
+
+```c
+VLIB_REGISTER_NODE (my_mark_node) = {
+  .name = "my-mark",
+  .type = VLIB_NODE_TYPE_INTERNAL,
+  .vector_size = sizeof (u32),
+  .n_next_nodes = 1,
+  .next_nodes = { [0] = "ethernet-input" },
+};
+```
+
+- **验证向量收益的对比实验思路**（方法学见 08-01）：用同一台机器、同一流量，对比 `show node runtime` 里 `ip4-lookup` 的每包 cycles；在启/不启用会强制逐包特殊处理的 feature 前后各测一次，观察 IPC 与每包 cycles 的变化，即可直观看到「向量被打破」的代价。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**陷阱一：帧长期凑不满，向量退化为标量**。这是最常见的性能问题。若某节点每次 dispatch 只有 1~4 个包，`M/N` 摊销几乎失效，性能和标量方案相差无几。诱因包括：收包 burst 上限被配得过小、上游节点把一帧按结果细分成大量小帧、feature arc 链路过长导致每级都分流、单条流被 hash 到单一 worker 但该 worker 收包速率低。排查时优先看 `show node runtime` 的 vectors/call，再沿图回溯哪一节点开始「碎帧」。
+
+**陷阱二：在向量循环里引入「逐包特殊分支」**。一旦循环体里出现 `if (unlikely_special_case) do_slow_path(b0)` 且该分支被频繁命中，同一段向量循环的代码路径不再一致，分支预测器失效，I-cache 也会被冷路径代码污染。正确做法是把「特殊包」从主向量里**分流**出去：主循环只处理普通路径，特殊包写到另一个 next node 的帧里，由专门的慢路径节点处理。VPP 自身大量使用这种模式（例如 `ip4-lookup` 把需分片的包送 `ip4-frag`，把本地投递的包送 `ip4-local`）。
+
+**陷阱三：跨包状态与逐包锁**。向量循环的前提是「包与包之间在同一阶段相互独立」。如果开发者在节点里对整帧加一把大锁、或依赖「上一个包处理后的全局状态」来处理下一个包，就既破坏了可批量性，也埋下了多 worker 下的竞争。共享状态应尽量做成 per-worker/per-thread 副本（见 06-06、06-07），或用无锁结构（见 06-08、06-10）。
+
+**陷阱四：trace / 统计 / 日志的热路径开销**。VPP 的 packet trace、每包计数器、`elog` 事件日志都能按包记录，但这些都会往向量循环里塞入分支与写内存。生产环境应在数据面热路径关闭逐包 trace（命令见 04-06），只在排障时短时开启；统计应优先用节点级 `vlib_node_runtime_t` 的批量计数，而不是在循环内对每包做原子自增。
+
+**陷阱五：帧大小与时延的权衡**。把 `VLIB_FRAME_SIZE` 调大能提升摊销，但也会增大「凑帧等待」带来的尾时延，并让一帧的数据缓存足迹变大。VPP 选 256 是经验平衡点，一般不建议改动该宏；若业务对时延极端敏感，应通过收包策略与调度（06-05、06-12）而非改帧大小来调节。
+
+**最佳实践清单**：① 节点函数内保持「单一主路径 + 分流慢路径」；② 用 `PREDICT_TRUE/FALSE` 标注可预测的分支；③ 用 `CLIB_PREFETCH` 提前 4~8 个包预取（见 06-04）；④ 尽量让一帧走完再切换节点，减少碎帧；⑤ 自定义节点务必用 `vlib_get_next_frame`/`vlib_put_next_frame` 成对提交，避免漏帧或重复帧；⑥ 用 `vectors/call`、每包 cycles 作为向量健康度指标纳管（判读见 08-02）。
+
+### 7. 小结与延伸阅读
+
+本篇确立了全册的第一性原理：VPP 把「一次处理一个包」重构为「一次处理一帧包」，以此对抗 I-cache 抖动、分支预测失败和每包固定开销三堵墙，代价是需要图节点、帧队列、批量调度一整套配套机制。理解「摊销 I-cache 冷启动成本」「同批次路径一致」「预取未来包」这三点，后续所有子系统的取舍都有了统一解释。
+
+延伸阅读路径：帧与节点如何组织、如何注册连接 → **06-02**；节点之间如何按特性动态编排 → **06-03**；向量循环如何配合缓存与预取 → **06-04**；谁来决定何时凑帧、如何 dispatch → **06-05**；帧与节点的字段定义 → **05-03**、报文载体字段 → **05-04**；节点运行时统计的命令与判读 → **04-06**、**08-02**；性能对比方法学 → **08-01**。
+
+---
+
+## 06-02 图节点与数据包处理图
+
+### 1. 背景与动机
+
+06-01 说明了「为什么要批量」，但批量本身不能凭空存在：必须有一套机制把「一批包」从一个处理阶段可靠、高效、可组合地送到下一个阶段，还要允许开发者像搭积木一样增删处理环节。VPP 的答案是**数据包处理图（packet processing graph）**：把整个转发流水线抽象成一张有向图，图的顶点是「节点（node）」，边是「下一节点（next node）连接」，而流动在边上的是 06-01 讲过的「帧」。每个节点是一个纯粹的批量处理函数——接收一帧包，执行一种处理，把结果包按去向投递到若干下游节点的帧里。
+
+用「图」而不是「一串函数调用」有四个直接的工程收益。第一，**可组合性**：新增一个功能（比如一种新的隧道封装）不必改动主流程，只要注册一个新节点、把它挂到合适的边后面即可；这正是 06-11 插件机制和 06-03 Feature Arc 的基础。第二，**可观测性**：因为每个节点是独立调度单元，VPP 能自动为「每个节点」统计调用次数、处理包数、消耗周期、丢弃与错误计数，于是 `show node runtime`、`show errors`（命令见 04-06）能精确指出瓶颈在哪个节点——这是标量流水账式代码很难做到的。第三，**调度与向量天然契合**：图节点是「接收一帧、产出一帧」的契约，调度器只需在「哪些节点有待处理帧」这个层面做决策，不必理解任何节点内部逻辑，责任边界清晰。第四，**按接口/按特性动态编排**：同一张图在不同接口上可以走不同的节点子链（06-03），靠的正是「边」可被运行时改写。
+
+从源码视角看，这套图不是运行时用某种图数据库动态构造的，而是**静态注册 + 运行时解析**的混合体：所有节点通过 `VLIB_REGISTER_NODE` 宏在编译/加载期登记进一个全局注册段，VPP 启动时由 `vlib_register_all_static_nodes`（`src/vlib/node.c`）扫描注册段、建索引、解析每个节点声明的 `next_nodes` 名字，把它们解析成运行时的 `next_index`；运行期调度器只跟数字索引和 pending 队列打交道，几乎不做字符串查找。理解「静态注册 → 启动期解析 → 运行期按索引调度」这条主线，是读懂 VPP 图引擎的关键。
+
+本篇把节点类型、帧在节点间的传递、连接解析、调度入口逐一讲清，并明确哪些内容属于本册（机制）、哪些回查 05（字段）、哪些回查 04（命令）。
+
+### 2. 核心概念
+
+**节点（node）与节点类型**。`vlib_node_t`（字段见 05-03）是节点的静态描述：名字、类型、节点函数指针、`next_nodes` 名字数组、`vector_size`、状态等。VPP 把节点分成几类，类型定义在 `src/vlib/node.h` 的 `vlib_node_type_t`（枚举名与取值需对照实际版本核验）：
+
+- `VLIB_NODE_TYPE_PRE_INPUT`：在所有 input 之前运行，用于极少数「必须先于收包」的初始化型工作，数量极少。
+- `VLIB_NODE_TYPE_INPUT`：输入/收包节点，如 `dpdk-input`、`af-packet-input`。主循环每轮主动调用它们来「生产」新帧，是数据面的源头。它们通常是轮询式的（06-12）。
+- `VLIB_NODE_TYPE_INTERNAL`：内部处理节点，占绝大多数，如 `ethernet-input`、`ip4-lookup`、`ip4-rewrite`、`interface-output`。它们不主动运行，只在有 pending frame 时被 dispatch。
+- `VLIB_NODE_TYPE_PROCESS`：进程节点，协作式、可挂起/等待事件/定时器的特殊节点，用于 ARP 解析、接口状态机等「慢速逻辑」，06-15 专门展开。
+
+**帧（frame）作为边的载荷**。节点之间的「边」传递的是 `vlib_frame_t`（字段见 05-03），即 06-01 讲过的 buffer index 数组。一个节点处理完一帧后，按每个包的处理结果把它们分发到不同的「下一节点」：例如 `ip4-lookup` 可能把大部分包送 `ip4-rewrite`，把 TTL 到期的送 `ip4-icmp-error`，把命中本地的送 `ip4-local`。分发通过 `next_index`（一个 0 基的小整数，对应 `next_nodes[]` 的下标）标识，节点函数里用 `vlib_get_next_frame(vm, node, next_index, ...)` 取得对应下游帧的写入位置。
+
+**节点连接与 `next_nodes`**。节点在注册时声明它可能流向哪些节点（字符串名），例如 `ip4-lookup` 声明 `"ip4-rewrite"`、`"ip4-local"`、`"ip4-drop"` 等。启动期 `vlib_node_main_init` / `vlib_register_all_static_nodes`（`src/vlib/node.c`）把这些名字解析成全局节点索引，填入节点运行时的 `next_nodes` 向量，运行时代码只使用解析后的 `u16 next_index`。这种「名字→索引」的一次性解析，避免了热路径里做任何字符串或哈希查找。另有 `VLIB_RX_NODE` / `VLIB_TX_NODE` 之类的宏配合 `vlib_node_add_next` / `vlib_node_add_named_next` 在运行时动态增删边（用于 feature、接口绑定），声明见 `src/vlib/node.h`。
+
+**pending frame 与 dispatch**。节点产出的帧并不立即执行下游，而是登记为 `vlib_pending_frame_t`（字段见 05-03）挂入 `vlib_node_main_t.pending_frames`。`vlib_main_loop` 每轮从 pending 队列取出条目，找到对应 `vlib_node_runtime_t`，调用其 `function`。「产出帧 → 登记 pending → 主循环 dispatch」的三级解耦，让节点函数可以专注处理逻辑，把「何时轮到谁」交给调度器（06-05）。
+
+**节点运行时与统计**。`vlib_node_runtime_t`（字段见 05-03）是每线程、每节点的运行时副本，存放函数指针、当前帧、累计 `calls`/`vectors`/`clocks`、错误计数、以及指向 `vlib_node_t` 的索引。VPP 的「按节点统计」能力就建立在这份 per-thread 结构上——这也是为什么统计天然无锁（各线程写自己的副本，读时汇总），呼应 06-06/06-07 的线程模型。
+
+**图的整体形态**。把所有 `next_nodes` 边画出来，会得到一张以各类 `*-input` 为源、以 `interface-output`/`*-tx`/`drop` 为汇的有向图。理解 VPP 转发路径，本质上就是在这张图上做一次遍历；`show vlib graph`（命令见 04-06）可导出这张图的可视化描述，编译期也常生成 `vlib/graph` 相关的 dot 文件。
+
+### 3. 关键数据结构与源码位置
+
+同样遵守去重铁律，**字段表一律回查 05-03**，本节只给定位与职责。
+
+- `vlib_node_t`、`vlib_node_runtime_t`、`vlib_frame_t`、`vlib_pending_frame_t`、`vlib_node_registration_t`、`vlib_node_main_t`：全部字段定义见 **05-03**；主声明在 `src/vlib/node.h`，实现与注册逻辑在 `src/vlib/node.c`。
+- `VLIB_REGISTER_NODE` / `VLIB_NODE_TYPE_*` / `vlib_node_fn_t` / `VLIB_FRAME_SIZE` / `VLIB_RX_NODE`：宏与类型定义在 `src/vlib/node.h`。
+- 取帧/放帧 API：`vlib_get_next_frame`、`vlib_put_next_frame`、`vlib_get_frame`、`vlib_put_frame`、`vlib_frame_vector_args`，声明与内联实现在 `src/vlib/node_funcs.h`、`src/vlib/global_funcs.h`（部分为宏），底层逻辑在 `src/vlib/node.c`。
+- 注册与启动期解析：`vlib_register_all_static_nodes`、`vlib_node_main_init`、`vlib_node_get_node`、`vlib_node_add_next` / `vlib_node_add_named_next`、`vlib_node_set_state` / `vlib_node_enable_disable`，位于 `src/vlib/node.c`。
+- 调度入口：`vlib_main_loop`、`dispatch_node` 在 `src/vlib/main.c`；input 节点调用与 pending frame 消费逻辑在同文件。
+- 具体功能节点：`src/vnet/ethernet/ethernet.c`（`ethernet-input`）、`src/vnet/ip/ip4_forward.c`（`ip4-lookup`、`ip4-rewrite`）、`src/vnet/interface_output.c`（`interface-output`）、DPDK input 节点在 `src/plugins/dpdk/input.c`（06-12）。这些是阅读「真实节点如何写向量循环」的最佳范本。
+- 图可视化：`show vlib graph` 命令实现散布在 `src/vlib/` 的 CLI 文件（如 `src/vlib/node_cli.c`），命令族见 04-06。
+
+一句话记忆：`node.h` 定结构、`node.c` 管注册与解析、`main.c` 管 dispatch、`vnet/` 与 `plugins/` 里是节点实例。
+
+### 4. 关键流程与调用链
+
+**阶段一：静态注册（编译/加载期）**。开发者在 C 文件里写 `VLIB_REGISTER_NODE (xxx_node) = {...}`。这个宏（`src/vlib/node.h`）利用编译器的 `section` 属性把注册结构放进一个专用 ELF 段（典型为 `__attribute__((section(".vlib_node_registration")))`，具体段名需对照实际版本核验）。插件被 `dlopen` 时，其全局构造函数同样会执行注册（06-11）。于是「所有节点」在进程镜像里形成一个注册数组。
+
+**阶段二：启动期解析与建图**。`vlib_main` 早期调用 `vlib_register_all_static_nodes`（`src/vlib/node.c`）：遍历注册段，为每个节点分配 `vlib_node_t` 与全局索引 `node_index`；随后解析每个节点的 `next_nodes[]` 名字，用 `vlib_node_get_node` / `vlib_node_add_next` 把名字解析成 `next_index`，填入运行时结构；同时为每线程分配 `vlib_node_runtime_t` 副本、初始化帧队列与统计。此阶段完成后，图在内存里以「索引数组」形式就绪，热路径再无字符串。
+
+**阶段三：运行期收包成帧**。`vlib_main_loop` 每轮先调用所有 `VLIB_NODE_TYPE_INPUT` 节点的函数（如 `dpdk_input`），这些节点轮询网卡、把收到的包组装成帧，并通过 `vlib_put_next_frame` 把帧投递给下游 internal 节点（如 `ethernet-input`），登记为 pending frame。
+
+**阶段四：主循环 dispatch internal 节点**。主循环进入「消费 pending 队列」的循环：取出 `vlib_pending_frame_t`，据其 `node_index` / `next_index` 定位 `vlib_node_runtime_t` 与 `vlib_frame_t`，调用 `dispatch_node` → `node->function(vm, rt, frame)`。节点函数执行 06-01 的向量循环，把结果包按 `next_index` 分流，用 `vlib_put_next_frame` 提交下游帧，可能产生新的 pending 条目。如此反复，直到 pending 队列排空或达到本轮调度上限。
+
+**阶段五：出接口与释放**。当帧流到 `interface-output` 及其下游 tx 节点，包被交给设备发送；驱动回收 mbuf / buffer，buffer index 回到缓冲池空闲链表（06-09）。若某节点判定丢弃，则把包送 `error-drop` 类节点，累加错误计数并释放 buffer。
+
+:::figure id=06-02-01 | name=数据包处理图与节点帧传递 | dir=TD
+node n1 "dpdk-input INPUT 收包成帧" blue
+node n2 "ethernet-input INTERNAL" teal
+node n3 "ip4-lookup INTERNAL" teal
+node n4 "ip4-rewrite INTERNAL" amber
+node n5 "interface-output INTERNAL" amber
+node n6 "dpdk-interface-tx 发送" purple
+node pf "pending_frame 队列" gray
+node dr "error-drop 丢弃计数" red
+edge n1 -> pf "vlib_put_next_frame 登记"
+edge pf -> n2 "dispatch 取出整帧"
+edge n2 -> n3 "frame 帧"
+edge n3 -> n4 "frame 帧"
+edge n3 -> dr "TTL到期 分流"
+edge n4 -> n5 "frame 帧"
+edge n5 -> n6 "tx 发送"
+edge n6 -> n1 dashed "下一轮轮询"
+:::
+
+> **图 06-02-01 文字兜底**：`*-input` 节点（蓝）是源头，负责收包并组装帧；帧经 `vlib_put_next_frame` 登记进 pending 队列（灰）；主循环把整帧 dispatch 给 internal 节点链（青→琥珀），每级按处理结果分流到不同 `next_index`（如 `ip4-lookup` 把异常包分流到红色 `error-drop`）；最终由出接口/tx 节点（紫）发出，虚线表示下一轮轮询重新开始。节点之间流动的是帧（buffer index 数组），报文本体零拷贝。
+
+| 节点类型 | 触发方式 | 典型代表 | 是否主动运行 | 相关篇目 |
+|---|---|---|---|---|
+| `PRE_INPUT` | 主循环最前 | 极少数初始化节点 | 每轮 | 06-05 |
+| `INPUT` | 主循环轮询 | `dpdk-input`、`af-packet-input` | 每轮主动收包 | 06-12 |
+| `INTERNAL` | pending frame 触发 | `ethernet-input`、`ip4-lookup` | 被动 dispatch | 本篇 / 06-05 |
+| `PROCESS` | 事件/定时器唤醒 | ARP、接口状态机 | 协作式挂起 | 06-15 |
+
+**连接解析的调用链（文字化）**：`VLIB_REGISTER_NODE`（编译期段）→ `vlib_register_all_static_nodes`（分配 `vlib_node_t`、索引）→ 解析 `next_nodes[]` 名字 → `vlib_node_add_named_next`（写运行时 `next_index`）→ 为各线程建 `vlib_node_runtime_t` → 运行期 `vlib_get_next_frame(vm, node, next_index)` 按索引取下游帧。运行期还有 `vlib_node_add_next`（动态挂边，feature/接口绑定用），它与启动期静态解析互补，是 06-03 Feature Arc 能在运行期改写子链的底层能力。
+
+### 5. 配置/命令/代码实例
+
+本节给「读图 / 写节点」的最小可用片段，**命令族见 04-06，startup 全参数见 04-01**，不重列清单。
+
+- **导出与观察图**：`show vlib graph`（可配合输出重定向生成 dot）、`show node runtime`、`show node`、`show errors`（命令见 04-06）用于查看节点连接、运行时统计与错误计数；判读方法见 08-02/08-03。
+- **按节点启停**（调试用）：`set node state` / `vlib_node_set_state`（命令与 API 见 04-06、04-07），可临时 disable 某节点验证路径；生产慎用。
+- **注册节点的代码骨架**（宏定义 `src/vlib/node.h`，命名与字段需对照实际版本核验）：
+
+```c
+VLIB_REGISTER_NODE (ip4_lookup_node) = {
+  .name = "ip4-lookup",
+  .type = VLIB_NODE_TYPE_INTERNAL,
+  .vector_size = sizeof (u32),          /* 帧元素是 u32 buffer index */
+  .n_next_nodes = IP4_LOOKUP_N_NEXT,
+  .next_nodes = {
+    [IP4_LOOKUP_NEXT_REWRITE] = "ip4-rewrite",
+    [IP4_LOOKUP_NEXT_LOCAL]   = "ip4-local",
+    [IP4_LOOKUP_NEXT_DROP]    = "ip4-drop",
+  },
+};
+```
+
+- **节点函数内分流的骨架**：`vlib_get_frame_vector_args` 取输入向量，`vlib_get_next_frame` 按 `next_index` 取各下游输出帧，循环里对每个 `bi0` 计算 `next0` 并 `to_next[next0][n++] = bi0`，末尾 `vlib_put_next_frame` 成对提交（完整写法见 06-01 第 4 节）。`VLIB_NODE_TYPE_INTERNAL` 节点的 `.function` 由注册结构或 `VLIB_NODE_FUNCTION` / `.function` 成员指定，具体绑定方式需对照 `src/vlib/node.h` 与实际节点源码核验。
+- **动态挂边示例**：在节点初始化或 feature 配置回调里用 `vlib_node_add_named_next(vm, node_index, "next-node-name")` 获得新的 `next_index` 并缓存，供运行期 `vlib_get_next_frame` 使用；这是 06-03 子链编排的底层手段。
+
+**完整示例：读节点连边并验证向量包处理**。
+
+```bash
+vppctl clear runtime
+vppctl show vlib graph
+vppctl show runtime
+```
+
+```text
+ip4-lookup -> ip4-rewrite, ip4-local, ip4-drop
+ip4-rewrite -> interface-output
+Thread 0 vpp_main (lcore 0)
+Name          State    Calls    Vectors    Clocks   Vectors/Call
+ip4-lookup    active   804      205824     1.7e1    256.00
+ip4-rewrite   active   804      205824     1.4e1    256.00
+```
+
+判读说明：`show vlib graph` 里 `ip4-lookup` 后列出的三条 next 边，就是注册项 `next_nodes`（字段见 05-03）在建图后落成的连接，节点函数按包把 `u32 buffer index` 分流到对应输出帧（机制见本篇第 4 节）；涉及的结构体字段（字段见 05-03）本册不重列。`show runtime` 的 Calls 是 dispatch 次数、Vectors 是本节点处理过的 buffer index 总数，`Vectors/Call = 256` 说明每次 dispatch 基本凑满一帧，正是一次处理整帧向量、而非逐包调用的体现；帧容量上限 `VLIB_FRAME_SIZE` 需对照 `src/vlib/node.h` 核验（需对照实际版本核验）。若该比值长期偏低，说明上游碎帧、向量摊销失效；Clocks 异常高则该节点是瓶颈。统计字段的确切类型（字段见 05-03）需对照 `src/vlib/node.h` 核验。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**陷阱一：`n_next_nodes` 与实际分流不匹配**。注册时声明的 `next_nodes[]` 数量必须覆盖节点函数里所有可能的 `next_index` 分支；若循环里算出的 `next0` 超出范围，会写越界或投递到错误节点，表现为难以定位的丢包/错包。新增分流路径时务必同步更新 `.next_nodes` 表与枚举下标。
+
+**陷阱二：`get/put_next_frame` 不成对或漏提交**。每个 `vlib_get_next_frame` 取到的写入区，必须以 `vlib_put_next_frame` 提交实际写入数量；漏提交会丢帧，重复提交会重复处理同一批包。跨 `while` 多轮填充时，注意每轮重新 `get`、末尾分别 `put`，且 `n_vectors` 统计要与实际写入一致。
+
+**陷阱三：节点粒度设计失衡**。节点切得太碎（每个 trivial 操作一个节点）会让一帧在 pending 队列里被反复 dispatch，`vectors/call` 下降、调度开销上升；切得太粗（一个大节点塞满所有分支）又破坏了 06-01 的「同批次路径一致」与 I-cache 复用。经验法则是：按「处理阶段 + 主要分流结果」划分，让每个节点内部主路径单一、慢路径分流出去。
+
+**陷阱四：误用 PROCESS 节点做数据面热路径**。`VLIB_NODE_TYPE_PROCESS` 是协作式、可挂起的，用于慢速控制逻辑；把它放在每包路径上会因挂起/唤醒与事件机制引入巨大开销。数据面一律用 `INTERNAL`（收包用 `INPUT`），只有需要 `wait_for_event`/定时器的逻辑才用 `PROCESS`（06-15）。
+
+**陷阱五：跨线程误改共享节点状态**。`vlib_node_t` 的静态部分与 `next_nodes` 解析属全局配置，运行期增删边通常需要在 barrier 下由主线程完成（06-06/06-07）；worker 线程不应在运行期随意 `vlib_node_add_next`。热路径只应读已解析好的 `next_index`。
+
+**陷阱六：忽略 `vector_size` 与帧对齐**。`vector_size` 告诉调度器帧里每个元素多大（通常是 `sizeof(u32)`），配错会导致 `vlib_frame_vector_args` 偏移算错。帧与 `CLIB_CACHE_LINE_ALIGN_MARK` 的对齐要求见 06-04，字段与对齐定义见 05-03。
+
+**最佳实践清单**：① 主路径单一、慢路径分流；② `get/put_next_frame` 严格成对、按 `next_index` 枚举取帧；③ 节点级统计（`calls`/`vectors`/`clocks`）作为图健康度指标；④ 动态挂边集中在初始化/barrier 期；⑤ 用 `show vlib graph` 定期核对实际拓扑与预期一致；⑥ 自定义节点先读 `src/vnet/ip/ip4_forward.c` 等范本再动手。
+
+### 7. 小结与延伸阅读
+
+本篇把「批量」落地成「图」：节点是批量处理单元，帧是边上的载荷，`next_nodes` 是连接，pending 队列 + 主循环 dispatch 是驱动引擎，静态注册 + 启动期解析保证热路径零字符串查找。这套设计同时交付了可组合性、可观测性与调度解耦，也是插件（06-11）与 Feature Arc（06-03）能成立的前提。
+
+延伸阅读：帧/节点/运行时字段全表 → **05-03**；注册与调度源码逐行 → `src/vlib/node.c`、`src/vlib/main.c`（**06-05** 展开主循环）；按接口动态编排子链 → **06-03**；节点类型与插件加载 → **06-11**；PROCESS 节点与事件 → **06-15**；图与运行时命令 → **04-06**、判读 → **08-02**；收包 input 节点实现 → **06-12**。
+
+## 06-03 Feature Arc 与特性编排机制
+
+### 1. 背景与动机
+
+06-02 把转发流水线抽象成图之后，一个很现实的问题随之而来：一个真实的转发设备不是只做「查表转发」，而是要在报文路径上按需要插入几十种功能——ACL 过滤、NAT 转换、IPsec 加解密、QoS 监管、流量镜像、隧道封装/解封装、conntrack……而且这些功能**并不是全局统一开启的**：接口 A 可能只做普通路由，接口 B 要做 NAT，接口 C 要做 IPsec + ACL。更麻烦的是，功能之间还有严格的**先后顺序**：解封装必须在查表之前，NAT 改写通常在查表之后、出接口之前，ACL 丢弃要尽量靠前以省掉后续无效处理。
+
+最朴素的实现是在每个相关节点里硬编码一堆开关：`if (nat_enabled) do_nat(b); if (acl_enabled) do_acl(b); ...`。这种做法有三个致命缺陷。其一，**代码爆炸与组合地狱**：N 个功能就是 2^N 种组合，节点函数里塞满 `if`，既违反 06-01 讲的「同批次路径一致」（不同包走不同开关组合，分支预测全乱），也让每个节点都变胖、I-cache 再次被撑爆。其二，**全局状态而非按接口状态**：一个布尔开关管所有接口，无法表达「接口 B 开 NAT、接口 A 不开」。其三，**顺序硬编码、不可扩展**：新增一个功能就要改动所有相关节点的判断顺序，插件（06-11）根本无法在不改核心代码的前提下插入自己的处理环节。
+
+VPP 的答案是 **Feature Arc（特性弧 / 特性编排机制）**：在某个「锚点节点」之后，挂一段**有序的、可按接口独立启停的、可动态组合的**节点子链。每个具体功能注册成一个 feature，并声明它相对其它 feature 的先后约束（`runs_before` / `runs_after`）；框架在启动期对约束做拓扑排序，生成一条有序的 feature 列表；运行期按接口把「启用哪些 feature」编译成一条 `config chain`（配置链），用一个 `config_index` 索引；数据面到达锚点时，根据当前接口的 `config_index` 取出子链，通过 `vnet_feature_next` 依次把帧导向子链上的 feature 节点。
+
+这个设计的精妙之处在于三点。第一，**顺序由约束推导而非硬编码**：插件只要声明「我必须在 X 之后、Y 之前运行」，框架自动排好位置，新增功能无需改动核心代码。第二，**按接口粒度 + 惰性编译**：全局只保存「每个接口启用了哪些 feature」的配置，真正的数据面路径（config chain）在配置变更时才重建一次，热路径只读一个索引。第三，**与向量/图模型无缝融合**：feature 本身就是普通图节点，子链就是一段 `next_nodes` 连接，帧沿子链流动完全复用 06-01/06-02 的机制，没有引入任何逐包分支。本篇把注册、排序、按接口启停、运行期子链跳转这条链讲透。
+
+### 2. 核心概念
+
+**Arc（弧）与锚点**。`vnet_feature_arc_t`（字段见 05-06）描述一条「特性弧」：它有一个名字、一个起始节点名（`start_node_name`，即锚点）、以及挂在这条弧上的 feature 列表。所谓锚点，是转发路径上一个固定的、作为子链入口的位置，例如 IPv4 单播弧的常见起点是查找前的某个节点（不同 VPP 版本里 `ip4-unicast` 弧的 `start_node_name` 需对照 `src/vnet/` 下注册处核验）。一条弧定义了「子链从哪里开始、按什么顺序经过一系列 feature」。VPP 里存在多条弧，典型如 `ip4-unicast`、`ip4-output`、`ip6-unicast`、`ip6-output`、`ethernet-input`、`interface-output` 等（确切集合需对照实际版本核验），分别对应 L3 单播入口、L3 出口、二层入口等不同插入点。
+
+**Feature 与注册**。`vnet_feature_registration_t`（字段见 05-06）描述单个 feature：`.arc_name`（挂到哪条弧）、`.node_name`（对应的图节点名）、`.runs_before[]` / `.runs_after[]`（相对顺序约束）。开发者用 `VNET_FEATURE_REGISTER` 宏注册 feature，用 `VNET_FEATURE_ARC_REGISTER` 宏注册弧（宏定义在 `src/vnet/feature/feature.h`）。注意 feature 不「拥有」处理逻辑，处理逻辑在它指向的图节点里；feature 只是把「节点 + 顺序约束 + 所属弧」登记进框架。
+
+**顺序约束与拓扑排序**。`runs_before` / `runs_after` 构成一个有向图：一条 `A.runs_before = [B]` 等价于有一条边 `A → B`。`vnet_feature_arc_init`（`src/vnet/feature/feature.c`）在启动期对这个 DAG 做拓扑排序，得到全弧内 feature 的线性顺序。若约束出现环，初始化会报错（这是配置错误的重要来源）。排序结果决定了「默认 config chain」里节点的先后。这里的关键取舍是：**排序只在启动期做一次**，运行期热路径完全不碰字符串和约束。
+
+**按接口启停与 config chain**。全局排序给出的是「所有 feature 的相对顺序」，但每个接口具体启用哪些 feature 是独立的。VPP 用 `vnet_config_main_t` / `vnet_config_t`（字段见 05-06）把「启用的 feature 集合」编译成一条紧凑的 `config chain`——一段连续内存，里面按序存着各 feature 的 `config_index`、节点索引、以及 feature 专属的 config 数据。每个接口（更准确说是每个接口的 `sw_if_index` 与弧的组合）保存一个 `config_index`（字段见 05-06，常挂在接口的运行时配置区）。`vnet_feature_enable_disable(sw_if_index, arc_name, feature_name, enable)` 是启停入口：它定位接口的当前 config chain，加入/移除目标 feature，重建一条新链，更新接口的 `config_index`。重建通常采用 copy-on-write / 引用计数，旧链在无引用时释放，避免阻塞正在处理的帧。
+
+**运行期子链跳转**。数据面到达锚点节点时，锚点（或紧随其后的 `feature` 起点节点）用当前报文的 `sw_if_index` 和弧索引查到 `config_index`，调用 `vnet_get_config_data`（`src/vnet/feature/feature.c` 及 `src/vnet/config.c` 相关）取出该链的第一个 feature 项；feature 节点处理完一帧后，通过 `vnet_feature_next(sw_if_index, &next, b)`（内联，头文件 `src/vnet/feature/feature.h`）读取 `vlib_buffer_t` 里暂存的 `feature_config_index` / 当前链游标，算出下一个 feature 的 `next_index`，把帧导过去。于是帧像「沿着一条动态拼好的轨道」依次经过启用的 feature，没启用的 feature 完全不出现在路径上。因为子链就是 `next_nodes` 连接，整帧批量推进依旧成立，没有逐包分支。
+
+**Feature 位图**。除了 config chain，框架还维护 feature 位图（字段见 05-06）用于快速判断「某接口是否启用了某类 feature」，供某些节点做粗粒度决策（例如是否要查 session 表）。位图是「是否」判断，config chain 是「顺序与数据」承载，两者分工不同。
+
+### 3. 关键数据结构与源码位置
+
+遵守去重铁律，**所有结构体字段定义回查 05-06**，本节只给源码定位与职责，不列字段表。
+
+- `vnet_feature_arc_t`、`vnet_feature_config_main_t`、`vnet_feature_registration_t`、`vnet_config_main_t`、`vnet_config_t`、feature 位图 / `config_index`：字段全表见 **05-06**；声明在 `src/vnet/feature/feature.h`、`src/vnet/config.h`。
+- `VNET_FEATURE_ARC_REGISTER` / `VNET_FEATURE_REGISTER` 宏：`src/vnet/feature/feature.h`。
+- 注册、排序、启停核心实现：`vnet_feature_arc_init`、`vnet_feature_enable_disable`、`vnet_feature_registration_init`（或同类初始化入口，确切函数名需对照实际版本核验）、`vnet_config_add_feature` / `vnet_config_del_feature` / `vnet_config_make_chain`，位于 `src/vnet/feature/feature.c` 与 `src/vnet/config.c`。
+- 运行期跳转：`vnet_feature_next`、`vnet_get_config_data` / `vnet_config_data`，内联实现在 `src/vnet/feature/feature.h`、`src/vnet/config.h`。
+- 弧与 feature 的实际注册点：`src/vnet/ip/`（L3 弧）、`src/vnet/ethernet/`（L2 弧）、以及各插件目录（如 `src/plugins/nat/`、`src/plugins/acl/`）里的 `VNET_FEATURE_REGISTER(...)` 调用，是阅读「真实 feature 如何声明顺序」的范本。
+- 接口配置存储：`sw_if_index` 对应的运行时配置在 `vnet_interface_main_t` 等结构（字段见 05-05），feature 的 `config_index` 常随接口运行时结构或 per-arc 数组保存，需对照 `src/vnet/interface.c` 核验。
+
+一句话记忆：`feature.h` 定宏与内联跳转、`feature.c` 管注册/排序/启停、`config.c` 管 config chain 的构造与内存、`vnet/` 与 `plugins/` 里是弧与 feature 实例。
+
+### 4. 关键流程与调用链
+
+**阶段一：静态注册（编译/加载期）**。核心与各插件通过两个宏登记弧与 feature：
+
+```c
+VNET_FEATURE_ARC_REGISTER (ip4_unicast) = {   /* 示意，字段见 05-06 */
+  .arc_name  = "ip4-unicast",
+  .start_nodes = VNET_FEATURES ("ip4-input"), /* 锚点，需对照版本核验 */
+};
+
+VNET_FEATURE_REGISTER (my_nat_feature) = {
+  .arc_name     = "ip4-unicast",
+  .node_name    = "my-nat",
+  .runs_before  = VNET_FEATURES ("ip4-lookup"),   /* 顺序约束示意 */
+  .runs_after   = VNET_FEATURES ("acl-plugin-in"),
+};
+```
+
+宏把注册结构放进专用 ELF 段（与 06-02 的 `VLIB_REGISTER_NODE` 同机制），`dlopen` 插件时同样会执行注册（06-11）。
+
+**阶段二：启动期拓扑排序**。VPP 启动、所有节点注册完成后，`vnet_feature_arc_init`（`src/vnet/feature/feature.c`）遍历注册段：先按 `arc_name` 把 feature 分组；再在每组内把 `runs_before` / `runs_after` 展开成 DAG，做拓扑排序，得到全序；检测环并报错；为每条弧生成「默认 config chain」（可能为空链，即不启用任何 feature 时直接跳到弧尾）。排序只在此时做一次。
+
+**阶段三：按接口启停 → 重建 config chain**。控制面通过 CLI 或 Binary API（命令见 04-05、API 见 04-07）调用 `vnet_feature_enable_disable(sw_if_index, "ip4-unicast", "my-nat", 1 /* enable */)`：
+1. 定位该接口在该弧上的当前 `config_index` 与对应 `vnet_config_t`；
+2. 以全局排序为基准，把目标 feature 按序插入（或移除）启用的 feature 集合；
+3. `vnet_config_add_feature` / `vnet_config_make_chain` 分配一段新内存，按序写入各 feature 的（节点索引、config_index、feature 私有 config 数据），形成新链；
+4. 用新链的 `config_index` 更新接口运行时配置；旧链引用计数减一，归零后释放（copy-on-write，保证正在处理的帧不被破坏）。
+这类配置变更属于全局状态修改，通常需要在 barrier 下由主线程串行完成（06-06/06-07），避免 worker 看到半更新状态。
+
+**阶段四：数据面子链跳转**。帧到达弧的锚点/起点节点后：
+1. 节点从报文的 `sw_if_index`（常来自 `vnet_buffer(b)->sw_if_index[VLIB_RX]`，字段见 05-04/05-05）与当前弧，查到接口保存的 `config_index`；
+2. `vnet_get_config_data(config_index, &next, &n_cfg)` 取出链首 feature 项，把链游标暂存进 `vlib_buffer_t` 的 feature 相关 opaque 字段（字段见 05-04）；
+3. 把帧投递到链首 feature 节点的 `next_index`；
+4. 每个 feature 节点执行完自己的向量循环后，调用 `vnet_feature_next(sw_if_index, &next, b)`：它读取 buffer 里的当前链游标，推进到下一项，返回下一 feature 的 `next_index`；若已到链尾，返回弧的默认下游节点；
+5. 帧据此被导向下一 feature 或弧尾，直到走完整条动态子链，继续主转发流程。
+
+:::figure id=06-03-01 | name=Feature Arc 注册排序按接口启停与运行期子链 | dir=TD
+node r1 "VNET_FEATURE_ARC_REGISTER 注册弧" blue
+node r2 "VNET_FEATURE_REGISTER 注册feature" blue
+node r3 "runs_before / runs_after 约束" teal
+node r4 "vnet_feature_arc_init 拓扑排序" teal
+node r5 "生成全序与默认config_chain" amber
+node e1 "enable_disable 按接口启停" purple
+node e2 "vnet_config_add_feature 重建链" purple
+node e3 "更新接口 config_index" purple
+node d1 "锚点节点读 config_index" green
+node d2 "vnet_get_config_data 取链首" green
+node d3 "vnet_feature_next 依次跳feature" green
+edge r1 -> r4 "弧定义"
+edge r2 -> r3 "依赖声明"
+edge r3 -> r4 "DAG"
+edge r4 -> r5 "排序结果"
+edge r5 -> e1 "默认链基准"
+edge e1 -> e2 "启停触发"
+edge e2 -> e3 "copy-on-write产出"
+edge e3 -> d1 "运行期读取"
+edge d1 -> d2
+edge d2 -> d3 "帧沿动态子链推进"
+:::
+
+> **图 06-03-01 文字兜底**：上半部（蓝→琥珀）是启动期：弧与 feature 经 `VNET_FEATURE_*_REGISTER` 注册，`runs_before/runs_after` 构成 DAG，`vnet_feature_arc_init` 拓扑排序产出全序与默认链。中部（紫）是配置期：按接口 `enable_disable` 触发 `vnet_config_add_feature` 以 copy-on-write 重建 config chain，更新接口 `config_index`。下半部（绿）是数据面：锚点节点读 `config_index` → `vnet_get_config_data` 取链首 → `vnet_feature_next` 沿子链逐个跳转，帧批量推进，未启用的 feature 不进入路径。
+
+| 约束写法 | 含义 | 展开成 DAG 的边 | 常见用途 |
+|---|---|---|---|
+| `A.runs_before = [B]` | A 必须在 B 之前 | `A → B` | 解封装早于查表 |
+| `A.runs_after = [C]` | A 必须在 C 之后 | `C → A` | NAT 晚于 ACL |
+| 同一 feature 同时声明两者 | 夹在 C 与 B 之间 | `C → A → B` | 精确插入位置 |
+| 约束成环 | 无法拓扑排序 | 初始化报错 | 配置错误，需排查 |
+
+**调用链文字化**：`VNET_FEATURE_*_REGISTER`（编译期段）→ `vnet_feature_arc_init`（分组 + 拓扑排序 + 环检测 + 默认链）→ 控制面 `vnet_feature_enable_disable`（CLI 见 04-05 / API 见 04-07）→ `vnet_config_add_feature` / `vnet_config_make_chain`（COW 重建链）→ 接口 `config_index` 更新 → 数据面 `vnet_get_config_data` → feature 节点向量循环 → `vnet_feature_next` → 下一 feature 或弧尾。
+
+### 5. 配置/命令/代码实例
+
+本节给「声明 feature / 观察子链」的最小片段，**完整命令族见 04-05、API 编程见 04-07、startup 全参数见 04-01**，不重列清单。
+
+- **按接口启用/关闭 feature**（典型命令示意，完整族见 04-05）：在指定 `sw_if_index` 与弧上开启某 feature，例如 `set interface feature arc ip4-unicast ...`（确切语法需对照实际版本核验，命令族见 04-05），底层即调用 `vnet_feature_enable_disable`。关闭时传 `enable=0`。
+- **查看已启用 feature**：`show interface features`（或 `show features`，命令见 04-06）可列出各接口各弧启用的 feature 与顺序；判读方法见 08-03。
+- **注册宏片段**（字段与宏名见 05-06、`src/vnet/feature/feature.h`，命名需对照版本核验）：见第 4 节阶段一的 `VNET_FEATURE_ARC_REGISTER` / `VNET_FEATURE_REGISTER` 示例。
+- **feature 节点内跳转的最小骨架**：
+
+```c
+/* feature 节点函数内，处理完一帧后示意 */
+u32 next0 = ...; /* 本 feature 自己的处理结果，通常已写入 buffer */
+/* 让框架推进 config chain，返回下一 feature 或弧尾的 next_index */
+vnet_feature_next (sw_if_index0, &next0, b0);
+/* 再把 bi0 按 next0 投递到 vlib_get_next_frame 对应的下游帧 */
+```
+
+- **启停的 API 调用片段**：`vnet_feature_enable_disable (sw_if_index, arc_index, feature_index, /* enable */ 1, feature_cfg, cfg_len)`（参数签名需对照 `src/vnet/feature/feature.h` 核验），通常由 CLI 或 Binary API handler 调用，编程用法见 04-07。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**陷阱一：顺序约束写错导致环或位置错乱**。`runs_before` / `runs_after` 一旦互相矛盾（A before B 且 B before A），`vnet_feature_arc_init` 拓扑排序失败，表现为启动期报错或该弧 feature 全部失效；约束太少则可能把 feature 排到错误位置（例如把 NAT 排到查表之前，地址还没改写就查了表）。新增插件 feature 时务必显式声明与邻近 feature 的相对关系，并用 `show interface features` 核对实际顺序。
+
+**陷阱二：启停未在 barrier / 主线程串行执行**。`enable_disable` 会重建全局 config chain 并更新接口 `config_index`，属于共享状态修改。若多个 worker 并发改、或改到一半被 worker 读到，会出现链游标与链内容不一致的诡异丢包。控制面应通过主线程 + barrier（06-06/06-07）串行化这类变更，数据面 worker 只读已发布的 `config_index`。
+
+**陷阱三：feature 节点不调用 `vnet_feature_next`**。feature 节点必须把「推进子链」的责任交回框架；若节点直接把帧投递到某个固定 `next_index` 而漏掉 `vnet_feature_next`，后面的 feature 会被整段跳过，且现象隐蔽（只有部分功能失效）。自定义 feature 节点务必以官方插件节点（如 `src/plugins/acl/` 的 feature 节点）为范本。
+
+**陷阱四：feature 节点内引入逐包分支，破坏向量收益**。feature 节点仍是图节点，必须遵守 06-01 的「主路径单一 + 慢路径分流」；在 feature 里对每包做复杂 `switch` 或依赖全局锁，会同时拖垮向量循环与多 worker 扩展性。
+
+**陷阱五：config chain 过长导致碎帧与缓存压力**。每多一级 feature 就多一次 dispatch、多一段链内存读取；几十个 feature 串起来会明显拉低 `vectors/call`、增加尾时延。应只启用必要的 feature，并把「同类检查」合并到尽量少的节点里。
+
+**陷阱六：`config_index` 缓存失效与 buffer 字段误用**。运行期子链游标暂存于 `vlib_buffer_t` 的 feature 相关字段（字段见 05-04），clone/复制 buffer 时若未正确继承或重置该字段，会导致子链游标错乱。涉及 buffer 克隆、链化的场景见 06-09。
+
+**最佳实践清单**：① 用 `runs_before/runs_after` 显式表达顺序，避免依赖注册顺序；② 启停集中在控制面主线程、必要时 barrier；③ feature 节点模板化，收尾一律 `vnet_feature_next`；④ 上线后用 `show interface features` 核对顺序与启用集合；⑤ 关注链长与 `vectors/call`（判读见 08-02）；⑥ 字段定义一律回查 05-06，命令一律回查 04-05。
+
+### 7. 小结与延伸阅读
+
+Feature Arc 把「功能开关」从硬编码的 `if` 升级为「按约束排序、按接口编译、按索引跳转的动态子链」：启动期拓扑排序定顺序，配置期以 COW 重建 config chain 定集合，数据面沿 `config_index` 与 `vnet_feature_next` 批量推进。它既复用了图与向量机制、没有引入逐包分支，又赋予插件在核心路径「声明式插入」的能力，是 VPP 可扩展性的支柱之一。
+
+延伸阅读：弧/feature/config 结构字段全表 → **05-06**；节点与 `next_nodes` 基础 → **06-02**；插件如何注册 feature → **06-11**；启停命令 → **04-05**、API → **04-07**、`show interface features` → **04-06**；buffer 中 feature 游标字段 → **05-04**、克隆语义 → **06-09**；barrier 与主线程串行化 → **06-06**/**06-07**；具体 feature 功能 → **07** 对应模块篇。
+
+---
+
+## 06-04 缓存友好设计与预取机制
+
+### 1. 背景与动机
+
+06-01 说向量化主要对抗的是「指令侧」的 I-cache 与分支预测墙，但报文处理还有另一堵同等重要的墙——**数据侧的内存墙**。现代 CPU 的算力增长远快于 DRAM 延迟的改善：一次 L1 命中约 4~5 个周期，L2 约十几周期，L3 数十周期，而一次 DRAM 访问可达两三百个周期。报文转发恰恰是典型的「指针追逐」（pointer chasing）负载：读以太网头判断类型 → 读 IP 头取目的地址 → 查 FIB 表命中一个邻接结构 → 读邻接里的 rewrite 数据 → 写回报文头。这几步几乎每一步都可能是一次缓存缺失，而且**后一步依赖前一步的结果**，硬件无法提前把整条链都加载好。若按标量方式逐包处理，CPU 大部分时间都在等内存，IPC 被压得很低。
+
+VPP 的向量模型为破解内存墙提供了关键前提：**因为一次拿到一整批包，所以存在「未来的包」可以提前加载**。在处理第 `i` 个包的同时，就对第 `i+K` 个包的 buffer 头、报文头、查表键发起软件预取（software prefetch），让 DRAM 加载与当前包的计算重叠；等循环推进到第 `i+K` 个包时，数据已经在缓存里，内存停顿被隐藏。标量模式没有「未来包」这个概念，预取无从谈起——这正体现了 06-01 与本篇的因果关系：向量化不只是省了 I-cache，也打开了预取窗口。
+
+但预取只是冰山一角。VPP 围绕 CPU 缓存做了一整套系统性设计：结构体**冷热字段分离**（把每包必读的热字段挤进第一个 cache line，冷字段挪到后面）；**缓存行对齐与填充**（`CLIB_CACHE_LINE_ALIGN_MARK`、`CLIB_CACHE_LINE_BYTES`，消除多线程下的伪共享 false sharing）；**per-thread 数据结构**（各 worker 写自己的副本，避免缓存行在核间来回弹）；**NUMA 本地化与大页**（buffer 内存分配在收包网卡所在的 NUMA 节点，用 hugepage 减少 TLB miss）；以及与硬件特性配合的 **DDIO**（Intel Data Direct I/O 让网卡 DMA 直接写进 L3 而非内存）。本篇把这些数据侧机制逐一讲清，并落到真实宏、真实头文件与真实节点循环上。
+
+### 2. 核心概念
+
+**Cache line 与冷热分离**。CPU 与内存之间以 cache line 为单位交换，典型 64 字节（VPP 里对应 `CLIB_CACHE_LINE_BYTES`，定义在 `src/vppinfra/cache.h`，具体值需对照实际版本核验，x86_64 通常为 64）。一次缺失会载入整条 64B，因此「把一起用的字段放在一起」能显著减少缺失次数。VPP 把 `vlib_buffer_t`（字段见 05-04）设计得极为紧凑：每包必读的 `current_data`、`current_length`、`flags`、`next_buffer`、`ref_count`、`opaque` 等热字段排在前 64B 内，冷门/调试字段靠后。这样读一个报文本体前的元数据通常只需一次 cache line 加载。理解「字段顺序是按访问频率排的，不是按语义分组的」，是读懂 VPP 结构体的关键（字段表见 05-04）。
+
+**缓存行对齐与伪共享**。`CLIB_CACHE_LINE_ALIGN_MARK(mark)`（宏在 `src/vppinfra/cache.h`）用于在结构体里插入对齐标记，保证紧随其后的字段从新 cache line 起始。它常用于 `vlib_main_t`（字段见 05-02）、`vlib_node_runtime_t`（字段见 05-03）以及各类 per-thread 统计结构。伪共享指的是：两个线程各写各的变量，但两个变量落在同一条 cache line 上，导致该 line 在两个核的 L1 之间反复失效（cache line ping-pong），性能急剧下降。VPP 用「对齐 + 填充」把不同线程写的数据隔到不同 line，从根上消除伪共享；这也是 06-06/06-07 线程模型能线性扩展的隐形前提。
+
+**软件预取 `CLIB_PREFETCH`**。`CLIB_PREFETCH(addr, size, type)`（定义在 `src/vppinfra/prefetch.h`，底层是编译器内置 `__builtin_prefetch` 或等价内联汇编，需对照实际版本核验）把一个地址提前载入缓存；`type` 区分读/写及局部性等级。VPP 节点循环里常见的写法是在处理 `from[i]` 时预取 `from[i+K]` 的 `vlib_buffer_t` 头与报文数据头，K 是**预取距离**（典型 4~8，经验值）。缓冲区辅助内联如 `vlib_prefetch_buffer_header` / `clib_prefetch_store`（声明在 `src/vlib/buffer.h`、`src/vppinfra/prefetch.h`，确切名字需对照版本核验）把常用预取封装好。预取距离是权衡：太小则加载来不及（没隐藏延迟），太大则预取的数据在被用到前又被挤出缓存，且白白占用内存带宽。
+
+**硬件预取与软件预取的分工**。CPU 硬件预取器擅长识别「规整的、连续地址」模式（如顺序扫描 `u32 bi[]` 数组），但对「`bi[i]` → buffer 指针 → 报文头 → 查表键」这种间接、跨页的指针链无能为力。所以 VPP 的作法是：索引数组的顺序遍历交给硬件预取，跨结构的间接加载用 `CLIB_PREFETCH` 手动补。二者互补。
+
+**NUMA 与大页**。多路服务器上，跨 NUMA 节点访问内存延迟与带宽都明显更差。VPP 的 buffer 内存、worker 线程、收包网卡要尽量绑定在同一 NUMA 节点（配置见 04-01、线程绑定见 06-06）。大页（hugepage，通常 2MB/1GB）把 TLB 能覆盖的内存范围放大几个数量级，显著减少大内存工作集下的 TLB miss；DPDK 的 mempool 与 VPP 的 buffer 池都建立在 hugepage 上（06-09/06-10）。
+
+**DDIO 与缓存污染**。Intel DDIO 允许网卡通过 DMA 把收到的包直接写进 LLC（L3）而非 DRAM，收包节点读取时几乎零内存延迟；反过来也要意识到，大流量 DMA 会占用/冲刷 LLC，可能污染其它数据，因此理解 LLC 容量与流量模型的关系对调优有意义（判读见 08-02）。
+
+**false sharing-free 的 per-thread 统计**。`vlib_node_runtime_t`（字段见 05-03）是按线程复制的，各 worker 累加自己的 `calls/vectors/clocks` 而不共享计数器，读统计时再汇总——这既无锁、又天然避免伪共享，是缓存友好设计在「统计」上的体现。
+
+### 3. 关键数据结构与源码位置
+
+遵守去重铁律，字段表一律回查 05，本节只给定位。
+
+- 缓存与预取宏：`CLIB_CACHE_LINE_BYTES`、`CLIB_CACHE_LINE_ALIGN_MARK`、`CLIB_CACHE_LINE_ALIGN`、`CLIB_PREFETCH`、`clib_prefetch_store` 等，位于 `src/vppinfra/cache.h`、`src/vppinfra/prefetch.h`。
+- `vlib_buffer_t` 的缓存布局与冷热字段：字段见 **05-04**，头文件 `src/vlib/buffer.h`；预取辅助内联 `vlib_prefetch_buffer_header` 等同文件（需对照版本核验）。
+- `vlib_main_t` / `vlib_node_runtime_t` 的对齐与 per-thread 布局：字段见 **05-02** / **05-03**，头文件 `src/vlib/main.h`、`src/vlib/node.h`，对齐标记使用见源码。
+- vppinfra 容器自身也做缓存优化（vec/pool/bihash 的 bucket 对齐、hash 的 cache-line 分桶）：实现见 **06-08**，字段见 **05-09**。
+- 查表结构的预取（bihash / FIB）：`clib_bihash` 的 bucket 预取在 `src/vppinfra/bihash_template.c` 等，字段见 05-09，机制见 06-08；FIB/邻接结构字段见 05-07。
+- buffer 内存的 NUMA/hugepage 分配：`vlib_buffer_main_init` 与物理内存后端（`src/vlib/buffer.c`、`src/vlib/physmem.c`、`src/vppinfra/` 下的 unix 内存映射），生命周期见 **06-09**、共享内存布局见 **06-10**。
+- 节点循环里的预取实例：`src/vnet/ip/ip4_forward.c`、`src/vnet/ethernet/ethernet.c`、各 `src/plugins/` input 节点，是阅读 `CLIB_PREFETCH` 真实用法的范本。
+
+一句话记忆：`cache.h`/`prefetch.h` 是工具，`buffer.h` + `node.h` 是布局，节点循环是预取落地处，NUMA/hugepage 由 buffer 池与线程绑定共同保证。
+
+### 4. 关键流程与调用链
+
+下面把「一帧包在缓存视角下被处理」的完整链路串起来，重点标出每一处缓存相关动作。
+
+1. **收包（DDIO / DMA 写 LLC）**。网卡把报文 DMA 到接收描述符指向的内存。在支持 DDIO 的平台上，数据直接进入 LLC；DPDK input 节点（06-12）`rte_eth_rx_burst` 拿到 `rte_mbuf` 后，把 mbuf 换算为 VPP `vlib_buffer_t`。因 buffer 池内存建在 hugepage 且与网卡同 NUMA，这一步的地址转换（TLB）代价被压到最低。
+2. **组装帧索引数组**。input 节点把一批 buffer index 写进 `vlib_frame_t` 的连续 `u32` 数组。这个数组地址连续、步长固定，**硬件预取器**会自动预取后续的索引元素，无需软件干预。
+3. **向量循环内的软件预取**。节点函数进入 `while (n_left)` 循环，典型模式（贴近真实写法，确切宏名需对照版本核验）：
+
+```bash
+u32 n_left = frame->n_vectors;
+u32 *from  = vlib_frame_vector_args (frame);
+while (n_left >= 4) {
+  /* 预取「未来」第 4 个包的 buffer 头与报文头，隐藏 DRAM 延迟 */
+  vlib_prefetch_buffer_header (vlib_get_buffer (vm, from[4]));
+  CLIB_PREFETCH (vlib_get_buffer (vm, from[4])->data,
+                 CLIB_CACHE_LINE_BYTES, LOAD);
+  /* 处理当前第 0 个包 */
+  vlib_buffer_t *b0 = vlib_get_buffer (vm, from[0]);
+  ip4_header_t *ip0 = vlib_buffer_get_current (b0);
+  /* ... 解析 / 查表 / 改写，见 06-01 ... */
+  from += 1;  n_left -= 1;
+}
+/* 尾部 n_left < 4 的包无需预取，直接处理，避免越界预取 */
+```
+
+这里的 `from[4]` 就是「未来包」，K=4 是让「发起加载」到「真正使用」之间留出约 4 次循环的计算时间，恰好覆盖一次内存往返。注意循环要留尾部标量收尾，防止预取越界到帧外。
+4. **查表路径的预取**。`ip4-lookup` 里，取到目的地址后要对 FIB / bihash 做查找：先对查表键所在的 bucket 发起预取，再做上一包的查表计算，使 bucket 加载与计算重叠。bihash 的「working copy / bucket」布局本身也按 cache line 对齐（06-08）。
+5. **写回报文头**。改写动作写入 buffer 数据区；因相关字段已在缓存（前面预取过），写命中率很高。产出帧用 `vlib_put_next_frame` 提交，帧索引数组本身连续，同样受益硬件预取。
+6. **统计无伪共享**。节点末尾把本帧 `vectors/clocks` 累加到**本线程**的 `vlib_node_runtime_t` 副本（对齐到独立 cache line），不与其他 worker 共享该行，避免核间失效。
+7. **跨节点传递**。帧在节点间流动时，报文本体不动、只搬索引（06-01），因此下游节点读到的 buffer 很可能仍在上游预热过的缓存层级里（尤其同 worker 同核时），局部性被延续。
+
+:::figure id=06-04-01 | name=向量循环中的软件预取流水线 | dir=LR
+node t1 "时刻T 处理包i 计算" blue
+node t2 "同时预取包i+4 buffer头" teal
+node t3 "同时预取包i+4 报文头与查表键" teal
+node t4 "时刻T+4 未来包数据已在缓存" amber
+node t5 "消除cache-miss停顿 IPC提升" green
+edge t1 -> t2 "CLIB_PREFETCH 发起加载"
+edge t1 -> t3 "CLIB_PREFETCH 发起加载"
+edge t2 -> t4 "与计算重叠 隐藏DRAM延迟"
+edge t3 -> t4
+edge t4 -> t5 "读命中 无停顿"
+:::
+
+> **图 06-04-01 文字兜底**：在处理第 `i` 个包做有效计算的同时，对第 `i+K`（K≈4）个包的 buffer 头、报文头、查表键发起软件预取；DRAM 加载与当前包计算并行进行；等循环推进到第 `i+K` 个包时，其数据已驻留缓存，读取不再停顿。虚线之外的硬件预取器负责连续索引数组，软件预取负责跨结构的间接指针链，二者互补。
+
+| 机制 | 源码位置（头文件） | 解决什么 | 相关字段 |
+|---|---|---|---|
+| `CLIB_CACHE_LINE_ALIGN_MARK` | `src/vppinfra/cache.h` | 对齐、消除伪共享 | 05-02 / 05-03 |
+| 冷热字段分离 | `src/vlib/buffer.h` | 减少每包 cache line 数 | 05-04 |
+| `CLIB_PREFETCH` | `src/vppinfra/prefetch.h` | 隐藏 DRAM 延迟 | 节点循环 |
+| `vlib_prefetch_buffer_header` | `src/vlib/buffer.h` | 预取 buffer 头 | 05-04 |
+| per-thread 运行时副本 | `src/vlib/node.h` | 无锁统计、无伪共享 | 05-03 |
+| hugepage / NUMA | `src/vlib/physmem.c` 等 | 减少 TLB miss、本地内存 | 05-10 / 06-09 |
+| DDIO | 平台/BIOS 配合 | DMA 直写 LLC | 06-12 |
+
+### 5. 配置/命令/代码实例
+
+本节给缓存/预取相关的宏用法与验证手段，**startup 全参数见 04-01、命令族见 04-06**，不重列清单。
+
+- **缓存行对齐宏的典型用法**（宏在 `src/vppinfra/cache.h`，示意）：
+
+```bash
+typedef struct {
+  /* 各线程只读的冷数据 / 共享配置 */
+  u32 shared_config;
+  CLIB_CACHE_LINE_ALIGN_MARK (worker_data);
+  /* 每个 worker 独占写、从新 cache line 起始，避免伪共享 */
+  u64 vectors;
+  u64 clocks;
+} my_per_thread_t;
+```
+
+- **预取宏用法**（见第 4 节循环的 `vlib_prefetch_buffer_header` + `CLIB_PREFETCH` 片段）；`LOAD` / `STORE` 语义与局部性参数需对照 `src/vppinfra/prefetch.h` 核验。
+- **NUMA / 大页相关 startup 示意**（全参数见 04-01）：`dpdk{}` 里的大页与 socket/NUMA 绑定、`cpu{}` 的 corelist 绑定、`buffers{}` 的 `buffers-per-numa` 决定 buffer 在哪个 NUMA 节点分配。这里只给示意，不展开参数语义。
+- **验证手段**：`perf stat` 观察 `cache-misses`、`LLC-load-misses`、`dTLB-load-misses` 判断预取与 TLB 效果；`show node runtime` 看每包 cycles（判读见 08-02）；`show memory` / `show buffers`（命令见 04-06）看内存与缓冲池分布；NUMA 错配的定位方法见 08-04。
+- **对比实验**：在自定义节点里去掉 `CLIB_PREFETCH` 前后，用相同流量对比该节点每包 cycles 与 LLC miss，即可直观看到预取收益；调整 K（2/4/8/12）找到本平台最优预取距离，方法学见 08-01。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**陷阱一：预取距离不当**。K 太小，加载到使用时数据还没回来，等于没预取；K 太大，预取的数据被后续流量挤出缓存、且白耗内存带宽。K 需结合「一次循环体计算量」与「平台内存延迟」实测，典型从 4 起调（见 08-01/08-02）。
+
+**陷阱二：循环尾部越界预取**。用 `from[i+K]` 时若循环条件仍是 `n_left > 0`，末尾会预取到帧外地址（可能触发无效加载甚至越界）。正确写法是主循环要求 `n_left >= K` 才预取，尾部 `n_left < K` 的包单独标量收尾（见第 4 节示例）。
+
+**陷阱三：读预取与写预取混用、局部性等级选错**。对「马上要改写」的字段用 store 意图、对「读一次即弃」的流数据用低局部性提示，能减少缓存污染；一概用默认参数可能把不复用数据强留在缓存里，挤走热数据。
+
+**陷阱四：伪共享**。给 per-thread 统计/状态加了对齐标记，却把「所有线程都写」的全局计数器放在同一结构里，仍会 ping-pong。原则是「只读共享、写入分离」：共享配置只读，每线程写数据用 `CLIB_CACHE_LINE_ALIGN_MARK` 隔开（呼应 06-06/06-07）。
+
+**陷阱五：NUMA 错配与大页不足**。buffer 池建在 NUMA0、worker 却在 NUMA1、网卡插在 NUMA1 的 PCIe 槽，会导致每次收包都跨节点访问。大页不足则退回小页、TLB miss 飙升。部署与排障见 03-02、08-04，参数见 04-01。
+
+**陷阱六：DDIO/LLC 被 DMA 流量污染**。高速收包持续写 LLC，可能挤掉查表热数据；在 LLC 较小或混合负载（数据面 + 控制面 + 其它进程）的平台上，需要结合 LLC 容量评估隔离（isolcpus / CAT 等，见 08-02）。
+
+**陷阱七：预取本身占用指令与带宽**。过度预取（每包预取四五个地址）会挤占前端发射槽和内存带宽，收益逆转为负。只预取「下一步真正要用且会 miss」的地址。
+
+**最佳实践清单**：① 结构体热字段挤进首条 cache line（字段见 05-04/05-03）；② per-thread 写数据对齐隔离；③ 向量循环用 `CLIB_PREFETCH` 预取未来 4~8 包并留尾部收尾；④ buffer/worker/网卡三者 NUMA 对齐 + hugepage；⑤ 用 `perf stat` 与每包 cycles 量化预取收益；⑥ 字段定义回查 05、配置参数回查 04-01、命令回查 04-06。
+
+### 7. 小结与延伸阅读
+
+本篇把 06-01 的向量模型延伸到数据侧：因为有一批「未来包」，软件预取才得以隐藏 DRAM 延迟；配合冷热字段分离、缓存行对齐消除伪共享、per-thread 副本、NUMA 本地化、大页与 DDIO，VPP 把「指针追逐」负载的每包内存停顿压到最低。向量化（06-01）与缓存友好（本篇）是同一枚硬币的两面，共同支撑了高 PPS。
+
+延伸阅读：向量循环基础 → **06-01**；buffer 字段冷热布局 → **05-04**、生命周期 → **06-09**；per-thread 对齐与线程模型 → **06-06**；bihash / 容器的缓存优化 → **06-08**、字段 → **05-09**；共享内存与 hugepage 布局 → **06-10**、字段 → **05-10**；收包 DDIO 路径 → **06-12**；NUMA/大页配置 → **04-01**、部署 → **03-02**；cache-miss 判读 → **08-02**、NUMA 错配排障 → **08-04**。
+
+## 06-05 vlib 主循环与调度器
+
+### 1. 背景与动机
+
+06-02 把转发逻辑组织成图，06-01 规定了节点一次处理一帧，06-03 让特性可动态编排——但到这一步为止，所有节点仍是**被动**的：`INTERNAL` 节点不会自己运行，只有被「调用」时才处理帧；`INPUT` 节点也需要有人周期性去轮询网卡。整套引擎必须有一个「心跳」来决定：什么时候去收包、收上来的一堆 pending frame 按什么顺序 dispatch、一个节点处理完产出的新帧何时被下一节点接手、时间怎么维护、那些可挂起的 process 节点和控制面请求又在哪里被照顾到。这个心跳就是 **vlib 主循环（`vlib_main_loop`）与调度器（dispatcher）**，实现在 `src/vlib/main.c`，是全册调用链的汇聚点。
+
+设计这个调度器要同时满足几个看似矛盾的目标。第一，**低延迟、高吞吐**：必须尽量让一帧凑满再处理（06-01 的摊销），又不能为了凑帧让包无限期等待。第二，**公平性**：不能让某个高频节点（例如收包 input）把 CPU 占满，导致 process 节点、控制面、定时器饿死。第三，**无锁与缓存友好**：调度发生在每个 worker 线程内部，热路径不能引入全局锁（呼应 06-04/06-06）。第四，**时间维护**：报文时间戳、定时器、process 的 `wait_for_clock` 都依赖一个稳定、低开销的时钟源。第五，**同步点**：全局配置变更需要所有线程暂停（barrier，06-06/06-07），主循环必须留出检查 barrier 的位置。
+
+理解主循环有一个很好的切入点：VPP 的数据面是**协作式、单线程内 run-to-completion** 的——每个 worker 线程在自己的 `vlib_main_loop` 里，把「收包 → 消费 pending 队列 → 调度 process → 检查 barrier」这几件事按固定节奏轮转，没有任何抢占式线程切换。之所以能做到高吞吐，恰恰是因为没有调度开销：节点函数被 dispatch 后一口气处理完一整帧才返回，调度器只在帧边界做决策。本篇逐层拆开这个循环，讲清「一帧从 pending 队列到节点函数再回到 pending 队列」的完整闭环，以及时间与 process 如何嵌进去。
+
+### 2. 核心概念
+
+**`vlib_main` 与 `vlib_main_loop` 的分工**。`vlib_main`（`src/vlib/main.c`）是初始化入口：建 `vlib_main_t`（字段见 05-02）、初始化 node main、buffer main、时间、elog、注册静态节点（06-02）、加载插件（06-11）、启动 worker（06-06），最后进入 `vlib_main_loop`（主线程）或 `vlib_worker_loop`（worker 线程，见 `src/vlib/threads.c`）。后者是真正的无限循环，二者主体结构类似，worker 版额外处理 barrier 与 RPC（06-06/06-07）。
+
+**主循环的几类工作**。一个简化但贴近真实的 `vlib_main_loop` 每轮依次做：
+1. **维护时间**：通过 `clib_time_now` / `vlib_time_now`（`src/vppinfra/time.h`、`src/vlib/main.h`）读取并更新单调递增的 CPU 周期换算值，供时间戳、定时器、统计使用。VPP 用 `clib_time_t` 把 TSC/时钟源周期转成秒，避免每包做昂贵的系统调用。
+2. **跑 pre-input / input 节点**：主循环主动调用所有 `VLIB_NODE_TYPE_PRE_INPUT`、`VLIB_NODE_TYPE_INPUT` 节点的函数（如 `dpdk-input`），让它们轮询网卡、把新包组装成帧并登记 pending frame。这是数据的源头。
+3. **消费 pending 队列（dispatch）**：进入内层循环，反复从 `vlib_node_main_t.pending_frames`（字段见 05-03）取出 `vlib_pending_frame_t`，调用 `dispatch_node` / `vlib_dispatch_node` 派发给对应节点函数，直到队列排空或达到本轮上限。这是吞吐的主要产生地。
+4. **调度 process 节点**：把可运行的 `VLIB_NODE_TYPE_PROCESS` 节点按事件/定时器唤醒并处理（机制见 06-15），兼顾慢速控制逻辑。
+5. **检查 barrier / 处理 signal**：worker 版在安全点检查 barrier 请求并配合暂停（06-06/06-07）；主线程处理 CLI、API、RPC 等控制面请求。
+
+**dispatch 的粒度与「帧边界调度」**。调度器只在**帧**的边界做决策，不在包之间切换：一次 `dispatch_node` 把整整一帧交给节点函数，节点跑完向量循环才返回。这既摊薄了调度开销，也保住了 I-cache 与预取窗口（06-01/06-04）。`dispatch_node`（在 `src/vlib/main.c`，部分版本封装为 `vlib_dispatch_node`，需对照实际版本核验）的核心逻辑是：根据 `vlib_pending_frame_t` 里的 `node_index` 找到该线程的 `vlib_node_runtime_t`，根据 `next_index` 定位 `vlib_frame_t`，调用 `node->function(vm, rt, frame)`，并在返回后累计本节点的 `calls`（+1）、`vectors`（+frame->n_vectors）、`clocks`（本次耗时周期），处理节点产出的新 pending 条目。
+
+**node runtime 与统计**。`vlib_node_runtime_t`（字段见 05-03）是每线程、每节点的运行时副本：函数指针、当前帧、累计计数、错误计数、状态标志。dispatch 的所有统计都写这份本地副本（无锁、无伪共享，06-04）。`show node runtime`（命令见 04-06）读的就是这些副本的汇总，判读见 08-02。
+
+**时间与计时器**。`clib_time_t`（`src/vppinfra/time.h`）维护周期→秒的换算；`vlib_time_now(vm)` 返回当前 vlib 时间。定时器 wheel（06-15）、process 的 `wait_for_clock`、以及报文时间戳都建立在这上面。为避免每包读时钟的开销，VPP 往往在主循环每轮更新一次时间，节点内复用。
+
+**调度公平与上限**。若 pending 队列里某条链持续产生新帧（例如环路或高速流），内层 dispatch 循环可能长时间不返回，饿死 process 与控制面。因此实现里通常有「每轮 dispatch 计数上限 / 时间片」或按队列分层处理（input 帧与 internal 帧分开、pending 队列按优先级组织，确切策略需对照 `src/vlib/main.c` 核验）。理解「主循环是协作式的、没有任何抢占」是排查「控制面卡住」「定时器不准」类问题的关键。
+
+**elog 与 trace 挂点**。`elog`（event logger，`src/vppinfra/elog.c` 等）与 packet trace 也挂在主循环与 dispatch 的安全点上，便于按帧粒度记录事件；生产环境热路径应关闭逐包记录（06-01 陷阱四）。
+
+### 3. 关键数据结构与源码位置
+
+字段表一律回查 05，本节只给定位与职责。
+
+- `vlib_main`、`vlib_main_loop`、`dispatch_node` / `vlib_dispatch_node`、`vlib_worker_loop`：主实现在 `src/vlib/main.c`；worker 循环与线程相关在 `src/vlib/threads.c`。
+- `vlib_main_t`（含 `node_main`、`main_loop` 计数、时间、heap、elog 等）：字段见 **05-02**，头文件 `src/vlib/main.h`。
+- `vlib_node_main_t.pending_frames`、`vlib_pending_frame_t`、`vlib_node_runtime_t`、`vlib_frame_t`：字段见 **05-03**，头文件 `src/vlib/node.h`。
+- `vlib_node_fn_t`（节点函数签名）、`VLIB_NODE_TYPE_*`：定义在 `src/vlib/node.h`。
+- 取帧/放帧 API（`vlib_get_next_frame` / `vlib_put_next_frame` 等）：`src/vlib/node_funcs.h`、`src/vlib/global_funcs.h`，06-01/06-02。
+- 时间：`clib_time_now` / `clib_time_t` 在 `src/vppinfra/time.h`；`vlib_time_now` 在 `src/vlib/main.h` / `global_funcs.h`。定时器 wheel 见 **06-15**、字段见 05-10。
+- process 节点：`vlib_process_t` 与相关函数在 `src/vlib/process.c`、`src/vlib/main.c`，机制见 **06-15**。
+- barrier 与 RPC：`vlib_worker_thread_barrier_sync` / `vlib_worker_thread_barrier_release`、`vlib_rpc_call_main_thread` 在 `src/vlib/threads.c`，用途见 **06-06**、实现与帧一致性见 **06-07**。
+- 启动顺序总入口：`src/vpp/vpp.c` 的 `main` → `vlib_main`，可据此顺出「初始化 → 循环」全链。
+
+一句话记忆：`main.c` 是心脏（初始化 + 循环 + dispatch），`node.c` 是骨骼（注册与帧），`threads.c` 是并行（worker + barrier），`time.h`/`process.c` 是节律与慢逻辑。
+
+### 4. 关键流程与调用链
+
+**启动链**：`main`（`src/vpp/vpp.c`）→ 解析 startup.conf（配置见 04-01）→ `vlib_main`（`src/vlib/main.c`）→ `vlib_main_init` 系列初始化（node main / buffer main / time / elog / stat segment）→ `vlib_register_all_static_nodes`（06-02）→ `vnet_feature_arc_init`（06-03）→ `vlib_load_plugins`（06-11）→ `vlib_launch_worker_thread`（06-06）→ 主线程进入 `vlib_main_loop`，各 worker 进入 `vlib_worker_loop`。
+
+**主循环一轮（伪代码，贴近 `src/vlib/main.c` 结构，确切分支需对照版本核验）**：
+
+```bash
+static_always_inline void
+vlib_main_loop (vlib_main_t * vm)
+{
+  while (1) {
+    /* 1) 更新本轮时间 */
+    vlib_time_now (vm);                       /* clib_time_now 换算 */
+
+    /* 2) 跑 pre-input / input 节点，收包成帧、登记 pending */
+    vlib_call_all_pre_input_nodes (vm);
+    vlib_call_all_input_nodes (vm);           /* 如 dpdk-input */
+
+    /* 3) 消费 pending 队列：dispatch 一帧一帧地推进 */
+    while (vlib_node_main_has_pending_frames (vm)) {
+      vlib_pending_frame_t *pf = vlib_get_next_pending_frame (vm);
+      vlib_node_runtime_t *rt = vlib_node_get_runtime (vm, pf->node_index);
+      u64 t0 = clib_cpu_time_now ();
+      /* dispatch_node: 取帧 -> 调节点函数 -> 累计统计 */
+      vlib_frame_t *f = vlib_get_frame (vm, pf->frame_index);
+      rt->function (vm, rt, f);               /* 节点向量循环，06-01 */
+      rt->clocks += clib_cpu_time_now () - t0;
+      rt->calls  += 1;
+      rt->vectors += f->n_vectors;
+      vlib_put_frame (vm, f);
+      /* 节点产出的新帧已被 vlib_put_next_frame 挂回 pending 队列 */
+    }
+
+    /* 4) 调度可运行的 process 节点（事件/定时器唤醒，06-15） */
+    vlib_process_reschedule (vm);
+
+    /* 5) 安全点：检查 barrier、处理控制面 signal / RPC（worker 版） */
+    vlib_worker_thread_check_barrier (vm);    /* 06-06 / 06-07 */
+  }
+}
+```
+
+**dispatch 一次的内部链（文字化）**：`pending_frames` 取出 `vlib_pending_frame_t`（含 `node_index`、`next_index`、帧索引）→ `vlib_node_get_runtime` 取本线程 `vlib_node_runtime_t` → 由 `next_index` 定位 `vlib_frame_t` → `rt->function(vm, rt, frame)` 进入节点函数 → 节点内 `vlib_get_next_frame` 取下游帧、`while(n_left)` 向量循环、`vlib_put_next_frame` 提交（06-01/06-02）→ 提交动作生成新的 `vlib_pending_frame_t` 挂回队列 → 返回 dispatch，累计 `calls/vectors/clocks` → 内层 while 继续取下一个 pending 条目。
+
+**时间维护链**：主循环每轮 `clib_time_now`（读 CPU 周期源，如 TSC）→ 经 `clib_time_t` 的换算系数转成秒 → 更新 `vm` 的时间字段（字段见 05-02）→ `vlib_time_now(vm)` 供节点取用 → process 的 `wait_for_clock`、timer wheel（06-15）据此判断到期。这样把「读时钟」从每包降为每轮一次。
+
+**process / 控制面嵌入点**：process 节点不是每轮都跑，而是被事件或定时器唤醒后放进可运行集合，主循环第 4 步统一调度；主线程的 CLI、Binary API（04-07）、stat segment 等控制面请求，也在主循环的安全点/单独线程被处理。理解「数据面循环不被控制面阻塞、控制面也不饿死」这一平衡，是理解 VPP 运行时行为的关键。
+
+:::figure id=06-05-01 | name=vlib 主循环与 dispatch 调度流程 | dir=TD
+node m0 "vlib_main 初始化 进入循环" blue
+node m1 "每轮 vlib_time_now 更新时间" teal
+node m2 "调用 pre-input / input 收包成帧" teal
+node m3 "pending_frame 队列是否为空" amber
+node m4 "dispatch_node 取一整帧" purple
+node m5 "node.function 向量循环处理" purple
+node m6 "累计 clocks/calls/vectors 产出新帧" purple
+node m7 "调度 process 节点 事件/定时器" green
+node m8 "检查 barrier 与 控制面同步" gray
+edge m0 -> m1
+edge m1 -> m2
+edge m2 -> m3
+edge m3 -> m4 "非空"
+edge m4 -> m5
+edge m5 -> m6
+edge m6 -> m3 "回填pending 内层循环"
+edge m3 -> m7 "排空"
+edge m7 -> m8
+edge m8 -> m1 "下一轮 虚线回环" dashed
+:::
+
+> **图 06-05-01 文字兜底**：`vlib_main` 初始化后进入无限循环；每轮先更新一次时间（青），再主动调用 input 节点收包成帧（青）；随后进入内层循环（琥珀→紫）反复从 pending 队列取出整帧、dispatch 到节点函数、累计统计、并把节点产出的新帧回填队列，直到排空；之后调度被事件/定时器唤醒的 process 节点（绿），在安全点检查 barrier 与控制面同步（灰），虚线回到下一轮。整个循环是协作式的，只在帧边界做调度决策。
+
+| 阶段 | 主要函数（源码） | 做什么 | 关联篇目 |
+|---|---|---|---|
+| 初始化 | `vlib_main` / `vlib_main_init` | 建结构、注册节点、加载插件、起 worker | 06-02 / 06-11 / 06-06 |
+| 时间维护 | `clib_time_now` / `vlib_time_now` | 周期→秒，更新本轮时间 | 06-15 |
+| 收包 | `vlib_call_all_input_nodes` | 调 input 节点成帧 | 06-12 |
+| dispatch | `dispatch_node` / `vlib_dispatch_node` | 取帧 → 调节点 → 统计 → 回填 | 06-01 / 06-02 |
+| process | `vlib_process_reschedule` | 事件/定时器唤醒的慢逻辑 | 06-15 |
+| 同步 | barrier / signal 检查 | 配合全局配置变更 | 06-06 / 06-07 |
+
+### 5. 配置/命令/代码实例
+
+本节给观察与验证主循环状态的手段，**命令族见 04-06、startup 全参数见 04-01**，不重列清单。
+
+- **观察调度健康度**：`show node runtime`、`show runtime`、`show vlib frame-queues`、`show errors`（命令见 04-06）可看每节点 `calls/vectors/clocks`、pending 队列长度、错误计数；`vectors/call` 偏低说明碎帧（06-01），某节点 `clocks` 异常高说明它是瓶颈。判读方法见 08-02/08-03。
+- **影响主循环的 startup 参数示意**（全参数见 04-01）：`cpu{}` 的 `main-core` 决定主线程绑核、`corelist-workers` 决定 worker 数（06-06）；`buffers{}` 的大小影响能否凑满帧。这里只给示意，不展开参数语义。
+- **主循环骨架代码**：见第 4 节伪代码；真实实现请对照 `src/vlib/main.c` 的 `vlib_main_loop` 与 `dispatch_node` 核验确切函数名、宏与分支（版本差异处标注「需对照实际版本核验」）。
+- **节点函数签名**（`src/vlib/node.h`，签名需对照版本核验）：`uword node_fn (vlib_main_t *vm, vlib_node_runtime_t *rt, vlib_frame_t *frame)`；dispatch 通过 `vlib_node_runtime_t.function` 调用它。
+- **验证实验**：用恒定流量观察 `show node runtime` 里 `ip4-lookup` 的 `vectors/call` 是否稳定接近 `VLIB_FRAME_SIZE`（方法学见 08-01）；短时开启 packet trace 看一帧内包的处理顺序（命令见 04-06），确认「整帧 dispatch、帧边界调度」的行为。
+
+**完整示例：观察主循环按帧调度的节奏**。
+
+```bash
+vppctl clear runtime
+vppctl show runtime
+vppctl show vlib frame-queues
+```
+
+```text
+Thread 0 vpp_main (lcore 0)
+  vector rates in 1.02e5, out 1.02e5, drop 0, punt 0
+Name                  Calls   Vectors    Clocks  Vectors/Call
+dpdk-input             4120   1054720    3.4e0   256.00
+ip4-lookup             4120   1054720    1.9e1   256.00
+interface-output       4120   1054720    2.2e1   256.00
+frame-queue[0]: size 64, head 12, tail 12, n_in_use 0
+```
+
+判读说明：`dpdk-input` 与各节点 Calls 相同、Vectors/Call 都接近 256，说明主循环从 pending 队列取出一帧后沿节点链整帧 dispatch，一次调用处理一帧内全部 buffer index（机制见本篇第 4 节），调度开销被 256 个包摊薄；相关帧与统计字段（字段见 05-03）。`vector rates in/out` 相等且 `frame-queue` 的 `n_in_use = 0`，说明没有帧积压，主循环一轮内就把 pending frame 消费完；若 `n_in_use` 持续上涨或 Vectors/Call 明显低于帧容量，意味着 worker 来不及消费、碎帧增多，此时应回查 `cpu{}` / `buffers{}` 配置（见 04-01）。`VLIB_FRAME_SIZE` 与队列尺寸的准确名字需对照 `src/vlib/main.c`、`src/vlib/node.h` 核验（需对照实际版本核验）。若 `show runtime` 里各节点 Calls 明显不一致，说明有节点被 feature arc 跳过或分流到不同 next，此时逐节点比对比只看总量更容易定位调度断点。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**陷阱一：在主循环或节点里做阻塞操作**。数据面循环是协作式、单线程 run-to-completion 的，任何阻塞（同步 I/O、拿锁等待、长睡眠、往慢设备写日志）都会让**整个线程**的所有包停住，直接造成丢包与时延尖刺。控制面工作应放到主线程/单独线程，通过 barrier 或 RPC（06-06/06-07）与数据面协调。
+
+**陷阱二：pending 队列「活锁」，饿死 process / 控制面**。若某节点持续产出新帧（配置错误形成环路、或收包速率持续打满），内层 dispatch 循环可能迟迟不返回，导致 process 节点、定时器、CLI 得不到调度。VPP 通过每轮 dispatch 上限/分层队列缓解（确切策略需对照 `src/vlib/main.c` 核验），自定义节点务必避免「自己产出帧又立刻回到自己」的无消耗环。
+
+**陷阱三：每包读时钟或每包系统调用**。时钟读取应在主循环每轮做一次、节点内复用 `vlib_time_now(vm)`；在向量循环里对每包 `clock_gettime`/系统调用会彻底破坏向量收益（06-01）。
+
+**陷阱四：忽略 `vectors/call` 与每包 cycles**。这两个指标是判断「向量化是否生效、调度是否健康」的体温计；长期偏低却不排查，往往掩盖了上游碎帧或某节点逐包特殊分支。判读见 08-02。
+
+**陷阱五：process 节点被当成热路径**。`VLIB_NODE_TYPE_PROCESS` 带挂起/唤醒开销（06-15），只适用于慢速控制逻辑；把它放在每包路径上会显著拉低吞吐。数据面用 `INTERNAL`，收包用 `INPUT`（06-02）。
+
+**陷阱六：误改 barrier / 统计共享状态**。`vlib_node_runtime_t` 是 per-thread 副本（06-04），dispatch 统计写本地；若开发者跨线程共享一个计数器或绕过 barrier 改全局节点状态，会引入伪共享与竞态。相关约束见 06-06/06-07。
+
+**最佳实践清单**：① 节点函数只在帧边界返回，循环内不阻塞、不系统调用；② 时钟每轮一次、节点内复用；③ 用 `calls/vectors/clocks` 持续监控调度健康度；④ process 与数据面严格分工；⑤ 全局状态变更走 barrier/主线程；⑥ 字段定义回查 05-02/05-03、命令回查 04-06、配置回查 04-01。
+
+### 7. 小结与延伸阅读
+
+`vlib_main_loop` 是全册调用链的汇聚点：它以协作式、单线程、帧边界调度的方式，把「更新时间 → input 收包 → 消费 pending 队列 dispatch → 调度 process → 检查 barrier」固定轮转，既让向量节点一口气处理整帧（06-01），又兼顾时间（06-15）、控制面与同步（06-06/06-07）。理解「没有抢占、只在帧边界决策」这一本质，就能理解 VPP 的高吞吐来源与各类调度相关故障的根因。
+
+延伸阅读：节点与帧基础 → **06-02**、字段 → **05-03**；`vlib_main_t` → **05-02**；收包 input 节点 → **06-12**；worker 循环、barrier、RPC → **06-06**；帧跨线程递交与 barrier 实现 → **06-07**；process / timer wheel / 事件 → **06-15**；插件加载时机 → **06-11**；运行时命令 → **04-06**、判读 → **08-02**；性能方法学 → **08-01**。
+
+---
+
+## 06-06 多线程与线程模型
+
+### 1. 背景与动机
+
+单核再优化也有物理上限：主频、IPC、单核缓存容量都封顶，而现代服务器动辄几十上百个核。要把吞吐线性扩展，VPP 必须多线程。但数据面多线程是出了名地难做——最直觉的「一个流水线阶段一个线程、阶段间用队列传递」会引入大量跨核缓存行弹跳、锁竞争和包乱序，往往加核不涨性能甚至倒退。
+
+VPP 的选择是 **shared-nothing 风格的 run-to-completion 多 worker**：把 06-05 那套单线程主循环**整体复制到每个 worker 线程**上，每个 worker 有自己独立的 `vlib_main_t`、`vlib_node_runtime_t` 副本、pending 队列、buffer 缓存、统计。一个报文从收包到转发，**尽量在同一个 worker 上从头跑到尾**，中途不换线程、不碰其它 worker 的数据。这样绝大多数处理都在线程本地完成，天然无锁、天然避免伪共享（06-04），扩展性与核数近似线性。
+
+在这个模型里，线程被分成两类角色：**main thread（主线程）** 负责控制面——CLI、Binary API（04-07）、配置变更、插件加载、初始的 input 与全局初始化；**worker threads** 专职跑数据面主循环（`vlib_worker_loop`，`src/vlib/threads.c`）。二者之间需要三类协调机制，本篇与 06-07 分工讲清：本篇讲**线程的创建、角色、生命周期、CPU 亲和与 NUMA、barrier 的用途、RPC 的用途**；06-07 讲**帧如何跨线程递交（handoff / pending frame 队列）、无锁 ring、barrier 与同步的实现细节、帧一致性**。
+
+还有一个不可回避的现实：有些操作**必须**全局串行——增删接口、改 FIB、启停 feature（06-03）、动态挂边（06-02）会改写所有 worker 都要读的共享结构。若 worker 正在跑向量循环时结构被改到一半，就会读到撕裂状态。VPP 用 **barrier（屏障）** 解决：控制面要改全局配置时，先让所有 worker 在安全点暂停、等它们全部进入屏障，再在主线程改配置，改完释放让 worker 继续。本篇把 barrier 作为「线程模型的同步语义」讲用途，实现的计数/等待/epoch 细节留给 06-07。
+
+### 2. 核心概念
+
+**main thread 与 worker threads**。主线程是进程启动时的那个线程，跑 `vlib_main` 并最终进入 `vlib_main_loop`；它还承担控制面命令处理。worker 是 `pthread_create` 出来的数据面线程，入口经 `vlib_worker_thread_bootstrap` 后进入 `vlib_worker_loop`（函数名需对照 `src/vlib/threads.c` 核验）。VPP 里「每线程一个 `vlib_main_t`」是关键：通过 `vlib_get_main()` / 线程本地存储取到当前线程的 `vm`，节点代码无需感知自己跑在哪个线程，写起来和单线程一样——这是 run-to-completion 能成立的基础。
+
+**per-thread 全局状态**。前面反复出现的 `vlib_main_t`（字段见 05-02）、`vlib_node_runtime_t`（字段见 05-03）、`vlib_buffer_main_t` 的每线程缓存、`vlib_node_main_t.pending_frames`，都是 per-thread 副本。共享的只有「只读或极少改」的全局配置（节点静态定义、FIB、feature config chain 等），改动走 barrier。这个「共享只读、写入本地」的划分，正是 06-04 缓存友好与 06-07 无锁设计的前提。
+
+**run-to-completion 与帧归属**。一个包进入某 worker 后，原则上就在这个 worker 的图里一路跑到底。收包时，网卡的某个 RX 队列绑定到某个 worker（RSS/多队列，06-12），从该队列收到的包天然归属该 worker；需要跨 worker 的场景（例如出接口绑在另一 worker、或需要按流分发）才走 06-07 的 handoff。尽量少的跨线程传递，是扩展性的关键。
+
+**barrier（屏障）**。`vlib_worker_thread_barrier_sync` / `vlib_worker_thread_barrier_release`（`src/vlib/threads.c`）是控制面「暂停全部 worker」的工具。用途：任何会改写 worker 共享读结构的全局配置变更（接口增删、FIB 更新、feature 启停 06-03、插件动态加载 06-11、node 动态挂边 06-02）都应在 barrier 内完成。语义是：请求方发起 sync → 各 worker 在 `vlib_worker_loop` 的安全点（帧边界，06-05）停下并确认 → 全部到齐后请求方获得独占 → 改配置 → release 唤醒 worker。实现层面的计数、等待、epoch 与「如何保证 worker 不在共享结构中间态」见 **06-07**。
+
+**RPC（跨线程请求主线程）**。worker 有时需要主线程代做控制面动作（例如发一条通知、查全局信息、触发配置），通过 `vlib_rpc_call_main_thread`（`src/vlib/threads.c`，确切函数名需对照版本核验）投递一个回调，主线程在主循环安全点执行。这样 worker 不直接碰控制面状态，避免加锁。RPC 与 barrier 方向相反：barrier 是主线程「叫停」worker，RPC 是 worker「请主线程办事」。
+
+**CPU 亲和与 NUMA**。每个 worker 用 `pthread_setaffinity_np`（或 VPP 封装）绑到指定核心，避免线程在核间迁移导致缓存失效；启动配置 `cpu{}` 的 `main-core`、`corelist-workers`（参数见 04-01）决定绑核方案。NUMA 上要求 worker、其收包网卡所在 PCIe NUMA 节点、其 buffer 池内存三者尽量同节点（06-04/06-10）。`show threads`（命令见 04-06）可查看各线程绑核与 CPU 占用。
+
+**worker 数与扩展性取舍**。worker 不是越多越好：每个 worker 独占一份 per-thread 状态与 buffer 缓存，过多会增加内存与 cache 压力；核跨 NUMA、超线程 sibling 争用执行单元、控制面/其它进程争核都会摊薄收益。经验上按物理核、按 NUMA、按收包队列数来配（方法学见 08-01/08-02）。
+
+### 3. 关键数据结构与源码位置
+
+字段表一律回查 05，本节只给定位与职责。
+
+- 线程创建、barrier、RPC：`src/vlib/threads.c`、`src/vlib/threads.h`；关键函数 `vlib_launch_worker_thread`、`vlib_worker_thread_bootstrap` / `vlib_worker_loop`、`vlib_worker_thread_barrier_sync` / `vlib_worker_thread_barrier_release`、`vlib_rpc_call_main_thread`（确切名字需对照版本核验）。
+- `vlib_thread_main_t`（worker 数量、barrier 计数、线程注册等）、`vlib_worker_thread_t`（每 worker 的绑核、pthread 句柄等）：字段见 **05-02** / **05-10**，头文件 `src/vlib/threads.h`。
+- `vlib_main_t` 的 per-thread 语义：字段见 **05-02**，`src/vlib/main.h`；`vlib_get_main()` 取当前线程 `vm`。
+- worker 主循环：`vlib_worker_loop` 在 `src/vlib/threads.c`，主体与 `vlib_main_loop`（06-05）一致，额外含 barrier 检查点。
+- 同步原语 `clib_spinlock_t`、原子操作、barrier 用到的计数/epoch：字段见 **05-10**，实现见 **06-07**、`src/vppinfra/` 下 lock/atomic 头文件。
+- 启动配置解析 `cpu{}`：`src/vpp/vpp.c`、`src/vlib/threads.c` 读取 startup.conf（参数见 04-01）。
+- 收包队列与 worker 绑定：DPDK 侧在 `src/plugins/dpdk/`（06-12），RSS/多队列把 RX 队列映射到 worker。
+
+一句话记忆：`threads.c` 管「创建 worker + barrier + RPC + 绑核」，`main.c` 管「循环主体」，每线程一份 `vlib_main_t`，共享结构靠 barrier 保护。
+
+### 4. 关键流程与调用链
+
+**阶段一：解析配置、决定线程布局**。启动时 `main`（`src/vpp/vpp.c`）读取 `cpu{}`（`main-core`、`corelist-workers` / `workers`，参数见 04-01），算出主线程与 worker 的核心集合；NUMA 拓扑由 `src/vppinfra/` 的 NUMA/affinity 辅助读取。
+
+**阶段二：主线程初始化**。主线程跑 `vlib_main`：初始化 node/buffer/time/stat/elog，注册静态节点（06-02），排 feature arc（06-03），加载插件（06-11），建共享只读结构。此时尚未启动 worker。
+
+**阶段三：创建 worker**。`vlib_launch_worker_thread`（`src/vlib/threads.c`）为每个 worker：`pthread_create` → 线程内 `vlib_worker_thread_bootstrap`（初始化本线程 `vlib_main_t` 副本、`vlib_node_runtime_t` 副本、每线程 buffer 缓存、绑核 `pthread_setaffinity_np`）→ 进入 `vlib_worker_loop`（与 06-05 相同的「时间 → input → dispatch pending → process → barrier 检查」循环）。worker 启动后通常在 barrier 处就绪等待主线程放行。
+
+**阶段四：barrier 协调全局变更（用途视角）**。控制面（CLI / API，04-05/04-07）要改全局配置时：
+1. 主线程调用 `vlib_worker_thread_barrier_sync`；
+2. 各 worker 在 `vlib_worker_loop` 的帧边界安全点检测到 barrier 请求，处理完当前帧后停下并确认；
+3. 全部 worker 到齐后，主线程获得「无 worker 正在跑数据面」的独占窗口，执行配置改写（更新 FIB / feature config chain / 节点 next 边 / 接口表）；
+4. 主线程调用 `vlib_worker_thread_barrier_release`，worker 从安全点继续。
+barrier 期间的停顿会短暂影响吞吐与时延，因此配置变更应批量、低频。**实现细节（计数、等待、如何判断安全点、epoch）见 06-07**。
+
+**阶段五：RPC 方向**。worker 需要主线程代办控制面动作时，调用 `vlib_rpc_call_main_thread(callback, arg)` 把回调挂到主线程队列；主线程在 `vlib_main_loop` 安全点取出执行。worker 自身不直接改控制面共享状态。
+
+**阶段六：run-to-completion 数据流**。收包队列绑定到 worker → 该 worker 的 input 节点成帧 → 在同一 worker 的 pending 队列与图里一路 dispatch 到出接口（06-05）→ 全程写本线程 `vlib_node_runtime_t` 统计（无锁，06-04）。只有确需跨 worker 时才走 06-07 的 handoff。
+
+:::figure id=06-06-01 | name=VPP 多线程模型 main 与 worker | dir=TD
+node mt "main thread 控制面 CLI/API 全局初始化" blue
+node bar "barrier 同步点 暂停全部worker" red
+node w1 "worker 0 vlib_worker_loop" teal
+node w2 "worker 1 vlib_worker_loop" teal
+node w3 "worker N vlib_worker_loop" teal
+node f1 "frame 收包 run-to-completion 不换线程" amber
+node rpc "RPC 回调 请主线程代办" purple
+edge mt -> w1 "pthread_create 启动并绑核"
+edge mt -> w2
+edge mt -> w3
+edge w1 -> f1 "包在本worker跑完全程"
+edge w2 -> f1
+edge w3 -> f1
+edge mt -> bar "全局配置变更 发起sync"
+edge bar -> w1 "在帧边界停下"
+edge bar -> w2 "在帧边界停下"
+edge bar -> w3 "在帧边界停下"
+edge w1 -> rpc dashed "worker请求"
+edge rpc -> mt "安全点执行"
+:::
+
+> **图 06-06-01 文字兜底**：主线程（蓝）负责控制面与初始化，并通过 `pthread_create` + 绑核启动多个 worker（青）；每个 worker 跑自己的 `vlib_worker_loop`，收包后 run-to-completion（琥珀），一个包在同一线程内走完整个图、统计写本线程副本。红色 barrier 表示全局配置变更时主线程暂停全部 worker，待它们在帧边界停下独占修改后再释放。紫色虚线是相反方向的 RPC：worker 请主线程代办控制面动作。
+
+| 线程角色 | 入口 | 主要职责 | 写哪些状态 | 关联篇目 |
+|---|---|---|---|---|
+| main thread | `vlib_main` / `vlib_main_loop` | 初始化、CLI/API、全局配置、插件加载 | 全局只读结构（barrier 内改） | 06-05 / 06-11 / 04-07 |
+| worker | `vlib_worker_loop`（`threads.c`） | 数据面收包与转发 | 本线程 `vm`/runtime/buffer 缓存 | 06-05 / 06-04 |
+| barrier | `vlib_worker_thread_barrier_*` | 暂停 worker、独占改配置 | barrier 计数/epoch | 本篇用途 / 06-07 实现 |
+| RPC | `vlib_rpc_call_main_thread` | worker→主线程代办 | 主线程回调队列 | 本篇 / 06-07 |
+
+### 5. 配置/命令/代码实例
+
+本节给线程模型相关的最小片段，**startup 全参数见 04-01、命令族见 04-06**，不重列清单。
+
+- **启动配置的线程布局示意**（全参数见 04-01）：
+
+```ini
+cpu {
+  main-core 0
+  corelist-workers 2-5        # 4 个数据面 worker
+  # 其它 cpu{} 参数（含调度策略、skip-cores 等）完整说明见 04-01
+}
+```
+
+- **观察线程**：`show threads`、`show cpu`、`show runtime`（命令见 04-06）可看 worker 数量、绑核、每线程 CPU 占用与每节点统计；判读见 08-02。
+- **创建 worker 的代码骨架**（`src/vlib/threads.c`，函数名/签名需对照版本核验）：`vlib_launch_worker_thread` 内部对每个 worker 分配 `vlib_worker_thread_t`（字段见 05-02/05-10）、`pthread_create` 指定入口、在入口里绑核并进入 `vlib_worker_loop`。
+- **barrier 用法骨架**（用途示意，实现见 06-07）：
+
+```bash
+/* 控制面：改全局共享结构前 */
+vlib_worker_thread_barrier_sync (vm);
+  vnet_feature_enable_disable (...);   /* 或改 FIB / 挂边 / 增删接口 */
+vlib_worker_thread_barrier_release (vm);
+```
+
+- **RPC 用法骨架**：worker 侧 `vlib_rpc_call_main_thread (my_callback, arg)`，主线程在 `vlib_main_loop` 安全点执行 `my_callback`。确切 API 需对照 `src/vlib/threads.h` 核验。
+- **验证实验**：逐步增加 worker 数，用 RFC2544 思路测零丢包速率（方法学见 08-01），观察吞吐是否近似线性、跨 NUMA 后是否回落；用 `show threads` 确认绑核与预期一致。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**陷阱一：barrier 停顿被低估**。barrier 要等所有 worker 都跑到帧边界，慢的那个决定停顿时长；频繁、细碎的配置变更（例如逐条下发大量路由）会反复触发 barrier，吞吐周期性塌陷。应批量下发、低频变更，并把可本地化的状态尽量做成 per-thread（06-07）。
+
+**陷阱二：在 worker 里直接改共享结构**。绕过 barrier 直接改 FIB / feature config chain / 节点 next 边，会让其它 worker 读到撕裂状态，表现为随机丢包、错转发且极难复现。全局写入一律走主线程 + barrier。
+
+**陷阱三：跨线程共享可写状态 / 伪共享**。哪怕只是「所有 worker 共写一个计数器」，也会造成 cache line ping-pong（06-04）。统计用 per-thread 副本，读时汇总。
+
+**陷阱四：CPU 亲和与 NUMA 错配**。worker 没绑核导致迁移、worker 与收包网卡/buffer 池跨 NUMA、把两个 worker 绑到同一超线程 sibling 争执行单元，都会明显掉性能。部署见 03-02、参数见 04-01、排障见 08-04。
+
+**陷阱五：worker 数贪多**。worker 越多，per-thread 状态与 buffer 缓存占用越大，控制面 barrier 停顿越长；超过物理核/收包队列数后收益转负。按物理核、NUMA、RX 队列数综合配置（08-01/08-02）。
+
+**陷阱六：RPC 死锁 / 长回调**。worker 同步等待主线程 RPC 结果、或主线程回调里又等待 worker，会形成死锁；RPC 应是异步、短小的回调，且回调里不做阻塞操作（呼应 06-05 陷阱一）。
+
+**陷阱七：帧跨线程传递破坏 run-to-completion**。过度使用 handoff / 按流分发会让包在核间来回跳，抵消扩展收益。跨线程递交的正确姿势与代价见 06-07。
+
+**最佳实践清单**：① 共享只读、写入本地；② 全局变更走 barrier 且批量低频；③ worker/网卡/buffer 三者 NUMA 对齐并绑核；④ 统计 per-thread 化；⑤ RPC 异步短小、避免死锁；⑥ 减少不必要的 handoff；⑦ 字段见 05-02/05-10、命令见 04-06、参数见 04-01。
+
+### 7. 小结与延伸阅读
+
+VPP 的多线程模型是「把单线程主循环复制到每个核」的 shared-nothing / run-to-completion：每 worker 有独立的 `vm`、runtime、pending 队列与统计，一个包尽量在同一线程跑完全程，从而无锁、无伪共享、近线性扩展；主线程专司控制面，靠 barrier 暂停 worker 独占改全局配置，靠 RPC 让 worker 反向请求主线程。本篇讲清了「线程有哪些、怎么创建、怎么绑核、barrier/RPC 用来做什么」。
+
+延伸阅读：主循环与 dispatch 主体 → **06-05**；`vlib_main_t` / `vlib_thread_main_t` 字段 → **05-02** / **05-10**；**帧跨线程递交、handoff、无锁 ring、barrier 实现细节与帧一致性 → 06-07**（本篇未展开的部分）；缓存友好与伪共享 → **06-04**；收包队列与 RSS → **06-12**；插件加载与 barrier → **06-11**；控制面 API → **04-07**；绑核参数 → **04-01**；`show threads` → **04-06**；扩展性与 NUMA 调优 → **08-01/08-02/08-04**。
+
+## 06-07 线程间通信、帧递交与 barrier
+
+### 1. 背景与动机
+
+06-06 确立了「每 worker 一份 per-thread 状态、run-to-completion」的多线程模型，并说明了线程如何创建、绑核，以及 barrier / RPC **用来做什么**。但那篇刻意留下了一个缺口：现实里的报文并不总能老老实实待在同一个 worker 上。至少有几类场景必须跨线程传递数据——出接口绑在另一个 worker 的 TX 队列上、报文需要按流哈希到指定 worker（保证同一条流的包序与状态一致）、某个特性（如 NAT / IPsec）把会话钉在特定 worker、以及收包队列数少于 worker 数时需要二次分发。此外，06-06 只讲了 barrier 的「用途」，没讲它**怎么实现**才能既暂停所有 worker、又不在热路径加重量级锁。本篇就是把这两块补齐：数据面的**帧递交（handoff）**机制，以及**同步原语与 barrier 实现细节**。
+
+这里要处理一个根本矛盾：06-06 费了很大力气做到「线程本地、无锁、无伪共享」，而跨线程传递天然意味着「一个线程写、另一个线程读」，必然触碰共享内存与缓存一致性。如果简单加一把互斥锁保护队列，每次递交都要抢占锁、引发 cache line 在核间弹跳，扩展性会立刻崩塌，等于把 06-06 的收益还回去。所以 VPP 做线程间通信的设计目标非常明确：**尽量用单生产者单消费者（SPSC）或单生产者多消费者（但每队列单消费者）的定长环形队列 + 原子操作/内存屏障，让递交路径无锁、批量、且缓存友好**；把「锁」压缩到极少见的控制面路径（barrier、配置变更）上。
+
+另一个目标是**批量**：帧递交不是一次搬一个包，而是一次搬一批 buffer index（一帧），这与 06-01 的向量思想一脉相承——跨线程的固定开销同样要被 N 摊薄。第三个目标是**一致性**：barrier 必须保证「所有 worker 都停在帧边界、没有任何 worker 正在读共享结构的中间态」，否则配置改写就会造成撕裂读。理解「无锁 ring + 批量帧 + 帧边界安全点 + 原子计数」这一组手法，就抓住了 VPP 线程间通信的全部要点。
+
+需要特别区分本篇与相邻篇的边界，避免读者混淆：**06-10** 讲的是共享内存区域、mheap 内存堆、svm 消息队列的**内存布局**；**06-13** 讲 Binary API 消息如何通过 svm_queue/socket 在控制面传输；而本篇聚焦**数据面帧/缓冲在 worker 之间递交**以及**同步原语（spinlock、原子、barrier 计数）**。三者都涉及「队列」，但承载的对象（帧索引 / 内存堆 / API 消息）与所在平面（数据面 / 内存管理 / 控制面）完全不同。
+
+### 2. 核心概念
+
+**帧递交的两种视角**。VPP 里「把包交给另一个线程」最贴近底层的动作是 `vlib_buffer_enqueue_to_thread`（`src/vlib/buffer.c` / `src/vlib/threads.c`，确切签名需对照实际版本核验）：它接收一组 buffer index 和目标线程索引，把这一批索引放进目标 worker 的「待收帧」队列。目标 worker 侧用 `vlib_get_frame_to_thread` / 在 `vlib_worker_loop` 的相应挂点批量取出，组装成 `vlib_frame_t` 后挂进自己的 pending 队列，进入本线程的图继续处理（06-05）。也有 vnet 层封装的 handoff（例如 interface-output 前按出接口/按流选 worker），本质都是「一批索引 + 一个目标线程 + 一个无锁队列」。
+
+**per-thread frame queue / handoff 队列**。多数实现里，每个 worker 有一组「输入队列」，其它线程（或收包分发逻辑）作为生产者往里写，该 worker 作为唯一消费者读——这是典型的 SPSC/多生产者单消费者结构。队列通常是**定长环形数组（ring）**，元素很小（`u32` buffer index 或一个小结构），用 `head`/`tail` 两个原子索引推进。因为已知容量且生产/消费各改一端，可以用 `clib_atomic` / 内存屏障（acquire/release 语义）实现无锁，避免互斥锁。生产者写满、消费者取空时的处理（丢弃/等待/回压）是取舍点，需结合具体队列实现核验。
+
+**handoff 与帧一致性**。跨线程传递的是 **buffer index**，不是报文本体（06-01/06-02）：报文本体始终留在 `vlib_buffer_t` 里，只有索引在队列间流动，因此零拷贝。但索引的所有权必须明确转移——源线程递交后不能再碰这个 buffer，目标线程取到后负责继续处理或释放。ref_count / 克隆语义（06-09）在「一份数据要发给多个 worker」（如组播/mirror）时尤其关键。
+
+**同步原语**。`clib_spinlock_t`（字段见 05-10，`src/vppinfra/lock.h`）是短临界区自旋锁；`clib_atomic` / `CLIB_MEMORY_BARRIER()` / `clib_atomic_fetch_add` 等（`src/vppinfra/atomics.h` 等，确切名字需对照版本核验）提供原子操作与内存屏障。设计原则是：**热路径用原子 + 屏障 + SPSC ring，尽量不用 spinlock**；spinlock 只用于控制面、barrier、以及极少数无法无锁化的结构。伪共享（06-04）同样适用于队列：`head` 与 `tail` 若落在同一 cache line，两个核各写一个也会 ping-pong，因此常按 cache line 对齐/填充。
+
+**barrier 的实现骨架**。06-06 讲了 barrier 的用途，这里讲它「怎么做到」。典型实现（对照 `src/vlib/threads.c` 的 `vlib_worker_thread_barrier_sync` / `vlib_worker_thread_barrier_release` 核验）依赖几个要素：
+- 一个全局的 **barrier 请求标志 / epoch**：主线程发起 sync 时置位；
+- 一个**原子计数器**（worker 到齐计数）：每个 worker 在 `vlib_worker_loop` 的**帧边界安全点**（即处理完一帧、尚未取下一帧时，呼应 06-05）检测到请求，停下并把计数 +1，然后自旋等待 release；
+- 主线程**自旋等待计数等于 worker 总数**，全部到齐即获得「无 worker 正在跑节点函数」的独占窗口；
+- 主线程改完配置后 `release`：清除标志/推进 epoch、唤醒 worker，worker 从安全点继续。
+「帧边界安全点」是精髓：worker 不需要在任意指令处被中断，只要在「处理完一帧、共享结构不会被读到的瞬间」停下即可，因此 barrier 不必发信号中断、也不必在节点函数里插桩，代价可控。
+
+**无锁读 + 延迟回收**。很多共享结构（feature config chain 06-03、FIB、node next 边）采用「无锁读、COW 写、barrier 内发布」：worker 平时只读已发布的指针/索引（无锁），控制面在 barrier 内构造新版本、原子替换指针，旧版本延迟回收（引用计数或 epoch），直到确认没有 worker 再引用。这样把「读」彻底无锁化，只在「写」时付一次 barrier 停顿。
+
+**与 06-10 / 06-13 的分工再强调**。数据面 handoff 队列承载帧索引、追求纳秒级、无锁；svm_queue（06-10/06-13）承载控制面 API 消息、走共享内存/ socket、追求可靠与跨进程。二者不要把「消息队列」混为一谈。
+
+### 3. 关键数据结构与源码位置
+
+字段表一律回查 05，本节只给定位与职责。
+
+- 帧递交：`vlib_buffer_enqueue_to_thread`、`vlib_get_frame_to_thread` / 等价的 handoff 辅助，位于 `src/vlib/buffer.c`、`src/vlib/threads.c`、`src/vlib/threads.h`（确切函数名与所在文件需对照版本核验）；vnet 层 handoff 节点在 `src/vnet/`（如 interface-output/handoff 相关，需核验）。
+- 线程队列与 barrier：`vlib_thread_main_t`（含 worker 数、barrier 计数/epoch、每线程队列注册）、`vlib_worker_thread_t`：字段见 **05-02** / **05-10**，`src/vlib/threads.h`。
+- 同步原语：`clib_spinlock_t` 字段见 **05-10**，头文件 `src/vppinfra/lock.h`；原子与内存屏障在 `src/vppinfra/atomics.h` / `src/vppinfra/clib.h` 相关头（确切名字需核验）。
+- pending frame / frame：`vlib_pending_frame_t`、`vlib_frame_t` 字段见 **05-03**，`src/vlib/node.h`（06-02/06-05）。
+- buffer 索引与所有权：`vlib_buffer_t.ref_count` / `next_buffer` 字段见 **05-04**，克隆与链化见 **06-09**。
+- `clib_time` / 计时、barrier 等待中的时间维护见 **06-05**、字段见 05-10。
+- 对比参照：共享内存区域 / mheap / svm_queue 的内存布局见 **06-10**（字段见 05-10）；Binary API 消息传输见 **06-13**（编程见 04-07）。
+
+一句话记忆：`threads.c`/`buffer.c` 管「帧怎么跨线程递交 + barrier 怎么实现」，`vppinfra` 提供「原子/自旋锁/屏障」工具，读多写少结构靠 COW + barrier 发布。
+
+### 4. 关键流程与调用链
+
+**流程 A：handoff 帧递交（数据面）**
+1. 某 worker 的图节点（例如出接口前）判断「这个包的下一跳/出接口/流归属另一个 worker」，收集一批需要转交的 buffer index；
+2. 调用 `vlib_buffer_enqueue_to_thread`（或 vnet 层封装）把**整批**索引写入目标 worker 的 handoff ring：生产者端原子推进 `tail`，配合 release 屏障确保 buffer 内容对目标线程可见；
+3. 目标 worker 在 `vlib_worker_loop` 的相应挂点（如 input 阶段之后）用 `vlib_get_frame_to_thread` 批量取下索引，组装/挂入本线程 pending 队列（06-05）；
+4. 目标 worker 的 `dispatch_node` 照常处理这一帧，报文本体零拷贝，只有索引换了线程。
+所有权在步骤 2 从源线程转移给目标线程；源线程此后不得再访问这些 buffer。
+
+**流程 B：barrier 同步（控制面）**
+1. 主线程在 CLI/API handler（04-05/04-07）里准备改全局结构，调用 `vlib_worker_thread_barrier_sync`：设置 barrier 请求标志、把到齐计数清零/记录 worker 总数；
+2. 主线程自旋等待；每个 worker 在 `vlib_worker_loop` 的帧边界安全点检查标志，发现请求后停止取新帧、原子把到齐计数 +1，随后自旋等待 release；
+3. 计数 == worker 总数 → 主线程确认「所有 worker 都停在帧边界、无节点函数在执行」，进入独占窗口，执行配置改写（改 FIB / feature config chain / node next 边 / 接口表），期间可安全使用 spinlock 保护非无锁结构；
+4. 主线程 `vlib_worker_thread_barrier_release`：清标志/推进 epoch、更新已发布的共享指针，唤醒 worker；
+5. worker 从安全点继续主循环，读到的是改完后的新状态（COW 下旧版本延迟回收）。
+
+:::figure id=06-07-01 | name=线程间帧递交 handoff 与 barrier 同步 | dir=LR
+node w0 "worker0 处理帧 判定需转交" teal
+node hq "目标worker handoff 无锁ring" amber
+node w1 "worker1 批量取帧继续处理" teal
+node mt "main thread 全局配置变更" blue
+node bar "barrier 计数与帧边界等待" red
+edge w0 -> hq "vlib_buffer_enqueue_to_thread 整批索引"
+edge hq -> w1 "vlib_get_frame_to_thread 批量取"
+edge mt -> bar "发起sync 等待到齐"
+edge bar -> w0 "帧边界停下确认"
+edge bar -> w1 "帧边界停下确认"
+edge bar -> mt "全部到齐 独占窗口" dashed
+:::
+
+> **图 06-07-01 文字兜底**：上半部分是数据面 handoff——worker0 把一整批 buffer index 经无锁 ring 递交给目标 worker，目标 worker 批量取出后在本线程图里继续，报文本体零拷贝。下半部分是 barrier——主线程发起 sync，各 worker 在帧边界停下并把到齐计数 +1，全部到齐后主线程获得独占窗口改配置，再 release 唤醒 worker。虚线表示「到齐后回给主线程独占权」。
+
+| 机制 | 承载对象 | 同步方式 | 触发方 | 关联篇目 |
+|---|---|---|---|---|
+| handoff / frame queue | 数据面帧索引 | SPSC/无锁 ring + 原子屏障 | 数据面节点 | 本篇 |
+| barrier | 全局共享结构 | 原子计数 + 帧边界自旋等待 | 主线程控制面 | 06-06 用途 / 本篇实现 |
+| RPC | 控制面回调 | 主线程队列 | worker→主线程 | 06-06 |
+| spinlock | 短临界区 | 自旋锁 | 控制面为主 | 字段见 05-10 |
+| COW 发布 | config/FIB 指针 | 原子替换 + 延迟回收 | 主线程（barrier 内） | 06-03 |
+| svm_queue | API 消息 | 共享内存队列/ socket | 控制面进程 | 06-10 / 06-13 |
+
+**调用链文字化（handoff）**：节点判定转交 → `vlib_buffer_enqueue_to_thread(vm, thread_index, bi[], n)` → 写目标 ring（release 屏障）→ 目标 worker `vlib_worker_loop` → `vlib_get_frame_to_thread` → 挂入本线程 pending 队列 → `dispatch_node`（06-05）→ 继续图处理 → 释放 buffer（06-09）。
+
+**调用链文字化（barrier）**：CLI/API → `vlib_worker_thread_barrier_sync` → 置标志/清计数 → worker 安全点检测 → 停帧 + `atomic_fetch_add(到齐计数)` → 自旋等待 → 主线程计数到齐 → 改共享结构（COW/原子发布）→ `vlib_worker_thread_barrier_release` → 清标志/推进 epoch → worker 继续。具体实现里的计数方式、等待变量、epoch 处理与「如何判断安全点」需对照 `src/vlib/threads.c` 核验。
+
+### 5. 配置/命令/代码实例
+
+本节给帧递交与同步的最小片段，**命令族见 04-06、startup 全参数见 04-01**，不重列清单。
+
+- **观察跨线程行为**：`show vlib frame-queues`、`show threads`、`show node runtime`、`show interface`（命令见 04-06）可看 handoff 队列状态、线程绑核、节点统计；handoff 相关错误/丢包计数在 `show errors`（命令见 04-06）。判读见 08-02/08-03。
+- **worker 数/绑核配置示意**（全参数见 04-01）：`cpu{ corelist-workers ... }` 决定有几个目标 worker 可 handoff；把收包队列与 worker 数对齐能减少不必要的跨线程分发（06-12）。
+- **帧递交骨架**（`src/vlib/threads.c` / `buffer.c`，签名需对照版本核验）：
+
+```c
+/* 一批 buffer index 转交给目标 worker */
+u32 thread_index = pick_worker_by_flow (b0);   /* 按流/出接口选 worker */
+vlib_buffer_enqueue_to_thread (vm, thread_index,
+                               bi_array, n_buffers,
+                               /* 是否批量/回压标志需核验 */);
+```
+
+- **barrier 用法骨架**（用途见 06-06，实现见本篇第 4 节流程 B）：见 06-06 第 5 节的 `sync` / `release` 包裹片段；确切 API 需对照 `src/vlib/threads.h` 核验。
+- **原子与屏障示意**（头文件 `src/vppinfra/atomics.h` 等，确切名字需核验）：生产者 `clib_atomic_store_rel(tail, ...)`，消费者 `clib_atomic_load_acquire(head, ...)`，配合 `CLIB_MEMORY_BARRIER()` 保证 buffer 内容可见性；这是无锁 ring 正确性的关键。
+- **验证实验**：构造出接口绑在另一 worker 的拓扑，用 `show vlib frame-queues` 观察 handoff 队列深度与丢包，配合 `show node runtime` 看目标 worker 是否均衡；制造一次批量路由下发，观察 barrier 期间吞吐短时回落（方法学见 08-01/08-02）。
+
+**完整示例：观察跨 worker 的帧 handoff 队列**。
+
+```bash
+vppctl show threads
+vppctl show vlib frame-queues
+vppctl show node runtime
+```
+
+```text
+Thread 0 vpp_main (lcore 0)
+Thread 1 vpp_wk_0 (lcore 2)
+Thread 2 vpp_wk_1 (lcore 3)
+frame-queue[0->1]: size 256, enqueues 48211, dequeues 48211, drops 0
+frame-queue[0->2]: size 256, enqueues 47980, dequeues 47980, drops 0
+```
+
+判读说明：两行 `frame-queue[0->1]` / `[0->2]` 对应主线程把帧批量 handoff 给两个 worker 的队列，`enqueues` 与 `dequeues` 相等且 `drops = 0`，说明生产者写入的 `vlib_pending_frame_t`（字段见 05-03）被目标 worker 完整取走、无回压丢帧。`show threads` 里的 worker 数决定有几条 handoff 目标队列（与 `cpu{}` 的 `corelist-workers` 一致，见 04-01）。若 `dequeues` 落后于 `enqueues` 或 `drops` 增长，通常是目标 worker 绑核与收包队列不匹配导致分发不均，可结合 `show node runtime` 看各 worker 负载。帧内携带的是 buffer index、队列元素用索引而非指针（字段见 05-03），确切队列名与递交 API 需对照 `src/vlib/threads.c`、`src/vlib/threads.h` 核验（需对照实际版本核验）。若两条队列的 enqueues 相差过大，说明按流选 worker 的哈希不均，可结合 `show interface` 看各口流量是否本就偏斜；barrier 同步期间计数短暂停滞属预期现象。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**陷阱一：跨线程传递破坏 run-to-completion**。handoff 意味着 cache 局部性丢失、报文本体可能被远端核访问、包序需要额外保证。能不转交就不转交；把 worker 数、收包队列、流到 worker 的映射配好，让绝大多数包在本线程跑完（06-06/06-12）。
+
+**陷阱二：无锁 ring 的内存屏障写错**。SPSC ring 的正确性完全依赖 acquire/release 语义：生产者必须先写完 buffer 内容再 release 推进 tail，消费者必须 acquire 读到 tail 后再读内容。若用普通读写或漏掉 `CLIB_MEMORY_BARRIER()`，在弱内存序架构（aarch64 等）上会出现「看到索引但看不到数据」的诡异错包。跨架构移植时务必复核（02-05）。
+
+**陷阱三：`head`/`tail` 伪共享**。两个原子索引若在同一 cache line，生产/消费各写一个仍会 ping-pong，抵消无锁收益。按 `CLIB_CACHE_LINE_ALIGN_MARK`（06-04）把两端隔到不同 line。
+
+**陷阱四：队列满/空的回压与丢包处理不当**。定长 ring 满时，生产者若忙等会拖垮源 worker、若直接丢包会造成静默丢包。需明确策略（回压、丢弃并计数、溢出到备用队列），并在 `show errors`（04-06）里可观测（08-03）。
+
+**陷阱五：barrier 内做耗时或阻塞操作**。barrier 期间所有 worker 停转，停顿时长直接等于主线程独占窗口时长。配置改写要短、批量、低频；绝不在 barrier 内做同步 I/O、日志刷盘或等待其它事件（呼应 06-05 陷阱一、06-06 陷阱一）。
+
+**陷阱六：绕过 barrier 直接改共享结构 / COW 旧版本提前回收**。前者导致撕裂读，后者导致 worker 仍引用已释放的旧 config chain。发布必须走 barrier + 原子替换，旧版本用引用计数/epoch 延迟回收（06-03）。
+
+**陷阱七：把数据面 handoff 与控制面 svm_queue 混为一谈**。二者对象、平面、可靠性要求都不同；API 消息走 06-10/06-13 的共享内存队列，帧索引走本篇无锁 ring，调试时先分清是哪条路径。
+
+**最佳实践清单**：① 尽量 run-to-completion、减少 handoff；② SPSC ring + acquire/release 屏障 + `head/tail` 对齐；③ 递交按批（一帧）进行，摊薄固定开销；④ 全局变更走 barrier、批量低频、窗口内不阻塞；⑤ COW + 延迟回收实现无锁读；⑥ 队列满/空策略明确且可观测；⑦ 字段见 05-02/05-03/05-10、命令见 04-06、参数见 04-01。
+
+### 7. 小结与延伸阅读
+
+本篇补齐了 06-06 留下的两块：数据面帧通过「批量 buffer index + 无锁 SPSC/ring + 原子屏障」在 worker 间递交，报文本体零拷贝、所有权随索引转移；共享结构通过「barrier 原子计数 + 帧边界安全点 + COW 原子发布 + 延迟回收」实现无锁读、独占写。理解「热路径无锁、只在帧边界同步、只在控制面停顿」这一分层，就理解了 VPP 多核线性扩展的底层保障。
+
+延伸阅读：线程创建/角色/亲和、barrier/RPC 用途 → **06-06**；主循环与帧边界安全点 → **06-05**；缓存行对齐与伪共享 → **06-04**；`clib_spinlock_t`/原子/同步原语字段 → **05-10**；buffer 所有权/ref_count/克隆 → **05-04** / **06-09**；共享内存区域/mheap/svm_queue 内存布局 → **06-10**；Binary API 消息传输 → **06-13**（编程见 04-07）；handoff 相关命令 → **04-06**、判读 → **08-02/08-03**；跨架构内存序 → **02-05**。
+
+---
+
+## 06-08 vppinfra 容器实现原理
+
+### 1. 背景与动机
+
+前面几篇讲的都是「调度、图、线程、缓存」这类宏观机制，但 VPP 的高性能还建立在另一层更基础的东西上：它几乎不用 C++ STL、不用 glibc 的通用容器，而是自带一套叫 **vppinfra**（`src/vppinfra/`）的基础库，里面实现了向量（vec）、对象池（pool）、哈希表（hash / bihash）、位图（bitmap）、fifo、heap、timer wheel 等全部容器。为什么不用现成的？因为通用容器为「通用」付出了代价：动态多态、迭代器抽象、每次操作的函数调用与分配器间接层、不确定的内存布局、以及难以针对缓存行/预取/无锁做优化。在数据面每包都可能触碰几十次的容器操作上，这些代价会被放大到不可接受。
+
+vppinfra 的设计哲学可以概括成四条。第一，**内存布局可控且连续**：容器尽量用一块连续内存 + 头部元信息，指针 arithmetic 代替节点指针追逐，天然对缓存与硬件预取友好（06-04）。第二，**接口极薄、大量内联/宏**：`vec_add1`、`pool_get`、`clib_bitmap_set` 等多数是内联函数或宏，热路径没有函数调用开销。第三，**为零拷贝与稳定索引优化**：pool 的元素不因增删而移动，返回的是稳定索引（这正好匹配 06-01 里 buffer index、图节点 index 的「整数索引」世界观）；vec 的增长策略几何化，摊薄重分配。第四，**为并发与缓存优化专门造结构**：`clib_bihash`（有界索引可扩展哈希）用「无锁读 + working copy/COW 写」支撑 FIB 这类「读极多、写极少」的查找，正是 06-07 讲的无锁读思路在容器层的体现。
+
+理解 vppinfra 还有一层现实意义：VPP 里几乎所有核心结构——`vlib_node_main_t` 的节点表、`vlib_buffer_main_t` 的缓冲池、`ip_lookup_main_t` 的 FIB、接口表、feature config chain——底层都是这些容器。**字段定义属于 05-09 权威源（本篇不列字段表），本篇专讲「实现取舍与算法」**：vec 怎么增长、pool 怎么复用槽位、hash 怎么解决冲突、bihash 怎么做到无锁读、bitmap 怎么按字批量操作。把这些讲清，读者看任何 VPP 结构体的「容器字段」时，就能立刻知道它的时间/空间开销与并发特性。
+
+### 2. 核心概念
+
+**vec（动态向量）**。VPP 里用得最多的容器。`vec` 不是 `struct { ptr; len; }` 那么简单，而是**把头部元信息放在用户指针之前**：`vec_header_t`（字段见 **05-09**，含已用长度、已分配容量等）紧贴在数据区前面，用户拿到的指针指向数据区首元素，容器通过 `vec_header(ptr)` 用负偏移回取头部。好处是：① 用户像用普通数组一样 `ptr[i]`，零额外间接层；② 头部与数据在同一块分配内存里，只需一次 malloc/一次缓存局部性；③ `vec_len(ptr)` 是 O(1) 读头部的内联操作。增长策略是**几何/取整增长**（容量不足时按一定比例或对齐到某个粒度扩容并拷贝，确切策略需对照 `src/vppinfra/vec.c` / `vec.h` / `vec_bootstrap.h` 核验），把「扩容重分配」摊薄到 O(1) 均摊。常见 API：`vec_add1` / `vec_add2`（追加）、`vec_validate`（按索引扩容并零填充）、`vec_reset_length`（逻辑清空但保留容量）、`vec_free`、`vec_dup`、`vec_insert` 等（声明在 `src/vppinfra/vec.h`）。`vec_validate` 的「按索引直接扩到能放下 index」语义非常适合「以稀疏索引为下标」的 VPP 用法。
+
+**pool（对象池）**。pool 解决「需要稳定索引、频繁分配释放定长对象」的需求：元素在连续数组里，但已释放的槽位用一张**空闲位图 / 空闲链**（`pool_header_t` + free bitmap，字段见 **05-09**）标记，分配时 `pool_get` 从空闲位图找空槽、复用之，释放时 `pool_put` 把槽位标回空闲而**不移动任何元素**。因此 pool 返回的「索引」在整个生命周期内稳定有效，外部可以安全地用 `u32` 索引长期引用对象（这正是 VPP 到处用 index 而非指针的原因）。代价是：数组不收缩、可能有内部碎片、遍历需跳过空洞（`pool_foreach` 会判断槽位是否空闲，`pool_is_free_index`）。`pool_get_index` 由指针反算索引，`pool_elt_at_index` 由索引取元素，都是 O(1)。
+
+**hash（哈希表）**。vppinfra 提供经典 `hash_t`（`src/vppinfra/hash.c` / `hash.h`）：以 key 做哈希、用桶 + 链/开放寻址解决冲突、支持变长 key 与用户自定义 hash/equal 回调、`hash_set` / `hash_get` / `hash_unset`。它通用、灵活，适合控制面与配置类查找。
+
+**clib_bihash（有界索引可扩展哈希）**。这是数据面查表的主力（FIB、MAC 表、会话表等多用其变体），字段见 **05-09**，实现是模板化的 `src/vppinfra/bihash_template.c` / `bihash_template.h`（通过宏实例化出 `BVT(clib_bihash)` 等不同类型的表，需对照版本核验）。它的核心思想：**桶（bucket）定长、KV 定长、桶内用一小段线性探测 + 溢出页**；更关键的是并发模型——读路径完全无锁（读已发布的桶与 KV），写路径通过 **working copy（COW）**：修改时复制受影响的桶/页，改好后原子发布新版本，旧版本延迟回收。这与 06-07 的「无锁读 + COW 写 + barrier/epoch 发布」一脉相承，专门服务「读几千万次、写几百次」的转发查表。bucket 的布局按 cache line 对齐、支持预取（06-04），一次查找的 cache miss 数被精心控制。
+
+**bitmap（位图）**。以 `uword`（一个机器字）为单位的位数组，`clib_bitmap_set` / `clib_bitmap_get` / `clib_bitmap_foreach` 等（`src/vppinfra/bitmap.h`）用位运算批量置位/清零/遍历。位图无 `vec_header`（或复用其长度语义，需核验），极省空间，被用于 pool 的空闲槽位、feature 位图（06-03）、vrf/接口标志集合等。按字操作意味着一次能处理 64 个标志位。
+
+**fifo / heap / timer wheel**。fifo（环形）、heap（二叉堆，用于优先队列）、timer wheel（时间轮，06-15 展开）也在 `src/vppinfra/` 内，字段见 05-09/05-10；它们同样遵循「连续内存 + 薄接口」原则。
+
+### 3. 关键数据结构与源码位置
+
+字段表一律回查 **05-09**（timer wheel / 锁相关回查 05-10），本节只给定位与职责。
+
+- `vec_header_t` / vec 实现：`src/vppinfra/vec.h`、`vec.c`、`vec_bootstrap.h`；字段见 **05-09**。
+- `pool_header_t` / pool 实现：`src/vppinfra/pool.h`；字段见 **05-09**。
+- `hash_t` / hash 实现：`src/vppinfra/hash.h`、`hash.c`；字段见 **05-09**。
+- `clib_bihash` / `clib_bihash_kv` / `clib_bihash_bucket_t`：`src/vppinfra/bihash_template.h`、`bihash_template.c`、`bihash_doc.h` 等；字段见 **05-09**，机制见本篇第 4 节。
+- `bitmap` / `uword` 位运算：`src/vppinfra/bitmap.h`；字段见 **05-09**。
+- fifo / heap：`src/vppinfra/fifo.h`、`heap.h`；字段见 **05-09**。
+- timer wheel：`src/vppinfra/tw_timer_template.h` / `tw_timer_2t_1w_2048sl.h` 等模板实例；机制见 **06-15**、字段见 **05-10**。
+- 同步/原子（bihash COW 用到）：`src/vppinfra/` 下 lock/atomics 相关头，字段见 05-10。
+- 应用实例：节点表 `src/vlib/node.c`（vec/pool）、缓冲池 `src/vlib/buffer.c`、FIB `src/vnet/ip/`（bihash）、feature config chain `src/vnet/config.c`（vec）、接口表 `src/vnet/interface.c`，都是读「容器怎么用」的范本。
+
+一句话记忆：`vec.h` 是动态数组、`pool.h` 是稳定索引池、`hash.h` 是通用哈希、`bihash_template.*` 是无锁读查表、`bitmap.h` 是位集合；全部字段表在 05-09。
+
+### 4. 关键流程与调用链
+
+**vec 追加与扩容**：`vec_add1(v, e, ...)` → 读 `vec_header(v)` 取 `len`/`alloc` → 若 `len < alloc`，直接在 `v[len]` 写入、`len++`（O(1)，无分配）→ 否则触发扩容：按几何/对齐策略算新容量、分配更大内存块（头部 + 数据）、拷贝旧数据、释放旧块、更新头部，再写入。因为扩容频率随容量增长而指数下降，单次追加均摊 O(1)。`vec_validate(v, i)` 则直接把容量扩到至少能容纳下标 `i` 并零填充中间元素，适合稀疏索引表。
+
+**pool 分配/释放的完整链**：`pool_get(pool, &obj)` → 查 `pool_header_t` 的空闲位图，找一个空闲槽位（没有则扩容连续数组，同样几何增长）→ 清零/初始化该槽、清空闲位、返回元素指针；`pool_get_index(pool, obj)` 用 `obj - 基址` 反算稳定索引（O(1)）。`pool_put(pool, obj)` → 把槽位标回空闲位图、可调用用户析构钩子，但**不移动其它元素、不缩容**；`pool_is_free_index` / `pool_elt_at_index` 供遍历与按索引访问时跳过空洞。这套「索引稳定、释放不搬移」正是 buffer、node、接口等都用 `u32` 索引互相引用的底气。
+
+**clib_bihash 查找与 COW 更新**（读极多、写极少）：
+- 查找 `clib_bihash_search(BV, &kv, &result_kv)`：由 key 算 hash → 定位 bucket（常按 cache line 对齐并可预取，06-04）→ 在桶内/溢出页线性比对 KV → 命中则拷出 value。整条读路径**不加锁**，只读已发布的桶与页。
+- 更新 `clib_bihash_add_del(BV, &kv, is_add)`：定位目标桶/页 → 复制一份 **working copy**（COW）→ 在副本上插入/删除 KV → 原子发布新桶/页指针（配合内存屏障）→ 旧版本延迟回收（引用计数/epoch/在 barrier 或安全点后释放，呼应 06-07）。因此读永远看到一致版本，写之间才需要串行化。
+- 桶满时分配溢出页并链入，保持查找步数有界——这也是「bounded-index」名字的由来（确切层级与阈值需对照 `bihash_template.c` 核验）。
+
+:::figure id=06-08-01 | name=vec 与 pool 的内存布局与增长 | dir=TD
+node vh "vec_header_t len/alloc 在用户指针之前" blue
+node vd "用户数据区 连续元素 ptr[i]" teal
+node vg "容量不足 几何增长 重新分配并拷贝" gray
+node ph "pool_header_t 加 空闲位图" blue
+node pd "定长元素槽位数组 索引稳定" teal
+node pf "pool_put 置空闲位 不移动元素" gray
+edge vh -> vd "用户指针指向数据区 负偏移取头部"
+edge vd -> vg "len达到alloc"
+edge ph -> pd "连续数组"
+edge pd -> pf "释放槽位复用"
+:::
+
+> **图 06-08-01 文字兜底**：vec（左）把 `vec_header_t`（长度/容量）放在用户指针之前，用户拿到的是指向连续数据区的指针，靠负偏移回取头部；容量不足时按几何策略扩容并整体拷贝。pool（右）用 `pool_header_t` + 空闲位图管理一片连续定长槽位，释放时只置空闲位、不移动任何元素，因此元素索引终生稳定。
+
+| 容器 | 底层布局 | 稳定索引 | 并发/读模型 | 典型用途 | 字段见 |
+|---|---|---|---|---|---|
+| vec | 头部 + 连续数组 | 否（扩容会搬） | 单线程写 | 通用动态数组、表 | 05-09 |
+| pool | 头部 + 槽位数组 + 空闲位图 | **是** | 单线程/需同步 | buffer/node/接口对象 | 05-09 |
+| hash | 桶 + 冲突链 | 否 | 需锁 | 控制面通用查找 | 05-09 |
+| bihash | 定长 KV + 桶 + 溢出页 | 按 key | **无锁读 + COW 写** | FIB/MAC/会话查表 | 05-09 |
+| bitmap | uword 位数组 | 按位 | 位运算/需同步 | 空闲槽、feature 位图 | 05-09 |
+| timer wheel | 分层轮 + 槽 | 按定时 | 协作式 | 定时器 | 05-10 |
+
+**bitmap 操作链**：`clib_bitmap_set(bmp, i)` → 算 `i / BITS(uword)` 定位字、`i % BITS` 定位位 → 用 `vec_validate` 之类确保位图长度足够 → 原子或普通 `|= (1 << bit)`；`clib_bitmap_get` 用 `&` 取位；`clib_bitmap_foreach` 用 `clib_bitmap_next_set` 按字跳过全零字，遍历效率接近 O(置位数 / 64)。
+
+### 5. 配置/命令/代码实例
+
+本节给容器用法的最小片段，**命令族见 04-06、startup 全参数见 04-01**，不重列清单。容器本身无独立 CLI，主要通过 `show memory` / `show vlib memory`（命令见 04-06）观察内存占用，判读见 08-02。
+
+- **vec 用法骨架**（`src/vppinfra/vec.h`，宏/函数名需对照版本核验）：
+
+```c
+u32 *v = 0;                 /* vec 变量初始化为 0 */
+vec_add1 (v, 42);           /* 追加，必要时自动扩容 */
+vec_validate (v, 100);      /* 确保下标 100 可访问，中间零填充 */
+uword n = vec_len (v);      /* O(1) 读头部长度 */
+vec_add1 (v, 43);              /* 再次追加，复用已分配容量 */
+vec_free (v);
+```
+
+- **pool 用法骨架**（`src/vppinfra/pool.h`）：
+
+```c
+my_obj_t *pool = 0;
+my_obj_t *o;
+pool_get (pool, o);                 /* 取一个槽位 */
+u32 idx = o - pool;                 /* 或 pool_get_index，得到稳定索引 */
+my_obj_t *p2 = pool_elt_at_index (pool, idx);  /* 由索引回查：p2 == o */
+pool_put (pool, o);                 /* 标空闲，不移动其它元素 */
+```
+
+- **bihash 用法骨架**（模板实例化类型名需对照 `bihash_template.h` 核验）：
+
+```c
+clib_bihash_kv_8_8_t kv, rv;
+kv.key = lookup_key;  kv.value = 0;
+if (clib_bihash_search_8_8 (&table, &kv, &rv) == 0)
+  next = rv.value;                /* 无锁读命中 */
+```
+
+- **bitmap 用法骨架**：`bmp = clib_bitmap_set (bmp, bit_index)`；`val = clib_bitmap_get (bmp, bit_index)`。
+- **验证手段**：`show memory` / `show vlib memory`（命令见 04-06）看各容器/heap 占用；用 gdb/pahole 实测 `vec_header_t` 与用户指针的负偏移关系、`pool_header_t` 与空闲位图布局（方法见 05-09）；在自定义插件里对比 vec 与 bihash 的查找延迟（方法学见 08-01）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**陷阱一：持有一个 vec 元素指针后追加，扩容使指针失效**。vec 扩容会重新分配并搬移整块数据，之前保存的 `&v[i]`、指向 vec 内部的指针全部悬空。跨追加操作应保存**下标**而非指针，或用 pool（索引稳定）。这是最常见的 vec 误用。
+
+**陷阱二：混淆 `vec_len` 与容量、`vec_reset_length` 以为会释放内存**。`vec_reset_length` 只把逻辑长度清零、保留已分配容量以便复用，内存并未归还；要真正释放须 `vec_free`。误用会导致「以为清了其实内存一直占着」。
+
+**陷阱三：pool 索引复用导致「悬空引用」**。pool 释放的槽位会被后续 `pool_get` 复用；若外部长期持有旧索引却没同步失效，可能指向一个语义完全不同的新对象。需要「代际号 / 版本号」或明确的生命周期管理来防止 ABA 类问题（尤其结合 06-09 的 buffer 回收）。
+
+**陷阱四：遍历 pool 不跳过空洞 / 直接用下标当连续数组**。`pool_foreach` 会判断空闲位；自己写 `for (i=0;i<vec_len(pool);i++)` 会读到已释放的脏数据。用 `pool_is_free_index` 或官方遍历宏。
+
+**陷阱五：bihash 误当通用并发哈希**。bihash 的无锁读 + COW 写针对「读多写极少」；频繁写会导致大量 working copy 分配与延迟回收压力，反而不如加锁的 hash。控制面高频增删、数据面只读查表才是它的主场（呼应 06-07）。
+
+**陷阱六：忽略 bihash 的 KV/桶对齐与预取**。bihash 的性能来自按 cache line 对齐的桶与可预取的 KV；自定义实例化时改坏模板参数（KV 大小、桶大小）会增加 cache miss（06-04）。
+
+**陷阱七：bitmap 越界与位宽假设**。`clib_bitmap_set` 会按需扩位图，但手动按 `uword` 位运算时若硬编码 64 位，在 32 位或不同字长平台会出错；一律用 `BITS(uword)` 之类宏（跨架构见 02-05）。
+
+**最佳实践清单**：① vec 存下标不存指针、复用容量用 `vec_reset_length`；② 需要稳定引用就选 pool，并管理索引代际；③ 「读多写极少」查表用 bihash，通用查找用 hash；④ 遍历 pool 用官方宏跳空洞；⑤ 位运算用 `BITS(uword)`；⑥ 容器字段/内存布局回查 05-09，timer wheel 见 06-15。
+
+### 7. 小结与延伸阅读
+
+vppinfra 是 VPP 高性能的「地基」：vec 用「头部前置 + 几何增长」把动态数组做到近裸数组开销，pool 用「空闲位图 + 索引稳定」支撑全系统「整数索引」世界观，bihash 用「无锁读 + COW 写」把转发查表做到极致，bitmap 用按字位运算把集合压到最小。它们的共同哲学——连续内存、薄接口、缓存友好、稳定索引——正是前几篇宏观机制在数据结构层的投射。
+
+延伸阅读：容器字段与内存布局全表 → **05-09**；缓存行对齐/预取 → **06-04**；无锁读 + COW 发布 → **06-07**；buffer 索引与回收 → **06-09** / **05-04**；共享内存与 mheap → **06-10** / **05-10**；timer wheel 机制 → **06-15**；bihash 在 FIB 的应用 → **07-03**、字段 → **05-07**；`show memory` → **04-06**、判读 → **08-02**；跨架构位宽 → **02-05**。
+
+## 06-09 缓冲池管理与 buffer 生命周期
+
+### 1. 背景与动机
+
+前面所有篇目里，报文都以「`u32` buffer index」的形式在帧、图、线程之间流动（06-01/06-02/06-07），但始终没回答一个最基础的问题：这个 index 指向的 `vlib_buffer_t` 从哪来、装了什么、用完去哪。报文是数据面的「货币」，而 buffer 就是铸币与回收系统——**每个包至少一次分配、一次释放**，在千万 PPS 下就是每秒几千万次分配/释放。如果这里用通用 `malloc/free`，光是锁竞争、元数据维护、缓存失效就足以吃掉全部性能。因此 VPP 必须为 buffer 设计一套专用的、批量、无锁、零拷贝、缓存友好的池化管理，这就是本篇的主题。
+
+几个硬约束决定了设计走向。第一，**零拷贝**：从网卡收到包到转发出去，报文本体不能被反复拷贝，这也是为什么全程流动的是 index 而非报文（06-01）；buffer 必须能表达「当前有效数据在哪、多长」（`current_data`/`current_length`），让解析/封装通过移动指针而非拷贝来剥头、加头。第二，**批量**：收包一次拿一批 mbuf，分配/释放也要按批进行，摊薄固定开销。第三，**per-thread 无锁**：每个 worker 有自己的 free list / 缓存（06-06），绝大多数分配释放在本地完成，不碰全局锁。第四，**支持克隆与链化**：组播/镜像/分片需要「一份数据被多个包引用」或「一个逻辑包由多个物理 buffer 串成链」，这要求引用计数与 `next_buffer` 机制。第五，**承载元数据**：除报文本体外，buffer 还要携带 `flags`、`opaque`/`opaque2`（vnet 层用它存 `sw_if_index`、feature 游标等，见 05-04）、`trace_index`、`error` 等，供整条图链路读写。
+
+VPP 的做法是：启动时按配置预分配一大片物理内存（hugepage，06-04/06-10），切成定长 `vlib_buffer_t` + 数据区，用 `vlib_buffer_main_t` / `vlib_buffer_pool_t`（字段见 **05-04**）管理；运行期通过 `vlib_buffer_alloc` 从 per-thread free list 批量取 index、通过 `vlib_buffer_free` 批量归还；节点通过 `vlib_get_buffer` 把 index 换成指针（06-01）；出接口发送后由驱动回收 mbuf 并触发 buffer 释放。本篇把「分配 → 填充 → 传递 →（克隆/链化）→ 发送 → 释放」这条完整生命周期、以及引用计数与 template 的取舍讲透。**结构体逐字段定义一律回查 05-04，本篇只讲机制与调用链。**
+
+### 2. 核心概念
+
+**缓冲池与 buffer index**。`vlib_buffer_main_t` / `vlib_buffer_pool_t`（字段见 **05-04**）描述一个或多个缓冲池：每个池是一片连续物理内存，按固定大小切槽，槽位用 `u32` index 寻址。`vlib_get_buffer(vm, bi)`（内联，`src/vlib/buffer.h` / `global_funcs.h`）把 index 换成 `vlib_buffer_t *`，通常是 `buffer_mem_start + bi * 每槽大小` 这样的换算。因为 index 是定长整数、槽位定长、内存预分配，整个分配/寻址都不需要遍历链表，O(1) 且缓存友好。
+
+**free list 与 per-thread 缓存**。分配不直接操作全局池，而是先查**本线程的 free list / 缓存**（呼应 06-06 的 per-thread 模型）：`vlib_buffer_alloc_from_free_list`（`src/vlib/buffer.c`，确切函数名需对照实际版本核验）从本地缓存批量取一批 index；本地不足时才从全局池补充一批（此时可能短暂用锁或原子）。释放 `vlib_buffer_free` 同理优先归还本线程缓存。这样热路径几乎无锁、无跨核 cache line 弹跳（06-04/06-07）。
+
+**buffer 模板与初始化**。新分配的 buffer 需要把一堆字段设成默认值（flags、ref_count=1、trace 关闭、opaque 清零等）。VPP 用 `vlib_buffer_template_t`（字段见 05-04）存一份「模板」，分配时用 `memcpy` 快速把模板拷到新 buffer，比逐字段赋值高效且不易漏。
+
+**当前数据指针与零拷贝解析**。剥头/加头不拷贝数据，而是调整 `current_data`（当前有效数据相对数据区起点的偏移）与 `current_length`。`vlib_buffer_get_current(b)`（内联）用 `b->data + b->current_data` 拿到当前协议头指针；解析完一层把 `current_data += header_len`、`current_length -= header_len`，封装时反向移动。这是 VPP 报文处理「零拷贝」的物理基础。
+
+**opaque 与 vnet 元数据**。`vlib_buffer_t` 里的 `opaque` / `opaque2` 等空间（字段见 05-04）被 vnet 层复用为 `vnet_buffer(b)`，存放 `sw_if_index[VLIB_RX/TX]`、feature config 游标（06-03）、邻接/查表中间结果、QoS 标记（06-14）等。它随 buffer 在图里一路传递，是「跨节点共享每包上下文」的载体；克隆/复制 buffer 时是否完整继承这些字段是常见坑（见陷阱）。
+
+**ref_count 与克隆（clone）**。当需要「同一个报文内容被多处引用」（组播复制、镜像、SPAN、IP 分片前的多份处理）时，VPP 不拷贝数据，而是**克隆 buffer 头部**：`vlib_buffer_copy` / clone 类函数产生一个新的 `vlib_buffer_t`（新 index），但其数据区指向同一份物理数据，通过 `ref_count`（字段见 05-04）记录引用数。`vlib_buffer_free` 时先 `ref_count--`，只有当引用归零才真正把数据区/槽位归还池。这样多份逻辑包共享一份报文数据，零拷贝。
+
+**chained buffer（链式 buffer）**。当单个 buffer 的数据区放不下一个大包（jumbo frame、重组、隧道封装后超长），用多个 buffer 串成链：首 buffer 的 `flags` 置 `VLIB_BUFFER_NEXT_PRESENT` 之类标志（确切宏名需对照 `src/vlib/buffer.h` 核验），`next_buffer` 指向下一段的 index。遍历/释放时要沿 `next_buffer` 逐段走（`vlib_buffer_chain` 相关辅助），不能只处理首段。链化与「克隆 + ref_count」是两个正交机制，容易混淆。
+
+**trace / error 元数据**。`trace_index` 关联 packet trace（06-05、命令见 04-06），`error` 记录节点判定的丢弃原因（`show errors`，04-06）。这些字段随 buffer 走，供排障回溯用；生产热路径应关闭逐包 trace（06-01 陷阱四）。
+
+**DPDK 后端的 mbuf ↔ buffer 映射**。用 DPDK 时，物理内存通常是 `rte_mempool`（建在 hugepage 上，06-04/06-10），`rte_mbuf` 与 `vlib_buffer_t` 有一套换算/布局约定（见 `src/plugins/dpdk/buffer.c`、`src/vlib/buffer.c`，需对照版本核验）：input 节点把收到的 `rte_mbuf` 转成 buffer index，tx 节点把 buffer index 转回 `rte_mbuf` 交给 `rte_eth_tx_burst`（06-12）。理解「VPP buffer 池往往就建在 DPDK mempool 之上」，能串起 06-04/06-10/06-12。
+
+### 3. 关键数据结构与源码位置
+
+字段表一律回查 **05-04**，本节只给定位与职责。
+
+- `vlib_buffer_t`、`vlib_buffer_template_t`、`vlib_buffer_pool_t`、`vlib_buffer_main_t`：字段见 **05-04**，声明在 `src/vlib/buffer.h`，实现在 `src/vlib/buffer.c`。
+- 缓冲池初始化与物理内存：`vlib_buffer_main_init`、`vlib_buffer_pool_init` 类函数（`src/vlib/buffer.c`）、`src/vlib/physmem.c`（hugepage/物理内存映射）、DPDK mempool 在 `src/plugins/dpdk/`（06-12）。
+- 分配/释放：`vlib_buffer_alloc` / `vlib_buffer_alloc_from_free_list`、`vlib_buffer_free` / `vlib_buffer_free_one`、`vlib_buffer_copy`（克隆），位于 `src/vlib/buffer.c`、`src/vlib/global_funcs.h`（内联），确切签名需对照版本核验。
+- 指针换算：`vlib_get_buffer`、`vlib_buffer_get_current`、`vlib_buffer_chain_*`，在 `src/vlib/buffer.h` / `global_funcs.h`。
+- flags 宏（`VLIB_BUFFER_NEXT_PRESENT` 等）：`src/vlib/buffer.h`。
+- `vnet_buffer(b)` / opaque 复用：`src/vnet/buffer.h`，字段见 05-04，相关机制见 06-03/06-14。
+- 与 06-10 的关系：buffer 池所占的 hugepage / 共享内存布局见 **06-10**、字段见 05-10。
+
+一句话记忆：`buffer.h` 定结构与内联、`buffer.c` 管池化分配释放、`physmem.c`/DPDK 管物理内存、各节点负责填充与沿链传递、`vnet/buffer.h` 定义 opaque 复用。
+
+### 4. 关键流程与调用链
+
+**阶段一：启动期建池**。`vlib_main` 初始化时由 `vlib_buffer_main_init`（`src/vlib/buffer.c`）读取 `buffers{}` 配置（`buffers-per-numa` 等，参数见 04-01）→ 经 `physmem`/DPDK 在对应 NUMA 节点预留 hugepage 内存（06-04/06-10）→ 切成定长槽，初始化 `vlib_buffer_pool_t`、free list、每线程缓存、以及 `vlib_buffer_template_t`（把默认 flags、ref_count=1 等预置好）。此后运行期不再向 OS 要内存。
+
+**阶段二：收包分配**。input 节点（06-12）轮询网卡拿到一批 mbuf/空闲槽 → `vlib_buffer_alloc(vm, bi_array, n)`（内部优先 `vlib_buffer_alloc_from_free_list` 从本线程 free list 批量取）→ 对每个 index 用 `vlib_get_buffer` 取指针、从模板 `memcpy` 初始化 → 填当前数据偏移/长度、`flags`、以及 `vnet_buffer(b)->sw_if_index[VLIB_RX]` 等 opaque 元数据。
+
+**阶段三：沿图零拷贝传递**。帧里流动的是 index（06-01/06-02）；每个节点用 `vlib_get_buffer(vm, bi)` 取指针，用 `vlib_buffer_get_current(b)` 读当前协议头，解析/改写通过移动 `current_data`/`current_length` 完成，不拷贝报文。查表结果、feature 游标（06-03）、QoS 标记（06-14）写入 opaque / flags 随包走。
+
+**阶段四：克隆与链化（可选分支）**。
+- 克隆：`vlib_buffer_copy` 类函数生成新 buffer（新 index），数据区共享、`ref_count++`；两份逻辑包各自在图里走，释放时各减一次引用。
+- 链化：大包拆成多段，首 buffer 置 `NEXT_PRESENT` 标志、`next_buffer` 指向下一段 index；需要整包数据时沿链遍历（`vlib_buffer_chain_*`），不能只读首段。
+
+**阶段五：出接口发送与释放**。出接口/tx 节点（06-12）把 buffer 交给驱动（DPDK 侧把 buffer index 换回 `rte_mbuf`、`rte_eth_tx_burst`）；驱动发送完成后，mbuf 回到 mempool，VPP 侧 `vlib_buffer_free(vm, bi_array, n)` 把 index 批量归还本线程 free list。释放内部：先处理 `ref_count`（>1 则只减引用不归还数据）、沿 `next_buffer` 处理链上各段、最后把槽位标回空闲。丢弃路径（error-drop，06-02）同样要 `vlib_buffer_free`，否则就是 buffer 泄漏。
+
+:::figure id=06-09-01 | name=buffer 从分配到释放的生命周期 | dir=TD
+node p1 "缓冲池 per-thread free list" blue
+node a1 "vlib_buffer_alloc 批量取 index" teal
+node f1 "input填充 数据偏移 flags opaque" teal
+node g1 "沿图传递 只搬index 零拷贝" amber
+node c1 "clone ref_count++ 或 chain next_buffer" purple
+node t1 "出接口发送 驱动回收" green
+node r1 "vlib_buffer_free 回free list" blue
+edge p1 -> a1 "批量分配"
+edge a1 -> f1 "模板初始化"
+edge f1 -> g1
+edge g1 -> c1 "可选 克隆或链化"
+edge c1 -> t1
+edge g1 -> t1 "正常路径"
+edge t1 -> r1 "释放"
+edge r1 -> p1 "归还复用"
+:::
+
+> **图 06-09-01 文字兜底**：buffer 从 per-thread free list 批量分配（蓝→青），经 input 节点用模板初始化并填充数据偏移/flags/opaque（青），随后以 index 形式沿图零拷贝传递（琥珀）；组播/大包等场景可走克隆（ref_count++）或链化（next_buffer）分支（紫）；出接口发送、驱动回收后，由 `vlib_buffer_free` 批量归还 free list（绿→蓝），完成一次生命周期闭环。
+
+| 操作 | 主要函数（源码） | 语义 | 关键字段 |
+|---|---|---|---|
+| 批量分配 | `vlib_buffer_alloc` / `..._from_free_list` | 从本线程 free list 取一批 index | 字段见 05-04 |
+| 指针换算 | `vlib_get_buffer` / `vlib_buffer_get_current` | index→指针、取当前协议头 | current_data/length |
+| 克隆 | `vlib_buffer_copy` 类 | 共享数据、ref_count++ | ref_count |
+| 链化 | `NEXT_PRESENT` + `next_buffer` | 多段串成一个逻辑包 | next_buffer/flags |
+| 批量释放 | `vlib_buffer_free` / `..._free_one` | 减引用、遍历链、归还槽位 | ref_count/next_buffer |
+| 元数据 | `vnet_buffer(b)` | 跨节点携带每包上下文 | opaque/opaque2 |
+
+**调用链文字化**：`vlib_buffer_main_init`（建池 + 模板）→ input `vlib_buffer_alloc`（批量取）→ `vlib_get_buffer` + 模板 `memcpy` + 填充 → 帧沿图 `dispatch_node`（06-05）逐节点 `vlib_get_buffer` / `vlib_buffer_get_current` 改写 →（可选 clone/chain）→ 出接口 tx（06-12）→ 驱动回收 → `vlib_buffer_free`（减 ref_count / 遍历链 / 归还 free list）。丢弃路径也必须走到 `vlib_buffer_free`。
+
+### 5. 配置/命令/代码实例
+
+本节给缓冲池相关的最小片段，**startup 全参数见 04-01、命令族见 04-06**，不重列清单。
+
+- **startup 缓冲池配置示意**（全参数见 04-01）：
+
+```ini
+buffers {
+  buffers-per-numa 16384       # 每 NUMA 节点的 buffer 数，完整参数见 04-01
+  # 每 socket 内存、hugepage 相关项完整说明见 04-01
+}
+```
+
+- **观察缓冲池**：`show buffers`、`show memory`、`show vlib buffers`、`show errors`（命令见 04-06）可看各池总量/空闲、每线程缓存分布、丢弃原因；buffer 泄漏常表现为 `show buffers` 的 free 数持续下降。判读见 08-02/08-03。
+- **分配骨架**（`src/vlib/buffer.c` / `global_funcs.h`，签名需对照版本核验）：
+
+```c
+u32 bi[VLIB_FRAME_SIZE];
+u32 n = vlib_buffer_alloc (vm, bi, want);       /* 批量分配到 bi[] */
+for (i = 0; i < n; i++) {
+  vlib_buffer_t *b = vlib_get_buffer (vm, bi[i]);
+  /* 从模板初始化、填 current_data/length/flags/opaque */
+  vnet_buffer (b)->sw_if_index[VLIB_RX] = rx_sw_if_index;
+}
+```
+
+- **释放骨架**：`vlib_buffer_free (vm, bi, n)`；单个释放用 `vlib_buffer_free_one`（确切名字需核验）。丢弃节点同样调用它，切勿只写 `next_buffer=~0` 了事。
+- **链化遍历骨架**：判断 `b->flags & VLIB_BUFFER_NEXT_PRESENT`，沿 `b->next_buffer` 用 `vlib_get_buffer` 逐段取，直到链尾；克隆后注意 `ref_count` 由释放路径统一维护。
+- **验证实验**：用 `show buffers` 观察高流量下 free 数是否稳定；人为触发丢弃路径看是否回补（若有泄漏，free 单调下降），方法学见 08-01、判读见 08-03。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**陷阱一：buffer 泄漏**。任何路径（正常发送、丢弃、错误、分片失败）最终都必须 `vlib_buffer_free`。自定义节点若把包「分流」到某个分支却忘了释放，或异常分支提前 return，free 数会单调下降直至池耗尽、全量丢包。用 `show buffers`（04-06）监控 free 基线，判读见 08-03。
+
+**陷阱二：ref_count 误用导致-use-after-free 或提前回收**。克隆后若忘记 `ref_count++`（或释放时多减），会出现「一份还在用、数据区已被回收另作他用」的错包；多减则提前释放。克隆/释放必须成对，且尽量用框架提供的 clone/free 辅助而非手工改计数字段。
+
+**陷阱三：克隆/复制 buffer 时 opaque 与 feature 游标处理不当**。06-03 的子链游标、06-14 的 QoS 标记、邻接查表中间结果都放在 opaque 里；复制 buffer 时若没继承（或没重置）这些字段，会导致「克隆出来的包走了错误的 feature 子链」或「游标错乱」。按业务语义决定是复制还是清零，参考官方 clone 实现。
+
+**陷阱四：chained buffer 只处理首段**。大包被拆成链，若解析/改写/释放只读首 buffer，会丢掉后续段数据或泄漏链上槽位。凡涉及整包的操作都要沿 `next_buffer` 遍历（用 chain 辅助函数）。
+
+**陷阱五：per-thread free list 失衡 / 跨线程释放**。一个 worker 分配、另一个 worker 释放会让 index 在不同线程缓存间漂移，破坏 06-06 的 run-to-completion 局部性；handoff（06-07）后尤其要注意「谁分配谁释放」或走统一的归还路径。NUMA 错配（buffer 池节点与 worker 节点不一致）见 06-04/08-04。
+
+**陷阱六：buffer 数/hugepage 配置不足**。`buffers-per-numa` 太小或 hugepage 预留不够，会在高突发流量下分配失败丢包；配得过大又浪费内存、降低缓存命中。按并发在途包数（收包 burst × 队列 × 链路深度）估算，参数见 04-01、部署见 03-02。
+
+**陷阱七：把 template 初始化漏掉**。新 buffer 若不从模板 `memcpy` 而逐字段赋值，容易漏设 `ref_count=1`、flags、trace 关闭等，引发连锁问题。统一走分配辅助。
+
+**最佳实践清单**：① 分配/释放都按批（一帧）；② 每条出口（发送/丢弃/异常）都释放；③ clone/free 成对维护 ref_count；④ 整包操作遍历 chain；⑤ 谁分配谁释放、NUMA 对齐；⑥ 用 `show buffers`/`show errors` 监控泄漏与丢弃；⑦ 字段见 05-04、配置见 04-01、命令见 04-06。
+
+### 7. 小结与延伸阅读
+
+buffer 生命周期是「index 世界观」的落地：预分配的定长池 + per-thread free list 让分配/释放批量无锁，`current_data/current_length` 让解析封装零拷贝，模板让初始化高效，`ref_count` 支持克隆、`next_buffer` 支持链化，opaque 承载跨节点元数据，最终所有路径都回到 `vlib_buffer_free`。它把「每包一次分配释放」这一最高频操作压到接近裸指针算术的成本，是 06-01 向量模型能成立的物质基础。
+
+延伸阅读：buffer 字段全表 → **05-04**；index 与帧传递 → **06-01**/**06-02**；图 dispatch → **06-05**；handoff 与所有权 → **06-07**；池化容器的 pool/vec → **06-08** / **05-09**；物理内存/hugepage/共享内存布局 → **06-10** / **05-10**；DPDK mbuf 映射与收发 → **06-12**；feature 游标在 opaque → **06-03**、QoS 标记 → **06-14**；`show buffers`/`show errors` → **04-06**、判读 → **08-02/08-03**；NUMA 错配排障 → **08-04**。
+
+---
+
+## 06-10 共享内存、消息队列与内存堆
+
+### 1. 背景与动机
+
+06-06 到 06-09 讲的是「数据面进程内部」怎么跑，但 VPP 不是一个封闭的单进程黑盒：它要对外提供 CLI（`vppctl`）、Binary API（控制面，04-07/06-13）、统计导出（stat segment，08-02），还要让外部进程（Honeycomb/govpp、VCL 应用、统计采集器）低开销地读数据、发消息。如果每次交互都走普通 socket 拷贝、或每次读统计都发一次 API 请求，控制面开销会反过来拖累数据面。VPP 的答案是 **共享内存（shared memory）**：把一部分内存映射成「VPP 与外部进程都能直接访问」的区域，让统计用 mmap 零拷贝读、让 API 消息用共享队列传递、让全局对象在共享堆上分配。
+
+这套机制要解决的问题可以拆成三块。第一，**跨进程可见的内存从哪来、怎么映射**：需要 `svm`（shared virtual memory，`src/svm/`）负责创建/映射/管理共享区域，处理「同一块物理内存在不同进程虚拟地址不同」的问题——因此共享结构里不能存绝对指针，必须用**相对偏移**（这是最大的坑）。第二，**共享区上的动态内存怎么分配**：普通 `malloc` 的堆是进程私有的，跨进程对象必须分配在共享堆上，VPP 用 `mheap`（`src/vppinfra/mheap.c`）在共享内存上实现 malloc/free。第三，**跨进程的消息与统计怎么传**：API 消息用 `svm_queue_t` 双向环形队列（06-13 展开消息格式与传输），统计用 `stat_segment` 把计数器放进共享区供客户端 mmap 直接读。
+
+理解本篇要注意它和相邻篇的分工，避免重复：**06-07** 讲的是「数据面 worker 之间的帧递交 + 无锁 ring + barrier 同步原语」；**06-13** 讲的是「Binary API 消息的序列化、分发、event/回调」；**本篇 06-10** 讲的是「这些共享区/队列/堆的**内存布局与管理**」——svm 区域怎么建、mheap 怎么在共享内存上分配、stat segment 与 API 消息内存在整个地址空间里的位置、hugepage 与 physmem 的关系。三篇都出现「队列」，但本篇的落点是「内存从哪来、放哪、谁映射」，而非「消息怎么编码」或「帧怎么递交」。字段定义一律回查 **05-10**，本篇只讲布局、机制与取舍。
+
+### 2. 核心概念
+
+**svm 与共享区域**。`svm_region_t`（字段见 05-10，`src/svm/svm.h`）描述一块共享内存区域：名字、大小、基址、以及区域内各子区的偏移。VPP 通过 `svm_map_region` / `svm_region_init` 类函数（`src/svm/svm.c`，确切名字需对照版本核验）在启动时创建/映射这些区域；外部进程通过 `svm_map_region` 以同一名字映射同一块物理内存到自己的地址空间。关键约束：**共享结构里存的是相对基址的偏移或索引，不是绝对指针**——因为同一块内存在 VPP 进程与外部进程里的虚拟地址不同，`vlib_buffer_t *` 这种绝对指针一跨进程就失效。
+
+**mheap（共享内存堆）**。普通进程堆是私有的；要在共享区上动态分配全局对象，VPP 用 `mheap`（`mheap_t` / `mheap_elt_t`，字段见 **05-10**，实现 `src/vppinfra/mheap.c`）。它在一块共享/大页内存上实现类 malloc 的分配：用位图/空闲块表管理空闲区间，支持 `mheap_alloc` / `mheap_free`（确切名字需核验），并能在需要时增长堆。VPP 的全局 heap（`vlib_global_main` 相关，字段见 05-02）与许多需要跨进程可见的对象就建在 mheap 之上。mheap 的取舍是「能跨进程共享、但分配/合并有元数据与碎片成本」，因此数据面热路径（buffer 分配，06-09）绝不用它，而用专用池。
+
+**stat segment（统计共享区）**。`stat_segment_main_t`（字段见 05-12/05-10，`src/vlib/stat_segment.c`）把节点计数、接口统计、错误计数等导出到一块共享内存区，外部采集器通过 mmap 直接读，无需逐次 API 请求、零拷贝、不影响数据面（数据面只写 per-thread 副本，06-04/06-06，汇总进共享区）。stat segment 有版本号/目录结构，客户端通过它发现计数器名字与偏移（判读见 08-02，命令见 04-06）。这是「共享内存让控制面读不打扰数据面」的典型。
+
+**svm_queue_t（消息队列）**。`svm_queue_t`（字段见 **05-10**，`src/svm/svm.h` / `queue.c`）是生产者-消费者环形队列，元素定长、用 head/tail 推进，专门用于**控制面 API 消息**在 VPP 与外部客户端之间双向传递（VAT/vppctl、govpp、VCL 等，编程见 04-07）。它与 06-07 的数据面 handoff ring 同属「无锁环形队列」思想，但承载的是 API 消息、走跨进程共享内存、要求可靠与有序，而不是帧索引。消息序列化与分发机制见 **06-13**。
+
+**整体内存布局**。一次 VPP 启动，进程地址空间里通常并存：私有堆（各线程 `vlib_main_t` 副本、per-thread 状态）、共享 svm 区域（内含 mheap 主堆、stat segment、API 消息队列区）、以及 physmem/hugepage 上的 buffer 池与 DPDK mempool（06-04/06-09）。理解「哪些是进程私有、哪些是共享、哪些是预分配的物理内存」，是读 `show memory`（04-06）输出与排查内存问题的前提。
+
+**与 hugepage / physmem 的关系**。数据面 buffer 池与 DPDK mempool 建在 hugepage 上（`src/vlib/physmem.c`，06-04/06-09），而 svm 共享区更多用于「控制面/统计/API 数据」；二者目的不同但都追求「少 TLB miss、少拷贝、可被多者直接访问」。配置 heapsize / statseg / socksvr 等（参数见 04-01）会影响这些区域大小与访问方式。
+
+### 3. 关键数据结构与源码位置
+
+字段表一律回查 **05-10**（stat segment 部分见 05-12），本节只给定位与职责。
+
+- svm 区域与队列：`svm_region_t`、`svm_queue_t`、`svm_map_region` / `svm_region_init` / `svm_queue_*`，在 `src/svm/svm.h`、`svm.c`、`queue.c`（确切文件名/函数需对照版本核验）；字段见 **05-10**。
+- mheap：`mheap_t`、`mheap_elt_t`、`mheap_alloc` / `mheap_free`，在 `src/vppinfra/mheap.c`、`mheap.h`；字段见 **05-10**。
+- 全局 heap 与 `vlib_global_main`：字段见 **05-02**，`src/vlib/main.h` / `global_funcs.h`。
+- stat segment：`stat_segment_main_t`、`stat_segment_*`，在 `src/vlib/stat_segment.c`、`stat_segment.h`；字段见 **05-12** / **05-10**。
+- 物理内存与 hugepage：`src/vlib/physmem.c`、`src/plugins/dpdk/`（mempool），机制见 **06-04**/**06-09**。
+- Binary API 消息内存与分发：`vlib_api_main_t` / 消息头字段见 **05-12**，传输与序列化机制见 **06-13**，编程见 **04-07**。
+- 配置：`heapsize` / `statseg` / `socksvr` 等 startup 参数见 **04-01**；`show memory` / `show api` 等命令见 **04-06**。
+
+一句话记忆：`svm/` 管「共享区与队列」、`mheap.c` 管「共享堆分配」、`stat_segment.c` 管「统计共享区」、`physmem.c`/DPDK 管「hugepage buffer 区」；字段全在 05-10。
+
+### 4. 关键流程与调用链
+
+**阶段一：启动期建共享区**。`vlib_main` 早期按 startup 配置（`heapsize`/`statseg` 等，参数见 04-01）→ `svm_map_region` 创建/映射主共享区（名字、大小、基址）→ 在区内划分：mheap 主堆、stat segment、API 消息队列区、其它全局对象区 → 用 `mheap` 初始化共享堆。所有区内引用用相对偏移，保证外部进程映射后可用。
+
+**阶段二：共享堆上分配全局对象**。需要跨进程可见或长期存在的全局结构，经 `mheap_alloc` 在共享堆上分配；`mheap_free` 归还。mheap 用空闲块/位图管理，支持增长（堆满时扩展 svm 区域）。注意：数据面每包路径不走 mheap（太慢），它只服务「少量、大块、跨进程」的对象。
+
+**阶段三：统计导出（零拷贝读）**。数据面各 worker 把计数写进 per-thread `vlib_node_runtime_t` 副本（无锁，06-04/06-06）→ stat segment 汇总/发布到共享区目录 → 外部采集器 `mmap` 同一区域、按目录里的名字与偏移直接读计数器，无需 API 往返、不打断数据面。版本化目录保证客户端能发现计数器布局（判读见 08-02）。
+
+**阶段四：API 消息经共享队列传递**。外部客户端建立 API 连接（04-07）→ 在共享区里建立一对 `svm_queue_t`（请求队列/响应队列，或双向队列）→ 客户端把序列化消息写入请求队列、VPP 从队列取出分发（消息格式与 handler 机制见 **06-13**）→ 响应/事件写回队列或走 event 通道。队列用 head/tail + 内存屏障保证跨进程可见（呼应 06-07 的环形队列思想，但对象是 API 消息）。
+
+**阶段五：buffer 区独立**。数据面 buffer 池（06-09）经 `physmem`/DPDK mempool 建在 hugepage 上，与 svm 共享区并列存在；`show memory`（04-06）可看到这几类内存的占用分布。
+
+:::figure id=06-10-01 | name=VPP 共享内存布局与消息队列 | dir=TD
+node base "svm_region_t 共享内存基址" blue
+node mh "mheap 主堆 全局对象跨进程共享" teal
+node st "stat_segment 统计共享区" amber
+node aq "API svm_queue 双向消息队列" purple
+node ph "physmem hugepage buffer池" green
+node cli "外部客户端 控制面与统计采集" gray
+edge base -> mh "区内偏移"
+edge base -> st "区内偏移"
+edge base -> aq "区内偏移"
+edge base -> ph "hugepage区 并列"
+edge aq -> cli "收发API消息 见06-13"
+edge st -> cli "mmap零拷贝读统计"
+:::
+
+> **图 06-10-01 文字兜底**：`svm_region_t` 是共享内存基址（蓝），区内用**相对偏移**划分出 mheap 主堆（青，跨进程全局对象）、stat segment（琥珀，统计导出）、API 消息队列（紫）；hugepage 上的 buffer 池（绿）与共享区并列。外部客户端（灰）通过 `svm_queue` 收发 API 消息（机制见 06-13）、通过 mmap 零拷贝读 stat segment 计数器。各引用一律是偏移而非绝对指针。
+
+| 区域 | 管理源码 | 承载 | 访问者 | 关联篇目 |
+|---|---|---|---|---|
+| svm 主区 | `src/svm/` | 基址/偏移布局 | 多进程 | 本篇 |
+| mheap 主堆 | `src/vppinfra/mheap.c` | 全局跨进程对象 | VPP + 客户端 | 本篇 / 05-10 |
+| stat segment | `src/vlib/stat_segment.c` | 计数器导出 | 采集器 mmap 读 | 本篇 / 08-02 |
+| svm_queue | `src/svm/queue.c` | API 消息 | 控制面双向 | 06-13 |
+| hugepage buffer 区 | `src/vlib/physmem.c` / DPDK | 报文本体 | 数据面 | 06-04 / 06-09 |
+
+**调用链文字化（API 连接）**：客户端连 `socksvr`（参数见 04-01）→ 映射 svm 区 → 建立 `svm_queue_t` 请求/响应队列 → `vl_api` 消息写入队列（序列化见 06-13）→ VPP `vlib_api_main` 消费 → 按 msg_id 分发 handler → 响应/事件回队列 → 客户端读取。编程用法见 **04-07**。
+
+### 5. 配置/命令/代码实例
+
+本节给共享内存相关的最小片段，**startup 全参数见 04-01、命令族见 04-06**，不重列清单。
+
+- **startup 相关参数示意**（全参数见 04-01）：`heapsize`（主共享堆大小）、`statseg`（统计段大小/访问方式）、`socksvr`（API socket 路径）、`unix{}`/`api-trace{}` 等。这里只给示意，不展开参数语义。
+- **观察内存**：`show memory`、`show vlib memory`、`show api clients`、`show statseg`（命令见 04-06）可看各区大小、共享堆使用、API 客户端、统计段状态；判读见 08-02。
+- **svm_queue 使用骨架**（`src/svm/`，签名需对照版本核验）：
+
+```text
+/* 概念示意：跨进程队列用偏移/索引，不存绝对指针 */
+svm_queue_t *q = svm_queue_init (n_items, item_size, consumer_pid);
+svm_queue_add (q, (u8 *) &msg, /* 阻塞/超时标志需核验 */);  /* 生产者 */
+svm_queue_sub (q, (u8 *) &msg);                             /* 消费者 */
+```
+
+- **stat segment 客户端读取思路**：客户端映射共享区 → 读目录（名字→偏移/类型）→ 按偏移直接读计数器值；无需逐次 API。编程见 04-07、判读见 08-02。
+- **mheap 分配骨架**：`void *p = mheap_alloc (heap, size); ... mheap_free (heap, p);`（确切 API 需对照 `src/vppinfra/mheap.c` 核验）。
+- **验证实验**：用 `show memory` 观察 heapsize 与 statseg 实际占用；启动一个 stat segment 采集器，确认读统计不引起 `show runtime` 波动（方法学见 08-01/08-02）。
+
+**完整示例：观察共享堆、统计段与 API 客户端**。
+
+```bash
+vppctl show memory
+vppctl show statseg
+vppctl show api clients
+```
+
+```text
+Heap                  size      used      free
+main heap             512M      96.3M     415.7M
+stat segment          32M       4.1M      27.9M
+statseg directory entries: 15234, version 42, update interval 1.00s
+api clients: 2 (vppctl, stat-collector)
+```
+
+判读说明：`show memory` 里 main heap 对应 startup 的 `heapsize`（主共享堆，见 04-01），stat segment 是独立共享区；`show statseg` 的 `directory entries` 与 `version` 对应统计段目录项数与版本号（字段见 05-10），消费者先映射共享区、再按目录里的名字→偏移读取计数器快照，用版本号判断数据是否处于半更新状态，因此读统计不触发 API 往返、也不扰动 `show runtime`。`show api clients` 列出的客户端通过 `svm_queue_t`（字段见 05-10）收发消息，队列跨进程用相对偏移而非绝对指针，这与共享内存里不能存进程内地址是同一条约束。`heapsize` / `statseg` 参数与共享区结构名需对照 `src/vlib/stat/`、`src/svm/` 核验（需对照实际版本核验）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**陷阱一：共享结构里存绝对指针**。这是跨进程共享内存第一大坑：同一块内存在 VPP 与外部进程虚拟地址不同，`vlib_buffer_t *` 之类指针一映射就失效。一律用**相对基址偏移 / 索引 / handle**，映射后由各进程自己换算成本地地址。
+
+**陷阱二：把 mheap 当数据面分配器**。mheap 有空闲块管理、位图、碎片与可能的锁，绝不能用在每包路径；每包分配走 06-09 的专用池。mheap 只服务少量、大块、需跨进程可见的全局对象。
+
+**陷阱三：跨进程队列缺内存屏障 / head-tail 伪共享**。与 06-07 的 ring 同理，生产者写完再 release 推进 tail、消费者 acquire 后再读；`head`/`tail` 按 cache line 对齐（06-04）。弱内存序架构（aarch64）上漏屏障会读到半消息（02-05）。
+
+**陷阱四：stat segment 版本/目录不兼容**。客户端按目录里的名字与偏移读计数器，VPP 升级后计数器集合/布局可能变化；采集器需处理版本协商与「名字消失」的情况（05-12、08-02、08-05 版本迁移）。
+
+**陷阱五：共享区大小预留不足**。heapsize/statseg/socksvr 队列深度配小了，会在启动或高负载时映射/分配失败、API 消息丢弃；配太大浪费内存。按全局对象量、计数器规模、API 并发估算（参数见 04-01）。
+
+**陷阱六：混淆「共享内存」与「hugepage buffer 区」**。svm 共享区服务控制面/统计/API，hugepage 区服务数据面报文；排查内存问题时先看 `show memory` 分清是哪一类再动手（06-09/06-04）。
+
+**陷阱七：把数据面 handoff 与 svm_queue 混为一谈**。前者是进程内 worker 间传帧索引（06-07），后者是跨进程传 API 消息（06-13），对象/平面/可靠性都不同。
+
+**最佳实践清单**：① 共享结构一律用偏移/索引；② 数据面分配绝不用 mheap；③ 跨进程 ring 用 acquire/release 屏障 + 对齐；④ stat segment 客户端做版本兼容；⑤ 合理预估各共享区大小；⑥ 字段见 05-10、配置见 04-01、命令见 04-06、消息机制见 06-13。
+
+### 7. 小结与延伸阅读
+
+本篇把「VPP 与外部世界共享数据」的内存基础讲清：svm 用相对偏移管理跨进程共享区，mheap 在共享内存上提供全局对象分配，stat segment 让统计被 mmap 零拷贝读、不打扰数据面，svm_queue 为 API 消息提供双向队列，hugepage/physmem 区则独立承载数据面 buffer。理解「私有堆 / 共享区 / 物理内存区」三分，以及「共享结构不能存绝对指针」这条铁律，就掌握了 VPP 内存管理的主干。
+
+延伸阅读：共享区/mheap/svm_queue 字段全表 → **05-10**；stat segment 结构 → **05-12**；数据面帧递交与无锁 ring → **06-07**；Binary API 消息序列化与分发 → **06-13**、编程 → **04-07**；buffer 池与 hugepage → **06-09** / **06-04**；缓存行/NUMA/大页 → **06-04**；`show memory`/`show statseg` → **04-06**、判读 → **08-02**；版本迁移 → **08-05**；跨架构内存序 → **02-05**；容器 vec/pool/bihash → **06-08**。
+
+## 06-11 插件机制与动态加载原理
+
+### 1. 背景与动机
+
+VPP 的核心（vlib + vnet）刻意保持精简：图引擎、缓冲池、主循环、接口抽象、基础二三层转发在这里，而 NAT、ACL、IPsec、负载均衡、隧道、各类隧道封装、GTP-U/UPF 等大量功能都放在**插件**里（`src/plugins/`）。这种「小内核 + 插件」的架构带来三个好处：核心稳定、功能可按需加载、第三方能在不改核心代码的前提下扩展数据面。但要让「插件里定义的节点、CLI 命令、API handler、feature」像核心自带的一样被图引擎调度，就必须有一套可靠的**动态加载与注册**机制——这正是本篇的主题。
+
+难点在于「注册」与「加载」的时序。06-02 讲过节点通过 `VLIB_REGISTER_NODE` 把注册结构放进专用 ELF 段，启动期 `vlib_register_all_static_nodes` 扫描这些段来建图；06-03 讲过 feature 通过 `VNET_FEATURE_*_REGISTER` 登记、启动期 `vnet_feature_arc_init` 拓扑排序。可是插件是**运行时 `dlopen` 动态加载的共享库**——它的注册段在 `dlopen` 之前根本不在进程镜像里。那插件里的节点/feature/CLI/API 是怎么进入系统的？答案是利用 ELF 的**全局构造函数（constructor）**：`dlopen` 会执行共享库里的 constructor，插件把「注册」动作放在 constructor（或宏展开出的 constructor）里，于是库一被加载，注册就发生。加载器随后重新收集节点、重排 feature、重建图，把新登记的内容合并进来。
+
+这套机制还支撑 **运行时热加载**（不必重启 VPP 就能 `load plugin`），以及 `startup.conf` 里的**白名单/黑名单**控制（`plugins{}`，参数见 04-01）。理解「静态注册段 + dlopen constructor + 加载后重建图」这条主线，就能把 06-02/06-03/06-11 三篇串成一条完整的可扩展性链条。本篇把插件发现、过滤、`dlopen`/`dlsym`、constructor 注册、加载后重建、以及依赖与版本问题逐一讲清。**结构体字段一律回查 05-11/05-12（插件与服务模块结构）与 05-02，本篇不列字段表；CLI 命令族见 04-05/04-01，不重列清单。**
+
+### 2. 核心概念
+
+**插件的载体与路径**。插件编译产物是共享库（`.so`，通常在 `lib64/vpp_plugins/` 之类的安装目录，确切路径需对照实际版本与构建产物核验，见 02-02）。`vlib_plugin_main_t`（字段见 **05-02** / **05-11**，`src/vlib/plugin.h`）保存插件主目录、已加载插件列表、以及从 `plugins{}` 解析出的白/黑名单。启动时 `vlib_load_plugins` 类函数（`src/vlib/plugin.c`，确切名字需核验）扫描该目录，列出候选 `.so`。
+
+**白名单 / 黑名单与加载决策**。`plugins{}` 配置（参数见 04-01）可指定 `plugin default { disable }` / `plugin <name> { enable }` 等策略：默认加载全部、默认禁用全部再逐个开、或按名字精确启停。加载器据此过滤候选集，决定哪些 `.so` 真正被 `dlopen`。这是控制面「功能开关」在进程启动阶段的第一道闸（区别于 06-03 运行期按接口启停 feature）。
+
+**VLIB_PLUGIN_REGISTER 与插件描述**。每个插件用 `VLIB_PLUGIN_REGISTER`（宏在 `src/vlib/plugin.h`，字段见 05-11）声明一段插件描述：`.version`（插件要求的 VPP ABI/版本串）、`.description`、以及可选的 `.default_disabled` 等（确切字段需对照版本核验）。这段描述同样通过注册段/构造函数登记，加载器用它做**版本/ABI 兼容性检查**——插件是用某个 VPP 版本编译的，版本串不匹配时应拒绝加载或告警，避免符号解析后行为错乱。
+
+**dlopen 与 constructor 注册**。核心加载函数 `vlib_load_one_plugin`（`src/vlib/plugin.c`，确切名字需核验）对每个候选 `.so` 调用 `dlopen(path, RTLD_NOW | RTLD_GLOBAL 之类标志)`：
+- `RTLD_NOW` 立即解析所有未定义符号，缺依赖立刻失败；`RTLD_GLOBAL`（或等价可见性）让插件里的符号能被后续加载的插件引用（插件间依赖）。
+- **`dlopen` 返回前，动态链接器会执行该 `.so` 的所有 constructor**。VPP 的注册宏（`VLIB_REGISTER_NODE`、`VNET_FEATURE_REGISTER`、`VLIB_CLI_COMMAND`、`VLIB_PLUGIN_REGISTER`、以及 API handler 的注册宏等）大多展开成「把结构放进专用 ELF 段」或「constructor 里调用注册函数」。因此库一加载，插件的节点、feature、CLI、API 就都被登记进全局注册集合。
+- `dlsym` 可用于取插件显式导出的钩子/初始化函数（若插件提供），但 VPP 主要依赖「注册段 + constructor」而非显式 `dlsym` 逐个取符号，这样插件开发者不必维护一份导出符号清单。
+
+**加载后重建图**。插件注册进来后，系统必须把它们真正接入：重新扫描节点注册段（`vlib_register_all_static_nodes` 或等价的「增量注册」入口）、把新节点的 `next_nodes` 名字解析成索引（06-02）、重跑/增量更新 feature arc 排序（06-03）、注册 CLI 命令树（04-02）、把 API handler 挂进消息分发表（06-13）。这一步是「插件可用」的临门一脚；若只 `dlopen` 而不重建，插件节点永远不会被 dispatch。
+
+**启动时加载 vs 运行期热加载**。启动加载发生在 `vlib_main` 早期（worker 启动、主循环开始前，06-05），此时世界是单线程的，重建图最安全。运行期热加载（`load plugin` 之类命令，命令见 04-05/04-01）则必须在 **barrier**（06-06/06-07）下、由主线程串行完成：暂停所有 worker → `dlopen` + 注册 → 重建共享结构 → release。否则 worker 可能在建图进行到一半时 dispatch 到半成品节点。
+
+**插件的「内容」本质**。一个插件 typically 打包了四类注册（字段/结构见 05-11/05-12）：图节点（`VLIB_REGISTER_NODE`）、feature 声明（`VNET_FEATURE_REGISTER`，06-03）、CLI 命令（`VLIB_CLI_COMMAND`，04-02）、Binary API 消息与 handler（`VL_API_*` / `vppapigen` 生成代码，06-13）。加载器统一把它们「激活」。这也是为什么插件机制是前面多篇的集大成应用。
+
+### 3. 关键数据结构与源码位置
+
+字段表一律回查 05，本节只给定位与职责。
+
+- 插件加载核心：`src/vlib/plugin.c`、`src/vlib/plugin.h`；关键函数 `vlib_load_plugins` / `vlib_load_new_plugins` / `vlib_load_one_plugin` / `vlib_plugin_early_init`（确切名字需对照版本核验）。
+- `vlib_plugin_main_t`（插件目录、已加载列表、白/黑名单）、`VLIB_PLUGIN_REGISTER` / `vlib_plugin_registration_t`：字段见 **05-02** / **05-11**，头文件 `src/vlib/plugin.h`。
+- 插件描述与依赖：`VLIB_PLUGIN_REGISTER` 的 `.version` / `.description` 等，版本/ABI 检查逻辑在 `src/vlib/plugin.c`。
+- 注册宏（插件加载时被 constructor 触发）：`VLIB_REGISTER_NODE`（`src/vlib/node.h`，06-02）、`VNET_FEATURE_REGISTER`（`src/vnet/feature/feature.h`，06-03）、`VLIB_CLI_COMMAND`（`src/vlib/cli.h`，04-02）、`VLIB_API...` / 消息 handler 宏（06-13，字段见 05-12）。
+- 启动调用点：`src/vpp/vpp.c` 的 `main` → `vlib_main`（`src/vlib/main.c`），加载发生在初始化早期；运行期热加载的 CLI 入口见 04-05/04-01。
+- 插件实例：`src/plugins/dpdk/`（06-12）、`src/plugins/nat/`、`src/plugins/acl/`、`src/plugins/lb/` 等，字段见 **05-11** / **05-12**，功能见 07 各模块篇。
+- 配置 `plugins{}` 与命令：参数见 **04-01**、命令族见 **04-05**。
+
+一句话记忆：`plugin.c` 管「扫描/过滤/dlopen/版本检查」，各注册宏把插件内容登记进段，`dlopen` 的 constructor 触发注册，加载后重建图/CLI/API 才算真正接入。
+
+### 4. 关键流程与调用链
+
+**阶段一：解析配置**。`main` → 读 `plugins{}`（`plugin path`、默认策略、逐插件 enable/disable，参数见 04-01）→ 初始化 `vlib_plugin_main_t`：确定插件目录、构造白/黑名单集合。
+
+**阶段二：发现候选**。`vlib_load_plugins`（`src/vlib/plugin.c`）扫描插件目录下的 `.so` 文件，去掉后缀得到插件名，与白/黑名单比对，得到待加载列表。
+
+**阶段三：逐个 `dlopen` + constructor 注册**。对每个待加载插件调用 `vlib_load_one_plugin`：
+1. 读取插件的 `VLIB_PLUGIN_REGISTER` 描述（`.version`），做 ABI/版本兼容检查，不匹配则跳过/报错；
+2. `dlopen(path, flags)`；
+3. `dlopen` 内部触发 constructor → 插件的 `VLIB_REGISTER_NODE` 把节点放进注册段、`VNET_FEATURE_REGISTER` 登记 feature、`VLIB_CLI_COMMAND` 挂命令、API handler 登记；
+4. 把插件加入已加载列表，记录句柄（供后续 `dlclose`/卸载，运行期卸载同样需 barrier）。
+
+阶段三的伪代码骨架（贴近 `src/vlib/plugin.c`，确切 API 需核验）：
+
+```c
+void
+vlib_load_one_plugin (vlib_plugin_main_t * pm, char * path)
+{
+  void *handle;
+  /* 版本/ABI 检查（读 VLIB_PLUGIN_REGISTER 的 .version） */
+  handle = dlopen (path, RTLD_NOW | RTLD_GLOBAL);  /* 触发 constructor 注册 */
+  if (!handle) { clib_warning ("%s", dlerror ()); return; }
+  /* 需要时 dlsym 取显式初始化钩子；多数注册已由 constructor 完成 */
+  /* 注册项已由 constructor 写入全局注册段，本函数无需显式 dlsym */
+}
+```
+
+**阶段四：加载后重建**。待加载列表处理完后，系统重新收集所有注册的静态节点（06-02）、解析 `next_nodes`、增量/全量重排 feature arc（06-03）、注册 CLI 命令树（04-02）、挂载 API handler（06-13）。至此插件节点可被 `vlib_main_loop` dispatch（06-05）。
+
+**阶段五：运行期热加载（可选）**。控制面收到加载命令（04-05/04-01）→ 主线程 `vlib_worker_thread_barrier_sync`（06-06/06-07）暂停 worker → `vlib_load_one_plugin` + 重建 → `vlib_worker_thread_barrier_release` 恢复。因为共享只读结构被改写，必须 barrier 保护。
+
+:::figure id=06-11-01 | name=VPP 插件动态加载流程 | dir=TD
+node s1 "startup plugins 白黑名单与路径" blue
+node s2 "扫描插件目录 匹配 .so" teal
+node s3 "vlib_load_one_plugin dlopen 版本检查" purple
+node s4 "constructor 触发全局注册" purple
+node s5 "VLIB_REGISTER_NODE 节点入段" amber
+node s6 "VNET_FEATURE_REGISTER 特性入段" amber
+node s7 "CLI 命令 与 API handler 注册" amber
+node s8 "重新收集节点 排序feature 建图" green
+edge s1 -> s2 "过滤候选"
+edge s2 -> s3 "逐个加载"
+edge s3 -> s4 "RTLD 触发"
+edge s4 -> s5
+edge s4 -> s6
+edge s4 -> s7
+edge s5 -> s8
+edge s6 -> s8
+edge s7 -> s8 "插件可用"
+:::
+
+> **图 06-11-01 文字兜底**：先由 `plugins{}` 白/黑名单与插件目录确定候选（蓝→青），再逐个 `vlib_load_one_plugin` 做版本检查并 `dlopen`（紫）；`dlopen` 触发 constructor，把节点、feature、CLI/API handler 分别登记（琥珀）；最后重新收集节点、解析连接、重排 feature、建图与命令树（绿），插件才真正接入调度。运行期热加载需额外在 barrier 下完成。
+
+| 注册宏 | 登记内容 | 加载后由谁消费 | 关联篇目 |
+|---|---|---|---|
+| `VLIB_REGISTER_NODE` | 图节点 | `vlib_register_all_static_nodes` | 06-02 |
+| `VNET_FEATURE_REGISTER` | feature + 顺序约束 | `vnet_feature_arc_init` | 06-03 |
+| `VLIB_CLI_COMMAND` | CLI 命令 | 命令树分发 | 04-02 |
+| `VLIB_PLUGIN_REGISTER` | 插件描述/版本 | 加载器 ABI 检查 | 本篇 |
+| API 消息/handler 宏 | Binary API 消息与回调 | 消息分发表 | 06-13 |
+
+**调用链文字化**：`main`（`src/vpp/vpp.c`）→ `vlib_main`（`src/vlib/main.c`）→ 读 `plugins{}` → `vlib_load_plugins`（扫描/过滤）→ `vlib_load_one_plugin`（版本检查 → `dlopen` → constructor 注册）→ 重建节点/feature/CLI/API → 启动 worker（06-06）→ `vlib_main_loop`（06-05）dispatch 插件节点。运行期：CLI（04-05）→ barrier sync → 同上加载+重建 → barrier release。
+
+### 5. 配置/命令/代码实例
+
+本节给插件加载的最小片段，**startup 全参数见 04-01、命令族见 04-05**，不重列清单。
+
+- **plugins 配置示意**（全参数见 04-01）：
+
+```bash
+plugins {
+  plugin default { disable }                 # 默认全禁用，参数语义见 04-01
+  plugin dpdk_plugin.so { enable }
+  plugin nat_plugin.so   { enable }
+  # plugin path / 逐插件策略完整说明见 04-01
+}
+```
+
+- **加载/查看插件命令**：`load plugin`、`show plugins`、`show plugin ...`（命令见 04-05/04-01）用于运行期加载与查看；完整命令族见 04-05。
+- **插件描述骨架**（`src/vlib/plugin.h`，字段需对照版本核验）：
+
+```c
+VLIB_PLUGIN_REGISTER = {
+  .version     = VPP_BUILD_VER,     /* ABI/版本串，需对照版本核验 */
+  .description = "My data-plane plugin",
+};
+```
+
+- **插件内注册节点骨架**：见 06-02 第 5 节的 `VLIB_REGISTER_NODE` 示例；feature 注册见 06-03 第 4 节。插件就是把这些注册 + 节点函数 + CLI + API 一起打进一个 `.so`。
+- **`dlopen` 骨架**：见第 4 节阶段三伪代码。
+- **验证手段**：`show plugins`（04-05）确认插件已加载；`show vlib graph`（04-06）确认插件节点出现在图中；`show interface features`（04-06）确认插件 feature 已注册；API 客户端调用插件消息（04-07/06-13）确认 handler 已挂载。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**陷阱一：加载后没重建图/feature/CLI/API**。`dlopen` 只是把注册结构放进内存，若不重新收集节点、解析 `next_nodes`、重排 feature，插件节点永远是「注册了但不可调度」的死节点。启动加载由框架统一重建；运行期热加载必须走框架入口而非自己 `dlopen` 了事。
+
+**陷阱二：运行期热加载未走 barrier**。重建会改写所有 worker 共享读的节点表/feature 链（06-07），并发改会造成撕裂读与随机丢包。运行期加载必须由主线程在 `vlib_worker_thread_barrier_sync/release` 之间完成（06-06/06-07）。
+
+**陷阱三：版本/ABI 不匹配**。插件用旧 VPP 头文件编译却加载到新 VPP，`VLIB_PLUGIN_REGISTER.version` 检查是第一道防线；绕过它（或版本串写错）会在符号解析成功后出现结构体布局错乱、崩溃等难查问题。始终用与运行环境一致的版本编译插件（02-06、08-05）。
+
+**陷阱四：符号可见性与插件间依赖**。`dlopen` 标志（RTLD_LOCAL vs RTLD_GLOBAL、`-fvisibility`、导出符号）决定后续插件能否引用本插件的符号；依赖其它插件时要保证被依赖方先加载且符号可见。加载顺序与依赖需在构建/配置里明确（02-04、04-01）。
+
+**陷阱五：重复加载 / 卸载遗漏**。`dlopen` 同一库多次、`dlclose` 未清理已注册节点/feature/CLI，会造成重复节点、命令重名、悬空 handler。加载器要维护已加载集合，卸载要做对称清理且同样 barrier。
+
+**陷阱六：插件注册顺序影响 feature 排序（误解）**。06-03 已说明顺序应由 `runs_before/runs_after` 约束推导，而非依赖插件加载先后；不要靠调整加载顺序来「碰运气」排 feature，显式声明约束。
+
+**陷阱七：把插件注册放在非 constructor 路径**。若某段注册代码只在被显式调用的函数里执行，而该函数在 `dlopen` 时没被触发，注册就丢失。注册宏必须放在全局作用域/正确段，确保 constructor 阶段生效。
+
+**最佳实践清单**：① 注册全用官方宏放全局作用域；② 启动靠框架统一重建、运行期热加载走 barrier；③ 用 `.version` 做 ABI 校验；④ 明确插件依赖与加载顺序、保证符号可见；⑤ 加载后用 `show plugins`/`show vlib graph`/`show interface features` 验证；⑥ 字段见 05-11/05-12、配置见 04-01、命令见 04-05。
+
+### 7. 小结与延伸阅读
+
+插件机制把「小内核 + 可扩展功能」落地为「静态注册段 + `dlopen` constructor + 加载后重建图」：`plugins{}` 决定加载哪些 `.so`，`vlib_load_one_plugin` 做版本检查与 `dlopen`，constructor 触发节点/feature/CLI/API 注册，框架重新建图后插件即可被调度；运行期热加载额外依赖 barrier 串行化。它是 06-02（节点）、06-03（feature）、04-02（CLI）、06-13（API）多篇机制的综合应用。
+
+延伸阅读：节点注册与建图 → **06-02**；feature 排序 → **06-03**；主循环 dispatch → **06-05**；barrier 与线程同步 → **06-06**/**06-07**；CLI 注册 → **04-02**；Binary API 消息与 handler → **06-13**、编程 → **04-07**；插件结构字段 → **05-11**/**05-12**；`plugins{}` 参数 → **04-01**、命令 → **04-05**；构建产物与 ABI → **02-02/02-06**、升级迁移 → **08-05**；具体插件功能 → **07** 各模块篇；DPDK 插件收发 → **06-12**。
+
+---
+
+## 06-12 轮询模式驱动（PMD）与批处理调度
+
+### 1. 背景与动机
+
+前面所有篇目都在讲「包进入图之后怎么处理」，而数据面的起点与终点是网卡收发。传统内核协议栈用**中断驱动**：网卡收包触发中断 → 内核软中断/NAPI → 协议栈处理，这套机制在通用场景够用，但在高 PPS 下有三笔硬开销：每次中断的上下文切换与调度、中断合并与锁竞争、以及数据在内核态/用户态之间拷贝与切换。10G/25G/100G 线速小包时，每包一次中断根本扛不住。
+
+VPP 对接 DPDK 的**轮询模式驱动（PMD, Poll Mode Driver）**走了另一条路：**用户态、无中断、专用线程持续轮询网卡队列**。收包不再靠中断通知，而是 worker 线程在自己的主循环里（06-05）反复调用 `rte_eth_rx_burst` 主动「看一眼」有没有包；发送用 `rte_eth_tx_burst` 批量推给网卡。因为收发都在用户态、没有中断、没有系统调用、没有上下文切换，配合 06-01 的向量批处理，能把每包固定开销压到极低。
+
+这套机制与 VPP 的架构高度契合。第一，**轮询就是 input 节点**：06-02 说过 `VLIB_NODE_TYPE_INPUT` 节点由主循环每轮主动调用，DPDK 的 `dpdk-input` 正是这样的节点，它内部就是 PMD poll loop。第二，**批量收发就是向量**：`rte_eth_rx_burst` 一次取一批 `rte_mbuf`（上限通常对齐 `VLIB_FRAME_SIZE`，06-01），转成一批 buffer index 组成帧，天然对接图引擎。第三，**run-to-completion**：网卡的 RX 队列通过 RSS 绑定到某个 worker（06-06），该队列的包从收到发都在同一 worker 跑完，避免跨线程（06-07）。第四，**零拷贝**：报文本体在 hugepage 上的 `rte_mempool`（06-04/06-10），`rte_mbuf` 与 `vlib_buffer_t` 只是一套布局映射（06-09），全程流动的是 index。
+
+本篇把 PMD 收包循环、mbuf↔buffer 转换、批量成帧、出接口 tx、发送完成回收、以及无中断轮询的取舍讲透。**结构体字段一律回查 05-11（`dpdk_main_t`/`dpdk_device_t`）、05-05（device/hw class）、05-04（buffer），本篇不列字段表；startup 全参数见 04-01、命令族见 04-03/04-06，不重列清单。**
+
+### 2. 核心概念
+
+**PMD 与无中断轮询**。DPDK PMD 在用户态直接操作网卡（VFIO/UIO 把设备映射到用户空间，部署见 03-02），收包线程在循环里反复调用 `rte_eth_rx_burst(port, queue, bufs, nb_pkts)`：有包就批量取回，没包就立即返回 0，线程继续下一轮轮询（空转）。因为一个核专职轮询、不做别的，空转并非浪费（它本来就该占满这个核），换来的是「包一到几乎零延迟被取走」。这与中断模式的「事件通知」是两种截然不同的 CPU 使用哲学。
+
+**rx/tx burst 与批大小**。`nb_pkts` 上限通常取 `VLIB_FRAME_SIZE`（06-01，典型 256）或驱动/配置指定的 burst 大小（确切默认值需对照 `src/plugins/dpdk/` 核验）。批大小是吞吐与时延的权衡：批越大，每次 `rte_eth_rx_burst` 的固定开销被摊得越薄、向量收益越高；批越大也可能让先到的包多等一会儿、增加尾时延，并让一帧的缓存足迹变大（06-01/06-04）。
+
+**`rte_mbuf` ↔ `vlib_buffer_t` 映射**。DPDK 的报文载体是 `rte_mbuf`（在 `rte_mempool` 上分配，hugepage，06-10），VPP 的载体是 `vlib_buffer_t`（06-09）。VPP 在 DPDK 插件里维护一套布局/偏移约定，让 `vlib_buffer_t` 与 `rte_mbuf` 的头尾空间相互对应，从而「收到的 mbuf 直接当成 VPP buffer 用」，只需把 mbuf 指针换算成 buffer index、填好 `current_data/current_length/flags/opaque`（06-09）。相关换算在 `src/plugins/dpdk/buffer.c`、`input.c`（确切文件/函数需对照版本核验）。出接口发送时反向把 buffer index 换回 `rte_mbuf` 交给 `rte_eth_tx_burst`。
+
+**dpdk-input 节点与 poll loop**。`dpdk-input`（`src/plugins/dpdk/input.c`，字段见 05-11）是 `VLIB_NODE_TYPE_INPUT` 节点，由 `vlib_main_loop` 每轮调用（06-05）。它遍历本 worker 负责的 (port, queue)，对每个队列做一次 `rte_eth_rx_burst`，把取回的 mbuf 批量转成 buffer index 组装成 `vlib_frame_t`，用 `vlib_put_next_frame` 投递给 `ethernet-input` 等下游节点（06-02）。**轮询发生在主循环的 input 阶段**，这与 06-05 的「每轮先跑 input 节点」完全对应。
+
+**RSS、多队列与 worker 绑定**。多队列网卡通过 RSS 把不同流分散到多个 RX 队列，每个队列绑定到某个 worker（配置见 `dpdk{}` 与 `cpu{}`，参数见 04-01；线程绑定见 06-06）。这样收包天然分散到多核、每核 run-to-completion、包序在同一流内由 RSS 保证。队列数应与 worker 数匹配，否则要么某些 worker 空闲、要么需要 06-07 的 handoff 二次分发。
+
+**interface-output 到 tx**。图处理末端，`interface-output` 节点（06-02）根据出接口选设备类，DPDK 设备对应的 tx 函数（如 `dpdk_interface_tx`，`src/plugins/dpdk/device.c`，确切名字需核验）把一批 buffer 换成 `rte_mbuf` 数组、调 `rte_eth_tx_burst` 批量发送；发送完成后网卡/驱动把 mbuf 回收进 mempool，VPP 侧对应 buffer 释放回池（06-09）。tx 也有「发送完成回收」的时机问题（见陷阱）。
+
+**无中断的取舍与自适应**。纯轮询在低流量时空转占满一个核、不省电；DPDK 也提供「interrupt + 自适应轮询」模式（空转一段时间后睡、有包再唤醒再切回轮询），但会引入中断与唤醒延迟。VPP 数据面通常选择**持续轮询**换确定性低时延，是否启用自适应/中断模式需结合部署与功耗需求（配置见 04-01，取舍见 08-02）。
+
+**device class / hw interface class**。`vnet_device_class_t` / `vnet_hw_interface_class_t`（字段见 **05-05**）是 VPP 抽象设备的接口，DPDK 插件注册自己的 device class，把「tx 函数、格式改写、能力标志」挂上去，让上层 `interface-output` 无需知道底层是 DPDK 还是 af_packet/virtio（07-01）。这是「PMD 可插拔」的抽象层。
+
+### 3. 关键数据结构与源码位置
+
+字段表一律回查 05，本节只给定位与职责。
+
+- DPDK 插件收发核心：`src/plugins/dpdk/input.c`（`dpdk-input` 节点 / poll loop）、`src/plugins/dpdk/device.c`（device class / tx）、`src/plugins/dpdk/buffer.c`（mbuf ↔ buffer 映射）、`src/plugins/dpdk/dpdk.h`；`dpdk_main_t` / `dpdk_device_t` 字段见 **05-11**。
+- 设备抽象：`vnet_device_class_t` / `vnet_hw_interface_class_t` / `vnet_hw_interface_t` 字段见 **05-05**，`src/vnet/interface.c`；`interface-output` 节点在 `src/vnet/interface_output.c`（06-02）。
+- buffer / frame / index：`vlib_buffer_t`（05-04）、`vlib_frame_t`（05-03），`vlib_get_buffer` / `vlib_buffer_alloc`（06-09）。
+- DPDK 库侧：`rte_eth_rx_burst` / `rte_eth_tx_burst` / `rte_mbuf` / `rte_mempool` 属 DPDK 自身，VPP 通过 `src/plugins/dpdk/` 封装；hugepage/VFIO 见 **06-10**/**03-02**。
+- 主循环调用点：`vlib_main_loop` 的 input 阶段（06-05，`src/vlib/main.c`）；worker 绑定与队列分配见 **06-06**/**06-07**。
+- 配置：`dpdk{}`（`dev`/`num-rx-queues`/`num-tx-queues`/大页/socket 等，全参数见 **04-01**）、`cpu{}` 绑核；命令见 **04-03**（接口/硬件）、**04-06**（show）。
+- 插件加载：`VLIB_PLUGIN_REGISTER` / `dlopen` 见 **06-11**，DPDK 插件本身就是被加载的插件之一。
+
+一句话记忆：`dpdk/input.c` 是收包 input 节点（poll loop）、`dpdk/device.c` 是 tx 与 device class、`dpdk/buffer.c` 管 mbuf↔buffer 映射，三者把 DPDK PMD 接进 VPP 的图与向量模型。
+
+### 4. 关键流程与调用链
+
+**收包链（input 阶段）**：
+1. `vlib_main_loop` 每轮调用 `vlib_call_all_input_nodes`（06-05）→ 执行 `dpdk-input` 节点函数；
+2. `dpdk-input` 遍历本 worker 负责的 (port, queue)，对每个队列 `rte_eth_rx_burst(port, queue, mbufs, burst)` 批量取包；
+3. 对每个 `rte_mbuf`：经 `src/plugins/dpdk/buffer.c` 的映射换算成 `vlib_buffer_t *` 与 `u32 bi`（buffer index），从模板初始化、填 `current_data/current_length/flags` 与 `vnet_buffer(b)->sw_if_index[VLIB_RX]`（06-09）；
+4. 把这一批 `bi` 组装成 `vlib_frame_t`（06-01/06-02），`vlib_put_next_frame` 投递给 `ethernet-input`（按 L2 类型还可分流），登记 pending frame；
+5. 主循环进入 dispatch 阶段（06-05），沿图批量处理。
+
+**处理链**：`ethernet-input` → `ip4-lookup`/`ip6-*` → feature 子链（06-03）→ `ip*-rewrite` → `interface-output`（06-02）。全程 index 零拷贝（06-01）、per-thread run-to-completion（06-06）、预取（06-04）。
+
+**发送链**：
+1. `interface-output` 根据出接口查 `vnet_device_class_t`（05-05），DPDK 设备对应 tx 回调（如 `dpdk_interface_tx`）；
+2. tx 回调把一批 buffer index 换回 `rte_mbuf*`，组装 tx 数组，处理 offload/rewrite（字段见 05-05/05-11）；
+3. `rte_eth_tx_burst(port, queue, tx_mbufs, n)` 批量发送；
+4. 网卡/DMA 发送完成后，mbuf 回到 `rte_mempool`；VPP 侧对应 `vlib_buffer_free`（06-09）把 buffer 归还本线程 free list，完成生命周期闭环。
+
+**poll loop 与批处理调度伪代码**（贴近 `src/plugins/dpdk/input.c`，确切 API 需核验）：
+
+```c
+uword
+dpdk_input (vlib_main_t * vm, vlib_node_runtime_t * rt, vlib_frame_t * f)
+{
+  dpdk_device_t *xd;
+  vec_foreach (xd, dm->devices_by_thread[vm->thread_index]) {
+    struct rte_mbuf *mb[VLIB_FRAME_SIZE];
+    u16 n = rte_eth_rx_burst (xd->port_id, xd->queue_id, mb, VLIB_FRAME_SIZE);
+    if (n == 0) continue;                       /* 空轮询，下一轮再来 */
+    u32 bi[VLIB_FRAME_SIZE];
+    for (i = 0; i < n; i++) {
+      vlib_buffer_t *b = dpdk_mbuf_to_buffer (mb[i]);  /* mbuf→buffer 映射 */
+      bi[i] = vlib_get_buffer_index (vm, b);
+      /* 模板初始化 + 填 current_data/length/flags/sw_if_index */
+    }
+    /* 把 bi[0..n) 组装成帧，投递到 ethernet-input */
+    to_next = vlib_get_next_frame (vm, rt, NEXT_ETHERNET_INPUT, ...);
+    memcpy (to_next, bi, n * sizeof (u32));
+    vlib_put_next_frame (vm, rt, NEXT_ETHERNET_INPUT, n);
+  }
+  return 0;   /* input 节点返回值语义需对照实际版本核验 */
+}
+```
+
+:::figure id=06-12-01 | name=DPDK PMD 批处理收发调度 | dir=TD
+node rx "rte_eth_rx_burst 批量收包 无中断轮询" blue
+node cvt "rte_mbuf 转 vlib_buffer index 成帧" teal
+node gr "vlib图 dispatch 批量处理 零拷贝" amber
+node tx "interface-output 到 dpdk_interface_tx" green
+node tb "rte_eth_tx_burst 批量发送" green
+node rec "发送完成 回收 mbuf 释放 buffer" gray
+edge rx -> cvt "主动轮询 批量取"
+edge cvt -> gr "frame 帧"
+edge gr -> tx
+edge tx -> tb
+edge tb -> rec
+edge rec -> rx "下一轮轮询 虚线回环" dashed
+:::
+
+> **图 06-12-01 文字兜底**：PMD 在 input 阶段无中断轮询、`rte_eth_rx_burst` 批量收包（蓝），经 mbuf↔buffer 映射转成一批 index 组装成帧（青），帧沿 vlib 图被批量 dispatch、零拷贝处理（琥珀），末端由 `interface-output`→DPDK tx 回调→`rte_eth_tx_burst` 批量发送（绿），发送完成后回收 mbuf、释放 buffer（灰），虚线回到下一轮轮询。整条链以「批」为单位，对接 06-01 的向量模型。
+
+| 参数/环节 | 作用 | 取舍 | 相关篇目 |
+|---|---|---|---|
+| rx burst 上限 | 一次取多少包 | 大→吞吐高、尾时延略增 | 06-01 / 06-04 |
+| RSS 队列数 | 收包分散到多核 | 需与 worker 数匹配 | 06-06 / 06-07 |
+| hugepage mempool | mbuf/buffer 物理内存 | 减少 TLB miss、NUMA 对齐 | 06-04 / 06-10 |
+| tx burst | 一次发多少包 | 批量摊薄、及时回收 | 06-09 |
+| 持续轮询 vs 自适应 | 空转占核 vs 中断延迟 | 数据面通常选持续轮询 | 08-02 |
+| device class | 抽象底层设备 | 让上层不感知 DPDK | 05-05 / 07-01 |
+
+### 5. 配置/命令/代码实例
+
+本节给 PMD 相关的最小片段，**startup 全参数见 04-01、命令族见 04-03/04-06**，不重列清单。
+
+- **dpdk 配置示意**（全参数见 04-01）：
+
+```ini
+dpdk {
+  dev 0000:af:00.0 { num-rx-queues 4 }     # 参数语义/完整族见 04-01
+  # 大页、socket/NUMA、其它 dev 参数完整说明见 04-01
+}
+cpu {
+  corelist-workers 2-5                      # 与 RX 队列数匹配，见 06-06
+}
+```
+
+- **观察收发**：`show hardware-interfaces`、`show interface`、`show dpdk ...`、`show errors`、`show node runtime`（命令见 04-03/04-06）看队列、收发计数、丢包、节点耗时；判读见 08-02/08-03。
+- **rx/tx burst 代码骨架**：见第 4 节 `dpdk_input` 伪代码与 `dpdk_interface_tx` 说明；真实实现对照 `src/plugins/dpdk/input.c` / `device.c` 核验。
+- **mbuf↔buffer 映射**：见 `src/plugins/dpdk/buffer.c`（函数名/偏移约定需对照版本核验），字段见 05-04/05-11。
+- **验证实验**：固定流量下调 rx burst 上限，观察 `show node runtime` 里 `dpdk-input` 的 `vectors/call` 与每包 cycles（方法学见 08-01）；队列数/worker 数不匹配时观察是否出现 handoff 与吞吐回落（06-07、04-06）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**陷阱一：纯轮询空转被误判为「CPU 浪费」**。PMD 专职核空转是设计使然，用 `top` 看到 100% 是正常的；不要用「让 CPU 歇会儿」的思路去加 sleep，那会直接推高时延与丢包。是否省电/自适应是另一个维度的决策（08-02）。
+
+**陷阱二：burst 太小或帧长期不满**。rx burst 上限配得过小、或流量被过度分流，会让 `vectors/call` 长期接近 1，向量收益（06-01）与预取窗口（06-04）双双失效。用 `show node runtime` 监控。
+
+**陷阱三：RSS 队列数 / worker 数 / NUMA 错配**。队列少于 worker → 部分核空闲、可能触发 handoff（06-07）；队列多于 worker → 一个 worker 轮询多队列；网卡/buffer 池/worker 跨 NUMA → 每次收包跨节点访问（06-04）。部署见 03-02、参数见 04-01、排障见 08-04。
+
+**陷阱四：发送完成回收时机与 tx 丢包**。`rte_eth_tx_burst` 返回的是「成功入队数」，未入队的 mbuf/buffer 必须显式释放，发送完成的也要及时回收，否则 buffer 泄漏（06-09）。tx 队列满、描述符 ring 配置不当会造成静默丢包。
+
+**陷阱五：mbuf↔buffer 布局/偏移假设写死**。两者映射依赖 VPP 与 DPDK 版本的头尾空间约定（`src/plugins/dpdk/buffer.c`）；升级其中一个却没同步另一个会错位读包。跨版本核验（08-05）。
+
+**陷阱六：忽略 device class 抽象，把 DPDK 逻辑写死在上层**。`interface-output` 应通过 `vnet_device_class_t`（05-05）调用 tx，而非直接调 `rte_eth_tx_burst`；否则 af_packet/virtio/vhost 等其它设备类无法复用路径（07-01）。
+
+**陷阱七：把 input 节点当 INTERNAL 用**。`dpdk-input` 是 `VLIB_NODE_TYPE_INPUT`、由主循环每轮主动调用（06-05/06-02），不是被 pending frame 触发的；搞错类型会导致收包不触发或重复轮询。
+
+**最佳实践清单**：① 队列/worker/NUMA/hugepage 四者对齐；② burst 尽量凑满、监控 `vectors/call`；③ 未入队/已发送 buffer 都正确释放；④ 经 device class 抽象收发；⑤ 用 `show hardware-interfaces`/`show node runtime`/`show errors` 监控；⑥ 字段见 05-11/05-05/05-04、参数见 04-01、命令见 04-03/04-06。
+
+### 7. 小结与延伸阅读
+
+PMD 是 VPP 数据面与物理网卡之间的桥梁：用户态、无中断、持续轮询，`rte_eth_rx_burst` 批量收包经 mbuf↔buffer 映射组装成帧（对接 06-01 向量与 06-02 input 节点），图内零拷贝批量处理，末端 `interface-output` 经 device class 调 `rte_eth_tx_burst` 批量发送、回收后释放 buffer（06-09）。RSS 多队列 + worker 绑定让它天然 run-to-completion（06-06），整条链以「批」为单位、与全册主线完全一致。
+
+延伸阅读：input 节点与主循环 → **06-02**/**06-05**；向量与帧 → **06-01**；buffer 生命周期与 mbuf 映射 → **06-09**；缓存/NUMA/hugepage → **06-04**/**06-10**；线程绑定与 handoff → **06-06**/**06-07**；插件加载（DPDK 本身是插件）→ **06-11**；device class 与接口抽象 → **05-05**/**07-01**；`dpdk{}` 参数 → **04-01**、VFIO/大页部署 → **03-02**、命令 → **04-03**/**04-06**；`dpdk_main_t`/`dpdk_device_t` 字段 → **05-11**；轮询/自适应取舍与判读 → **08-02**、NUMA 排障 → **08-04**。
+
+## 06-13 Binary API 消息机制（控制面通道原理）
+
+### 1. 背景与动机
+
+01-03 讲过 VPP 是「数据面与控制面分离」的架构：数据面（vlib 图引擎 + worker）只负责高速转发，配置、查询、事件订阅、统计则由控制面完成。CLI（`vppctl`）是给运维人员交互用的，而真正让外部程序驱动 VPP 的是 **Binary API**——一条供 govpp、Honeycomb、VAT（`vpp_api_test`）、VCL、NETCONF 适配层、自研控制器使用的二进制消息通道（编程用法见 **04-07**）。本篇讲这条通道**在 VPP 内部的机制原理**：消息怎么定义、怎么序列化、怎么在控制面与数据面之间传输、怎么按 ID 分发到处理函数、以及异步事件如何推送。
+
+为什么需要专门讲原理？因为 Binary API 串联了本册多块机制，理解它才能把「一次配置下发」完整走通：控制面进程通过共享内存队列或 socket（**06-10** 的 `svm_queue_t` / socksvr）发一条消息 → VPP 侧 API 主循环读取 → 按消息 ID 查分发表调用 handler → handler 往往要改全局共享结构，需在 **barrier**（06-06/06-07）内完成 → 结果通过 reply 或 event 回传。它既不是简单的 RPC，也不是纯文本协议，而是一套「IDL 生成 + 定长/变长二进制消息 + 请求响应匹配 + 事件订阅」的完整体系。
+
+本篇边界要划清：**04-07 是控制面与 API 集成的权威源**（govpp/Honeycomb/VCL 编程、`exec`、配置持久化、事件订阅用法），本篇不重列那些编程示例；**06-10 是共享内存/队列内存布局的权威源**，本篇只把 `svm_queue`/socket 当作传输载体引用；**05-12 是 `vlib_api_main_t` / 消息头字段的权威源**，本篇不列字段表。本篇聚焦「消息机制、序列化、分发、event/回调」这条内部链路。
+
+### 2. 核心概念
+
+**IDL 与代码生成（vppapigen）**。VPP 用 `.api` 文件（IDL）定义消息，例如 `define xxx { u32 client_index; u32 context; ... }`、`autoreply define ...`、`option vnet ...` 等（语法需对照实际 `.api` 文件与 `src/tools/vppapigen/` 核验）。构建时 `vppapigen`（`src/tools/vppapigen/`）把 IDL 生成多语言产物：C 消息结构 `vl_api_xxx_t`、C 端 handler 声明、Java/Python 绑定、VAT 测试客户端代码、以及消息 ID 与名字的映射表。这套「IDL → 生成代码」的做法保证了控制面与数据面对消息布局理解完全一致，避免手工维护两套结构体。
+
+**消息结构与消息头**。每条消息是定长/变长的二进制结构：`vl_api_xxx_t` 通常以消息 ID（`_vl_msg_id`）、`client_index`、`context` 开头（字段见 **05-12**），后接具体参数。`client_index` 标识发起请求的客户端连接，`context` 是客户端自填的「请求相关值」，VPP 在 reply 里原样带回，用于把「异步到达的 reply」匹配到「当初发出的请求」——因为一条连接上可能同时飞着多个未完成的请求。`autoreply` 类消息框架自动回一个通用 reply，普通消息由 handler 显式构造 reply。
+
+**序列化与字节序**。消息在传输前按约定布局序列化：定长字段按 C 结构布局、必要时转网络字节序（消息头/整数字段的处理约定需对照 `src/vlibapi/` 核验），变长字段（如字符串、数组）用长度前缀 + 数据，或 `vl_api_..._t` 末尾的变长数组。消息总长放在消息头（字段见 05-12），接收方据此界定一条消息边界。因为 VPP 与客户端可能不同进程甚至不同字节序/字长，布局约定（对齐、字长、字节序）必须严格一致，这正是代码生成要解决的核心问题之一。
+
+**传输载体**。客户端通过 `socksvr`（startup 参数见 04-01）建立连接，通常有两种承载：一是**共享内存 `svm_queue_t` 双向队列**（06-10），请求/响应/事件都走共享队列、零拷贝、低延迟；二是 **unix domain socket** 传二进制消息（更通用、便于跨主机/调试）。VAT、govpp 等客户端封装了连接与队列细节（编程见 04-07）。数据面侧 `vlib_api_main_t`（字段见 05-12）维护消息缓冲、客户端表、handler 表与事件队列。
+
+**消息分发（按 msg_id 查 handler）**。VPP 侧 API 主循环（`src/vlibapi/`、`src/vlibmemory/` 的 `vl_msg_api_*` 相关，确切文件/函数需对照版本核验）读取一条消息 → 从消息头取 `_vl_msg_id` → 在 **handler 分发表**里找到对应处理函数（注册宏常形如 `vl_msg_api_set_handlers` / `VLIB_API_HANDLER` / `vl_api_..._t_handler`，确切名字需核验）→ 调用 handler。handler 通常做两件事之一：改配置/触发动作（可能经 barrier，06-06/06-07）并回 reply，或查询并回带数据的 reply。分发是「整数 ID → 函数指针」的 O(1) 查表，无字符串解析。
+
+**reply 与 event**。同步请求由 handler 回 reply（带 `context` 便于匹配）。异步通知走 **event**：客户端先发 `want_xxx_events`（订阅类消息，注册自己为事件接收者），当对应数据面事件发生（接口 up/down、邻居变化、统计阈值等）时，VPP 构造 event 消息推给订阅者。`vlib_api_main_t` 维护事件订阅者集合与待发事件队列（字段见 05-12）。event 与 reply 的区别是「无请求上下文、主动推送」。
+
+**api-trace 与调试**。`api-trace`（参数见 04-01、命令见 04-06）可记录进出的 API 消息，用于回放与排障；它挂在 API 收发路径上，是理解「到底发了哪些消息」的实用工具（判读见 08-03）。
+
+### 3. 关键数据结构与源码位置
+
+字段表一律回查 **05-12**，本节只给定位与职责。
+
+- 消息定义（IDL）：各 `*.api` 文件（`src/vnet/`、`src/vlib/`、`src/plugins/` 下），语法见 `src/tools/vppapigen/`。
+- 代码生成器：`src/tools/vppapigen/`（`vppapigen`、`vppapigen_c.py` 等，确切文件名需核验），生成 `vl_api_*.h` / 多语言绑定。
+- 消息头与 API 主结构：`vlib_api_main_t`、消息头字段见 **05-12**；声明在 `src/vlibmemory/vl_api.h` / `src/vlibapi/api.h` 一类头文件（确切路径需对照版本核验）。
+- 消息收发/分发：`vl_msg_api_handler` / `vl_msg_api_handler_with_vm` / `vl_msg_api_set_handlers` / `_vl_msg_id` 映射，在 `src/vlibapi/api.c`、`src/vlibmemory/memory_api.c` 一类（确切文件/函数需核验）；`svm_queue_t` 传输见 **06-10**。
+- handler 示例：各模块 `*_api.c`（如 `src/vnet/interface_api.c`、`src/vnet/ip/ip_api.c`、`src/plugins/.../*_api.c`），是读「handler 怎么写」的范本。
+- 事件订阅：`want_..._events` 类消息与 `vlib_api_main_t` 事件队列（字段见 05-12），机制见本篇第 4 节。
+- 配置/命令：`socksvr{}` / `api-trace{}` 参数见 **04-01**；`show api clients`、`show api`、`api trace` 命令见 **04-06**；控制面编程见 **04-07**。
+
+一句话记忆：`*.api` 定消息、`vppapigen` 生成代码、`svm_queue`/socket 传输（06-10）、`_vl_msg_id` → handler 分发、`context` 匹配 reply、`want_events` 走异步推送。
+
+### 4. 关键流程与调用链
+
+**阶段一：定义与生成**。开发者写 `xxx.api`（IDL）→ 构建期 `vppapigen` 生成 `vl_api_xxx_t` 结构、`_vl_msg_id` 常量、handler 原型、以及客户端绑定（C/Python/Java/VAT）。生成物把「消息名 ↔ ID ↔ 布局」固定下来，控制面与 VPP 各持一份一致定义。
+
+**阶段二：建连与传输**。客户端连 `socksvr`（04-01）→ 协商/映射共享区 → 建立 `svm_queue_t` 请求/响应队列（06-10）或 socket 连接 → 拿到本连接的 `client_index`（字段见 05-12）。
+
+**阶段三：请求入站与分发**。
+1. 客户端把参数填进 `vl_api_xxx_t`，序列化（定长字段 + 变长前缀 + 消息总长），写入请求队列（release 屏障，06-07/06-10）；
+2. VPP 侧 API 主循环从队列取消息（acquire）→ 读消息头 `_vl_msg_id` 与长度 → 边界校验；
+3. 用 `_vl_msg_id` 查 handler 分发表 → 调用 `vl_api_xxx_t_handler`（`vl_msg_api_handler`）；
+4. handler 执行：查询类直接组装 reply；配置类在 **barrier**（06-06/06-07）内改共享结构（如启停 feature 06-03、加接口/路由），改完构造 reply；
+5. reply 带原 `context` 写回响应队列/socket（release），客户端按 `context` 匹配到当初的请求。
+
+**阶段四：事件推送**。
+1. 客户端发 `want_xxx_events(enable, client_index, context)` 订阅 → VPP 把该 `client_index` 加入对应事件类型的订阅者集合（字段见 05-12）；
+2. 数据面/控制面事件发生（接口状态变化、统计刷新、表项变化等）→ 构造 event 消息；
+3. 遍历订阅者，把 event 写入各自响应队列；客户端异步读取、无需请求上下文。
+
+:::figure id=06-13-01 | name=Binary API 消息机制与分发 | dir=TD
+node api "*.api IDL 定义消息" blue
+node gen "vppapigen 生成 C/Python/Java/VAT" teal
+node cli "外部客户端 govpp/VAT/VCL/Honeycomb" gray
+node q "svm_queue 或 unix socket 传输" purple
+node hd "vl_msg_api_handler 按 _vl_msg_id 分发" amber
+node fn "handler 改配置(barrier)<br/>或查询 并 reply" amber
+node ev "want_events 订阅 异步事件推送" green
+edge api -> gen "代码生成"
+edge gen -> cli "语言绑定"
+edge cli -> q "序列化消息写入"
+edge q -> hd "读取 msg_id"
+edge hd -> fn "函数指针"
+edge fn -> q "reply 带 context 回写"
+edge fn -> ev "触发事件"
+edge ev -> q "event 消息"
+:::
+
+> **图 06-13-01 文字兜底**：`*.api` IDL 经 `vppapigen` 生成多语言绑定（蓝→青），外部客户端（灰）把消息序列化后经 `svm_queue`/socket（紫，内存布局见 06-10）送进 VPP；VPP 按 `_vl_msg_id` 查表分发到 handler（琥珀），handler 在 barrier 内改配置或查询后带 `context` 回 reply；事件路径（绿）由 `want_..._events` 订阅、事件发生时主动推送 event。reply 与 event 都回写同一传输通道。
+
+| 层次 | 关键元素 | 作用 | 相关篇目 |
+|---|---|---|---|
+| 定义 | `*.api` / `vppapigen` | 统一消息布局与 ID | 本篇 |
+| 结构 | `vl_api_xxx_t` / 消息头 | msg_id / client_index / context | 字段见 05-12 |
+| 传输 | `svm_queue_t` / socket | 请求/响应/event 承载 | 06-10 |
+| 分发 | `vl_msg_api_handler` / ID→函数表 | 按 msg_id 调用 handler | 本篇 |
+| 匹配 | `context` / `client_index` | 异步 reply 匹配请求 | 本篇 |
+| 通知 | `want_..._events` / 事件队列 | 主动推送异步事件 | 本篇 |
+| 改动 | barrier + handler | 安全改共享结构 | 06-06 / 06-07 |
+
+**调用链文字化**：客户端 `vl_api_xxx_t` → 序列化 → `svm_queue_add`（06-10）→ VPP `vl_msg_api_handler` 取 `_vl_msg_id` → `vl_api_xxx_t_handler` →（配置类：`vlib_worker_thread_barrier_sync` → 改结构 → `release`）→ 构造 reply（带 `context`）→ `svm_queue` 回写 → 客户端按 `context` 匹配。事件：`want_xxx_events` → 注册订阅者 → 事件发生 → 构造 event → 推送。
+
+### 5. 配置/命令/代码实例
+
+本节给消息机制的最小片段，**控制面编程与集成见 04-07、startup 全参数见 04-01、命令族见 04-06**，不重列清单。
+
+- **IDL 定义骨架**（`*.api`，语法需对照 `src/tools/vppapigen/` 与现有 `.api` 核验）：
+
+```c
+option version = "1.0.0";
+autoreply define my_feature_enable
+{
+  u32 client_index;
+  u32 context;
+  u32 sw_if_index;
+  u8  enable;
+};
+```
+
+- **handler 注册与实现骨架**（`src/vlibapi/` 与模块 `*_api.c`，宏/函数名需对照版本核验）：
+
+```c
+static void
+vl_api_my_feature_enable_t_handler (vl_api_my_feature_enable_t * mp)
+{
+  /* 配置改动：在 barrier 内改共享结构 */
+  vlib_worker_thread_barrier_sync (vlib_get_main ());
+    vnet_feature_enable_disable (...);
+  vlib_worker_thread_barrier_release (vlib_get_main ());
+  /* autoreply 由框架回；普通消息此处构造 REPLY 并 vl_msg_api_send */
+}
+/* 注册：vl_msg_api_set_handlers(MSG_ID, name, handler, ...)，确切 API 需核验 */
+```
+
+- **传输/调试配置示意**：`socksvr{}`（socket 路径）、`api-trace{ on }`（消息记录），全参数见 **04-01**；`show api clients`、`show api`、`api trace` 命令见 **04-06**。
+- **客户端用法**（govpp / VAT / VCL / Honeycomb、事件订阅）见 **04-07**，本篇不重列。
+- **验证手段**：开启 `api-trace`（04-01/04-06）记录一次配置下发的完整消息流，确认「请求 msg_id → handler → reply context」链路；用 `show api clients`（04-06）看连接与 `client_index`。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**陷阱一：消息布局/字节序/字长不一致**。客户端与 VPP 对 `vl_api_xxx_t` 的对齐、字节序、变长字段长度理解不一致，会解析出乱码或越界。始终用 `vppapigen` 生成的绑定、不要手写消息结构；跨语言/跨版本尤其要核验（04-07、08-05）。
+
+**陷阱二：变长消息长度/边界处理**。字符串、数组用长度前缀，接收方必须按消息头里的总长做边界校验；漏校验会读到相邻消息或越界（安全边界，见系统安全要求）。
+
+**陷阱三：`context` / `client_index` 用错**。reply 必须原样带回请求的 `context`，否则客户端无法匹配并发请求；`client_index` 写错会把 reply/event 发到别的连接。autoreply 也要正确带 context。
+
+**陷阱四：handler 未注册 / msg_id 冲突**。新增消息若忘记 `vl_msg_api_set_handlers` 之类注册，或 ID 映射不一致，消息会被丢弃或误分发。构建后核对生成的 ID 表与 handler 表（04-07）。
+
+**陷阱五：配置类 handler 绕过 barrier 改共享结构**。这与 06-06/06-07 一脉相承：直接改 FIB/feature/接口表会让 worker 读到撕裂状态。配置 handler 必须在 barrier 内串行化，且窗口内不阻塞。
+
+**陷阱六：事件订阅泄漏 / 风暴**。`want_..._events` 订阅者断连后若未从集合移除，会向失效 `client_index` 推消息；高频事件（如逐包统计）大量推送会淹没控制面。订阅要对称清理、事件要节流（字段见 05-12）。
+
+**陷阱七：把 Binary API 与 CLI、统计混为一谈**。CLI 是文本交互（04-02）、stat segment 是 mmap 共享统计（06-10/08-02）、Binary API 是二进制消息通道（本篇/04-07）；三者入口与用途不同，排障时先分清走哪条。
+
+**最佳实践清单**：① 用 IDL 生成绑定、不手写结构；② 严格校验消息长度与变长字段；③ reply 带回 `context`、写对 `client_index`；④ 配置 handler 走 barrier；⑤ 事件订阅对称注册/清理、节流；⑥ 用 `api-trace`/`show api clients` 排障；⑦ 字段见 05-12、传输见 06-10、编程见 04-07、命令见 04-06、参数见 04-01。
+
+### 7. 小结与延伸阅读
+
+Binary API 是「控制面驱动数据面」的机制主干：`*.api` IDL 经 `vppapigen` 生成一致的多语言绑定，消息以定长/变长二进制结构经 `svm_queue`/socket（06-10）传输，VPP 按 `_vl_msg_id` 查表分发到 handler，配置类 handler 在 barrier（06-06/06-07）内安全改共享结构，`context` 匹配 reply、`want_..._events` 走异步事件推送。理解这条链，就把「一次配置下发」从客户端一直到 worker 安全改状态串通了。
+
+延伸阅读：控制面编程与集成（govpp/Honeycomb/VCL/事件订阅/`exec`/持久化）→ **04-07**；`vlib_api_main_t` / 消息头字段 → **05-12**；`svm_queue`/共享内存布局 → **06-10**；barrier 与共享结构一致性 → **06-06**/**06-07**；插件如何注册 API handler → **06-11**；启停 feature 的配置动作 → **06-03**；`socksvr`/`api-trace` 参数 → **04-01**、`show api`/`api trace` 命令 → **04-06**、判读 → **08-03**；CLI 注册 → **04-02**；统计导出 → **06-10**/**08-02**；版本迁移 → **08-05**。
+
+---
+
+## 06-14 QoS、流分类与流量管理原理
+
+### 1. 背景与动机
+
+到此为止，本册讲的都是「怎么把包又快又准地转发出去」。但真实网络不只是尽力而为（best-effort）转发：运营商要限速与计费、企业要保障关键业务带宽、数据中心要做租户隔离、边界要防流量突发打满链路。这些需求统称为 **QoS / 流量管理**，落到数据面就是四件事：**分类**（这个包属于哪条流/哪类业务）、**监管**（它有没有超速、超速了是标记还是丢弃）、**标记**（给它打上 DSCP/优先级等标记，供后续或下游设备处理）、**排队调度**（拥塞时按优先级/权重决定谁先发、谁后发）。
+
+VPP 把这套能力做成一组可插拔的图节点/feature（06-03），而不是写死在转发路径里。这与全册主线一脉相承：分类、监管、标记各自是独立节点，通过 feature arc 挂到合适的插入点（如 `ip4-unicast` 入口、出口），按接口独立启停（06-03），处理一批包（06-01 向量循环），结果通过 `vnet_buffer(b)` 的 opaque 字段（05-04）在节点间传递，最终在出接口前完成排队与调度。理解「QoS 也是一组节点 + 一份每包上下文」这个视角，就不会把它当成另一套神秘子系统。
+
+几个设计约束值得先点明。第一，**分类要快**：每包都要查表，必须哈希 O(1)、缓存友好（06-04），不能线性遍历 ACL 规则。第二，**监管要准且无锁**：令牌桶状态按 per-thread / per-policer 维护，避免多 worker 竞争（06-06/06-07）。第三，**标记与顺序**：DSCP 改写必须在封装/rewrite 前后的正确位置，否则可能被后续封装覆盖或写到错层。第四，**HQoS 与 worker 模型**：层次化队列调度往往需要按端口/按类排队，与多 worker 的出接口绑定要协调，避免跨线程传递破坏 run-to-completion（06-06/06-07）。
+
+本篇把 classify、policer、marking、HQoS 四类机制的原理、源码位置、调用链与取舍讲清。**结构体字段一律不列全表**：classify/policer 相关结构字段请对照实际版本核验头文件路径（下面给出），每包 QoS 上下文见 **05-04**；相关模块字段在 05 大纲中如无对应篇，统一标注「需对照实际版本核验」并给可定位头文件。**命令族见 04-05（网络服务与插件命令全集含 policer/classify）、show 命令见 04-06，不重列清单**；QoS 功能模块与组网行为见 **07-11**。
+
+### 2. 核心概念
+
+**流分类（classify）**。VPP 的 `vnet_classify`（`src/vnet/classify/`）提供「按报文任意字段组合做哈希匹配」的通用分类：用户定义一张 classify table，指定 **mask**（从报文头里抽取哪些字节参与匹配，支持 L2/L3/L4 字段任意组合）、**match 规则**（期望的值）、**桶大小/表大小**、以及**命中后的动作**（`next_index` 分流、`opaque` 标记、policer 索引、或跳到下一张表形成 table 链）。匹配时用 mask 抽出关键字节 → 算哈希 → 定位 bucket → 在桶内比对，O(1) 且缓存友好（呼应 06-04/06-08 的 bihash 思路）。多张表可以串成链实现「先匹配 A 再匹配 B」的复杂分类。分类结果通常写进 `vnet_buffer(b)` 的 opaque（05-04），供后续 policer/marking 节点读取。classify 与 ACL（07-08）关系密切：ACL 可基于 classify 或会话表实现状态化匹配（功能模块见 07-08）。
+
+**监管（policer / 令牌桶）**。`src/vnet/policer/` 实现限速：每个 policer 维护一个**令牌桶**（token bucket），按配置的速率（CIR/PIR、CBS/PBS 等参数，确切参数需对照实际版本核验）随时间补充令牌，报文到达时按长度扣令牌，依据剩余令牌把包标成不同 **color**（如绿/黄/红，对应 conform / exceed / violate）。VPP 支持单速率（srTCM）与双速率（trTCM）等算法（确切实现需核验），color 决定后续动作：绿色放行、黄色标记降优先级、红色丢弃或重标记。令牌桶状态按 per-thread 或 per-policer 独立维护，避免 06-06/06-07 的跨核竞争；时间来自 06-05/06-15 的 `vlib_time_now`，避免每包系统调用。
+
+**标记（marking）**。QoS 标记主要是改写 IP 头的 DSCP/ECN 字段（IPv4 ToS / IPv6 Traffic Class），或二层 802.1p 优先级（`src/vnet/qos/` 及相关 rewrite 代码）。标记可由 classify 命中结果、policer color、或接口/表配置触发。关键取舍是**顺序**：DSCP 改写要在 rewrite/封装前完成，且不能被隧道外层头的默认 DSCP 覆盖；「继承/透传外层 DSCP」与「重新标记」是常见配置点（命令见 04-05）。
+
+**HQoS（层次化 QoS）**。普通 QoS 是「一个出接口一个队列」，HQoS 则是「端口 → 子端口 → 管道（pipe）→ 业务类 → 队列」的多级层次，每级可配速率/权重/优先级，拥塞时由调度器（如 DPDK `rte_sched` 或 sw queue）按层次决定出队顺序（`src/plugins/dpdk/` 的 HQoS 相关、`src/vnet/` 的 queue/调度，确切实现需对照版本核验）。实现上，出接口前按分类结果把包放进对应队列/类，调度器批量出队交给 tx（06-12）。HQoS 与多 worker 结合时要处理「同一端口的队列由哪个 worker 驱动」，避免跨线程传递（06-06/06-07）。
+
+**每包 QoS 上下文与节点编排**。分类/监管/标记结果暂存于 `vnet_buffer(b)` opaque（字段见 **05-04**，与 06-03 的 feature 游标、06-09 的元数据同处一片空间），节点间靠它传递「这个包的 class / color / policer index / next」。整套 QoS 通过 feature arc（06-03）挂成子链：入口分类 → 监管 → 标记 → 出口排队，均为 `INTERNAL` 节点（06-02）、遵守向量循环（06-01）。
+
+**分类到队列的映射**。classify 命中的「class id」可直接映射到 HQoS 的队列/管道，或映射到 policer 索引；「分类 → 监管 → 标记 → 排队」构成一条完整的流量管理链。理解这四级的上下游关系（而非孤立看某个命令），是本篇核心。
+
+### 3. 关键数据结构与源码位置
+
+字段表一律回查 05 或标注核验，本节只给定位与职责。
+
+- classify：`vnet_classify_table_t` / `vnet_classify_entry_t` / mask / session 等，位于 `src/vnet/classify/vnet_classify.c`、`classify.h`（确切文件名/字段需对照实际版本核验）；分类结果写 `vnet_buffer(b)`（字段见 **05-04**）。
+- policer：`policer_t` / 令牌桶状态 / `qos_police` 类函数，位于 `src/vnet/policer/policer.c`、`policer.h`；color、速率参数需对照版本核验；时间来源见 **06-05**/**06-15**。
+- marking / QoS 改写：`src/vnet/qos/`、`src/vnet/ip/ip*_rewrite.c` 相关，DSCP/ToS/802.1p 字段处理需核验；报文头字段见 **05-08**（以太网/VLAN）、IP 头字段需对照 `src/vnet/ip/` 核验。
+- HQoS / 队列调度：DPDK HQoS（`rte_sched` 集成，在 `src/plugins/dpdk/`）、VPP sw queue / interface-output 排队（`src/vnet/interface_output.c`，06-02/06-12），确切实现需对照版本核验。
+- 每包上下文 opaque：`vnet_buffer(b)` 字段见 **05-04**，`src/vnet/buffer.h`（与 06-03/06-09 共用）。
+- feature 编排：`VNET_FEATURE_REGISTER` / arc 见 **06-03**、字段见 **05-06**。
+- 命令/配置：classify table、policer、mark、HQoS 的 CLI 与插件参数见 **04-05**；show 命令见 **04-06**；功能模块见 **07-11**。
+
+一句话记忆：`classify/` 管哈希分类、`policer/` 管令牌桶、`qos/`+rewrite 管标记、DPDK/sw queue 管 HQoS 调度，全部结果经 opaque（05-04）串联、经 feature arc（06-03）挂链。
+
+### 4. 关键流程与调用链
+
+**阶段一：配置期建表与挂链**。控制面经 CLI/API（04-05/04-07）创建 classify table（mask + 匹配规则 + 命中动作）、policer（速率/桶参数）、HQoS 层级与队列映射；把 classify/policer/mark 节点通过 feature arc（06-03）按接口启停，生成 config chain。表结构建在共享内存/堆上（06-10），数据面只读。
+
+**阶段二：入口分类**。收包沿图到达 feature 子链（06-03）的 classify 节点 → 对一帧里每个包：按 table 的 mask 从报文头抽关键字节 → 算哈希定位 bucket → 比对命中 → 把命中的 `next_index` / class id / policer index / 标记写进 `vnet_buffer(b)` opaque（05-04）→ 按结果分流到下游节点（06-01/06-02）。未命中走默认动作。多表命中可串联（table 链）。
+
+**阶段三：监管（令牌桶）**。policer 节点读取 opaque 里的 policer index → 取对应令牌桶状态（per-thread/per-policer，06-06）→ 用 `vlib_time_now`（06-05/06-15）按时间补令牌 → 按包长扣令牌 → 判定 color（绿/黄/红）→ 依 color 决定 mark / drop / 放行，并把 color 写回 opaque 供后续使用。
+
+**阶段四：标记**。marking 节点依 color / class / 接口配置改写 IP DSCP/ECN 或二层 802.1p（在 rewrite/封装前的正确位置），写回报文头（06-09 的 `current_data` 改写，零拷贝）。
+
+**阶段五：排队与调度（HQoS）**。出接口前，按 class/队列映射把包放入相应队列；拥塞时由调度器按层级优先级/权重批量出队（DPDK `rte_sched` 或 sw queue）→ `interface-output` → tx（06-12）。多 worker 下需保证同一端口队列的驱动归属明确（06-06/06-07）。
+
+:::figure id=06-14-01 | name=QoS 流分类监管与队列调度流程 | dir=TD
+node in "收包进入 feature 子链" blue
+node cl "classify node mask+hash 查表命中" teal
+node po "policer node 令牌桶计量 判定color" amber
+node mk "marking 改写 DSCP 或 drop" amber
+node hq "HQoS 按 class 入队 层次调度" purple
+node out "出接口 tx 发送" green
+edge in -> cl "向量批处理"
+edge cl -> po "写 opaque class/policer"
+edge po -> mk "color 决定 mark/drop"
+edge mk -> hq
+edge hq -> out "批量出队"
+:::
+
+> **图 06-14-01 文字兜底**：报文进入 feature 子链后先由 classify 节点按 mask+hash 查表分类（青），结果（class/policer index/next）写入 opaque；policer 节点用令牌桶计量判定 color（琥珀），marking 据 color 改写 DSCP 或丢弃（琥珀），随后进入 HQoS 按 class 入队并层次化调度（紫），最终批量出队交出接口发送（绿）。整条链以向量批处理、结果经每包上下文串联。
+
+| 机制 | 源码（核验） | 核心算法 | 输入/输出 | 关联篇目 |
+|---|---|---|---|---|
+| classify | `src/vnet/classify/` | mask + 哈希 bucket 比对 | 报文→class/next | 06-08 / 07-08 |
+| policer | `src/vnet/policer/` | 令牌桶 srTCM/trTCM | 包长+时间→color | 06-05 / 06-15 |
+| marking | `src/vnet/qos/` / rewrite | DSCP/ToS/802.1p 改写 | color→标记 | 06-09 / 05-08 |
+| HQoS | DPDK `rte_sched` / sw queue | 层次队列 + 加权调度 | class→队列→出队 | 06-12 / 07-11 |
+| 上下文 | `vnet_buffer(b)` | opaque 串联 | 字段见 05-04 | 06-03 / 06-09 |
+| 编排 | feature arc | 按接口启停子链 | 见 06-03 | 05-06 |
+
+**调用链文字化**：CLI/API 建表挂链（04-05/04-07/06-03）→ 收包沿子链 → `classify` 节点（mask+hash→opaque class/policer）→ `policer` 节点（令牌桶→color）→ `marking`（DSCP 改写或 drop）→ HQoS 入队/调度 → `interface-output`/tx（06-12）→ 释放 buffer（06-09）。分类/监管/标记均为遵守向量循环的 `INTERNAL` 节点（06-01/06-02）。
+
+### 5. 配置/命令/代码实例
+
+本节给 QoS 机制的最小片段，**完整命令族见 04-05、show 命令见 04-06、startup 全参数见 04-01**，不重列清单。
+
+- **CLI 示意**（完整语法/参数见 04-05）：`classify table ... masks ...`、`set policer ...`（速率/桶参数）、`set interface ... policer ...`、`set ip dscp rewrite ...`、`show classify tables` / `show policer`（命令见 04-06/04-05）。这里只给示意，不展开参数语义。
+- **classify 节点查表示意骨架**（结构/函数需对照 `src/vnet/classify/` 核验）：
+
+```c
+/* 每包：按 mask 抽 key，哈希定位 bucket，比对命中 */
+vnet_classify_entry_t *e = vnet_classify_hash_entry (table,
+                              vlib_buffer_get_current (b), mask);
+if (e) {
+  vnet_buffer (b)->qos.class_id = e->next_index;   /* 写 opaque，字段见 05-04 */
+  next0 = e->next_index;                           /* 按命中结果分流 */
+}
+```
+
+- **policer 计量骨架**（`src/vnet/policer/`，函数名需核验）：以 `vlib_time_now` 补令牌、按 `b->current_length` 扣令牌、判定 color → `MARK` / `DROP`，写回 opaque。
+- **标记骨架**：在 rewrite 前改写 IP 头 ToS/Traffic Class 的 DSCP 位；配合 `current_data` 零拷贝改写（06-09）。
+- **验证手段**：`show classify tables`、`show policer`、`show errors`、`show interface` / `show hardware-interfaces`（命令见 04-06/04-03）看命中计数、监管统计、丢弃；判读见 08-02/08-03；限速效果用打流仪按 RFC2544 思路验证（08-01）。
+
+**完整示例：配置 classify 与 policer 并观察命中计数**。
+
+```bash
+vppctl classify table masks match l3 ip4 src
+vppctl set policer cir 1000 cbs 100000 rate kbps
+vppctl show classify tables
+vppctl show policer
+```
+
+```text
+Table 0: mask l3 ip4 src, buckets 16384, active sessions 2, hits 120034
+  matched packets 120034, misses 88912
+Policer 0: cir 1000 kbps, cbs 100000
+  conform 98000, exceed 18000, violate 4034, drops 4034
+```
+
+判读说明：`show classify tables` 的 `hits` / `matched packets` 是节点按 mask 抽出 key、哈希定位 bucket 后的命中累计数（字段见 05-09），命中结果写入 buffer 的 opaque 区并据此分流（字段见 05-04）。`show policer` 的 conform / exceed / violate 三色计数来自令牌桶：按时间补令牌、再按 `b->current_length` 扣令牌（字段见 05-04）后判定颜色，violate 的包被丢弃，故 `drops` 与 violate 一致、其余两色之和约等于 `matched`。若 `hits` 长期为 0，通常是 mask 与流量字段不匹配或表未挂到 feature arc 上（编排见 06-03）。命令全参数见 04-05，classify / policer 的结构与函数需对照 `src/vnet/classify/`、`src/vnet/policer/` 核验（需对照实际版本核验）。若 conform 与 exceed 之和远小于 matched，要先确认表是否真的挂到了入向 feature，再检查 `set interface ... policer` 绑定的方向；`show errors` 里的丢弃计数可与 `drops` 交叉核对。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**陷阱一：classify mask 设计不当**。mask 抽错字段/长度会让所有包哈希到同一 bucket（冲突退化成线性）或永不命中。按报文布局精确设 mask，并用 `show classify tables`（04-06）看命中率与冲突；表大小/桶大小需匹配流数量（哈希取舍见 06-08）。
+
+**陷阱二：令牌桶参数与时间源**。速率/桶深单位（bps vs pps、字节 vs 包）配错会限速失准；每包读系统时钟会破坏向量收益，必须用 `vlib_time_now`（06-05/06-15）由主循环每轮更新的时间。参数语义需对照实际版本核验。
+
+**陷阱三：标记顺序与封装覆盖**。DSCP 改写若在隧道封装之后做，会被外层头默认 DSCP 覆盖、或改错层；「透传 vs 重标记」要与隧道/rewrite 配置协调（07-06、04-05）。
+
+**陷阱四：policer 状态跨 worker 竞争**。令牌桶若被多个 worker 共享写，会引入锁/伪共享（06-04/06-06/06-07）。应 per-thread/per-policer 维护或按流钉到单一 worker（06-06/06-07 的流到 worker 映射）。
+
+**陷阱五：HQoS 与多 worker 队列归属不清**。同一端口队列被多 worker 驱动会造成跨线程传递、包序与调度语义混乱；需明确队列由哪个 worker/线程驱动，尽量保持 run-to-completion（06-06/06-07/06-12）。
+
+**陷阱六：opaque 字段复用冲突**。classify/policer/marking 都往 `vnet_buffer(b)` opaque 写上下文（05-04），而 06-03 的 feature 游标、06-09 的邻接元数据也在同一片空间；自定义节点务必按框架约定使用字段、克隆 buffer 时正确继承/重置（06-09 陷阱三），否则子链/监管结果错乱。
+
+**陷阱七：把 QoS 当孤立命令理解**。分类→监管→标记→排队是上下游链，只配 policer 不配分类映射、或只配 classify 不挂 feature 子链，都会「配了不生效」。用 `show interface features`（04-06）确认子链已挂。
+
+**最佳实践清单**：① 精确设 mask、监控命中率与冲突；② 令牌桶参数按单位精确、时间用 `vlib_time_now`；③ 标记放在封装/rewrite 前的正确位置；④ policer 状态 per-thread、HQoS 队列归属明确；⑤ opaque 按框架约定使用；⑥ 用 `show classify tables`/`show policer`/`show errors` 验证整条链；⑦ 命令见 04-05、show 见 04-06、功能见 07-11、字段见 05-04。
+
+### 7. 小结与延伸阅读
+
+QoS 不是另一套子系统，而是「一组遵守向量与图模型的 feature 节点 + 一份每包上下文」：classify 用 mask+哈希快速分类，policer 用令牌桶判定 color，marking 改写 DSCP/优先级，HQoS 按层次队列调度出队，结果经 `vnet_buffer(b)` opaque 串联、经 feature arc 按接口编排。理解「分类→监管→标记→排队」这条上下游链，以及它与 06-01/06-03/06-04/06-06 的复用关系，就掌握了 VPP 流量管理的原理主干。
+
+延伸阅读：vector/图/feature 基础 → **06-01**/**06-02**/**06-03**；每包上下文 opaque → **05-04** / **06-09**；哈希容器取舍 → **06-08**；时间与定时器 → **06-05**/**06-15**；线程/无锁 → **06-06**/**06-07**；出接口 tx → **06-12**；classify/ACL 模块 → **07-08**、QoS/policer/HQoS 模块 → **07-11**；CLI 命令 → **04-05**、show 命令 → **04-06**、统计判读 → **08-02/08-03**、压测方法 → **08-01**；隧道封装顺序 → **07-06**。
+
+## 06-15 定时器、事件与进程节点
+
+### 1. 背景与动机
+
+前面十四篇把 VPP 数据面描述成一条由向量驱动的流水线：input node 收包、internal node 按 feature arc 逐级处理、output node 发送。这条流水线有一个隐含前提——每个节点都是**无状态、非阻塞、一次调用处理一批报文**的。图节点运行时的契约非常苛刻：`vlib_node_runtime_t` 派发下来的函数必须在有限时间内返回，不能睡眠、不能等锁、不能做阻塞式 I/O，因为 worker 线程的主循环正被它占着，一次停顿会让该核上所有接口一起丢包。
+
+但真实系统里存在大量"不适合放进包处理路径"的工作：ARP/ND 邻居表项的老化扫描、NAT 会话超时回收、IPsec SA 的 rekey 定时检查、BFD 会话按周期发送检测报文、接口统计的周期性采集、插件向控制面上报状态、以及在启动阶段等待硬件初始化完成。这些任务的共同特征是：**由时间或外部事件触发、执行频率远低于包速、允许被延迟、自身可能包含多步逻辑甚至等待**。把它们硬塞进图节点会造成两种后果：要么每个包都检查一遍"是否到了该做的时间"（无谓的分支与缓存污染），要么在图节点里忙等（直接违反非阻塞契约）。
+
+VPP 的答案是把这类工作从图节点体系中剥离出来，交给一类特殊节点——**进程节点（process node）**。`vlib_process_t` 运行在一个由主循环协作式调度的"轻量协程"环境里，它可以主动挂起自己等待事件或超时，把 CPU 让回给包处理循环，等条件满足后再从挂起点继续执行。配合定时轮（timing wheel）与事件/信号机制，VPP 在主线程内实现了一套不依赖操作系统线程、不需要锁、且不会阻塞数据面的异步任务框架。本篇要讲清三件事：进程节点凭什么能"挂起而不阻塞"、定时轮如何做到 O(1) 级的海量定时器管理、以及事件与 barrier 如何与多线程主循环协同。理解这套机制，才能解释为什么 `show runtime` 里一些节点平时显示零耗时却会在特定时刻突然活跃，也才能避免在插件里写出"睡 1 秒等接口 up"这类会拖垮整个转发面的错误代码。
+
+（字段见 05-xx：本篇涉及的结构体只作概念性引用，不重列字段表；机制与调度主循环见 06-05，线程模型见 06-06，帧递交见 06-07；相关 CLI 与统计见 04-06 / 08-02。）
+
+### 2. 核心概念
+
+**进程节点（process node）**：一种注册类型为 `VLIB_NODE_TYPE_PROCESS` 的节点。它与 `VLIB_NODE_TYPE_INPUT` / `VLIB_NODE_TYPE_INTERNAL` 的根本区别不在"处理什么"，而在"如何被调度"。普通图节点的函数被主循环以"来一批帧就调一次"的方式调用，函数返回即结束本轮；进程节点的函数体是一个**长期存在的执行流**，内部可以多次调用挂起原语，每次挂起都把控制权交还主循环，恢复时从挂起点继续往下执行，局部变量保持不变。VPP 用 `vlib_process_t` 记录这个执行流的栈、事件队列、挂起原因与唤醒条件。
+
+**协作式调度（cooperative scheduling）**：进程节点不是 OS 线程，没有独立内核栈、不参与抢占式调度。它由 `vlib_main_loop` 在每轮循环的合适时机检查"哪些进程节点已就绪"，把 CPU 借给它们；进程节点必须**主动**通过挂起原语交还控制权。这意味着一个进程节点若写了死循环或阻塞系统调用，整个 worker（通常是 main 线程）会被卡死，且没有别的线程能救它——这是本篇最重要的约束。
+
+**挂起/唤醒原语**：`vlib_process_wait_for_event()` 挂起直到任意事件到达；`vlib_process_wait_for_event_or_clock (seconds)` 挂起直到事件到达或超时；`vlib_process_suspend (seconds)` 只按时间挂起；`vlib_process_signal_event (vm, node_index, type, opaque)` 由其他代码主动向指定进程节点投递事件并使其就绪。事件携带一个类型码与一组 opaque 数据，供进程节点区分"这次唤醒是邻居老化还是 SA 到期"。这些接口的具体签名与参数顺序**需对照实际版本核验**，头文件位于 `src/vlib/process.h`、`src/vlib/node_funcs.h` 一带。
+
+**定时轮（timing wheel）**：当定时器数量达到几十万（NAT 会话、IPsec SA、BFD 会话、邻居表项各有自己的超时）时，用最小堆或链表按到期时间排序会带来 O(log n) 或 O(n) 的插入开销，且每包路径都要碰它。VPP 采用分层定时轮：把时间轴划分成若干"槽（slot）"，每个槽挂一个到期定时器链表；推进时只处理当前槽，插入时按到期滴答直接取模定位槽位，均摊 O(1)。`src/vppinfra/` 下提供了多种参数化的定时轮模板（文件名形如 `tw_timer_*`，槽数、轮层数、滴答粒度由模板参数确定，具体可用变体**需对照实际版本核验**），上层再封装成 `vlib_signal_timer` 之类的接口供插件使用。
+
+**事件（event）与信号（signal）**：这两个词在 VPP 代码里含义接近但不完全等同。event 通常指进程节点之间/从图节点到进程节点的异步通知，带类型与 opaque；signal 更多用于"一次性触发某个处理"的轻量标记，以及 `vlib_signal_timer` 这类定时回调。实践中可以理解为同一套"投递—就绪—唤醒"机制的不同封装层。
+
+**barrier（屏障）**：当控制面需要修改全局数据结构（增删接口、改 worker 数、重载配置）时，必须让所有 worker 暂时离开包处理循环，这就是 barrier。进程节点与 barrier 有微妙关系：进程节点一般只运行在 main 线程，但 barrier 期间主循环本身处于特殊状态，若进程节点此时挂起等待某个只有 worker 才能产生的事件，就会形成互相等待。因此涉及全局配置变更的代码要走 `vlib_worker_thread_barrier_sync` / `..._release` 配对，且不要在 barrier 持有期间做长耗时等待（详见 06-06 / 06-07）。
+
+:::figure id=06-15-01 | name=进程节点协作式调度与定时轮 | dir=TD
+node n1 "vlib_main_loop" blue
+node n2 "包处理图节点" teal
+node n3 "就绪进程节点" purple
+node n4 "定时轮" amber
+node n5 "事件队列" amber
+edge n1 -> n2 "每轮派发"
+edge n1 -> n3 "检查就绪"
+edge n3 -> n1 dashed "挂起让出 CPU"
+edge n4 -> n5 "到期投递事件"
+edge n5 -> n3 "唤醒"
+:::
+
+### 3. 关键数据结构与源码位置
+
+| 名称 | 作用 | 源码位置 |
+|---|---|---|
+| `vlib_process_t` | 进程节点执行流状态：事件队列、挂起原因、恢复点、私有栈 | `src/vlib/process.c` / `src/vlib/process.h` |
+| `vlib_node_t` / `vlib_node_runtime_t` | 节点注册与运行时；进程节点是其中一种 `type` | `src/vlib/node.c` / `src/vlib/node.h`（字段见 05-03） |
+| `vlib_main_t` 中的进程相关成员 | 就绪/挂起进程索引、事件与定时轮句柄 | `src/vlib/main.c` / `src/vlib/global_funcs.h`（字段见 05-02） |
+| 定时轮模板 | 分层时间轮、槽、滴答、到期链表 | `src/vppinfra/tw_timer_*.h`（具体模板参数需对照实际版本核验） |
+| `VLIB_REGISTER_PROCESS` / `VLIB_PROCESS_NODE` | 进程节点注册宏 | `src/vlib/process.h` 及使用该宏的插件源码 |
+| `vlib_signal_timer` 相关接口 | 定时器创建/更新/停止与到期回调 | `src/vlib/` 下 timer 相关文件 |
+| `elog` / `vlib_elog_*` | 事件日志记录，用于排障调度时序 | `src/vlib/elog.c`、`src/vppinfra/elog.h` |
+
+一个常见困惑是"进程节点到底有没有独立栈"。答案是有独立的执行上下文，但它不是 pthread：VPP 通过 `clib_setjmp` / `clib_longjmp` 系列（或等价的协程切换实现，具体机制**需对照实际版本核验**，相关代码在 `src/vppinfra/` 的 `longjmp` / `setjmp` 封装与 `src/vlib/process.c`）保存与恢复寄存器现场，使得挂起时函数栈帧与局部变量得以保留。这解释了为什么进程节点函数可以写成一个从头到尾顺序执行的大函数，中间穿插多次 `wait`，而不必把状态机拆成回调。
+
+### 4. 关键流程与调用链
+
+**注册与启动**：插件或核心模块用 `VLIB_REGISTER_PROCESS`（宏名与签名需对照实际版本核验）声明一个 `VLIB_NODE_TYPE_PROCESS` 节点，指定节点名与处理函数。VPP 启动时 `vlib_main()` → `vlib_process_startup()`（或同等启动例程）扫描所有注册项，为每个进程节点分配 `vlib_process_t`、初始化事件队列、建立初始执行上下文，并把它挂入"首次就绪"集合。
+
+**主循环调度**：`vlib_main_loop()`（见 06-05）每轮大致遵循这样的次序：先派发挂起的帧给图节点、再轮询 input node 收包、然后检查定时轮是否有到期项并把对应事件投递到目标进程节点、接着遍历就绪进程节点并把控制权切换过去。进程节点运行到 `vlib_process_wait_for_event_or_clock()` 时主动挂起，切回主循环；主循环继续处理报文，因此"等待"不消耗 CPU。这条链可以概括为：
+
+```bash
+vlib_main_loop
+  ├─ vlib_process_pending_frames / 派发图节点帧
+  ├─ input node 收包（06-12 PMD 轮询）
+  ├─ timer wheel 推进 → 到期回调 → vlib_process_signal_event
+  └─ 就绪进程队列 → 切换到 vlib_process_t 上下文
+        └─ process_fn()
+             ├─ 处理事件 / 执行业务逻辑
+             └─ vlib_process_wait_for_event_or_clock() → 挂起 → 回到主循环
+```
+
+**事件投递与唤醒**：任意上下文（图节点、CLI 命令处理函数、Binary API handler、另一个进程节点）都可以调用 `vlib_process_signal_event()`。该函数把事件写入目标进程的事件队列，并把进程标记为就绪。若目标是当前线程，就绪检查在下一轮循环生效；跨线程投递需要走线程间消息/屏障机制（见 06-06 / 06-07），不能假设立即可见。事件类型码由投递方与消费方约定，`opaque` 通常放一个索引或一个指针值，避免在事件里塞大对象。
+
+**定时器到期**：插件创建定时器时指定"多少滴答后到期"。定时轮按槽组织，主循环每次推进只扫描当前槽；到期项触发回调，回调里通常只做一件事——给对应进程节点发事件，把真正的业务处理留给进程节点。这样把"时间触发"与"事件驱动"统一到一条路径上，也避免了在定时器中断式上下文里做重活。
+
+**与 API/控制面的衔接**：控制面通过 Binary API（见 06-13 / 04-07）下发配置时，API handler 常需要"通知某模块重新扫描配置"。典型做法就是给该模块的进程节点发一个事件，进程节点醒后读取新配置并执行。这条链把 04 全册的配置命令、06-13 的消息机制与本篇的事件机制串成一条完整通路。
+
+:::figure id=06-15-02 | name=事件投递到进程节点唤醒的调用链 | dir=TD
+node n1 "CLI / Binary API handler" blue
+node n2 "vlib_process_signal_event" teal
+node n3 "目标进程事件队列" amber
+node n4 "就绪标记" amber
+node n5 "vlib_main_loop 检查就绪" purple
+node n6 "process_fn 从挂起点继续" green
+edge n1 -> n2 "投递"
+edge n2 -> n3
+edge n3 -> n4
+edge n4 -> n5
+edge n5 -> n6
+:::
+
+### 5. 配置 / 命令 / 代码实例
+
+**进程节点骨架（示意，宏名与函数签名需对照实际版本核验）**：
+
+```c
+/* 声明一个进程节点：名字、类型、处理函数 */
+VLIB_REGISTER_PROCESS (my_aging_proc, static) = {
+  .name     = "my-aging-process",
+  .type     = VLIB_NODE_TYPE_PROCESS,
+  .function = my_aging_process_fn,
+};
+
+static uword
+my_aging_process_fn (vlib_main_t * vm,
+                     vlib_node_runtime_t * rt, vlib_frame_t * f)
+{
+  vlib_process_t *p = vlib_get_current_process (vm);
+  f64 interval = 1.0;              /* 每秒巡检一次 */
+
+  while (1)
+    {
+      /* 挂起：直到有事件到达，或最多等 interval 秒 */
+      vlib_process_wait_for_event_or_clock (vm, interval);
+
+      /* 消费事件队列：区分"配置变更"与"周期巡检" */
+      uword event_type = 0, *event_data = 0;
+      /* event_data 由 vlib_process_get_events 一类接口取得 */
+      if (/* 收到配置变更事件 */ 0) {
+          /* 重读配置，重建本地缓存 */
+      }
+
+      /* 周期任务：扫描会话表，回收超时表项 */
+      my_scan_and_expire (vm);
+
+      vec_free (event_data);
+    }
+  return 0;   /* 实际不会走到这里 */
+}
+```
+
+要点：`while (1)` 是允许的，前提是循环体内**必有一次挂起**。挂起时长决定巡检精度与 CPU 占用的平衡；把 interval 设得过小会让进程节点频繁被唤醒，虽不影响包处理路径的正确性，却会挤占 main 线程时间并干扰 `show runtime` 的耗时判读。
+
+**定时器使用示意**：
+
+```c
+/* 创建/更新一个定时轮句柄，具体 API 需对照实际版本核验 */
+u32 timer_handle = my_timer_start (/* ticks */ 100);
+/* 到期回调里只投递事件，不做重活 */
+static void
+my_timer_expired (u32 handle, void *opaque)
+{
+  vlib_main_t *vm = vlib_get_main ();
+  vlib_process_signal_event (vm, my_aging_proc.index,
+                             MY_EVENT_TIMER, (uword) opaque);
+}
+```
+
+**运维侧观察命令**（完整命令族见 04-06，此处只列与本篇直接相关的几条）：
+
+| 目的 | 命令示例 | 关注点 |
+|---|---|---|
+| 看进程节点是否被调度 | `show runtime` | 进程节点的 calls / vectors / clocks 是否有增长 |
+| 看事件与计时统计 | `show vlib processes`（若当前版本提供） | 挂起/唤醒次数、等待时长，名称需对照实际版本核验 |
+| 看节点错误计数 | `show errors` | 进程节点相关的 error counter 是否异常增长 |
+| 抓事件时序 | `show event-logger` / `elog` 相关命令 | 调度与唤醒先后顺序 |
+| 动态改巡检频率 | 通过对应插件的 CLI 或 startup.conf 插件段 | 完整参数见 04-01 / 04-05 |
+
+### 6. 注意事项、陷阱与最佳实践
+
+1. **绝不在进程节点里做阻塞操作**。`sleep()`、同步文件 I/O、等互斥锁、调用可能阻塞的 socket recv，都会让 main 线程停摆，进而影响所有接口。若必须做慢操作，应拆成异步步骤或交给外部进程，通过事件通知结果。
+2. **循环体必须有挂起点**。忘记写 `vlib_process_wait_*` 会让进程节点变成死循环，主循环再也拿不回控制权，表现为 VPP 完全无响应、CLI 连不上。
+3. **事件可能合并或丢失**。事件队列容量有限（具体上限需对照实际版本核验），高频投递同一类型事件时可能被合并；因此进程节点醒来后应当**重新扫描权威状态表**，而不是依赖事件里携带的数据做增量更新。这是"事件只作唤醒提示、状态以表为准"的设计原则。
+4. **定时器滴答粒度与精度**。定时轮的精度由滴答长度决定，不能假定毫秒级精确；对时间敏感的逻辑（BFD 检测、SA 硬过期）要按实际滴答换算并留裕量，且注意定时器轮转时可能有一次槽扫描的批量开销。
+5. **barrier 期间不要长时间挂起等待**。配置变更路径上若持有 barrier 又等人投递事件，而投递方正是被 barrier 拦住的 worker，会形成死锁。配置类操作尽量同步完成，把重活放到 barrier 释放之后，用事件触发异步执行（见 06-06 / 06-07）。
+6. **跨线程投递要走正规通道**。不要直接读写另一个 `vlib_main_t` 的事件队列；使用 VPP 提供的线程间消息/barrier 机制，否则在 NUMA 多 worker 环境下会出现偶发丢事件（见 06-06）。
+7. **用 `show runtime` 判读而非猜**。进程节点平时显示零耗时属正常；若某个进程节点持续占用大量 clocks，通常是挂起时长过短或扫描逻辑过重。结合 `show errors` 与事件日志定位，方法见 08-02 / 08-03。
+8. **插件卸载要清理定时器与事件**。遗留的定时轮句柄会在回调里访问已释放内存，属于典型的间歇性崩溃源；注册与注销必须成对。
+9. **版本差异要显式核验**。进程节点宏、事件接口名、定时轮模板参数在 VPP 各版本间有调整，文中所有 `需对照实际版本核验` 标记处，请以 `src/vlib/process.h`、`src/vppinfra/tw_timer_*.h` 及目标版本头文件为准。
+
+### 7. 小结与延伸阅读
+
+VPP 用"进程节点 + 定时轮 + 事件"在主循环内实现了一套轻量协作式异步框架：进程节点提供可挂起的长生命周期执行流，定时轮提供 O(1) 级的海量超时管理，事件把 API/CLI/定时器/图节点的触发统一成唤醒信号，而协作式调度保证这一切不会阻塞包处理路径。它与 06-05 的主循环、06-06 的线程模型、06-12 的 PMD 轮询共同构成"为什么 VPP 能既做线速转发又做复杂状态维护"的答案。
+
+延伸阅读：主循环与调度 → **06-05**；线程、barrier 与跨线程通信 → **06-06 / 06-07**；vppinfra 容器实现 → **06-08**；Binary API 消息机制 → **06-13**；节点注册与帧传递 → **06-02**；插件动态加载 → **06-11**；基础容器字段 → **05-09 / 05-10**；相关 CLI 与 show 命令 → **04-06**，插件参数 → **04-05 / 04-01**；BFD/邻居老化等具体模块 → **07-14 / 07-04**，NAT/IPsec 会话超时 → **07-05 / 07-07**；运行时耗时与排障判读 → **08-02 / 08-03**。

@@ -1,0 +1,1061 @@
+# VPP 技术资料 · 03 部署
+
+> 本册为**实战型（C 型骨架）**：每一篇都按「目标与拓扑 → 前置条件与环境 → 分步操作 → 验证方法与预期结果 → 常见失败与排错 → 小结」组织，给出可直接照做的命令与配置片段。
+> 版本基准 VPP 23.06 / master，操作系统以 Ubuntu 22.04 / CentOS Stream 9、内核 5.x 为主。
+> **去重约定**：`startup.conf` 全量参数与 CLI 命令全集是 `04` 全册的权威内容，本册只写每个场景必需的片段，并注明「完整参数见 04-01」「命令见 04-xx」；结构体逐字段见 `05`，转发/调度机制见 `06`，模块功能见 `07`，本册均不展开。文中不确定的字段名、函数签名、CLI 子命令与驱动名称一律标注「需对照实际版本核验」并给出可定位的源码或头文件路径。
+
+---
+
+## 03-01 单机部署：硬件要求与基础拓扑
+
+### 1. 目标与拓扑
+
+本篇的目标，是在一台物理服务器上把 VPP 作为一个独立的用户态数据面进程稳定地跑起来：让它接管至少两块物理网卡，打通最基础的二层桥接或三层转发，并借此把 CPU、内存、NUMA、大页、网卡、IOMMU 这几类最容易埋雷的硬件资源一次性校准。单机部署是整条实验链路的起点，它的价值不在于功能多，而在于建立一个"干净、可复现、可度量"的基准。只有把单机基准校准完成，后续在云上、容器里、SmartNIC 上或多实例场景下遇到的性能问题与异常，才能被正确地归因到"平台差异"，而不是被误判为 VPP 本身的缺陷，也不会反过来把基础配置错误当成平台特性去反复折腾。这一点对团队协作尤其重要：一份写清楚 NUMA、大页、核绑定的单机部署记录，是所有人讨论"为什么这里只有一半线速"时唯一可信的共同语言。
+
+基础拓扑如下图所示。一台双路服务器，两颗 CPU 各自挂载本地内存，形成 `node0` 与 `node1` 两个 NUMA 节点；两块 PCIe 网卡分别插在两颗 CPU 对应的 PCIe Root Complex 之下，因此通过 `numa_node` 读出来的归属节点并不相同；VPP 进程通过 `startup.conf` 把 main 线程绑定到 `main-core`，把若干 worker 线程绑定到 `corelist-workers` 指定的核，并从每个 NUMA 节点预留的大页里分别分配 DPDK 内存与缓冲区池；两块网卡各接一台流量发生器或对端设备，形成"进—查表—出"的最简闭环。图中用实线表示数据面收发与轮询关系，用虚线表示核绑定、大页供给这类"资源供给"关系，二者性质不同：数据面是运行时每包都要走的，资源供给是启动期一次性建立的。
+
+:::figure id=03-01-01 | name=单机部署基础拓扑与资源供给 | dir=TD
+node peer0 "流量发生器 A" gray
+node nic0 "NIC-0 PCIe<br/>numa_node=0<br/>vfio-pci" teal
+node peer1 "流量发生器 B" gray
+node nic1 "NIC-1 PCIe<br/>numa_node=1<br/>vfio-pci" teal
+node vpp "VPP 进程<br/>main + N worker<br/>startup.conf" purple
+node cpu0 "CPU0 / NUMA0<br/>cores 0-11" blue
+node cpu1 "CPU1 / NUMA1<br/>cores 12-23" blue
+node hp0 "Hugepages 1G<br/>node0" amber
+node hp1 "Hugepages 1G<br/>node1" amber
+edge peer0 -> nic0 "Rx 流"
+edge nic0 -> vpp "PMD 轮询 Rx"
+edge vpp -> nic0 "Tx"
+edge nic0 -> peer0 "Tx 流"
+edge nic1 -> vpp "PMD 轮询 Rx"
+edge vpp -> nic1 "Tx"
+edge peer1 -> nic1 "Rx 流"
+edge nic1 -> peer1 "Tx 流"
+edge cpu0 -> vpp dashed "main-core + worker 绑核"
+edge cpu1 -> vpp dashed "worker 绑核"
+edge hp0 -> vpp dashed "node0 大页 DPDK/缓冲池"
+edge hp1 -> vpp dashed "node1 大页 DPDK/缓冲池"
+:::
+
+这里需要把一条贯穿全书的原则讲透：VPP 采用轮询模式驱动（PMD），worker 线程会长期把它所绑定的核跑到接近 100%，不依赖中断、也不让出 CPU，因此"网卡、承载它的内存、轮询它的 CPU 三者尽量落在同一个 NUMA 节点"不是调优建议，而是能否达到线速的前提条件。跨 NUMA 的一次收包，意味着 DMA 把报文写到远端节点内存、worker 再跨 QPI/UPI 读取，64 字节小包场景下这一来一回足以让 PPS 掉三成以上，且时延抖动明显放大。这也是为什么单机部署阶段就必须把 NUMA 拓扑画清楚、量清楚，而不是等性能不达标再回来补。
+
+拓扑里还刻意保留了"管理口"这一概念：被 VPP 接管的网卡会从内核协议栈消失（`ip link` 里再也看不到），如果服务器只有一块网卡又把它绑给了 DPDK，重启后就会把自己锁在外面。因此单机部署的最低硬件要求其实是"两块用于数据面的网卡 + 一块独立的管理网卡"，管理网卡留在内核驱动、配置静态地址，专门承载 SSH 与控制面流量。数据面网卡和管理网卡在规划阶段就要用不同颜色、不同命名区分清楚，这条经验在后面容器化和多实例部署里会反复用到。
+
+最后说明拓扑与后续篇章的关系：本篇只负责把 VPP 进程"立起来"，并让接口处于 up 状态、能收发最基础的报文；至于把网卡从内核驱动解绑并交给用户态、写 `dpdk{}` 段的完整绑定流程，是 `03-02` 的内容；把这些能力搬到虚机、容器、SmartNIC、主备集群，分别是 `03-03` 到 `03-06` 的内容。本篇给出的 `cpu{}` / `unix{}` 片段是最小可运行集，完整参数见 04-01，配置与命令族的权威索引同样在 `04` 全册。
+
+### 2. 前置条件与环境
+
+硬件层面要先做一次"够不够格"的判断。VPP 的高吞吐来自批量向量处理，但它对硬件的诉求很朴素：足够多的物理核、足够大的连续物理内存、支持用户态轮询且驱动成熟的网卡、以及一颗打开了 IOMMU 的 CPU。下表给出一套可用于功能验证与中等压力压测的基准配置，它不代表生产容量规划，而是保证后面每一步都有确定结果的"最小可信环境"。生产环境的核数、大页数、网卡数应按目标 PPS 与带宽另行计算。
+
+| 维度 | 最低可用（功能验证） | 推荐基准（压测/准生产） | 核验命令 | 说明 |
+|---|---|---|---|---|
+| CPU | 4 核，支持 SSE4.2 | 双路 ≥16 物理核，关闭超线程干扰 | `lscpu` | worker 数一般不超过物理核数减 2（留给 main 与 OS） |
+| 内存 | 8 GB | ≥32 GB，双通道以上 | `free -h` | 大页独占后不可被回收，需留足内核与_page cache |
+| 大页 | 512 × 2 MB | 每 NUMA 节点 4–8 × 1 GB | `cat /proc/meminfo \| grep -i huge` | 1 GB 大页减少 TLB miss，启动期预留 |
+| 网卡 | 1 块 DPDK 兼容卡 + 1 管理口 | 2+ 块 10/25 GbE，分属不同 NUMA | `lspci -nn \| grep -i eth` | 需 DPDK PMD 支持，见 `03-02` |
+| IOMMU | 开启 | 开启且 `iommu=pt` | `dmesg \| grep -i IOMMU` | vfio-pci 的前置，见 `03-02` |
+| OS/内核 | Ubuntu 22.04 / 内核 ≥5.4 | Ubuntu 22.04，或 CentOS Stream 9 | `uname -r` | 需 `hugetlbfs`、`vfio`、`uio` 支持 |
+| VPP | 23.06 发行包 | 23.06 或 master 同版本编译产物 | `vppctl show version` | 控制面与数据面版本必须一致 |
+
+软件层面，建议通过发行版包安装而不是一开始就源码编译，以便把变量收敛到"部署配置"这一件事上。以 Debian/Ubuntu 系为例，需要 `vpp`、`vpp-plugin-core`、`vpp-plugin-dpdk`、`python3-vpp-api`、`vpp-dbg` 等包（包名随版本与仓库略有差异，需对照实际版本核验）；RHEL 系对应 `vpp`、`vpp-lib`、`vpp-plugins`、`vpp-devel`。安装后用 `dpkg -l | grep vpp` 或 `rpm -qa | grep vpp` 确认所有包来自同一个版本号，混用不同 build 是最隐蔽的一类启动失败来源。
+
+权限与运行环境也要提前理清。VPP 主进程需要锁定大页内存（`mlock`）、访问 `/dev/vfio`、写 `/dev/hugepages`，因此官方包一般会创建 `vpp` 用户/组，并在 systemd unit 里放开 `LimitMEMLOCK`。手工前台调试时直接用 root 最省心，但生产上应沿用包自带的用户，并通过 `unix{}` 段的 `gid` / `cli-listen` 控制访问（完整参数见 04-01）。另外务必确认 `/dev/shm` 与 `/run/vpp` 可写，VPP 的共享内存段、Binary API socket、CLI socket、stats segment 都落在这类位置，权限不对会表现为"进程起来了但 vppctl 连不上"。
+
+关于源码位置的说明，本篇作为部署篇不展开任何调用链，只给出"配置从哪被读进去"的入口，便于排错时定位日志与宏。`startup.conf` 的各配置段通过 `VLIB_CONFIG_FUNCTION` / `VLIB_EARLY_CONFIG_FUNCTION` 一类的注册宏挂进框架（宏定义与注册机制在 `src/vlib/` 下与配置相关的头文件中，需对照实际版本核验）；`cpu{}` 段的解析与线程模型集中在 `src/vlib/threads.c` / `src/vlib/threads.h`，其中 `vlib_thread_main_t` 记录了 main/worker 的核分配；`unix{}` 段与主入口在 `src/vlib/unix/main.c` 与 `src/vpp/vnet/main.c`；主循环 `vlib_main_loop` 在 `src/vlib/main.c`；大页与物理内存分配相关实现可查 `src/vlib/physmem.c` 及 `src/vlib/unix/` 下的对应文件（路径需对照实际版本核验）。启动期若某段配置没生效，顺着"配置段名 → 注册函数 → 日志里的 early/config 关键字"去查，比盲改配置快得多。
+
+### 3. 分步操作
+
+**第 1 步：硬件与 NUMA 盘点。** 不要凭机型手册猜拓扑，直接读 sysfs。先用 `lscpu` 看物理核数与 NUMA 节点数，再用 `numactl -H` 看每个节点的 CPU 列表与可用内存，确认"哪几个核属于 node0、哪几个属于 node1"。接着用 `lspci -tv` 看清 PCIe 树，对每块候选网卡执行 `cat /sys/bus/pci/devices/0000:3b:00.0/numa_node`（把地址换成实际值）读出它挂在哪个节点，并用 `ethtool -i eth0 | grep bus-info` 把内核网口名与 PCI 地址对上。若条件允许，`lstopo`（hwloc 包）能一次性画出 CPU/内存/PCIe 的归属图。这一步的产物应当是一张自己画的对应关系表：网卡 PCI 地址 → 内核接口名 → `numa_node` → 该节点上的核列表。后面写 `cpu{}` 和 `dpdk{}` 全靠它。
+
+**第 2 步：配置 BIOS 与内核启动参数。** 在 BIOS 里打开 VT-d / AMD-Vi（Intel/AMD 的 IOMMU 硬件支持），关闭 C-State 深度节能与 CPU 频率自适应，把电源策略设为 Performance。随后编辑 `/etc/default/grub`，在 `GRUB_CMDLINE_LINUX` 里加入一组典型参数：
+
+```bash
+GRUB_CMDLINE_LINUX="intel_iommu=on iommu=pt \
+  isolcpus=2-9,14-21 nohz_full=2-9,14-21 rcu_nocbs=2-9,14-21 \
+  default_hugepagesz=1G hugepagesz=1G hugepages=8 \
+  mitigations=off selinux=0"
+```
+
+其中 `isolcpus` / `nohz_full` / `rcu_nocbs` 把将要给 worker 的核从内核调度域与时钟中断里摘出去，`iommu=pt` 让 IOMMU 只对需要直通的设备做转换，`hugepages=8` 在启动早期预留 1 GB 大页（启动期预留能保证物理连续，比运行时 `echo` 更可靠）。AMD 平台把 `intel_iommu=on` 换成 `amd_iommu=on`。执行 `update-grub`（或 RHEL 系 `grub2-mkconfig -o /boot/grub2/grub.cfg`）后重启，用 `cat /proc/cmdline` 确认参数真的生效。`mitigations=off` 会关闭一批安全补丁、只建议在隔离的压测环境使用，生产环境需按安全基线评估，不要无脑照抄。
+
+**第 3 步：校准大页与 CPU 隔离。** 重启后复核 `grep -i huge /proc/meminfo`，确认 `HugePages_Total` 与预期一致；再分别看 `/sys/devices/system/node/node0/hugepages/hugepages-1048576kB/nr_hugepages` 与 `node1` 的对应值，若启动参数是全局 `hugepages=8`，内核通常会在两个节点间均分，若发现全落在 node0，要改为按节点分别 `echo` 设置：
+
+```bash
+echo 4 > /sys/devices/system/node/node0/hugepages/hugepages-1048576kB/nr_hugepages
+echo 4 > /sys/devices/system/node/node1/hugepages/hugepages-1048576kB/nr_hugepages
+mkdir -p /dev/hugepages
+mount -t hugetlbfs -o pagesize=1G none /dev/hugepages
+```
+
+把挂载写进 `/etc/fstab` 以免重启丢失。同时用 `cat /sys/devices/system/cpu/isolated` 确认隔离核生效，用 `cpupower frequency-info` 或遍历 `scaling_governor` 确认这些核处于 `performance`。这一步常见误区是只设了大页、却没确认 hugetlbfs 挂载点，DPDK 会报"无法打开 /dev/hugepages"；反过来挂载了但启动期没预留，则会在压力上来时因大页被其他进程抢走而分配失败。
+
+**第 4 步：安装 VPP 并检查版本一致性。** 按第 2 节的包清单安装，随后执行 `vppctl show version`（若此时服务未起，可用 `vpp -c /etc/vpp/startup.conf` 前台试跑）确认版本号、编译时间与 git hash。记录这组字符串，后续换机器、升版本、编译插件时都以它为准。同时确认 `/usr/lib/systemd/system/vpp.service`（或 `/lib/systemd/system/vpp.service`）存在，官方包自带的 unit 已经处理了大页挂载、`LimitMEMLOCK`、运行用户等细节，能复用就尽量复用。
+
+**第 5 步：写最小可运行的 startup.conf。** 以 `/etc/vpp/startup.conf` 为入口，先只放让进程"能起来且能连上"的片段，DPDK 网卡绑定的完整写法留给 `03-02`。注意下面只是场景必需片段，完整参数见 04-01：
+
+```ini
+unix {
+  nodaemon
+  log /var/log/vpp/vpp.log
+  full-coredump
+  cli-listen /run/vpp/cli.sock
+  gid vpp
+}
+cpu {
+  main-core 0
+  corelist-workers 2-5
+}
+buffers {
+  buffers-per-numa 16384
+}
+```
+
+这里的 `corelist-workers 2-5` 必须落在第 2 步 `isolcpus` 的范围内，且优先选与数据面网卡同 NUMA 节点的核；`buffers-per-numa` 决定每个 NUMA 节点预分配的缓冲区数量，小包压测时若出现 `no free buffers` 类错误再调大。`main-core` 建议留在 node0、不要与 worker 重叠。此阶段先不写 `dpdk{}`，让 VPP 以"无物理接口"的方式起来，能大幅缩小首次排错面——这一步跑通，说明安装、大页、CPU、权限、socket 路径都没问题。
+
+**第 6 步：启动并设为开机自启。** 用 `systemctl daemon-reload` 加载 unit，再 `systemctl enable --now vpp`，随后 `systemctl status vpp` 与 `journalctl -u vpp -f` 观察。若使用包自带 unit，先确认它的 `ExecStart` 指向的正是你编辑的 `/etc/vpp/startup.conf`。前台调试与 systemd 启动不要同时进行，两者会争抢 `/run/vpp/cli.sock` 与共享内存段，表现为"第二个进程起不来"。确认 `vppctl show version` 能返回后，再进入 `03-02` 把网卡交给 DPDK。
+
+**第 7 步：打通基础接口（收尾，可延后）。** 本篇只验证进程与线程层面，接口创建、状态、地址属于 `04-03` 的命令族（命令见 04-03），此处仅给出最小验证片段：`vppctl set interface state <name> up`、`vppctl set interface ip address <name> 10.0.0.1/24`、`vppctl ping 10.0.0.2`。此时还没有物理接口，可先跳过，等 `03-02` 绑定好网卡再回来补齐。把这一步单列出来的目的，是明确"单机部署"与"网卡绑定"的边界，避免在没有接口时误判为部署失败。
+
+### 4. 验证方法与预期结果
+
+验证要分层进行，先证明进程活着，再证明资源到位，最后证明数据面可用；每一层都用确定性的只读命令，且把输出与预期逐项对照（命令族见 04-06，命令见 04-02）。
+
+第一层"进程与版本"：`vppctl show version` 应返回与第 4 步记录一致的版本号、编译日期与 git hash；`systemctl status vpp` 应为 `active (running)`；`ps -eLo pid,tid,pcpu,comm | grep vpp` 应能看到一个 `vpp` 主进程以及若干 `vpp_wk_*` / `vpp_main` 线程。`vppctl show log` 里不应出现 `ERROR`、`FATAL`、`failed to` 等关键字，尤其关注 `unix_config`、`cpu_config`、`physmem` 相关的初始化行。
+
+第二层"资源与线程"：`vppctl show threads` 应列出 1 个 main 线程与数量等于 `corelist-workers` 的 worker 线程，且每个线程的 `CPU ID` / `Core` 与配置一致、都落在隔离核上；`vppctl show memory` 与 `vppctl show buffers` 应显示每个 NUMA 节点各有独立的大页内存池与缓冲区池，`buffers-per-numa` 的取值能被 `show buffers` 的总量大致印证。宿主机侧 `numastat -p $(pidof vpp)` 应显示 VPP 在两个节点上都有内存占用，而不是全部挤在 node0——这是判断"大页是否按 NUMA 均分"最直观的外部证据。
+
+第三层"转发就绪"：`vppctl show interface` 在尚未绑定网卡时应只列出 `local0` 等虚拟接口，且 `show runtime` 里 `dpdk-input` 之类节点计数为零属正常（本篇无物理设备）；`vppctl show errors` 不应有持续增长的错误计数。执行 `vppctl show hardware-interfaces` 在绑定前为空或仅有占位，也属预期。
+
+把以上三层的实际输出（版本号、线程列表、内存/缓冲池数值、`numastat` 结果）保存成一份"单机基准记录"，它是后续所有压测与排错的对照基线。任何一次环境变更（换内核、加大页数、改 worker 数、升级 VPP）之后，都应重跑这套只读命令并比对差异，差异项就是需要解释的变更点。预期结果的判定标准可以概括为一句话：进程不报错、线程绑对核、内存在两个 NUMA 节点上都能看到、CLI 可稳定连接；四条同时满足，单机部署即告完成，可以放心进入 `03-02`。
+
+### 5. 常见失败与排错
+
+| 现象 | 可能根因 | 定位命令 | 修复方向 |
+|---|---|---|---|
+| `vppctl` 报连不上 socket | CLI socket 路径/权限不符，或 unit 与手工进程冲突 | `ls -l /run/vpp/`、`ss -xl \| grep cli` | 统一 `cli-listen` 与 `gid`，停掉重复进程（完整参数见 04-01） |
+| 启动即 `cannot allocate memory` / 大页失败 | 启动期未预留、hugetlbfs 未挂载、被他进程占用 | `grep -i huge /proc/meminfo`、`mount \| grep huge` | 改启动参数预留 + 写 fstab，`fuser /dev/hugepages` 查占用 |
+| worker 没绑到预期核 | `corelist-workers` 与 `isolcpus` 不一致，或 systemd `CPUAffinity` 覆盖 | `vppctl show threads`、`cat /proc/<pid>/status \| grep Cpus` | 对齐配置与隔离核，检查 unit 的 `CPUAffinity` |
+| 跨 NUMA 性能只有一半 | 网卡 `numa_node` 与 worker 核分属不同节点 | `cat /sys/bus/pci/devices/*/numa_node`、`numastat -p` | 把 worker 调到网卡同节点，或 `socket-mem` 按节点分配 |
+| 只剩管理口、SSH 断联 | 唯一网卡被绑给 DPDK | 带外管理/iDRAC/IPMI 登录排查 | 始终保留独立管理网卡，规划阶段区分命名 |
+| 版本混杂、插件加载报错 | 多来源安装包 build 不一致 | `dpkg -l \| grep vpp`、`vppctl show plugins` | 全量卸载重装同一仓库同一版本 |
+
+排错顺序建议固定为"日志 → 资源 → 线程 → 接口"：先看 `vppctl show log` 与 `journalctl -u vpp`，因为 VPP 的配置解析失败几乎都会在这里留下段名；再看大页与 `/dev/hugepages`；再看 `show threads` 的绑核；最后才看接口。这个顺序能避免一上来就怀疑驱动或硬件，而实际上八成的首次部署失败都落在大页、权限、socket 路径这三项上。另一个高频陷阱是"前台调试进程没退干净"：`ps aux | grep vpp` 看到残留进程时，先停 systemd 再杀残留，确认共享内存段与 socket 释放后再重启，否则会反复出现"地址已被占用"类的伪故障。
+
+#### 陷阱与最佳实践
+
+- **不要在生产环境关安全缓解**：`mitigations=off` 与 `selinux=0` 仅用于隔离压测，生产需按安全基线保留并评估性能损失。
+- **大页优先启动期预留**：运行时 `echo` 到 `nr_hugepages` 可能因内存碎片拿不到连续物理页，重启后也易丢；把它写进 GRUB 并写 fstab 挂载才可靠。
+- **核绑定三处对齐**：`isolcpus`、`cpu{}` 的 `corelist-workers`、systemd 的 `CPUAffinity` 三者必须一致，任何一处遗漏都会让 worker 漂到非隔离核上被内核线程抢占。
+- **NUMA 就近是硬要求**：网卡、大页、worker 核三者同节点是线速前提，`socket-mem` 与大页按节点分别配置，别只配一个全局值。
+- **留管理口、留基线**：独立管理网卡与一份单机基准记录，是后面所有篇章能快速定位"是不是环境问题"的两件护身符。
+- **配置只写必要片段**：`startup.conf` 全参数与 CLI 全集是 `04` 的权威内容（完整参数见 04-01），本册不重列、不展开转发原理（原理见 06），避免多册之间出现互相矛盾的版本描述。
+
+### 6. 小结
+
+本篇建立了单机部署的硬件与拓扑基准：先用 `lscpu` / `lstopo` / sysfs 把 NUMA、PCIe、网卡归属量清楚，再用 GRUB 参数把 IOMMU、CPU 隔离与 1 GB 大页一次性配置到位，随后通过最小 `startup.conf` 让 VPP 在无物理接口的前提下先跑通"进程—线程—内存"三层验证，并保存一份可复用的基准记录。贯穿其中的核心判断只有两条：资源要按 NUMA 就近供给，配置要只写场景必要片段、把全参数与命令族留给 `04` 全册。完成单机基准后，下一步就是把具体网卡从内核解绑、交给 DPDK，这正是 `03-02` 要解决的问题；而本篇形成的 NUMA 对应关系表、隔离核范围、大页分配方案，会原封不动地成为后续所有部署形态的输入。
+
+---
+
+## 03-02 VPP + DPDK 网卡绑定部署实战
+
+### 1. 目标与拓扑
+
+本篇的目标，是把 `03-01` 已经跑起来的 VPP 进程，与真实的物理网卡对接起来：让网卡脱离内核驱动、改由用户态的 vfio-pci（或 uio_pci_generic）接管，由 DPDK PMD 轮询收发，再被 VPP 识别为可配置的 `GigabitEthernet` / `TenGigabitEthernet` 类接口并进入转发图。这是从"进程活着"到"真正能转发报文"的关键一跃，也是绝大多数初次部署者卡住最久的一环。之所以单独成篇，是因为它把内核、驱动、IOMMU、大页、PCI 配置空间、VPP 的 `dpdk{}` 配置段这几层耦合在一起，任何一层没对齐都表现为"接口起不来"或"起来了不收包"，而现象与根因之间往往隔了好几层。
+
+部署流程如下图：先确认网卡的 PCI 地址与 NUMA 归属，再加载并启用 IOMMU 与 vfio-pci，接着预留并挂载大页，随后用 `driverctl`（或 `dpdk-devbind.py`）把网卡从内核驱动解绑、绑定到用户态驱动，然后编写 `startup.conf` 的 `dpdk{}` / `cpu{}` 段，交给 systemd 启动，最后用 `vppctl` 验证接口与收发。图中实线是必须严格按顺序执行的步骤，虚线是两块网卡分别绑定到 vfio-pci 后汇入同一个 VPP 进程的资源关系。把顺序画出来很重要：先绑网卡再写配置看似差不多，但一旦绑错（例如把管理口也绑了），排查成本完全不同；而先确认 `numa_node` 再决定 `socket-mem` 与 worker 核，直接决定后面性能是否达标。
+
+:::figure id=03-02-01 | name=DPDK 网卡绑定与启动流程 | dir=TD
+node s1 "1. 确认 PCI 地址与 NUMA<br/>lspci / ethtool -i / numa_node" blue
+node s2 "2. 开启 IOMMU 并加载驱动<br/>modprobe vfio-pci / uio_pci_generic" blue
+node s3 "3. 预留并挂载 Hugepages<br/>hugepages-1048576kB / hugetlbfs" blue
+node s4 "4. 解绑内核驱动并绑定<br/>driverctl / dpdk-devbind.py" teal
+node s5 "5. 编写 startup.conf<br/>dpdk{} + cpu{}（完整参数见 04-01）" teal
+node s6 "6. systemd 启动 vpp<br/>ExecStartPre 就绪检查" teal
+node s7 "7. vppctl 验证接口与收发" amber
+node nic0 "NIC-0 0000:3b:00.0<br/>vfio-pci" green
+node nic1 "NIC-1 0000:3b:00.1<br/>vfio-pci" green
+node ok "接口 up / Rx-Tx 计数增长" green
+edge s1 -> s2
+edge s2 -> s3
+edge s3 -> s4
+edge s4 -> nic0 "bind"
+edge s4 -> nic1 "bind"
+edge nic0 -> s5 dashed "dev 声明"
+edge nic1 -> s5 dashed "dev 声明"
+edge s5 -> s6
+edge s6 -> s7
+edge s7 -> ok "show interface"
+:::
+
+拓扑上还要明确一点：绑定完成后，这两块网卡在 `ip link` / `ifconfig` 里会彻底消失，因为内核驱动已经不再持有它们；它们现在只存在于 VPP 的接口命名空间里。此时所有"看接口、配 IP、查统计"都必须改用 `vppctl`（命令见 04-03 / 04-06），继续用 `ip` / `ethtool` 只会得到"设备不存在"。这个认知切换是本篇之后所有操作的前提，也是排错时最常见的误会来源。
+
+关于驱动选型的取舍也在此交代：vfio-pci 依赖 IOMMU，能提供 DMA 隔离与更高的安全性，是生产与虚机直通场景的首选；uio_pci_generic 不要求 IOMMU、配置更简单，适合没有 VT-d/AMD-Vi 的老平台或快速功能验证，但缺少 DMA 隔离、部分网卡与 DPDK 新版本支持有限。二者在 `dpdk{}` 段里通过 `uio-driver` 一类参数指定（字段名需对照实际版本核验，完整参数见 04-01）。`03-03` 的虚拟化与 `03-04` 的容器透传，本质上都是把同一套 vfio-pci 绑定搬进 VM/Pod，因此本篇是它们的公共前置。
+
+### 2. 前置条件与环境
+
+必须已经完成 `03-01` 的全部内容：VPP 能前台或 systemd 启动、`vppctl show version` 可用、大页已按 NUMA 预留并挂载、CPU 隔离核已确定，且已保存一张"网卡 PCI 地址 → 内核接口名 → `numa_node` → 同节点核列表"的对应关系表。本篇会真正消费这张表。此外需要确认几件事：内核已启用 `CONFIG_VFIO_PCI`、`CONFIG_HUGETLBFS`、`CONFIG_UIO`（发行版通用内核一般默认带齐），`lsmod | grep -E 'vfio|uio'` 能看到模块；CPU 与 BIOS 已打开 VT-d / AMD-Vi，`dmesg | grep -i -e DMAR -e IOMMU` 有 `IOMMU enabled` 之类输出；手上有 `dpdk-devbind.py`（来自 `dpdk` / `dpdk-tools` 包）或 `driverctl`（来自 `driverctl` 包）。
+
+| 项目 | 检查命令 | 期望结果 |
+|---|---|---|
+| IOMMU 开启 | `dmesg \| grep -i -e DMAR -e IOMMU` | 有 enabled / DMAR 表，非 `IOMMU not found` |
+| vfio 模块可用 | `modinfo vfio-pci` | 正常输出模块信息 |
+| 大页就绪 | `grep -i huge /proc/meminfo` | `HugePages_Free` 足够，hugetlbfs 已挂载 |
+| 网卡 PCI | `lspci -nn \| grep -i ethernet` | 拿到 `0000:3b:00.0` 形式地址与厂商设备号 |
+| NUMA 归属 | `cat /sys/bus/pci/devices/0000:3b:00.0/numa_node` | 返回 0 或 1，与 worker 核规划一致 |
+| 当前驱动 | `ethtool -i eth2 \| grep driver` / `driverctl -v list-devices` | 明确是 ixgbe/i40e/mlx5_core/ena 等 |
+| 管理口独立 | `ip -br link` | 另有管理口在内核，未被列入绑定清单 |
+
+一个必须反复强调的前置条件是"绑定清单白名单化"：在动手之前，用 `ip route` 找到默认路由所在接口，把它和所有承载 SSH、NTP、监控流量的接口明确标记为"禁止绑定"，只把准备交给 VPP 的数据面网卡写进清单。生产事故里最常见的一类是误把管理口 `0000:xx:00.x` 也 `driverctl set-override` 成 vfio-pci，重启后机器直接失联，只能靠带外管理恢复。把白名单落成一个文本文件、绑定脚本逐行读取并 `grep -v` 排除管理口，是成本极低但收益极高的习惯。
+
+源码与入口位置（本篇不展开机制，只给排错定位用）：`dpdk{}` 配置段的解析集中在 `src/plugins/dpdk/device/init.c` 一类的初始化文件（含 `dpdk_config` 注册函数，路径需对照实际版本核验），相关结构 `dpdk_main_t` / `dpdk_device_t` 的定义在 `src/plugins/dpdk/device/dpdk.h` / `dpdk_priv.h` 中（字段见 05-11，本篇不重列）；接口创建与队列建立的入口在 `src/plugins/dpdk/device/` 目录下；`cpu{}` 与 worker 启动仍对应 `src/vlib/threads.c`（原理见 06-06 / 06-12，本篇不展开）。当 `dpdk{}` 段某项没生效时，用 `vppctl show log` 过滤 `dpdk` 关键字，再对照上述文件里的 `clib_warning` / 配置解析逻辑，通常比反复试参数更快。
+
+还有一组容易被忽略、却直接影响能否稳定线速的参数，是收发描述符数量与分段缓冲区。`dev` 子块里与 RX/TX descriptor 数量相关的选项（常见命名如 `num-rx-desc` / `num-tx-desc`，字段名与默认值需对照实际版本核验）决定每个队列能缓存多少在途报文：小包高 PPS 场景下描述符过少，会在突发流量时直接丢包，`vppctl show interface` 里 `rx miss` / `rx no buffer` 一类计数随之增长；描述符过多则占用更多大页内存，需要在"队列数 × 每队列描述符数 × 描述符大小"上做乘法留量。另一个取舍是 multi-segment mbuf：默认单段缓冲区能覆盖标准 MTU，一旦启用巨帧或做隧道封装后报文超过单段长度，就需要允许链式缓冲区，某些版本通过 `no-multi-seg` 一类开关控制（完整参数见 04-01）。开启链式缓冲会略微增加每包处理开销，因此只在确有巨帧需求时才开。此外，动手前最好用 `lspci -nn` 记下网卡的厂商/设备号，对照当前 VPP 内置 DPDK 版本的 PMD 支持列表确认驱动可用，避免把一块不支持的卡绑进 vfio-pci 后，在 EAL 初始化阶段才报"无可用 PMD"。这些细节与前面几步一样，都应在第 1 步的对应关系表里补一列备注，让部署记录能独立回答"为什么这样配"。
+
+### 3. 分步操作
+
+**第 1 步：锁定 PCI 地址并生成绑定清单。** 用 `lspci -nn | grep -i ethernet` 列出所有以太网控制器，配合 `ethtool -i` 把内核接口名与 PCI 地址一一对应；对每块候选网卡读 `numa_node`，并记录它当前由哪个内核驱动接管：
+
+```bash
+lspci -nn | grep -i ethernet
+ethtool -i eth2 | grep -E 'driver|bus-info'
+cat /sys/bus/pci/devices/0000:3b:00.0/numa_node
+cat /sys/bus/pci/devices/0000:3b:00.1/numa_node
+```
+
+把结果整理成 `PCI地址  内核名  numa_node  用途` 四列，排除管理口，得到类似 `0000:3b:00.0 / eth2 / 0 / data0` 的绑定清单。后续所有步骤都只引用这份清单里的地址，杜绝凭记忆敲设备号。
+
+**第 2 步：启用 IOMMU 并加载用户态驱动。** 确认 GRUB 已带 `intel_iommu=on iommu=pt`（AMD 为 `amd_iommu=on`），重启生效后加载模块：
+
+```bash
+modprobe vfio
+modprobe vfio-pci
+# 无 IOMMU 的老平台退而求其次：
+modprobe uio
+modprobe uio_pci_generic
+# 某些场景需要 unsafe no-iommu（见 03-03 云环境），谨慎使用：
+# echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode
+```
+
+用 `lsmod | grep -E 'vfio|uio'` 与 `dmesg | tail` 确认加载无报错。把 `vfio-pci` 写进 `/etc/modules-load.d/vpp.conf` 保证开机自动加载。这里 `iommu=pt`（passthrough）让未被直通的设备不走转换、只对 vfio 设备启用 DMA 保护，是性能与安全的常用折中；若 `dmesg` 报 `IOMMU` 未启用而硬件明明支持，回到 BIOS 检查 VT-d/AMD-Vi 是否被"Above 4G Decoding / SR-IOV"等选项间接影响。
+
+**第 3 步：确认大页与挂载。** 复用 `03-01` 的结论，但要注意 DPDK 对内存更敏感：执行 `grep -i huge /proc/meminfo` 看 `HugePages_Free`，确认 `mount | grep hugetlbfs` 显示 `/dev/hugepages` 且 `pagesize=1G`。若两块网卡分属 node0/node1，建议按节点分别预留并在 `dpdk{}` 里用 `socket-mem` 显式分配（字段名需对照实际版本核验，完整参数见 04-01），避免 DPDK 只在单个 socket 上拿到内存、另一节点上的网卡因无本地内存而初始化失败。
+
+**第 4 步：解绑内核驱动并绑定到 vfio-pci。** 这是全篇最关键的一步，二选一使用 `driverctl` 或 `dpdk-devbind.py`，不要混用两套工具管理同一块卡。`driverctl` 的优势是"覆盖（override）"可持久化、重启后仍生效：
+
+```bash
+driverctl -v list-devices | grep -i net
+# 绑定单块数据面网卡（排除管理口）
+driverctl set-override 0000:3b:00.0 vfio-pci
+driverctl set-override 0000:3b:00.1 vfio-pci
+# 核验
+driverctl -v list-devices | grep -E '3b:00'
+# 回滚（需要还给内核时）
+# driverctl unset-override 0000:3b:00.0
+```
+
+等价的 `dpdk-devbind.py` 写法（适合临时验证，重启不持久）：
+
+```bash
+dpdk-devbind.py --status
+dpdk-devbind.py --bind=vfio-pci 0000:3b:00.0 0000:3b:00.1
+# 或退化为 uio
+# dpdk-devbind.py --bind=uio_pci_generic 0000:3b:00.0
+dpdk-devbind.py --status
+```
+
+绑定成功的标志是 `dpdk-devbind.py --status` 里对应设备出现在 "Network devices using DPDK-compatible driver" 分组，且 `ip link` 里对应的 `ethX` 消失。若设备仍显示 `drv=ixgbe unused=vfio-pci`，说明解绑未成功，先确认该接口没有被 NetworkManager / 系统服务占用（`nmcli dev status`、`ip link set eth2 down`），必要时先 `driverctl unset-override` 再重来。
+
+**第 5 步：编写 `startup.conf` 的 `dpdk{}` 与 `cpu{}`。** 在 `03-01` 的最小配置上补 `dpdk{}`，把第 4 步绑定的 PCI 地址逐条声明，`name` 用于给 VPP 接口一个稳定可读的名字，`socket-mem` 按 NUMA 节点分配内存（数值单位为 MB）：
+
+```ini
+unix {
+  nodaemon
+  log /var/log/vpp/vpp.log
+  cli-listen /run/vpp/cli.sock
+  gid vpp
+}
+cpu {
+  main-core 0
+  corelist-workers 2,4,6,8
+}
+dpdk {
+  uio-driver vfio-pci
+  huge-page-dir /dev/hugepages
+  socket-mem 1024,1024
+  dev default {
+    num-rx-queues 2
+    num-tx-queues 2
+  }
+  dev 0000:3b:00.0 { name data0 }
+  dev 0000:3b:00.1 { name data1 }
+}
+buffers {
+  buffers-per-numa 16384
+}
+```
+
+关键对应关系：`corelist-workers` 选的核要与两块网卡的 `numa_node` 就近（此处假设两卡分别属 node0/node1，则 worker 也跨两节点搭配）；`socket-mem 1024,1024` 表示 node0、node1 各 1 GB；`num-rx-queues` 一般不大于该节点的 worker 数；`uio-driver` 要与第 4 步实际绑定的驱动一致。以上字段在不同 VPP/DPDK 版本间可能有增减或改名（例如 `dev` 子块选项、`socket-mem` 是否仍受支持），**完整参数见 04-01，字段名与可用值需对照实际版本核验**。本篇只给出部署必需的最小集，不重列命令清单、不展开 PMD 轮询与转发图原理（原理见 06-12）。
+
+**第 6 步：完善 systemd 的启动前置检查。** 在 unit 的 `[Service]` 里用 `ExecStartPre` 把"驱动、大页、绑定状态"变成启动前置条件，避免机器重启后大页未就绪或 `driverctl` 覆盖丢失导致 VPP 空转：
+
+```ini
+[Unit]
+Description=Vector Packet Processing
+After=network-pre.target
+[Service]
+Type=simple
+ExecStartPre=/sbin/modprobe vfio-pci
+ExecStartPre=/bin/sh -c 'grep -q /dev/hugepages /proc/mounts || mount -t hugetlbfs -o pagesize=1G none /dev/hugepages'
+ExecStartPre=/usr/sbin/driverctl -v list-devices | /bin/grep -q '0000:3b:00.0 \* vfio-pci' || /bin/true
+ExecStart=/usr/bin/vpp -c /etc/vpp/startup.conf
+Restart=on-failure
+LimitMEMLOCK=infinity
+[Install]
+WantedBy=multi-user.target
+```
+
+注意上面第三条 `ExecStartPre` 里的匹配串只是示意，实际应以 `driverctl -v list-devices` 的真实输出格式为准（需对照实际版本核验）；更稳妥的做法是写一个独立校验脚本，检查失败即 `exit 1` 阻止启动。`Restart=on-failure` 配合 `03-06` 的高可用设计才有意义，单机场景先确保不因配置错误无限重启循环。改完执行 `systemctl daemon-reload && systemctl restart vpp`，用 `journalctl -u vpp -f` 跟启动日志。
+
+**第 7 步：把接口拉起来并配置地址（收尾）。** VPP 起来后，先用 `vppctl show interface` 确认 `data0` / `data1` 已被识别为物理接口，再执行最小配置片段（命令见 04-03）：
+
+```bash
+vppctl set interface state data0 up
+vppctl set interface state data1 up
+vppctl set interface ip address data0 10.0.0.1/24
+vppctl set interface ip address data1 10.1.0.1/24
+vppctl show interface addr
+```
+
+若要形成"进—转发—出"的最简闭环，还需配置路由或桥接（命令见 04-04），并在对端流量发生器上配同网段地址与回程路由。需要重申：这些接口已不在内核，所有验证都必须走 `vppctl`，`ip addr` / `ethtool data0` 一律无效。
+
+### 4. 验证方法与预期结果
+
+第一层"驱动与绑定"：`dpdk-devbind.py --status` 里数据面网卡应处于 "using DPDK-compatible driver" 且显示 `drv=vfio-pci`；`driverctl -v list-devices` 对应行应标记 override 为 `vfio-pci`；`lspci -k -s 3b:00.0` 的 `Kernel driver in use` 应为 `vfio-pci`。宿主机 `ip link` 里原 `eth2/eth3` 消失，管理口仍在。这层失败就不要往下走，说明绑定本身没成。
+
+第二层"VPP 识别接口"：`vppctl show interface` 应列出 `data0` / `data1` 且状态可置为 up；`vppctl show hardware-interfaces` 应显示每块卡的 RX/TX 队列数、驱动名、NUMA 节点与核放置，`num-rx-queues` 的配置值能被印证；`vppctl show threads` 的 worker 核应与 `corelist-workers` 一致且落在隔离核；`vppctl show log` 中 DPDK 初始化行应显示 `socket-mem` 按两个 socket 各分配到内存、无 `EAL: Cannot get hugepage information` 或 `requested ... not available` 之类报错（命令见 04-06，具体子命令输出格式需对照实际版本核验）。
+
+第三层"真实收发"：从流量发生器向 `data0` 打流，`vppctl show interface` 的 `rx packets` / `tx packets` 计数应持续增长，`vppctl show errors` 无新增错误，`vppctl show runtime` 里 `dpdk-input` 节点有向量处理计数；`vppctl ping <对端地址>` 应通。若配了 `vppctl trace add dpdk-input 10` 再看 `vppctl show trace`，应能看到报文经过 `dpdk-input → ethernet-input → ip4-lookup ...` 的完整节点链（节点链含义见 06-02，本篇只展示如何在部署后用 trace 确认数据面通，不展开原理）。`show runtime` 里若 `dpdk-input` 长时间零计数而 `show interface` 有 Rx，多半是队列/核绑定错配，回到第 5 步核对 `num-rx-queues` 与 worker 数。
+
+把"绑定状态 + 接口列表 + 队列放置 + 打流计数 + trace 首包路径"五项截屏或存文本，作为 `03-02` 的验收基线。预期可归纳为：驱动绑对、接口被 VPP 认出、队列落在预期 NUMA 核、报文计数持续增长、trace 能看到完整路径。五项齐备，网卡绑定部署完成。
+
+### 5. 常见失败与排错
+
+| 现象 | 可能根因 | 定位命令 | 修复方向 |
+|---|---|---|---|
+| `dpdk-devbind.py` 绑定后设备仍属内核驱动 | 接口被 NM/服务占用、未先 down | `nmcli dev status`、`driverctl -v list-devices` | 停用 NM 管理、`ip link set down` 后重绑 |
+| VPP 启动报 `EAL: Cannot get hugepage information` | hugetlbfs 未挂载 / 大页不足 | `mount \| grep huge`、`grep -i huge /proc/meminfo` | 补挂载、增 `nr_hugepages`、按节点分配 |
+| 某块网卡初始化失败、`socket-mem` 报错 | 双路但只在单 socket 分了内存 | `vppctl show log \| grep -i dpdk`、`lspci`/`numa_node` | `socket-mem` 显式写两节点，大页按节点均分 |
+| 接口 up 但不收包 | RX 队列数 > worker 数、核/网卡跨 NUMA | `vppctl show hardware-interfaces`、`vppctl show threads` | 队列数 ≤ 同节点 worker 数，核就近绑定 |
+| `ip addr` / `ethtool` 看不到接口 | 认知错位：接口已归 VPP | `vppctl show interface` | 全部改用 vppctl（命令见 04-03） |
+| 重启后绑定丢失 | 用了 `dpdk-devbind.py` 临时绑定 | `driverctl -v list-devices` | 改用 `driverctl set-override` 持久化 |
+| 管理口一起消失、SSH 断联 | 误把管理口写进绑定清单 | 带外管理登录排查 | 绑定前白名单排除管理口，`driverctl unset-override` 恢复 |
+| `vfio-pci` 报 IOMMU group 不合法 | 未开 VT-d/AMD-Vi 或组内有多设备 | `dmesg \| grep -i IOMMU`、`ls /sys/kernel/iommu_groups/` | 开 IOMMU、整组设备一并绑定或换 `uio_pci_generic` |
+
+排错同样遵循固定层次："绑定状态 → 大页/EAL 初始化 → 配置段解析 → 接口与队列 → 收发计数"。最高频的三类根因依次是：大页没按 NUMA 备齐、`dpdk{}` 里的 PCI 地址或 `uio-driver` 与实际绑定不一致、以及 RX 队列数与 worker 核错配。另有一类隐蔽问题：IOMMU group 里除了目标网卡还挂了别的设备（如同一 PCIe 桥下的 USB/GPU），vfio 要求整组设备都归 vfio 才能直通，此时要么把整组都绑走，要么退回 `uio_pci_generic`。在云环境还常遇到 no-iommu 限制，处理方式放到 `03-03` 专门讲。
+
+#### 陷阱与最佳实践
+
+- **绑定清单白名单化**：动手前用默认路由与 `ip -br link` 标出管理口并显式排除，脚本化绑定，杜绝手敲 PCI 地址。
+- **持久化用 driverctl、临时验证用 dpdk-devbind.py**：二者不要交叉管理同一块卡；生产一律 `driverctl set-override` 并写开机模块加载。
+- **三元组一致性**：`dpdk{}` 的 PCI 地址、`uio-driver`、`socket-mem`/worker 的 NUMA 归属必须与第 4 步真实绑定结果、`lspci` 的 `numa_node` 逐项对得上。
+- **队列数 ≤ 同节点 worker 数**：多队列 RSS 要有多 worker 才有意义，否则报文会集中到少数核上，反而不均。
+- **配置只写必要片段**：`dpdk{}` / `cpu{}` 全参数与 dev 子块全部选项见 04-01，本册不重列；PMD 轮询、帧递交、转发图原理见 06-12 / 06-02，本册不展开。
+- **重启链路要闭环**：把 `modprobe`、hugetlbfs 挂载、绑定校验写进 `ExecStartPre` 或独立脚本，保证重启后无需人工干预就能恢复到验收基线。
+
+### 6. 小结
+
+本篇完成了从"VPP 进程活着"到"物理网卡由 DPDK 接管并进入转发"的完整链路：先锁定 PCI 地址与 NUMA 归属并生成排除管理口的绑定白名单，再开启 IOMMU、加载 vfio-pci、按节点备齐大页，接着用 `driverctl`/`dpdk-devbind.py` 把网卡从内核解绑并绑定，随后在 `startup.conf` 里以最小的 `dpdk{}` / `cpu{}` 片段声明设备、队列与内存，最后通过 systemd 前置检查与 `vppctl` 分层验证把"驱动—接口—队列—收发—trace 路径"逐项坐实。三条最值得记住的结论是：管理口必须白名单排除，绑定方式要持久化，PCI 地址 / 驱动 / NUMA / 队列数必须与 `corelist-workers` 严格一致。本篇形成的绑定脚本、`startup.conf` 片段与验收基线，是 `03-03` 虚拟化/云、`03-04` 容器透传的直接输入——它们本质上都是把 vfio-pci 这套绑定搬进不同运行环境。
+
+---
+
+## 03-03 云与虚拟化部署
+
+### 1. 目标与拓扑
+
+本篇的目标，是把 `03-02` 在物理机上跑通的 VPP + DPDK 能力，迁移到"资源不直接属于你"的虚拟化与公有云环境里，并说清楚每种形态能拿到什么性能、要付出什么代价。物理机部署时，CPU、内存、网卡、IOMMU 都是独占且可精确控制的；一旦进入 VM 或云实例，这些资源要么被 Hypervisor 抽象了一层，要么被多租户共享，要么根本不暴露标准的 PCIe 配置空间。于是同一个 `startup.conf`、同一套 vfio-pci 绑定思路，在不同平台上会出现细微但致命的差异：KVM 里可以直通整块网卡，SR-IOV 里只能拿到 VF，virtio 走的是半虚拟化队列，AWS ENA 则有自己的 PMD 与 IOMMU 限制。部署者必须先判断"我这一层到底拿到了哪种设备"，再决定绑定方式和 `dpdk{}` 片段，而不是把物理机脚本原样拷贝进来。
+
+下图把四种典型形态画在同一个宿主机视角下：物理网卡通过 SR-IOV 切出多个 VF，VF 可以经 vfio-pci 直通给 KVM 虚机里的 VPP；另一条路径是 Hypervisor 把网卡抽象成 virtio-net / vhost-user 后端，VPP 在 Guest 里以 virtio 驱动或 VPP 侧的 vhost-user socket 对接；公有云一侧，AWS Nitro 实例把网卡呈现为 ENA 设备，EC2 裸金属实例可像物理机一样用 vfio-pci 绑定，普通实例则受平台 IOMMU 策略约束。图中实线是数据面可达路径，虚线是控制/管理路径或平台抽象边界。
+
+:::figure id=03-03-01 | name=云与虚拟化四种部署形态 | dir=TD
+node host "物理宿主机<br/>NIC + IOMMU + Hugepages" blue
+node pf "SR-IOV PF<br/>sriov_numvfs" teal
+node vf0 "VF 0000:3b:10.0" green
+node vf1 "VF 0000:3b:10.2" green
+node kvm "KVM / QEMU VM<br/>VPP in Guest" purple
+node vhost "vhost-user socket<br/>virtio 后端" amber
+node ena "AWS ENA 网卡<br/>Nitro 卡" teal
+node ec2 "EC2 实例 / 裸金属<br/>VPP + DPDK" purple
+node ctrl "控制面 / 管理网" gray
+edge host -> pf "开启 SR-IOV"
+edge pf -> vf0 "创建 VF"
+edge pf -> vf1 "创建 VF"
+edge vf0 -> kvm "vfio-pci 直通"
+edge vf1 -> kvm dashed "另 VF 备用"
+edge host -> vhost "vhost-user 后端"
+edge vhost -> kvm "virtio-pci / vhost-user"
+edge host -> ena "Nitro 呈现"
+edge ena -> ec2 "ena PMD / vfio-pci"
+edge ctrl -> kvm dashed "管理"
+edge ctrl -> ec2 dashed "管理"
+:::
+
+需要在一开始就建立"性能取舍"的坐标。直通（PCI passthrough / SR-IOV VF）把 DMA 与中断路径几乎原封不动交给 Guest，性能最接近裸机，代价是热迁移受限、VF 数量有限、云平台上未必允许；virtio / vhost-user 保留了迁移与灵活组网的便利，但多了一层队列拷贝与后端调度，小包 PPS 与尾时延通常要打折；公有云 ENA 则介于两者之间，能拿到接近线速的吞吐，却要接受平台对 IOMMU、巨帧、多队列的硬限制。本篇不评判哪种更好，而是给出每种形态"照着做能跑通"的操作链，以及每处该用 `vppctl` 还是 `ethtool` 的边界（命令见 04-03）。
+
+和前两篇的衔接关系：无论哪种形态，Guest/实例内部仍要重复 `03-01` 的 CPU 隔离与大页、`03-02` 的绑定与 `dpdk{}` 配置，只是"设备从哪来"变了。因此本篇重点放在宿主机/云平台侧的设备准备与呈现方式，以及 Guest 内需要相应调整的那几处配置，而不重复大页、`cpu{}` 段的完整写法（完整参数见 04-01）。
+
+### 2. 前置条件与环境
+
+形态判断是第一步，可以用一张表把"能拿到什么设备、要什么前置"列清楚。KVM 直通要求宿主机 CPU 支持 VT-d/AMD-Vi、BIOS 开启、内核带 `intel_iommu=on`，且目标设备所在 IOMMU group 可整体直通；SR-IOV 还要求网卡与驱动支持 VF（如 ixgbe / i40e / mlx5_core），并能在 PF 上创建 `sriov_numvfs`；virtio 路径要求 QEMU 与 Guest 内核带 virtio-net / vhost 支持，VPP 侧则对应 `create vhost-user socket` 一类命令（命令见 04-03，子命令格式需对照实际版本核验）；AWS ENA 要求选用支持 ENA 的实例族（如 m5n / c5n / i3en 及裸金属 `.metal` 规格），并加载 `ena` 内核驱动用于初始识别。
+
+| 形态 | Guest 侧看到的设备 | 宿主机/平台前置 | 性能 | 主要限制 |
+|---|---|---|---|---|
+| PCI 直通整卡 | 完整 PCIe 网卡 | VT-d/AMD-Vi、IOMMU group 干净 | 接近裸机 | 无法热迁移、独占 |
+| SR-IOV VF 直通 | VF（轻量 PCIe 功能） | PF 开 `sriov_numvfs`、VF 绑 vfio-pci | 接近裸机 | VF 数量、MAC/VLAN 受 PF 管控 |
+| virtio / vhost-user | virtio-net PCI 设备 | QEMU vhost-user 后端、hugepages 共享 | 中等 | 队列拷贝、尾时延 |
+| AWS ENA | ENA 设备 | 支持 ENA 的实例、`ena` 驱动 | 中到高 | IOMMU/MTU/队列受平台限制 |
+| EC2 裸金属 | 近似物理 PCIe | `.metal` 规格 | 接近裸机 | 成本高、仍需平台网络约束 |
+
+环境核验命令按层展开。宿主机侧：`lscpu | grep -i virtualization` 确认硬件虚拟化、`dmesg | grep -i -e DMAR -e IOMMU` 确认 IOMMU、`find /sys/kernel/iommu_groups/ -type l` 查看设备分组、`lspci -nn` 确认网卡型号是否支持 SR-IOV。Guest/实例内部：`lspci -nn` 看到的应是 VF、virtio 或 ENA 设备而非物理 PF；`ethtool -i eth0` 的 driver 应为 `virtio_net` / `ena` 或直通后的 vfio 归属；`grep -i huge /proc/meminfo` 确认 Guest 自己也预留了大页——这一点最容易被忽略，VF 直通只解决了网卡，Guest 里的 DPDK 仍要自己的大页与隔离核。
+
+选定形态之后，还有几项"平台策略"层面的前置值得单独确认。SR-IOV 场景里，VF 虽然直通进了 Guest，但它的 MAC 地址、VLAN 标签、以及是否允许改 MAC/开启混杂，仍受 PF 侧管控；宿主机上通常通过 `ip link set <PF> vf <N> mac <MAC> vlan <VLAN> spoofchk on` 一类命令配置（命令格式随驱动与 iproute2 版本而异，需对照实际版本核验），若 Guest 里 VPP 需要设置接口 MAC 或收发带 VLAN 的帧，而 PF 侧没放开，就会表现为"接口 up 但不收包"或被静默丢弃。直通与 SR-IOV 的另一项硬约束是热迁移：由于 Guest 持有真实硬件的 DMA 上下文，传统热迁移基本不可用，必须靠主备切换（`03-06`）来容灾，这反过来决定了它在高可用设计里的位置。公有云侧则要提前核对实例族对"可附加 ENI 数量""每 ENI 队列数""是否允许巨帧""单实例带宽/PPS 配额"的限制——这些限制在控制台或实例元数据里能查到，且往往比技术文档更早成为压测天花板。把这些平台约束与硬件能力一起写进第 2 节的形态表备注列，能避免部署到一半才发现"这块卡根本不允许做这件事"。
+
+源码与入口位置（只给定位，不展开机制）：virtio / vhost-user 驱动实现在 `src/vnet/devices/virtio/`（旧版本可能在 `src/plugins/vhost-user/`，路径需对照实际版本核验）；`dpdk{}` 段与设备初始化仍在 `src/plugins/dpdk/device/`（字段见 05-11）；DPDK 侧的 ENA PMD 位于 DPDK 源码树的 `drivers/net/ena/`，VPP 通过 DPDK 间接使用，无需 VPP 专用插件；vhost-user 相关 CLI 与 socket 创建入口在 `src/vnet/devices/virtio/` 与对应 `vhost_user` 实现文件。云环境下的 `show hardware-interfaces` 输出判读与物理机一致（命令见 04-06）。
+
+### 3. 分步操作
+
+**第 1 步：选定形态并准备设备。** 若走 SR-IOV，在宿主机 PF 上创建 VF 并确认它们出现在 PCI 总线上：
+
+```bash
+# 查看 PF 支持的最大 VF 数
+cat /sys/bus/pci/devices/0000:3b:00.0/sriov_totalvfs
+# 创建 4 个 VF
+echo 4 > /sys/bus/pci/devices/0000:3b:00.0/sriov_numvfs
+lspci -nn | grep -i 'virtual function'   # 或 lspci | grep 3b:1
+```
+
+把该写入做成 udev 规则或开机脚本，否则重启后 VF 消失。随后用 `03-02` 第 4 步的方法，把要分给 Guest 的 VF（例如 `0000:3b:10.0`）`driverctl set-override ... vfio-pci`，**注意只绑 VF、不要误绑 PF**，PF 留在内核用于管理其余 VF 与交换。若走整卡直通，则确认该卡所在 IOMMU group 内没有必须留给宿主机的其他设备（用 `readlink -f /sys/kernel/iommu_groups/*/devices/*` 逐一核对），整组一并绑到 vfio-pci。
+
+**第 2 步：把设备交给 KVM/QEMU。** 两种主流写法。libvirt 在 domain XML 里加 hostdev（地址按实际 bus/slot/function 填）：
+
+```xml
+<hostdev mode='subsystem' type='pci' managed='yes'>
+  <driver name='vfio'/>
+  <source>
+    <address domain='0x0000' bus='0x3b' slot='0x10' function='0x0'/>
+  </source>
+  <address type='pci' domain='0x0000' bus='0x00' slot='0x06' function='0x0'/>
+</hostdev>
+```
+
+纯 QEMU 命令行等价写法：
+
+```bash
+qemu-system-x86_64 -enable-kvm -m 16G -cpu host \
+  -object memory-backend-file,id=mem,size=16G,mem-path=/dev/hugepages,share=on \
+  -numa node,memdev=mem \
+  -device vfio-pci,host=0000:3b:10.0,id=net0 \
+  -smp 8,sockets=1,cores=8,threads=1 \
+  -nographic
+```
+
+这里 `-object memory-backend-file ... mem-path=/dev/hugepages` 把 Guest 内存落在大页上，是让 Guest 内 DPDK 能正常分配的关键；`-numa node` 把 Guest NUMA 拓扑与直通设备的 `numa_node` 对齐，避免 Guest 里出现"设备在一个节点、内存在另一个节点"。务必给 Guest 配置足够的隔离核（`-smp` + `vcpu pinning` / `<vcpupin>`），否则 `03-01` 的 `isolcpus` 结论在 Guest 里不成立。
+
+**第 3 步：Guest 内重复最小化部署。** 进入 Guest 后，按 `03-01`/`03-02` 的精简版再来一遍：GRUB 加 `intel_iommu=on`（直通场景 Guest 里通常只需 `iommu=pt`，具体视 Hypervisor 呈现而定）、预留大页并挂载 hugetlbfs、`isolcpus` 隔离将要给 worker 的 vCPU、安装同版本 VPP。此时 `lspci` 应能看到 `0000:00:06.0` 这类被直通进来的 VF/网卡，`ethtool -i` 的 `bus-info` 与之一致。`startup.conf` 的 `dpdk{}` 里写的是 **Guest 看到的 PCI 地址**，不是宿主机的 `0000:3b:10.0`——这是虚拟化部署最高频的一处错配：把宿主机地址写进 Guest 配置，VPP 会报找不到设备。`cpu{}` 的 worker 核也要按 Guest 的 vCPU 编号重排（完整参数见 04-01）。
+
+**第 4 步：virtio / vhost-user 路径（备选形态）。** 当不能或不想用直通时，让 VPP 直接作为 vhost-user 后端对接 QEMU。VPP 侧创建 socket 并把接口拉起（命令见 04-03，子命令格式需对照实际版本核验）：
+
+```bash
+vppctl create vhost-user socket /tmp/vhost0.sock server
+vppctl set interface state VirtualEthernet0/0/0 up
+vppctl set interface l2 bridge VirtualEthernet0/0/0 1   # 示例，命令见 04-04
+```
+
+QEMU 侧用 vhost-user 把 virtio-net 接到该 socket：
+
+```bash
+qemu-system-x86_64 -enable-kvm -m 8G \
+  -object memory-backend-file,id=mem,size=8G,mem-path=/dev/hugepages,share=on \
+  -numa node,memdev=mem \
+  -chardev socket,id=char0,path=/tmp/vhost0.sock,server \
+  -netdev type=vhost-user,id=net0,chardev=char0,vhostforce \
+  -device virtio-net-pci,netdev=net0,mac=52:54:00:00:00:01,mq=on,vectors=10 \
+  -smp 4 \
+  -nographic
+```
+
+要点是 QEMU 与 VPP 必须共享同一份 hugepages 后端（`-mem-path` 指向同一挂载点），且 `mq=on` / `vectors` 与 VPP 侧的多队列配置匹配，否则多队列起不来。此路径下 Guest 里跑的是普通内核 virtio 驱动而非 DPDK，性能低于直通，但换来热迁移与灵活组网；也可以在 Guest 里再跑一个 VPP 用 virtio PMD 接 vhost-user，形成"VPP—VPP"纯用户态链路，配置思路同 `03-02`，只是设备类型换成 virtio。
+
+**第 5 步：AWS ENA 路径。** 在支持 ENA 的实例上先用 `ethtool -i eth0` 确认 `driver: ena`，`modinfo ena` 确认驱动存在。普通 Nitro 实例上，DPDK 往往无法拿到标准 IOMMU 组，需要让 vfio-pci 工作在 no-iommu 模式（**仅用于可信、隔离的测试实例，生产需评估安全影响**）：
+
+```bash
+modprobe vfio-pci
+echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode
+# 用 ethtool -i 拿 bus-info，例如 0000:00:03.0
+dpdk-devbind.py --status
+dpdk-devbind.py --bind=vfio-pci 0000:00:03.0
+```
+
+随后 `startup.conf` 的 `dpdk{}` 用 ENA 的 PCI 地址声明 `dev`（字段名需对照实际版本核验，完整参数见 04-01）。裸金属 `.metal` 实例则更接近物理机，可沿用 `03-02` 的标准 vfio-pci 流程。需要特别注意云平台对 MTU、巨帧、多队列数、以及"同一实例可绑定设备数"的硬限制，超出时 `vppctl show log` 里 DPDK EAL 会明确报错；ENAs 的 `num-rx-queues` 也要与实例允许的队列数对齐。AWS 上另一个现实约束是：把主网卡绑给 DPDK 会切断实例的网络与 SSM 会话，务必保留或额外挂载一块管理用 ENI 留在内核，这与 `03-02` 的"管理口白名单"是同一条原则在云上的翻版。
+
+**第 6 步：统一验证。** 无论哪种形态，Guest/实例内部都用 `vppctl show interface` / `show hardware-interfaces` / `show threads` / `show log` 复核（命令见 04-06），确认接口被识别、队列与 vCPU 对齐、无 EAL 报错；再从对端（另一 VM、同 VPC 实例或流量发生器）打流看计数增长。宿主机侧用 `virsh domxml-to-native` 或 `driverctl -v list-devices` 复核直通关系，云平台侧用控制台确认 ENI 与实例状态。
+
+### 4. 验证方法与预期结果
+
+分层验收，且每层都要区分"宿主机视角"与"Guest/实例视角"。宿主机/平台层：SR-IOV 创建后 `lspci` 能看到预期数量的 VF，`driverctl -v list-devices` 显示目标 VF 的 override 为 vfio-pci，PF 仍由内核驱动持有；libvirt/QEMU 启动无 `vfio: error, group ... is not viable` 之类报错；AWS 侧实例状态正常、管理 ENI 仍在内核。
+
+Guest/实例层：`lspci -nn` 看到的 PCI 地址与 `startup.conf` 里 `dev` 声明的完全一致（这是虚拟化部署最该首先确认的一条）；`ethtool -i` 的 `bus-info` 与该地址吻合；`vppctl show interface` 列出被接管的接口且可置 up；`vppctl show hardware-interfaces` 显示队列数与多队列配置一致、NUMA/vCPU 归属符合 Guest 的 `-numa` 规划；`vppctl show threads` 的 worker 落在 Guest 隔离 vCPU 上；`vppctl show log` 无 EAL 大页/队列/IOMMU 报错（命令见 04-06）。
+
+数据面层：从对端打流，`vppctl show interface` 的 Rx/Tx 计数持续增长，`vppctl show errors` 无新增，`vppctl ping` 通；virtio/vhost-user 路径额外观察 `show runtime` 里 vhost-user 相关 input 节点的向量计数，确认后端确实在收包而非空转。性能取舍的预期也应写进验收记录：直通/SR-IOV 应接近 `03-02` 物理机基线，virtio 路径小包 PPS 与尾时延应有可解释的下降，ENA 的队列数/MTU 应符合平台上限。把"设备地址、队列数、vCPU 绑定、PPS 相对物理基线的比例"存档，作为该形态的容量依据。
+
+### 5. 常见失败与排错
+
+| 现象 | 可能根因 | 定位命令 | 修复方向 |
+|---|---|---|---|
+| Guest 里 VPP 报找不到 `dev` 设备 | 把宿主机 PCI 地址写进了 Guest 配置 | 两端 `lspci -nn` 对比 | `dpdk{}` 改用 Guest 侧地址（完整参数见 04-01） |
+| `vfio: group not viable` | IOMMU group 内有非直通设备 | `readlink -f /sys/kernel/iommu_groups/*/devices/*` | 整组绑定或换设备/换 `uio_pci_generic` |
+| SR-IOV VF 重启后消失 | `sriov_numvfs` 未持久化 | `lspci \| grep -i virtual` | 写 udev 规则/开机脚本 |
+| Guest 内 DPDK 大页分配失败 | 只直通了网卡，Guest 未预留大页 | `grep -i huge /proc/meminfo`、`mount \| grep huge` | Guest 内重做大页 + QEMU `-mem-path` |
+| vhost-user 链路不通 | QEMU 与 VPP 未共享 hugepages / socket 路径不符 | `ls -l /tmp/vhost0.sock`、`mount \| grep huge` | 统一 `-mem-path` 与 socket，匹配 `server`/`client` 角色 |
+| 多队列起不来 | `mq=on`、`vectors` 与 VPP 队列数不匹配 | `vppctl show hardware-interfaces` | 两侧队列数对齐 |
+| AWS 绑主网卡后失联 | 未保留管理 ENI | 云控制台/串口 | 保留独立管理 ENI，仅在测试实例用 no-iommu |
+| ENA EAL 报队列/MTU 超限 | 超出平台对队列数、巨帧的限制 | `vppctl show log \| grep -i -e ena -e eal` | 下调 `num-rx-queues` 与 MTU 至平台上限内 |
+
+排错主线仍是"先确认 Guest 里到底看到了什么设备，再核对 `dpdk{}` 写的地址，最后看大页/队列/IOMMU 三件套"。云与虚拟化相较物理机多出来的两类根因最值得单独记：一是地址错配（宿主机地址 vs Guest 地址），二是平台策略限制（IOMMU group、no-iommu、ENI 数量、队列上限）。另有一类性能"软故障"：功能全通但 PPS 远低于基线，多半是 Guest NUMA 没对齐（设备挂在一个 vCPU 节点、内存落在另一个）或 vCPU 没做 pinning 被 Hypervisor 调度漂移，用 `numastat -p $(pidof vpp)` 与 vcpu pinning 配置核对即可定位。
+
+#### 陷阱与最佳实践
+
+- **地址视角要切换**：`dpdk{}` 里永远是 Guest/实例看到的 PCI 地址；把宿主机地址抄进来是虚拟化部署第一大坑。
+- **Guest 也是一台"物理机"**：大页、隔离核、NUMA 规划、IOMMU 一项都不能省，直通只解决了网卡。
+- **PF 与 VF 分工明确**：SR-IOV 只把 VF 绑给 vfio-pci，PF 留内核管理；误绑 PF 会让其余 VF 与交换功能失效。
+- **云上保留管理通道**：AWS 保留独立管理 ENI，任何形态都保留带外/内核管理口，主数据面网卡才可交给 DPDK。
+- **性能取舍写进验收**：直通≈裸机、virtio 有可解释下降、ENA 受平台上限约束，用相对物理基线的比例量化，别凭感觉。
+- **配置与命令不越界**：`dpdk{}` 全参数见 04-01、接口/桥接命令见 04-03 / 04-04、`show` 命令族见 04-06；本册不重列命令清单、不展开 virtio/PMD 转发原理（原理见 06-12 / 07-01）。
+
+### 6. 小结
+
+本篇把 VPP + DPDK 从物理机搬到了 KVM、SR-IOV、virtio/vhost-user 与 AWS ENA 四类环境，核心结论是"先判断这一层拿到了什么设备，再决定绑定方式"：直通与 SR-IOV VF 最接近裸机但牺牲迁移灵活性，virtio/vhost-user 换来可迁移性与组网弹性但有小包与时延代价，ENA/裸金属则受云平台 IOMMU、队列、MTU 的硬约束。操作上，宿主机侧负责创建/呈现设备（VF、`vfio` hostdev、`-mem-path` 大页、ENI），Guest/实例侧仍需完整重做大页、隔离核与最小 `dpdk{}` 配置，且配置里必须用 Guest 视角的 PCI 地址。三条最该记住的经验是：地址视角切换、Guest 大页与 NUMA 不能省、任何形态都保留管理通道。这些经验在 `03-04` 的容器化里会以另一种形式再次出现——容器不虚拟硬件，但同样要把设备、大页、CPU 精确地"透传"进去。
+
+---
+
+## 03-04 容器化部署
+
+### 1. 目标与拓扑
+
+本篇的目标，是把 VPP 作为容器里的数据面进程跑起来，并解决容器环境特有的三件事：设备透传、大页透传、以及 CPU/网络的确定性分配。容器与虚拟机的本质区别在于它不虚拟硬件——VPP 在容器里看到的仍然是宿主机的内核、同一套 NUMA 拓扑、同一批 `/dev` 设备节点，只是被 namespace 与 cgroup 圈定了一个视图。这既是好消息也是坏消息：好消息是没有 Hypervisor 抽象层、性能可以做到接近裸机；坏消息是所有"宿主机级"的前置条件（vfio-pci 绑定、大页预留、IOMMU、CPU 隔离）一个都不会因为容器化而自动出现，反而需要显式地挂载、授权与调度。很多人第一次在 Docker 里跑 VPP 失败，根因不是镜像不对，而是忘了把 `/dev/vfio` 和 `/dev/hugepages` 挂进去。
+
+在 Kubernetes 里，问题又多了一层：Pod 要声明 hugepages 资源、要拿到 SR-IOV VF 这类扩展资源、要有第二张数据面网卡、还要把 worker 线程钉在独占的 CPU 上。下图给出一个典型的 K8s VPP 数据面 Pod：宿主机预先完成 vfio 绑定、大页预留与 CPU 隔离；SR-IOV Device Plugin 把 VF 作为可调度资源暴露；Multus CNI 在默认控制面网卡之外，再给 Pod 挂一张数据面网卡；VPP Pod 以 privileged 方式拿到 `/dev/vfio`、`/dev/hugepages` 与 PCI sysfs，并通过静态 CPU 管理策略获得独占核。图中实线是数据面/资源注入，虚线是控制面与调度关系。
+
+:::figure id=03-04-01 | name=K8s 容器化 VPP 数据面 Pod | dir=TD
+node host "宿主机<br/>vfio-pci + Hugepages<br/>+ IOMMU + isolcpus" blue
+node devplug "SR-IOV Device Plugin<br/>intel.com/sriov_netdevice" teal
+node kubelet "kubelet<br/>static CPU / hugepages 预留" blue
+node pod "VPP Pod (privileged)<br/>vpp -c startup.conf" purple
+node vf "SR-IOV VF<br/>/dev/vfio + PCI sysfs" green
+node hp "/dev/hugepages<br/>hugepages-1Gi 资源" amber
+node multus "Multus CNI<br/>NetworkAttachmentDefinition" amber
+node net0 "net0 控制面<br/>默认 CNI" gray
+node net1 "net1 数据面<br/>SR-IOV / VF" green
+edge host -> devplug "暴露 VF 资源"
+edge host -> kubelet "大页 + 独占核"
+edge kubelet -> pod "调度 + 资源注入"
+edge devplug -> pod "分配 VF"
+edge host -> vf "vfio 绑定"
+edge vf -> pod "设备透传"
+edge hp -> pod "大页挂载"
+edge multus -> pod "附加第二网卡"
+edge multus -> net0
+edge multus -> net1
+:::
+
+需要先划清与相邻篇章的边界：Docker/K8s 里的镜像构建、deb/rpm 打包属于 `02-03`；容器内 `startup.conf` 的 `dpdk{}` / `cpu{}` 写法仍是 `03-02` 的结论（完整参数见 04-01）；SR-IOV VF 的创建与 vfio 绑定仍是 `03-03` 的宿主机动作。本篇只讲"如何把这些已经就绪的宿主机资源，正确、确定性地交到容器里"，以及 Docker 与 K8s 两种编排方式各自的透传清单与调度配置。VPP 在容器里仍以主机网络或透传网卡收发，默认 CNI 只承载控制面，数据面不经过内核网络栈转发，这一点与 `07` 各模块的组网行为相关（功能见 07-01），本册不展开转发原理。
+
+### 2. 前置条件与环境
+
+宿主机层必须先"回到物理机状态"：完成 `03-01` 的大页预留、CPU 隔离、IOMMU 开启与 `03-02` 的 vfio-pci 绑定，且数据面网卡/VF 已由 `driverctl set-override` 持久化。容器化不会替你做这些，它只是消费这些成果。核验清单与 `03-02` 基本一致，但要多确认三项：`/dev/vfio/vfio` 与 `/dev/vfio/<group>` 设备节点存在、`/dev/hugepages` 已挂载且有大页空闲、PCI sysfs（`/sys/bus/pci/devices/`）可读。
+
+| 层级 | 项目 | 检查/准备命令 | 容器侧对应动作 |
+|---|---|---|---|
+| 宿主机 | vfio-pci 绑定持久化 | `driverctl -v list-devices` | 挂载 `/dev/vfio` |
+| 宿主机 | 1 Gi / 2 Mi 大页 | `grep -i huge /proc/meminfo`、`mount \| grep huge` | 挂载 `/dev/hugepages` + hugepages 资源 |
+| 宿主机 | CPU 隔离 / 独占核 | `cat /sys/devices/system/cpu/isolated` | `--cpuset-cpus` / static CPU policy |
+| 宿主机 | SR-IOV VF | `lspci \| grep -i virtual` | Device Plugin 暴露资源 |
+| 运行时 | Docker / containerd | `docker version` / `crictl version` | privileged + 设备/卷挂载 |
+| K8s | 扩展资源与 CNI | `kubectl describe node`、`kubectl get nad` | Multus + Device Plugin + hugepages |
+| 镜像 | VPP 镜像与版本 | `docker images`、`vppctl show version` | 与控制面/API 客户端同版本 |
+
+镜像方面，用发行版官方或社区维护的 VPP 镜像（如 `ligato/vpp` 系列，镜像名与 tag 需对照实际仓库核验），确保镜像内的 VPP 版本与 `vppctl`、Python/govpp 控制面客户端一致；镜像里要带齐 `dpdk` 插件、`/etc/vpp/startup.conf` 可挂载点以及 CLI socket 目录。生产上建议把 `startup.conf` 做成 ConfigMap 挂载而非打进镜像，以便不同节点用不同 PCI 地址与核绑定。K8s 侧还需：开启 `HugePages` feature gate（2 Mi 与 1 Gi 由 kubelet 分别上报，1 Gi 在部分版本需要额外特性开关，需对照实际版本核验）、以 `--cpu-manager-policy=static` 启动 kubelet 并对 Guaranteed QoS 的整核 Pod 提供独占 CPU、部署 Multus 与 SR-IOV Network Device Plugin。
+
+源码与入口位置（仅定位）：VPP 容器内运行主体仍是 `src/vpp/vnet/main.c` / `src/vlib/main.c`，`dpdk{}` 解析在 `src/plugins/dpdk/device/`（字段见 05-11），CLI socket 与 `unix{}` 段在 `src/vlib/unix/`（完整参数见 04-01）。容器化本身不改变这些代码路径，改变的只是它们能看到的 `/dev`、`/sys` 与 cgroup 视图；因此排错时"容器内 `lspci` / `ls /dev` 看到什么"往往比看 VPP 日志更快定位问题。
+
+还有两个容器特有的资源视图必须先厘清。其一是共享内存：VPP 的 Binary API 队列、stats segment 与部分共享结构落在 `/dev/shm`，而 Docker 默认只给容器 64 MiB 的 `/dev/shm`、K8s 默认也走同样受限的 shm 视图，容量不足时会出现"进程能起、但控制面连不上或 statseg 报空间不足"这类难查的故障，部署时应显式加大（Docker 用 `--shm-size`，K8s 用 `emptyDir: {medium: Memory}` 挂载到 `/dev/shm`，取值需按实际共享内存需求核验）。其二是锁内存与 cgroup：DPDK 需要 `mlock` 住大页，容器必须同时具备 `IPC_LOCK` 能力与足够高的 `memlock` ulimit（`--ulimit memlock=-1:-1` 或 securityContext 对应设置），否则 EAL 会在预留内存阶段失败；而在 cgroup v2 环境里，hugetlb 还有独立的资源控制器，Pod 声明的 `hugepages-1Gi` 配额正是在这一层兑现，配额与节点实际空闲大页不一致就会在调度或启动阶段暴露。把这些"看不见的默认值"逐项显式化，是容器化部署区别于物理机部署最琐碎、也最值得先做完的准备工作。
+
+### 3. 分步操作
+
+**第 1 步：准备宿主机资源。** 复用 `03-01`~`03-03`：GRUB 预留 1 GB 大页、挂载 hugetlbfs、`isolcpus` 隔离核、`driverctl` 把数据面 VF 绑定 vfio-pci。为容器化额外确认：
+
+```bash
+ls -l /dev/vfio/                       # 应有 vfio 与各 group 节点
+mount | grep hugetlbfs                  # /dev/hugepages pagesize=1G
+cat /sys/devices/system/cpu/isolated
+driverctl -v list-devices | grep vfio-pci
+```
+
+这一步的产物是"可被透传的资源清单"：VF 的 PCI 地址与 IOMMU group、大页挂载点、隔离核范围。后面 Docker/K8s 配置都引用它。
+
+**第 2 步：Docker 单机容器化（开发与验证首选）。** 用 privileged 容器显式挂载设备、大页、PCI sysfs、配置与 socket 目录，并用 `--cpuset-cpus` 钉核、`--network host` 让主机网络视图可见：
+
+```bash
+docker run -d --name vpp \
+  --privileged \
+  --network host \
+  --cpuset-cpus="2-5" \
+  -v /dev/hugepages:/dev/hugepages \
+  -v /dev/vfio:/dev/vfio \
+  -v /sys/bus/pci:/sys/bus/pci:ro \
+  -v /sys/kernel/mm/hugepages:/sys/kernel/mm/hugepages:ro \
+  -v /run/vpp:/run/vpp \
+  -v /etc/vpp/startup.conf:/etc/vpp/startup.conf:ro \
+  -e LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu \
+  ligato/vpp:23.06 \
+  vpp -c /etc/vpp/startup.conf
+```
+
+逐项解释：`--privileged` 给出访问设备与 `mlock` 的能力（生产可收窄为 `--cap-add=SYS_ADMIN,IPC_LOCK,NET_ADMIN,NET_RAW` + `--device` 白名单，减少攻击面）；`/dev/vfio` 与 `/dev/hugepages` 是 DPDK 的两条生命线；`/sys/bus/pci` 只读挂载供 EAL 枚举设备；`/run/vpp` 放 CLI/API socket；`--cpuset-cpus` 与 `startup.conf` 的 `corelist-workers` 必须落在同一组隔离核上（完整参数见 04-01）。`startup.conf` 里的 `dpdk{}` 仍写宿主机的 PCI 地址——容器不虚拟硬件，看到的地址与宿主机一致，这与 `03-03` 的 Guest 视角切换正好相反，是容器与虚机最容易混淆的一点。启动后用 `docker logs vpp` 与 `docker exec -it vpp vppctl show interface` 验证（命令见 04-06）。
+
+**第 3 步：收窄权限（生产建议）。** privileged 容器权限过大，生产应改为按需授权：把 VF 对应的 IOMMU group 设备节点逐个 `--device=/dev/vfio/<N>` 挂入，配合 `--cap-add=IPC_LOCK --cap-add=NET_ADMIN --security-opt seccomp=unconfined`（seccomp 策略需按实际运行时与内核核验），并用 `--ulimit memlock=-1:-1` 放开锁内存限制。关键是"设备 + 能力 + memlock"三样齐备，缺任一项 DPDK 都会在 EAL 初始化阶段报权限或大页错误。
+
+从 privileged 收窄到按需授权时，最容易漏掉的是 IOMMU group 编号与容器 device 的映射：宿主机上 `ls /dev/vfio/` 得到的 group 号，要逐个以 `--device` 或 hostPath 的设备路径形式挂进容器，且容器内进程必须对 `/dev/vfio/vfio` 这个全局字符设备也有访问权限，否则即使 group 节点齐全，EAL 仍会在 vfio 初始化阶段失败。一个稳妥的过渡做法是先在 privileged 容器里跑通，再用 `strace` 或容器运行时的审计日志收集 VPP 实际打开的设备路径，按这份"真实清单"逐项收窄，而不是凭经验猜需要哪些 `/dev` 节点。这样既拿到了最小权限，又不会因为漏挂一个节点而反复回退到 privileged。
+
+**第 4 步：K8s 侧的资源与网卡编排。** 先定义 SR-IOV 的 NetworkAttachmentDefinition（Multus 用它给 Pod 挂第二张网卡，资源名需与 Device Plugin 上报的一致，JSON 字段需对照实际版本核验）：
+
+```yaml
+apiVersion: "k8s.cni.cncf.io/v1"
+kind: NetworkAttachmentDefinition
+metadata:
+  name: sriov-net1
+  annotations:
+    k8s.v1.cni.cncf.io/resourceName: intel.com/intel_sriov_netdevice
+spec:
+  config: '{
+    "cniVersion":"0.3.1",
+    "type":"sriov",
+    "name":"sriov-net1",
+    "vlan":0,
+    "ipam":{"type":"static"}
+  }'
+```
+
+Pod 里声明 hugepages、SR-IOV 资源、Multus 网络、privileged 与设备/大页挂载，并用整数 CPU + memory 让 kubelet 判定为 Guaranteed QoS 以拿到独占核：
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vpp
+  annotations:
+    k8s.v1.cni.cncf.io/networks: sriov-net1
+spec:
+  containers:
+  - name: vpp
+    image: ligato/vpp:23.06
+    command: ["vpp", "-c", "/etc/vpp/startup.conf"]
+    securityContext:
+      privileged: true
+      capabilities:
+        add: ["IPC_LOCK","NET_ADMIN","NET_RAW","SYS_ADMIN"]
+    resources:
+      requests:
+        cpu: "4"
+        memory: "2Gi"
+        hugepages-1Gi: 4Gi
+        intel.com/intel_sriov_netdevice: "1"
+      limits:
+        cpu: "4"
+        memory: "2Gi"
+        hugepages-1Gi: 4Gi
+        intel.com/intel_sriov_netdevice: "1"
+    volumeMounts:
+    - {name: hugepage, mountPath: /dev/hugepages}
+    - {name: vfio, mountPath: /dev/vfio}
+    - {name: vppconf, mountPath: /etc/vpp/startup.conf, subPath: startup.conf}
+    - {name: vpp-run, mountPath: /run/vpp}
+  volumes:
+  - name: hugepage
+    emptyDir: {medium: HugePages}
+  - name: vfio
+    hostPath: {path: /dev/vfio}
+  - name: vppconf
+    configMap: {name: vpp-startup}
+  - name: vpp-run
+    emptyDir: {}
+```
+
+要点逐条：`hugepages-1Gi: 4Gi` 必须与节点上报的 1 Gi 大页容量匹配，且 requests=limits 才是 Guaranteed；`cpu: "4"` 为整数且 requests=limits，配合 `--cpu-manager-policy=static` 才会分配独占核；Multus 通过 `k8s.v1.cni.cncf.io/networks` 注解附加 `net1`，默认 CNI 仍提供 `net0` 控制面；`emptyDir: {medium: HugePages}` 让 kubelet 把 hugetlbfs 挂进容器（具体 medium 取值与 1 Gi 支持需对照实际 K8s 版本核验）。`startup.conf` 用 ConfigMap 管理，不同节点按实际 VF PCI 地址与独占核生成不同配置。
+
+**第 5 步：CPU 与 NUMA 对齐。** 容器里最容易掉的性能坑是"设备在一个 NUMA 节点、大页/CPU 在另一个"。需要三处对齐：Device Plugin 分配的 VF 尽量与 Pod 独占核同 NUMA 节点（可配合 Topology Manager 的 `single-numa-node` 策略，策略名需对照实际版本核验）、`startup.conf` 的 `corelist-workers` 落在 kubelet 实际分配的独占核上、`socket-mem` 按节点分配（完整参数见 04-01）。`docker exec vpp cat /proc/self/status | grep Cpus_allowed_list` 或 K8s 里 `kubectl exec vpp -- taskset -pc 1` 可读到容器实际可用的 CPU 集，用它反推 `corelist-workers`，比照抄宿主机隔离核更可靠。
+
+**第 6 步：启动与联调。** `kubectl apply -f` 后 `kubectl describe pod vpp` 确认资源已分配、无 `FailedScheduling`（常见为 hugepages 或 SR-IOV 资源不足、Topology Manager 无法满足 NUMA 对齐）；`kubectl logs vpp` 看 EAL 初始化；`kubectl exec -it vpp -- vppctl show interface` / `show hardware-interfaces` / `show threads` 复核接口、队列、绑核（命令见 04-06）；最后从 `net1` 对端打流看计数增长。若把 VPP 用作 CNI 数据面（vhost-user 接其他 Pod/VM），思路与 `03-03` 的 vhost-user 路径一致，只是 socket 与 hugepages 要在 Pod 之间共享卷。
+
+### 4. 验证方法与预期结果
+
+容器/编排层：`docker inspect vpp` 或 `kubectl describe pod vpp` 应显示 `/dev/vfio`、`/dev/hugepages`、`/sys/bus/pci` 均已挂载，capabilities 齐全，CPU 集为预期的独占核；`kubectl describe node` 应显示 hugepages 与 SR-IOV 扩展资源被正确扣减；`kubectl get pods -o wide` 确认 Pod 被调度到具备对应资源的节点。
+
+容器内层：`docker exec vpp ls /dev/vfio` 能看到 group 节点，`grep -i huge /proc/meminfo` 与 `mount | grep huge` 显示大页可用（注意容器看到的是宿主 hugetlbfs 视图）；`vppctl show interface` 列出被接管接口且可置 up；`vppctl show hardware-interfaces` 显示队列数与 NUMA 归属；`vppctl show threads` 的 worker 落在 `Cpus_allowed_list` 之内；`vppctl show log` 无 EAL 权限/大页/PCI 枚举报错（命令见 04-06）。K8s 里额外用 `kubectl exec vpp -- ip link` 确认 Multus 附加的 `net1` 存在、`net0` 控制面仍在。
+
+数据面层：从 `net1`/VF 对端打流，`vppctl show interface` 计数增长、`show errors` 无新增、`vppctl ping` 通；用 `numastat -p $(pidof vpp)`（在容器所属 cgroup 视角）确认内存在设备同节点。性能预期是接近 `03-02` 物理机基线，若明显偏低，优先怀疑 NUMA 错配、独占核未生效（被 `cpu-manager-policy` 或 `--cpuset-cpus` 漏配）或大页跨节点。把"挂载清单、资源配额、实际 CPU 集、VF PCI 地址、NUMA 归属、相对基线 PPS"存档。
+
+除功能性验证外，容器化部署还建议补做两类"编排级"验证。第一类是重建与漂移：删除 Pod 或重启 Docker 容器后，确认新的 `Cpus_allowed_list`、VF 绑定、大页配额与 ConfigMap 挂载都能恢复到原样，且 `startup.conf` 里写死的 PCI 地址在新调度节点上仍然有效——若集群节点间 VF 的 PCI 地址不一致，写死地址会让 Pod 漂到别的节点后直接找不到设备，正确做法是按节点生成 ConfigMap 或用 Device Plugin 把设备信息注入环境变量再模板化配置。第二类是资源边界：用 `docker stats` / `kubectl top pod` 与 cgroup 下的 `memory` / `hugetlb` 用量观察 `memlock`、大页是否触顶，确认没有因 cgroup 限额把 DPDK 需要的内存挡在门外。这两类验证在物理机部署里通常不需要，却是容器环境能否长期稳定运行的关键，应和 `03-02` 的验收基线一起纳入上线检查表。
+
+### 5. 常见失败与排错
+
+| 现象 | 可能根因 | 定位命令 | 修复方向 |
+|---|---|---|---|
+| EAL 报 `Permission denied` / 打不开 `/dev/vfio` | 未挂设备节点或权限/能力不足 | `docker inspect` / `kubectl describe pod`、`ls /dev/vfio` | 补 `--device`/hostPath + `IPC_LOCK` + privileged/能力 |
+| EAL 报大页不足 / `mmap` 失败 | 未挂 hugetlbfs 或 hugepages 资源配额不符 | `mount \| grep huge`、`kubectl describe node` | 挂 `/dev/hugepages` + `hugepages-1Gi` requests=limits |
+| `FailedScheduling` | 节点无足够 hugepages / SR-IOV / NUMA 不满足 | `kubectl describe pod`、`kubectl describe node` | 对齐资源上报与配额，调整 Topology Manager 策略 |
+| Pod 起但 worker 漂到非独占核 | 非 Guaranteed QoS 或 CPU policy 非 static | `taskset -pc 1`、`cat /proc/self/status` | cpu/memory 整数且 req=limit，开 static policy |
+| `dpdk{}` 找不到设备 | 地址视角混淆或 PCI sysfs 未挂 | 容器内 `lspci -nn`、`ls /sys/bus/pci` | 容器用宿主机地址，补 sysfs 挂载（完整参数见 04-01） |
+| 多队列/性能不达标 | VF、大页、CPU 跨 NUMA | `numastat -p`、`show hardware-interfaces` | Topology Manager + `socket-mem` 按节点对齐 |
+| Multus `net1` 未出现 | NAD 资源名与 Device Plugin 不一致 / 注解写错 | `kubectl get net-attach-def`、`kubectl describe pod` | 对齐 resourceName 与 networks 注解 |
+| 控制面断联 | 把默认网卡也交给了 DPDK | `kubectl exec -- ip link` | 数据面只用附加网卡，保留 net0 控制面 |
+
+排错主线是"编排分配 → 容器内可见资源 → EAL 初始化 → 接口/队列 → NUMA 对齐"。容器化相较物理机新增的高频根因集中在两类：资源没真正"透传进去"（设备、大页、sysfs、能力、memlock 缺一不可），以及调度层面的不确定性（QoS 不达标拿不到独占核、Topology Manager 导致 NUMA 不满足而调度失败）。一个实用技巧是先用 `docker run` 把镜像与 `startup.conf` 调通，再把同样的挂载/能力清单翻译成 K8s YAML，能把"是镜像问题还是编排问题"快速切开。
+
+#### 陷阱与最佳实践
+
+- **容器不虚拟硬件**：`dpdk{}` 用宿主机 PCI 地址，与虚机 Guest 视角相反；别把 `/dev/vfio` 与 `/dev/hugepages` 漏挂。
+- **权限最小化**：开发用 privileged，生产收窄为按需 `--device` + `IPC_LOCK/NET_ADMIN` + `memlock=-1`，降低攻击面。
+- **Guaranteed QoS 才拿独占核**：整数 CPU、requests=limits、kubelet static policy 三者齐备，`corelist-workers` 用容器实际 `Cpus_allowed_list` 反推。
+- **NUMA 三处对齐**：VF、大页、独占核同节点，配合 Topology Manager 与 `socket-mem`，否则性能悄悄打折。
+- **配置外置**：`startup.conf` 用 ConfigMap、按节点生成，避免把 PCI 地址与核绑定写死进镜像。
+- **保留控制面**：数据面用 Multus 附加网卡/`net1`，默认 CNI 的 `net0` 留给控制面与管理，别让 VPP 接管唯一网卡。
+- **不越界重复**：`dpdk{}`/`cpu{}` 全参数见 04-01、接口/桥接命令见 04-03 / 04-04、`show` 命令族见 04-06；镜像与打包见 02-03；本册不重列命令、不展开模块转发原理（原理见 06、07）。
+- **编排可重复性优先**：把设备、大页、CPU 与 ConfigMap 的差异收敛成按节点生成的声明式清单，保证 Pod 重建或漂移后能自动回到验收基线，别依赖某台机器上手工调出来的"能跑"状态。容器化真正的难点不在首次启动，而在第 N 次重建后仍与第一次完全一致，因此上线前务必用删除重建的方式实测一次，而不是只看首次部署成功就收工。
+
+### 6. 小结
+
+本篇把 VPP 装进了 Docker 与 Kubernetes：宿主机先按 `03-01`~`03-03` 把 vfio、大页、隔离核、SR-IOV VF 备齐，Docker 侧用 privileged/能力 + 设备/大页/sysfs 挂载 + `--cpuset-cpus` 把这些资源确定性交进容器，K8s 侧则用 hugepages 资源、SR-IOV Device Plugin、Multus 附加网卡与 static CPU 管理策略完成同等效果。三条最关键的认知是：容器不虚拟硬件（地址用宿主机视角、但资源必须显式透传）、Guaranteed QoS 才拿得到独占核、NUMA 三处对齐决定性能是否接近裸机。`03-05` 将在此基础上更进一步——不再只是把现成网卡透传进去，而是引入 SmartNIC、Cryptodev、QAT 这类专用硬件加速引擎，让 VPP 把一部分处理从 CPU 卸载出去。
+
+---
+
+## 03-05 硬件加速集成
+
+### 1. 目标与拓扑
+
+本篇的目标，是让 VPP 把一部分原本由 CPU 承担的处理，卸载到专用硬件上去，从而在不增加 worker 核数的前提下提升吞吐、降低时延，或实现线速加解密。前面四篇讨论的都是"如何把网卡交给 VPP、如何让 VPP 跑在不同的运行环境里"，本质上仍是把报文拉到通用 CPU 上用向量指令处理；而当吞吐目标逼近单核极限、或业务里 IPSec/SSL 这类密码学运算占比很高时，纯软件路径会遇到瓶颈。硬件加速集成就是在这类场景下，把校验和、分段、加解密、流分类甚至整条转发路径，交给网卡、Cryptodev 引擎、QAT 或 SmartNIC/DPU 去做。
+
+需要先建立一个清醒的边界判断：不是所有 offload 都值得开，也不是所有硬件都能被 VPP 用上。网卡的 checksum/TSO/RSS 属于"基础且几乎无副作用"的一类，通常默认就该开；Cryptodev/QAT 属于"针对特定负载（加解密）收益巨大、但需要额外设备与配置"的一类；SmartNIC/DPU 的 `rte_flow` 流卸载则属于"改动数据面路径、与具体网卡/固件强绑定、收益和风险都最大"的一类。三者的集成深度、配置位置、排错方式完全不同，不能一概而论。本篇按这三类分别给出集成路径。
+
+下图把三类加速画在同一张数据面视图里：VPP 经 DPDK PMD 收发报文并把基础 offload 交给 NIC；IPSec/加密类负载经 `vnet_crypto` 的 Cryptodev 引擎下沉到 QAT 或软件 cryptodev PMD；流分类/转发经 `rte_flow` 映射到 SmartNIC/DPU 做旁路卸载。实线是常规数据面与卸载调用，虚线是"命中硬件后绕回 CPU 或旁路"的辅助关系。
+
+:::figure id=03-05-01 | name=硬件加速集成的三条路径 | dir=TD
+node vpp "VPP 数据面<br/>worker + 图节点" purple
+node pmd "DPDK PMD<br/>rte_eth 收发" teal
+node nic "物理 NIC<br/>checksum / TSO / RSS" green
+node crypto "vnet_crypto<br/>Cryptodev 引擎" amber
+node qat "Intel QAT<br/>加解密 / 压缩" amber
+node swcd "软件 cryptodev<br/>AES-NI 回退" gray
+node flow "vnet_flow / rte_flow<br/>流规则" blue
+node dpu "SmartNIC / DPU<br/>流卸载 / 旁路" blue
+node peer "对端网络" gray
+edge vpp -> pmd "rte_eth_tx / rx"
+edge pmd -> nic "硬件 offload"
+edge nic -> peer "线速收发"
+edge peer -> nic "入向流"
+edge vpp -> crypto "IPSec / 加密作业入队"
+edge crypto -> qat "QAT PMD 作业"
+edge crypto -> swcd dashed "无 QAT 时回退"
+edge qat -> vpp dashed "完成回调 / dequeue"
+edge vpp -> flow "flow 规则下发"
+edge flow -> dpu "rte_flow 卸载"
+edge dpu -> peer "旁路转发"
+edge dpu -> vpp dashed "未命中 / 上送 CPU"
+:::
+
+与相邻篇章的衔接仍需点明：无论用哪种加速，底座仍是 `03-01`~`03-02` 的大页、隔离核、vfio-pci 绑定与 `dpdk{}` 配置；`03-03`/`03-04` 里 SR-IOV VF、vhost-user、设备透传的能力盘点，是判断"硬件是否被容器/虚机看见"的前提。本篇只讲加速引擎如何接入 VPP 并验证生效，具体的 IPSec 模块功能、SA/SPD 组网见 `07-07`，转发图与轮询机制见 `06`（原理见 06-12），CLI 与配置参数的权威索引在 `04`（完整参数见 04-01，命令见 04-05）。
+
+### 2. 前置条件与环境
+
+第一件要事是"盘点硬件到底支持什么"，不要凭型号猜。用 `ethtool -k ethX` 看内核视角的 offload 开关（rx/tx-checksumming、tso、gso、gro、lro、rx-vlan-offload 等），用 `lspci -nn | grep -i -e ethernet -e co-processor -e quickassist` 找出网卡与 QAT 设备，用 DPDK 自带的 `dpdk-testpmd`（或 `testpmd`，工具名随 DPDK 版本而异，需对照实际版本核验）在 VF/直通设备上枚举 `offloads` 能力，用 `lspci -k` 确认 QAT 设备当前由哪个驱动接管。Cryptodev 路径还需确认 VPP 编译时启用了 DPDK cryptodev 引擎（相关实现在 `src/plugins/dpdk/cryptodev/`，引擎注册随版本而异，需对照实际版本核验），以及 `vnet_crypto` 框架可用（源码在 `src/vnet/crypto/`）。
+
+| 加速类型 | 依赖硬件/驱动 | 盘点命令 | 适用负载 | 风险 |
+|---|---|---|---|---|
+| NIC 基础 offload | 网卡 + DPDK PMD 支持 | `ethtool -k`、`dpdk-testpmd` | 通用收发 | 低，几乎无副作用 |
+| Cryptodev（软件） | CPU AES-NI / ARMv8 CE | `lscpu \| grep aes`、`vppctl show crypto ...` | 中等加密负载 | 低，占用 CPU |
+| QAT（硬件） | Intel QAT PF/VF + 驱动 | `lspci \| grep -i quickassist`、`modinfo qat_*` | 高吞吐 IPSec/TLS | 中，设备与固件绑定 |
+| SmartNIC / DPU 流卸载 | 支持 `rte_flow` 的网卡/固件 | `dpdk-testpmd -- ... flow` | 固定五元组转发 | 高，路径与固件强耦合 |
+
+环境前提与 `03-02` 一致：IOMMU 开启、大页按 NUMA 预留、`driverctl` 把要用的设备绑定 vfio-pci、CPU 隔离核就绪。QAT 场景额外要求宿主机加载 QAT PF 驱动并创建 VF（驱动名如 `qat_4xxx`、`qat_c3xxx`、`qat_dh895xcc` 等随平台与内核版本而异，需对照实际平台核验），再把 VF 绑定到 vfio-pci 供 DPDK 的 qat cryptodev PMD 使用；SmartNIC 场景则往往要求特定固件版本与 DPDK 版本匹配，且需要把 PF/VF 用 `rte_flow` 规则编程。所有加速设备都应做 NUMA 就近规划：QAT 卡、SmartNIC 与承载 worker 的核、大页尽量落在同一节点，否则卸载省下的 CPU 时间会被跨节点 DMA 吃掉。
+
+源码与入口位置（只给定位，不展开机制）：`dpdk{}` 的 dev 子块与 offload 开关解析在 `src/plugins/dpdk/device/`（字段见 05-11，完整参数见 04-01）；crypto 引擎与作业派发在 `src/vnet/crypto/` 及 `src/plugins/dpdk/cryptodev/`（IPSec 模块结构见 05-11，功能见 07-07）；`vnet_flow_t` 与 `rte_flow` 映射在 `src/vnet/flow/`（相关实现路径需对照实际版本核验）；DPDK 侧的 QAT、ENA、各网卡 PMD 位于 DPDK 源码树的 `drivers/crypto/qat/`、`drivers/net/` 等目录，VPP 通过 DPDK 间接使用。排错时先在 VPP 日志里过滤 `dpdk` / `crypto` / `flow` 关键字，再对照上述文件里的初始化与能力校验逻辑。
+
+### 3. 分步操作
+
+**第 1 步：能力盘点与基线记录。** 在没启用任何加速之前，先记一份纯软件基线：用 `03-02` 的验收方法打流，记录目标 PPS、`vppctl show runtime` 里各节点每包 cycles、`vppctl show errors`，以及 IPSec/加密场景下 CPU 占用。随后盘点硬件：
+
+```bash
+ethtool -k eth2 | grep -E 'checksum|segmentation|offload'
+lspci -nn | grep -i -e ethernet -e 'co-processor' -e quickassist
+# 用 DPDK 工具枚举设备与 offload 能力（工具名/参数需对照实际版本核验）
+dpdk-testpmd -- --help 2>/dev/null | head -n 20
+cat /sys/bus/pci/devices/0000:3b:00.0/numa_node
+```
+
+没有基线，后面就无法判断"开了 offload 到底有没有收益"。把基线数值、硬件型号、固件/驱动版本一起存档，这是本篇最容易被跳过、却最关键的一步。
+
+**第 2 步：启用 NIC 基础 offload。** 这类 offload 大多由 DPDK PMD 默认协商，VPP 的 `dpdk{}` 段提供开关（字段名与可用值需对照实际版本核验，完整参数见 04-01）。典型片段：
+
+```ini
+dpdk {
+  uio-driver vfio-pci
+  socket-mem 1024,1024
+  dev default {
+    num-rx-queues 4
+    num-tx-queues 4
+  }
+  dev 0000:3b:00.0 {
+    name data0
+  }
+}
+```
+
+需要理解的是，VPP 在某些版本里默认关闭部分 TX checksum offload（存在 `no-tx-checksum-offload`、`enable-tcp-udp-checksum` 一类开关），原因是软件已算好的校验和与硬件重算可能冲突；是否启用、以及 `tso`、`vlan-strip` 等子选项，一律以实际版本的 `04-01` 全参数表为准，本篇不重列命令清单、不猜测字段名。RSS 多队列则通过 `num-rx-queues` 与 `cpu{}` 的 worker 数配合：队列数应与同 NUMA 节点的 worker 数匹配，让每个 worker 收一个队列，避免跨核 handoff。`vppctl show hardware-interfaces` 能回读实际生效的队列与能力位（命令见 04-06）。
+
+**第 3 步：接入 Cryptodev 引擎。** 对 IPSec/TLS 这类加密负载，VPP 通过 `vnet_crypto` 框架把加解密作业派发给已注册的引擎（软件 AES-NI 或 DPDK cryptodev）。启用路径通常是：确认 VPP 构建里带 DPDK cryptodev 引擎插件，在 `dpdk{}` 或独立的 `crypto{}` 配置段里声明 cryptodev 设备/队列（段名与字段随版本差异较大，需对照实际版本核验，完整参数见 04-01），启动后用 `show` 命令观察已注册引擎与 handler：
+
+```bash
+# 以下为示意，具体子命令与输出需对照实际版本核验（命令见 04-06 / 04-05）
+vppctl show crypto engines
+vppctl show crypto handlers
+```
+
+软件回退路径（无 QAT 时）依赖 CPU 的 AES-NI / ARMv8 Crypto Extensions，用 `lscpu | grep -i aes` 确认；它不省 CPU，但能让功能先跑通。真正卸载到硬件时，作业经 cryptodev PMD 入队、由 QAT 完成后回调，VPP 侧表现为加密相关节点每包 cycles 下降、CPU 占用下降、但 `show errors` 可能出现 `crypto` 队列满/超时类计数——这是判断卸载是否真的在硬件上执行的重要观测点。IPSec SA/SPD 的具体配置属于 `07-07` 与 `04-05`，本篇只保证"引擎能被 VPP 识别并调度"。
+
+要真正判断加解密是否卸载成功，需要理解作业提交方式对性能的影响。VPP 通常把多个加密作业组成 burst 一次性入队、再由 worker 轮询或在回调里 dequeue，批量大小直接决定"每包摊到的入队/出队开销"：批量太小，cryptodev 的队列往返开销会吃掉硬件省下的 cycles；批量太大，又会增加首包等待时延，对时延敏感业务不利。因此调参时要在吞吐与时延之间取平衡，观察点是 `vppctl show runtime` 里 crypto 相关节点每包 cycles、`show errors` 里的队列满/超时计数，以及打流测得的 P99 时延（命令见 04-06）。另一个实用判据是 CPU 占用：在加密负载不变的前提下，启用硬件引擎后 worker 核占用应明显下降而吞吐上升；若两者都没变，说明作业仍走软件引擎，要回查 `show crypto engines` 里硬件引擎的优先级是否高于软件回退、以及 cryptodev 设备是否被正确声明。硬件卸载是"异步"语义，报文进入加密队列到完成回调之间会让出 CPU，这也意味着单纯看某个 worker 是否 100% 运行不再能判断它在不在干活，必须结合引擎计数与业务吞吐一起判读。
+
+**第 4 步：准备并绑定 QAT 设备。** 以 Intel QAT 为例，宿主机先加载 PF 驱动、创建 VF，再把 VF 交给 vfio-pci（驱动名、sysfs 路径、VF 创建方式随 QAT 代际与内核版本而异，需对照实际平台核验）：
+
+```bash
+# 示意：驱动名与设备地址按实际平台替换
+modprobe qat_4xxx            # 或 qat_c3xxx / qat_dh895xcc 等，需对照实际平台核验
+lspci -nn | grep -i quickassist
+# 由 QAT PF 驱动创建 VF 后，对 VF 绑定 vfio-pci
+driverctl set-override 0000:3c:01.0 vfio-pci
+dpdk-devbind.py --status | grep -i qat
+```
+
+随后在 VPP 的 `dpdk{}` / cryptodev 相关配置里声明该设备（字段需对照实际版本核验，完整参数见 04-01），并确认 `vppctl show log` 里 DPDK EAL 枚举到了 QAT 的 cryptodev PMD、`show crypto engines` 里出现对应硬件引擎。QAT 的常见坑是"驱动加载了但 VF 没创建"或"VF 绑给了错误驱动导致 DPDK 看不到"，用 `lspci -k` 逐设备核对 `Kernel driver in use` 即可定位。若平台没有 QAT，保留软件 cryptodev 回退，功能不受影响、只是没有卸载收益。
+
+**第 5 步：SmartNIC / DPU 流卸载（高阶、谨慎）。** 当网卡/固件支持 `rte_flow` 且业务是固定五元组的转发（如 vRouter、UPF 用户面规则）时，可把匹配—动作规则下沉到硬件。VPP 侧通过 `vnet_flow` / flow 相关 API 把规则映射到 `rte_flow`（实现在 `src/vnet/flow/`，CLI 子命令与能力随版本和网卡差异很大，需对照实际版本核验，命令见 04-03 / 04-05）。典型思路：先用 `dpdk-testpmd` 在目标网卡上验证 `rte_flow` 规则能被固件接受，再在 VPP 里下发等价 flow，未命中的报文仍上送 CPU 走软件转发（图中虚线）。这一步风险最高：固件版本、DPDK 版本、VPP 版本三者必须匹配，规则语义（VLAN、隧道、encap/decap）各网卡支持度不一，且硬件流表容量有限、溢出后行为各异。生产上建议先在单条规则、单接口灰度，确认 `vppctl show errors` 无异常、`show hardware-interfaces` 的 offload 计数增长、CPU 占用下降后再扩量。本篇不展开 `rte_flow` 规则语义与转发图原理（原理见 06、功能见 07）。
+
+**第 6 步：回归验证与收益对比。** 每启用一类加速，都回到第 1 步的基线流量重测，比对 PPS、时延、CPU 占用、每包 cycles 与 `show errors`。把"基线 / NIC-offload / +Cryptodev / +QAT / +流卸载"几组数据列成表，判断哪一类真正带来了收益。硬件加速的价值必须用数据说话，配置生效不等于收益兑现——常见情况是 QAT 已识别但作业仍走软件引擎，或 `rte_flow` 规则未命中导致报文依旧上送 CPU，只有回归对比才能发现。
+
+### 4. 验证方法与预期结果
+
+能力生效层：`vppctl show hardware-interfaces`（或 `show hardware detail`，子命令格式需对照实际版本核验）应回读 NIC 的 offload 能力位与队列数，checksum/TSO/RSS 的启用状态与 `dpdk{}` 配置一致；`vppctl show log` 里 DPDK EAL 应枚举到 cryptodev/QAT 设备且无 `not supported` / `failed to configure` 报错（命令见 04-06）。
+
+引擎注册层：`vppctl show crypto engines` / `show crypto handlers` 一类命令应列出软件引擎与（若配置成功）QAT 硬件引擎，并能看到各 handler 的优先级/绑定关系；用 `vppctl show errors` 观察是否有 `crypto` 相关队列满、超时计数，正常情况下这些计数应保持为零或稳定（命令见 04-06，具体子命令与计数器名需对照实际版本核验）。
+
+收益层：同流量重测，NIC offload 应让校验和/分段相关节点 cycles 下降；Cryptodev/QAT 应让加密负载下 CPU 占用与每包 cycles 明显下降、吞吐上升；`rte_flow` 命中应让 CPU 侧对应流计数下降、硬件 offload 计数增长。若功能全通但 CPU/吞吐毫无变化，按第 6 步的对比表定位"配置生效但路径没切过去"的软故障。把每类加速的"能力回读 + 引擎列表 + 前后 PPS/CPU 对比"存档，作为是否在生产启用该 offload 的依据。
+
+### 5. 常见失败与排错
+
+| 现象 | 可能根因 | 定位命令 | 修复方向 |
+|---|---|---|---|
+| TX 校验和错误、对端丢包 | 软件与硬件重复计算校验和 | 抓包对端、`vppctl show errors` | 按 04-01 核对 checksum offload 开关组合 |
+| `rte_flow`/offload 报 `not supported` | 网卡/固件/DPDK 版本不支持 | `dpdk-testpmd`、`show log \| grep -i flow` | 升级固件/DPDK，或退回软件路径 |
+| Cryptodev 引擎未出现 | VPP 构建缺引擎插件 / 配置段未声明 | `vppctl show plugins`、`show crypto engines` | 装回带 cryptodev 的插件，补配置（完整参数见 04-01） |
+| QAT 已加载但作业仍走软件 | VF 未创建 / 绑错驱动 / 引擎优先级 | `lspci -k`、`show crypto engines` | 建 VF 并绑 vfio-pci，调整引擎优先级 |
+| `show errors` 出现 crypto 队列满 | 硬件作业队列/批量参数不足 | `show errors`、`show runtime` | 调大队列/批量，或降载，字段见 04-01 |
+| 开了 offload 但性能没变 | 规则未命中 / 路径仍走 CPU | 前后 PPS/CPU 对比、`show hardware-interfaces` | 核对 flow 规则与命中计数，别只看"配置成功" |
+| 多队列 RSS 不均 | `num-rx-queues` 与 worker 数/NUMA 不匹配 | `show hardware-interfaces`、`show threads` | 队列数对齐同节点 worker 数 |
+
+排错主线是"能力是否被硬件支持 → 配置是否被 VPP 读到 → 引擎/规则是否真的注册并命中 → 收益是否兑现"。硬件加速相较前几篇多出来的两类根因：一是版本/固件三方不匹配（VPP、DPDK、网卡固件），二是"配置生效但数据面没切过去"的软故障——后者尤其隐蔽，必须用回归对比与命中计数揭穿，而不能只看启动日志没有报错。
+
+#### 陷阱与最佳实践
+
+- **先记基线再开加速**：没有前后 PPS/CPU/每包 cycles 对比，就无法证明 offload 真的有价值。
+- **按收益/风险分级**：NIC 基础 offload 默认开；Cryptodev/QAT 针对加密负载；`rte_flow` 卸载灰度上线、先单规则验证。
+- **版本三方匹配**：VPP、DPDK、网卡/QAT 固件必须配套，能力盘点用 `dpdk-testpmd` 实测而非查表。
+- **NUMA 就近同样适用**：QAT/SmartNIC、大页、worker 核同节点，否则卸载收益被跨节点 DMA 抵消。
+- **保留软件回退**：无 QAT 时不依赖硬件、用 AES-NI 软件引擎保功能，硬件只做加速不做单点依赖。
+- **不越界重复**：`dpdk{}`/crypto/flow 全参数见 04-01、IPSec/flow 命令见 04-05、接口/show 命令见 04-03 / 04-06；IPSec 模块功能见 07-07、字段见 05-11、原理见 06-12；本册不重列命令、不展开转发与调度原理。
+
+### 6. 小结
+
+本篇把 VPP 的数据面从"纯 CPU 处理"扩展到三条硬件加速路径：网卡基础 offload（checksum/TSO/RSS）几乎无副作用、应默认启用；Cryptodev/QAT 针对 IPSec/TLS 等加密负载把加解密下沉到 QAT 或软件引擎，收益大但依赖设备与驱动；SmartNIC/DPU 的 `rte_flow` 流卸载能把固定规则的转发旁路到硬件，收益与风险都最高、必须灰度。贯穿其中的两条方法论是：任何加速都要先用 `dpdk-testpmd`/`ethtool` 实测硬件能力、用基线流量记录收益对比；任何"配置成功"都要用引擎注册、命中计数与前后 PPS/CPU 数据去验证真的切到了硬件路径，而不是只信启动日志。硬件加速解决的是单实例能力上限，而 `03-06` 要解决的是另一个维度的问题——当一台实例无论怎么加速都不够、或不允许单点故障时，如何用主备、多 worker 与多实例隔离把系统撑成高可用的整体。
+
+---
+
+## 03-06 高可用与多实例部署
+
+### 1. 目标与拓扑
+
+本篇是全册的收束，目标是把前面五篇建起来的"单台、单进程、单数据面"能力，扩展成可容错的部署形态：在一台机器里用多 worker 把吞吐横向拉开，用实例隔离在同一台机器上跑多个互不干扰的 VPP 进程，再用主备与故障切换把单点故障挡在系统之外。这三件事分别对应不同的失效域：多 worker 解决的是"算力不够"，实例隔离解决的是"多租户/多业务互不干扰、故障不蔓延"，主备与切换解决的是"整机或整进程挂掉"。把它们混为一谈是设计上的大忌——多 worker 不提供高可用，主备也不等于性能翻倍，实例隔离更不是为了冗余。
+
+先看清晰的分层：一台物理机内部，若干个 worker 线程分摊 RX 队列、由 RSS 把流分散到不同核；同一台机器上还可以跑多个 VPP 实例，每个实例有自己独立的 `cli-listen` socket、`api-segment` 前缀、stats segment、大页分区与 cpuset，彼此不共享状态；在机器之外，两台机器上的 VPP 实例构成主备，上游通过 ECMP/BFD 或 VRRP 类协议选路，主实例故障时把流量切到备实例。下图把这三层的"正常态"画在一起，实线是主数据面路径，虚线是备用路径与心跳/同步关系。
+
+:::figure id=03-06-01 | name=高可用与多实例部署拓扑 | dir=TD
+node up "上游 ECMP / BFD / VRRP" gray
+node instA "实例 A（主）<br/>独立 socket / 大页 / cpuset" blue
+node instB "实例 B（备）<br/>独立资源池" blue
+node wa0 "A worker 0..N<br/>NUMA0 RSS 队列" teal
+node wa1 "A worker 0..N<br/>NUMA1 RSS 队列" teal
+node instC "实例 C（本机第二进程）<br/>隔离 socket / cpuset" purple
+node down "下游网络" gray
+edge up -> instA "主路径"
+edge up -> instB dashed "备路径 / BFD 检测"
+edge instA -> wa0 "分发队列"
+edge instA -> wa1 "分发队列"
+edge wa0 -> down
+edge wa1 -> down
+edge instB -> down dashed "故障后承接"
+edge instA -> instB dashed "会话/状态同步 + 心跳"
+edge instA -> instC dashed "同机隔离（无共享）"
+:::
+
+下面的故障切换流程则是本篇的第二个图，它把"检测 → 判定 → 撤销/切换 → 恢复"串成时序：BFD/心跳检测到主不可达，上游撤销主路径 ECMP 下一跳或 VRRP 切主，备实例接管虚 IP/会话，故障实例由 systemd 重启或人工恢复后重新加入。这张图强调的是"切换不是一个动作，而是一条链"，链条里任何一环缺失（没有快检测、没有会话同步、上游不会撤销路由）都会让主备形同虚设。
+
+:::figure id=03-06-02 | name=主备故障切换时序 | dir=TD
+node s1 "1. 稳态：主承载流量<br/>备同步会话/状态" blue
+node s2 "2. 检测：BFD / 心跳超时" amber
+node s3 "3. 判定：主失效<br/>撤销主 ECMP 下一跳 / VRRP 切主" amber
+node s4 "4. 切换：备接管 VIP 与会话<br/>流量改走备路径" red
+node s5 "5. 恢复：原主重启<br/>systemd Restart / 人工" teal
+node s6 "6. 回切或降为备<br/>重新加入同步" green
+edge s1 -> s2 "故障发生"
+edge s2 -> s3 "检测超时"
+edge s3 -> s4 "路由/网关切换"
+edge s4 -> s5 "修复原主"
+edge s5 -> s6 "重新同步"
+edge s6 -> s1 dashed "稳态（可回切）"
+:::
+
+与全册的衔接：无论多 worker、多实例还是主备，每个 VPP 进程底座仍是 `03-01`~`03-02` 的大页/隔离核/vfio 绑定/`dpdk{}` 配置，只是把资源做了"分区"或"复制"；`03-03`/`03-04` 的虚拟化与容器化，是主备实例最常见的落地载体；`03-05` 的加速则决定单实例能扛多少流量、进而决定需要几个实例。本篇讲部署结构与切换编排，`cpu{}` / `unix{}` / `api-segment{}` 等仅写场景必要片段（完整参数见 04-01），VRRP/BFD/IPSec 等模块功能见 `07`（功能见 07-xx）、命令见 `04`（命令见 04-05）、转发与线程机制见 `06`（原理见 06-06 / 06-07），本册一律不展开。
+
+### 2. 前置条件与环境
+
+三类设计各自的前置不同，先列清楚再动手。多 worker 要求网卡与 PMD 支持多 RX 队列（RSS）、队列数能被同 NUMA 节点的 worker 数整除或匹配、且流量本身有足够多的五元组以便散列均匀；实例隔离要求每个实例独占一组核、一段大页、一组 PCI 设备/VF，并有彼此不冲突的 socket 与共享内存命名空间；主备要求两台（或多台）机器、上游设备支持 ECMP/BFD 或二层支持 VRRP/虚 IP、以及一条独立于数据面的心跳/管理通道。
+
+| 维度 | 多 worker | 实例隔离（同机多进程） | 主备 |
+|---|---|---|---|
+| 解决的问题 | 单进程算力上限 | 多业务/多租户隔离 | 整机/进程故障 |
+| 核心资源 | RX 队列 + 同节点核 | 独立 socket / 大页 / cpuset / VF | 两台机器 + 上游选路 |
+| 关键配置 | `corelist-workers` + `num-rx-queues` | `cli-listen` / `api-segment` / `statseg` / cpuset 不冲突 | VRRP 或 ECMP+BFD、会话同步 |
+| 失效域 | 单进程内 | 单进程间互不蔓延 | 跨机器 |
+| 典型误用 | 以为能容灾 | 以为能提升单机性能 | 以为能翻倍吞吐 |
+
+环境核验沿用前几篇：`lscpu` / `numactl -H` 确认 NUMA 与核数，`driverctl -v list-devices` 确认每实例要用的 VF 已绑定 vfio-pci，`grep -i huge /proc/meminfo` 确认大页总量足够"按实例切分"，`dpdk-devbind.py --status` 确认设备分组。实例隔离还要额外检查命名空间：不同实例的 `cli-listen` 路径、`api-segment{ prefix }`、`statseg{ socket-name }`、`socksvr` socket 以及 `/dev/shm` 下的段名必须全部不同，否则第二个进程会因"地址已被占用"启动失败（字段名需对照实际版本核验，完整参数见 04-01）。主备则要先在上游交换机/路由器侧确认 ECMP 与 BFD 能力，或在二层确认 VRRP/ gratuitous ARP 行为。
+
+源码与入口位置（仅定位）：线程创建与 worker 启动在 `src/vlib/threads.c` / `src/vlib/threads.h`（`vlib_thread_main_t`，原理见 06-06 / 06-07）；`unix{}` 的 CLI socket、`api-segment{}`、`statseg{}` 等命名空间在 `src/vlib/unix/` 与对应配置注册文件（字段见 05-xx，完整参数见 04-01）；VRRP 插件在 `src/plugins/vrrp/`，BFD 相关实现在 `src/plugins/bfd/`（路径需对照实际版本核验，功能见 07-14）；多队列与 RSS 的设备侧配置仍在 `src/plugins/dpdk/device/`（字段见 05-11）。
+
+### 3. 分步操作
+
+**第 1 步：多 worker 横向扩展。** 在 `03-02` 的单 worker 配置上，把 `cpu{}` 的 `corelist-workers` 扩到同 NUMA 节点的一组隔离核，并把 `dpdk{}` 的 `num-rx-queues` 调到与 worker 数匹配：
+
+```ini
+cpu {
+  main-core 0
+  corelist-workers 2,4,6,8,10,12,14,16
+}
+dpdk {
+  dev default {
+    num-rx-queues 8
+    num-tx-queues 8
+  }
+  dev 0000:3b:00.0 { name data0 }
+  dev 0000:3b:00.1 { name data1 }
+}
+```
+
+要点：worker 核与队列数都要与网卡 `numa_node` 就近，`num-rx-queues` 一般等于该节点 worker 数；散列不均（单一大流）时 RSS 也救不了，需要 `rte_flow`/flow 规则或更细的散列键（能力见 `03-05`）。每调一次 worker 数都回到 `03-02` 的验收方法重测 PPS 曲线，观察是否接近线性增长——若加到某个点后不再涨，多半是跨 NUMA、内存带宽或队列数不合理，而不是"worker 不够"。（完整参数见 04-01，机制见 06-06 / 06-07）
+
+**第 2 步：同机多实例隔离。** 在一台机器上跑第二个 VPP 进程，关键是"资源分区 + 命名空间隔离"。为每个实例准备独立的 `startup.conf`，资源上分开：实例 A 用核 2-9 + node0 大页 + `0000:3b:00.0`，实例 B 用核 14-21 + node1 大页 + `0000:3b:00.1`；命名空间上把 socket、共享内存前缀、stats 全部错开（字段名需对照实际版本核验，完整参数见 04-01）：
+
+```ini
+# 实例 A：/etc/vpp/startup-a.conf
+unix {
+  cli-listen /run/vpp/cli-a.sock
+  gid vpp
+}
+api-segment { prefix vppa }
+statseg { socket-name /run/vpp/stats-a.sock }
+cpu { main-core 0  corelist-workers 2-9 }
+dpdk {
+  socket-mem 1024,0
+  dev 0000:3b:00.0 { name a0 }
+}
+```
+
+```ini
+# 实例 B：/etc/vpp/startup-b.conf
+unix {
+  cli-listen /run/vpp/cli-b.sock
+  gid vpp
+}
+api-segment { prefix vppb }
+statseg { socket-name /run/vpp/stats-b.sock }
+cpu { main-core 12  corelist-workers 14-21 }
+dpdk {
+  socket-mem 0,1024
+  dev 0000:3b:00.1 { name b0 }
+}
+```
+
+注意 `socket-mem` 用 `1024,0` 与 `0,1024` 把两个实例的内存分别锁在各自 NUMA 节点，`main-core` 不重叠，`dev` 各自独占一块网卡。用 systemd template unit 管理最省事：`/usr/lib/systemd/system/vpp@.service` 里 `ExecStart=/usr/bin/vpp -c /etc/vpp/startup-%i.conf`，然后 `systemctl enable --now vpp@a`、`systemctl enable --now vpp@b`。验证时对每个实例分别用 `vppctl -s /run/vpp/cli-a.sock show threads` 与 `-s /run/vpp/cli-b.sock`（`-s` 指定 socket 的用法需对照实际版本核验，命令见 04-02）确认彼此看不到对方的接口与线程。实例隔离的价值正在于此：一个实例崩溃、升级、重启，另一个完全不受影响。
+
+**第 3 步：主备高可用。** 主备有两种主流做法，按网络环境二选一。三层环境用 ECMP + BFD：上游路由器把主、备两台 VPP 都作为等价下一跳，用 BFD 快速检测主是否存活，主失效时自动撤销对应下一跳；VPP 侧的 BFD 会话配置属 `04-05` / `07-14`（命令见 04-05，功能见 07-14，本篇不重列）。二层环境用 VRRP：VPP 的 VRRP 插件（`src/plugins/vrrp/`）让主备共享一个虚 IP，主定期发通告，备在通告超时后接管 VIP 并发 gratuitous ARP 刷新上游 MAC 表（CLI 子命令需对照实际版本核验，命令见 04-05）。
+
+无论哪种，都要配齐三件事才有意义：一是**独立心跳/管理通道**，故障检测流量不能走即将被切换的数据面，否则会出现"数据面断了、心跳也断、但判断不出来"的死锁；二是**会话/状态同步**，有状态业务（NAT、IPSec、防火墙会话）主备之间要同步连接状态，否则切换后已有连接全部中断，等于没做高可用（同步机制与具体模块相关，属 `07` 各模块能力，本篇不展开）；三是**明确的切换判据与回切策略**，BFD 检测间隔/倍数、VRRP 通告间隔决定切换时长，回切是否自动、是否需人工确认要写进运维手册。
+
+```bash
+# 示意：查看 VRRP / BFD 状态与虚 IP 归属（子命令需对照实际版本核验，命令见 04-05 / 04-06）
+vppctl show vrrp vr
+vppctl show bfd sessions
+```
+
+**第 4 步：进程级自愈与故障切换联动。** 主备之外，单机内的进程自愈靠 systemd：`Restart=on-failure`、`RestartSec`、以及 `ExecStartPre` 里的大页/绑定校验（见 `03-02` 第 6 步），保证 VPP 异常退出后能自动拉起并恢复到验收基线。但要注意 `Restart=on-failure` 与"切换"是两件事：进程重启秒级完成、上游 ECMP/BFD 可能还没触发切换，两者时间尺度不同，需用 BFD 检测间隔与 `RestartSec` 配合，避免"进程正在重启、上游已切走、起来后又抢回"的抖动。建议把"进程自愈"用于单实例偶发崩溃，"主备切换"用于整机/整链路故障，二者通过上游选路解耦。故障切换完整时序见图 03-06-02：稳态同步 → 检测超时 → 撤销主下一跳/VRRP 切主 → 备接管 VIP 与会话 → 原主重启恢复 → 重新同步并可回切。
+
+**第 5 步：容量与失效域规划。** 把 `03-05` 的单实例能力上限作为输入，计算需要几个实例、几个 worker、几台机器做主备；明确每个失效域的边界：一个 worker 挂影响该进程的部分队列、一个进程挂影响该实例全部流量、一台机器挂触发主备切换。规划时把"大页总量、隔离核总数、VF 数量、心跳网络、上游 ECMP 容量"逐项列出并留余量，避免主备切换后备用机器资源不足以承接全量流量——这是高可用设计里最容易被忽略的"切换后过载"问题。
+
+### 4. 验证方法与预期结果
+
+多 worker 层：`vppctl show threads` 应列出数量与 `corelist-workers` 一致的 worker，`show hardware-interfaces` 显示 RX 队列数与配置一致、队列分布在预期 NUMA 节点；打流后 `show runtime` 里各 worker 的 `dpdk-input` 向量计数应大致均衡，散列不均时某几个核会明显偏高（命令见 04-06）。PPS 应随 worker 数近线性增长直到遇到内存带宽或跨 NUMA 瓶颈。
+
+实例隔离层：两个实例分别用各自 CLI socket 连接，`show interface` / `show threads` / `show memory` 应只看到本实例的资源，`ps -eLo pid,tid,pcpu,comm | grep vpp` 应显示两组进程、CPU 集互不重叠；`numastat -p <pidA>` 与 `<pidB>` 应分别集中在 node0 与 node1；停掉 `vpp@a` 后 `vpp@b` 的接口与流量不受影响，重启 `vpp@a` 后能回到各自基线。socket/前缀无冲突是这层最该先确认的一条。
+
+主备层：稳态下 `show vrrp vr` 显示主为 Master、备为 Backup（或 BFD 会话均 up、上游 ECMP 两个下一跳在列）；主动停掉主实例的 VPP 或断其数据面链路，BFD/VRRP 应在配置的检测时间内判定失效，上游撤销主下一跳 / 备升主并接管 VIP，`vppctl ping` 经 VIP 短暂中断后恢复，有状态连接若在同步范围内应保持；`show bfd sessions` / `show vrrp vr` 状态翻转、`show errors` 无持续增长异常即为符合预期。把"切换时长、丢包数、会话是否保持、回切行为"记录成验收表——这是判断主备是否真正可用的唯一标准。
+
+### 5. 常见失败与排错
+
+| 现象 | 可能根因 | 定位命令 | 修复方向 |
+|---|---|---|---|
+| 加 worker 后 PPS 不涨 | 跨 NUMA、单一大流、队列数不匹配 | `show threads`、`show hardware-interfaces`、`show runtime` | 核/队列/网卡同节点，细化散列键 |
+| 第二个实例起不来，报地址占用 | `cli-listen`/`api-segment`/`statseg` 冲突 | `ss -xl \| grep vpp`、`ls /dev/shm`、`show log` | 命名空间逐项错开（完整参数见 04-01） |
+| 两实例互相看到/抢资源 | cpuset、大页、VF 未分区 | `taskset -pc`、`numastat -p`、`driverctl -v` | 核/大页/VF 按实例独占切分 |
+| 主备切换后连接全断 | 未做会话/状态同步 | 业务层连接跟踪、`show` 相关模块计数 | 启用对应模块的状态同步（功能见 07） |
+| 切换迟迟不触发或频繁抖动 | BFD/VRRP 计时与 `RestartSec` 不匹配 | `show bfd sessions`、`show vrrp vr`、`journalctl -u vpp` | 对齐检测间隔/倍数与重启退避，心跳走独立通道 |
+| 切换后备机过载 | 容量未按全量规划 | `show runtime`、CPU/大页监控 | 按 `03-05` 上限留余量，规划 N+1 |
+| 心跳与数据面同路径死锁 | 检测流量走将被切换的数据面 | 心跳链路 `ip route`/独立网口核查 | 心跳/管理通道与数据面物理或逻辑分离 |
+| 进程反复重启 | `Restart=on-failure` 遇配置错误无限循环 | `journalctl -u vpp`、`systemctl status` | 修配置根因，设 `StartLimitBurst` 限流 |
+
+排错主线是"资源分区 → 命名空间隔离 → 检测与选路 → 状态同步 → 容量"。高可用部署相较单实例多出来的根因集中在两类：一是命名空间/资源没真正隔离开（socket 冲突、cpuset 重叠、大页串用），二是切换链条缺环（没有快检测、没有会话同步、心跳与数据面同路径、切换后容量不足）。这两类问题在稳态下都看不出来，只有主动做故障注入演练（停进程、断链路、断心跳）才会暴露——因此故障切换验证必须"真断一次"，不能只看配置。
+
+#### 陷阱与最佳实践
+
+- **别混淆三个维度**：多 worker 提性能、实例隔离控失效域、主备做容灾，三者解决的不是同一个问题，不能互相替代。
+- **命名空间逐项错开**：多实例的 `cli-listen` / `api-segment` 前缀 / `statseg` / socksvr / `/dev/shm` 段名全部唯一，用 systemd template unit 管理。
+- **资源独占分区**：每实例独立核、大页、VF 与 NUMA 节点，`socket-mem` 按节点切分，避免互相踩踏。
+- **切换是一条链**：快检测（BFD/VRRP）+ 上游选路撤销 + VIP/会话接管 + 状态同步，缺一环主备就形同虚设。
+- **心跳走独立通道**：检测流量与数据面分离，避免"断联判不出"的死锁。
+- **真做故障注入**：主动停进程/断链路验证切换时长、丢包、会话保持与回切，稳态检查不能替代演练。
+- **容量按切换后全量规划**：备用侧要能独立承接 100% 流量，留 N+1 余量，防止切换即过载。
+- **不越界重复**：`cpu{}` / `unix{}` / `api-segment{}` / `statseg{}` 全参数见 04-01，VRRP/BFD/IPSec 命令见 04-05，接口/show 命令见 04-03 / 04-06；模块功能见 07-07 / 07-14，字段见 05-11，线程与帧递交机制见 06-06 / 06-07；本册不重列命令清单、不展开转发与调度原理。
+
+### 6. 小结
+
+本篇作为部署册的收束，把单实例能力组织成可容错的整体：用多 worker + RSS 多队列横向拉开单进程吞吐，用资源分区 + 命名空间隔离在同一台机器上跑多个互不干扰的 VPP 实例，用主备（ECMP+BFD 或 VRRP）+ 会话同步 + 独立心跳 + 进程自愈把整机故障挡在系统之外，并以故障注入演练验证"检测—撤销—接管—恢复"的完整切换链条。三条最该带走的结论是：多 worker、实例隔离、主备分别对应性能、隔离、容灾三个不同维度；命名空间与资源必须逐实例独占、逐项错开；高可用只有在"真断一次"的演练里才算数，且备用侧要按切换后全量流量规划容量。至此，`03` 全册从单机硬件校准（`03-01`）、DPDK 网卡绑定（`03-02`）、虚拟化/云（`03-03`）、容器化（`03-04`）、硬件加速（`03-05`）一路走到高可用与多实例（`03-06`），形成一套从"让 VPP 跑起来"到"让 VPP 在生产里稳稳跑着"的完整部署链路；其中所有 `startup.conf` 全参数、CLI 命令族、结构体字段与转发/调度机制，均按去重铁律分别交由 `04`、`05`、`06`、`07` 作为唯一权威源，本册只保留各场景必需的操作片段与交叉引用。
+
+
+

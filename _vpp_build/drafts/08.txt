@@ -1,0 +1,1245 @@
+# VPP 技术资料 · 08 运维、性能基准与排障
+
+> 本册聚焦 VPP 从「能跑」到「跑得稳、跑得可度量、出问题能定位」的工程能力：性能基准方法学、调优与指标判读、日志与 packet trace、故障案例库、版本升级与配置迁移、生产运维 checklist。
+> 版本基准 VPP 23.06 / master。本册是「运维视角」的资料，不重复定义结构体字段（字段见 05 全册）、不重列 CLI 命令清单（命令见 04 全册，尤其 04-06）、不展开转发机制与调用链原理（原理见 06 全册）、不讲解模块功能与组网（见 07 全册）。本册讲的是：在什么场景下把哪些命令组合起来、如何判读它们的输出、以及据此做出运维决策。
+> 交叉引用统一写法：`（字段见 05-xx ｜ 命令见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）`。凡涉及具体结构体字段、CLI 子命令全量参数、内部调度机制，本册一律引用权威源，只在必要处给出「最小可用命令片段 + 输出判读」。
+
+---
+
+## 08-01 性能基准与测试方法学
+
+### 1. 目标与拓扑
+
+VPP 是一款以「每秒包数（PPS）」和「确定性低时延」为核心卖点的用户态数据面，性能是它的第一语言。但对 VPP 做性能测试，最容易出现的问题不是「测不准」，而是「测得不可比」：同一套 binaries，换一个人、换一天、换一台机器、换一个打流工具，跑出来的数字能差出一倍，然后团队陷入「到底该信谁」的争论。本篇的目标不是教读者「跑一个好看的分数」，而是建立一套**可复现、可对比、可归档、可回归**的性能基准方法学：明确测什么指标、用什么拓扑、选哪个流量生成器、如何按 RFC 2544 的思路做二分搜索、如何判读结果、如何把结果固化成基线，以便日后每次代码变更、内核升级、网卡固件更换、配置调整都能和这份基线做对照。
+
+需要先界定本篇覆盖的指标集合，这是所有后续步骤的度量对象：
+
+- **吞吐（Throughput / 零丢包速率 NDR）**：在「零丢包」约束下被测设备（DUT, Device Under Test）能持续转发的最大速率，单位同时用 Mpps（每秒百万包）与 Gbps（线速占比）。它与「能打进去多少」无关，只认「发出去且被对端完整收回多少」。
+- **丢包率（Frame Loss Rate）**：在给定输入负载下的丢包比例，通常画成「输入速率 → 丢包率」曲线，用来观察零丢包拐点之后系统如何劣化（是悬崖式丢包还是渐进式丢包）。
+- **时延（Latency）**：包括平均时延、最小/最大时延、尾分位（P99 / P99.9 / P99.99）与抖动（Jitter）。VPP 场景尤其关注尾分位——平均值很漂亮但 P99.9 突然飙高，往往意味着 buffer 耗尽、barrier 同步或某个周期性进程抢占。
+- **背靠背（Back-to-Back / 突发容量）**：以最大速率发送一段有限长度的突发帧且不丢包的最大突发长度，本质上在测缓冲深度与瞬时吸收能力（机制见 06-09 缓冲池管理）。
+- **每包处理成本（Cycles per Packet）**：通过 `show runtime` 的节点时钟统计换算，是「为什么只能跑这么快」的解释性指标，而非对外 SLA 指标（判读方法见 08-02，命令见 04-06）。
+
+基准测试的主流拓扑是**单机背靠背（back-to-back / hairpin）**：一台流量生成器用两个物理端口，分别连到 DUT 的两个物理端口，流量从生成器的 Port0 注入 DUT 的 Port0，经 VPP 转发后从 DUT 的 Port1 出来，再回到生成器的 Port1 被回收统计。这种拓扑的最大好处是把「发送」和「接收」放在同一台生成器、同一时钟域内，计数天然对齐，不需要两台机器做时钟同步，非常适合做二分搜索找零丢包点；同时 DUT 侧只需一台机器，变量最少。它的代价是 DUT 的两个端口共享同一条 PCIe 根复合体与同一个 NUMA node，压测结果会受 PCIe 带宽与 NUMA 局部性影响，因此必须把端口、worker、大页都绑定到同一个 NUMA node，并在报告中明确标注，否则结果不可比。
+
+:::figure id=08-01-01 | name=VPP 基准压测背靠背拓扑与流量路径 | dir=TD
+node gen "流量生成器 T-Rex / MoonGen / pktgen<br/>双端口 Port0 Port1 同一时钟域" blue
+node p0 "DUT Port0 收包口<br/>PCIe 与 NUMA node 绑定" green
+node path "VPP 转发路径<br/>dpdk-input → ethernet-input<br/>→ ip4-lookup → interface-output" teal
+node p1 "DUT Port1 发包口<br/>同 NUMA node" green
+node stat "计数与判读层<br/>生成器 counters / show interface<br/>show errors / statseg / ethtool -S" amber
+node base "基线归档<br/>版本 / 配置 / 环境 / 结果 CSV" purple
+node dutbox "被测设备 DUT<br/>VPP 23.06 数据面" gray
+edge gen -> p0 "Port0 注入流量"
+edge p0 -> path "收包入图"
+edge path -> p1 "转发出口"
+edge p1 -> gen "Port1 回收统计"
+edge p0 -> stat dashed "计数对齐"
+edge p1 -> stat dashed "计数对齐"
+edge stat -> base "多轮结果入档"
+edge dutbox -> path dashed "承载"
+:::
+
+> 图注（表格兜底）：背靠背拓扑的角色与数据流。若预览器不渲染图形，按下表理解——生成器 Port0 是唯一注入点，DUT Port1 是唯一回收点，四方计数（生成器 tx、DUT rx、DUT tx、生成器 rx）必须彼此对齐，测试才可信。
+
+| 角色 | 端口/对象 | 职责 | 关键约束 |
+|---|---|---|---|
+| 流量生成器 | Port0 / Port1 | 注入、回收、统计、时延打戳 | 两端口同机同时钟；CPU 核独立绑定，不与 DUT 争用 |
+| DUT 收包口 | Port0 | 接生成器 Port0，进入 VPP 图节点 | 与 Port1、worker、大页同 NUMA node |
+| DUT 转发路径 | node graph | L2 xconnect 或 L3 路由最简路径 | 关闭无关 feature，固定 worker 数（原理见 06-02 / 06-03） |
+| DUT 发包口 | Port1 | 出向回到生成器 Port1 | 队列数、描述符数固定并记档 |
+| 判读层 | counters / statseg | 四方计数对齐、丢包与 error 判读 | 命令见 04-06，本册只讲判读 |
+| 归档层 | 基线库 | 版本/配置/环境/结果入档 | 一次一档，可回归对比 |
+
+除背靠背外，还有两种拓扑需要了解其适用边界。**双 DUT 串联**（生成器 → DUT-A → DUT-B → 生成器）让收发分别落在不同设备，更接近真实网络，也便于测单向时延，但引入了两台机器的时钟与配置变量，一般用于系统级验收而非组件基准。**单端口环回**（同一物理口自发自收，靠 VPP 内部 loopback 或交叉连线把流量折回）接线最省，但收发共享同一端口队列、同一 PCIe 带宽，容易把「端口争用」误判成「转发瓶颈」，只在端口资源极度受限时使用，且必须在报告中注明折算口径。
+
+无论哪种拓扑，都要先画出**最简转发路径**并写进基线。以 VPP 23.06 的 L3 转发为例，一条典型调用链是 `dpdk-input`（`src/plugins/dpdk/` 下的 input node）→ `ethernet-input`（`src/vnet/ethernet/`）→ `ip4-input` / `ip4-lookup`（`src/vnet/ip/`）→ `ip4-rewrite` → `interface-output` → `dpdk-output-tx`（驱动发送节点）；L2 xconnect 则走 `l2-input` → `l2-fwd` / `l2-xcrw` 分支（原理见 06-02、06-12，模块见 07-02 / 07-03）。路径上每多挂一个 feature（ACL、NAT、IPsec、policer），每包 cycles 都会上升，零丢包速率随之下降——所以「测 VPP 性能」永远要说明测的是**哪条路径、挂了哪些 feature**，否则数字没有意义。
+
+### 2. 前置条件与环境
+
+性能基准的可复现性，九成取决于「环境是否被钉死」。这一节把需要固定、需要记录、需要体检的项目列全，任何一项漂移都足以让两次测试不可比。
+
+**硬件层**。CPU 要记录型号、基频/睿频、物理核数、是否开启超线程、NUMA 拓扑（`numactl -H`、`lstopo`）、LLC 大小；网卡要记录型号、固件版本、PCIe 代际与链路宽度（`lspci -vv` 看 `LnkCap` / `LnkSta`）、支持的收发队列数、是否支持硬件时间戳；内存要记录通道数、频率、大页类型与数量。BIOS 层的 C-state、P-state、Turbo、超线程、SR-IOV、VT-d/IOMMU 开关都必须记录，因为它们直接决定时延抖动与峰值 PPS。一个常见分歧是「要不要关 Turbo」：若追求绝对可复现、跨机器可比，应关闭 Turbo 并锁频（`cpupower frequency-set -g performance`，必要时在 BIOS 关 Turbo）；若追求「生产实际能跑多快」，则保留生产 BIOS 配置，但同一条基线序列内必须始终一致，绝不中途切换。
+
+**软件层与版本矩阵**。下表是每次基线必须入档的最小版本矩阵，缺一项都会给日后的差异排查埋雷：
+
+| 维度 | 需记录项 | 获取方式 / 备注 |
+|---|---|---|
+| VPP | 版本号、git commit、构建类型（release/debug）、编译优化 | `show version`（命令见 04-06）、`dpkg -l` 或 build 产物 |
+| DPDK | 版本、编译选项、驱动（vfio-pci / igb_uio） | VPP 内置 DPDK 或外链版本需区分 |
+| 内核 | `uname -r`、启动参数（isolcpus / hugepages / iommu） | `/proc/cmdline` |
+| 网卡固件/驱动 | firmware version、内核驱动版本 | `ethtool -i` |
+| 流量生成器 | 工具名与版本、Lua/配置脚本版本 | T-Rex / pktgen-dpdk / MoonGen 各自 version |
+| 编译器/运行时 | gcc/clang、LuaJIT、Python 版本 | 影响生成器性能，需一并记档 |
+| 配置文件 | startup.conf、exec 脚本、生成器 yaml/lua | 全文入档，见 04-01 配置体系 |
+| 拓扑 | 端口 PCI 地址、NUMA 归属、连线关系 | 与 `:::figure` 拓扑图对应 |
+
+**CPU 隔离与稳态**。压测前要把「数据面」「生成器」「控制面/系统」三类负载在物理核上彻底分开。典型做法是通过 grub 启动参数 `isolcpus=<隔离核列表> nohz_full=<...> rcu_nocbs=<...>` 把一部分核从内核调度器中隔离出来，配合 `intel_idle.max_cstate=1 processor.max_cstate=1` 抑制深睡眠带来的唤醒延迟，再用 `irqbalance` 禁用或把中断从隔离核上 ban 掉，最后用 `taskset` / `cgroup cpuset` 把 VPP worker 与生成器进程分别钉到互不重叠的核上（CPU 隔离与 NUMA 绑定的完整方法论见 08-02、08-06，配置参数见 04-01 的 `cpu{}` 块）。压测时还要确认没有定时任务、监控 agent、日志轮转在隔离核上抢 CPU——`ps -eLo pid,cls,rtprio,pri,psr,comm | grep` 扫一遍隔离核，应只看到预期的 worker 与生成器线程。
+
+**大页与 VPP 最小配置**。压测用 1G 大页优先于 2M 大页（TLB miss 更少、更稳），且要按 NUMA node 分别预留，避免跨 node 分配（大页预留、NUMA 绑定的内核参数与 `dpdk{}` 参数见 04-01、03-01/03-02）。下面给出一个「为基准测试服务」的最小 `startup.conf` 片段，重点是**把 worker 数、缓冲数、队列数、CPU 绑定全部显式写死**——凡是让 VPP 自动推断的项，都要改成显式值并记档：
+
+```bash
+unix {
+  nodaemon
+  log /var/log/vpp/vpp.log
+  full-coredump
+  cli-listen /run/vpp/cli.sock
+}
+cpu {
+  main-core 0
+  corelist-workers 2,4,6
+}
+dpdk {
+  dev 0000:3b:00.0 { name p0 }
+  dev 0000:3b:00.1 { name p1 }
+  num-rx-desc 1024
+  num-tx-desc 1024
+  socket-mem 1024,0
+  no-multi-seg
+}
+buffers {
+  buffers-per-numa 131072
+}
+```
+
+> 提示：上面各块的**完整参数含义与合法取值见 04-01**，本处只固定「压测需要钉死的那几项」。`dev` 的 PCI 地址、`socket-mem` 按 NUMA node 分配、worker 核号必须与第 1 节拓扑图里的 NUMA 归属一致；`no-multi-seg` / 描述符数 / `buffers-per-numa` 一旦改变，零丢包速率和背靠背结果都会变，必须作为基线字段记录。生产配置往往与此不同，报告中要标注「基准配置」而非「生产配置」。
+
+**流量生成器选型**。这是方法学里最关键的一次决策，选错工具会让时延数据从根上不可信。下表对比四种常见方案：
+
+| 工具 | 底层 | 时延精度 | 状态/脚本能力 | RFC2544 自动化 | 硬件时间戳 | 适用场景 | 主要短板 |
+|---|---|---|---|---|---|---|---|
+| **T-Rex**（Cisco，STL/ASTF） | DPDK，双端口 | 中高（软件打戳 + latency 流） | 强，Python profile / 有状态 ASTF | 强，社区有基准脚本；ASTF 更贴近业务 | 依赖网卡/配置 | VPP 官方 CSIT 主流、大流量 PPS、多流、有状态业务 | 配置 yaml 较复杂；纯软件时延有调度噪声 |
+| **pktgen-dpdk** | DPDK，Lua/CLI | 中（内置 per-port 统计） | 中，Lua 脚本 / 交互 CLI | 弱，需外部脚本驱动二分 | 一般 | 快速冒烟、端口/队列级打流、直观 `page stats` | 精确时延与尾分位能力弱；自动化基准不便 |
+| **MoonGen** | DPDK + LuaJIT（libmoon） | **高**，支持网卡硬件时间戳 | 强，Lua 全编程 | 强，自带 load-latency / 二分脚本 | **支持**（需网卡） | 学术级时延、尾分位、RFC2544 精确时延 | 上手门槛高；依赖特定网卡时间戳能力 |
+| **内核 pktgen** | `/proc/net/pktgen` | 低 | 弱 | 无 | 无 | 仅内核栈粗测 | 几乎不用于 VPP/DPDK 基准，易误导 |
+
+选型结论：**追求「和 fd.io 官方口径可比、大流量吞吐、多流与有状态」选 T-Rex**（fd.io CSIT——Continuous System Integration and Testing——正是以 TRex 为主要打流器，结果发布在社区 CSIT 报告与性能看板，做 VPP 基准时优先对齐它的口径）；**追求「微秒级甚至纳秒级时延、尾分位、硬件时间戳、RFC2544 严格时延」选 MoonGen**；**只是快速验证端口能不能打满、队列有没有丢包**用 pktgen-dpdk 最省事。内核 pktgen 不应出现在 VPP 数据面基准里，它的发包路径经过内核协议栈，和 DPDK 轮询模式完全不同，测出来的数字没有参考意义（原理见 06-12）。
+
+**环境体检与生成器自环校准**。正式压测前必须做两件事。第一，用小流量（比如 1 kpps 双向）确认 Port0/Port1 的 MAC、IP、ARP/邻居、接口 up、L2/L3 表项都正确，确认 VPP 的 `show errors` 无异常计数、`show interface` 有收有发——这一步用最简命令组合验证转发闭环（命令见 04-06，判读见本节第 4 部分）。第二，**把 DUT 换成一根直连线或让 DUT 做纯环回，校准生成器自身**：如果生成器连自己都稳定打不到物理线速、或者自身就有时延抖动，那后面测到的一切都是生成器瓶颈而非 DUT 瓶颈。校准通过后，把生成器核绑定、PCI 地址、脚本版本一并入档。
+
+### 3. 分步操作
+
+下面把一次规范的 RFC 2544 风格基准拆成可复用的步骤。每一步都强调「固定什么、记录什么」，因为方法学的核心就是消除自由度。
+
+**步骤 0 · 固化配置与版本快照**。把上一节的版本矩阵、startup.conf 全文、生成器配置全文、拓扑图、grub 参数、`cpupower` 设置、BIOS 关键开关打包成一次基线档案，赋予唯一 ID（如 `baseline-2026-11-vpp2306-l3-xconnect-64B`）。后续任何一次「重跑」都必须能从这份档案 1:1 复原环境。建议用 git 或带校验和的对象存储保存，避免「配置其实被人偷偷改过一行」。
+
+**步骤 1 · 安装并配置流量生成器**。以 T-Rex 为例，核心是 `trex_cfg.yaml`：正确填写两个端口的 PCI 地址、接口名、`port_info` 里的 IP/MAC（这些地址要和 VPP 侧的邻居/路由配置对得上），以及 `platform` 段把 `master_thread_id`、`latency_thread_id` 与各 `dual_if` 的收发线程绑定到独立核。一个最小片段示意：
+
+```text
+- version: 2
+  interfaces: ["3b:00.0", "3b:00.1"]
+  port_info:
+    - ip: 10.0.0.1
+      default_gw: 10.0.0.2
+    - ip: 10.1.0.1
+      default_gw: 10.1.0.2
+  platform:
+    master_thread_id: 0
+    latency_thread_id: 1
+    dual_if:
+      - socket: 0
+        threads: [2, 3, 4, 5]
+```
+
+pktgen-dpdk 则是命令行 + Lua：`pktgen -l 0-4 -- -P -m "[1:3].0, [2:4].1"` 之类把核映射到端口，再用 `set 0 rate 100`、`start 0` 起流。MoonGen 用 Lua 脚本，典型结构是在 `mg.startTask` 里用 `device.config{...}` 配端口、`packet.get*Packet` 造包、`device:getTxQueue(0)` 起发送 task，并挂 `timestamper` 使能硬件时间戳。三者脚本全文都要入档；具体语法以各工具对应版本的官方文档为准，**不要凭记忆编造 CLI 参数名**，不确定处写「需对照实际版本核验」并给出工具配置文件路径。
+
+**步骤 2 · 配置 VPP 数据面为最简路径**。按第 1 节选定的路径配好 L2 xconnect 或 L3 路由与邻居/ARP，只保留必要 feature。这里有两条纪律：一是**关闭一切与测试无关的 feature 与调试开关**（trace、packet pcap、调试级日志、api-trace 全关，它们都会吃 cycles，见 08-02/08-03）；二是**固定 worker 数与队列数**，不要让自动推断介入。命令片段示例（完整命令族见 04-03 / 04-04，本处仅为压测路径示意）：
+
+```bash
+set interface state p0 up
+set interface state p1 up
+set interface ip address p0 10.0.0.2/24
+set interface ip address p1 10.1.0.2/24
+ip route add 10.0.0.1/32 via 10.0.0.1 p0
+set ip neighbor p1 10.1.0.1 02:00:00:00:00:01
+```
+
+**步骤 3 · 定义流量模型**。至少覆盖 RFC 2544 建议的帧长集合：64、128、256、512、1024、1280、1518 字节（含 FCS 的以太网帧长），再加一组 **IMIX**（常见 7:4:1 的 64/576/1518 或 64/512/1518 混合）代表真实流量。同时钉死：流数（单流会命中同一 FIB/邻接缓存，多流会压 RSS 与查找缓存，两者结果差异很大，必须分别测并标注）、MAC/IP 是否递增、单向还是双向、载荷模式、是否带 VLAN、是否启用时延流。帧长之所以重要，是因为线速开销固定为「前导 7 + SFD 1 + 帧间隔 IFG 12 = 20 字节」，小包时这 20 字节占比极高，64B 帧在线上占 84 字节，对 PPS 压力最大；大包则偏向 Gbps 带宽压力。理论线速对照见第 4 节表格。
+
+**步骤 4 · 预热与计数归零**。每个测试点先预热 10–30 秒（让 FIB/邻接缓存、DDIO、TLB、生成器状态都进入稳态），丢弃预热期的计数，再开始计时窗口。同时在生成器与 VPP 侧清零/记录起始计数（`clear` 类命令见 04-06，本册讲时机：预热后、计时前归零）。预热不足是「第一轮偏低、后面越跑越高」的常见根因。
+
+**步骤 5 · RFC 2544 吞吐二分搜索**。这是找零丢包速率（NDR / Throughput）的标准方法：在 `[0, 线速]` 区间内二分，每次以中点速率发流、稳定计时 T 秒（RFC 2544 建议足够长，工程上常取 30–60 秒），判据是「生成器发送总数 == 生成器接收总数」且 VPP 侧无 error、无丢包；若无丢包则抬升下界、若有丢包则压低上界，直到区间小于收敛阈值（如线速的 1%）。每个速率档都要重复若干次取稳定值。RFC 2544 还要求在每个帧长上独立做这个搜索，并对结果做多次重复验证。
+
+:::figure id=08-01-02 | name=RFC2544 零丢包吞吐二分搜索流程 | dir=TD
+node s "设定帧长与搜索区间<br/>low 等于 0 high 等于线速" blue
+node mid "以 mid 速率发流<br/>预热后稳定计时 T 秒" teal
+node chk "判读生成器 tx 与 rx<br/>以及 DUT error 计数" amber
+node ok "无丢包 记录 NDR 候选<br/>low 等于 mid" green
+node bad "有丢包<br/>high 等于 mid" red
+node conv "区间宽度小于收敛阈值" purple
+node rep "该帧长重复多轮<br/>切换下一帧长" gray
+node done "汇总各帧长零丢包速率<br/>写入基线" blue
+edge s -> mid
+edge mid -> chk
+edge chk -> ok "无丢包"
+edge chk -> bad "有丢包"
+edge ok -> conv
+edge bad -> conv
+edge conv -> mid "否 继续收敛"
+edge conv -> rep "是 完成该档"
+edge rep -> mid "换帧长重搜"
+edge rep -> done "全部完成"
+:::
+
+> 图注（表格兜底）：二分搜索的判据是「零丢包」而非「最大不崩速率」；收敛后仍要在该速率附近做「微加/微减」验证，确认拐点真实存在，而不是恰好卡在计时窗口边界。
+
+| 步骤 | 动作 | 关键参数 | 通过判据 |
+|---|---|---|---|
+| 初始化 | 设定帧长与 `[low, high]` 区间 | high = 该帧长理论线速 | — |
+| 发流 | 以 `mid` 速率注入 | 预热 10–30s，计时 30–60s | 流量稳定 |
+| 判读 | 比对生成器 tx/rx、VPP error、statseg 丢包 | 四方计数对齐 | tx 全量收回且无 error |
+| 收敛 | 二分逼近零丢包边界 | 收敛阈值 ≈ 线速 1% | 区间足够窄 |
+| 复验 | 拐点附近微加/微减 + 多轮重复 | ≥ 3 轮 | 结果方差在容差内 |
+
+**步骤 6 · 时延测量**。时延必须在「零丢包速率」或指定负载（如 50% / 90% NDR）下测，且要区分单向时延与往返时延。最严谨的做法是 MoonGen 借助网卡硬件时间戳打戳，直接得到单向时延分布；T-Rex 则通过 latency 流（启动加 `-l` 或相当参数、配置采样率）得到 RTT 与直方图，注意**不要用 RTT/2 冒充单向时延**——收发路径不对称（feature、队列、NUMA）时这个假设不成立。采样率也有讲究：采样过密会干扰数据流、过稀则抓不到尾分位；通常取一个固定的、记入档案的比例。必须记录平均、P50、P99、P99.9、max 与抖动，尾分位往往才是 SLA 真正关心的量。生成器的 latency 线程要绑到独立核，避免和发送线程争用（这正是步骤 1 里 `latency_thread_id` 的意义）。
+
+**步骤 7 · 丢包率曲线与背靠背**。在零丢包拐点之上取若干速率点，画出「输入负载 → 丢包率」曲线，观察劣化形态；再按 RFC 2544 做背靠背测试：以线速发送有限长度的突发，逐步加长突发直到出现丢包，记下不丢包的最大突发长度。这个指标直接反映 `buffers{}` 深度、网卡 RX 描述符数与 `show buffers` 里的缓冲池余量（字段见 05-04，机制见 06-09），是容量规划的重要输入（见 08-06）。
+
+**步骤 8 · 多轮重复与统计处理**。同一配置至少跑 3 轮（生产基准建议更多），报告中给中位数、最小值、最大值与标准差/变异系数，而不是只报一个最好看的数字。设定客观的异常轮剔除准则（如某轮环境计数器出现外部干扰、或结果与中位数偏离超过 X%），**先定准则再跑**，不能事后按结果挑数据。所有原始计数、脚本、日志、环境快照随报告一起归档。
+
+### 4. 验证方法与预期结果
+
+测试跑完只是开始，判读才是方法学的落点。核心原则是**四方计数对齐 + 分层排除**：生成器的发送/接收、DUT 两个接口的收发、`ethtool -S` 的网卡级计数、VPP 内部 error/缓冲计数，四层数据必须自洽，任何一层「多出来」或「少一块」都要定位清楚，不能只看生成器的 `rx-pps` 就下结论。
+
+以 T-Rex 的 `tui` 或 `stats` 输出为例，需要判读的字段（数值形态示意，具体字段命名以所用 T-Rex 版本为准，不确定处写「需对照实际版本核验」并给出工具 stats 输出路径）：
+
+```text
+port |    tx-pps    |    rx-pps    |   tx-bps   |   rx-bps   | opackets | ipackets | oerrors | ierrors
+  0  |  14.88 Mpps  |     0        |  10 Gbps   |     0      |  ...     |    0     |    0    |    0
+  1  |     0        |  14.88 Mpps  |     0      |  10 Gbps   |    0     |   ...    |    0    |    0
+latency: avg 12.3 us  max 38.1 us  jitter 1.7 us  p99 18.4 us  (histogram ...)
+```
+
+判读要点：`Port0` 只应看到 tx，`Port1` 只应看到 rx（背靠背单向流）；两端口合计的 `opackets == ipackets` 才是零丢包；`oerrors/ierrors` 必须恒为 0；latency 的 `max` 与 `p99` 要和 `avg` 一起看，若 `avg` 很低但 `max` 周期性冲高，说明存在周期性抢占或缓冲抖动，不能算通过。
+
+VPP 侧要做的是**组合判读**而非罗列命令（完整命令清单见 04-06，此处只讲「用哪几个、看什么」）：用 `show interface` 确认两个口的 `rx/tx packets` 与生成器对齐、`show errors` 确认没有任何 node error 计数增长（一旦有 error，说明有包在图内被丢弃，吞吐数字立即作废）、`show runtime` 看各节点 `Clocks`/`Calls`/`Vectors` 以核算每包 cycles 并定位热点、`show buffers` 确认缓冲池未耗尽、`statseg` 的 `/if/` 与 `/err/` 命名空间做长时间序列采样（统计计数器原理见 06-xx，字段见 05-12）。这一组命令的「场景化组合与输出判读」正是 08-02 的主题，本处只要求「压测中它们必须同时为零异常」。
+
+**理论线速核对**是防止「自欺」的关键一步。下表给出各速率、各帧长下的理论最大 PPS（按帧长 + 20 字节线速开销计算，FCS 计入帧长），实测零丢包速率除以理论值即「线速达成率」：
+
+| 帧长（含 FCS） | 线上字节 | 10 Gbps 理论 Mpps | 25 Gbps 理论 Mpps | 100 Gbps 理论 Mpps |
+|---|---|---|---|---|
+| 64 | 84 | 14.88 | 37.20 | 148.81 |
+| 128 | 148 | 8.45 | 21.12 | 84.46 |
+| 256 | 276 | 4.53 | 11.32 | 45.29 |
+| 512 | 532 | 2.35 | 5.87 | 23.50 |
+| 1024 | 1044 | 1.20 | 2.99 | 11.97 |
+| 1280 | 1300 | 0.96 | 2.40 | 9.62 |
+| 1518 | 1538 | 0.81 | 2.03 | 8.13 |
+
+> 例如 10 Gbps、64 字节帧下理论上限约 14.88 Mpps；若某次「L3 转发」实测零丢包速率只有 3 Mpps，不要先怪 VPP，先核对是不是把生成器核、DUT worker、网卡绑到了不同 NUMA node、是不是 2M 大页 TLB miss 严重、是不是挂了 ACL/NAT feature、是不是开了 trace 或调试日志。VPP 单 worker 在纯 L2/L3 最简路径上达到数 Mpps 量级是合理的，但具体数字高度依赖硬件与配置，**不要凭空给出「VPP 一定能跑 X Mpps」的结论**，一切以本环境实测 + 本表核对为准。
+
+**可信结果的四条硬标准**：（1）四方计数完全对齐；（2）VPP `show errors` 全程零增长、`show buffers` 有稳定余量；（3）生成器自环校准能达到物理线速，证明生成器不是瓶颈；（4）多轮重复的中位数稳定、方差在预先设定的容差内。四条缺一，报告都必须标注「仅供参考，未达可归档基线」。
+
+**基线记录模板**：每次归档至少包含下表字段，供后续回归对比。
+
+| 字段组 | 字段示例 |
+|---|---|
+| 标识 | 基线 ID、测试日期、执行人、归档路径与校验和 |
+| 环境 | 版本矩阵全部字段、BIOS/grub/`cpupower`、NUMA 绑定、大页配置 |
+| 配置 | startup.conf 全文、exec 全文、生成器 yaml/lua 全文、拓扑图 ID |
+| 流量模型 | 帧长集合、IMIX 配比、流数、双向/单向、feature 列表 |
+| 结果 | 各帧长 NDR、丢包率曲线、时延分位、背靠背值、每包 cycles |
+| 统计 | 轮数、中位数/方差、异常轮及剔除依据 |
+| 判读 | 四方计数对齐结论、error/buffer 结论、线速达成率 |
+
+### 5. 常见失败与排错
+
+**流量打不到线速**。先做生成器自环校准：若直连都打不满，问题在生成器——核数不够、发送核与接收核争用、绑错 NUMA、Lua/Python 造包太慢、PCIe 带宽被两端口共享。若自环能打满而接上 DUT 后掉速，问题在 DUT 或链路：worker 数不足、worker 与网卡跨 NUMA、2M 大页 TLB miss、挂了额外 feature、开了 trace/pcap/调试日志、RX 描述符或 `buffers-per-numa` 太小导致微突发丢包。定位顺序遵循「先证明工具、再分段排除」，逐层用 `ethtool -S`（网卡）、`show errors`（图内丢弃）、`show buffers`（缓冲池）、`show runtime`（热点节点）把丢包段切出来（这些命令的组合判读见 08-02 / 08-03，命令见 04-06）。
+
+**单向不通 / 零收包**。最常见是配置闭环没建立：MAC/IP 写错、ARP/邻居未解析、接口未 `up`、L2 xconnect 或 L3 路由/回程路由缺失、VFIO 未绑定、PCI 地址填错。用最简小流量 + packet trace 看包停在哪一个 node（`trace add` 的用法与 `show trace` 判读见 08-03，命令见 04-06），比反复改配置高效得多。
+
+**时延异常 / 抖动大**。逐项排查：Turbo/C-state 未锁、latency 线程与发送线程共核、时间戳用的是软件而非硬件、采样率过高干扰数据流、生成器自身过载、测试机上有其他负载抢占。若平均时延正常但尾分位周期性冲高，重点看是否有周期性 `vlib_process`、barrier 同步、日志刷屏或 buffer 回收抖动（机制见 06-05 / 06-07）。
+
+**丢包归属不清**。务必分清「生成器发不出去」「网卡丢」「VPP 图内丢」「对端收不到」四种，用四方计数 + `ethtool -S` + `show errors` + `show buffers` 逐层对齐，而不是笼统写「有丢包」。拐点附近的微突发丢包尤其容易被误判为「转发能力不足」，实际常常是缓冲深度或描述符数不够。
+
+**症状 → 排查方向速查表**：
+
+| 症状 | 优先排查方向 | 首选判读手段 |
+|---|---|---|
+| 自环都打不满线速 | 生成器核绑定/造包性能/PCIe | 生成器 stats、自环校准 |
+| 接 DUT 后掉速 | NUMA 绑定、大页、worker 数、feature | `show runtime`、`numastat`、`show errors` |
+| error 计数增长 | 图内丢弃点、表项/资源 | `show errors`、trace |
+| 平均时延低但尾分位冲高 | 抢占、barrier、buffer 回收、日志 | latency 直方图、`show runtime` |
+| 拐点附近微突发丢包 | 缓冲深度、RX 描述符 | `show buffers`、`ethtool -S`、背靠背测试 |
+| 多轮结果漂移 | 频率/温度/外部负载/预热不足 | 环境快照对比、预热时长 |
+
+#### 陷阱与最佳实践
+
+- **不要用瞬时峰值当吞吐**。必须取稳态计时窗口内的持续速率；秒级尖峰往往来自缓冲尚未耗尽，不可持续。
+- **不要忘记线速开销**。计算 PPS 时把 20 字节前导/IFG 算进去，否则 64B 帧的「达成率」会算错 20% 以上；同时区分「含 FCS 帧长」与「载荷长度」两种口径。
+- **不要用 RTT/2 冒充单向时延**，除非已证明收发路径完全对称；MoonGen 硬件时间戳或 T-Rex latency 流是更可信的来源。
+- **不要在共享 hypervisor / 有邻居噪声的云主机上做绝对基准**，或至少在报告中明确标注为「相对基准」。
+- **固定一切变量**：频率、NUMA、大页、worker 数、缓冲数、描述符数、feature 列表、生成器版本与脚本，全部入档；任何一项变动都算一条新基线，不与旧数据混算。
+- **压测配置 ≠ 生产配置**：为排除干扰而关闭的 feature、日志、trace，恰是生产环境要开的；报告必须标注二者差异，避免用基准数字直接承诺生产 SLA。
+- **结果可复现优先于「跑分好看」**：一个能被别人 1:1 复现的中等数字，价值远高于一个无法复现的漂亮数字。优先对齐 fd.io CSIT 的口径与帧长集合，便于跨团队比较。
+- **不确定处宁可标注也不要编造**：工具 CLI 参数、字段命名、版本号，凡是记忆不确切的，写「需对照实际版本核验」并给出配置文件/头文件/输出路径（本册遵守 SPEC 第 2 节的同样纪律）。
+
+### 6. 小结
+
+本篇给出的是 VPP 性能基准的「方法学」而非某个具体分数：以单机背靠背为主拓扑，先钉死硬件/内核/版本/配置/CPU 隔离与 NUMA 绑定，按吞吐与时延精度选 T-Rex（对齐 fd.io CSIT、大流量与有状态）、MoonGen（硬件时间戳、严格时延与尾分位）或 pktgen-dpdk（快速冒烟），再按 RFC 2544 的二分搜索思路逐帧长找零丢包速率，配合时延分位、丢包率曲线、背靠背测试与多轮统计，最后以「四方计数对齐、error 零增长、生成器非瓶颈、多轮稳定」四条硬标准判定结果是否可归档为基线。所有数字都要回到「哪条转发路径、挂了哪些 feature、什么环境」才有意义。
+
+后续衔接：测出瓶颈后如何判读 `show runtime`/`statseg` 并调优，见 08-02；压测或现网中出现丢包/不通如何用日志、trace、pcap 定位，见 08-03；典型故障的成套处置见 08-04。延伸阅读方向：RFC 2544（网络互联设备基准测试方法）、RFC 2889（LAN 交换设备）、RFC 3918（组播）、ITU-T Y.1564（以太网业务激活测试）、RFC 1242 / 2285（术语与基准定义），以及 fd.io CSIT 报告与 TRex / MoonGen 官方文档——它们定义了本篇反复引用的「零丢包速率、背靠背、时延分位」等术语的精确含义。
+
+## 08-02 性能调优与监控指标
+
+### 1. 背景与动机
+
+一套 VPP 系统「跑起来」与「跑得满、跑得稳、知道为什么只跑到这儿」之间，隔着完整的性能工程。VPP 采用 DPDK 轮询模式驱动（PMD），worker 线程在空闲时也持续轮询网卡队列、不让出 CPU，因此 `top` 里看到某个核 100% 是**设计使然而非故障**——这是新手最容易踩的第一个认知坑：把常态当异常，然后盲目「降负载」或「加核」，结果越调越差。真正的性能问题往往藏在更隐蔽的地方：网卡在 NUMA node1 而 worker 绑在 node0，每个包都要跨 QPI/UPI 访问内存；用 2M 大页导致 TLB miss 拖垮小包转发；worker 数与 RX 队列数不匹配，帧在 worker 间反复 handoff；缓冲池深度不够，微突发一到就丢包；某个 feature（ACL 规则爆炸、NAT 会话表过大）把每包 cycles 抬了数倍。
+
+本篇建立一套「指标体系 → 判读方法 → 调优杠杆 → 闭环验证」的框架。它不追求给出「某个参数该填几」的万能答案（那高度依赖硬件与业务），而是讲清楚：VPP 有哪些可观测指标、它们由哪段源码产生、在什么场景下把哪几个 `show` 命令组合起来看、如何判读输出里的每一列、以及调整每个杠杆时的收益与代价。这样读者拿到任何一台机器、任何一个版本，都能自己走完「测量 → 定位 → 改一个变量 → 复测」的闭环。
+
+**去重边界**：本册不重列任何 `show` / `statseg` 命令清单——那是 04-06 的唯一权威源；本篇只讲「命令组合与输出判读」。结构体逐字段定义见 05 全册（本篇一律写「字段见 05-xx」），调度与缓冲机制见 06 全册（原理见 06-xx），接口与模块行为见 07 全册。凡涉及具体 CLI 子命令的全量参数，均引用 04-06 / 04-01。
+
+### 2. 核心概念
+
+**指标分层模型**。把 VPP 的可观测数据按「离硬件远近」分层，是判读的第一步——丢包可能发生在任一层，定位就是逐层排除：
+
+| 层 | 代表指标 | 主要来源（命令见 04-06） | 回答的问题 |
+|---|---|---|---|
+| 业务/SLA | PPS、Gbps、时延分位、丢包率、会话数 | 外部打流器、08-01 基线 | 用户感受到的性能 |
+| 接口层 | rx/tx packets / bytes / drops / errors | `show interface`、statseg `/if/` 命名空间 | 包有没有进出接口 |
+| 图节点层 | 各 node 的 Calls / Vectors / Clocks、node error 计数 | `show runtime`、`show errors`、`show node` | 包在图内走到哪、在哪被丢、每包成本 |
+| 缓冲/内存层 | 各池 free/used、`no free buffers` 类计数、堆使用 | `show buffers`、`show memory`、`/err/` | 资源有没有耗尽 |
+| 线程/CPU 层 | 各 worker 利用率、`Vectors/Call`、cycles per packet | `show threads`、`show runtime` | 批处理是否充分、核是否够用 |
+| 硬件/驱动层 | 网卡 rx_missed / rx_no_buffer / q_* 计数、PCIe | `show hardware`、`ethtool -S` | 丢在驱动还是线缆 |
+
+**`show runtime` 的列语义是调优的核心判读对象**。它按图节点逐行给出：`Calls`（节点被调度次数）、`Vectors`（累计处理的数据包/帧向量元素总数）、`Suspended`/`Clocks`（累计消耗的 CPU 时钟周期，具体列名随版本略有差异，需对照实际版本核验）、以及由它们导出的 `Vectors/Call`（平均向量长度）与 `Clocks per Vector / per Packet`（每包处理成本）。几个关键推论：`Vectors/Call` 越接近硬件允许的最大向量（DPDK input 常见 256 量级），说明批处理收益吃得越满（原理见 06-01）；若长期只有个位数，要么是流量太稀，要么是队列/轮询配置把向量切碎了。`Clocks` 除以 `Vectors` 得到 cycles/packet，再除以主频可估算单包处理时间、乘以 PPS 可估算「理论上界」——这解释了「为什么只能跑这么快」。**注意这是累积或区间统计，判读要用两次采样之差除以时间间隔**，不能拿绝对值下结论。
+
+**statseg（统计段）与采样**。VPP 把各类计数器放在共享内存里供外部零拷贝读取，`vppctl` 的很多 `show` 本质也是它的消费者；23.06 起新版 statseg 用目录式路径组织计数器（`/if/...`、`/err/...`、`/sys/...`、`/net/...` 等命名空间，确切前缀与目录项结构需对照实际版本核验，字段见 05-12），外部可用 `vpp_get_stats` 类工具或 Python 绑定（编程用法见 04-07）周期性采集，接入 Prometheus/Grafana 做时间序列。要牢记两条：其一，**计数器是累计值**，速率 = (本次值 − 上次值) / 采样间隔；其二，**采集本身有开销**，高频全量拉取目录、在 CLI 里反复轮询大表，都会轻微干扰数据面，生产上要控制采样频率与范围。
+
+**调优杠杆清单**（本篇后续逐项展开）：worker 数与 main-core 绑定、RX/TX 队列数与描述符数、缓冲池大小、大页规格（2M vs 1G）、CPU 隔离与 IRQ 隔离、NUMA 绑定（网卡 / worker / 大页 / 内存四者一致）、feature arc 裁剪、各类 offload、Turbo/超线程/DDIO 的取舍。它们不是彼此独立的旋钮，改一个常牵动另一个——这正是「一次只改一个变量」原则的原因。
+
+### 3. 关键数据结构与源码位置
+
+本节只给「去哪找实现」的定位路径，不重列任何结构体字段表（字段见 05 全册）。掌握这些路径的价值在于：当 `show` 输出出现一个看不懂的计数器或一列含义不明的数字时，能直接回到源码确认它到底累加了什么。
+
+| 关注点 | 源码位置（VPP 23.06 / master） | 关键符号 / 函数 | 说明 |
+|---|---|---|---|
+| 主循环与节点调度 | `src/vlib/main.c` | `vlib_main_loop*` / `vlib_*_next_frame` 系列 | runtime 统计在 dispatch 节点前后累计（原理见 06-05） |
+| 节点运行时结构 | `src/vlib/node.h`、`src/vlib/node.c` | `vlib_node_runtime_t` | runtime 行的数据载体（字段见 05-03） |
+| 通用计数器 | `src/vlib/counter.c`、`src/vlib/counter.h` | `vlib_increment_*_counter` 系列、`vlib_combined_counter_main_t` | 接口 rx/tx 计数由此累加（字段见 05-12） |
+| 错误计数器 | `src/vlib/error.c`、`src/vlib/error.h` | `vlib_error_count` 及 node error 注册 | `show errors` 的数据源（字段见 05-xx） |
+| 统计段 | `src/vpp/stats/stat_segment.c`（新版）、旧版 `src/vlibmemory/` | `stat_segment_shared_header_t`、`stat_segment_directory_entry_t` | 共享内存目录与消费者接口（字段见 05-12，机制见 06-10） |
+| 线程模型 | `src/vlib/threads.c`、`src/vlib/threads.h` | `vlib_worker_thread`、`vlib_thread_main_t`、`vlib_launch_worker_thread` | worker 启动与绑定（字段见 05-02，原理见 06-06） |
+| 缓冲池 | `src/vlib/buffer.c`、`src/vlib/main.c` | `vlib_buffer_alloc_from_pool`、`vlib_buffer_free` | `show buffers` 数据源（字段见 05-04，机制见 06-09） |
+| DPDK 输入节点 | `src/plugins/dpdk/device/` | input node 的 `node_fn`、`dpdk_device_t` | `show hardware` 统计来源（模块见 07-01，原理见 06-12） |
+| 日志（调优相关） | `src/vlib/log.c` | `vlib_log_*`、`vlib_log_class` | 调试日志刷屏会吃 cycles（详见 08-03） |
+
+> 版本号与符号名以实际 checkout 为准：上表给的是 23.06 / master 中可定位的路径，若某函数签名或结构体名与手头版本不符，写「需对照实际版本核验」并保留头文件路径即可，不要编造签名（遵循 SPEC 第 2 节纪律）。表中「通用计数器」行单元格已改用通配写法，其完整符号为 `vlib_increment_simple_counter`、`vlib_increment_combined_counter`、`vlib_combined_counter_main_t`，三者均可在 `src/vlib/counter.c` 中定位核验。
+
+### 4. 关键流程与调用链
+
+**计数产生链**：`vlib_main_loop`（`src/vlib/main.c`）从 pending frames 取出待处理向量 → 调用 `node->function`（如 `dpdk-input` → `ethernet-input` → `ip4-lookup` → `interface-output`）→ 节点内部在收发接口上调用 `vlib_increment_combined_counter` 累加 packets/bytes，或在丢弃路径调用 `vlib_error_count` 累加 node error → 这些计数器写入 statseg 共享内存 → 消费者（`vppctl show ...`、`vpp_get_stats`、监控 agent）按采样周期读取并做差。理解这条链后就能明白：`show interface` 的 rx 是「接口层计数」，`show errors` 是「图内丢弃点计数」，`show hardware` 是「驱动层计数」，三者数值不一致时，差值恰好指示丢包发生在哪一段。
+
+**调优决策闭环**：先用 08-01 的基线测出当前 NDR → 采两次 `show runtime` 计算各节点 cycles/packet，找出成本最高的节点 → 用 `perf` / pcap 抽样确认热点是「代码路径」还是「配置/资源」→ 从杠杆清单里**只挑一个**改动 → 复测同基线对比 → 有效则入档、无效则回滚该变量再试下一个。没有基线就没有「有效/无效」的判据，调优会退化成碰运气。
+
+:::figure id=08-02-01 | name=VPP 监控指标分层与调优决策闭环 | dir=TD
+node hw "硬件驱动层<br/>ethtool -S / show hardware<br/>网卡与 PCIe 计数" gray
+node ifl "接口层<br/>show interface / statseg /if/<br/>rx tx packets bytes drops" blue
+node nd "图节点层<br/>show runtime / show errors<br/>Calls Vectors Clocks error" teal
+node buf "缓冲内存层<br/>show buffers / show memory<br/>free 余量 与 /err/" amber
+node thr "线程 CPU 层<br/>show threads / 每核利用率<br/>cycles per packet" purple
+node perf "热点定位<br/>perf top / perf record<br/>pcap 抽样" red
+node lever "调优杠杆<br/>worker 数 NUMA 绑定<br/>大页 buffer 数 feature 裁剪" green
+node base "基线复测 对比 08-01<br/>一次只改一个变量" blue
+edge hw -> ifl "计数上送"
+edge ifl -> nd
+edge nd -> buf
+edge buf -> thr
+edge thr -> perf "发现热点"
+edge perf -> lever "定位瓶颈"
+edge lever -> base "复测验证"
+edge base -> nd dashed "闭环迭代"
+:::
+
+> 图注（表格兜底）：自下而上逐层排除——硬件层确认线缆/驱动不丢，接口层确认包进出，节点层确认图内丢弃与每包成本，缓冲层确认资源余量，线程层确认核够不够、批处理充不充分。任何一层异常即在该层收敛，不再往下走。
+
+### 5. 配置/命令/代码实例
+
+本节给「组合与判读」，不重列命令清单（命令见 04-06，参数见 04-01）。
+
+**场景一：确认 NUMA 与 CPU 绑定是否正确**。调优前先看「网卡在哪个 node、worker 绑在哪些核、大页落在哪个 node」。组合：`numactl -H` / `lstopo` 看拓扑 → `show threads` 看各 worker 的核与 node → `show hardware` 看接口所属 node → 对照 `startup.conf` 的 `cpu{}` 与 `dpdk{} socket-mem`。判读：三者必须落在同一 NUMA node；若 `socket-mem 0,1024` 把大页分给了 node1，而 worker 用 `corelist-workers` 绑在 node0 的核上，则每个包都跨节点访存，小包 PPS 可能腰斩。
+
+**场景二：判读 `show runtime` 找热点**。两次采样、间隔固定，示意输出（列形态随版本略异，需核验）：
+
+```text
+Name                 State         Calls          Vectors        Suspends         Clocks       Vectors/Call
+dpdk-input           active          120000        30720000             0        9.2e9             256
+ethernet-input       active         120000        30720000             0        3.1e9             256
+ip4-lookup           active         120000        30720000             0        6.4e9             256
+ip4-rewrite          active         120000        30720000             0        2.0e9             256
+```
+
+判读：`Vectors/Call` 约 256 说明批处理充分，`dpdk-input` 的 `Clocks` 最高属正常（它承担收包与 DMA 交互）；若 `ip4-lookup` 的 cycles/packet 异常高，而 FIB 表项巨大，就要怀疑查找缓存命中率或是否挂了额外查表 feature；若所有节点 `Vectors/Call` 都只有个位数，先回头查流量速率与队列配置，而不是急着加 worker。
+
+**场景三：用 `perf` 与 pcap 佐证**。`perf top -p <vpp-pid>` 看热点函数是否集中在某个 node 或某个 `clib_bihash` 查找；`perf record -g -p <pid> -- sleep 30` 出调用图（VPP 的符号解析与 perf map 见 02-06）；对丢包或内容异常再用 pcap 抽样抓若干包核对 MAC/IP/校验和（pcap 用法见 08-03，命令见 04-06）。注意 `perf` 与 pcap 都有开销，只在定位窗口内短时开启。
+
+**场景四：statseg 时间序列采集**。用 Python 绑定（编程用法见 04-07，接口名/路径需对照实际版本核验）周期性拉取 `/if/` 与 `/err/` 目录并做差：
+
+```bash
+# 伪代码：每 10 秒对累计计数器做差得到速率，具体 API 与路径以实际版本核验
+prev = statseg.dump(["/if/", "/err/"])
+while True:
+    time.sleep(10)
+    cur = statseg.dump(["/if/", "/err/"])
+    rx_rate = (cur["/if/rx-packets"] - prev["/if/rx-packets"]) / 10
+    err_rate = (cur["/err/<node>/<error>"] - prev["/err/<node>/<error>"]) / 10
+    prev = cur
+```
+
+**「指标 → 命令组合 → 健康阈值 → 异常含义」判读表**（命令族见 04-06）：
+
+| 指标 | 组合（场景化，非清单） | 健康判据 | 异常时含义 |
+|---|---|---|---|
+| 接口收发 | `show interface` 两口对照 + statseg `/if/` 做差 | rx 与 tx 计数随负载线性增长、drops=0 | drops 增长 → 缓冲/队列/下游丢 |
+| node error | `show errors` 区间做差 | 全程零增长 | 某 node error 增长 → 图内有规则性丢弃，见 08-04 |
+| 每包成本 | `show runtime` 两次采样算 Clocks/Vectors | 与基线一致、无突增 | 突增 → feature 变重 / 缓存未命中 / 调试开关 |
+| 向量长度 | 同上算 `Vectors/Call` | 接近队列上限 | 长期偏低 → 流量稀或队列被切碎 |
+| 缓冲余量 | `show buffers` + `/err/` | free 稳定有余量 | free 持续下降 → 泄漏或突发过大 |
+| worker 利用率 | `show threads` + 每核 `top -H` | 100% 属常态、分布均衡 | 某核显著更高 → 流哈希不均 / RSS 失衡 |
+| 硬件丢包 | `show hardware` + `ethtool -S` | rx_missed / no_buffer 为零 | 非零 → 描述符或 PCIe 瓶颈，先于 VPP 丢 |
+
+**调优参数与取舍表**（完整参数见 04-01）：
+
+| 杠杆 | 影响 | 收益 | 代价 / 风险 |
+|---|---|---|---|
+| worker 数 | 并行转发核数 | 适度增加线性提 PPS | 过多导致帧 handoff、barrier、跨 NUMA、队列不足 |
+| main-core / corelist-workers | 控制面与数据面核分配 | 避免控制面抢 worker | 绑错 NUMA 反而掉速 |
+| RX/TX 队列数、描述符数 | 收包并发与突发吸收 | 匹配多 worker、抗微突发 | 过多吃内存、缓存局部性下降 |
+| buffers-per-numa | 缓冲池深度 | 抗突发、降 `no free buffers` | 过大吃大页、TLB/缓存压力 |
+| 大页 2M → 1G | TLB miss | 小包 PPS 更稳 | 需 BIOS/grub 预留、不可动态调 |
+| CPU 隔离 / IRQ 隔离 | 减少抢占与抖动 | 尾分位更稳 | 减少系统可用核 |
+| feature arc 裁剪 | 每包 cycles | 关掉不用 feature 直接提速 | 功能缺失，需确认业务不依赖 |
+| Turbo / 超线程 / DDIO | 峰值频率与缓存 | 影响峰值与稳定性 | 与可复现性冲突（见 08-01） |
+
+### 6. 注意事项、陷阱与最佳实践
+
+- **「CPU 100%」不是故障**。PMD 轮询下 worker 空闲也满核，判据应是吞吐/时延/丢包，而非 `top` 的利用率。看到 100% 就加核、降负载，是常见的反向操作。
+- **worker 越多越好是错的**。worker 数与 RX 队列数、NUMA node、流数量要匹配；帧在 worker 间 handoff（原理见 06-07）与 barrier 同步都有成本，过多 worker 反而让 PPS 下降。加 worker 必须配合队列数、绑核与复测。
+- **NUMA 四者一致**：网卡所在 node、worker 核所在 node、大页（`socket-mem`）所在 node、被访问内存所在 node 要对齐。跨节点是「配置没报错但性能莫名低」的头号根因（案例见 08-04）。
+- **大页不是越多越好，规格更关键**。2M 大页在小包高密度转发下 TLB miss 明显，1G 更稳；但 1G 大页必须开机预留、无法在线增补，容量规划要提前做（见 08-06）。
+- **缓冲池余量要留水位**。`show buffers` 的 free 长期贴底或 `/err/` 出现 `no free buffers` 类计数，说明突发吸收能力不足；调 `buffers-per-numa` 或增描述符，但别盲目翻倍，先确认不是某节点泄漏（字段见 05-04）。
+- **采样与观测本身有开销**。高频 statseg 全量拉取、CLI 大表轮询、常开 trace/pcap、调试级日志，都会吃 cycles、污染时延尾分位；定位窗口短时开启，结束后复原。
+- **一次只改一个变量**。改完用 08-01 的同基线复测，有效入档、无效回滚；同时改 worker 数和大页和 feature，结果无法归因。
+- **offload 与 feature 需核验**。哪些校验和/分段 offload 在所用网卡与 VPP 版本真正生效、某 feature 是否能安全关闭，都需对照实际版本与硬件核验，不要凭经验下结论。
+- **建立「基线—变更—复测」闭环**。所有调优动作关联到 08-01 的基线档案与 08-06 的变更管理，避免「谁悄悄调过一个参数」成为悬案。
+
+### 7. 小结与延伸阅读
+
+本篇把 VPP 调优从「凭感觉调参数」拉回工程闭环：以分层指标模型（硬件/接口/节点/缓冲/线程/业务）为地图，以 `show runtime` 的 `Calls/Vectors/Clocks` 与 statseg 累计计数做差为判读核心，以 `perf`/pcap 佐证热点，再从 worker 数、NUMA 绑定、大页、缓冲数、feature 裁剪等杠杆里**一次只改一个变量**，用 08-01 的基线复测验证。记住三个反直觉点：PMD 的 100% CPU 是常态、worker 不是越多越好、NUMA 错配比代码慢更常见。
+
+衔接：这些 `show` 命令在真实故障里如何串成决策链、日志与 packet trace 如何配合，见 08-03；具体参数全量见 04-01 / 04-06，结构体字段见 05-03 / 05-04 / 05-12，调度与缓冲机制见 06-05 / 06-06 / 06-09 / 06-10。延伸阅读方向：`perf` / `pahole` 工具文档、DPDK `ethtool` 统计含义、Linux `isolcpus` / `nohz_full` / `rcu_nocbs` 内核文档、NUMA `numastat` 手册，以及 fd.io CSIT 的每包 cycles 口径。
+
+---
+
+## 08-03 日志、packet trace 与故障排查流程
+
+### 1. 背景与动机
+
+性能问题看数字，功能问题（不通、丢包、 intermittent 抖动）看「包到底去哪了」。VPP 在用户态实现了完整的数据面，内核协议栈那套 `tcpdump`/`netstat`/`/proc` 经验大多失效：包不经过内核 netdev 的常规路径，好在 VPP 提供了自己的一套诊断体系——分级日志、packet trace（在图节点级别逐包留痕）、pcap 抓包、Binary API 调用追踪（api-trace）、崩溃转储（coredump），以及 `show errors` 的节点错误计数。工具越多，越容易「一上来全打开」，结果被 trace 开销拖垮、被日志刷屏淹没、trace 缓冲被覆盖，反而拿不到关键信息。
+
+本篇的目标是给出一条**分层、按需、开销可控**的排查决策链：从现象出发，先用代价最低的命令把故障域收敛到某一层，再逐步启用代价更高的 trace / pcap / coredump，每一层都讲「看什么、怎么判读、什么情况下转向下一层」。同时把日志与 coredump 的配置、api-trace 的回放、perf 的辅助定位串成体系。全篇遵守去重铁律：不重列 `show` / `trace` / `pcap` 命令清单（权威源 04-06），只讲场景组合与输出判读；结构体字段引用 05 全册，机制引用 06 全册。
+
+### 2. 核心概念
+
+**日志体系**。VPP 的日志分几路：早期/驱动层常用的 `clib_warning` / `clib_error`（`src/vppinfra/error.h` 一带），以及较新的分级日志 `vlib_log_*`（`src/vlib/log.c`，`vlib_log_class` / 日志级别），后者支持按模块/类别设置级别。`startup.conf` 的 `logging{}` 块控制默认级别与各目标级别（`default-log-level`、`default-syslog-log-level`、按 class 覆盖等，完整参数见 04-01）；`unix{}` 决定日志落盘位置、是否 `nodaemon`、是否输出到 syslog/控制台。默认落盘路径通常是 `/var/log/vpp/vpp.log`（确切路径以 `unix{}` 的 `log` 配置为准，需对照实际版本核验）。日志级别从 `emergency/alert/critical/error/warn/notice/info/debug` 逐级细化（命名以实际版本为准），生产一般用 `info` 或 `warn`，排障时才临时提到 `debug`——**debug 级别在数据面高频路径上会严重掉速**。
+
+**packet trace**。这是 VPP 最有特色的诊断手段：给指定 node 挂一个「抓 N 个包」的过滤器，命中后把该包**经过的每一个图节点、每个节点的关键决策与 error** 记录进一块环形缓冲，事后用 `show trace` 回放。典型用法是 `trace add <node> <count>` 指定从哪个节点开始、抓多少个包（命令见 04-06）。底层靠 `vlib_buffer_t` 里的 `trace_index` 关联到 trace 缓冲条目（字段见 05-04），实现在 `src/vlib/trace.c`。它回答的是「包停在了哪个 node、被哪个 node 以什么 error 丢弃」，比 pcap 更贴近 VPP 图内语义，但**有每包开销且缓冲会被覆盖**，不能长开。
+
+**pcap**。VPP 的 pcap 有两类常见用途：dispatch trace（记录包在图节点间的流转，便于看节点序列）与报文 capture（把实际字节写到 pcap 文件，用 Wireshark/tcpdump 打开核对 MAC/IP/VLAN/校验和/隧道封装）。实现位置（如 `src/vpp/pcap.c` 或 `src/vlib/` 下相关文件）与 CLI 语法需对照实际版本核验，命令见 04-06。pcap 落盘要盯磁盘空间，长时间全量抓会把盘写满。
+
+**api-trace**。记录控制面通过 Binary API 发给 VPP 的消息序列，可回放以复现「某个配置是怎么被下发的」，对「控制面下错了表项」「升级后某 API 行为变了」类问题极有价值。实现常见于 `src/vlibapi/` / `src/vpp/api/` 一带（确切路径需核验），配置在 `api-trace{}` 块（见 04-01）。
+
+**coredump 与崩溃诊断**。`unix{}` 里的 `full-coredump` 决定是否生成完整转储、`coredump-size` 控制大小上限（参数见 04-01）；配合系统 `ulimit -c`、`/proc/sys/kernel/core_pattern` 或 `coredumpctl`，崩溃后用 `gdb` 回溯栈。VPP 是多线程进程，回溯时要 `thread apply all bt` 看所有 worker。
+
+**perf**（辅助）。与 08-02 共用：`perf top` / `perf record -g` 定位 CPU 热点，`perf stat` 看 cache-miss / cycles，用于「慢但不丢」类问题。
+
+### 3. 关键数据结构与源码位置
+
+同样只给定位路径，不重列字段表（字段见 05 全册）：
+
+| 关注点 | 源码位置（23.06 / master） | 关键符号 | 说明 |
+|---|---|---|---|
+| 分级日志 | `src/vlib/log.c`、`src/vlib/log.h` | `vlib_log_class`、`vlib_log_*`、`VLIB_LOG_CLASS` | 按 class 设级别（字段见 05-xx） |
+| 基础告警 | `src/vppinfra/error.h` 一带 | `clib_warning`、`clib_error_t` | 早期/驱动层日志 |
+| packet trace | `src/vlib/trace.c`、`src/vlib/trace.h` | `vlib_trace_t`、`vlib_trace_header_t`、trace buffer | 环形缓冲与逐节点留痕（字段见 05-04） |
+| trace 关联 | `src/vlib/buffer.h` | `vlib_buffer_t.trace_index` | 包与 trace 条目的关联（字段见 05-04） |
+| node error | `src/vlib/error.c`、`src/vlib/error.h` | `vlib_error_count`、error 注册 | `show errors` 数据源（字段见 05-xx） |
+| unix 日志/转储 | `src/vlib/unix/` | unix main / coredump 处理 | `unix{}` 配置落地 |
+| api-trace | `src/vlibapi/` 或 `src/vpp/api/`（需核验） | API 消息记录与回放 | 配置见 `api-trace{}`（见 04-01） |
+| pcap | `src/vpp/pcap.c` 或相关文件（需核验） | pcap dispatch / capture | 命令见 04-06 |
+| CLI 注册 | `src/vlib/cli.c` | `VLIB_CLI_COMMAND` | `show`/`trace` 命令入口（见 04-02） |
+
+> 上述中标注「需核验」的路径/符号，请以实际 checkout 头文件为准；不确定就写「需对照实际版本核验」并保留可定位路径，不要编造函数名。
+
+### 4. 关键流程与调用链
+
+**分层排查决策链**（本篇核心）。原则是「先廉价后昂贵、先收敛后细查」：
+
+1. **现象分类**：不通 / 丢包 / 慢 / 抖动 / 崩溃，先确定是「完全不通」还是「部分丢」「时好时坏」。
+2. **接口层**：`show interface` 看两端口 rx/tx 是否都有计数。若**无任何 rx**，故障在链路/绑定/对端层（VFIO 绑定、端口 up、PCI 地址、线缆、对端发包），直接转硬件/链路排查，不必往下走 VPP 图内。
+3. **图内丢弃层**：`show errors` 看是否有 node error 计数增长。有 → 按 error 枚举定位是哪个 node、哪类丢弃（表项缺失、资源不足、校验失败），这是最快的一类根因（案例见 08-04）。
+4. **逐包轨迹层**：error 无异常但仍不通/丢包 → `trace add <node> <count>` + `show trace`，看包停在哪一个 node、被打上什么标记。trace 能区分「没进图」「进了图但被 silent drop」「走了错的分支」。
+5. **报文内容层**：需要核对字节内容（MAC/IP/VLAN/隧道封装/校验和）→ pcap capture + Wireshark。
+6. **节点行为层**：`show runtime` / `show node` 看节点调度与每包成本，排除「慢」是资源还是配置。
+7. **硬件层**：`show hardware` / `ethtool -S` 看驱动与网卡计数，排除 rx_missed / no_buffer。
+8. **外部层**：以上都正常 → 转向对端、链路、控制面、防火墙、路由协议等外部因素。
+
+:::figure id=08-03-01 | name=VPP 故障分层排查决策流程 | dir=TD
+node s "故障现象<br/>不通 丢包 慢 抖动 崩溃" blue
+node q1 "show interface<br/>两端口 rx 与 tx 是否都有计数" gray
+node a1 "无 rx 查链路层<br/>VFIO 绑定 端口 up<br/>PCI 地址 对端 线缆" red
+node q2 "show errors<br/>是否有 node error 增长" gray
+node a2 "按 node error 枚举定位<br/>表项缺失 资源不足 校验失败" amber
+node q3 "trace add 加 show trace<br/>包停在哪一个 node" gray
+node q4 "pcap 抓包<br/>MAC IP VLAN 封装 校验和对不对" gray
+node q5 "show runtime 加 show node<br/>节点行为 每包 cycles" gray
+node q6 "show hardware 加 ethtool -S<br/>驱动与硬件是否丢" gray
+node ext "转向外部<br/>对端 链路 控制面 配置 防火墙" purple
+node done "定位根因 输出修复与回归<br/>成套案例见 08-04" green
+edge s -> q1
+edge q1 -> a1 "无收发"
+edge q1 -> q2 "有收发"
+edge q2 -> a2 "有 error"
+edge q2 -> q3 "无 error"
+edge q3 -> q4
+edge q4 -> q5
+edge q5 -> q6
+edge q6 -> ext "数据面无异常"
+edge a1 -> done
+edge a2 -> done
+edge ext -> done
+:::
+
+> 图注（表格兜底）：决策链的每一步都是「判据 → 分支」。下表把「现象 → 首选组合 → 判读 → 转向」固化，图形不渲染时照表执行。
+
+| 步骤 | 首选组合（命令见 04-06） | 判读要点 | 异常时的转向 |
+|---|---|---|---|
+| 1 接口层 | `show interface` 两口对照 | rx/tx 是否都有、drops 是否增长 | 无 rx → 链路/绑定层；有 drops → 缓冲/队列 |
+| 2 丢弃层 | `show errors` 区间做差 | 任一 node error 增长即定位点 | 有 error → 按枚举查表项/资源 |
+| 3 轨迹层 | `trace add` + `show trace` | 包经过的 node 序列与终止 node | 停在意外节点 → 查 feature/表项 |
+| 4 内容层 | pcap capture + Wireshark | MAC/IP/VLAN/隧道/校验和 | 封装错 → 回查配置 |
+| 5 行为层 | `show runtime` + `show node` | 向量长度、每包成本、节点状态 | 成本突增 → 08-02 调优 |
+| 6 硬件层 | `show hardware` + `ethtool -S` | rx_missed / no_buffer / q_* | 非零 → 描述符/PCIe |
+| 7 外部层 | 对端 + 控制面 + 协议 | 双向一致性 | 数据面洁净 → 查外部 |
+
+**四类诊断数据流**：日志、trace、pcap、api-trace、coredump 各有一条产生与消费链，理解它们有助于选对工具、控制开销。
+
+:::figure id=08-03-02 | name=日志 trace pcap coredump api-trace 诊断数据流 | dir=TD
+node dp "数据面与节点<br/>vlib node 处理向量" blue
+node log "日志链<br/>vlib_log / clib_warning<br/>logging{} 级别 → /var/log/vpp/vpp.log" teal
+node tr "trace 链<br/>trace_index 写环形缓冲<br/>show trace 回放" amber
+node pcap "pcap 链<br/>dispatch trace / capture<br/>落盘 供 Wireshark" purple
+node api "api-trace 链<br/>记录 Binary API 消息<br/>回放控制面操作" gray
+node core "崩溃链<br/>signal → full-coredump<br/>gdb / coredumpctl 回溯" red
+node out "诊断结论<br/>根因 修复 回归" green
+edge dp -> log dashed "日志事件"
+edge dp -> tr "每包 trace"
+edge dp -> pcap "报文镜像"
+edge dp -> api dashed "控制面调用"
+edge dp -> core "异常崩溃"
+edge log -> out
+edge tr -> out
+edge pcap -> out
+edge api -> out
+edge core -> out
+:::
+
+> 图注（表格兜底）：五条链相互独立又互补——日志看「系统说了什么」，trace 看「包在图里走到哪」，pcap 看「字节对不对」，api-trace 看「控制面下发了什么」，coredump 看「崩溃时栈在哪」。按故障类型挑 1–2 条链，不要全开。
+
+### 5. 配置/命令/代码实例
+
+以下均为「最小片段 + 判读」，完整参数与命令族见 04-01 / 04-06。
+
+**日志配置片段**（`startup.conf`，参数见 04-01）：
+
+```bash
+unix {
+  nodaemon
+  log /var/log/vpp/vpp.log
+  full-coredump
+  coredump-size unlimited
+}
+logging {
+  default-log-level info
+  default-syslog-log-level notice
+}
+```
+
+判读：生产常态用 `info/notice`；只在排障窗口临时把相关 class 提到 `debug`，定位后立即降回。日志级别与落盘路径以实际版本为准，不确定写「需对照实际版本核验」并给出 `logging{}` / `unix{}` 所在配置文件路径。
+
+**trace 组合示例**（命令见 04-06）：
+
+```text
+trace add dpdk-input 100
+# 复现流量后：
+show trace
+# 定位结束：
+trace clear
+```
+
+判读：每条 trace 开头是「包从哪个 node 进入」，随后逐行是它依次经过的节点及该节点附着的关键信息，末尾若停在某个丢弃/异常节点，即为根因线索。若 `show trace` 为空，要么流量没到该 node（回退到 `show interface`），要么 count 已耗尽/被覆盖（加大 count 或缩短窗口）。多 worker 下 trace 分散在各 worker 缓冲，回放时需注意合并视角。
+
+**pcap / api-trace / coredump 片段**（命令见 04-06，配置见 04-01）：
+
+```bash
+pcap dispatch trace on max 1000 file vpp_dispatch.pcap
+pcap trace rx tx max 100 file /var/log/vpp/capture.pcap intfc p0
+api-trace on
+show api-trace
+```
+
+判读：pcap 文件用 Wireshark 打开，重点核对 `eth.src/dst`、`vlan`、`ip.src/dst`、隧道 `VNI`/`SPI`、IP/TCP/UDP 校验和；api-trace 回放用来确认「控制面到底下发了哪条路由/邻居/隧道」，常能解释「配置看起来对但表项不对」。崩溃后：
+
+```bash
+coredumpctl info vpp
+coredumpctl gdb vpp        # 或 gdb /usr/bin/vpp /var/log/vpp/core
+(gdb) thread apply all bt
+```
+
+**「现象 → 工具组合 → 判读」速查表**：
+
+| 现象 | 首选组合 | 关键判读 |
+|---|---|---|
+| 完全不通、接口无 rx | `show interface` + `show hardware` + `show log` | 绑定/up/PCI/驱动 |
+| 有进无出、疑似被丢 | `show errors` + `trace add`/`show trace` | 停在哪个 node、什么 error |
+| 封装/地址疑似错 | pcap capture + Wireshark | 字节级内容 |
+| 通但慢/抖动 | `show runtime` + `perf` + statseg 时序 | 每包成本、抢占、尾分位 |
+| 配置生效但行为不符 | api-trace + `show` 对应表项 | 控制面实际下发内容 |
+| 进程消失/反复重启 | `/var/log/vpp/` + coredump + `gdb` | 崩溃栈与插件版本 |
+| 间歇性、难复现 | 常态日志 + 低频 statseg + 条件 trace | 长时序相关性与拐点 |
+
+### 6. 注意事项、陷阱与最佳实践
+
+- **trace 不能长开**。它有每包开销，且缓冲是环形的，高 PPS 下几十毫秒就被覆盖；用「限定 node + 限定 count + 短窗口」的方式抓，抓完立刻 `trace clear`。生产上只在维护窗口或复现环境启用。
+- **日志级别是性能开关**。把 `default-log-level` 设成 `debug`、或让高频路径刷 `clib_warning`，会显著吃 cycles、污染时延尾分位（呼应 08-02）。排障调级、结束复原，应写入变更清单。
+- **pcap 落盘有风险**。全量抓高速口会在几分钟内写满磁盘，务必限 `max` 包数、限文件、监控磁盘水位；抓完及时关闭。
+- **coredump 需要提前具备条件**。`full-coredump` / `coredump-size` / `ulimit -c` / `core_pattern` 必须事先配好并验证过——等崩溃发生再想起来开，往往已经错过现场。转储文件很大，注意 `/var/log/vpp/` 所在分区容量与轮转（见 08-06）。
+- **多 worker 的 trace/日志要合并看**。各 worker 有独立缓冲与时序，单看一个 worker 容易漏掉跨核路径；时间戳对齐后再判读。
+- **先廉价后昂贵，先收敛后细查**。别一上来就 trace + pcap + debug 日志全开；按第 4 节决策链逐层排除，能用 `show errors` 定位的就别开 pcap。
+- **保护现场与可复现**。崩溃或变更前先备份 `startup.conf`、exec、日志、api-trace；记录版本与时间戳，便于和 08-05 的升级/回滚关联。
+- **敏感信息**。pcap、api-trace、debug 日志可能含地址、密钥、租户信息，归档与外发前做脱敏与权限控制。
+- **与监控联动**。08-02 的 statseg 常态时序 + 本篇的事件级工具是互补关系：前者发现「什么时候开始不对」，后者回答「那个时刻包怎么了」。
+
+### 7. 小结与延伸阅读
+
+本篇把 VPP 的诊断工具组织成一条开销可控的决策链：`show interface` 收敛链路层 → `show errors` 定位图内丢弃 → `trace`/`show trace` 看逐节点轨迹 → pcap 核字节 → `show runtime`/`perf` 看性能 → `show hardware`/`ethtool -S` 排除硬件 → 最后转向外部；并配套了日志（`logging{}` / `/var/log/vpp/`）、api-trace（控制面回放）、coredump（崩溃栈）、perf（热点）四条辅助数据流。核心心法是「先廉价后昂贵、先收敛后细查、用完即关」，以及「trace/日志/pcap 都有开销，生产环境按需短开」。
+
+衔接：决策链上每个「异常点」对应的成套处置见 08-04；命令全量见 04-06，配置参数见 04-01，字段见 05-04 / 05-xx，机制见 06-xx。延伸阅读方向：VPP `vlib/log.c` 与 `trace.c` 源码注释、Wireshark 对 VXLAN/IPsec/ESP 的解码、gdb 多线程回溯、`systemd-coredump` / `coredumpctl` 手册，以及 04-07 的 Binary API 编程（理解 api-trace 回放的对象）。
+
+## 08-04 常见故障案例库
+
+### 1. 目标与拓扑
+
+前三篇给了方法：08-01 建基线、08-02 判指标、08-03 走排查决策链。本篇把这套方法落到**具体故障**上，做成一个可检索的案例库。它的价值不在于「背下 9 个问题的答案」，而在于让读者熟悉一套稳定的四段式动作——**现象 → 定位 → 根因 → 修复**——今后遇到任何没见过的问题，都能按同样的节奏把未知问题拆成已知步骤。
+
+每个案例都严格遵守这四段，且额外带一句「验证/回归」，把处置闭环接回 08-01 的基线与 08-06 的变更管理。案例覆盖 VPP 运维最常遇到的资源、拓扑、转发、性能、隧道、稳定性六类故障域：大页不足、NUMA 错配、接口不收包、node error 计数解读、CPU 打满、邻居不通、隧道单向通、缓冲池耗尽、进程反复崩溃。全部按「先判读、后动手」组织，用到的命令一律只讲组合与输出判读，不重列清单（权威源 04-06）；结构体字段引用 05 全册，机制引用 06 全册，模块行为引用 07 全册。
+
+:::figure id=08-04-01 | name=常见故障现象到根因域映射与案例索引 | dir=TD
+node s "故障现象<br/>不通 丢包 慢 抖动 崩溃" blue
+node a "启动与资源域<br/>案例一 大页不足<br/>案例八 缓冲耗尽" teal
+node b "拓扑与绑定域<br/>案例二 NUMA 错配<br/>案例三 接口不收包" green
+node c "图内转发域<br/>案例四 node error<br/>案例六 邻居不通" amber
+node d "性能与状态域<br/>案例五 CPU 打满" purple
+node e "隧道与叠加域<br/>案例七 隧道单向通" gray
+node f "稳定性域<br/>案例九 coredump 反复崩溃" red
+node m "统一方法<br/>现象 → 定位 → 根因 → 修复 → 回归" purple
+node src "判读依据<br/>04-06 命令 / 05 字段<br/>06 原理 / 08-01 基线" gray
+edge s -> a "起不来"
+edge s -> b "收不到"
+edge s -> c "表项与 error"
+edge s -> d "慢与抖动"
+edge s -> e "单向通"
+edge s -> f "进程消失"
+edge a -> m
+edge b -> m
+edge c -> m
+edge d -> m
+edge e -> m
+edge f -> m
+edge m -> src dashed "判读与回归依据"
+:::
+
+> 图注（表格兜底）：先把现象归到根因域，能大幅缩小排查范围。下表是案例索引速查，图形不渲染时按「首选判读手段」列直接定位到对应案例。
+
+| 案例 | 现象关键词 | 首选判读手段（命令见 04-06） | 根因域 |
+|---|---|---|---|
+| 一 | VPP 启动失败、日志报 hugepage | `/proc/meminfo`、`dmesg`、`show log` | 启动与资源 |
+| 二 | 能跑但 PPS 腰斩、cycles 偏高 | `numastat -p`、`show threads`、`show hardware` | 拓扑与绑定 |
+| 三 | 接口 rx 恒为 0 | `show interface`、`show hardware`、`lspci -k` | 拓扑与绑定 |
+| 四 | `show errors` 某 node 计数增长 | `show errors` + trace + 对应表项 `show` | 图内转发 |
+| 五 | worker 100%、吞吐不达标 | `show runtime` + `perf top` + `show threads` | 性能与状态 |
+| 六 | 直连 ping 不通、邻居未解析 | `show ip neighbors` + trace + pcap | 图内转发 |
+| 七 | 隧道单向通、大包不通 | 隧道 `show` + 双向 trace + underlay pcap | 隧道与叠加 |
+| 八 | `show buffers` free 持续下降 | `show buffers` + `/err/` + `show memory` | 启动与资源 |
+| 九 | 进程消失 / 反复重启 | `/var/log/vpp/` + coredump + `gdb` | 稳定性 |
+
+### 2. 前置条件与环境
+
+案例库的每个「定位」步骤都假设读者已具备一套可观测环境，否则现场一到就抓瞎。开工前请确认以下前置条件就绪——它们大多来自 08-02、08-03、08-06 的常态化建设，而不是故障时才临时搭：
+
+- **日志可读**：`/var/log/vpp/vpp.log`（或 `unix{}` 指定的路径）可访问，`logging{}` 级别至少 `info`，`show log` 能回看启动段；systemd 侧 `journalctl -u vpp` 可用。
+- **coredump 已具备条件**：`unix{}` 的 `full-coredump` / `coredump-size`、`ulimit -c`、`core_pattern` 或 `coredumpctl` 事先配好并验证过生成一个转储；否则案例九只能靠猜。
+- **计数与时序可用**：`show interface` / `show errors` / `show runtime` / `show buffers` / statseg `/if/` `/err/` 能正常读取，最好已有长时序监控（08-02），能回答「什么时候开始不对」。
+- **诊断工具就位**：`trace add`/`show trace`、pcap、api-trace、`perf`、`ethtool -S`、`numastat`、`lstopo`、`driverctl`/`dpdk-devbind`、`gdb`/`coredumpctl` 都在 PATH 中，且团队知道它们的开销（08-03）。
+- **基线可对照**：有同硬件、同配置的 08-01 基线，才能判断「PPS 腰斩」「cycles 偏高」到底是不是异常。
+- **版本与包矩阵**：`show version`、`dpkg -l | grep vpp`（或对应包管理器）、内核 `uname -r`、网卡固件 `ethtool -i` 可随时取到——案例二、九尤其依赖它排除「版本/包不一致」。
+- **变更记录**：最近的 startup.conf / exec / 控制面下发记录可追溯（api-trace 是重要来源），否则「谁改了配置」无从查起。
+
+另有一条纪律：**先保业务、再查根因**。生产环境出现案例九这类中断性故障时，优先按 08-05 的回滚或切换预案恢复服务，把 coredump/api-trace/日志留存好，再离线分析，不要在业务中断窗口里做耗时定位。
+
+### 3. 分步操作
+
+以下九个案例即案例库主体。每个案例的四段标签（**现象 / 定位 / 根因 / 修复**）刻意统一，便于横向对照与检索。
+
+#### 案例一：大页不足，VPP 启动即失败
+
+**现象。** VPP 进程起不来或启动后立即退出，`/var/log/vpp/vpp.log` 的 EAL/DPDK 初始化段出现与 huge page / memory reserve / cannot allocate 相关的报错；`show interface` 里没有任何物理口，或 `dpdk{}` 段被跳过；`systemctl status vpp` 显示反复重启。业务表现为「设备上线后完全没有数据面」。这是部署与扩容后最常见的硬故障。
+
+**定位。** 三步走：其一，`cat /proc/meminfo | grep -i huge` 看 `HugePages_Total`、`HugePages_Free`、`Hugepagesize`，确认总量、余量、规格（2M 还是 1G）；其二，`dmesg | grep -i huge` 与 `show log` 启动段对照，确认 EAL 到底申请了多少、失败在哪个 socket；其三，查 `/sys/kernel/mm/hugepages/` 与各 `/sys/devices/system/node/nodeX/hugepages/` 的 `nr_hugepages`，看大页是否落在了错误的 NUMA node，并确认有没有别的进程（另一个 VPP 实例、OVS-DPDK、残留的 hugepage 挂载）占用。同时把 `dpdk{} socket-mem` 的申请量与可用量做算术核对。
+
+**根因。** 通常是四类：`vm.nr_hugepages` 预留总量小于 `socket-mem` 申请量；规格不匹配——`socket-mem` 以 MB 为单位申请，而 1G 大页必须在开机阶段用 grub `hugepagesz=1G hugepages=N` 预留，运行时用 `sysctl vm.nr_hugepages` 只能补 2M 大页，且连续物理内存碎片化时 1G 大页常常分不出来；NUMA 分布错——大页全在 node0，而 `socket-mem 0,1024` 要的是 node1；或多进程争用把预留吃光。
+
+**修复。** 2M 大页可临时 `sysctl -w vm.nr_hugepages=N` 补足并挂 `/dev/hugepages`；1G 大页必须改 grub（`default_hugepagesz=1G hugepagesz=1G hugepages=N` 加 `hugepage_alloc_threads=` 视内核而定，参数需对照实际内核版本核验）后重启，且建议开机预留在 NIC 与 worker 所在的那个 node；按 node 精确预留可写对应 `nodeX/hugepages/hugepages-1048576kB/nr_hugepages`；清理占用进程或将 `socket-mem` 调到可用范围内。修复后把大页预留写进 08-06 的开机 checklist，避免下次扩容重现。**验证/回归**：VPP 正常起、物理口出现、`show log` 无 hugepage 报错、跑一遍 08-01 小流量基线确认转发可用。
+
+#### 案例二：NUMA 错配，能跑但 PPS 腰斩
+
+**现象。** VPP 完全正常、接口有收有发、无 error，但实测零丢包速率只有同型号机器基线的一半左右，`show runtime` 里转发节点的 cycles/packet 明显偏高，时延也偏高。这是「配置没报错、性能莫名低」的典型，最容易误判成「VPP 版本不行」。
+
+**定位。** 把「网卡 / worker / 大页 / 内存」四者的 NUMA 归属摆到一张表上：`lstopo` 或 `numactl -H` 看拓扑与网卡 PCI 所在 node；`show hardware` / `lspci -vv` 确认接口所属 node；`show threads` 看每个 worker 绑在哪个核、属于哪个 node；对照 `startup.conf` 的 `cpu{} corelist-workers` 与 `dpdk{} socket-mem`；再用 `numastat -p <vpp-pid>` 看进程内存是否大量落在远端 node、`perf stat -e` 观察 cache-miss / 远程访存相关事件（具体事件名需对照 CPU 与 perf 版本核验）。
+
+**根因。** 网卡插在 node1 的 PCIe 槽，worker 却用 `corelist-workers` 绑到 node0 的核；或 `socket-mem 1024,0` 把大页全部分给 node0 而网卡在 node1；或大页按 node 预留时给错了 node。结果每个包的 DMA 缓冲、描述符、buffer 元数据都要跨 QPI/UPI 远程访问，每包多出几十到上百纳秒，小包高密度转发下累积成 PPS 腰斩（缓存/NUMA 机制见 06-04，大页与部署见 03-01 / 03-02）。
+
+**修复。** 四者对齐：把 worker 核改绑到网卡所在 node 的核、`socket-mem` 按该 node 分配（如卡在 node1 则用 `socket-mem 0,1024`）、大页按同一 node 预留、必要时把网卡换到与 CPU 直连的插槽；`main-core` 一般放控制面核、不必强求与 worker 同 node，但 worker 必须与网卡同 node。修完用 08-01 的同基线复测，确认 PPS 与 cycles/packet 回到基线区间。**验证/回归**：`numastat -p` 远端分配显著下降、`show threads` 核归属正确、NDR 恢复。
+
+#### 案例三：接口不收包，rx 恒为 0
+
+**现象。** `show interface` 显示某物理口 `rx packets` 长期为 0（tx 可能为 0 也可能在发），对端确实在打流；ping/业务全不通。这是部署阶段最高频的问题。
+
+**定位。** 按 08-03 决策链第一层：`show interface` 确认 state 是否 `up`、MTU、队列；`show hardware` 看驱动、队列数、描述符；`lspci -k` / `driverctl` 确认网卡是否绑定到 `vfio-pci`（或所用 `uio` 驱动）而非内核驱动；`show log` 启动段看 `dpdk{}` 是否识别到该 `dev`；`ethtool -S`（若仍可见）看物理层计数；最后用 `trace add dpdk-input <count>` + `show trace` 确认包是否进入图。重点核对 `dpdk{} dev` 里的 PCI 地址字符串是否与实际插槽一致、`no-pci`/白名单有没有把它排除。
+
+**根因。** 常见有：网卡没绑 VFIO/uio（仍挂 `ixgbe`/`i40e` 等内核驱动，VPP 拿不到）；PCI 地址写错或用了 `interface` 名而非 BDF；端口 administratively down；`num-rx-queues` 为 0 或与 worker 数不匹配；IOMMU 未开导致 VFIO 绑定失败；线缆/光模块/对端未发；VLAN 过滤或端口 `promisc` 配置导致不匹配流量被丢。
+
+**修复。** 用 `driverctl`/`dpdk-devbind.py` 把网卡重绑到 `vfio-pci`（参数与驱动名需对照实际版本核验）；修正 `dev` 的 BDF；`set interface state <name> up`；配好收包队列与描述符数；确认 BIOS 开 VT-d/IOMMU、内核加 `intel_iommu=on` 之类参数；用最简小流量 + trace 确认包进入 `dpdk-input`。**验证/回归**：`show interface` rx 开始增长、trace 显示包入图、`show errors` 无异常、08-01 小流量闭环通过。
+
+#### 案例四：node error 计数解读——`show errors` 某节点持续增长
+
+**现象。** `show interface` 收发都正常，但 `show errors` 里某个 node 的某类 error 计数随时间持续增长，同时伴随稳定丢包。这类问题的关键是「读懂 error 名字」，它直接指向根因。
+
+**定位。** 对 `show errors` 做两次采样、取差值，锁定「哪个 node 的哪类 error」；配合 `trace add <该node或上游node> <count>` + `show trace` 看命中该 error 的包长什么样；再按 error 类别去查对应表项（`show ip fib` / `show ip neighbors` / `show bridge-domain` / `show adjacency` 等，命令见 04-04）。**注意 error 枚举字符串与所属 node 名随 VPP 版本变化，下表仅为「含义类别」示意，确切名称需对照实际版本核验**（可回到 `src/vnet/` 各模块用 `VLIB_REGISTER_ERROR` / `vlib_error_*` 定位定义）。
+
+| 含义类别（示意） | 常见所属节点 | 通常根因 |
+|---|---|---|
+| 无表 / 未命中路由（如 no table / not in table 类） | `ip4-lookup` / `ip6-lookup` | 缺路由、VRF/table 不对、FIB 未下发 |
+| 邻接/rewrite 失败类 | `ip4-rewrite` / adjacency | 邻居未解析、邻接缺失 |
+| 未知 ethertype / 无 L3 头 / L3 MAC 不匹配类 | `ethernet-input` | VLAN 配置、接口未配 L3、MAC 不对 |
+| TTL 超时 / 校验和错误类 | `ip4-input` / `ip6-input` | 环路、报文被改写、offload 配置 |
+| 缓冲分配失败类 | `dpdk-input` / buffer 相关节点 | 缓冲池耗尽（见案例八） |
+| ARP/ND 丢弃类 | `arp-input` / `ip6-nd` | 邻居解析失败（见案例六） |
+| 隧道解封装失败类 | `vxlan` / `ipsec` / `gre` 节点 | VNI/SPI/密钥不匹配（见案例七） |
+
+**根因。** error 计数增长意味着「有包在图内被有规则地丢弃」，不是性能问题而是配置/表项/资源问题：缺路由、缺邻居、VLAN/VRF 配错、MTU 与分片、feature 之间冲突、或缓冲资源不足。它与「接口有收有发但业务不通」高度相关。
+
+**修复。** 按上表分类对症下药：缺路由补 `ip route`、缺邻居补 `set ip neighbor` 或排查 ARP、VRF/table 对齐、VLAN 与接口 L3 配置核对、校验和/offload 核对、资源不足转案例八。修完确认该 error 计数**停止增长**（不是清零，计数器可 `clear`）、丢包归零、trace 显示包顺利走完全程。**验证/回归**：`show errors` 区间差为零、`show interface` drops 不再增长、业务恢复、必要时纳入 08-02 的 error 告警。
+
+#### 案例五：CPU 打满——worker 100% 但吞吐不达标
+
+**现象。** `top -H` 看到某个 worker 线程长期 100%，同时吞吐上不去或时延尾分位抖动。这里最大的陷阱是：**PMD 轮询模式下 worker 空闲也 100%，这本身是正常的**。所以第一步永远是先判断「这是常态还是异常」。
+
+**定位。** 用 08-02 的判据：吞吐/丢包/时延是否达标？达标 → 大概率只是 PMD 常态，别动；不达标再往下。`show runtime` 看 `Vectors/Call` 与每包成本是否异常、`show threads` 看各 worker 负载是否均衡（单流哈希不均会把流量压到一个核）、`perf top -p <pid>` / `perf record -g` 看热点函数落在哪个 node 或哪个 `clib_bihash` 查找、`show log` 是否被 debug 日志/`clib_warning` 刷屏、`show buffers` 是否泄漏、确认是否有人开了 trace/pcap/api-trace。
+
+**根因。** 分两类。**预期内**：PMD 满核是设计，吞吐达标即无需处置。**异常**：调试日志或高频 `clib_warning` 刷屏吃掉大量 cycles；某 feature 规则爆炸（ACL 规则数万条、NAT 会话表过大）抬高每包成本；buffer 泄漏导致反复分配/回收；barrier 同步卡住（机制见 06-07）；单流 RSS 哈希不均、多 worker 只有一个在干活；控制面/监控进程抢占了数据面核；trace/pcap 常开。
+
+**修复。** 预期内不改任何参数。异常类：把日志级别降回 `info`/`warn`、关闭 trace/pcap、优化或裁剪 feature、修泄漏、增加 worker 并同步加足 RX 队列与多流以让 RSS 分散负载、用 `isolcpus`/cpuset 把控制面赶出数据面核（见 08-02 / 08-06）。每次只改一个变量并复测。**验证/回归**：`perf` 热点转移、`show threads` 负载均衡、NDR 与尾分位回到 08-01 基线。
+
+#### 案例六：邻居不通——直连 ping 失败、ARP/ND 未解析
+
+**现象。** 两台设备直连或同二层网段，接口都 `up`、有收有发计数，但 `ping` 不通；或能发出 ARP 请求但收不到应答。业务表现为「配置看起来都对，就是不通」。
+
+**定位。** `show ip neighbors` / `show ip arp` / `show ip6 neighbors` 看邻居项状态是否 resolved、MAC 是否正确；`trace add` 抓 ARP/ND 相关节点 + `show trace` 看请求/应答是否进出、被谁丢弃；`show adjacency` / `show ip fib` 看邻接与路由是否完整；`show interface` 核对 IP 地址与掩码、所属 VRF/table；pcap 抓 ARP 报文字节（谁在问、谁在答、MAC 对不对）；ipv6 还要确认 `ip6-nd` / RA 相关配置与是否被挡。
+
+**根因。** 接口未配 IP 或掩码/VRF 错；邻居未解析（对端没回、ARP 被某个 feature/ACL 丢弃、需要 `proxy-arp` 而未配）；静态邻居 MAC 写错；VRF/table 不一致导致在错误的表里查邻接；ipv6 ND 通告被挡或 RA 未启用；ACL 误丢 ARP（注意 ARP 的处理路径与 ip4 feature arc 不完全重合，规则要写对）；MTU/双工等物理层问题。
+
+**修复。** 配好接口 IP + `set interface state up`；用 `set ip neighbor` 临时静态指定或彻底排查 ARP 双向（pcap 验证请求与应答都到位）；核对 VRF/table 一致性；放开误丢 ARP/ND 的 feature/ACL、按需配 `proxy-arp`；ipv6 确认 ND/RA。**验证/回归**：`show ip neighbors` 状态 resolved、pcap 见 ARP 往返、`ping` 通、`show errors` 无 ARP 类 error 增长。
+
+#### 案例七：隧道单向通——VXLAN / IPsec / GRE 只有单向流量
+
+**现象。** 隧道一端能访问对端、反向不通；或小包 `ping` 通、大包业务不通；`show interface` 两个方向计数明显不对称。VXLAN / GRE / IPsec / Geneve 都可能出现（模块见 07-06 / 07-07）。
+
+**定位。** 双端都要查：隧道 `show`（如 `show vxlan tunnel`、IPsec `show ipsec sa` 等，命令见 04-05）核对端点 `src`/`dst`、VNI、SPI、密钥是否对称；两端各自 `trace add` + `show trace` 看封装与解封装是否都成功、`show errors` 看隧道节点是否有解封装失败类 error；`show ip fib` 核对 **underlay 双向路由**（回包能不能回到源端）；pcap 在两端抓 underlay（UDP 4789 / GRE / ESP）确认报文往返；`show interface` 看 overlay 与 underlay 的 MTU、DF 位。
+
+**根因。** 只在一端建了隧道或 `src`/`dst` 写反；VNI/SPI/密钥两端不对称；underlay 回程路由缺失导致回包到不了对端（最常见、最易漏）；防火墙丢了 UDP 4789 / ESP / GRE；MTU + DF 导致大包被丢弃（正好解释「小包通大包不通」）；overlay 回程 FIB/邻居缺失；IPsec SA 只建了单向。
+
+**修复。** 双端补齐隧道并逐字段对称核对 VNI/SPI/endpoint/密钥；补 underlay 双向路由；放通防火墙相应协议与端口；调 overlay MTU 或做 TCP MSS clamp、必要时允许分片；补足 overlay 回程表项与邻居；pcap 两端确认封装对称。**验证/回归**：双向 `ping` 与大包业务均通、双端 `show interface` 计数对称、隧道节点 error 不再增长。
+
+#### 案例八：缓冲池耗尽——`show buffers` free 持续下降
+
+**现象。** `show buffers` 各缓冲池 free 数持续下降或长期贴底，`show errors` 出现缓冲分配失败类计数，突发流量后大量丢包、时延尾分位飙高，严重时伴随接口 drops。与案例一的「起不来」不同，这是「跑着跑着劣化」。
+
+**定位。** `show buffers` 多池 free/used 做时序、`show memory` / statseg `/err/` 看分配失败计数、`show runtime` 看是否某节点异常吃 buffer；审查是否有人常开 trace/pcap（它们会额外占用与延长 buffer 生命周期）；排查是否有插件/自定义节点分配了 buffer 未释放或 clone 引用计数处理错误（buffer 生命周期与引用计数见 06-09，字段见 05-04）。
+
+**根因。** `buffers-per-numa` 配得太小或大页总量不足（与案例一相关）；流量突发超过缓冲吸收能力（背靠背不足，见 08-01）；`num-rx-desc` 过小；某节点/插件的 buffer 泄漏（alloc 未 free、clone/ref_count 错误）；trace 开着放大消耗。
+
+**修复。** 适度增大 `buffers-per-numa` 与描述符数（权衡大页内存与 TLB 压力，别盲目翻倍）；关闭常开的 trace/pcap；若是泄漏则回到源码定位未释放路径并修复（这才是根治）；用 08-01 的背靠背测试确认突发吸收能力恢复。**验证/回归**：`show buffers` free 稳定有余量、缓冲分配类 error 停止增长、突发下丢包归零、尾分位回到基线。
+
+#### 案例九：进程反复崩溃——coredump 与版本不一致
+
+**现象。** VPP 进程突然消失或 systemd 反复重启，业务中断；`/var/log/vpp/vpp.log` 末段可能有 signal / abort 记录；控制面发现 Binary API 连接断开。这是最高优先级的中断性故障。
+
+**定位。** 先按本节开头的「先保业务」切流/回滚（预案见 08-05），再离线：`journalctl -u vpp` + `/var/log/vpp/vpp.log` 末段看崩溃时间线与最后日志；`coredumpctl list vpp` / `coredumpctl gdb vpp`（或 `gdb /usr/bin/vpp <core>`）里 `thread apply all bt` 看所有 worker 的崩溃栈，定位到具体函数与插件；`show version` / `dpkg -l | grep vpp` 核对所有 `vpp*` 包版本是否一致（升级漏装 `vpp-plugin-core` 等是经典根因）；api-trace 回放崩溃前控制面最后下发的消息。
+
+**根因。** 升级或装包后核心与插件 ABI/版本不匹配（见 08-05）；控制面下发了越界/非法参数触发空指针或断言；某插件的已知 bug；内存越界；大页/驱动异常间接导致；或命中特定报文触发的解析崩溃。
+
+**修复。** 第一步永远是**回滚到上一稳定版本**恢复业务（deb 回滚见 08-05）；其次对齐所有 `vpp*` 包到同一版本；用 coredump + gdb 定位到函数/插件后，升级到含修复的版本或规避触发该路径的 API 调用/报文；确保 `full-coredump` 与磁盘容量到位以保留现场（见 08-06）；回归 08-01 基线与业务验证后再重新上线。**验证/回归**：进程稳定不再重启、`journalctl` 无新崩溃、所有包版本一致、业务与性能回到基线。
+
+### 4. 验证方法与预期结果
+
+九个案例的「验证/回归」不是各写各的，而是共享一套统一手法，把它们收敛成可交接的动作：
+
+1. **计数对齐**：`show interface` 两口 rx/tx 与对端/打流器对齐、drops 不再增长（08-01 的四方对齐原则）。
+2. **error 归零**：`show errors` 做区间差为零——注意是「停止增长」，累计值需 `clear` 后才归零（命令见 04-06）。
+3. **轨迹完整**：`show trace` 显示包顺利走完预期 node 序列，不再停在意外丢弃点。
+4. **字节正确**：pcap 核对 MAC/IP/VLAN/隧道封装/校验和符合预期。
+5. **性能回基线**：涉及性能的案例（二、五、八）必须复测 08-01 基线，NDR、cycles/packet、尾分位、背靠背都回到区间内，才算真正修好，而不是「看起来能跑」。
+6. **长稳观察**：资源类（一、八）与稳定性类（九）要观察一段时间（含至少一次突发或业务高峰），确认 free 余量稳定、进程不再重启。
+7. **回归入档**：把「现象→根因→修复→验证结论」写进案例库/工单，并把有效修复固化进 08-06 的 checklist 或 08-05 的版本/配置基线，避免同一问题二次发生。
+
+| 案例 | 关键验证动作 | 预期结果 |
+|---|---|---|
+| 一 大页不足 | 重启 VPP、`show interface`、`show log` | 物理口出现、无 hugepage 报错 |
+| 二 NUMA 错配 | `numastat -p` + 08-01 复测 | 远端分配下降、NDR 回基线 |
+| 三 接口不收包 | `show interface` rx + trace | rx 增长、包入 `dpdk-input` |
+| 四 node error | `show errors` 区间差 + 表项 `show` | error 停止增长、丢包归零 |
+| 五 CPU 打满 | `perf` + `show threads` + 基线复测 | 负载均衡、尾分位恢复 |
+| 六 邻居不通 | `show ip neighbors` + pcap + ping | 邻居 resolved、双向通 |
+| 七 隧道单向通 | 双端隧道 `show` + 双向 pcap | 计数对称、大包也通 |
+| 八 缓冲耗尽 | `show buffers` 时序 + 背靠背 | free 稳定、突发不丢 |
+| 九 进程崩溃 | `journalctl` + 版本核对 + 长稳 | 不再重启、包版本一致 |
+
+**落地示例：把验证动作落到案例三「接口 rx 恒为 0」**。下面只演示「这个场景组合哪几条命令、按什么顺序看」，不是命令清单（全集见 04-06，决策链见 08-03）；接口名、BDF 需按现场替换，输出为示意，列形态需对照实际版本核验。
+
+```bash
+# 场景：某物理口 rx 长期为 0，对端确认在打流（案例三）
+# ① 最廉价的一层：接口计数与状态
+show interface GigabitEthernet0/8/0
+# ② 驱动/队列层：确认 VPP 是否拿到网卡、RX 队列是否 > 0
+show hardware GigabitEthernet0/8/0
+# ③ 绑定层：确认该 BDF 挂的是 vfio-pci 而非内核驱动（BDF 按实际插槽改）
+lspci -k -s 0000:08:00.0
+# ④ 图内入口：短窗口、限 node、限包数，用完即关（见 08-03）
+trace add dpdk-input 10
+show trace
+```
+
+```text
+vpp# show interface GigabitEthernet0/8/0
+GigabitEthernet0/8/0 (up):
+  rx packets 0          rx bytes 0
+  tx packets 0          tx bytes 0
+  drops 0               ip4 0
+vpp# show hardware GigabitEthernet0/8/0
+  RX queues 2  TX queues 2  RX desc 1024
+  driver vfio-pci   numa node 0
+vpp# trace add dpdk-input 10
+vpp# show trace
+No packets in trace buffer
+```
+
+**判读：先看哪一行 → 排除什么 → 锁定哪个根因域。** 第一眼看 `show interface` 的 `rx packets 0` 与 `(up)`：`state up` 排除「端口 administratively down」，`drops 0` 说明包根本没到接口层，案例四（node error）、案例八（缓冲耗尽）这类图内/资源域随之排除（它们必有 drops 或 error 增长）；若这里是 `down`，根因直接锁定端口状态，不必往下走。第二眼看 `show hardware` 的 `driver vfio-pci` 与 `RX queues 2`：二者正常即排除「网卡仍挂 ixgbe/i40e 内核驱动、VPP 拿不到」和「`num-rx-queues` 为 0」两个案例三经典根因；若 `driver` 仍是内核驱动或队列为 0，根因域立即锁定「绑定 / 收包队列」，回到案例三修复段处理。第三眼看 `show trace` 的 `No packets in trace buffer`：`dpdk-input` 一个包都没抓到，说明包连转发图都没进，07 全册的 FIB、ACL、VRF、邻居全部排除，根因被压缩到「物理层 / 线缆光模块 / 对端未发 / VLAN 或 promisc 过滤」这一层。反过来若 trace 有包却停在 `ethernet-input` 的未知 ethertype，就要跳出案例三、转案例四按 error 名称判读。若这四步输出都正常却仍无业务流量，别停在接口层：转 08-02 用 statseg 的 /if/ 计数与 `show errors` 做区间差，先分清是计数口径不同步还是包真的没到，再决定是否升级到物理口 pcap。全程只读「能一次排除一整类根因」的那一行，逐层推进，绝不在 rx=0 时先翻 FIB 或抓 pcap——那正是 08-03 警告的「跳步」。
+
+### 5. 常见失败与排错
+
+案例库本身也会「用错」，这一节讲排错方法论层面的常见失误，以及贯穿全部案例的陷阱与最佳实践。
+
+**方法论层面的常见失误**：一是**跳步**——还没看 `show interface` 就开 pcap，或没看 `show errors` 就上 trace，被海量信息淹没；应严格遵循 08-03 的「先廉价后昂贵」。二是**把现象当根因**——「CPU 100%」是现象，「debug 日志刷屏」或「单流哈希不均」才是根因；案例五专门处理这种误判。三是**只看一头**——隧道、邻居、NAT 这类双向问题必须两端都查，只查一端永远差半张图。四是**改完不验证**——`error` 清零了但性能没回基线、大页补了但没写进开机配置，都会复现。五是**同时改多个变量**——改完看似好了却不知道哪个起作用，下次仍会踩。
+
+**症状 → 排查方向速查（本册视角）**：
+
+| 症状 | 优先案例 | 第一动作 |
+|---|---|---|
+| 进程起不来 / 接口不存在 | 一、三 | 看 `/proc/meminfo` 与 `show log` 启动段 |
+| 能跑但明显慢 | 二、五 | `numastat -p` + `show runtime` 判常态/异常 |
+| 有进无出、稳定丢包 | 四、八 | `show errors` 区间差 + `show buffers` |
+| 直连/网段不通 | 六 | `show ip neighbors` + pcap 看 ARP |
+| 单向通 / 大包不通 | 七 | 双端隧道 `show` + underlay 路由 + MTU |
+| 进程消失 / 反复重启 | 九 | 先切流回滚，再 `coredumpctl` + 版本核对 |
+
+#### 陷阱与最佳实践
+
+- **先判「常态还是异常」**：PMD 100% CPU、计数器累计值非零、日志里的 info 级提示，都不一定是故障；没有 08-01 基线做对照，就容易把正常当异常、把异常当正常。
+- **累计计数器要做差**：`show errors`、`statseg`、`show interface` 都是累计值，判「是否仍在发生」必须用两次采样之差；`clear` 只影响展示，不要用它掩盖问题。
+- **诊断工具有开销且会覆盖**：trace 缓冲是环形的、pcap 会写满盘、debug 日志吃 cycles，生产上「限 node + 限 count + 短窗口 + 用完即关」（见 08-03）。
+- **双向问题两端查**：隧道、邻居、路由、ACL 都要在两端与两个方向分别验证计数与封装对称。
+- **先保业务、后查根因**：中断性故障先按 08-05 回滚/切换恢复，留存 coredump/api-trace/日志再离线分析。
+- **一切修复回归基线**：性能类案例不以「能跑」为终点，以复测 08-01 基线达标为终点；资源/稳定性类要长稳观察含一次高峰。
+- **版本与包一致性是隐形根因**：升级漏装插件、核心与插件版本错配，能解释大量「莫名崩溃/行为不符」，排查崩溃时必查 `dpkg -l | grep vpp`（见 08-05）。
+- **不确定的枚举/字段不编造**：node error 名称、结构体字段、CLI 参数、版本差异，一律对照实际版本核验并给可定位路径（字段见 05-xx ｜ 命令见 04-06 ｜ 原理见 06-xx）。
+- **把个案沉淀成 checklist**：每修好一个案例，就把「开机预留、NUMA 四者对齐、error 告警、coredump 预留」等固化进 08-06，组织能力才比个人经验可靠。
+
+### 6. 小结
+
+本篇用九个完整案例演示了「现象 → 定位 → 根因 → 修复 → 回归」的统一节奏，覆盖启动资源（大页、缓冲）、拓扑绑定（NUMA、接口不收包）、图内转发（node error、邻居）、性能状态（CPU 打满）、隧道叠加（单向通）、稳定性（coredump）六类故障域。三个贯穿始终的要点：第一，**先判读再动手**，用 08-03 的决策链把故障域收敛到一层；第二，**常态与异常要分清**，PMD 满核、累计计数器、双向对称都是反复出现的认知陷阱；第三，**修复必须回归基线并沉淀**，把个案固化进 08-06 的 checklist 与 08-05 的版本/配置基线，才算闭环。
+
+衔接：诊断命令的组合与全量见 04-06 / 04-01，buffer 与 trace 相关字段见 05-04，NUMA/缓冲/调度机制见 06-04 / 06-07 / 06-09，隧道与邻居模块见 07-04 / 07-06 / 07-07；崩溃与版本错配的处置预案见 08-05，常态化预防见 08-06。延伸阅读方向：systemd-coredump 与 gdb 多线程回溯、`numastat` / `lstopo` NUMA 诊断、DPDK EAL 大页参数文档、VPP 各模块 `VLIB_REGISTER_ERROR` 定义（用于精确解读 `show errors` 枚举）。
+
+## 08-05 版本升级与配置迁移
+
+### 1. 背景与动机
+
+VPP 的升级比普通应用软件危险得多，因为它是**直接承载生产流量的数据面**：进程一停，流量就断；版本一换，不仅二进制变了，DPDK/内核/网卡固件的耦合关系、Binary API 的消息定义、插件的 ABI、`startup.conf` 的参数、statseg 的计数器命名空间都可能跟着变。一次「只把 `vpp` 主包升了、忘了升插件」的半吊子升级，足以让整机起不来；一次「控制面没跟着升、API CRC 对不上」的升级，会让配置下发全部被拒，表面看进程正常、实际数据面是空的。
+
+本篇把升级当作一次**受控变更**来组织：先讲清版本矩阵与 LTS/稳定分支策略、VPP 的 deb 包族与 API/ABI 兼容模型，再给出升级与回滚的完整流程、配置迁移的检查项、以及命令组合与输出判读。全篇遵守去重铁律：不重列 `show` 命令清单（见 04-06）、不重列结构体字段（见 05 全册）、不展开机制（见 06 全册）；本篇的「命令」只用于说明升级动作与校验判读，配置全参数见 04-01、API 编程见 04-07、配置持久化见 04-07。
+
+### 2. 核心概念
+
+**版本命名与发布节奏**。fd.io VPP 采用 `YY.MM` 式版本号（如 23.02、23.06、23.10、24.02 一类，本文基准为 23.06 / master），大致按年度内多个 release 的节奏推进，每个 release 有对应的源码 tag 与打包产物。社区会在部分 release 上维护较长时间的**稳定分支 / LTS**（对 LTS 的确切版本号、维护周期与终止支持日期，须以 fd.io 官方发布页与 release notes 为准，写「需对照实际版本核验」，不要凭记忆指定某个版本一定是 LTS）。生产选型的一般原则：优先选仍在维护窗口内的稳定分支，不盲目追 master；升级前查清当前版本与目标版本之间跨了几个 release、有多少 breaking changes。
+
+**deb 包族与「同版本」铁律**。Debian/Ubuntu 上 VPP 被拆成多个包，升级时必须**所有 `vpp*` 包升到完全相同的版本**，典型包族如下（包名以所用发行版/仓库为准，需核验）：
+
+| 包 | 内容 | 漏升后果 |
+|---|---|---|
+| `vpp` | 主程序与核心库 | 版本基准 |
+| `vpp-plugin-core` | 核心插件（NAT/ACL/feature 等） | 插件 ABI 不匹配，加载失败或崩溃 |
+| `vpp-plugin-dpdk` | DPDK 数据面插件 | 网卡起不来、PMD 异常 |
+| `vpp-dev` / `vpp-api-*` | 头文件、`.api` 定义、开发库 | 控制面编译/生成物不一致 |
+| `python3-vpp-api` / `vpp-api-python` | Python 绑定 | 控制面脚本 API 不匹配 |
+| `vpp-dbg` | 调试符号 | 影响 coredump 分析 |
+
+漏升任何一个，都会触发「版本错配」类故障（案例见 08-04 案例九）。RHEL/CentOS 系用 rpm 包，逻辑相同。
+
+**API / ABI 兼容模型**。VPP 的 Binary API 消息由 `.api` 文件定义（`src/vnet/`、`src/vpp/api/` 等目录下的 `*.api`），经 `vppapigen` 生成 C/Python/Java 代码，每条消息带一个由定义派生的 **CRC**（形如 `vl_api_xxx_t_crc` 之类宏，确切命名需核验）。控制面（VAT、govpp、Honeycomb、自研 agent，编程见 04-07）连上 VPP 时会校验消息 CRC；**VPP 升了而控制面没跟着重新生成，CRC 不匹配，消息会被拒绝**，表现往往是「进程在、接口在、但路由/隧道一条都下不进去」。同理，第三方/自研插件是针对特定 VPP 版本编译的，跨版本升级后必须重新编译，否则 ABI 不兼容。
+
+**配置兼容与 statseg 变化**。`startup.conf` 的参数在不同 release 间可能被改名、废弃或语义调整（完整参数与版本差异见 04-01）；插件的 CLI 命令也可能变化（见 04-05）。一个容易被忽略的坑是**统计命名空间变化**：VPP 在 23.x 附近对 statseg 做过实现重构，计数器的目录路径/前缀可能改变（确切变化需对照实际版本核验，字段见 05-12），升级后原有监控采集脚本可能全部取不到数——「监控一片空白」常被误判成「数据面没流量」。
+
+**回滚、灰度与维护窗口**。升级必须是可回退的：保留旧版本 deb 包（或可从仓库装回指定版本）、保留升级前的 startup.conf/exec/版本矩阵/基线快照、准备切流手段（双机/主备/BGP/上游引流，见 03-06 高可用）。流程上先灰度一台或一对、走维护窗口切流、观察正常再全量；异常则按回滚流程切回。
+
+### 3. 关键数据结构与源码位置
+
+本节给「升级兼容性到底校验的是什么」的可定位路径，不重列字段表（字段见 05 全册）：
+
+| 关注点 | 源码 / 文件位置（23.06 / master） | 关键符号或文件 | 说明 |
+|---|---|---|---|
+| API 消息定义 | `src/vnet/**/*.api`、`src/vpp/api/*.api`、`src/vlibapi/` | `*.api`、`vl_api_*_t`、CRC 宏 | 控制面 CRC 校验的依据（编程见 04-07） |
+| API 生成物 | build 产物 `*.api.h` / `*.api.json` / `vppapigen` 输出 | `VL_API_*_CRC` 类宏（需核验） | 升级后需与控制面重新对齐 |
+| 版本标识 | `vpp` 源码版本宏、build 元数据 | 版本字符串 / git commit | `show version` 的数据来源（命令见 04-06） |
+| startup.conf 解析 | `src/vpp/`、`src/vlib/unix/` 相关解析代码 | 各配置块解析入口 | 参数改名/废弃的定位处（参数见 04-01） |
+| statseg 目录 | `src/vpp/stats/stat_segment.c`（新版）、旧版 `src/vlibmemory/` | 目录项与命名空间 | 计数器路径变化的定位处（字段见 05-12） |
+| 插件加载 | `src/vlib/` 插件注册 / `dlopen` | `VLIB_PLUGIN_REGISTER` | 插件 ABI 与加载（原理见 06-11） |
+| 包清单 | 发行版仓库 / `dpkg -l` / `rpm -qa` | `vpp*` 包版本 | 同版本核对依据 |
+
+> 版本宏名、CRC 宏名、`.api` 文件的确切路径以实际 checkout 为准；不确定写「需对照实际版本核验」并保留目录路径，不编造符号名（遵循 SPEC 第 2 节）。
+
+### 4. 关键流程与调用链
+
+**升级主流程**：备份与快照 → 兼容性检查 → 灰度切流 → 停服 → deb 升级（全包同版本）→ 配置迁移 → 启动校验 → 观察 → 全量或回滚。**回滚流程**：异常触发 → 切流回旧设备/旧版本 → 降级 deb 到旧版本 → 恢复旧配置 → 校验 → 复盘。两条流程共享「备份」这个锚点：无论升级成功还是回滚，都要更新或复用那份快照。
+
+:::figure id=08-05-01 | name=VPP 版本升级与回滚流程 | dir=TD
+node s "升级触发<br/>安全补丁 新特性 LTS 到期" blue
+node bak "备份与快照<br/>startup.conf exec 配置<br/>版本矩阵 基线 数据面状态" teal
+node chk "兼容性检查<br/>API CRC 插件 ABI 配置参数<br/>statseg 命名空间 内核 DPDK 驱动" amber
+node gray "灰度一台或一对<br/>维护窗口 切流" purple
+node stop "停 VPP 服务 保留现场" gray
+node upg "deb 升级 全部 vpp 包同版本" green
+node mig "配置迁移<br/>startup.conf 参数改名 废弃<br/>exec 与 Binary API 适配" green
+node start "启动校验<br/>show version 接口 error<br/>API CRC 控制面 基线复测" teal
+node obs "观察期 长稳 业务 性能" purple
+node good "全量发布 入档 更新基线" blue
+node bad "异常" red
+node rb "回滚 切流回旧<br/>降级 deb 恢复配置 校验" red
+edge s -> bak
+edge bak -> chk
+edge chk -> gray
+edge gray -> stop
+edge stop -> upg
+edge upg -> mig
+edge mig -> start
+edge start -> obs
+edge obs -> good "正常"
+edge obs -> bad "异常"
+edge bad -> rb
+edge rb -> bak dashed "复盘后再升级"
+edge good -> bak dashed "更新基线快照"
+:::
+
+> 图注（表格兜底）：升级流程的每一步都有「准入/准出」判据。下表把关键门禁固化，图形不渲染时照表执行。
+
+| 阶段 | 准入 | 准出判据 |
+|---|---|---|
+| 备份 | 变更批准 | 配置/版本矩阵/基线/数据面状态已快照且可恢复 |
+| 兼容性检查 | 备份完成 | API CRC、插件 ABI、参数、statseg、驱动全部核对 |
+| 灰度切流 | 检查通过 | 维护窗口、流量已切走、回滚路径可用 |
+| 升级与迁移 | 停服完成 | 全 `vpp*` 包同版本、配置已按新版本适配 |
+| 启动校验 | 进程已起 | `show version` 正确、接口 up、无 error、控制面可下发、基线达标 |
+| 观察/全量 | 校验通过 | 长稳与业务正常、性能回基线 |
+| 回滚 | 任一准出失败 | 旧版本恢复、配置还原、业务验证通过 |
+
+**API CRC 校验链**（解释「为什么进程正常却下不进配置」）：控制面加载针对某 VPP 版本生成的 API 定义（`*.api.h` / 绑定）→ 连接 VPP 的 Binary API socket → 逐消息核对 CRC / 消息 ID → 不一致则拒绝 → 配置/表项停留在旧状态。因此升级 VPP 后，**控制面与自研插件必须用目标版本的 `.api` 重新生成并同步升级**，这是兼容性检查里最容易被漏掉的一环（API 机制见 06-13，编程用法见 04-07）。
+
+### 5. 配置/命令/代码实例
+
+以下为升级动作与校验判读的最小片段，配置全参数见 04-01、命令全量见 04-06、API 编程见 04-07。
+
+**升级前：版本矩阵快照与包核对**（把输出入档）：
+
+```bash
+show version                     # 当前版本 / commit（命令见 04-06）
+dpkg -l | grep vpp               # 或 rpm -qa | grep vpp，核对所有 vpp* 包版本
+apt-cache policy vpp             # 或 yum --showduplicates，确认可装/可回退的版本
+cp /etc/vpp/startup.conf /backup/startup.conf.<date>
+cp /etc/vpp/startup.conf/exec  /backup/                    # 若有 exec 启动脚本，配置持久化见 04-07
+```
+
+判读：`dpkg -l | grep vpp` 里所有 `vpp*` 包的版本字符串必须完全一致；`apt-cache policy` 要能列出旧版本，否则回滚时无包可降——**回滚预案必须提前验证「旧版本还装得回来」**。
+
+**升级动作**（Debian/Ubuntu 示意）：
+
+```text
+apt install --only-upgrade vpp=23.06-<rev> \
+                           vpp-plugin-core=23.06-<rev> \
+                           vpp-plugin-dpdk=23.06-<rev> \
+                           python3-vpp-api=23.06-<rev>
+# 或统一 apt install vpp=<target> ... 让依赖解析到同一 rev
+```
+
+> 强烈建议用 `apt-mark hold vpp*` 或固定版本引脚（pin）避免无人值守升级把某台机器单独升到不同版本；版本号格式、包名、仓库来源都需对照实际发行版核验，不要照抄。
+
+**配置迁移检查表**（参数以目标版本 04-01 / release notes 为准）：
+
+| 检查项 | 做法 | 风险 |
+|---|---|---|
+| startup.conf 参数改名/废弃 | 逐块对照新旧版本差异（见 04-01） | 旧参数被忽略 → 配置静默不生效 |
+| 插件与 feature 配置 | 确认目标版本仍含对应插件 | 插件缺失 → 功能消失 |
+| exec / 启动脚本 | 核对 CLI 命令是否改名（见 04-02 / 04-05） | 脚本报错 → 表项未下发 |
+| Binary API / 控制面 | 用目标版本 `.api` 重新生成并同步升级 | CRC 不匹配 → 配置被拒 |
+| statseg 命名空间 | 对照新旧目录路径（字段见 05-12） | 监控取不到数 |
+| 内核 / DPDK / 驱动 / 固件 | 核对兼容矩阵（见 03-02） | 网卡起不来 |
+| 大页 / CPU 隔离 / NUMA | 与升级前一致（见 08-02 / 08-06） | 性能下降 |
+
+**启动后校验**（组合与判读，不重列清单）：`show version` 确认目标版本 → `show interface` 确认接口全 up、有收有发 → `show errors` 区间差为零 → `show runtime` 与 08-01 基线对比每包成本 → 控制面实际下发一条路由/隧道并回读表项确认成功（验证 API CRC 通了）→ statseg 采集脚本能取到数（验证命名空间）→ 复测基线 NDR。这一组通过，才算「升级成功」，而不是「进程起来了」。
+
+**回滚动作**（示意）：
+
+```bash
+# 1) 切流回旧设备/旧版本实例（见 03-06 高可用）
+# 2) 降级所有 vpp* 包到旧版本
+apt install vpp=<old-rev> vpp-plugin-core=<old-rev> \
+            vpp-plugin-dpdk=<old-rev> python3-vpp-api=<old-rev>
+# 3) 恢复旧 startup.conf / exec，重启并校验
+cp /backup/startup.conf.<date> /etc/vpp/startup.conf
+```
+
+判读：回滚后同样要跑「版本、接口、error、控制面下发、基线」五项校验；若旧版本包已不在仓库，说明备份阶段没做好，这是要在 08-06 checklist 里提前堵住的漏洞。
+
+### 6. 注意事项、陷阱与最佳实践
+
+- **全 `vpp*` 包同版本是铁律**。混装是「莫名崩溃/插件加载失败」的头号根因（案例见 08-04 案例九），升级脚本要显式列出所有包并校验版本一致。
+- **API CRC 要连控制面一起升**。别只盯着 VPP 服务端；govpp/Honeycomb/自研 agent、VAT 脚本、自研插件都要用目标版本 `.api` 重新生成，否则「进程正常、配置全空」。
+- **statseg 命名空间变化会打断监控**。升级后第一件事验证采集脚本仍能取数，别把「监控空白」当成「没流量」去查数据面。
+- **配置静默失效最危险**。参数被改名/废弃时 VPP 可能只给一条警告甚至忽略，不会报错；必须逐块对照 release notes 与 04-01，并在启动后用「下发 + 回读」验证配置真正生效。
+- **回滚预案要先验证**。确认旧版本包可装回、配置快照可恢复、切流路径可用；没验证过的回滚等于没有回滚。
+- **内核 / DPDK / 驱动 / 固件耦合**。VPP 升级常伴随 DPDK 版本变化，可能要求新内核或新固件（见 03-02），把它们纳入兼容性矩阵一起评估，别只看 `vpp` 包。
+- **灰度与维护窗口**。先一台/一对、观察长稳与业务再全量；用 `apt-mark hold` / 版本引脚防止机器之间版本漂移。
+- **保留现场**。升级前后各存一份版本矩阵、`show` 关键输出、基线结果与 coredump 配置；升级失败的复盘依赖这些（衔接 08-04 案例九、08-06 备份）。
+- **LTS 与版本确定性**。生产明确在哪个稳定分支、何时到期，提前规划下一次升级，不要等分支终止支持才被动迁移；确切 LTS 信息以 fd.io 官方为准（需核验）。
+- **一次只引入一类变化**。不要「升级 + 改配置 + 换网卡驱动」一起做，否则出事无法归因；变量隔离原则与 08-02 调优一致。
+
+### 7. 小结与延伸阅读
+
+本篇把 VPP 升级从「装个新包」还原为一次受控变更：以版本矩阵与 LTS/稳定分支为选型依据，以「全 `vpp*` 包同版本 + API CRC 同步 + 插件重编 + 配置逐块核对 + statseg 命名空间验证 + 内核/DPDK/固件兼容」为兼容性检查核心，以「备份 → 灰度 → 停服 → 升级 → 配置迁移 → 启动校验 → 观察 → 全量/回滚」为流程，并强调启动后必须用「版本、接口、error、控制面下发、基线」五项校验才算成功。两个最隐蔽的坑是「进程正常但 API CRC 不匹配导致配置全空」和「statseg 命名空间变化导致监控空白」。
+
+衔接：崩溃与版本错配的现场处置见 08-04 案例九，常态化预防与升级门禁见 08-06，配置全参数与版本差异见 04-01、API 编程见 04-07、命令判读见 04-06、`.api` 与插件机制见 06-13 / 06-11、高可用切流见 03-06。延伸阅读方向：fd.io 官方 release notes 与 LTS 页面、VPP `vppapigen` / `.api` 定义文档、`dpkg` / `apt` 版本引脚与 hold 机制、`vpp-api` 各语言绑定（govpp / Honeycomb）的 CRC 校验说明。
+
+---
+
+## 08-06 生产环境运维最佳实践 checklist
+
+### 1. 背景与动机
+
+前面五篇分别解决了「怎么测（08-01）、怎么判（08-02）、怎么查（08-03）、常见坑怎么修（08-04）、怎么升级（08-05）」，本篇把它们收束成**可落地、可交接、可审计**的生产运维体系。VPP 生产事故的共性，往往不是某个技术点不会，而是「该有的检查没做、该留的现场没留、该有的预案没验证」：上线时没预留 1G 大页，扩容后 VPP 起不来（案例一）；没做 CPU 隔离，尾分位长期不达标；没开 coredump，崩溃后无从定位（案例九）；升级没验证回滚，出事无法回退（08-05）；监控只采了接口计数，statseg 命名空间一变就全瞎。
+
+本篇的价值是把散落在前五篇的要素，组织成一套分层运维体系 + 一组上线前门禁 + 一套容量规划与监控告警基线 + 一份变更/应急 checklist。它不追求发明新技术，而追求「组织能力比个人经验可靠」——把每个踩过的坑固化成一条可勾选的检查项。全篇遵守去重铁律：命令只讲组合与判读（见 04-06），参数引用 04-01，字段引用 05 全册，机制引用 06 全册，模块引用 07 全册。
+
+### 2. 核心概念
+
+**运维体系分层**。把 VPP 生产系统自上而下分成五层，每层有各自的 SLI、检查项与责任边界（配图见第 4 节）：SLO/SLI 层（吞吐、PPS、时延分位、丢包率、可用性）、流程层（变更管理、灰度、回滚、上线门禁、应急演练、容量规划）、可观测层（statseg 时序、日志、告警、基线对比）、控制面层（Binary API / govpp / Honeycomb、api-trace、配置持久化）、VPP 数据面层（worker、NUMA、大页、buffer、feature、版本）、基础设施层（CPU 隔离、IRQ 隔离、网卡固件、内核、IOMMU、systemd、大页预留）。任一层缺失都会在故障时放大成事故。
+
+**SLO / SLI 与「什么算异常」**。VPP 的 PMD 常态 100% CPU，因此**不能把「worker 利用率」当 SLI**。合适的 SLI 是：接口零丢包速率（NDR，见 08-01）、时延尾分位（P99/P99.9）、丢包率、`show errors` 的增长率、`show buffers` free 水位、业务可用性。告警要基于「区间做差 / 与基线偏离」而非绝对值（呼应 08-02）。
+
+**容量规划**。三个可计算的量：worker 数 ≈ 目标 PPS ÷ 单 worker 实测 PPS（来自 08-01 基线），向上取整并留 20–30% 余量；大页 ≈ 各 NUMA node 的 `socket-mem` + 缓冲池 + DPDK mbuf + FIB/表项内存之和，且必须在开机阶段按 node 预留（1G 大页，见案例一）；buffer 数（`buffers-per-numa`）与 `num-rx-desc` ≈ 最大在途包数 + 突发深度，用 08-01 的背靠背测试标定。三者都要留水位并写入容量台账。
+
+**变更管理与可观测性**。任何变更（升级、调参、加 feature、换驱动）都必须：有批准、有备份、有灰度、有回滚预案、有观察期、有入档（08-05 流程）。可观测性要覆盖「指标 + 日志 + 事件 + 现场」四类，缺一类就会出现「知道出事了但不知道为什么」。
+
+### 3. 关键数据结构与源码位置
+
+本节把运维需要「知道东西放在哪」的路径固化，不重列字段表（字段见 05 全册）：
+
+| 关注点 | 路径 / 位置 | 说明 |
+|---|---|---|
+| 主配置 | `/etc/vpp/startup.conf` 及 `unix{}` 指定路径 | `cpu{}` / `dpdk{}` / `buffers{}` / `logging{}` / `api-trace{}` 等（参数见 04-01） |
+| 运行态 socket | `/run/vpp/`（`cli.sock`、API socket、statseg socket） | `cli-listen` 等配置落点（见 04-01） |
+| 日志 | `/var/log/vpp/vpp.log` 或 `unix{}` 指定 | `logging{}` 级别、`logrotate`（见 04-01 / 08-03） |
+| coredump | `unix{}` `full-coredump` / `coredump-size`、`core_pattern` / `coredumpctl` | 崩溃现场（见 08-03 / 案例九） |
+| 服务单元 | systemd `vpp.service` | `Restart=`、启动顺序、大页就绪依赖 |
+| 大页 | `/sys/kernel/mm/hugepages/`、`/sys/devices/system/node/nodeX/hugepages/`、grub cmdline | 开机预留与按 node 分配（见案例一 / 03-02） |
+| 统计段 | `src/vpp/stats/stat_segment.c`（新版）、statseg socket | 计数器目录（字段见 05-12，机制见 06-10） |
+| 版本/包 | `show version`（见 04-06）、`dpkg -l` / `rpm -qa` | 版本矩阵（见 08-05） |
+
+> 路径、unit 名、socket 名、参数名以实际发行版与 VPP 版本为准，不确定写「需对照实际版本核验」并保留可定位路径。
+
+### 4. 关键流程与调用链
+
+**运维体系分层图**（本篇核心图）：上层目标分解为流程与检查，流程约束可观测与变更，可观测驱动控制面，控制面下发到数据面，数据面依赖基础设施，变更前后由备份/回滚兜底。
+
+:::figure id=08-06-01 | name=VPP 生产运维体系分层 | dir=TD
+node slo "SLO 与 SLI<br/>吞吐 PPS 时延分位 丢包率 可用性" blue
+node flow "流程层<br/>变更管理 灰度 回滚预案<br/>上线前检查 应急演练 容量规划" purple
+node obs "可观测层<br/>statseg 时序 日志 告警<br/>show errors 基线对比" teal
+node ctl "控制面层<br/>Binary API govpp Honeycomb<br/>api-trace 配置持久化" amber
+node data "VPP 数据面层<br/>worker NUMA 大页 buffer<br/>feature 版本" green
+node base "基础设施层<br/>CPU 隔离 IRQ 隔离 网卡固件<br/>内核 大页预留 IOMMU systemd" gray
+node rb "备份与恢复<br/>配置 版本矩阵 基线 coredump" red
+edge slo -> flow "目标分解"
+edge flow -> obs "约束与检查"
+edge obs -> ctl "指标与告警"
+edge ctl -> data "下发配置"
+edge data -> base "依赖"
+edge base -> rb dashed "现场留存"
+edge flow -> rb "变更前备份"
+:::
+
+> 图注（表格兜底）：六层 + 一个兜底。下表把每层的「关键检查对象」列出，图形不渲染时按层核对。
+
+| 层 | 关键检查对象 | 关联篇章 |
+|---|---|---|
+| SLO/SLI | NDR、P99/P99.9、丢包率、可用性 | 08-01 / 08-02 |
+| 流程 | 变更/灰度/回滚/门禁/演练/容量台账 | 08-05 |
+| 可观测 | statseg 时序、日志、告警、基线 | 08-02 / 08-03 |
+| 控制面 | API CRC、api-trace、配置持久化 | 08-05 / 04-07 |
+| 数据面 | worker/NUMA/大页/buffer/feature/版本 | 08-02 / 08-04 |
+| 基础设施 | 隔离/固件/内核/IOMMU/systemd/大页预留 | 03-01 / 03-02 |
+| 兜底 | 配置/矩阵/基线/coredump 备份 | 08-04 / 08-05 |
+
+**上线前门禁流程**。把第 5 节的 checklist 做成四道门禁，任一不通过即打回整改，全部通过才灰度上线、观察正常再全量发布并入档。
+
+:::figure id=08-06-02 | name=上线前检查门禁流程 | dir=TD
+node s "变更申请" blue
+node g1 "硬件内核门禁<br/>大页 CPU 隔离 NUMA 绑定 IOMMU" teal
+node g2 "配置门禁<br/>startup.conf 版本矩阵 worker buffer 数" teal
+node g3 "可观测门禁<br/>日志 coredump statseg 告警 基线" amber
+node g4 "预案门禁<br/>回滚 deb 版本 配置备份 灰度切流" purple
+node go "灰度上线 观察期" green
+node no "打回整改" red
+node full "全量发布 入档 更新 checklist" blue
+edge s -> g1
+edge g1 -> g2 "通过"
+edge g1 -> no "不通过"
+edge g2 -> g3 "通过"
+edge g2 -> no "不通过"
+edge g3 -> g4 "通过"
+edge g3 -> no "不通过"
+edge g4 -> go "通过"
+edge g4 -> no "不通过"
+edge go -> full "观察正常"
+:::
+
+> 图注（表格兜底）：四道门禁对应四类必查项——硬件/内核、配置、可观测、预案。全部通过才允许进入灰度；观察期异常按 08-05 回滚。
+
+**监控告警链**：statseg 周期采样 → 做差算速率 → 与 08-01 基线/阈值比对 → 触发告警（丢包、error 增长、尾分位越界、buffer 水位、进程重启）→ 按 08-03 决策链定位 → 按 08-04 案例修 → 回归基线 → 更新 checklist。**应急处置链**：告警 → 判级别 → 先保业务（切流/回滚，见 08-05 / 03-06）→ 留存现场（日志/coredump/api-trace/pcap）→ 离线定位 → 复盘入档。
+
+### 5. 配置/命令/代码实例
+
+本节给出可直接落地的 checklist、容量规划算式、告警规则与配置片段（命令全量见 04-06，参数见 04-01）。
+
+**上线前 checklist（主表）**——这是本篇最核心的可交付物，逐条可勾选：
+
+| # | 类别 | 检查项 | 通过判据 |
+|---|---|---|---|
+| 1 | 大页 | 1G 大页开机预留、按 NUMA node 分配、总量 ≥ `socket-mem`+缓冲+mbuf | `/proc/meminfo`、`nodeX/hugepages` 核对；重启后仍生效 |
+| 2 | CPU 隔离 | `isolcpus`/`nohz_full`/`rcu_nocbs`、IRQ 隔离、控制面与数据面核分离 | 隔离核上只有预期 worker |
+| 3 | NUMA 绑定 | 网卡/worker/大页/内存四者同 node | `numastat -p`、`show threads`、`show hardware` 一致 |
+| 4 | IOMMU/驱动 | VT-d/IOMMU 开、网卡绑 `vfio-pci`、固件版本入档 | `lspci -k`、`ethtool -i` |
+| 5 | worker 数 | 按目标 PPS ÷ 单 worker 基线，留 20–30% 余量 | 与 08-01 基线一致 |
+| 6 | buffer 数 | `buffers-per-numa`、`num-rx/tx-desc` 经背靠背测试标定 | `show buffers` free 有稳定水位 |
+| 7 | 版本矩阵 | 所有 `vpp*` 包同版本、控制面 API CRC 对齐、LTS 在维护窗内 | `dpkg -l`、`show version`、控制面下发回读 |
+| 8 | 日志 | `logging{}` 级别生产为 info/warn、`logrotate` 配好、磁盘水位监控 | `/var/log/vpp/` 可写、轮转生效 |
+| 9 | coredump | `full-coredump`/`coredump-size`/`ulimit -c`/`core_pattern` 验证过能生成 | `coredumpctl` 可列出、gdb 可回溯 |
+| 10 | 可观测 | statseg 时序、接口/error/缓冲/时延告警、基线已归档 | 监控能取到数、告警可触发 |
+| 11 | 备份 | startup.conf/exec/版本矩阵/基线/表项快照可恢复 | 恢复演练通过 |
+| 12 | 回滚预案 | 旧版本 deb 可装回、切流路径可用、灰度方案就绪 | 回滚演练通过 |
+| 13 | 变更流程 | 维护窗口、灰度、观察期、入档、审批齐全 | 工单完备 |
+| 14 | 演练 | 故障/回滚/扩容演练已完成并复盘 | 有演练记录 |
+| 15 | 容量台账 | 当前 PPS/时延/水位与容量上限、扩容触发阈值 | 台账更新 |
+
+**容量规划算式（示意）**：
+
+```bash
+worker 数   = ceil(目标 PPS / 单 worker 实测 PPS) × 1.2~1.3 余量
+大页需求   ≈ Σ_node( socket-mem + buffers-per-numa × buffer 大小
+                    + rx/tx 描述符 × mbuf + FIB/表项 + 元数据 )
+buffer 深度 ≈ 最大在途包数 + 背靠背实测突发深度（08-01 步骤 7）
+CPU 核预留 = main-core 1 + worker 数 + 控制面/生成器/系统核，全部纳入隔离规划
+```
+
+> 所有系数来自本环境 08-01 基线实测，不要照搬他人数值；大页必须在开机阶段预留（案例一），buffer 深度用背靠背测试标定。
+
+**监控告警规则表**：
+
+| 指标 | 采集（命令/来源见 04-06 / 08-02） | 告警条件 | 关联处置 |
+|---|---|---|---|
+| 丢包/接口 drops | `show interface`、statseg `/if/` 做差 | 区间差 > 0 且持续增长 | 08-03 决策链 |
+| node error | `show errors` 区间差 | 任一 node 增长 | 08-04 案例四 |
+| 时延尾分位 | 打流器/ latency 流 / statseg | P99.9 越过 SLO | 08-02 调优 / 案例五 |
+| buffer 水位 | `show buffers` free | 低于水位线或持续下降 | 08-04 案例八 |
+| NDR/吞吐 | 08-01 基线对比 | 偏离基线超容差 | 08-02 / 案例二 |
+| 进程重启 | systemd / `journalctl` | 单位时间内重启 | 08-04 案例九 |
+| statseg 可取数 | 采集脚本自检 | 取数失败（防命名空间变化） | 08-05 |
+| 磁盘水位 | `/var/log/vpp/`、coredump 分区 | 超过阈值 | 日志轮转 / 清理 |
+
+**配置与脚本片段**（参数见 04-01，命令见 04-06）：
+
+```bash
+# grub 启动参数（示意，需按实际内核核验）
+GRUB_CMDLINE_LINUX="... isolcpus=2-9 nohz_full=2-9 rcu_nocbs=2-9 \
+  intel_iommu=on default_hugepagesz=1G hugepagesz=1G hugepages=16"
+
+# startup.conf 关键块（示意）
+cpu  { main-core 0  corelist-workers 2,4,6,8 }
+dpdk { socket-mem 0,8192  num-rx-desc 1024  num-tx-desc 1024 }
+buffers { buffers-per-numa 131072 }
+logging { default-log-level info }
+unix { full-coredump  coredump-size unlimited  log /var/log/vpp/vpp.log }
+```
+
+```bash
+# 变更前后备份脚本（示意，纳入 08-05 流程）
+stamp=$(date +%F-%H%M)
+cp /etc/vpp/startup.conf /backup/vpp/startup.conf.$stamp
+dpkg -l | grep vpp   > /backup/vpp/pkg-matrix.$stamp
+vppctl show version  > /backup/vpp/version.$stamp    # 命令见 04-06
+tar czf /backup/vpp/logs.$stamp.tgz /var/log/vpp/
+```
+
+**健康检查**：用控制面定期「下发一条无害表项 + 回读」验证 API CRC 通路，用 `show errors` 区间差为零 + `show interface` 计数增长验证数据面活着，配合 systemd `Restart=` 策略与上游探活（如 BFD，模块见 07-14）做可用性探测。
+
+### 6. 注意事项、陷阱与最佳实践
+
+- **大页预留要在开机阶段、按 NUMA node**。运行时补 2M 大页救不了 1G 大页需求；这是案例一反复事故的根源，务必进 grub 并写进上线门禁。
+- **别把 worker 利用率当 SLI**。PMD 常态 100%，告警应基于 NDR、时延尾分位、丢包率、error 增长率、buffer 水位（呼应 08-02 / 案例五）。
+- **监控要有「自检」**：验证采集脚本本身能取到数，否则 statseg 命名空间一变（08-05）就「监控全绿但其实是全瞎」。
+- **coredump / 日志 / 大页都吃磁盘**：`/var/log/vpp/` 与 coredump 分区要独立水位监控 + `logrotate` + 转储清理，别让现场把盘写满导致二次故障。
+- **回滚预案必须演练过**：「旧版本包还能装回来」「切流路径真的能用」都要验证，没验证的回滚等于没有（08-05）。
+- **容量留水位并定期复算**：业务增长、feature 增加、表项膨胀都会抬高每包成本与内存占用，用 08-01 基线定期复测并更新容量台账与扩容阈值。
+- **一次一变更 + 灰度 + 观察期**：变量隔离原则贯穿升级、调优、扩容；全量前必观察长稳与业务。
+- **checklist 要可勾选、可审计、可更新**：每条有明确判据、责任人与最近一次执行时间；每次事故/演练复盘后把新坑补进去（把 08-04 的个案沉淀为组织能力）。
+- **现场留存与敏感信息**：日志/pcap/api-trace/coredump 可能含租户地址与密钥，归档、外发、权限都要管控（呼应 08-03）。
+- **版本与 LTS 生命周期管理**：明确当前稳定分支与到期时间，提前规划升级窗口；确切 LTS 信息以 fd.io 官方为准（需核验）。
+- **不要照抄配置片段**：本文所有参数、grub 项、包名、路径都需对照实际版本与发行版核验；不确定写「需对照实际版本核验」并给可定位路径（遵循 SPEC 第 2 节）。
+
+### 7. 小结与延伸阅读
+
+本篇把前五篇收束成一套生产运维体系：以「SLO/SLI → 流程 → 可观测 → 控制面 → 数据面 → 基础设施」六层加「备份/恢复」兜底为骨架，以四道上线门禁（硬件内核 / 配置 / 可观测 / 预案）为闸门，以 15 条可勾选 checklist、容量规划算式、监控告警规则、备份脚本为可交付物，并把变更管理、灰度回滚、监控自检、现场留存、演练复盘固化为组织能力。核心思想一句话：**把每个踩过的坑变成一条可勾选的检查项，让组织能力比个人经验可靠**。
+
+全册衔接回顾：08-01 建基线（可复现的性能基准）、08-02 判指标（分层指标与判读）、08-03 走决策链（日志/trace/pcap/coredump）、08-04 修个案（九个「现象→定位→根因→修复」案例）、08-05 管变更（升级与回滚）、本篇做常态（checklist 与体系）。交叉引用统一为 `（字段见 05-xx ｜ 命令见 04-06 / 04-01 ｜ 原理见 06-xx ｜ 模块见 07-xx）`。延伸阅读方向：SRE 的 SLO/错误预算与变更管理实践、fd.io 官方 VPP 部署与 release notes、systemd / coredumpctl / logrotate 文档、Linux NUMA 与大页内核文档、Prometheus 采集与告警规则设计、以及 03-01 / 03-02 部署与 03-06 高可用（切流与回滚的底层依赖）。
+
+
+

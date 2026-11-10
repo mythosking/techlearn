@@ -1,0 +1,1205 @@
+# VPP 技术资料 · 02 编译与构建
+
+> 本册定位：从零搭建构建环境、完整跑通一次源码编译、理解构建系统内部机制，并覆盖容器、离线、交叉编译与构建优化等工程化议题。
+> 版本基准：VPP 23.06 / master。构建脚本、目标名、产物目录命名在不同版本间存在调整，凡涉及具体目标名与路径的细节，均标注「需对照实际版本核验」，并给出可定位的源码位置。
+> 阅读提示：本册讲「怎么把 VPP 编译出来」，不涉及运行时配置参数（见 04 全册）、结构体逐字段定义（见 05 全册）、数据面调度机制（见 06 全册）与功能模块组网（见 07 全册）。
+
+---
+
+## 02-01 编译环境准备：依赖与工具链
+
+### 1. 背景与动机
+
+把 VPP 从源码编译出来，第一道门槛往往不是代码本身，而是构建环境。与普通的 C 语言应用不同，VPP 是一个运行在用户态、直接驱动网卡的高性能数据面程序，它的编译环境横跨操作系统、编译器、脚本语言、第三方子项目和系统内核五个层面，任何一层缺件都会让构建在看似无关的环节突然失败。理解这一点非常重要：很多新手在 `make build` 报出「找不到某个头文件」或「某个 Python 模块缺失」时才回头补依赖，而此时 CMake 已经生成了半成品构建树，补装依赖后若不清理缓存，常常会遇到更隐蔽的链接错误。因此环境准备不是「先装一堆包」的体力活，而是需要理解「谁在什么时候需要什么」的系统性工作。
+
+第一层复杂度来自依赖面广。VPP 主体是 C 代码，但它的 Binary API 消息并不靠手写 C 头文件维护，而是从 `.api` 定义文件经由代码生成器（历史上是 `vppapigen`，位于 `src/vppapigen/` 及 `src/tools/vppapigen/`，需对照实际版本核验）生成 C 头文件、Python/Java 绑定和测试桩。这意味着 Python 及其若干第三方模块是构建期的硬依赖，而不是「跑测试时才用」的可选项。同时 VPP 的很多插件（如 DPDK、rdma-core、memif、各类加密加速）会链接第三方开发库，这些库在开发包未安装时，CMake 可能只是静默禁用对应插件，导致编译「成功」但产物功能残缺——这类「假成功」比直接报错更危险。
+
+第二层复杂度来自工具链的多代并存。今天（版本基准 23.06 / master）VPP 的构建体系是「GNU Make 作为用户入口 + CMake 负责配置与生成 + Ninja 负责实际编译」的三层结构：顶层 `Makefile` 提供 `make build`、`make build-release`、`make install-deps`、`make pkg-deb`、`make test` 等语义化目标，这些目标内部再去调用 CMake 生成 Ninja 构建文件。而作为 VPP 关键依赖的 DPDK，在较新版本中已从旧的 config/Makefile 体系迁移到 meson + ninja。于是同一棵源码树里同时存在 make、cmake、ninja、meson 四种工具，它们各管一段、彼此衔接。这与 VPP 早期（约 2016—2018 年）纯 GNU Make + `build-data/*.mk` 手写片段的体系已经大不相同，理解这段演进（详见 02-04）能帮你读懂为什么顶层是 Makefile 而构建目录里全是 CMake/Ninja 的产物。
+
+第三层复杂度来自发行版碎片化。Debian/Ubuntu 系使用 apt 与 `.deb` 包，RHEL/CentOS/Rocky 系使用 dnf/yum 与 `.rpm` 包，同名开发库在两边的包名、默认编译器版本、Python 包管理策略都不一致。例如「内核头文件」在 Ubuntu 是 `linux-headers-$(uname -r)`，在 RHEL 系则是 `kernel-devel` / `kernel-headers`；NUMA 开发库在两边分别叫 `libnuma-dev` 与 `numactl-devel`。VPP 社区为此提供了 `make install-deps`（部分版本为 `make install-dep`，需对照实际版本核验）这一自动检测发行版并安装依赖的入口，但自动脚本只能覆盖主流发行版的主流版本，遇到定制系统、最小化安装或国产化 OS 时仍需人工梳理依赖清单。
+
+第四层复杂度来自构建场景的分化：native 本地编译、容器镜像内编译、完全离线的内网编译、以及交叉编译（如 x86 宿主产出 aarch64 产物，见 02-05）对环境的要求各不相同。离线场景无法从网络拉取 DPDK 等外部依赖，交叉编译场景需要整套目标架构的 sysroot 与工具链，这些都把「环境准备」从一次性动作放大为需要预先规划的工程量。本册后续各篇（02-03、02-05）会分别展开。
+
+综上，环境准备的目标不只是「让编译通过」，而是做到三点：依赖齐全且版本匹配、工具链各层职责清晰可排查、构建场景（在线/离线/交叉）事先确定。本篇剩余部分将按「概念分层 → 源码与目录位置 → 调用链 → 命令实例 → 陷阱」的顺序，把这套环境讲透。
+
+### 2. 核心概念
+
+**工具链分层模型。** 可以把 VPP 的构建工具链自顶向下分为五层：入口层是顶层 `Makefile`，它面向开发者，提供语义化目标；配置层是 CMake，负责探测系统、检查依赖、生成构建规则，并把结果落在 `build-root/` 下的构建树里；执行层是 Ninja（或 CMake 生成的 Makefile），负责增量编译、并行调度和链接；编译层是 gcc 或 clang，把 C 源码编译为 `.o`，要求支持 gnu11/C11 及若干 GNU 扩展；代码生成与脚本层是 Python 3 及其模块，负责 `.api` 文件生成、测试框架和一些构建期辅助脚本。DPDK 子项目则自带一层 meson 配置 + ninja 编译，作为「子构建」被主构建调用或引用。把这五层记牢，看到构建日志里的 `cmake`、`ninja`、`meson`、`gcc`、`python3` 交替出现时就不会困惑。
+
+**依赖的三种分类。** 其一是构建时依赖（build-time）与运行时依赖（runtime）之分：编译器、CMake、Ninja、Python 生成脚本、各 `-dev`/`-devel` 开发包属于构建时依赖，编译完成后的目标机上未必需要；而 `libnuma`、`libatomic`、大页与 `vfio` 内核能力、`libm` 等则关系到运行，部署时（见 03 全册）仍要具备。其二是强制依赖与可选依赖之分：C 编译器、CMake/Ninja、Python 3、标准 C 库开发头文件是强制的；DPDK、rdma-core（Mellanox/ConnectX）、`libmemif`、各类加密/压缩加速 SDK、Intel 相关 PMD 库是可选的，缺失时往往只是让对应插件不参与构建。其三是「源码内自带」与「外部拉取」之分：VPP 部分依赖以源码子模块或 `build/` 下 external 下载物的形式在构建期获取，离线环境必须提前缓存（见 02-03）。区分这三类，才能在「编译失败」和「编译成功但功能不全」之间做出正确判断。
+
+**install-deps 机制。** 顶层 Makefile 中的 `install-deps` 目标本质是一层包装：它先探测 `/etc/os-release` 判断发行版与版本，再委派给 `extras/` 或 `build-data/` 下对应的脚本（常见命名为 `extras/scripts/install_deps.sh` 一类，确切路径与脚本名需对照实际版本核验），由脚本调用 `apt-get install` 或 `dnf install` 批量安装开发包。它解决的是「90% 用户的主流发行版」问题，但并不等价于「依赖清单本身」；在容器、离线、国产化 OS 场景中，工程师更应当读脚本、抽出包列表，自行重建等价环境。
+
+**构建体系的现状与历史定位。** 这里先给出一个会被 02-04 详细展开的结论：VPP 现在的「主构建系统」是 CMake + Ninja，顶层 `Makefile` 只是面向人的便捷封装，不再是驱动编译的实体；`build-data/*.mk` 这类 GNU Make 片段是早期体系的遗留，在近代版本里主要用于打包元数据等辅助用途，不再是编译规则的主载体；meson 不是 VPP 主构建系统，而是 DPDK 等子项目使用的构建系统，会作为子构建出现在 VPP 构建过程中。因此「VPP 用 make 还是 cmake 还是 meson」的正确答案是「三层都用，但各管一段」。凡涉及具体目标名、目录名和脚本名的说法，都应以你手上那份源码树的 `Makefile`、`CMakeLists.txt` 与 `build-data/` 实际内容为准，标注需对照实际版本核验。
+
+**native 与交叉的环境差异。** native 编译复用宿主机的编译器、头文件与库；交叉编译则要为目标架构准备交叉工具链（如 `aarch64-linux-gnu-gcc`）、目标 sysroot、以及为目标架构重新编译的 DPDK 等依赖（见 02-05）。环境准备阶段就要明确本次构建属于哪种，因为两者所需的包集合几乎不重叠，混装会造成链接器选错库、运行时出现「Exec format error」等问题。
+
+### 3. 关键数据结构与源码位置
+
+本册所谓「结构」指构建配置与目录结构，而非 VPP 运行时的内存数据结构——后者的逐字段定义属于 05 全册的权威范围（字段见 05-xx），本篇不重列、也不展开。理解构建，首先要能在一棵 VPP 源码树里迅速定位到关键文件。下表给出版本基准 23.06 / master 下的典型布局（目录名与文件归属需对照实际版本核验）：
+
+| 路径 | 作用 | 环境准备阶段的关注点 |
+|---|---|---|
+| `Makefile` | 顶层入口，定义 `install-deps`/`build`/`build-release`/`pkg-deb`/`test` 等目标 | 读它可确认本版本的确切目标名与变量，如 `WS_ROOT`、`BUILD_ROOT` |
+| `CMakeLists.txt` | CMake 主配置，探测依赖、定义组件与编译选项 | 依赖检查逻辑、`find_package`/`pkg_check_modules` 调用点 |
+| `build-root/` | 构建与安装产物树（构建时生成） | 环境是否具备写权限、磁盘空间是否充足 |
+| `build-data/` | 平台/打包元数据，早期为 `*.mk` 片段 | 打包用包列表、平台差异定义 |
+| `extras/` | 辅助脚本与打包资源 | `install_deps` 类脚本、deb/rpm 打包脚本 |
+| `src/` | 全部组件源码 | 各组件子目录即构建单元 |
+| `src/vppinfra/` | 基础设施库（vec/pool/hash/时间/字符串等） | 纯 C，几乎无外部依赖，是最先编译的组件 |
+| `src/vlib/` | 图节点、主循环、缓冲区等核心库 | 依赖 vppinfra |
+| `src/vnet/` | 网络协议与接口层 | 依赖 vlib/vppinfra |
+| `src/plugins/` | 各类插件（dpdk、acl、nat…） | 可选依赖最集中处，缺包时易被静默禁用 |
+| `src/vpp-api/` | API 定义与绑定（含 python 等语言绑定） | `.api` 文件驱动代码生成，依赖 Python |
+| `src/vpp/` | 主程序入口（vpp 进程） | 最终链接目标 |
+| `src/vppapigen/`（或 `src/tools/vppapigen/`） | API 代码生成器 | 需对照实际版本核验确切位置 |
+
+**依赖清单的权威来源。** 不要凭记忆拼依赖包，环境准备时应从三处交叉核对：一是顶层 `Makefile` 里 `install-deps` 指向的脚本；二是 `CMakeLists.txt` 与各组件 `CMakeLists.txt` 中的 `find_package` / `pkg_check_modules` / `check_include_file` 调用；三是 `build-data/` 与 `extras/` 下的打包元数据（如 deb 的 `control` 模板、rpm 的 spec 文件）。这三处共同定义了「编译到底需要哪些 `.h` 和 `.so`」。下表按类别给出典型依赖（包名因发行版而异，需对照实际版本核验）：
+
+| 类别 | 典型依赖 | Ubuntu/Debian 包名示例 | RHEL/Rocky 包名示例 | 强制性 |
+|---|---|---|---|---|
+| 编译器 | gcc / clang、binutils | `build-essential`、`clang` | `gcc`、`gcc-c++`、`clang` | 强制 |
+| 构建驱动 | CMake、Ninja、GNU Make | `cmake`、`ninja-build`、`make` | `cmake`、`ninja-build`、`make` | 强制 |
+| 脚本 | Python 3、ply 等模块 | `python3`、`python3-ply`、`python3-pip` | `python3`、`python3-ply` | 强制 |
+| 内核/系统 | 内核头文件、NUMA、udev/pciaccess | `linux-headers-$(uname -r)`、`libnuma-dev`、`libudev-dev` | `kernel-devel`、`numactl-devel`、`libudev-devel` | 强制/半强制 |
+| 网络/加速 | DPDK、rdma-core、libmemif | 多为源码自带或外部拉取 | 同左 | 可选 |
+| 打包 | dpkg-dev / rpm-build、fakeroot | `dpkg-dev`、`fakeroot` | `rpm-build` | 打 deb/rpm 时需要 |
+| 测试/调试 | 测试框架、libunwind、elfutils | `libunwind-dev`、`elfutils` | `libunwind-devel`、`elfutils-libelf-devel` | 可选 |
+
+需要强调：`vppapigen` 生成 API 这件事，使 Python 与 `.api` 文件的处理成为构建链路里不可跳过的一环；`src/vpp-api/` 中的 `.api` 定义与 `src/vppapigen/` 的生成器是一对，任何一处版本不匹配，都会表现为「生成的头文件与源码对不上」的编译错误。这类问题在切换分支或 cherry-pick 后尤其常见，清理 `build-root/` 中生成的 API 头并重新跑 cmake 是标准处理手法。
+
+### 4. 关键流程与调用链
+
+环境准备阶段有两条值得记住的调用链。
+
+**依赖安装链**：开发者执行 `make install-deps` → 顶层 `Makefile` 解析目标、设置 `WS_ROOT` 等变量 → 调用 `extras/` 下发行版检测/安装脚本 → 脚本读取 `/etc/os-release` 判定发行版 → 选择 `apt-get` 或 `dnf` 分支 → 安装上表所列开发包 →（部分版本）预拉取或初始化外部依赖。这条链的脆弱点在于发行版检测：非标准 `/etc/os-release`、最小化容器镜像、离线网络都会让它中断或半途而废，因此要能读脚本、手动复现其包列表。
+
+**工具链协作链**：`make build` → 顶层 Makefile 转调 CMake（传入构建类型、安装前缀、组件开关等）→ CMake 探测依赖并生成 `build-root/build-vpp*/` 下的 Ninja 文件 → Ninja 调度 gcc/clang 编译各组件 `.c`、调用 python3 与 vppapigen 处理 `.api` 生成头、并（在需要时）触发 DPDK 的 meson/ninja 子构建 → 链接得到 `vpp` 与各插件 `.so` → 产物落入 `build-root/install-vpp*/`。这条链说明：环境准备要同时满足「CMake 能找到」「Ninja 能调度」「gcc 能编译」「python 能生成」「meson 能配 DPDK」五个环节，缺一不可。
+
+下面用一张分层图刻画这五层工具链及依赖关系（配色区分职责，箭头表示调用/依赖方向）：
+
+:::figure id=02-01-01 | name=VPP 构建工具链分层与依赖 | dir=TD
+node n1 "开发者入口<br/>顶层 Makefile" blue
+node n1a "install-deps / build / build-release<br/>pkg-deb / test" blue
+node n2 "配置层<br/>CMake / CMakeLists.txt" teal
+node n3 "执行层<br/>Ninja 构建树" teal
+node n4 "编译层<br/>gcc / clang (gnu11)" amber
+node n5 "代码生成层<br/>python3 + vppapigen (.api)" purple
+node n6 "子项目构建<br/>DPDK 用 meson + ninja" purple
+node n7 "系统依赖<br/>kernel headers / libnuma / libudev" gray
+node n8 "打包工具链<br/>dpkg / rpm / cpack" green
+edge n1 -> n1a
+edge n1a -> n2 "cmake configure"
+edge n1a -> n7 "安装开发包"
+edge n2 -> n3 "生成 ninja 文件"
+edge n3 -> n4 "编译 .c"
+edge n3 -> n5 "生成 API 头"
+edge n3 -> n6 "子构建 DPDK"
+edge n4 -> n7 "链接系统库"
+edge n6 -> n7 "链接系统库"
+edge n1a -> n8 "pkg-deb / pkg-rpm"
+:::
+
+> 文字兜底：入口层是 `Makefile`；配置层是 CMake；执行层是 Ninja；编译层是 gcc/clang；代码生成层是 python3 + vppapigen；DPDK 子项目另有 meson/ninja；系统依赖（内核头文件、libnuma、libudev 等）被编译层与子构建共同链接；打包工具链在 `pkg-deb`/`pkg-rpm` 目标下被单独调用。
+
+### 5. 配置/命令/代码实例
+
+下面给出环境准备与自检的典型命令序列。原则上优先使用 `make install-deps`，仅当自动脚本不适用时才手工安装。以下包名与命令均为常见形式，确切内容需对照实际版本核验。
+
+**（1）先看清楚这份源码到底要什么**（强烈建议在动手前执行）：
+
+```bash
+# 进入源码根目录
+cd vpp
+# 查看顶层 Makefile 提供了哪些目标，以及 install-deps 指向哪个脚本
+grep -n "install-dep\|build-release\|pkg-deb\|^build\|^test" Makefile
+# 查看 CMake 探测了哪些依赖
+grep -rn "find_package\|pkg_check_modules" CMakeLists.txt src/ 2>/dev/null | head -40
+```
+
+**（2）使用自动脚本安装依赖**（主流 Ubuntu/Debian、RHEL 系）：
+
+```bash
+# 自动检测发行版并安装开发包（需 root 或 sudo）
+make install-deps
+# 若本版本目标名为单数，等价写法（需对照实际版本核验）
+# make install-dep
+```
+
+**（3）手工安装（最小化容器 / 定制 OS 场景）**，以 Ubuntu 22.04 为例：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+    build-essential cmake ninja-build git \
+    python3 python3-pip python3-ply \
+    linux-headers-$(uname -r) \
+    libnuma-dev libudev-dev libpciaccess-dev \
+    libunwind-dev libelf-dev \
+    dpkg-dev fakeroot
+```
+
+RHEL/Rocky 系等价包名（需对照实际版本核验）：
+
+```bash
+sudo dnf install -y \
+    gcc gcc-c++ cmake ninja-build make git \
+    python3 python3-ply \
+    kernel-devel kernel-headers \
+    numactl-devel libudev-devel libpciaccess-devel \
+    libunwind-devel elfutils-libelf-devel \
+    rpm-build
+```
+
+**（4）工具链版本自检**——把版本信息记录下来，排错时非常有用：
+
+```bash
+gcc --version | head -1
+clang --version | head -1 2>/dev/null
+cmake --version | head -1
+ninja --version
+python3 --version
+meson --version 2>/dev/null    # DPDK 子构建需要时
+pkg-config --version
+```
+
+**（5）确认内核与运行库环境**（构建期与运行期共通项，部署细节见 03 全册）：
+
+```bash
+uname -r                       # 内核版本，用于选对 headers 包
+ls /usr/src/                   # 内核头文件是否就位
+ldconfig -p | grep -E "numa|udev|pciaccess"   # 开发库是否可被链接器找到
+```
+
+下表把「自检项 → 命令 → 期望结果 → 异常含义」对应起来，便于逐项核对：
+
+| 自检项 | 命令 | 期望结果 | 异常含义 |
+|---|---|---|---|
+| 编译器可用 | `gcc --version` | 输出版本，且不太旧 | 命令不存在 → 未装 build-essential |
+| CMake 可用 | `cmake --version` | 版本满足 `CMakeLists.txt` 的最低要求 | 版本过低 → configure 阶段报错 |
+| Ninja 可用 | `ninja --version` | 输出版本号 | 缺失 → 生成器回退或失败 |
+| Python 生成链 | `python3 -c "import ply"` | 无报错 | ModuleNotFoundError → API 生成会失败 |
+| 内核头匹配 | `ls /usr/src/linux-headers-$(uname -r)` | 目录存在 | 不匹配 → 编译内核相关模块时失败 |
+| NUMA 开发库 | `pkg-config --exists numa && echo ok` | 输出 ok | 缺失 → 链接错误或大页相关功能受限 |
+
+### 6. 注意事项、陷阱与最佳实践
+
+**陷阱一：Python 版本与模块。** VPP 的 API 代码生成历史上经历过 Python 2 到 Python 3 的迁移（需对照实际版本核验你所用分支的状态）。若 `python` 仍指向 Python 2、或 `ply` 等模块只装在某个虚拟环境里，构建会在生成 API 头时报错。最佳实践是显式用 `python3`，把所需模块装到系统 Python 或确保构建脚本使用的解释器能看到它们；在 CI 里固定 Python 版本，避免「在我机器上能编」的问题。
+
+**陷阱二：编译器与 C 标准。** VPP 使用较多 GNU 扩展，要求编译器支持 gnu11/C11。过旧的 gcc（如某些长期支持发行版默认的 4.x）会报语法或内建函数错误；过新的编译器又可能因更严格的告警（-Werror 类选项）把历史代码判为失败。最佳实践是使用该版本官方文档推荐的编译器区间，遇到 `-Werror` 相关问题先确认是不是「用错了编译器版本」，而不是急着改源码。
+
+**陷阱三：内核头文件与运行内核不一致。** 构建 DPDK 相关组件或内核态辅助模块时，需要针对当前运行内核的头文件。若只装了 `linux-headers-generic` 而实际跑的是定制内核，或 `kernel-devel` 版本与 `uname -r` 不符，会出现「编译过了但模块加载不了」或编译期找不到符号的问题。注意 VPP 主用 `vfio-pci` 用户态驱动，编译期对内核模块的依赖已比早年（igb_uio/KNI 时代）轻，但 headers 匹配仍是基本前提。
+
+**陷阱四：可选依赖被静默禁用导致「假成功」。** CMake 在找不到 DPDK、rdma-core 等可选依赖时，可能只是关闭对应插件并继续构建。结果是编译通过、`vpp` 能起，却没有你期望的插件。最佳实践：configure 阶段后仔细读 CMake 输出摘要，确认目标插件的构建状态；必要时显式打开组件开关并指定依赖路径，而不是「编译完再看」。
+
+**陷阱五：并行编译的内存与磁盘。** Ninja 默认高并发，VPP 全量编译（含 DPDK）在内存较小的机器上极易 OOM，表现为编译器被 kill、报「internal compiler error」这类误导性错误。最佳实践是用 `-j` 或 CMake 的并行度限制控制并发（如 `make build -j4` 或设置环境变量，确切传参方式需对照实际版本核验）；同时确保 `build-root/` 所在分区有数 GB 空闲，编译产物、调试符号和中间文件会占用可观空间。
+
+**陷阱六：依赖装完不清缓存。** 补装依赖后，CMake 缓存里「未找到」的判定可能仍保留。最佳实践是清理对应构建树或删掉 `build-root/` 下的 `CMakeCache.txt` 重新 configure（清理目标名如 `make wipe` 需对照实际版本核验），避免用过期探测结果继续编译。
+
+**关于 make 与 meson/cmake 差异的环境层提示。** 环境准备时不要试图「只装一种构建工具」：顶层 Makefile 需要 GNU Make，CMake 需要能生成 Ninja 文件，DPDK 子项目可能需要 meson。把这三者都纳入依赖清单，是避免「装了半天却卡在子构建」的关键；三者的职责边界与历史演进将在 02-04 系统展开。
+
+**离线与交叉的预告。** 如果目标环境无法联网，`make install-deps` 的「一边检测一边 apt 下载」模式会失效，必须提前把开发包、DPDK 源码、Python 模块做成离线缓存或本地镜像（见 02-03）。如果目标是 aarch64/ARM 而宿主是 x86，则本机这套 `gcc`/`-dev` 包基本不适用，需要换成交叉工具链与目标 sysroot（见 02-05）。环境准备阶段就应确定场景，不要等到构建中途才改方案。
+
+### 7. 小结与延伸阅读
+
+本篇把 VPP 的编译环境拆成五层工具链（入口 Makefile、配置 CMake、执行 Ninja、编译 gcc/clang、代码生成 python3+vppapigen，外加 DPDK 的 meson 子构建）和三类依赖（构建时/运行时、强制/可选、自带/外部拉取），给出了源码树关键路径表、依赖清单表与自检表，并强调了「读 Makefile/CMakeLists.txt/install-deps 脚本」而非凭记忆拼包的方法论。核心结论有三条：其一，环境准备要满足的是一条调用链上所有环节，而非某一个工具；其二，可选依赖缺失会造成「假成功」，必须核对 configure 摘要；其三，场景（在线/离线/交叉）要在动手前确定。
+
+后续阅读建议：02-02 会把这些依赖真正用起来，跑一遍 clone → install-deps → build → pkg-deb 的完整流程；02-03 讲如何在容器与离线环境里复现这套环境；02-04 深入 Makefile/`build-data`/CMake 的协作与 make→cmake→ninja/meson 的演进；02-05 讲交叉编译下的工具链替换；02-06 讲环境就绪后如何通过构建类型与编译选项产出不同用途的产物。运行期的大页、CPU 隔离、网卡绑定等部署话题属于 03 全册，startup.conf 全参数属于 04 全册，本篇只做构建所需的最小涉及，不重复展开。
+
+---
+
+## 02-02 从源码完整编译 VPP 实战
+
+### 1. 目标与拓扑
+
+本篇是一次端到端的实操：在一台干净的 x86_64 Linux 主机上，从克隆源码开始，依次完成依赖安装、配置、编译、产物核对、安装与打包、测试，最终得到可运行的 `vpp` 主程序、一组插件 `.so`、由 `.api` 生成的 API 头文件，以及可供分发安装的 `.deb` 包。目标是让读者不仅「照着敲能成功」，还能在每一步知道「这一步在构建链路的哪一层、产出了什么、去哪里验证」，从而具备独立排错能力。为聚焦构建本身，本篇假定单机构建、联网可用、native 架构；容器/离线场景见 02-03，交叉编译见 02-05，构建系统内部机制见 02-04。
+
+先用一张编译总流程图刻画全链路（team-lead 指定的关键图）。图中把「入口目标 → 配置 → 编译 → 产物树 → 分发/验证」串起来，虚线表示测试与回查这类辅助关系：
+
+:::figure id=02-02-01 | name=VPP 源码编译总流程 | dir=TD
+node n1 "git clone<br/>获取 VPP 源码" blue
+node n2 "checkout 版本<br/>v23.06 / master" blue
+node n3 "make install-deps<br/>安装构建依赖" gray
+node n4 "CMake configure<br/>生成 Ninja 构建文件" teal
+node n5 "make build (debug)<br/>make build-release" amber
+node n6 "build-root/<br/>build 树 + install 产物树" purple
+node n7 "vpp / 插件 .so /<br/>vppctl / API 头" green
+node n8 "make install<br/>装到系统前缀" blue
+node n9 "make pkg-deb<br/>产出 .deb 包" blue
+node n10 "make test<br/>单元 / 集成测试" red
+edge n1 -> n2
+edge n2 -> n3
+edge n3 -> n4 "cmake 探测依赖"
+edge n4 -> n5 "ninja 编译链接"
+edge n5 -> n6 "产物落盘"
+edge n6 -> n7
+edge n6 -> n8
+edge n6 -> n9
+edge n7 -> n10 dashed "取产物验证"
+edge n4 -> n10 dashed "测试目标"
+:::
+
+> 文字兜底（图不可渲染时参照）：①克隆并切换版本 → ②`make install-deps` 装依赖 → ③CMake configure 生成 Ninja 文件 → ④`make build` / `make build-release` 编译链接 → ⑤产物进入 `build-root/` 的 build 树与 install 树 → ⑥从 install 树得到 `vpp`、插件、`vppctl`、API 头 → ⑦`make install` 安装到系统、`make pkg-deb` 打包、`make test` 测试。下表进一步把每个 make 目标映射到它的作用与产物位置。
+
+| 阶段 | 关键命令 / 目标 | 构建链路层 | 主要产物位置 |
+|---|---|---|---|
+| 取源码 | `git clone` / `git checkout` | — | 本地源码根目录 |
+| 装依赖 | `make install-deps` | 入口层 → 系统包 | 系统 `/usr/include`、`/usr/lib` |
+| 配置 | （由 build 目标内部触发）CMake | 配置层 | `build-root/build-vpp*/` |
+| 编译 | `make build` / `make build-release` | 执行层 → 编译层 | `build-root/build-vpp*/` |
+| 安装树 | （随 build 一并生成） | 执行层 | `build-root/install-vpp*/` |
+| 系统安装 | `make install` | 入口层 | `/usr/bin`、`/usr/lib` 等前缀 |
+| 打包 | `make pkg-deb` / `make pkg-rpm` | 入口层 → 打包工具链 | `build-root/` 下的 `.deb`/`.rpm` |
+| 测试 | `make test` | 入口层 | 测试日志与结果 |
+
+> 说明：上表与图中的 `build-root/build-vpp*`、`install-vpp*` 为 debug/release 构建目录的通配写法，确切目录名（如是否含 `_debug`、`-native` 后缀）需对照实际版本核验；`make install-dep` 单数变体、`make test-debug` 等目标名同理。
+
+### 2. 前置条件与环境
+
+**操作系统。** 建议使用该 VPP 版本官方文档明确支持的发行版与版本（版本基准 23.06 / master 下常见为 Ubuntu 20.04/22.04 LTS 或 RHEL 8/9 系，需对照实际版本核验）。选长期支持版本的好处是 `make install-deps` 脚本覆盖最全、编译器版本处在推荐区间。不建议使用滚动更新发行版或过旧系统：前者依赖版本太新容易触发 `-Werror` 类问题，后者编译器/CMake/Python 版本往往不达标。
+
+**硬件资源。** 全量编译（含 DPDK）建议至少 4 核、8 GB 以上内存、20 GB 以上可用磁盘；开启调试符号或做多种构建类型叠加时需要更多。内存不足是并行编译最常见的隐性失败源（编译器被 OOM killer 杀掉，报出误导性的 internal error）。若资源有限，务必限制并行度（见第 5 节）。磁盘要特别留足 `build-root/` 空间：调试构建会同时保留 `.o`、`.so` 与调试符号，体积远大于最终安装包。
+
+**网络与权限。** 构建期需要联网完成三件事：`git clone` 源码、安装依赖包、以及（可能）拉取 DPDK 等外部源码/子模块。安装依赖阶段需要 `sudo`/root 权限；编译阶段建议用普通用户在自己有写权限的目录进行，避免把整棵 `build-root/` 变成 root 所有，给后续增量编译和清理制造权限障碍。若目标环境不能联网，请勿直接照搬本篇步骤，改走 02-03 的离线方案。
+
+**工具链就绪。** 按 02-01 的自检表确认 gcc/clang、CMake、Ninja、python3（含生成所需模块）、内核头文件与 NUMA/udev 开发库就位。本篇从 `make install-deps` 开始，等价于把这些检查交给自动脚本，但心里要清楚脚本背后装的是什么。
+
+**版本基准与可复现性。** 记录三项信息以备复现与排错：源码的 commit/tag（如 `v23.06`，确切标签名需核验）、编译器版本、发行版版本。VPP 在不同分支间构建脚本差异明显，一份在 master 上成功的命令集，切到稳定分支后可能需要调整目标名或依赖。把 `git rev-parse HEAD` 的输出连同构建日志一起归档，是工程实践中的好习惯。
+
+### 3. 分步操作
+
+以下步骤按「取源码 → 装依赖 → 配置与编译 → 产物核对 → 安装/打包 → 测试」组织。命令中的确切目标名、目录名、tag 名均需对照实际版本核验；凡给出通配写法处，以你源码树的实际输出为准。
+
+**Step 1 — 克隆源码。** 从 VPP 官方仓库获取源码。官方主仓库托管在 FD.io 的 Gerrit，另有 GitHub 只读镜像（如 `FDio/vpp`，具体地址以 FD.io 官方文档为准，需对照实际版本核验）。示例：
+
+```bash
+# 使用 GitHub 只读镜像（地址需对照 FD.io 官方文档核验）
+git clone https://github.com/FDio/vpp.git
+cd vpp
+```
+
+克隆后建议先读一遍顶层 `Makefile` 的头部注释与目标列表，确认本版本提供了哪些目标：
+
+```bash
+sed -n '1,80p' Makefile
+grep -nE "^(install-dep|build|build-release|pkg-deb|pkg-rpm|test|wipe)" Makefile
+```
+
+**Step 2 — 切换到目标版本。** 不要默认在 master 上做生产构建，稳定分支/tag 的可复现性更好。标签与分支命名（如 `v23.06`、`stable/2306` 等）需对照实际版本核验：
+
+```bash
+git tag -l | grep -i 23          # 查看可用标签
+git checkout v23.06              # 示例标签，需核验
+git rev-parse HEAD               # 记录 commit，便于复现
+```
+
+**Step 3 — 安装依赖。** 用顶层封装目标自动安装：
+
+```bash
+# 自动检测发行版并安装开发包（需 sudo）
+make install-deps
+# 若本版本目标名为单数：make install-dep（需对照实际版本核验）
+```
+
+这一步对应 02-01 的「依赖安装链」。若脚本因发行版不识别而失败，按 02-01 第 5 节的手工命令补装，再回到此处。完成后用 `pkg-config --exists numa && echo ok`、`python3 -c "import ply"` 等快速自检（命令见 02-01）。
+
+**Step 4 — 执行编译（debug 与 release）。** 顶层 `build` 目标内部会触发 CMake configure（生成 Ninja 文件）与 Ninja 编译链接。debug 构建带调试符号、优化级别低、便于 gdb 调试；release 构建面向性能：
+
+```bash
+# debug 构建（开发/调试用）
+make build
+# release 构建（性能/生产用）
+make build-release
+```
+
+两者会生成各自的构建树与安装树，通常位于 `build-root/` 下形如 `build-vpp_debug-native/`、`install-vpp_debug-native/` 与 `build-vpp_release-native/`、`install-vpp_release-native/` 的目录（确切命名需对照实际版本核验）。这一步会做几件事：编译 `src/vppinfra/`、`src/vlib/`、`src/vnet/`、`src/plugins/`、`src/vpp/` 等组件；调用 python3 + vppapigen 处理 `src/vpp-api/` 的 `.api` 文件生成 C 头与绑定；并在需要时触发 DPDK 的 meson/ninja 子构建。构建日志里看到 cmake、ninja、gcc、python3、meson 交替出现，正对应 02-01 的工具链分层。
+
+若资源紧张，限制并行度（确切传参方式需对照实际版本核验）：
+
+```bash
+# 示例：以较低并发编译，避免内存被打爆
+make build -j4
+# 或设置环境变量后由 ninja 采用（方式需核验）
+# CMAKE_BUILD_PARALLEL_LEVEL=4 make build-release
+```
+
+**Step 5 — 核对产物。** 编译结束后先不急着装，先确认 install 树里确有预期产物：
+
+```bash
+# 以 debug 安装树为例（目录名需核验）
+find build-root/install-vpp_debug-native -maxdepth 2 -type f | head -40
+ls  build-root/install-vpp_debug-native/bin/          # vpp、vppctl、vpp_api_test、vat 等（需核验）
+ls  build-root/install-vpp_debug-native/lib/          # libvppinfra.so、libvnet.so 等
+ls  build-root/install-vpp_debug-native/lib/vpp_plugins/   # 各插件 .so（目录名需核验）
+```
+
+预期能看到：`vpp` 主程序、`vppctl`（CLI 客户端）、各类工具、核心共享库、以及 `vpp_plugins/` 下的插件动态库；由 `.api` 生成的头文件应在 include 目录或 build 树中。若某个预期插件 .so 不在，回到 configure 摘要检查对应可选依赖是否被禁用（这是 02-01 强调的「假成功」）。
+
+**Step 6 — 安装与打包。** 让产物可被系统使用，或做成可分发包：
+
+```bash
+# 安装到系统前缀（通常需 sudo，前缀由 CMake 配置决定）
+sudo make install
+# 构建 .deb 包（Ubuntu/Debian 系；RHEL 系用 make pkg-rpm，目标名需核验）
+make pkg-deb
+# 查看打出的包
+find build-root -name "*.deb" -o -name "*.rpm"
+```
+
+`make pkg-deb` 背后走的是 `build-data/` 与 `extras/` 里的打包元数据与脚本（如 deb control 模板 / rpm spec，确切路径需核验），把 install 树中的文件按包规则装配成 `.deb`。这一步在离线分发场景里尤为重要：打好包即可拷到目标机用 `dpkg -i` 安装，无需在目标机重编（见 02-03）。
+
+**Step 7 — 运行测试。** 用顶层目标跑单元/集成测试，验证产物基本可用：
+
+```bash
+make test
+# 部分版本区分 debug/release 测试目标，如 make test-debug（需核验）
+```
+
+测试会用到编译产物与 Python 测试框架，是「编译成功」之外更强的一道校验。测试目标的确切名称、是否需要先 `make build`、以及测试框架依赖，均需对照实际版本核验。
+
+下表把各步命令、预期产物、验证方式集中列出，便于操作时逐行对照：
+
+| 步骤 | 命令 | 预期产物 / 现象 | 验证方式 |
+|---|---|---|---|
+| 1 | `git clone` | 源码目录 | `ls src/` 见组件目录 |
+| 2 | `git checkout v23.06` | 切到目标版本 | `git rev-parse HEAD` |
+| 3 | `make install-deps` | 系统装上开发包 | `pkg-config`、`python3 -c` 自检 |
+| 4 | `make build` / `build-release` | Ninja 编译链接完成 | 日志无 error，`build-root/` 出现构建树 |
+| 5 | `find`/`ls` 产物 | `vpp`、插件 .so、API 头 | 文件存在且非空 |
+| 6 | `make install` / `pkg-deb` | 系统安装 / `.deb` 包 | `which vpp`、`find -name "*.deb"` |
+| 7 | `make test` | 测试通过或给出结果 | 测试日志 |
+
+### 4. 验证方法与预期结果
+
+编译完成只是「没有报错」，真正的验收要回答四个问题：产物在不在、能不能跑、功能全不全、测试过不过。
+
+**（1）产物完整性。** 按 Step 5 列目录，确认 `bin/` 下有 `vpp` 与 `vppctl`，`lib/` 下有核心库，`vpp_plugins/` 下有插件 `.so`。用 `file build-root/install-vpp_debug-native/bin/vpp` 确认是 ELF 可执行文件，用 `ldd` 看动态库依赖是否都能解析（出现 `not found` 即链接或环境有问题）。
+
+**（2）版本与基本信息。** 直接运行产物查询版本（参数需对照实际版本核验）：
+
+```bash
+build-root/install-vpp_debug-native/bin/vpp --version
+# 或（参数可能不同，需核验）
+build-root/install-vpp_debug-native/bin/vpp -v
+```
+
+预期输出包含 VPP 版本号、构建信息、编译时间等。若报「command not found」或动态库错误，回到上一步查依赖。注意：完整启动 `vpp` 进程涉及大页、网卡绑定、startup.conf 等运行期配置，属于 03/04 全册范围，本篇不展开；这里只做「产物可加载」层面的验证。
+
+**（3）功能完整性（防「假成功」）。** 回看 Step 4 的 CMake configure 摘要，逐个确认目标插件处于构建状态；检查 `vpp_plugins/` 下是否确有你需要的插件（如 DPDK、ACL、NAT 等）。可选依赖缺失导致插件被静默跳过，是编译「成功」却功能残缺的头号原因。
+
+**（4）测试与打包结果。** `make test` 的输出应给出通过/失败统计；`make pkg-deb` 产出的 `.deb` 可用 `dpkg -c xxx.deb` 查看内容清单，确认包含 `vpp`、`vppctl`、库与插件。下表汇总验收项：
+
+| 验收项 | 命令 / 方法 | 预期结果 | 不达标时的含义 |
+|---|---|---|---|
+| 主程序存在 | `ls .../bin/vpp` | 文件存在 | 编译/链接未完成 |
+| 可加载 | `ldd .../bin/vpp` | 无 `not found` | 运行库/环境缺件 |
+| 版本可查 | `vpp --version`（需核验参数） | 输出版本信息 | 产物不完整 |
+| 插件齐全 | `ls .../lib/vpp_plugins/` | 目标插件 .so 在列 | 可选依赖被禁用 |
+| 测试通过 | `make test` | 结果为通过 | 产物或环境异常 |
+| 包内容正确 | `dpkg -c xxx.deb` | 含核心文件 | 打包规则有误 |
+
+### 5. 常见失败与排错
+
+**失败一：`make install-deps` 报「不支持的发行版」或网络超时。** 根因是脚本按 `/etc/os-release` 分支，遇到定制/最小化系统或离线网络即无法继续。修复：按 02-01 第 5 节手工安装依赖清单；离线场景搭建本地 apt/dnf 镜像或预置包缓存（见 02-03）。
+
+**失败二：configure 阶段报 CMake 版本过低或找不到某包。** 根因是编译器/CMake/开发库版本或路径不满足 `CMakeLists.txt` 要求。修复：升级/降级到推荐版本，核对 `pkg-config` 能否找到对应 `.pc` 文件；补装后删除 `build-root/` 下的 `CMakeCache.txt` 重新 configure，避免沿用「未找到」的缓存判定（清理目标如 `make wipe` 需核验）。
+
+**失败三：编译中途 `internal compiler error` 或进程被 kill。** 多数不是编译器 bug，而是并行编译内存不足（OOM）。修复：降低并行度（`make build -j4` 或限制 Ninja 并发，方式需核验），增加 swap 或在内存更大的机器上构建；同时确认磁盘未满（`df -h`）。
+
+**失败四：链接期报 undefined reference 或找不到 `-lnuma`/`-ludev`。** 根因是只装了运行库没装 `-dev`/`-devel` 开发包，或库路径不在链接器搜索范围。修复：补装开发包，确认 `ldconfig` 与 `pkg-config` 能解析；交叉编译时尤其要确认选中的是目标架构的库而非宿主机库（见 02-05）。
+
+**失败五：API 生成失败，报 `ModuleNotFoundError` 或生成头与源码不匹配。** 根因是 Python 生成链缺模块，或切分支后 `build-root/` 中残留旧生成的 API 头。修复：装齐 python3 及生成所需模块（如 ply），清理生成物后重新 configure + build；切换分支后建议整体清理构建树。
+
+**失败六：DPDK 子构建失败。** 表现为 meson/ninja 报错或 DPDK 源码拉取失败。根因多为网络不可达、缺少 meson/ninja、或目标架构依赖未交叉编译。修复：确认 meson/ninja 就位、网络可用或已预置 DPDK 源码（离线见 02-03）、交叉场景用目标工具链（见 02-05）。
+
+**失败七：`make build` 成功但目标插件 .so 缺失。** 这正是 02-01 强调的「假成功」：可选依赖未装，CMake 静默禁用了插件。修复：读 configure 摘要，补装对应依赖，显式打开组件开关后重编。
+
+**失败八：`make pkg-deb` 报缺打包工具或 control 模板错误。** 根因是未装 `dpkg-dev`/`fakeroot`（rpm 场景为 `rpm-build`），或 `build-data/`/`extras/` 下打包元数据与当前版本不匹配。修复：补装打包工具链，核对打包脚本路径（需核验）。
+
+下表把这些失败按「现象 → 根因 → 修复」压缩为速查：
+
+| 现象 | 根因 | 修复 |
+|---|---|---|
+| install-deps 不支持发行版/超时 | 脚本分支不覆盖 / 离线 | 手工装依赖或本地镜像 |
+| CMake 版本过低 / 找不到包 | 工具链或开发库不达标 | 调整版本、清缓存重配 |
+| internal compiler error / 被 kill | 并行编译 OOM | 降并发、加内存/swap |
+| undefined reference | 缺 `-dev` 开发包 | 补装并确认 ldconfig |
+| API 生成失败 | Python 模块缺失/旧生成物 | 装模块、清生成物 |
+| DPDK 子构建失败 | 网络/meson/交叉工具链 | 预置源码、装齐工具、换工具链 |
+| 插件 .so 缺失 | 可选依赖被静默禁用 | 读摘要、补依赖、显式开组件 |
+| pkg-deb 失败 | 缺打包工具/元数据不符 | 补工具、核对脚本路径 |
+
+### 6. 小结
+
+本篇完整走了一遍 VPP 源码编译：`git clone` → 切换版本 → `make install-deps` → CMake configure → `make build` / `make build-release` → 核对 `build-root/` 的 install 树 → `make install` / `make pkg-deb` → `make test`。贯穿全篇的方法论是：把每一步对应到 02-01 的工具链分层，知道产物落在哪、去哪验证、失败时往回查哪一层。特别要记住三点：编译「成功」不等于功能齐全（防可选依赖被静默禁用的假成功）、内存与磁盘是全量编译的隐性约束、切换分支后要清理 CMake 缓存与生成物。
+
+本篇聚焦联网、native、单机构建。若环境无法联网或要求可复现的构建镜像，转 02-03 的官方容器与离线方案；若想搞懂 `Makefile`、`build-data/*.mk`、`build-root/` 之间的关系以及 make 与 cmake/ninja/meson 的分工演进，转 02-04；若目标平台是 aarch64/ARM，转 02-05；若需要按用途定制 debug/release、调试符号、优化级别、asan/ubsan 与覆盖率产物，转 02-06。运行期的启动配置、大页与网卡绑定属于 03/04 全册，本篇只做「产物可加载」层面的最小验证，不重复展开。
+
+## 02-03 官方容器镜像与离线编译方案
+
+### 1. 背景与动机
+
+02-02 演示的是「一台联网、原生架构、干净但自由的主机」上的标准编译。然而真实工程里大量场景并不满足这个前提：持续集成（CI）需要每次都在完全一致的环境中构建，避免「开发机能编、构建机编不了」；企业内网、涉密网络或生产隔离区往往完全不能访问外网，`make install-deps` 那种「边检测边 apt 下载」的模式直接失效；目标机上通常不允许也无需安装编译器、CMake、内核头文件这一整套构建工具链，只希望拷一个包就能装；此外还需要同时维护多个 VPP 版本（如稳定分支与 master）而互不污染系统依赖。这些都指向两个互补的工程化方案——容器镜像与离线编译。
+
+容器方案解决的是「环境一致性与隔离」：把操作系统、编译器、依赖、构建脚本固化进一个镜像，任何人在任何宿主机上拉到同一个镜像，就得到字节级接近的构建环境；不同版本用不同镜像/标签隔离，不会互相踩踏。离线方案解决的是「网络不可达」：把构建期的所有网络依赖——发行版开发包、Python 模块、DPDK 及 external 源码、git 子模块——提前缓存成本地资源，让构建过程只从本地读取。两者经常叠加使用：离线环境里先用一台可联网的机器把依赖「灌」进镜像或缓存目录，再把镜像/缓存拷进内网批量构建。
+
+另一个容易被忽视的动机是交付形态的转变。联网 native 编译的终点是「本机 `make install`」，而在容器/离线场景里，终点应当是「一个可分发的产物」——通常是 `make pkg-deb` / `make pkg-rpm` 打出的 `.deb`/`.rpm`，或是一个已经装好 VPP 的运行镜像。把编译产物做成包，目标机只需 `dpkg -i` / `rpm -i`，既不需要编译器，也不必重跑 CMake，这正是离线部署最经济的路径。理解「构建环境」与「运行环境」的解耦，是本篇贯穿始终的主线：容器/离线把这两者彻底拆开，构建侧追求可复现，运行侧追求最小依赖。
+
+需要提醒的是，容器化「编译」与容器化「运行」是两件事。前者只需要编译器、依赖与源码，产出二进制或包；后者还需要把大页、`vfio-pci`/`uio` 设备节点、网卡、NUMA 等资源透传进容器，涉及 cgroup、设备映射与特权模式，属于部署话题（见 03-04 容器化部署），本篇只在陷阱一节点到为止，不展开运行态配置。
+
+### 2. 核心概念
+
+**镜像分层与可复现构建。** 一个典型的 VPP 构建镜像可自底向上分为：基础 OS 层（固定发行版与版本，如 Ubuntu 22.04）、工具链层（gcc/clang、CMake、Ninja、python3 及模块）、依赖层（内核头文件、libnuma/libudev 开发包、打包工具）、源码层（clone 的 VPP 源码与预置的 DPDK/external 源码）。每一层都应在 Dockerfile 里显式固定版本：基础镜像用具体 tag 而非 `latest`，apt 包尽量锁版本，Python 模块用 `requirements` 固定。可复现构建（reproducible build）的核心就是「消除隐式变量」——编译器版本、依赖版本、源码 commit、构建参数都要可追溯；把这些连同 `git rev-parse HEAD` 一起记录，才能在几个月后回答「这个包到底是怎么编出来的」。
+
+**官方镜像与官方包。** FD.io 社区为 VPP 提供两类官方二进制资产：一是各发行版的软件包仓库（`.deb` / `.rpm`），二是容器镜像（构建用或运行用）。使用官方包的价值在于「省去编译」——若只需部署而非改源码，直接从官方仓库安装稳定版本是成本最低、可复现性最好的选择（升级与版本矩阵见 08-05）。使用官方镜像的价值在于「省去配环境」——镜像里已经装好了 02-01 那套依赖。但要注意：官方二进制/镜像的版本未必与你要的分支一致，且镜像内的编译器与 glibc 版本决定了产物能否在你的目标机上运行（见第 6 节）。凡涉及官方镜像的确切仓库名、标签、包仓库地址，均需对照 FD.io 官方文档与实际版本核验，本篇不编造具体地址。
+
+**离线编译的本质：把网络依赖本地化。** 回顾 02-01 的依赖分类，离线需要处理的是「外部拉取」那一类。可归纳为四个缓存桶：①发行版开发包（`.deb`/`.rpm` 及其依赖闭包），做法是搭本地 apt/dnf 镜像或 `apt-get download` 后 `dpkg -i` 批量装；②Python 模块与生成器依赖（如 ply），做法是 `pip download` 到本地目录后用 `--no-index --find-links` 离线安装；③DPDK 及 external 源码、git 子模块，做法是提前 clone/tarball 化，在构建脚本里把拉取地址改成本地路径；④VPP 源码自身，做成内部 git 镜像或离线 tarball。把这四桶备齐，构建过程就能做到「零外网」。
+
+**构建容器 vs 运行容器 vs 多阶段构建。** 构建容器装全套工具链，体积大，只用来产出包；运行容器只装运行时依赖（libnuma、大页能力、必要的库），从构建产物里拷贝 `vpp`、插件与配置，体积小、攻击面小。用多阶段 Dockerfile（multi-stage build）把两阶段串起来，是兼顾可复现与镜像精简的标准做法：第一阶段 `FROM ... AS builder` 里 `make build-release && make pkg-deb`，第二阶段 `FROM 干净基础镜像` 里只 `COPY --from=builder` 产物并 `dpkg -i`。
+
+**与 02-02 的关系。** 02-02 的步骤在容器/离线里一步不少，只是「依赖从哪来」和「产物往哪去」变了：`make install-deps` 可能被替换为「镜像已预装」或「从本地源安装」，`make build` 与 `make pkg-deb` 照旧，`make install` 通常被 `dpkg -i` 取代。把 02-02 的流程图记住，替换其中两三个节点，就是离线构建流程。
+
+### 3. 关键数据结构与源码位置
+
+本篇的「结构」指构建相关的目录与打包元数据，运行时数据结构字段属 05 全册（字段见 05-xx），不在此重列。容器与离线方案主要围绕下列源码位置展开（确切路径与脚本名需对照实际版本核验）：
+
+| 路径 / 资源 | 作用 | 容器 / 离线中的用途 |
+|---|---|---|
+| `Makefile` | `install-deps`/`build`/`pkg-deb` 等目标 | 构建容器内执行；离线时据此改拉取源 |
+| `extras/` | 辅助脚本、发行版依赖安装脚本、打包资源 | 读 `install_deps` 类脚本抽出离线包清单 |
+| `build-data/` | 平台与打包元数据（deb control 模板 / rpm spec 等） | `make pkg-deb` 装配包时读取 |
+| `build-root/` | 构建与安装产物树 | 多阶段构建里 `COPY --from` 的来源 |
+| `src/vpp-api/` + `src/vppapigen/` | `.api` 定义与生成器 | 离线需确保 python 模块与生成器齐备 |
+| DPDK / external 源码 | 数据面 PMD 依赖 | 离线时改为本地 tarball 或预置目录 |
+| Dockerfile / 打包脚本 | 镜像定义与包装配 | 由集成方在 `extras/` 或仓库构建目录中维护（需核验） |
+
+**离线缓存清单**是本篇最关键的一张「结构表」。它把 02-01 的依赖清单翻译成「离线要预先准备什么」：
+
+| 缓存桶 | 具体内容 | 获取方式（联网侧操作） | 离线侧使用方式 |
+|---|---|---|---|
+| 发行版开发包 | gcc/cmake/ninja/python3/headers/numa/udev/打包工具及其依赖闭包 | `apt-get install --download-only` 或 `apt-get download` / `dnf download --resolve` | 本地 apt/dnf 源或 `dpkg -i *.deb` 批量装 |
+| Python 模块 | ply 及生成器所需模块 | `pip download -d wheels/` | `pip install --no-index --find-links=wheels/` |
+| 外部源码 | DPDK、external 依赖、git 子模块 | 提前 clone / 打包 tarball | 构建脚本改指向本地路径 |
+| VPP 源码 | 目标分支/tag 的完整源码 | `git clone` 或 `git archive` | 内网 git 镜像或离线 tarball |
+| 打包工具链 | dpkg-dev/rpm-build/fakeroot | 随发行版开发包一并缓存 | 容器内 `make pkg-deb` 时使用 |
+
+这张表的价值在于：离线编译的失败，十有八九是某个桶没备齐或版本对不上（尤其依赖闭包——只下载了主包却漏了它依赖的次级包）。逐桶核对，比在构建日志里大海捞针高效得多。
+
+### 4. 关键流程与调用链
+
+**容器构建链**：开发者编写 Dockerfile → `FROM 固定基础镜像` → 安装工具链层与依赖层（等价于把 02-01 的依赖清单固化）→ `COPY` 或 `git clone` 源码 → `make build-release` + `make pkg-deb`（内部仍走 CMake→Ninja→gcc/vppapigen/DPDK meson 那条链）→ 产物落入 `build-root/install-vpp*/` 与 `.deb` →（多阶段）第二阶段只拷贝产物装包，得到精简运行镜像。这条链的关键是把「环境」固化在镜像层里，把「产物」从构建层里抽出来。
+
+**离线构建链**：联网准备机把四个缓存桶灌满 → 打包成离线介质（本地源目录 / tarball / 离线镜像）→ 拷入内网构建机 → 配置本地 apt/dnf 源与本地 pip 源 → 将 CMake/构建脚本里的外部拉取地址改写为本地路径（或用环境变量指向预置 DPDK 源码）→ 执行与 02-02 相同的 `make build` / `make pkg-deb` → 产出 `.deb`/`.rpm` → 拷到目标机 `dpkg -i` 安装。这条链与 02-02 的唯一实质差别，是把「依赖安装」与「外部拉取」两处从网络改成本地。
+
+下面用一张图把「镜像分层 + 离线缓存 + 产物交付」串起来，虚线表示「联网侧准备、离线侧消费」的搬运关系：
+
+:::figure id=02-03-01 | name=容器镜像分层与离线构建交付 | dir=TD
+node b0 "固定基础 OS 镜像<br/>Ubuntu 22.04 (tag 锁定)" gray
+node b1 "工具链层<br/>gcc / cmake / ninja / python3" teal
+node b2 "依赖层<br/>headers / numa / udev / 打包工具" teal
+node b3 "源码层<br/>VPP + 预置 DPDK/external" amber
+node c1 "make build-release<br/>make pkg-deb" blue
+node c2 "build-root/ 产物树<br/>+ .deb / .rpm" purple
+node c3 "运行镜像 / 目标机<br/>dpkg -i 安装" green
+node o1 "离线缓存桶<br/>deb包 / wheels / 源码tarball" red
+node o2 "本地 apt / pip 源<br/>内网 git 镜像" red
+edge b0 -> b1
+edge b1 -> b2
+edge b2 -> b3
+edge b3 -> c1
+edge c1 -> c2
+edge c2 -> c3 "拷贝产物装包"
+edge o1 -> o2 dashed "联网侧准备"
+edge o2 -> b2 dashed "离线侧消费"
+edge o2 -> b3 dashed "离线侧消费"
+:::
+
+> 文字兜底：镜像自底向上为「固定 OS → 工具链 → 依赖 → 源码」四层；源码层上执行 `make build-release`/`make pkg-deb` 生成 `build-root/` 产物与 `.deb`/`.rpm`；产物被拷贝进精简运行镜像或目标机用 `dpkg -i` 安装。离线场景中，联网侧先把「deb 包 / wheels / 源码 tarball」灌入缓存桶，离线侧以本地 apt/pip 源与内网 git 镜像消费这些缓存，替代镜像里原本的在线安装与拉取步骤。
+
+### 5. 配置/命令/代码实例
+
+以下命令给出容器与离线两类操作的骨架。凡涉及官方镜像仓库名、包仓库地址、脚本确切路径与参数，均需对照 FD.io 官方文档与实际版本核验，此处不编造具体地址。
+
+**（1）构建容器 Dockerfile 骨架（多阶段）**：
+
+```dockerfile
+# ===== 阶段一：构建 =====
+FROM ubuntu:22.04 AS builder            # 固定 tag，勿用 latest（需核验支持版本）
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y \
+        build-essential cmake ninja-build git \
+        python3 python3-pip python3-ply \
+        linux-headers-generic libnuma-dev libudev-dev \
+        libpciaccess-dev libunwind-dev \
+        dpkg-dev fakeroot
+COPY vpp-src /src/vpp
+WORKDIR /src/vpp
+# 依赖已随镜像固化，等价于 make install-deps 的结果
+RUN make build-release && make pkg-deb
+
+# ===== 阶段二：运行（精简） =====
+FROM ubuntu:22.04
+RUN apt-get update && apt-get install -y libnuma1 libudev1 && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/vpp/build-root/*.deb /tmp/
+RUN dpkg -i /tmp/*.deb || apt-get -f install -y   # 处理运行依赖（方式需核验）
+```
+
+要点：构建阶段装全套工具链并产出包；运行阶段只装运行时库、从 builder 拷贝 `.deb` 装包，镜像体积与攻击面都显著下降。
+
+**（2）离线介质准备（联网侧）**：
+
+```bash
+# 下载开发包及其依赖闭包（Ubuntu）
+mkdir -p offline/debs && cd offline/debs
+apt-get download build-essential cmake ninja-build python3 python3-ply \
+    linux-headers-generic libnuma-dev libudev-dev dpkg-dev fakeroot
+# 下载 Python 模块 wheel
+mkdir -p ../wheels
+pip download -d ../wheels ply
+# 预置源码与 DPDK/external
+cd .. && git clone --mirror <VPP 官方仓库地址> vpp.git   # 地址需核验
+tar czf vpp-src.tgz -C /path/to vpp
+# 把 offline/ 目录整体刻录/拷贝进内网
+```
+
+**（3）离线构建机侧（内网）**：
+
+```bash
+# 用本地 deb 源批量安装（或 dpkg -i 后 apt-get -f 补依赖）
+sudo dpkg -i offline/debs/*.deb
+sudo apt-get -f install -y                       # 若本地源已配好
+# 离线安装 Python 模块
+pip install --no-index --find-links=offline/wheels/ ply
+# 让构建脚本指向本地预置的 DPDK/external 源码（改写方式需核验）
+export VPP_EXTERNAL_SRC=/opt/offline/external    # 变量名仅为示意，需核验
+cd /opt/vpp && make build-release && make pkg-deb
+```
+
+**（4）目标机交付**：
+
+```bash
+# 拷贝 .deb 到目标机后安装（无需编译工具链）
+sudo dpkg -i vpp_*.deb vpp-plugin-*.deb
+sudo dpkg -l | grep vpp                          # 核对已安装包
+```
+
+下表把容器与离线两种路径的目标、关键动作与产物做个对照：
+
+| 维度 | 容器镜像方案 | 纯离线方案 |
+|---|---|---|
+| 核心目标 | 环境一致、多版本隔离 | 网络不可达时仍能构建 |
+| 依赖来源 | 固化在镜像层 | 本地 apt/dnf 源 + wheels + 源码 tarball |
+| 关键命令 | `docker build` / `make build-release` / `make pkg-deb` | `dpkg -i` / `pip --no-index` / `make build` |
+| 产物形态 | 运行镜像 或 `.deb`/`.rpm` | `.deb`/`.rpm` |
+| 目标机要求 | 有容器运行时 | 只需包管理器，无编译工具链 |
+| 主要风险 | glibc/内核版本与产物不兼容 | 依赖闭包不全、版本对不上 |
+
+### 6. 注意事项、陷阱与最佳实践
+
+**陷阱一：基础镜像用 `latest` 导致不可复现。** `FROM ubuntu:latest` 会在某天突然换基础版本，编译器/glibc 随之变化，昨天能编的今天编不过、或产物在目标机跑不起来。最佳实践：锁定具体 tag，并把 `git rev-parse HEAD`、编译器版本、依赖包版本一并写入构建产物元数据。
+
+**陷阱二：glibc 与内核版本不匹配。** 在较新基础镜像里编译出的 `vpp`，若目标机 glibc 更旧，会报 `GLIBC_x.xx not found`；反过来，构建时用的 `linux-headers` 版本与目标机运行内核不符，可能影响内核相关模块。最佳实践：构建镜像的基础 OS 尽量与最终运行 OS 同代，或在与目标机一致的发行版上构建；这是「构建环境与运行环境要对齐」原则的直接体现。
+
+**陷阱三：离线依赖闭包不全。** 只下载了主包却漏了它的依赖，`dpkg -i` 会报一堆未满足依赖。最佳实践：用 `apt-get download` 配合依赖解析工具，或 `apt-get install --download-only` 让 apt 自动把闭包一并取回；在离线机上先用 `dpkg -i` + `apt-get -f install`（本地源）校验一遍，再开始编译。
+
+**陷阱四：外部拉取地址未改写。** CMake/构建脚本里若仍写着联网 clone DPDK 或 external 依赖，离线构建会卡在拉取超时。最佳实践：先在联网机上把依赖预置为本地目录，再把脚本/环境变量中的拉取地址指向本地路径（确切变量与改写方式需核验）；构建日志里一旦出现 `git clone`/`wget`/`curl` 且目标是外网，就说明还有遗漏。
+
+**陷阱五：容器内外产物权限与用户。** 用 root 在容器内编译，`build-root/` 产物拷到宿主机后属主是 root，后续增量编译或清理可能遇到权限问题。最佳实践：镜像里用非 root 构建用户，或 `docker build` 后 `chown`；多阶段构建只拷贝产物，不把整个构建树带出去。
+
+**陷阱六：把「构建容器」误当「运行容器」直接用。** 构建镜像里装满编译器、头文件、源码，体积大且含大量非运行必需组件；直接拿它跑 VPP 既浪费又扩大安全风险。运行态还额外需要大页、`vfio-pci`/设备节点透传、网卡与 NUMA 资源，这些属于 03-04 容器化部署的范畴（本篇不展开）。最佳实践：坚持多阶段，运行镜像只保留运行时库与产物。
+
+**陷阱七：忽略官方二进制/包的可用性。** 如果只是部署、不改源码，自己从零离线编译往往是过度工程。最佳实践：优先评估官方 `.deb`/`.rpm` 与官方镜像能否直接满足（包仓库与镜像地址需核验），确需定制（打补丁、开特定插件、指定构建类型）再走编译；这能大幅降低内网维护成本。
+
+**陷阱八：版本与包完整性。** 离线介质在多次拷贝中可能损坏或混入错版本。最佳实践：对 tarball 与 `.deb` 做校验和（sha256）并记录，内网 git 镜像固定到具体 commit；交付前在目标机 `dpkg -l` 核对版本与 02-02 记录的源码 commit 一致。
+
+### 7. 小结与延伸阅读
+
+本篇把 02-02 的联网 native 编译，推广到「环境要一致」与「网络不可达」两类工程化场景。核心方法有三条：用固定分层的容器镜像把工具链与依赖固化下来，实现可复现与多版本隔离；用「发行版开发包 / Python wheels / 外部源码 / VPP 源码」四个缓存桶把所有网络依赖本地化；用 `make pkg-deb`/`make pkg-rpm` 把编译产物做成包，让目标机无需编译工具链即可安装。贯穿始终的主线是「构建环境与运行环境解耦」：构建侧追求可复现，运行侧追求精简与最小依赖。
+
+延伸阅读：本篇只讲「编译与打包」，容器化运行所需的大页、设备透传、网卡与 NUMA 配置见 03-04，版本升级与包管理见 08-05；构建类型（debug/release、优化、asan/coverage）如何影响容器内产物的用途见 02-06；交叉编译场景下离线缓存与工具链的叠加见 02-05；构建系统本身的机制（`Makefile`、`build-data`、CMake、Ninja、meson 的分工）见 02-04。startup.conf 全参数与 CLI 全集属 04 全册，本篇不重复展开。
+
+---
+
+## 02-04 构建系统详解
+
+### 1. 背景与动机
+
+很多工程师能照着 `make build` 把 VPP 编出来，却答不上三个问题：顶层到底是 GNU Make、CMake 还是 meson 在驱动编译？`build-data/*.mk` 与 `build-root/` 各自是什么、属于哪一代体系？想新增一个插件、改一个编译选项、或为交叉编译换工具链时，应该动哪个文件？这些问题的答案都在构建系统里。不理解构建系统，就只能停留在「会用」层面：遇到 configure 报错不知查哪、加了组件不生效、改了编译选项被缓存覆盖、交叉编译时工具链切不过去。
+
+理解 VPP 构建系统还有一层特殊难度——它是一段「演进史」的叠加结果。VPP 并非一开始就使用今天这套体系：早期版本采用纯 GNU Make + `build-data/*.mk` 手写片段的方式来描述每个组件该编译哪些 `.c` 文件、链接哪些库；后来为改善可维护性、依赖探测与跨平台能力，主构建迁移到了 CMake（由 CMake 生成 Ninja 或 Makefile 来实际编译）；而作为 VPP 关键依赖的 DPDK，又在自己的版本演进中从旧的 config/Makefile 体系迁移到了 meson + ninja。于是今天的 VPP 源码树里，GNU Make、CMake、Ninja、meson 四种工具并存，各管一段、彼此衔接。若用「VPP 到底用哪个构建系统」这种非此即彼的问法，注定得不到正确答案。
+
+本篇的目标就是把这团看似混乱的关系理清楚：先讲清四种工具的定位与历史/现状差异（这也是理解全册的关键），再拆解 `Makefile`、`build-data/*.mk`、`CMakeLists.txt`、`build-root/`、`src/` 组件目录各自的角色，接着用一张组件/目标依赖图把「make 目标」与「组件编译」两条链连起来，最后给出改动构建配置的正确姿势与常见陷阱。凡涉及具体目标名、目录名、脚本名与 CMake 变量名，均标注「需对照实际版本核验」，并以你手上源码树的 `Makefile`、`CMakeLists.txt`、`build-data/` 实际内容为准。
+
+### 2. 核心概念
+
+**四种工具的定位差异（重点）。** 先把它们放到「元构建 → 执行 → 编译」的坐标系里：
+
+| 工具 | 定位 | 输入 | 输出 | 在 VPP 中的角色 |
+|---|---|---|---|---|
+| GNU Make | 通用构建驱动 / 用户入口 | 顶层 `Makefile` 及规则 | 调用下游工具 | 提供构建 / 打包 / 测试等语义化目标，是「人用的入口」，不再直接驱动每个 `.c` 的编译（见下方命令示例） |
+| CMake | 元构建系统（生成器） | `CMakeLists.txt`、探测结果 | Ninja 文件 / Makefile | 真正的「配置实体」：探测依赖、定义组件与编译选项、生成 `build-root/` 下的构建规则 |
+| Ninja | 低级执行器 | CMake 生成的 `build.ninja` | `.o`/`.so`/可执行文件 | 负责增量判定、并行调度、调用编译器链接器，面向机器、速度优先 |
+| meson | 另一套元构建系统 | `meson.build` | ninja 文件 | 不是 VPP 主构建系统，而是 DPDK 等子项目采用；在 VPP 构建中作为「子构建」出现 |
+| gcc / clang | 编译器 | `.c` + 头文件 | `.o` | 实际把 C 源码编译为目标文件（gnu11/C11，含 GNU 扩展） |
+| python3 + vppapigen | 代码生成 | `.api` 定义 | C 头 / 绑定 | 处理 Binary API 定义，生成编译所需的头文件 |
+
+上表中 GNU Make 单元格里的语义化目标，完整写法如下（目标名与参数以源码树根目录 `Makefile` 为准，需对照实际版本核验；本篇不重列命令全集）：
+
+```bash
+# 顶层 Makefile 的语义化目标（目标名需对照实际版本核验；定义见根目录 Makefile）
+make install-deps          # 安装系统构建依赖
+make build                 # 配置并编译（debug 构建类型）
+make build-release         # 配置并编译（release 构建类型）
+make pkg-deb               # 读 build-data/ 元数据，把安装树装配成 deb 包
+make test                  # 基于 build-root/ 产物运行测试
+```
+
+关键区别有三。其一，**「元构建」与「执行」分离**：CMake 和 meson 都不直接编译，而是先「配置」再「生成」低级构建文件，交给 Ninja 执行；Make 在这里既当入口又（在早期）当过执行器，是历史最久、层次最混的一个。其二，**CMake 与 meson 是同层竞品**，二者解决的是同一类问题（探测 + 生成 ninja 文件），只是被不同项目选中：VPP 主构建选了 CMake，DPDK 选了 meson。其三，**顶层 `Makefile` 今天已退化为 wrapper**：它不描述「某个 `.c` 怎么编」，而是把「装依赖、配置、编译、打包、测试」这些动作封装成目标，内部转调 CMake。这与早期「`build-data/*.mk` 里逐组件列举源文件」的做法有本质不同。
+
+**历史演进脉络。** 大致可划三段（确切时间线与版本边界需对照 FD.io 官方文档核验）：①早期（约 2016—2018 年），纯 GNU Make 时代——`build-data/*.mk` 与 `src/` 各组件下的 makefile 片段手工维护源文件清单、编译标志与链接规则，`Makefile` 直接驱动 gcc；②迁移期（约 2019 年前后），为降低手工维护成本、增强依赖探测与跨平台/交叉编译能力，主构建逐步转向 CMake，构建输出统一收敛到 `build-root/`，Ninja 成为默认执行器；③现状（版本基准 23.06 / master），顶层 Makefile 保留为便捷入口，CMake 为配置实体，Ninja 为执行器，而 DPDK 子项目自带 meson/ninja 构建。DPDK 自身从 Makefile/config 迁移到 meson 的时间线与 VPP 的 CMake 迁移相互交织，最终形成今天「一树四工具」的格局。
+
+**为什么保留顶层 Makefile。** 既然实体是 CMake，为何不直接让用户敲 `cmake -B build-root && ninja`？因为一条 `make build` 隐藏了大量细节：构建类型（debug/release）、安装前缀、组件开关、外部依赖路径、构建目录命名、多步骤串联（configure→build→install→package）。保留 Makefile 作为稳定的人机接口，既照顾了历史习惯，也让 CI 脚本有个不变的入口；CMake 的命令行参数则可以在 Makefile 里集中管理。这是「稳定接口 + 可变实现」的典型工程取舍。
+
+**`build-data/` 与 `build-root/` 的角色转变。** `build-data/*.mk` 在早期是编译规则的载体，在近代版本里更多承担平台/打包元数据等辅助职责（如 deb/rpm 打包用的包列表、平台差异定义），不再是编译规则主载体；`build-root/` 则是 CMake 生成物与安装产物的统一落点，内部按「构建树（build-vpp*）」与「安装树（install-vpp*）」分离（确切目录命名需核验）。把这两者从「早期规则」与「当前产物」的角度区分开，就不难理解为何 `build-data/` 还在、却不再决定 `.c` 怎么编。
+
+### 3. 关键数据结构与源码位置
+
+本篇的「结构」指构建配置与目录组织；运行时结构体逐字段定义属 05 全册（字段见 05-xx），本篇不重列、不展开。下表按「属于哪一代体系」梳理关键文件：
+
+| 文件 / 目录 | 角色 | 体系归属 | 关注点 |
+|---|---|---|---|
+| `Makefile` | 顶层入口目标定义 | 早期延续 + 现状 wrapper | 目标名、`WS_ROOT`/`BUILD_ROOT` 等变量、转调 CMake 的参数 |
+| `CMakeLists.txt`（根 + 各组件） | 配置实体：探测依赖、定义组件/选项 | 现状主体 | `find_package`/`pkg_check_modules`、组件开关、编译标志 |
+| `build-data/*.mk` | 平台/打包元数据 | 早期遗留 → 辅助 | 包列表、平台差异；不再是逐组件编译规则主载体 |
+| `build-root/` | 构建树 + 安装树 | 现状产物落点 | `build-vpp*/`（CMake/Ninja 生成物）、`install-vpp*/`（staging 产物） |
+| `src/vppinfra/` | 基础设施库（vec/pool/hash/时间等） | 组件 | 依赖最少，通常最先编译 |
+| `src/vlib/` | 图节点、主循环、缓冲区 | 组件 | 依赖 vppinfra |
+| `src/vnet/` | 网络协议与接口层 | 组件 | 依赖 vlib/vppinfra |
+| `src/plugins/` | 插件集合（dpdk/acl/nat…） | 组件 | 可选依赖最集中，缺包时易被静默禁用 |
+| `src/vpp-api/` | `.api` 定义与语言绑定 | 组件 | 驱动 vppapigen 生成头 |
+| `src/vpp/` | 主程序入口 | 组件 | 最终链接为 `vpp` |
+| `src/vppapigen/`（或 `src/tools/vppapigen/`） | API 生成器 | 工具 | 确切位置需核验 |
+| `extras/` | 依赖安装脚本、打包资源 | 辅助 | `install_deps` 类脚本、deb/rpm 脚本 |
+
+**组件依赖顺序**是理解编译链的骨架：`vppinfra` 不依赖其他 VPP 组件，是底座；`vlib` 依赖 `vppinfra`；`vnet` 依赖 `vlib` 与 `vppinfra`；`plugins` 依赖 `vnet`/`vlib`/`vppinfra`；`src/vpp/` 主程序链接上述各库并加载插件。与此同时，`src/vpp-api/` 的 `.api` 文件经 vppapigen 生成的头文件，会被多个组件引用——这条「代码生成」支线横切在组件链之上。CMake 正是按这种依赖关系组织目标（target）与链接顺序；读各组件目录下的 `CMakeLists.txt`，就能看到 `target_link_libraries` 一类的依赖声明（确切函数名与写法需核验）。
+
+**`build-root/` 的双树结构**值得单独强调：`build-vpp*/` 里是 CMake 探测结果、`build.ninja`、`.o`、生成的 API 头等中间物；`install-vpp*/` 里是「装好待打包/待安装」的产物（`bin/vpp`、`lib/*.so`、`lib/vpp_plugins/*.so`、`bin/vppctl` 等）。`make install` 与 `make pkg-deb` 都以安装树为源。把「中间物」与「可交付物」分到两棵树，是增量编译、清理与打包互不干扰的关键。
+
+### 4. 关键流程与调用链
+
+构建系统有两条交织的链。
+
+**目标依赖链（横向，用户视角）**：`make install-deps` 准备系统依赖 → `make build`/`make build-release` 触发 CMake configure 并驱动 Ninja 编译 → 产物落入 `build-root/` 双树 → `make install` 把安装树内容拷到系统前缀 / `make pkg-deb`/`make pkg-rpm` 读 `build-data/` 元数据把安装树装配成包 → `make test` 基于产物跑测试。清理类目标（如 `make wipe`，需核验）负责删 `build-root/` 构建树。
+
+**组件编译链（纵向，构建视角）**：CMake 按依赖顺序自底向上组织——先 `vppinfra`，再 `vlib`，再 `vnet`，再 `plugins`，最后链接 `vpp` 主程序；期间 python3 + vppapigen 处理 `src/vpp-api/` 的 `.api` 生成头供各组件 include；DPDK 子项目以 meson/ninja 单独构建后，被 `src/plugins/dpdk/` 引用。Ninja 依据依赖关系做增量判定与并行调度。
+
+下面这张组件/目标依赖图把两条链叠在一起：上半部是 make 目标与配置，下半部是组件依赖与代码生成支线，中间由 CMake/Ninja 衔接（team-lead 指定的关键图）：
+
+:::figure id=02-04-01 | name=VPP 构建目标与组件依赖图 | dir=TD
+node t1 "make install-deps" gray
+node t2 "make build / build-release" blue
+node t3 "make pkg-deb / pkg-rpm" green
+node t4 "make test" red
+node cfg "CMake configure<br/>(CMakeLists.txt)" teal
+node nin "Ninja 执行器<br/>build-root/build-vpp*" teal
+node api "src/vpp-api (.api)<br/>+ vppapigen 生成头" purple
+node c1 "src/vppinfra<br/>基础设施库" amber
+node c2 "src/vlib<br/>图节点/主循环" amber
+node c3 "src/vnet<br/>网络层" amber
+node c4 "src/plugins<br/>含 dpdk 子构建(meson)" amber
+node c5 "src/vpp<br/>主程序 vpp" blue
+node out "build-root/install-vpp*<br/>bin / lib / vpp_plugins" green
+edge t1 -> cfg "备好依赖"
+edge t2 -> cfg
+edge cfg -> nin "生成 build.ninja"
+edge nin -> c1
+edge c1 -> c2 "被链接"
+edge c2 -> c3 "被链接"
+edge c3 -> c4 "被链接"
+edge c3 -> c5 "被链接"
+edge c4 -> c5 "插件加载"
+edge api -> c2 dashed "生成头被 include"
+edge api -> c3 dashed "生成头被 include"
+edge api -> c4 dashed "生成头被 include"
+edge c5 -> out
+edge out -> t3 "装配成包"
+edge out -> t4 "取产物测试"
+:::
+
+> 文字兜底：用户目标 `install-deps`/`build`/`build-release` 汇入 CMake configure，CMake 生成 `build.ninja` 交给 Ninja；Ninja 按 `vppinfra → vlib → vnet → plugins → vpp` 的依赖顺序编译链接，`src/vpp-api` 经 vppapigen 生成的头被多个组件 include，DPDK 以 meson/ninja 子构建参与 `plugins`；最终产物进入 `build-root/install-vpp*` 安装树，供 `pkg-deb`/`pkg-rpm` 装配成包或供 `test` 取用。下表把 make 目标与其触发的构建动作再做一次对应。
+
+| make 目标 | 触发的层 | 主要动作 | 产出 / 影响 |
+|---|---|---|---|
+| `install-deps` | 入口 → 系统包 | 检测发行版装开发包（脚本在 `extras/`，需核验） | 系统具备编译依赖 |
+| `build` | 入口 → CMake → Ninja | debug 配置 + 编译链接 | `build-root/` debug 双树 |
+| `build-release` | 入口 → CMake → Ninja | release 配置 + 编译链接 | `build-root/` release 双树 |
+| `install` | 入口 | 安装树拷到系统前缀 | `/usr/bin`、`/usr/lib` 等 |
+| `pkg-deb` / `pkg-rpm` | 入口 → 打包 | 读 `build-data/` 元数据装配包 | `.deb` / `.rpm` |
+| `test` | 入口 → 测试框架 | 基于产物跑单元/集成测试 | 测试结果 |
+| `wipe` 类清理 | 入口 | 删除构建树（目标名需核验） | 清理 `build-root/` |
+
+> 表中目标名、构建/安装目录命名、清理目标名均需对照实际版本核验；以源码树 `Makefile` 与 `CMakeLists.txt` 实际内容为准。
+
+### 5. 配置/命令/代码实例
+
+理解构建系统后，改动要落在「正确的层」。下面给出几类典型操作的定位方法与命令（确切变量名、开关名、目标名需核验）。
+
+**（1）先读懂这份源码的构建系统**——不要凭记忆改：
+
+```bash
+# 顶层目标与变量
+grep -nE "^[a-zA-Z_-]+:|WS_ROOT|BUILD_ROOT|^install-dep|^build|^pkg-|^test" Makefile | head -60
+# CMake 探测了什么依赖、定义了什么选项
+grep -nE "option\(|find_package|pkg_check_modules|add_subdirectory" CMakeLists.txt | head -60
+# 各组件的依赖关系（以 vnet / plugins 为例）
+grep -rn "target_link_libraries\|add_dependencies" src/vnet/CMakeLists.txt src/plugins/ 2>/dev/null | head -40
+# build-data 里还有哪些 .mk / 打包元数据
+ls build-data/ && head -40 build-data/*.mk 2>/dev/null
+```
+
+**（2）查看当前 CMake 配置与构建类型**：
+
+```bash
+# 读构建树里的缓存，确认实际生效的选项（目录名需核验）
+grep -E "CMAKE_BUILD_TYPE|CMAKE_INSTALL_PREFIX|CMAKE_C_COMPILER" \
+    build-root/build-vpp_debug-native/CMakeCache.txt
+# 直接用 cmake 重新配置（绕过 wrapper 时，参数需与 Makefile 对齐，需核验）
+cmake -S . -B build-root/build-vpp_debug-native -G Ninja -DCMAKE_BUILD_TYPE=Debug
+ninja -C build-root/build-vpp_debug-native -j4
+```
+
+**（3）新增/启用一个组件或插件的正确姿势**：优先改对应组件目录的 `CMakeLists.txt`（用 `add_subdirectory` / 组件声明 / `target_link_libraries` 一类机制，确切写法需核验），或在 CMake 配置里显式打开组件开关，而不是去改 `build-data/*.mk` 或生成的 `build.ninja`。改完重新 configure（必要时清 `CMakeCache.txt`），让 CMake 重新生成规则。
+
+**（4）切换编译器 / 为交叉编译做准备**——这是 02-05 的前置：
+
+```bash
+# 通过 CMake 变量指定编译器（交叉编译时指向 aarch64 工具链，见 02-05）
+cmake -S . -B build-root/build-vpp_debug-native -G Ninja \
+    -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+    -DCMAKE_BUILD_TYPE=Release      # 参数与工具链文件名需核验
+```
+
+**（5）追溯一个目标到底做了什么**——用 make 的干跑（dry-run）看命令展开：
+
+```bash
+make -n build | head -40        # 查看 build 目标展开后的 cmake/ninja 命令
+make -n pkg-deb | head -40      # 查看打包目标调用了哪些脚本
+```
+
+`make -n` 是理解「wrapper 之下到底跑了什么」最直接的手段：它会把 `build` 展开成一串 `cmake`/`ninja` 调用，把 `pkg-deb` 展开成 `extras/` 或 `build-data/` 下的打包脚本调用。建议每位读者对自己手上的源码树都跑一次，把 02-04 的抽象描述与真实命令对上。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**陷阱一：用错「层」改配置。** 最常见的错误是去改 `build-data/*.mk` 或生成的 `build.ninja`/`CMakeCache.txt` 来调整编译选项——前者在近代版本里已不是编译规则主载体，后者是生成物，重新 configure 就会被覆盖。最佳实践：编译规则、组件、选项改 `CMakeLists.txt` 或 cmake 命令行变量；打包元数据才看 `build-data/`；入口动作才动 `Makefile`。
+
+**陷阱二：目标名与目录名随版本漂移。** `make install-deps` 在部分版本可能是 `make install-dep`，构建目录可能是 `build-vpp_debug-native` 之类带不同后缀，清理目标可能是 `wipe`/`wipe-release`/`distclean` 之一，测试目标可能区分 debug/release。这些都必须「对照实际版本核验」。最佳实践：把 `grep -n "^..." Makefile`（见第 5 节）作为每次换分支后的第一件事，不要复用别的分支记下的命令。
+
+**陷阱三：CMake 缓存导致改动不生效。** 补装依赖、换编译器、改选项后，若不清 `build-root/` 里的 `CMakeCache.txt` 重新 configure，CMake 可能沿用旧的「未找到」判定或旧编译器路径，表现为「明明装了依赖还是报错」。最佳实践：结构性改动后删除对应构建树或用清理目标（需核验）整体重配。
+
+**陷阱四：把 meson 当成 VPP 主构建系统。** 看到构建日志里有 meson 就以为要改用 meson 配置 VPP，是概念混淆。meson 只负责 DPDK 等子项目；VPP 主构建是 CMake。最佳实践：分清「主构建（cmake）」与「子构建（meson）」的边界，子构建失败去查 DPDK/meson 侧，主构建失败去查 CMake 侧。
+
+**陷阱五：可选依赖被静默禁用误判为构建系统 bug。** 插件没编出来，往往是 `find_package`/`pkg_check_modules` 没找到依赖而关闭了对应组件（见 02-01、02-02 的「假成功」），并非 CMake 配置错。最佳实践：configure 后读摘要，逐项确认目标组件状态，必要时显式打开开关并指定依赖路径。
+
+**陷阱六：增量构建的陈旧生成物。** 切换分支后，`build-root/` 里由 vppapigen 生成的旧 API 头可能与新源码不匹配，报出「结构体/枚举未定义」类错误。最佳实践：切分支、改 `.api` 定义后清理生成物与构建树再全量构建；CI 里对每个版本用独立构建目录，避免复用。
+
+**陷阱七：绕过 wrapper 直接调 cmake/ninja 时参数不对齐。** 顶层 Makefile 隐藏了构建类型、前缀、组件开关、外部依赖路径等一串参数，手工 `cmake -B` 若漏了关键 `-D`，产物会与 `make build` 不一致。最佳实践：用 `make -n build` 先看清 Makefile 实际传了什么，再决定是否需要绕过；能走 `make build` 就别手工拼 cmake 命令。
+
+**陷阱八：把运行时结构/命令知识混进构建讨论。** 构建系统关心的是「组件怎么编、目标怎么串、产物落哪」，不关心 vlib_buffer_t 怎么布局（字段见 05-xx）、也不关心某条 CLI 的参数（见 04-xx）。保持这一边界，能让构建排错不被无关信息干扰。
+
+### 7. 小结与延伸阅读
+
+本篇回答了开篇三问。其一，顶层是 GNU Make 作为「人用入口」的 wrapper，真正的配置实体是 CMake，执行器是 Ninja，而 meson 只是 DPDK 等子项目的构建系统——「一树四工具，各管一段」。其二，`build-data/*.mk` 是早期 GNU Make 时代编译规则载体的遗留，近代版本里转为平台/打包辅助元数据；`build-root/` 是 CMake 生成物与安装产物的统一落点，按构建树与安装树分离。其三，改配置要落在正确的层：规则/组件/选项改 `CMakeLists.txt`，依赖探测看 `find_package`/`pkg_check_modules`，动作编排看 `Makefile`，打包元数据看 `build-data/`，绝不要改生成的 `build.ninja` 或 `CMakeCache.txt`。
+
+历史脉络上，VPP 主构建经历了「纯 GNU Make + build-data/*.mk → CMake + Ninja」的迁移，DPDK 走的是「Makefile/config → meson + ninja」，两条线交织成今天的格局；理解这段演进，就能明白为什么 `Makefile` 还在、为什么日志里四种工具交替出现。方法上，`make -n build`、`grep` Makefile/CMakeLists、`cat CMakeCache.txt` 是把抽象结构与真实命令对上的三件利器。
+
+延伸阅读：把构建系统真正跑起来的端到端步骤见 02-02；环境依赖清单见 02-01；容器/离线如何复用这套体系见 02-03；换工具链做 aarch64/ARM 交叉编译（本质就是给 CMake 换编译器与 sysroot、给 DPDK 换 meson 交叉文件）见 02-05；构建类型、优化级别、asan/ubsan/覆盖率等编译选项如何注入这套系统见 02-06。运行时机制（见 06 全册）、模块功能（见 07 全册）、配置与命令（见 04 全册）、结构体字段（见 05 全册）均不在本篇范围，交叉引用一律按「字段见 05-xx ｜ 命令见 04-xx ｜ 原理见 06-xx」的约定，不重列。
+
+## 02-05 交叉编译 VPP（aarch64 / ARM）
+
+### 1. 背景与动机
+
+前几篇默认「编译机架构 = 运行机架构」，即 native 编译。但 VPP 的落地场景里有相当一部分并非 x86_64：ARM 服务器（如基于 Neoverse 的云实例）、边缘计算网关、网络 appliances、嵌入式/工控设备、以及部分智能网卡上的配套控制面，越来越多地采用 aarch64（ARM64）。这些平台往往需要交叉编译——在算力更强、工具更全的 x86_64 宿主上，产出能在 aarch64 目标上运行的 VPP 与插件。动机通常有四类：目标设备 CPU/内存/存储有限，跑不动全量编译（VPP 加 DPDK 的编译对资源要求不低，见 02-02）；目标机上根本没有也不该有编译器、CMake、头文件这套构建工具链；CI/CD 需要在同一批 x86 构建机上统一产出多架构产物；以及离线/隔离环境里只有 x86 构建服务器可用。
+
+交叉编译的本质是「用宿主机的工具，产出目标机的二进制」，它把 02-01~02-04 里所有隐含的「本机假设」全部打破。native 编译时，gcc 编出的是宿主架构、链接的是本机 `/usr/lib`、CMake 探测到的是本机库、DPDK 子构建默认也用本机工具链；交叉编译里，这些都必须显式换成目标架构的对应物：编译器换成 `aarch64-linux-gnu-gcc` 一类交叉工具链，头文件与库换成目标架构的 sysroot，CMake 要被告知「别用本机探测结果」，DPDK 的 meson 子构建要配交叉文件，Python 代码生成器又必须在宿主上跑、产出给目标用的头文件。任何一个环节串了架构，都会表现为链接器选错库、`Exec format error`，或更隐蔽的「编译通过但运行即崩」。
+
+正因为交叉编译是「对整套构建体系的压力测试」，它也是检验你是否真正理解 02-04 的最佳试金石：只有清楚 Makefile 是 wrapper、CMake 是配置实体、Ninja 是执行器、meson 只管 DPDK 子项目，才知道该把「换架构」这件事落在哪几处——答案是 CMake 的 toolchain file（主构建）与 meson 的 cross file（DPDK 子构建）两处，外加 sysroot 与 pkg-config 的指向。本篇按「概念 → 关键文件 → 调用链 → 实例 → 陷阱」展开，凡涉及工具链命名、CMake/meson 文件名与变量、组件路径，均标注「需对照实际版本核验」。
+
+### 2. 核心概念
+
+**宿主、目标与三元组。** 交叉编译里要时刻分清三个角色：build（实际跑编译器的机器，通常是 x86_64）、host / target（产物要运行的机器，aarch64）。工具链常用「目标三元组」命名，如 `aarch64-linux-gnu-gcc`、`aarch64-linux-gnu-ld`、`aarch64-linux-gnu-pkg-config`；三元组的具体形式（是否带 `-gnu`/`-none`、是否含 ABI 后缀）取决于所用工具链，需核验。理解三元组是防「串架构」的第一道关：看到日志里出现裸 `gcc` 而非 `aarch64-linux-gnu-gcc`，就要警觉。
+
+**sysroot。** sysroot 是「目标机根文件系统的一个镜像」，里面按 `/usr/include`、`/usr/lib/aarch64-linux-gnu/` 等结构放着目标架构的头文件与库。交叉编译器以 `--sysroot=` 指向它，从而「以为」自己在给目标机编译。VPP 依赖的 libnuma、libudev、libpciaccess、libc 开发包等，都必须是 sysroot 里的 aarch64 版本，绝不能链到宿主机的 x86_64 `.so`——后者是交叉编译最经典的翻车点。准备 sysroot 的方式有：发行版提供的跨架构开发包、用 debootstrap/multistrap 之类工具构建目标根文件系统、或从目标设备直接导出（方式需核验）。
+
+**CMake toolchain file。** 这是把「换架构」注入 VPP 主构建的标准入口（呼应 02-04 的 CMake 配置实体）。一个 toolchain file 里通常声明：`CMAKE_SYSTEM_NAME=Linux`、`CMAKE_SYSTEM_PROCESSOR=aarch64`、`CMAKE_C_COMPILER` 指向交叉 gcc、`CMAKE_SYSROOT` 指向 sysroot、以及 `CMAKE_FIND_ROOT_PATH` 与一系列 `CMAKE_FIND_ROOT_PATH_MODE_*` 变量，用来约束 `find_package`/`find_library` 只在 sysroot 里找、别误用宿主库。configure 时以 `-DCMAKE_TOOLCHAIN_FILE=...` 传入即可。这份文件是「主构建换架构」的落点。
+
+**meson cross file。** DPDK 在较新版本用 meson 构建（见 02-04），它有自己的交叉配置机制：一个 cross file 里声明 `[binaries]` 段的 `c`、`cpp`、`ar`、`strip`、`pkgconfig` 指向交叉工具，以及 `[host_machine]` 段的 `system`/`cpu_family`/`cpu`/`endian`，还可通过 `[built-in options]` 设置 `c_args` 等。VPP 构建 DPDK 子项目时需要让 meson 读到这份 cross file。这是「子构建换架构」的落点——与主构建的 CMake toolchain file 并列、互不替代，正好印证 02-04「CMake 管主构建、meson 管子项目」的分工。
+
+**pkg-config 的交叉陷阱。** 很多依赖靠 `pkg-config` 提供 `.pc` 文件里的头文件与库路径。交叉编译时若 `PKG_CONFIG_PATH` 仍指向宿主机 `/usr/lib/pkgconfig`，`.pc` 里返回的就是 x86_64 路径，链接必然出错。正确做法是使用交叉版 `pkg-config`（如 `aarch64-linux-gnu-pkg-config`）或设置 `PKG_CONFIG_LIBDIR`/`PKG_CONFIG_SYSROOT_DIR`，让它只在 sysroot 里找目标架构的 `.pc`。
+
+**宿主工具 vs 目标工具。** 有一类工具必须在宿主上运行、但其输出给目标用：`vppapigen`（Python 代码生成器，处理 `src/vpp-api/` 的 `.api` 生成 C 头）、CMake 自身、Ninja、meson、python3。它们用宿主架构即可，不能也不该换成 aarch64 版；它们的「产物」（生成的头文件、构建文件）才是给目标编译用的。把「在宿主上跑的生成器」与「给目标编的库」区分开，是交叉编译配置里最容易被忽略、又最关键的观念。这与 02-04 组件链里那条「代码生成支线」正好对应。
+
+### 3. 关键数据结构与源码位置
+
+本篇「结构」指交叉编译涉及的配置与目录，运行时结构体字段属 05 全册（字段见 05-xx），不重列。下表列出关键文件及其在交叉编译中的落点（文件名、路径、变量名需对照实际版本核验）：
+
+| 文件 / 目录 | 作用 | 交叉编译中的配置要点 |
+|---|---|---|
+| CMake toolchain file（集成方自建） | 注入主构建的架构/编译器/sysroot | 声明 `CMAKE_SYSTEM_PROCESSOR`、`CMAKE_C_COMPILER`、`CMAKE_SYSROOT`、`CMAKE_FIND_ROOT_PATH` |
+| meson cross file（集成方自建） | 注入 DPDK 子构建的交叉设置 | `[binaries]` 指向交叉工具链，`[host_machine]` 声明 aarch64 |
+| `CMakeLists.txt`（根 + 组件） | 定义组件、依赖探测、编译选项 | 确认 `find_package`/`pkg_check_modules` 受 `CMAKE_FIND_ROOT_PATH` 约束 |
+| `Makefile` | 顶层入口 wrapper | 是否支持透传 `CMAKE_TOOLCHAIN_FILE` 等参数（需核验）；必要时绕过 wrapper 直接 cmake |
+| `src/vpp-api/` + `src/vppapigen/` | `.api` 定义与生成器 | 生成器在宿主运行，生成头给目标组件 include |
+| `src/plugins/dpdk/` | DPDK 插件 | 引用按目标架构交叉编译出的 DPDK |
+| sysroot（外部准备） | 目标架构头文件与库 | 含 aarch64 版 libnuma/libudev/libpciaccess/libc 等 |
+| `build-root/` | 构建树 + 安装树 | 产出为 aarch64 ELF；建议用独立目录名区分交叉构建 |
+| `extras/` / `build-data/` | 依赖脚本 / 打包元数据 | 交叉打包时目标架构字段要正确（如 deb 的 Architecture） |
+
+**产物架构的判定**应作为交叉编译的常规检查：用 `file build-root/install-vpp*/bin/vpp` 应看到 `ARM aarch64` 一类的字样，而非 `x86-64`；`readelf -h`/`readelf -d` 可进一步确认机器类型与依赖库路径。把这条检查写进 CI，能在产物交付前拦下绝大多数「串架构」事故。
+
+下表把「native 编译假设 → 交叉编译要换成什么」逐项对照，便于逐条核对配置：
+
+| 环节 | native 编译（隐式） | 交叉编译（必须显式） |
+|---|---|---|
+| 编译器 | 宿主 `gcc` | `aarch64-linux-gnu-gcc`（经 CMake toolchain file） |
+| 头文件/库 | 本机 `/usr/include`、`/usr/lib` | 目标 sysroot 内的 aarch64 版本 |
+| 依赖探测 | CMake 查本机 | 查 sysroot（`CMAKE_FIND_ROOT_PATH` 约束） |
+| pkg-config | 本机 `.pc` | 交叉 pkg-config + `PKG_CONFIG_LIBDIR` |
+| DPDK 子构建 | meson 本机配置 | meson cross file 指定目标工具链 |
+| 代码生成器 | 宿主 python3/vppapigen | 仍用宿主，产物给目标用 |
+| 产物架构 | 宿主架构 | aarch64 ELF（`file` 验证） |
+
+### 4. 关键流程与调用链
+
+交叉编译的完整调用链可拆为「准备 → 双构建 → 交付」三段：
+
+**准备段**：在 x86 宿主上安装交叉工具链 → 准备/挂载目标 aarch64 sysroot（含全量开发库）→ 编写 CMake toolchain file 与 meson cross file → 配置交叉版 pkg-config 路径 →（离线场景）预置目标架构的 DPDK/external 源码。这一段几乎全在 02-01「环境准备」的延长线上，只是把「本机依赖」换成「目标架构依赖」。
+
+**双构建段**：`make build` / `cmake -DCMAKE_TOOLCHAIN_FILE=...`（主构建）→ CMake 用交叉 gcc 探测 sysroot 内依赖、生成 `build.ninja` → Ninja 调用 `aarch64-linux-gnu-gcc` 编译 `vppinfra/vlib/vnet/plugins/vpp` 等组件；同时 python3 + vppapigen 在宿主上处理 `.api`、生成头供目标组件 include；DPDK 子构建通过 meson cross file 用目标工具链编出 aarch64 版 DPDK，被 `src/plugins/dpdk/` 引用。主构建与子构建两条线各自换架构、彼此独立（再次呼应 02-04）。
+
+**交付段**：产物落入 `build-root/` 的 aarch64 安装树 → `make pkg-deb` 装配成标记 `Architecture: arm64` 的包（字段需核验）→ 拷到目标机 `dpkg -i`，或在 QEMU/目标板上验证运行。运行态的大页、网卡绑定等仍属 03/04 全册，但目标架构（如 ARM 上的 NUMA/大页粒度、IOMMU 支持）需在部署时确认。
+
+下面用一张交叉编译流程图把「宿主准备 → 主构建(CMake) / 子构建(meson) 双线 → 目标产物」串起来，虚线表示「宿主工具生成、给目标组件消费」这类跨架构依赖（team-lead 指定的关键图）：
+
+:::figure id=02-05-01 | name=VPP aarch64 交叉编译流程 | dir=TD
+node h1 "x86 宿主<br/>安装 aarch64 交叉工具链" blue
+node h2 "目标 sysroot<br/>aarch64 头文件与库" gray
+node h3 "CMake toolchain file<br/>交叉编译器 + sysroot" teal
+node h4 "meson cross file<br/>DPDK 子构建配置" teal
+node gen "宿主工具<br/>python3 + vppapigen 生成头" purple
+node c1 "cmake configure (交叉)<br/>find 只查 sysroot" teal
+node c2 "ninja → aarch64-gcc<br/>编译各组件" amber
+node c3 "DPDK (aarch64)<br/>meson + ninja 子构建" amber
+node out "build-root/<br/>aarch64 安装树 (ELF)" green
+node pkg "make pkg-deb<br/>Architecture: arm64" blue
+node ver "目标机 / QEMU<br/>file + 运行验证" red
+edge h1 -> h3
+edge h2 -> h3
+edge h1 -> h4
+edge h2 -> h4
+edge h3 -> c1 "-DCMAKE_TOOLCHAIN_FILE"
+edge c1 -> c2 "交叉 gcc"
+edge gen -> c2 dashed "生成头供 include"
+edge h4 -> c3 "meson --cross-file"
+edge c3 -> c2 dashed "目标 DPDK 被引用"
+edge c2 -> out
+edge out -> pkg
+edge out -> ver dashed "拷到目标验证"
+edge pkg -> ver
+:::
+
+> 文字兜底：宿主侧准备交叉工具链、目标 sysroot、CMake toolchain file 与 meson cross file；主构建经 CMake toolchain file 用交叉 gcc 编译各组件，宿主上的 vppapigen 生成头供目标组件 include；DPDK 经 meson cross file 编出 aarch64 版并被 plugins 引用；产物进入 `build-root/` 的 aarch64 安装树，打包成 `Architecture: arm64` 的 `.deb` 后在目标机或 QEMU 上用 `file` 与运行验证。
+
+### 5. 配置/命令/代码实例
+
+以下命令与文件内容为典型骨架，确切的工具链名、包名、变量名、文件名与路径均需对照实际版本核验。
+
+**（1）安装交叉工具链（Ubuntu 宿主）**：
+
+```bash
+sudo apt-get install -y \
+    gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+    binutils-aarch64-linux-gnu \
+    crossbuild-essential-arm64
+# 验证交叉编译器可用
+aarch64-linux-gnu-gcc --version | head -1
+```
+
+**（2）CMake toolchain file 骨架（`aarch64-toolchain.cmake`）**：
+
+```cmake
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR aarch64)
+set(CMAKE_SYSROOT /opt/sysroot/aarch64)
+set(CMAKE_C_COMPILER   aarch64-linux-gnu-gcc)
+set(CMAKE_CXX_COMPILER aarch64-linux-gnu-g++)
+# 只在 sysroot 内查找依赖，避免误用宿主库
+set(CMAKE_FIND_ROOT_PATH /opt/sysroot/aarch64)
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)   # 生成器等程序仍用宿主
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+```
+
+> 注意 `PROGRAM` 设为 `NEVER`：让 CMake 找 python3、vppapigen 这类「在宿主上跑的程序」时仍用宿主工具，而库/头/包只在 sysroot 里找。这正是第 2 节「宿主工具 vs 目标工具」的落地。
+
+**（3）meson cross file 骨架（`aarch64-meson.cross`）**：
+
+```ini
+[binaries]
+c = 'aarch64-linux-gnu-gcc'
+cpp = 'aarch64-linux-gnu-g++'
+ar = 'aarch64-linux-gnu-ar'
+strip = 'aarch64-linux-gnu-strip'
+pkgconfig = 'aarch64-linux-gnu-pkg-config'
+
+[host_machine]
+system = 'linux'
+cpu_family = 'aarch64'
+cpu = 'aarch64'
+endian = 'little'
+```
+
+**（4）配置交叉版 pkg-config 与主构建**：
+
+```bash
+# 让 pkg-config 只返回 sysroot 里目标架构的 .pc
+export PKG_CONFIG_LIBDIR=/opt/sysroot/aarch64/usr/lib/aarch64-linux-gnu/pkgconfig
+export PKG_CONFIG_SYSROOT_DIR=/opt/sysroot/aarch64
+# 方式一：走顶层 wrapper（若支持透传，需核验）
+make build-release CMAKE_TOOLCHAIN_FILE=/path/aarch64-toolchain.cmake
+# 方式二：绕过 wrapper 直接 cmake（参数需与 Makefile 对齐，需核验）
+cmake -S . -B build-root/build-vpp_aarch64 -G Ninja \
+    -DCMAKE_TOOLCHAIN_FILE=/path/aarch64-toolchain.cmake \
+    -DCMAKE_BUILD_TYPE=Release
+ninja -C build-root/build-vpp_aarch64
+```
+
+（5）**让 DPDK 子构建使用 cross file**：具体注入方式（环境变量、`extras/` 脚本参数或构建配置变量）需对照实际版本核验；原则上等价于让 meson 以 `--cross-file /path/aarch64-meson.cross` 配置 DPDK。先用 `make -n build` 看清子构建的实际调用，再决定改哪一处。
+
+**（6）产物架构验证**：
+
+```bash
+file build-root/install-vpp_aarch64/bin/vpp        # 期望 ARM aarch64，非 x86-64
+readelf -h build-root/install-vpp_aarch64/bin/vpp | grep Machine
+aarch64-linux-gnu-readelf -d build-root/install-vpp_aarch64/bin/vpp | grep NEEDED
+# 打包后核对架构字段（需核验）
+dpkg-deb -f vpp_*.deb Architecture
+```
+
+下表把交叉编译各步骤的「命令 / 期望现象 / 串架构信号」列成速查：
+
+| 步骤 | 命令 / 文件 | 期望现象 | 串架构信号 |
+|---|---|---|---|
+| 工具链 | `aarch64-linux-gnu-gcc --version` | 交叉编译器可用 | 输出宿主 gcc 或无此命令 |
+| 依赖探测 | cmake configure 日志 | 找到 sysroot 内 aarch64 库 | 找到 x86_64 `/usr/lib` 库 |
+| 编译 | `ninja -C ...` 日志 | 调用交叉 gcc | 出现裸 `gcc` |
+| 生成头 | vppapigen 阶段 | 宿主生成头成功 | 试图跑 aarch64 版 python |
+| 产物 | `file .../bin/vpp` | ARM aarch64 | x86-64 或 Exec format error |
+
+### 6. 注意事项、陷阱与最佳实践
+
+**陷阱一：宿主库与目标库串线。** 最常见也最危险。CMake 的 `find_library` 或 `pkg-config` 若指回宿主机，链接器会把 x86_64 的 `libnuma.so` 链进 aarch64 产物，报「skipping incompatible ...」或链接失败。最佳实践：toolchain file 里把 `CMAKE_FIND_ROOT_PATH_MODE_LIBRARY/INCLUDE/PACKAGE` 设为 `ONLY`，并正确配置 `PKG_CONFIG_LIBDIR`/`PKG_CONFIG_SYSROOT_DIR`；configure 后读日志逐项确认依赖来源路径。
+
+**陷阱二：把生成器也交叉了。** vppapigen、CMake、Ninja、meson、python3 必须在宿主运行。若误让 `CMAKE_FIND_ROOT_PATH_MODE_PROGRAM=ONLY` 把它们也限定到 sysroot，或试图用 aarch64 版 python，会直接报「无法执行二进制文件」。最佳实践：`PROGRAM` 设为 `NEVER`，保留宿主工具链跑生成器与构建工具。
+
+**陷阱三：DPDK 子构建没换架构。** 只给主构建配了 CMake toolchain file，DPDK 仍用 meson 本机配置编出 x86_64 版，最终插件链接失败或运行异常。最佳实践：主构建（CMake toolchain）与子构建（meson cross file）两处都要配，缺一不可——这是 02-04「双构建体系」在交叉场景下的直接后果。
+
+**陷阱四：sysroot 依赖不全。** 只装了 libnuma、漏了 libudev/libpciaccess 或其次级依赖，configure 阶段可能静默禁用插件（又是「假成功」），或链接期报缺库。最佳实践：用 02-01 的依赖清单逐项确认 sysroot 里有对应 aarch64 开发包；宁可先全装，再按需裁剪。
+
+**陷阱五：`-march`/指令集与目标 CPU 不匹配。** 在宿主上习惯性加了 `-march=native`，会把 x86 指令集编进产物（或交叉编译时根本不合法）；即便用 `-march=armv8-a+...` 之类，也要与目标板实际支持的扩展（如 NEON、CRC、crypto）一致，否则运行到不支持的指令会 SIGILL。最佳实践：交叉编译时用目标 CPU 明确支持的架构参数，勿沿用 x86 的 `-march=native`；不确定时先用保守的通用 aarch64 基线。
+
+**陷阱六：大页、IOMMU、内核与 glibc 版本。** 产物能跑起来还依赖目标机内核支持 `vfio-pci`/IOMMU、配置好大页、且 glibc 版本不低于构建 sysroot（否则 `GLIBC_x.xx not found`，与 02-03 同源）。最佳实践：sysroot 与目标机系统同代；部署阶段按 03 全册确认大页与设备绑定；ARM 平台的 NUMA/大页粒度与 x86 可能不同，需实测。
+
+**陷阱七：产物架构未验证就交付。** 交叉编译最容易「看似成功、其实编出宿主架构」。最佳实践：把 `file .../bin/vpp` 期望输出 `ARM aarch64` 写进 CI 断言；条件允许时用 QEMU 用户态模拟或目标板做一次冒烟启动（运行态配置见 03/04 全册）。
+
+**陷阱八：交叉构建目录与 native 混用。** 复用同一个 `build-root/build-vpp*/` 目录，CMakeCache 里残留的宿主编译器/探测结果会让交叉配置不生效。最佳实践：为交叉编译使用独立命名的构建目录（如 `build-vpp_aarch64`），切换架构前清理缓存。
+
+### 7. 小结与延伸阅读
+
+本篇把 VPP 编译从 native 推广到 aarch64/ARM 交叉编译。核心结论是「换架构落在两处、分清两类工具」：主构建用 CMake toolchain file 换编译器与 sysroot，DPDK 子构建用 meson cross file 换目标工具链（正是 02-04 双构建体系的必然要求）；CMake/Ninja/meson/python3/vppapigen 等「在宿主上跑的程序」保持宿主架构，只有被编译的库、头文件、sysroot 与最终产物换成 aarch64。sysroot 完整性、pkg-config 指向、生成器归属、DPDK 交叉、产物架构验证，是贯穿全篇的五个检查点。
+
+延伸阅读：本篇的每一步都建立在 02-01 的依赖分类、02-02 的编译流程、02-04 的构建系统机制之上；离线叠加交叉时，四个缓存桶（02-03）里要换成目标架构的开发包与依赖；交叉编译出的产物同样可以按 02-06 选择 debug/release 与优化/诊断选项；目标机上真正把 VPP 跑起来（大页、网卡绑定、startup.conf）属 03/04 全册，本篇不展开。运行时机制（06 全册）、结构体字段（05 全册）、模块功能（07 全册）、CLI 全集（04 全册）均不在本篇范围。
+
+---
+
+## 02-06 构建类型与编译优化
+
+### 1. 背景与动机
+
+同一份 VPP 源码，可以编出用途迥异的产物：开发阶段需要带完整调试符号、几乎不优化的二进制，方便 gdb 单步、看变量、定位逻辑错误；性能压测与生产部署需要充分优化、体积精简的产物，追求吞吐与 PPS；排查偶发内存越界、use-after-free 时，需要 ASan/UBSan 这类插桩构建；做测试覆盖率度量、CI 质量门禁时，又需要 gcov/lcov 的覆盖率构建。若把所有需求都塞进「一种构建」，结果往往是「调试版跑不出真实性能、压测版又没法排错」——用错构建类型，会直接导致结论失真：拿 debug 版测吞吐没有意义，拿 release 版查变量又看不到符号。
+
+这引出一个常被忽视的方法论问题：**结论必须与其所用构建类型绑定**。「VPP 在这台机器上能跑 X Mpps」这句话，脱离了构建类型（优化级别、是否开断言、是否插桩）几乎没有可比性（性能基准方法学见 08-01）。同理，一个只在 release 下出现的偶发崩溃，用 debug 版往往复现不了——优化会改变内存布局与时序。工程上因此需要「同一源码、多套构建类型、各自独立产物」的能力，并在记录实验数据时注明用的是哪一套。
+
+VPP 的构建体系（02-04）天然支持这种分化：顶层 `make build` 与 `make build-release` 就对应 debug 与 release 两套构建类型，二者在 `build-root/` 下用不同的构建树与安装树，互不干扰；更细的优化、诊断、覆盖率选项，则通过 CMake 的编译标志注入这套体系。本篇讲清「有哪些构建类型、各自改了什么、如何注入、有什么代价」，并给出一张构建类型对比图。凡涉及具体编译标志、CMake 变量、目标名与产物目录命名，均标注「需对照实际版本核验」。
+
+### 2. 核心概念
+
+**构建类型（build type）的本质是一组编译/链接选项的集合。** 在 CMake 体系里由 `CMAKE_BUILD_TYPE` 及对应的 `CMAKE_C_FLAGS_<TYPE>` 控制；顶层 Makefile 的 `build` / `build-release` 只是把这套选择封装成便捷目标（wrapper，见 02-04）。区分 debug 与 release 的关键是四个维度：
+
+| 维度 | debug | release |
+|---|---|---|
+| 优化级别 | `-O0`（或 `-Og`），几乎不优化 | `-O2`（或 `-O3`），充分优化 |
+| 调试符号 | `-g`，完整符号 | 通常 `-g` 可选 / 可剥离（见第 6 节） |
+| 断言 | 开启（NDEBUG 未定义） | 通常关闭（`-DNDEBUG`） |
+| 用途 | gdb 调试、逻辑排错 | 性能压测、生产部署 |
+
+**常见优化选项。** `-O2` 是稳妥的默认，平衡性能与编译时间/代码体积；`-O3` 更激进（更多内联、向量化、循环变换），但对 VPP 这类指令 cache 敏感的数据面程序未必更快——代码膨胀可能抬高 i-cache 缺失率（见第 6 节）；`-Ofast` 放宽 IEEE 浮点语义，对网络转发意义有限且可能引入语义偏差；`-march=<arch>` / `-mtune=<cpu>` 针对目标 CPU 生成指令（native 时常用 `-march=native`，但会牺牲可移植性，交叉编译时尤其危险，见 02-05）；LTO（链接时优化，`-flto`）跨编译单元优化，可能带来收益但显著拖慢链接、加大调试难度；PGO（profile-guided optimization）基于采样反馈优化，流程复杂，是否纳入 VPP 官方构建需核验。以上选项是否由 VPP 默认启用、以何种变量暴露，均需对照实际版本核验。
+
+**调试与诊断类构建。** 其一是**调试符号**：`-g` 保留符号，`-g3` 连宏信息也保留；生产构建可「编译带 `-g`、交付前 `objcopy --only-keep-debug` 分离出符号包」，兼顾可运行体积与事后可调试（见第 5 节）。其二是 **perf map / perf 支持**：让 `perf` 能把采样地址映射回符号，配合 `-fno-omit-frame-pointer` 保留帧指针更利于栈回溯。其三是 **Sanitizer**：ASan（AddressSanitizer，`-fsanitize=address`）检测内存越界、use-after-free、泄漏；UBSan（`-fsanitize=undefined`）检测未定义行为；TSan 检测数据竞争（对 VPP 多线程模型有用，但与 ASan 通常不共存）。其四是**覆盖率**：`--coverage` / `-fprofile-arcs -ftest-coverage` 插桩，配合 gcov/lcov 生成覆盖率报告。插桩类构建会显著改变性能与内存行为，只用于诊断，绝不能拿来测性能。
+
+**构建类型如何注入体系（呼应 02-04）。** 入口是 `CMAKE_BUILD_TYPE` 与各类 `CMAKE_C_FLAGS*`；顶层 Makefile 的 `build`/`build-release` 设定好对应值再转调 CMake；自定义类型（如 asan、coverage）可通过 cmake 命令行 `-D` 传标志，或写一份 CMake toolchain/preset 文件。产物按构建树分离在 `build-root/build-vpp*/` 与 `install-vpp*/`，这是多套构建类型能共存、互不覆盖的基础。
+
+### 3. 关键数据结构与源码位置
+
+本篇「结构」指编译选项相关的配置位置，运行时结构体字段属 05 全册（字段见 05-xx），不重列。下表列出与构建类型相关的关键位置（文件名、变量名、目录名需对照实际版本核验）：
+
+| 位置 | 作用 | 关注点 |
+|---|---|---|
+| 根 `CMakeLists.txt` / `src/cmake/` | 定义编译标志、构建类型默认值 | `CMAKE_C_FLAGS`、`add_compile_options`、构建类型分支（写法需核验） |
+| 顶层 `Makefile` | `build` / `build-release` 目标 | 各目标传给 CMake 的 `CMAKE_BUILD_TYPE` 与额外参数 |
+| `build-root/build-vpp*/CMakeCache.txt` | 记录本构建树实际生效的配置 | `CMAKE_BUILD_TYPE`、`CMAKE_C_FLAGS*` 的实际值 |
+| `build-root/build-vpp*/build.ninja` | Ninja 规则（生成物，勿手改） | 每条编译命令里的 `-O`/`-g`/`-fsanitize` |
+| `build-root/install-vpp*/` | 各类型独立的安装树 | debug/release 产物分开，避免相互覆盖 |
+| `extras/` / `build-data/` | 打包元数据 | release 包是否剥离符号、是否带独立符号包（需核验） |
+
+**验证「当前产物到底用了什么选项」**是工程实践中的关键动作：一是读 `CMakeCache.txt` 里的 `CMAKE_BUILD_TYPE` 与 flags；二是用 `make -n build` 或查看 `build.ninja` 里实际编译命令的 `-O`/`-g`；三是对产物本身，用 `readelf -S`/`file`/`nm` 判断是否带调试符号、用 `strings` 或依赖检查判断是否带了 asan 运行库（`libasan.so`）。把「配置声明」与「产物实际」双向核对，能避免「以为编了 release、其实是 debug」这类事故。
+
+下表把构建类型、典型标志、产物特征与用途集中列出（标志需核验）：
+
+| 构建类型 | 典型标志 | 产物特征 | 用途 | 主要代价 |
+|---|---|---|---|---|
+| Debug | `-O0 -g`（断言开） | 体积大、带符号、慢 | gdb 调试、逻辑排错 | 性能远低于真实 |
+| Release | `-O2/-O3`（`-DNDEBUG`） | 优化、可剥离符号 | 压测、生产 | 难单步调试 |
+| Release+符号 | `-O2 -g` 后分离符号 | 运行二进制精简 + 独立符号包 | 生产可事后调试 | 构建/打包多一步 |
+| ASan/UBSan | `-fsanitize=address/undefined` | 带插桩、依赖 sanitizer 运行库 | 内存/UB 排错 | 内存与性能开销大 |
+| Coverage | `--coverage` / gcov 插桩 | 带覆盖率计数 | 测试覆盖率度量 | 性能下降明显 |
+
+### 4. 关键流程与调用链
+
+不同构建类型的流程是「同源分流」：都从 `src/` 同一份源码出发，经 CMake 按 `CMAKE_BUILD_TYPE`/flags 生成不同的 `build.ninja`，Ninja 调用带不同 `-O`/`-g`/`-fsanitize` 的编译器命令，产出落入 `build-root/` 下各自独立的构建树与安装树，最终服务于不同用途（gdb / 压测 / 排错 / 覆盖率报告）。要点是「配置层一次选择、执行层各自展开、产物层彼此隔离」。
+
+下面用一张构建类型对比图把这种「同源、多配置、分用途」的结构画出来（team-lead 指定的关键图），虚线表示所有类型都落入各自独立的构建树：
+
+:::figure id=02-06-01 | name=VPP 构建类型与编译优化对比 | dir=TD
+node src "同一份 VPP 源码<br/>src/ 组件" gray
+node cm "CMake 配置层<br/>CMAKE_BUILD_TYPE + flags" teal
+node d "Debug<br/>-O0 -g 断言开" blue
+node r "Release<br/>-O2/-O3 符号可选" green
+node a "ASan / UBSan<br/>-fsanitize 插桩" amber
+node cov "Coverage<br/>--coverage 插桩" purple
+node br "build-root/<br/>各自独立构建树/安装树" gray
+node u1 "gdb 调试 / 逻辑排错" blue
+node u2 "性能压测 / 生产部署" green
+node u3 "内存越界 / UB 排查" amber
+node u4 "测试覆盖率报告" purple
+edge src -> cm
+edge cm -> d
+edge cm -> r
+edge cm -> a
+edge cm -> cov
+edge d -> u1
+edge r -> u2
+edge a -> u3
+edge cov -> u4
+edge d -> br dashed "独立目录"
+edge r -> br dashed "独立目录"
+edge a -> br dashed "独立目录"
+edge cov -> br dashed "独立目录"
+:::
+
+> 文字兜底：同一份 `src/` 源码经 CMake 配置层按 `CMAKE_BUILD_TYPE` 与编译标志分流为 Debug（`-O0 -g`，用于 gdb 调试）、Release（`-O2/-O3`，用于压测/生产）、ASan/UBSan（插桩，用于内存与未定义行为排查）、Coverage（`--coverage`，用于覆盖率报告）四类；每类在 `build-root/` 下使用独立的构建树与安装树，产物互不覆盖。
+
+### 5. 配置/命令/代码实例
+
+**（1）用顶层目标选择 debug / release**（最简单，推荐日常使用）：
+
+```bash
+make build            # debug 构建（开发调试）
+make build-release    # release 构建（压测/生产）
+# 分别核对两套构建树实际生效的配置（目录名需核验）
+grep -E "CMAKE_BUILD_TYPE|CMAKE_C_FLAGS" \
+    build-root/build-vpp_debug-native/CMakeCache.txt
+grep -E "CMAKE_BUILD_TYPE|CMAKE_C_FLAGS" \
+    build-root/build-vpp_release-native/CMakeCache.txt
+```
+
+**（2）用 cmake 直接指定构建类型与优化级别**（需与 Makefile 参数对齐，需核验）：
+
+```bash
+cmake -S . -B build-root/build-vpp_release-native -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_FLAGS_RELEASE="-O3 -g -DNDEBUG"
+ninja -C build-root/build-vpp_release-native
+```
+
+**（3）构建 ASan/UBSan 诊断版**（编译与链接都要带标志，确切写法需核验）：
+
+```bash
+cmake -S . -B build-root/build-vpp_asan -G Ninja \
+    -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_C_FLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" \
+    -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+    -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
+ninja -C build-root/build-vpp_asan
+# 运行前按需设置 sanitizer 运行选项（方式需核验）
+# ASAN_OPTIONS=detect_leaks=1 ... build-root/install-vpp_asan/bin/vpp ...
+```
+
+**（4）覆盖率构建与报告**：
+
+```bash
+cmake -S . -B build-root/build-vpp_cov -G Ninja \
+    -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_C_FLAGS="--coverage -O0 -g" \
+    -DCMAKE_EXE_LINKER_FLAGS="--coverage"
+ninja -C build-root/build-vpp_cov
+# 跑测试后用 gcov/lcov 生成报告（工具链需预先安装，命令需核验）
+# lcov --capture --directory build-root/build-vpp_cov --output-file cov.info
+# genhtml cov.info --output-directory cov-report
+```
+
+**（5）生产 release 保留可调试性：分离调试符号**：
+
+```bash
+# 编译带 -g，交付前分离符号（命令需核验）
+objcopy --only-keep-debug vpp vpp.debug
+strip --strip-debug vpp
+objcopy --add-gnu-debuglink=vpp.debug vpp
+# 线上二进制精简，vpp.debug 单独归档供事后 gdb 加载
+```
+
+**（6）perf 友好的 release 构建**：在 release 标志里加 `-fno-omit-frame-pointer`（必要时配合 `-g`），让 `perf` 采样能拿到完整调用栈；是否生成 perf map 及具体方式需对照实际版本与工具链核验。
+
+下表把「目的 → 命令/目标 → 关键标志 → 产物去向」做成速查：
+
+| 目的 | 命令 / 目标 | 关键标志 | 产物去向 |
+|---|---|---|---|
+| 开发调试 | `make build` | `-O0 -g` | debug 安装树 |
+| 性能压测/生产 | `make build-release` | `-O2/-O3 -DNDEBUG` | release 安装树 |
+| 线上可事后调试 | release + `objcopy` | `-O2 -g` + 分离符号 | 二进制 + `.debug` 包 |
+| 内存/UB 排查 | cmake + asan 构建 | `-fsanitize=address,undefined` | asan 构建树 |
+| 覆盖率度量 | cmake + coverage 构建 | `--coverage` | coverage 构建树 |
+
+### 6. 注意事项、陷阱与最佳实践
+
+**陷阱一：用 debug 版测性能、或用插桩版下结论。** debug（`-O0`、断言开）与 asan/coverage（插桩）会严重改变性能与内存行为，拿它们测吞吐/PPS/时延毫无意义；反过来，拿 release 版 gdb 单步又看不到变量。最佳实践：明确「这套产物用于什么」，性能结论只在 release（且注明优化级别）下给出，方法学见 08-01；诊断只在对应插桩版里做。
+
+**陷阱二：`-O3` / `-Ofast` 不等于更快。** 对 VPP 这种向量化、指令 cache 敏感的数据面程序，激进优化带来的代码膨胀可能抬高 i-cache miss、反而降速；`-Ofast` 放宽浮点语义还可能引入难以察觉的行为偏差。最佳实践：以 `-O2` 为基线，用真实流量对比 `-O3`（配合 08-01 的基准方法）再决定是否采用，不盲目追求最高优化级别。
+
+**陷阱三：`-march=native` 破坏可移植性 / 串架构。** 在构建机上用 `-march=native` 编出的产物只能在同代 CPU 上跑，换机器可能 SIGILL；交叉编译时（02-05）更是把 x86 特性带进 aarch64 构建，直接出错。最佳实践：可分发产物用保守的通用基线或明确的目标 `-march`，把 `-march=native` 限定在「本机自用压测」场景。
+
+**陷阱四：ASan 与 VPP/DPDK 的内存模型冲突。** VPP 大量使用大页、自定义堆（mheap/svm）、DPDK 的 hugepage 内存，ASan 的影子内存与红区机制可能与这些自定义分配器「打架」，出现误报或无法启动；ASan 还会显著抬高内存占用。最佳实践：把 ASan 用于「不依赖 DPDK 大页路径」的单元/逻辑排查，全数据面内存问题结合其它手段；遇到冲突先缩小范围，别默认插桩版能直接跑生产拓扑。
+
+**陷阱五：多套构建类型混用同一构建目录。** 在 `build-vpp_debug-native/` 里改 `CMAKE_BUILD_TYPE=Release` 但不清缓存，或把 release 产物装进 debug 安装树，会造成「配置声明与产物实际不符」。最佳实践：每套类型用独立构建目录与安装目录（这正是 `build-root/` 双树设计的用意），切换类型前清 `CMakeCache.txt` 重新 configure。
+
+**陷阱六：release 完全剥离符号导致线上无法排错。** 为省体积 `strip` 掉所有符号，线上崩溃只剩地址，事后无从定位。最佳实践：生产构建「带 `-g` 编译 + 交付前分离符号」，把 `.debug` 归档并与二进制版本绑定（见第 5 节），兼顾体积与可调试性；是否由 `build-data/` 打包脚本自动产生符号包需核验。
+
+**陷阱七：LTO / PGO 的高成本与调试难题。** LTO 拖慢链接、使栈回溯与 gdb 体验变差，PGO 需要「采样构建→训练运行→再构建」的复杂流程，二者是否值得，取决于是否有明确收益证据。最佳实践：除非有基准数据支撑且在 CI 中固化流程，否则保持默认，不为「听起来高级」而引入构建复杂度；VPP 官方是否提供相关开关需核验。
+
+**陷阱八：忘记记录构建类型。** 实验报告、性能基线、故障复现若不注明 debug/release、优化级别、是否插桩，结论无法复现也无法对比。最佳实践：把 `CMAKE_BUILD_TYPE`、`CMAKE_C_FLAGS*`、编译器版本、源码 commit 一并记入产物元数据（呼应 02-03 的可复现构建）。
+
+### 7. 小结与延伸阅读
+
+本篇讲清了「同一份 VPP 源码如何按用途产出不同产物」：构建类型本质是一组编译/链接选项的集合，由 `CMAKE_BUILD_TYPE` 与 `CMAKE_C_FLAGS*` 注入 02-04 的 CMake/Ninja 体系，顶层 `make build` / `make build-release` 是 debug/release 的便捷封装，`build-root/` 的双树结构保证多套类型彼此隔离。Debug（`-O0 -g`，调试）、Release（`-O2/-O3`，压测/生产）、ASan/UBSan 与 Coverage（插桩诊断）各有用途与代价；优化选项（`-O2/-O3`、`-march`、LTO/PGO）与诊断手段（调试符号分离、perf map、sanitizer、gcov）共同构成工程化的构建矩阵。贯穿全篇的方法论是：**结论必须与构建类型绑定**，性能只在 release 下测、排错只在调试/插桩版做，并始终记录所用类型与选项。
+
+延伸阅读：本篇的选项如何注入构建系统见 02-04，基础编译流程见 02-02，环境准备见 02-01；容器/离线与交叉编译同样可以套用本篇的构建类型选择（容器镜像里编 release、交叉编译编 aarch64 release 见 02-03 / 02-05）；如何用这些产物做严谨的性能基准与判读见 08-01，生产运维的符号归档、监控与升级见 08-02 / 08-05 / 08-06。运行时机制（06 全册）、模块功能（07 全册）、配置与命令（04 全册）、结构体字段（05 全册）不在本篇范围，交叉引用按「字段见 05-xx ｜ 命令见 04-xx ｜ 原理见 06-xx」约定，不重列。
