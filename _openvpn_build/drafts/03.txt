@@ -1,0 +1,1675 @@
+# OpenVPN 技术资料 · 03 部署与环境配置
+
+## 03-01 单机服务端部署：tun 路由模式最小可用拓扑
+
+### 1. 目标与拓扑
+
+本篇是整册部署实战的第一块地基，目标被刻意收得很窄：在一台具备公网地址的 Linux 主机上，把一个社区版 OpenVPN 服务端以 tun 路由模式跑起来，让一台远程客户端能够完成接入，并得到可复现、可判读的连通结果。这里反复强调「最小可用」四个字，是要和「生产可用」划清界限。最小可用只追求一条链路打通、四个层次的验证全部通过，它不追求高可用、不追求细粒度访问控制和审计、不追求性能调优，也不追求证书生命周期的规范化管理。这些内容分别由 03-02 的证书体系、03-06 的高可用以及 08 册的运维实践补齐。把边界先钉死，读者才不会拿一份调试用的最小配置直接上生产，也不会因为本篇没讲集群就误以为社区版内置了故障切换能力——那种带 Web 管理界面、内置集群与集中认证的形态属于商业版 Access Server，社区版只提供 `src/openvpn/` 这一套用户态程序，所有高可用都要靠外部手段拼装。
+
+先说清楚「路由模式」在部署视角下的含义，避免和后面 03-04 的桥接模式混淆。tun 是三层设备，服务端与客户端各自拿到一个隧道内的虚拟 IP，二者之间是点到点的三层关系，跨隧道的流量依靠系统路由表与内核转发来传递；它不转发二层广播帧，也不把客户端放进服务端的以太网广播域。本篇只关心「怎么把它配起来、怎么确认路由可达」，至于原始 IP 包进入 tun 字符设备之后如何被读取、封装、加密，属于数据通道机制，原理见 06-03，封装与 MTU 推导见 06-04；tun 设备本身的平台抽象与驱动差异见 07-01；本篇一律不展开。同样，服务端那批指令的完整清单属于 04 册，本篇只取用本场景必需的最小集合，并明确写出「完整指令族见 04-02 / 04-03 / 04-04」。结构体的逐字段定义属于 05 册，本篇若点到相关对象只写「（字段见 05-xx）」，绝不列字段表。这套去重约定贯穿全册，后面每篇都不再重复解释，只在具体引用处给出编号。
+
+地址规划要先定，它是后续所有配置与验证的隐含前提。本例取隧道网段 `10.8.0.0/24`，服务端 tun0 固定为 `10.8.0.1`，客户端从地址池里拿到 `10.8.0.2` 一类地址；服务端物理网卡假设为 eth0，持有公网 IP，对外监听 UDP 1194。选私有网段是为了避免和常见的家用、办公内网段冲突，选 `/24` 是因为单机最小拓扑下一台客户端足够用，但又不至于把掩码写得过窄导致后续加客户端时返工；端口沿用社区版惯例的 1194/UDP，具体端口与协议当然可以改，只是本例为便于对照验证保持默认值。要提醒的是，隧道网段不能与服务端所在内网、客户端本地网段、以及任何一条待推送的路由目标重叠，否则会出现「连上了却选错路」的软故障，这类冲突在 03-04 与 08-04 会展开成用例。物理网卡名、公网地址、隧道网段三者都是示意值，实际环境需对照本机核验，不能照抄。
+
+整条链路的空间关系如下图所示，图 03-01-01 把客户端、公网链路、服务端物理网卡、openvpn 进程、tun0 接口与服务端内网串成一条单向数据流，虚线是回包与回查关系。
+
+:::figure id=03-01-01 | name=单机 tun 路由模式最小可用拓扑 | dir=TD
+node n1 "远程客户端<br/>tun 虚拟地址 10.8.0.2" blue
+node n2 "公网链路<br/>UDP 1194" teal
+node n3 "服务端物理网卡<br/>eth0 公网 IP" amber
+node n4 "openvpn 进程<br/>监听 UDP 1194" purple
+node n5 "tun0 接口<br/>10.8.0.1" green
+node n6 "服务端内网<br/>或本机服务" gray
+edge n1 -> n2 "加密隧道"
+edge n2 -> n3 "到达宿主机"
+edge n3 -> n4 "socket 收包"
+edge n4 -> n5 "写入 tun"
+edge n5 -> n6 "路由转发"
+edge n6 -> n5 dashed "回包回查"
+:::
+
+对着这张图把数据流走一遍，能提前把「验证该看哪一层」想清楚。客户端把去往隧道网段的包交给虚拟网卡，经公网链路以加密后的 UDP 报文抵达服务端 eth0；内核把该 UDP 交给监听 1194 的 openvpn 进程，进程解出内层 IP 包后写入 tun0；tun0 表现为一块三层接口，内核再按路由表决定是转给服务端本机服务，还是经 eth0 转发到服务端内网。回包沿虚线反向走一遍。这里最容易被忽略的一点，是「进程能收包」和「内核肯转发」是两件独立的事：前者靠端口与防火墙，后者靠 `net.ipv4.ip_forward` 与 FORWARD 链策略，任何一件没配好都会表现为「隧道建立了但 ping 不通」。第 4 节的四层验证与第 5 节的排错表，正是按这条链路逐层切片设计的。
+
+最后交代本篇与后续各篇的分工，避免读者误以为一本书要在一篇里讲完所有部署。03-02 负责产出本篇直接拿来用的 CA、服务端证书、客户端证书、DH 参数、tls-crypt 密钥与 CRL，本篇默认这些文件已经就位，只负责把它们放到正确目录并赋予正确权限；03-03 从客户端一侧讲同一条链路怎么接进来、profile 怎么分发；03-04 把本篇的 tun 路由模式与 tap 桥接模式摆在一起对比，并讲 `redirect-gateway` 这类全局流量接管；03-05 把同样的服务端搬进容器与云环境，处理 `/dev/net/tun`、能力集与安全组；03-06 再叠多实例与故障切换。全书唯一权威源的分工同样要在这里立住：配置指令与命令行参数以 04 册为准，结构体字段以 05 册为准，机制与调用链以 06 册为准，模块能力与组网以 07 册为准。本篇作为实战册，只回答「在这台机器上按什么顺序敲什么命令、看到什么算成功、出错往哪查」，不越界充当任何一本字典或原理书。
+
+### 2. 前置条件与环境
+
+部署前的检查宁可多花几分钟，也不要在启动失败后回头逐项试错。第一项是主机与权限：需要一台具备公网可达地址的 Linux 主机，架构以 x86_64 为主，具备 root 或可 sudo 的账户，能够通过发行版包管理器安装社区版 OpenVPN。装完先跑一次 `openvpn --version` 记录主版本与编译期能力标签，确认落在 2.6.x 稳定分支或 2.7 开发分支这一基准范围内；版本行里的构建目标、能力标签与库版本的具体格式随发行版与编译选项变化，需对照实际版本核验，本篇不假定任何一个具体标签必然存在。是否启用 `ovpn-dco` 内核数据通道卸载属于另一个层次，它要求宿主机加载对应内核模块并与用户态版本配合，本篇的最小拓扑不依赖它，相关条件见 06-12 与 07-10，字段见 05-xx，此处不展开。
+
+第二项是内核 TUN 支持，这是路由模式最硬的门槛。检查 `/dev/net/tun` 这个字符设备是否存在、主次设备号是否正确，必要时用 `modprobe tun` 加载模块、用 `lsmod` 确认。若内核把 TUN 编成内建而非模块，`lsmod` 里看不到 `tun` 也不代表不可用，这时以能否打开设备为准。一个实用的小技巧是对该设备执行读取类操作：设备正常但未被打开时通常返回「文件描述符状态错误」一类的提示，反而证明驱动在位；真正要警惕的是「没有那个设备」或「不允许的操作」，前者说明节点缺失，后者多半是权限或容器能力集没给够。容器场景下设备节点不会凭空出现，必须由运行时显式映射，那是 03-05 的主题。设备文件的具体路径、主次设备号与模块名需对照实际内核版本核验。
+
+第三项是内核 IPv4 转发。路由模式下，客户端到服务端内网或服务端本机之外的流量要经过内核转发，因此 `net.ipv4.ip_forward` 必须为 1。这里要分清「临时生效」与「持久生效」：`sysctl -w` 改的是运行中的值，主机一重启就丢；要持久化必须写进 `/etc/sysctl.d/` 下的独立配置文件或发行版约定的 sysctl 配置文件，再用 `sysctl --system` 或重启让配置落地。本篇在分步操作里两种都给，并刻意把它们拆成两步，就是为了杜绝「今天验证通过、明天重启全线断」这类典型事故。至于转发在内核里究竟怎么查路由、怎么走 netfilter 钩子，属于机制范畴，原理见 06-11，本篇只要求「开关打开、验证能通」。
+
+第四项是网络可达性。服务端防火墙与云平台安全组都要对 UDP 1194 放行入站；如果客户端要走服务器上网，还要考虑出方向 MASQUERADE 或 SNAT，以及 FORWARD 链的默认策略。很多云主机默认把入站规则收得很紧，本机 `iptables` 全开也不通，根源在安全组没放行，这类「本机看着没问题、外部就是连不上」的现象要优先怀疑外层控制面。UDP 是无连接协议，普通基于 TCP 握手的应用层健康检查往往探不准，验证时要用能发 UDP 的手段或干脆看服务端日志有无收到首个握手包，具体放行命令与云厂商控制台字段名需对照实际平台核验。此外，若主机启用了 SELinux 或 AppArmor，读证书文件、写 status 日志、执行 up 脚本都可能被策略拦截，排错时不能只看传统权限位。
+
+第五项是证书与密钥前提。本篇默认读者已经按 03-02 产出了 CA 证书 `ca.crt`、服务端证书与私钥 `server.crt` / `server.key`、DH 参数 `dh.pem`、控制通道保护密钥 `ta.key`，并把它们放进服务端配置目录。目录布局因发行版而异，Debian 系常见 `/etc/openvpn/server/`，RHEL 系常见 `/etc/openvpn/server/` 或 `/etc/openvpn/` 根下，具体需对照实际版本核验。私钥必须收紧到仅服务账户可读，CA 与证书可读即可；权限过松时 OpenVPN 会在日志里给出警告甚至拒绝加载。还要确认主机时间同步正常，证书有效期校验对时钟敏感，客户端与服务端时钟偏差过大时握手会失败，其判定属于控制通道机制，原理见 06-06，本篇只把「先对时」列为前置动作。
+
+把上述检查项整理成下表，逐项对照后再进入分步操作。表中「配置目录」一格写成 `server/\|根下` 用竖线表示两种可选布局，按本套资料表格约定必须转义为 `\|`，否则会被解析成列分隔导致整表错列。
+
+| 检查项 | 命令或路径 | 预期结果 | 异常信号 |
+|---|---|---|---|
+| 版本与能力 | openvpn --version | 落在 2.6.x 或 2.7 基准 | 版本过旧或标签异常 |
+| TUN 设备 | /dev/net/tun 与 lsmod | 节点存在或模块已加载 | 无设备或权限不足 |
+| 内核转发 | net.ipv4.ip_forward | 运行时为 1 且已持久化 | 重启后回退为 0 |
+| 配置目录 | server/\|根下 | 证书与密钥就位且权限收紧 | 找不到文件或私钥过松 |
+| 端口放行 | 防火墙与安全组 | UDP 1194 入站可达 | 本机可连外部不可连 |
+| 时钟同步 | timedatectl 或等价命令 | 与标准时间一致 | 偏差过大致握手失败 |
+
+表后补两句判读要点。第一，表里「预期结果」一列描述的是「可以进入下一步」的门槛，不是最终验证结论；真正的连通性证据在第 4 节。第二，任何一项打了问号都不要带着疑问往下敲命令，尤其「内核转发」与「配置目录」两项，前者漏了会制造最难查的软故障，后者漏了会在 systemd 启动时才以一种很间接的方式报出来。systemd 的 unit 命名同样要提前核对：社区版源码在 `distro/systemd/` 下提供 unit 模板，但不同发行版打包后的服务名可能是 `openvpn-server@.service`、`openvpn@.service` 或带实例后缀的其它形式，配置目录与 `--config` 的相对路径基准也因此不同，具体需对照实际发行版与版本核验。本篇后续命令以 `openvpn-server@server` 为例，读者务必替换成本机真实 unit 名。
+
+### 3. 分步操作
+
+下面按「确认前置、放好文件、写配置、开转发、放行端口、起服务、前台兜底」的顺序给出完整命令。为便于判读，命令与典型输出分开列出；所有输出均写明「示例输出，具体格式需对照实际版本核验」，且刻意不使用任何省略行，每行都是一条完整示意记录。
+
+**步骤一：确认 TUN 设备与内核转发现状**。这一步只做体检，不改系统。
+
+```bash
+ls -l /dev/net/tun
+lsmod | grep tun
+sysctl net.ipv4.ip_forward
+cat /proc/sys/net/ipv4/ip_forward
+```
+
+以下为示例输出，具体格式需对照实际版本核验。
+
+```text
+crw-rw-rw- 1 root root 10, 200 Nov 11 09:50 /dev/net/tun
+tun                    49152  0
+net.ipv4.ip_forward = 0
+0
+```
+
+逐行判读这段输出，能把第 2 节的三项前置检查落到实处。第一行 `crw` 开头说明这是一个字符设备，`10, 200` 是 TUN 设备惯用的主、次设备号，权限位显示所有用户可读写，这通常是可用的；若这一行变成「没有那个文件或目录」，说明设备节点缺失，回到 `modprobe tun` 或检查内核配置。第二行 `tun` 模块存在且引用计数为 0，表示驱动已加载但当前没有进程占用它，属于启动前的正常状态；如果这里为空而设备又能打开，多半是 TUN 被编进内核而非以模块形式存在，不必惊慌。第三、四行是关键：两处都读到 0，说明 IPv4 转发当前关闭，这正是必须在下一步显式打开的开关；`sysctl` 命令与直接读 `/proc/sys/` 下的文件应当给出一致的值，两者不一致几乎只可能是改了没生效或读错了路径。这里要克制一句：设备号、模块名、proc 路径与数值格式都可能随内核版本变化，需对照实际版本核验，绝不能据这段示例去断定「设备一定是 10,200」或「模块一定叫 tun」。看到转发为 0 不要跳过，第 4 步会把它同时做成运行时与持久化两层。
+
+**步骤二：建立配置目录并放置证书与密钥**。以下命令假设 03-02 已产出所需文件，具体文件名与来源目录见 03-02；这里只演示归位与收紧权限。
+
+```bash
+sudo install -d -m 0750 /etc/openvpn/server
+sudo install -m 0644 ca.crt server.crt dh.pem /etc/openvpn/server/
+sudo install -m 0600 server.key ta.key /etc/openvpn/server/
+sudo chmod 0600 /etc/openvpn/server/server.key
+ls -l /etc/openvpn/server/
+```
+
+这里用 `install` 而非裸 `cp`，好处是能在复制的同时一次定好属主、权限与目录，避免「先拷成 0644 再补 chmod」这种容易漏一步的写法。私钥 `server.key` 与控制通道密钥 `ta.key` 必须 0600，CA、证书、DH 参数是公开或半公开材料，0644 即可；目录本身给 0750，既让服务账户能进入，又不向其它普通用户敞开。最后一行 `ls -l` 是给自己看的复核，确认没有哪个私钥被误写成世界可读。证书文件的内容、链结构与有效期校验属于 PKI 范畴，操作分步见 03-02，链校验原理见 06-06，模块能力见 07-04，本篇不展开；这里只把它们当作已经可信的输入文件。
+
+**步骤三：编写最小 server.conf**。这份配置只保留单机 tun 路由模式跑通所必需的指令，是「最小可用」的精确定义。完整指令族见 04-02（网络与隧道）、04-03（TLS 与加密）、04-04（服务端与客户端模式），本篇不逐条解释每个指令的语义与可选值。
+
+```conf
+# /etc/openvpn/server/server.conf 最小可用示例
+port 1194
+proto udp
+dev tun
+ca ca.crt
+cert server.crt
+key server.key
+dh dh.pem
+tls-crypt ta.key
+server 10.8.0.0 255.255.255.0
+ifconfig-pool-persist ipp.txt
+keepalive 10 120
+persist-key
+persist-tun
+status /var/log/openvpn/status.log
+verb 3
+explicit-exit-notify 1
+```
+
+对着这份文件说明三处取舍，目的是让读者理解「为什么这么少」而不是照抄后心里没底。第一，`port` / `proto` / `dev` 定死了监听端点与设备类型，配合 `server` 一条指令展开出服务端模式、地址池与基础路由推送；`server` 内部隐含的一整套行为属于 04-04 的服务端模式指令族，本篇刻意不拆解，只写「完整指令族见 04-04」。第二，`ca` / `cert` / `key` / `dh` / `tls-crypt` 五条把步骤二的文件挂进配置，其中 `tls-crypt` 控制通道保护所需的 `ta.key` 由 03-02 生成；加密套件本身在 2.6.x 里由 NCP 协商，默认即可用，本篇不写 `cipher` 一类指令，也不讨论套件选择，相关指令见 04-03、协商原理见 06-07。第三，`keepalive`、`persist-key`、`persist-tun`、`status`、`verb`、`explicit-exit-notify` 属于运行期可观测性与重连体验的最小保障，具体参数含义与可调范围见 04-02 / 04-04。`status` 指向的路径要确认进程有写权限，`verb 3` 是日常与排错之间的折中档，分级见 04-01 与 08-03。文件里没有 `user` / `group` 降权、没有 `client-config-dir`、没有 `push route`，是因为这些都属于生产加固与路由扩展，留到第 5 节「陷阱与最佳实践」和 03-04 再补；最小拓扑不需要它们也能连通。相对路径 `ca.crt` 等以配置所在目录或 systemd 的工作目录为基准，具体基准需对照实际 unit 核验。
+
+**步骤四：打开并持久化内核转发**。临时值与持久值一次做完，避免重启回退。
+
+```bash
+sudo sysctl -w net.ipv4.ip_forward=1
+echo 'net.ipv4.ip_forward = 1' | sudo tee /etc/sysctl.d/99-openvpn-forward.conf
+sudo sysctl --system
+sysctl net.ipv4.ip_forward
+```
+
+第一条让运行中的值立刻变为 1，第二条把同样的设置写进独立配置文件，第三条重新加载全部 sysctl 配置使其生效并顺带验证没有语法错误，第四条回读确认。把持久化单独做成一步，是本篇最想强调的部署习惯：只敲第一条就收工，验证阶段全绿，但机器重启后客户端「能连上、不能访问内网」，排查方向很容易被带到证书或路由推送上去，白白绕一大圈。配置文件名 `99-openvpn-forward.conf` 里的数字前缀决定加载顺序，若同目录已有别的文件也设置了同名参数，以加载顺序靠后的为准，具体目录与优先级需对照实际发行版核验。
+
+**步骤五：放行防火墙与云安全组，并按需配置 NAT**。本机以 nftables 为例，iptables 发行版写法不同，需对照实际版本核验。
+
+```bash
+sudo nft add rule inet filter input udp dport 1194 accept
+sudo nft add rule inet filter forward iifname tun0 accept
+sudo nft add rule inet filter forward oifname tun0 accept
+sudo nft add rule ip nat postrouting oifname eth0 masquerade
+```
+
+第一条放行进站 UDP 1194，第二、三条允许 tun0 进出方向的转发，第四条在客户端需要经服务端上网或访问服务端内网且回包要改写源地址时提供 MASQUERADE。要清醒认识到这四条只是示意：生产环境应把它们落进持久化的规则集而不是逐条 `add rule`，云主机还必须在平台安全组里再做一次 UDP 1194 入站放行，防火墙链名、表名、网卡名与安全组字段名都需对照实际平台核验。若客户端暂时只访问服务端 tun0 地址 `10.8.0.1`，NAT 与 FORWARD 规则其实用不上，可以先不做，等第 4 节验证到「访问内网」那一层再补，这样能把排错范围压到最小。
+
+**步骤六：用 systemd 启动并设为开机自启**。unit 名以本机实际为准，此处用 `openvpn-server@server` 举例。
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now openvpn-server@server
+systemctl status openvpn-server@server --no-pager
+```
+
+以下为示例输出，具体格式需对照实际版本核验。
+
+```text
+● openvpn-server@server.service - OpenVPN service for server
+     Loaded: loaded (/lib/systemd/system/openvpn-server@.service; enabled; vendor preset: enabled)
+     Active: active (running) since Wed 2026-11-11 10:00:00 UTC; 2min ago
+   Main PID: 1234 (openvpn)
+     Status: "Initialization Sequence Completed"
+      Tasks: 1 (limit: 4915)
+     CGroup: /system.slice/system-openvpn\x2dserver.slice/openvpn-server@server.service
+             └─1234 /usr/sbin/openvpn --config server.conf
+```
+
+这段输出要逐行读，因为它是「服务端真的起来了」最集中的一张证据。`Loaded` 行的 `enabled` 说明开机自启已写入，模板路径暴露了本机采用的 unit 命名约定，正好用来核对前面反复提醒的发行版差异；`Active: active (running)` 且已稳定存活两分钟，排除了「起来就崩」的循环重启；`Main PID` 给出进程号，后续抓日志、看监听、发信号都要用它；最关键的 `Status: "Initialization Sequence Completed"` 是 OpenVPN 完成初始化序列的标记，看到这行才说明配置解析、证书加载、设备打开、路由下发都走完了，它是比「进程存在」强得多的成功信号；`CGroup` 下那一行给出了实际执行的命令行，能反查 `--config` 指向的配置文件与工作目录。任何一项与预期不符，都应先翻 `journalctl -u openvpn-server@server -n 100`，而不是急着重敲启动命令。unit 名、模板路径、状态字符串与参数格式均需对照实际版本核验。
+
+**步骤七：准备前台调试兜底**。systemd 适合常态运行，但排错期更推荐前台跑，日志直接打到终端，改配置即时可见。
+
+```bash
+sudo openvpn --config /etc/openvpn/server/server.conf
+```
+
+前台启动时日志默认输出到标准输出，`verb` 调高即可看到握手与路由细节；确认无误后再 `Ctrl+C` 退回 systemd 托管。注意前台与 systemd 不能同时占用同一端口与设备，切换前先 `systemctl stop openvpn-server@server`。`--config` 是加载配置文件的标准入口，其语法与内联文件块见 04-01；这里只当作调试手段使用，不展开它背后的解析流程（原理见 06-01）。
+
+把上面七步的先后关系与两条回查路径画成图，见图 03-01-02：任一层验证不通过就回到前置检查，服务起不来则切到前台调试定位。
+
+:::figure id=03-01-02 | name=单机服务端部署分步与验证链 | dir=TD
+node n1 "确认 TUN 设备<br/>与内核转发" blue
+node n2 "放置证书与密钥" teal
+node n3 "编写 server.conf" amber
+node n4 "放行 UDP 1194" purple
+node n5 "systemctl 启动" green
+node n6 "四层验证" gray
+node n7 "前台调试<br/>openvpn --config" red
+edge n1 -> n2 "前置就绪"
+edge n2 -> n3 "文件到位"
+edge n3 -> n4 "配置完成"
+edge n4 -> n5 "端口可达"
+edge n5 -> n6 "观察结果"
+edge n6 -> n1 dashed "不通过回查"
+edge n6 -> n7 dashed "失败改前台"
+:::
+
+### 4. 验证方法与预期结果
+
+验证不能只看「进程在不在」，而要按第 1 节那条数据流切成四层逐层取证：服务与日志层、监听层、tun 接口与路由层、端到端连通层。每一层都有明确的预期结果，任一层不符就把故障域锁定在对应环节，不必全盘重查。下面把四层验证合成一组命令，输出集中判读。
+
+```bash
+systemctl is-active openvpn-server@server
+sudo ss -lunp | grep 1194
+ip addr show tun0
+ip route | grep 10.8.0
+sudo tail -n 20 /var/log/openvpn/status.log
+```
+
+以下为示例输出，具体格式需对照实际版本核验。
+
+```text
+active
+UNCONN 0 0 0.0.0.0:1194 0.0.0.0:* users:(("openvpn",pid=1234,fd=6))
+3: tun0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UNKNOWN group default qlen 500
+    inet 10.8.0.1 peer 10.8.0.2/32 scope global tun0
+10.8.0.0/24 dev tun0 proto kernel scope link src 10.8.0.1
+OpenVPN Client Status
+Common Name,Real Address,Bytes Received,Bytes Sent,Connected Since
+client1,203.0.113.9:1194,8421,9103,Wed Nov 11 10:01:02 2026
+ROUTING TABLE
+Virtual Address,Common Name,Real Address,Last Ref
+10.8.0.2,client1,203.0.113.9:1194,Wed Nov 11 10:01:05 2026
+```
+
+这段输出信息密度很高，值得逐行拆开，它是本章「怎么算成功」的核心判读材料。第一行 `active` 是 systemd 对服务状态的最简回答，只证明单元被拉起，不足以证明隧道可用。第二行 `ss` 显示 0.0.0.0:1194 上有 UDP 套接字处于 UNCONN 状态且归属 openvpn 进程，确认进程确实在预期端口收包；若这里空缺或端口被别的进程占用，问题就在监听层，与安全组、证书都无关。第三、四行是 tun0 的接口详情：`POINTOPOINT` 印证这是三层点到点设备而非二层 tap，`UP,LOWER_UP` 说明链路与设备都已就绪，`inet 10.8.0.1 peer 10.8.0.2` 表明服务端地址与对端地址按地址池规划落位，MTU 1500 是默认值，后续若出现大包不通要回到 03-04 与 06-04 的 MTU 议题。第五行路由表出现 `10.8.0.0/24 dev tun0`，说明去往隧道网段的路由已由服务端建立，这是 `server` 指令下发结果的直观证据。最后那几行 status 文件内容更有价值：`CLIENT LIST` 里出现 `client1` 及其真实公网地址、收发字节数非零、连接时间，且 `ROUTING TABLE` 里把 `10.8.0.2` 关联到该客户端，说明不只是有个进程在跑，而是真实有一台客户端完成了接入并被分配了地址。要特别克制：status 文件的表头措辞、字段顺序、时间格式与版本相关，示例里的 `OpenVPN Client Status`、列名与地址都需对照实际版本核验；字节数为 0 或列表为空都说明「隧道建了但没客户端连上」，此时应转向 03-03 的客户端配置，而不是继续在本机找服务端毛病。完整的 status 格式与字段含义见 04-06，本篇只用到「有没有客户端、有没有分到地址」这两个判据。
+
+端到端连通性是最后一层，也是唯一能证明「数据真的过隧道」的验证。在客户端成功接入后，先 `ping 10.8.0.1` 确认到服务端隧道地址可达，再按需求 `ping` 服务端内网地址或访问一个本机服务；若目标是服务端背后的内网网段，还要确认服务端已把该网段推送给客户端、并且后端网络有回程路由，相关 `push route`、`iroute` 与 `client-config-dir` 的部署见 03-04，指令权威源见 04-04，路由推送原理见 06-11。这里给出「最小可用」的判定标准：`ping 10.8.0.1` 稳定有回包、status 文件里客户端收发字节持续增长、服务端日志出现初始化完成标记，三条同时满足即可判定本篇目标达成。
+
+把四层验证动作与预期结果整理成下表，失败时可按图索骥直接反查到具体环节。
+
+| 验证层 | 命令 | 预期结果 | 不符时的含义 |
+|---|---|---|---|
+| 服务与日志 | systemctl status 与 journalctl | active 且有初始化完成标记 | 配置或证书加载失败 |
+| 监听层 | ss -lunp 过滤 1194 | openvpn 占用 UDP 1194 | 端口未监听或被占用 |
+| 接口与路由 | ip addr 与 ip route | tun0 为 10.8.0.1 且有网段路由 | TUN 未打开或地址池异常 |
+| 端到端 | ping 10.8.0.1 与 status | 有回包且客户端字节增长 | 转发、防火墙或客户端配置 |
+
+表后再强调一条方法论：验证要按「由内到外」还是「由外到内」取决于现象。若客户端报「连不上」，从监听层与安全组往内查；若客户端报「连上了但没网」，从转发、FORWARD、NAT 与路由推送往内查。把现象先归到某一层，再用上表定位命令，比把整份配置重读一遍高效得多。所有命令的输出格式、字段与路径都需对照实际版本核验，本节给的是判读框架而非可照抄的结论。
+
+### 5. 常见失败与排错
+
+第一类失败是 TUN 设备打不开，日志里常出现「Cannot open TUN/TAP dev」一类字样。按顺序排除三处：设备节点是否存在、运行账户是否有权限、容器或受限环境是否允许创建设备。物理机与虚拟机通常 `modprobe tun` 加检查 `/dev/net/tun` 即可解决；容器场景必须显式映射设备并给足能力集，做法见 03-05；若 SELinux 或 AppArmor 拦截，日志里会同时出现拒绝审计记录，这时改权限位没用，要处理策略。把「设备不存在」和「设备存在但被拒绝」分开，是这一类排错的第一步。
+
+第二类是最隐蔽的软失败：客户端显示已连接、`ping 10.8.0.1` 却不通，或能 ping 通隧道地址但访问不到服务端内网。这时握手与数据通道其实已经建立，问题几乎总在内核转发与包过滤：`net.ipv4.ip_forward` 没开、只改了运行时没持久化导致重启后回退、FORWARD 链默认丢弃、缺 MASQUERADE 导致回包找不到路、或后端网络没有回程路由。排查顺序建议先看 `sysctl net.ipv4.ip_forward` 与 FORWARD 规则，再看是否需要 NAT，最后才怀疑路由推送。若现象是「重启前好、重启后坏」，直接跳到持久化那一步，十有八九是步骤四被跳过了。转发与过滤的机制边界见 06-11，本篇只给排查顺序。
+
+第三类是端口与可达性失败，表现为客户端反复超时、服务端日志里根本没收到首个握手包。这类问题要分三层看：本机 `ss -lunp` 有没有在听、本机防火墙有没有放行、云平台安全组有没有放行 UDP 1194。三者是串联关系，任何一层断了都不通；UDP 无连接，别用 `telnet` 一类 TCP 工具去探，会得到误导性结论。还要核对服务端 `proto udp` 与客户端一致、端口一致，以及服务端是否因 `local` 绑定到了错误地址。安全组字段名、防火墙链名与网卡名需对照实际平台核验。
+
+第四类是证书与权限失败，日志里常见「cannot load CA certificate」「private key」相关报错，或直接提示证书过期、未生效。先看步骤二的归位是否完整、`server.conf` 里的相对路径基准是否与 systemd 工作目录一致、私钥权限是不是 0600；再看主机时钟是否与标准时间同步，时钟偏差会让有效期校验失败，判定逻辑属控制通道机制，原理见 06-06，链校验本身见 07-04。若把 `verb` 调高仍看不出名堂，用步骤七的前台启动把日志打到终端逐行读，通常比在 journal 里翻更快。证书文件如何正确生成与吊销见 03-02，本篇不重复其操作。
+
+第五类是 systemd 相关失败：`systemctl enable --now` 报「Unit not found」，多半是前面反复提醒的 unit 命名与发行版不一致；服务起来又立刻退出，先看 `journalctl -u` 里最后几行，比反复 `restart` 有效；改了配置不生效，检查是不是前台进程还占着端口，或 unit 里 `--config` 指向的根本不是刚改的那份文件。`daemon-reload` 在改过 unit 文件后必须跑，但只改 `server.conf` 时并不需要，分清这两种变更能少走弯路。
+
+最后集中列一组「陷阱与最佳实践」，它们都不是最小可用所必需，却是从调试配置走向生产配置时最容易漏的：其一，加入 `user` 与 `group` 做权限降级，让进程在完成需要 root 的设备与路由操作后降到普通账户，缩小被攻破后的影响面，具体指令见 04-04；其二，保留 `persist-key` 与 `persist-tun`，让重连期间不重复打开设备、不重新读私钥，减少断流窗口；其三，`verb` 日常保持 3、排错临时调高、结束后调回，避免高等级日志长期刷盘并泄露敏感字段，分级见 04-01、日志脱敏见 08-06；其四，status 与日志文件要纳入轮转，路径要有写权限且不被世界可读；其五，最小配置里没有 `client-config-dir`、没有细粒度 `push route`、没有 `user` 降权、没有 CRL 校验，直接上生产等于把调试态暴露到公网，务必按 03-02 补证书治理、按 03-04 补路由、按 03-06 补冗余、按 08 册补运维后再上线；其六，社区版不提供 Access Server 那类集中管理、内置集群与 Web 控制台，别把商业版能力写进验收清单。把失败现象与处理方向整理成下表。
+
+| 现象 | 优先怀疑层 | 优先查看 | 处理方向 |
+|---|---|---|---|
+| 打不开 TUN 设备 | 设备与权限 | 设备节点与审计日志 | 加载模块或映射设备 |
+| 连上但 ping 不通 | 转发与过滤 | sysctl 与 FORWARD | 开转发持久化并补 NAT |
+| 客户端反复超时 | 端口与安全组 | ss 与平台安全组 | 逐层放行 UDP 1194 |
+| 证书相关报错 | 文件与时钟 | 前台日志与文件权限 | 归位文件并对时 |
+| Unit not found | systemd 命名 | 已安装 unit 列表 | 换用本机真实服务名 |
+
+### 6. 小结
+
+用一条主线收束本篇：单机 tun 路由模式的最小可用部署，是「先体检 TUN 设备与内核转发，再把 03-02 产出的证书与密钥归位收紧权限，写一份只含本场景必需指令的 server.conf，把 IPv4 转发同时做成运行时与持久化两层，放行本机防火墙与云安全组的 UDP 1194，用 systemd 拉起并核对 unit 命名，最后按服务与日志、监听、接口与路由、端到端四层逐层验证」。其中「转发持久化」与「四层验证」是最容易被跳过、也最容易在重启后或排错时反噬的两步，值得单独记牢。看到 `Initialization Sequence Completed`、tun0 拿到 `10.8.0.1`、status 文件里客户端收发字节持续增长、以及 `ping 10.8.0.1` 稳定回包，四条同时成立才算本篇目标达成，缺任何一条都说明还停在某一层里。
+
+本篇始终守着实战册的边界：配置指令只取最小必要集合并写明「完整指令族见 04-02 / 04-03 / 04-04」，结构体字段只写「（字段见 05-xx）」，数据通道封装与路由推送机制只写「原理见 06-03 / 06-04 / 06-11」，设备与证书模块能力只写「模块见 07-01 / 07-04」；社区版与商业版 Access Server 的能力边界也单独点明，没有把内置集群或集中认证当成社区版功能。所有具体路径、unit 名、设备号、输出格式与版本标签都标注了「需对照实际版本核验」并给出 `distro/systemd/`、`/proc/sys/net/ipv4/`、`/dev/net/tun` 等可定位线索，不凭印象编造。
+
+下一篇 03-02 会把本篇当作「已经就位」直接引用的那批证书与密钥，从零用 easy-rsa 一步步生成出来，并讲清 CA、服务端证书、客户端证书、DH 参数、tls-crypt 密钥与 CRL 各自落在哪个文件、如何分发与吊销；再往后 03-03 从客户端视角接进这条链路，03-04 对比路由与桥接，03-05 搬进容器与云，03-06 叠加高可用。六篇合起来，正好覆盖「一台机器先跑通，再逐步做成能上线的系统」这条完整路径，而本篇就是这条路径的起点。
+
+## 03-02 PKI 与证书体系部署：easy-rsa / CA / 服务端与客户端证书 / CRL
+
+### 1. 目标与拓扑
+
+03-01 把一套「已经就位」的证书与密钥当作输入，直接拿来启动服务端；本篇就是把这批输入从零生产出来，并讲清它们各自落在哪个文件、怎样分发、怎样吊销。目标可以精确地写成一句话：用社区版生态里事实标准的 easy-rsa 3.x，搭建一套足以支撑单服务端、多客户端接入的 PKI，产出 CA 证书与私钥、服务端证书与私钥、至少一张客户端证书与私钥、DH 参数、控制通道保护密钥 `ta.key`，以及一份可用的证书吊销列表 CRL，并把这些文件按 03-01 与 03-03 需要的形式分发到位。这里同样要强调「足以支撑」而非「生产级完备」：生产级还要叠加离线 CA、硬件密钥、证书生命周期台账、定期轮换与审计，那些属于 08-06 的运维实践与 07-04 的模块能力，本篇只铺好可运行的第一版骨架，并在第 5 节把加固方向逐条点出。
+
+先把「拓扑」这个词在本篇的语境里重新定义一次，避免读者去找一张网络连线图。证书体系的拓扑不是网元之间的连线，而是「信任锚与文件流」：CA 是唯一的信任锚，服务端证书与客户端证书都由它签发，服务端与客户端各自持有自己的私钥，彼此通过共同信任的 CA 建立信任；DH 参数与控制通道密钥是全局共享的材料；CRL 由 CA 签发、被服务端用来拒绝已吊销的客户端。整条链是「初始化目录 → 建 CA → 生成并签发请求 → 补齐共享参数 → 生成 CRL → 按角色分发」，如下图所示，图 03-02-01 把 easy-rsa 的子命令与产出物串成一条文件流，虚线是 CA 对 CRL 的签发回查关系。
+
+:::figure id=03-02-01 | name=PKI 文件生成与分发链 | dir=TD
+node n1 "vars 配置<br/>与 init-pki" blue
+node n2 "build-ca<br/>生成 CA" teal
+node n3 "gen-req 服务端<br/>sign-req server" amber
+node n4 "gen-req 客户端<br/>sign-req client" purple
+node n5 "gen-dh 与<br/>tls-crypt key" green
+node n6 "gen-crl<br/>吊销列表" gray
+node n7 "分发到服务端<br/>与客户端" red
+edge n1 -> n2 "初始化目录"
+edge n2 -> n3 "签发服务端"
+edge n2 -> n4 "签发客户端"
+edge n3 -> n5 "补齐参数"
+edge n4 -> n7 "客户端文件"
+edge n5 -> n7 "服务端文件"
+edge n6 -> n7 "CRL 分发"
+edge n2 -> n6 dashed "CA 签发回查"
+:::
+
+对着这张图要把「谁必须保密、谁可以公开」先分清楚，这是后面所有分发动作的依据。CA 私钥 `ca.key`、服务端私钥 `server.key`、各客户端私钥、以及 `ta.key` 属于秘密材料，必须收紧权限、绝不能进版本库、也绝不能通过明文邮件或聊天工具传递；CA 证书 `ca.crt`、服务端与客户端证书、DH 参数、CRL 属于可公开或半公开材料，可以随 profile 分发。图中 `分发到服务端与客户端` 这一节点其实代表两条不同的清单：服务端需要 `ca.crt`、`server.crt`、`server.key`、`dh.pem`、`ta.key`、`crl.pem`；客户端需要 `ca.crt`、`client1.crt`、`client1.key`、`ta.key`。把这两张清单记牢，03-01 步骤二与 03-03 的归位动作才不会张冠李戴。
+
+去重与边界必须在这里立住，因为「证书」是全书最容易写成原理或字典的题材。按唯一权威源约定，easy-rsa 与 `openvpn --genkey` 等工具的完整命令清单以 04-07 运维工具为准，证书相关的 TLS 配置指令以 04-03 为准，本篇只按部署顺序取用本场景必需的子命令并写「完整 PKI 工具命令见 04-07、完整指令族见 04-03」；X.509 链校验、握手阶段如何使用证书属于控制通道机制，原理见 06-06，本篇绝不展开；证书与 PKI 的模块能力、PKCS#11 硬件密钥、verify-x509 钩子属于 07-04 的模块范畴，本篇只把它当作「下一步读哪里」的索引，写「模块见 07-04」；结构体字段一律「（字段见 05-xx）」。换句话说，本篇回答的是「先敲哪条、再敲哪条、产出哪个文件、怎么验证、出错找谁」，不是「证书为什么能建立信任」——后者是 06 与 07 的职责。
+
+最后交代版本基准与核验纪律。本册以 OpenVPN 2.6.x 稳定分支、2.7 开发分支（master）为基准，easy-rsa 以 3.x 系列为参照。easy-rsa 的子命令名称、`vars` 文件的变量命名、`pki/` 目录结构、`--genkey` 的子命令形式、以及 DH 参数在 NCP 时代的重要性，都可能随版本调整，凡不确定处一律写「需对照实际版本核验」并给出 `vars.example`、`doc/`、发行版包路径等可定位线索，绝不凭印象编造变量名或命令拼写。读者手里的 `easyrsa help` 与当前 easy-rsa 版本自带的文档，才是这些细节的最终权威。
+
+### 2. 前置条件与环境
+
+第一项是拿到 easy-rsa 3.x 并确认可用。它既可能作为发行版包提供，落在 `/usr/share/easy-rsa/` 一类路径，也可能是独立仓库克隆下来的工作树；两种形态下入口都叫 `easyrsa`（或工作树里的 `./easyrsa`），但环境变量、依赖的 openssl 版本与默认 `vars.example` 内容会有差异，具体路径与版本需对照实际发行版核验。用 `easyrsa --version` 或直接看工作目录下的脚本头确认落到 3.x，这很重要：easy-rsa 2.x 是另一套以 `./build-ca`、`./build-key-server` 为入口的脚本，命令形态与 3.x 完全不同，把两代混用是新手最常见的卡点。本篇全线使用 3.x 的 `init-pki / build-ca / gen-req / sign-req / gen-dh / gen-crl` 这一组子命令。
+
+第二项是规划工作目录，这是本章最该先想清楚的一件事。强烈建议把 PKI 放在一个独立于 OpenVPN 运行配置之外的专用目录，例如 `/etc/openvpn/easy-rsa` 或管理员家目录下的 `~/openvpn-ca`，让「签发权威」与「运行进程」在文件系统上分离。理由很实际：服务端进程不需要、也不应该能读到 CA 私钥，一旦把 `pki/` 整个塞进 `/etc/openvpn/server/`，等于把最敏感的 `ca.key` 暴露给了运行账户，任何一次配置误打包都可能把根私钥带出去。理想做法是 CA 在离线或至少访问受限的主机上签发，只把签发好的成品文件拷贝进运行主机，本篇为可复现起见在同一台机器上演示，但会在第 5 节把「CA 离线」列为首要加固项。目录权限建议 0700，操作全程用专用账户并配合严格的 `umask`。
+
+第三项是准备 `vars` 配置。easy-rsa 3.x 允许把组织信息、证书有效期、密钥长度、摘要算法等写成 `set_var EASYRSA_* ...` 形式放进 `pki/vars` 或工作目录的 `vars` 文件，避免每条命令都交互式询问。典型会涉及国家、省市、组织名、默认邮箱、证书与 CRL 的有效期、CA 与证书密钥长度、以及使用的摘要算法等；这些变量的确切名称、取值与默认值以当前版本的 `vars.example` 为准，需对照实际版本核验，本篇不编造任何一个变量拼写。要提醒的是，CRL 有效期尤其容易被忽略：设得太短、又没有定期刷新与分发机制，会出现「CRL 过期导致服务端拒绝所有客户端」这类集体故障，08-06 会把证书生命周期台账展开，这里先把它列入前置考虑。
+
+第四项是与运行环境的配合。签发主机需要 openssl（easy-rsa 底层依赖它），系统时钟要准，因为证书的 `notBefore` / `notAfter` 都基于当前时间，时钟异常会直接产出「还没生效」或「已经过期」的证书，其校验时机属于控制通道机制，原理见 06-06。还要提前想好命名规范：服务端证书、每张客户端证书都要有稳定且唯一的名称，本例用 `server` 与 `client1`，真实环境建议用主机名、工号或设备编号，并保证「一张证书对应一个客户端」的关系可追溯。最后确认服务端配置里将要引用哪些文件名，与本篇产出物一一对应，避免签发完发现名字对不上再回头改。
+
+把本篇要产出的文件、保密级别与消费方整理成下表，后续每完成一步就对照勾一次。表中「消费方」一格写成 `服务端\|客户端` 用竖线表示两类去向，按本套资料表格约定转义为 `\|`，避免被解析成列分隔导致整表错列。
+
+| 产出文件 | 含义 | 保密级别 | 消费方 |
+|---|---|---|---|
+| pki/ca.crt | CA 根证书 | 可公开 | 服务端\|客户端 |
+| pki/private/ca.key | CA 私钥 | 严格保密 | 仅签发主机 |
+| pki/issued/server.crt | 服务端证书 | 可公开 | 服务端 |
+| pki/private/server.key | 服务端私钥 | 严格保密 | 服务端 |
+| pki/issued/client1.crt | 客户端证书 | 可公开 | 客户端 |
+| pki/private/client1.key | 客户端私钥 | 严格保密 | 客户端 |
+| pki/dh.pem | DH 参数 | 可公开 | 服务端 |
+| ta.key | tls-crypt 密钥 | 严格保密 | 服务端\|客户端 |
+| pki/crl.pem | 证书吊销列表 | 可公开 | 服务端 |
+
+表后补两点判读。第一，「可公开」不等于「可以随便丢」，它只是说泄露后不直接破坏机密性，但证书与 CRL 仍应保证完整性，分发时最好连同来源一起校验；第二，`pki/` 下还有 `reqs/`、`certs_by_serial/`、`index.txt`、`serial` 等 easy-rsa 内部管理文件，它们不属于分发清单，却对后续签发与吊销至关重要，不要随意删除或手工改动，否则 `sign-req` 与 `revoke` 会报错。完整目录结构在步骤二给出。
+
+### 3. 分步操作
+
+下面按图 03-02-01 的顺序给出完整命令。为便于判读，命令与典型输出分开列出；所有输出均写明「示例输出，具体格式需对照实际版本核验」，且刻意不使用任何省略行，每行都是一条完整示意记录。
+
+**步骤一：准备 easy-rsa 工作目录与 vars**。以下命令以独立工作树为例，包安装形态可把 `./easyrsa` 换成 PATH 中的 `easyrsa`。
+
+```bash
+mkdir -p ~/openvpn-ca
+cd ~/openvpn-ca
+cp /usr/share/easy-rsa/vars.example pki/vars
+./easyrsa help
+```
+
+第二行的 `cp` 目标路径 `pki/vars` 要在 `init-pki` 之后才有效，若工作目录尚无 `pki/`，可先把 `vars.example` 复制为工作目录下的 `vars`，具体读取位置以当前版本文档为准，需对照实际版本核验。最后一行 `easyrsa help` 用来罗列本版本真实支持的子命令，是核对命令拼写最省事的办法；读者应养成「先 help 再照抄」的习惯，而不是把本篇示例当成唯一真理。
+
+**步骤二：初始化 PKI 目录**。`init-pki` 只建骨架，不产生任何密钥材料。
+
+```bash
+./easyrsa init-pki
+find pki -maxdepth 2 -type d | sort
+```
+
+以下为示例输出，具体格式需对照实际版本核验。
+
+```text
+init-pki complete; you may now create a CA or requests.
+Your newly created PKI dir is: /home/admin/openvpn-ca/pki
+pki
+pki/private
+pki/reqs
+pki/issued
+pki/certs_by_serial
+```
+
+逐行判读这段输出，能把「目录骨架」这件事落到实处。第一行是成功提示，明确告诉你下一步可以「创建 CA 或生成请求」，它同时是一个隐性检查点：若这一步报目录已存在或权限错误，说明之前跑过或工作目录选错了，不要带着残留继续。第二行给出 PKI 根目录的绝对路径，后面所有产出文件都相对它定位，核对路径能避免「签完了却去别处找文件」。后面几行是 `find` 列出的子目录：`private` 将存放所有私钥，`reqs` 存放证书请求，`issued` 存放签发出的证书，`certs_by_serial` 按序列号归档证书。要清醒认识到此时目录里还没有 `ca.crt`、`index.txt`、`serial` 这些文件，它们要等 `build-ca` 之后才出现；看到「目录建好了」就以为证书齐了，是这一阶段最常见的误判。目录名、层级与提示文案随 easy-rsa 版本变化，需对照实际版本核验，绝不能据这段示例断定某文件一定在某个目录下。
+
+**步骤三：创建 CA**。`nopass` 表示 CA 私钥不设口令，仅用于可复现演示；生产环境强烈建议去掉它并妥善保管口令。
+
+```bash
+./easyrsa build-ca nopass
+ls -l pki/ca.crt pki/private/ca.key
+```
+
+以下为示例输出，具体格式需对照实际版本核验。
+
+```text
+Using SSL: openssl OpenSSL 3.x
+Generating a RSA private key
+writing new private key to '/home/admin/openvpn-ca/pki/private/ca.key'
+You are about to be asked to enter information for the certificate request.
+Common Name (eg: your user, host, or server name) [Easy-RSA CA]:
+CA creation complete and you may now import and sign requests.
+-rw------- 1 admin admin 1704 Nov 11 10:05 pki/private/ca.key
+-rw-r--r-- 1 admin admin 2033 Nov 11 10:05 pki/ca.crt
+```
+
+这段输出有三处值得盯住。第一，`Using SSL` 一行暴露了底层实际调用的 openssl 版本，它决定可用算法与默认参数，记录它有助于日后复现；第二，`Common Name ... [Easy-RSA CA]` 是 CA 的 CN，若 `vars` 里配了 `EASYRSA_REQ_CN` 之类变量会直接采用默认值，配置位置需对照实际版本核验；第三是 `ls -l` 的权限位，`ca.key` 是 `-rw-------`（0600）、`ca.crt` 是 `-rw-r--r--`（0644），正好对应第 2 节表格里的保密级别，如果私钥被写成 0644，必须立刻 `chmod 600` 修正。`CA creation complete` 与 `you may now import and sign requests` 一起，构成「可以进入签发阶段」的门槛。这里同样要克制：密钥长度、摘要算法、CN 提示文案与文件字节数都是示意，需对照实际版本核验；CA 私钥一旦泄露，整套信任体系都要重建，这是第 5 节反复强调的重中之重。
+
+**步骤四：生成并签发服务端证书**。`gen-req` 产出私钥与请求，`sign-req server` 用 CA 签发并标记服务端用途。
+
+```bash
+./easyrsa gen-req server nopass
+./easyrsa sign-req server server
+ls -l pki/issued/server.crt pki/private/server.key
+```
+
+以下为示例输出，具体格式需对照实际版本核验。
+
+```text
+Generating a RSA private key
+writing new private key to '/home/admin/openvpn-ca/pki/private/server.key'
+Keypair and certificate request completed. Your files are:
+req: /home/admin/openvpn-ca/pki/reqs/server.req
+key: /home/admin/openvpn-ca/pki/private/server.key
+You are about to sign the following certificate.
+  Common Name: server
+  Type: server
+Certificate is to be certified until Nov 11 10:07 2028 GMT (1080 days)
+Confirm request details: yes
+Certificate created at: /home/admin/openvpn-ca/pki/issued/server.crt
+-rw------- 1 admin admin 1704 Nov 11 10:07 pki/private/server.key
+-rw-r--r-- 1 admin admin 4567 Nov 11 10:07 pki/issued/server.crt
+```
+
+判读要点集中在用途与有效期两处。`Type: server` 是关键：easy-rsa 按 `sign-req` 的类型参数把扩展用途写进证书，服务端证书与客户端证书的用途扩展不同，选错类型会让对端在校验时拒绝，具体扩展名与校验时机属于 X.509 链校验机制，原理见 06-06、模块见 07-04，本篇只要求「服务端用 server 类型、客户端用 client 类型」这条操作纪律。`Certificate is to be certified until ... (1080 days)` 给出有效期，天数由 `vars` 里的有效期变量决定，需对照实际版本核验，务必记进台账以便到期前轮换。`Confirm request details: yes` 是签发前的人工确认，自动化场景可用批处理变量跳过，具体开关需对照实际版本核验。最后 `ls -l` 再次确认私钥 0600、证书落到 `issued/` 下。至此 03-01 服务端清单里的 `server.crt` 与 `server.key` 已经齐了。
+
+**步骤五：生成并签发客户端证书**。每增加一个客户端就重复这一对命令，名称必须唯一。
+
+```bash
+./easyrsa gen-req client1 nopass
+./easyrsa sign-req client client1
+./easyrsa gen-req client2 nopass
+./easyrsa sign-req client client2
+ls -1 pki/issued/
+```
+
+这里刻意连做两张客户端证书，是为了把「一机一证」的原则演示清楚：03-06 会讲到共享证书与 `duplicate-cn` 的风险，而规范做法是每个客户端独立签发、独立分发、可独立吊销。`ls -1 pki/issued/` 应能看到 `server.crt`、`client1.crt`、`client2.crt` 三个文件。客户端私钥连同证书、`ca.crt`、`ta.key` 一起构成 03-03 要分发的 profile，任何一张客户端私钥都不要复用到另一台设备。
+
+**步骤六：生成 DH 参数与控制通道密钥**。
+
+```bash
+./easyrsa gen-dh
+openvpn --genkey tls-crypt ta.key
+ls -l pki/dh.pem ta.key
+chmod 600 ta.key
+```
+
+以下为示例输出，具体格式需对照实际版本核验。
+
+```text
+Generating DH parameters, 2048 bit long safe prime, generator 2
+This is going to take a long time
+DH parameters of size 2048 created at /home/admin/openvpn-ca/pki/dh.pem
+-rw------- 1 admin admin 424 Nov 11 10:12 ta.key
+-rw-r--r-- 1 admin admin 424 Nov 11 10:12 pki/dh.pem
+```
+
+逐行判读：`gen-dh` 的输出明确提示「会花较长时间」，这一步在大密钥长度下可能跑很久，属于正常现象，不要误以为卡死而强杀；产出的 `dh.pem` 是全局共享参数，服务端配置里的 `dh` 指令指向它（指令见 04-03）。`openvpn --genkey tls-crypt ta.key` 生成控制通道保护密钥，服务端与客户端必须使用同一个 `ta.key`，且 `tls-crypt` 与旧式 `tls-auth` 不是同一件事、不能混用，完整工具命令见 04-07、相关指令见 04-03、机制见 06-06。要特别标注版本差异：`--genkey tls-crypt <file>` 这种子命令形式以 2.6.x / 2.7 为参照，旧版本可能写作 `--genkey --secret <file>` 一类形式，`openvpn --help` 与 `man openvpn` 才是当前版本的权威，需对照实际版本核验。另外，2.6.x 起数据通道加密套件由 NCP 协商，传统有限域 DH 参数在 ECDH 场景下的实际作用与是否仍必需，需对照实际版本核验，本篇按兼容惯例仍生成它并挂进配置，不对其必要性下结论。最后两行 `ls -l` 与 `chmod` 把 `ta.key` 收紧到 0600，它是秘密材料，权限不能含糊。
+
+**步骤七：生成 CRL，并演示吊销与重生成**。CRL 是「让吊销生效」的载体，不能只吊销不刷新。
+
+```bash
+./easyrsa gen-crl
+./easyrsa revoke client2
+./easyrsa gen-crl
+openssl crl -in pki/crl.pem -noout -text | head -n 12
+```
+
+以下为示例输出，具体格式需对照实际版本核验。
+
+```text
+CRL file created at: /home/admin/openvpn-ca/pki/crl.pem
+Revoking certificate 02, serial number, reason: unspecified
+Using configuration from /home/admin/openvpn-ca/pki/openssl-easyrsa.cnf
+Revoked Certificates:
+    Serial Number: 02
+        Revocation Date: Nov 11 10:15:03 2026 GMT
+```
+
+这段输出把「吊销」这件事拆成了两个动作，务必分清。第一次 `gen-crl` 生成初始 CRL，里面通常还没有吊销条目；`revoke client2` 把序列号为 02 的证书标记为吊销，但这一步只改了 easy-rsa 的内部索引，**不会**自动让新 CRL 生效，所以紧接着第二次 `gen-crl` 重新签发 CRL 才是关键；`openssl crl` 的输出里 `Revoked Certificates` 段出现 `Serial Number: 02` 与吊销时间，证明新 CRL 确实包含了被吊销的证书。服务端要靠 CRL 拒绝已吊销客户端，需要配置里挂上 CRL 校验，具体指令见 04-03；CRL 文件更新后如何在运行中的服务端生效、是否需要重启或重新加载、以及 CRL 过期后的行为，都需对照实际版本核验。这里也要注意，示例里用 `head -n 12` 截断只是为了让输出可读，真实核查应看完整内容；命令里的管道与过滤写法不影响本套资料的表格约定，因为它出现在代码块而非表格单元格中。
+
+**步骤八：按角色分发**。以下命令把成品归位到 03-01 的服务端目录与 03-03 的客户端 staging 目录，权限按第 2 节表格执行。
+
+```bash
+sudo install -d -m 0750 /etc/openvpn/server /etc/openvpn/client-staging
+sudo install -m 0644 pki/ca.crt pki/issued/server.crt pki/dh.pem pki/crl.pem /etc/openvpn/server/
+sudo install -m 0600 pki/private/server.key ta.key /etc/openvpn/server/
+sudo install -m 0644 pki/ca.crt pki/issued/client1.crt /etc/openvpn/client-staging/
+sudo install -m 0600 pki/private/client1.key ta.key /etc/openvpn/client-staging/
+```
+
+注意服务端清单里包含 `crl.pem`，客户端清单里不包含；`ca.key` 始终留在签发主机，绝不进入任何运行目录。分发到远程主机时必须走加密通道并校验完整性，私钥不要经由明文渠道。客户端 profile 如何把这几个文件内联或引用、以及不同平台的落地路径，见 03-03；服务端配置如何引用它们，见 03-01 步骤三，指令权威源见 04-03。
+
+把 `pki/` 的最终结构用一棵目录树列出，便于核对每一步的产出位置，具体文件清单需对照实际版本核验。
+
+```tree
+pki/
+├── ca.crt
+├── crl.pem
+├── dh.pem
+├── index.txt
+├── serial
+├── certs_by_serial/
+├── issued/
+│   ├── server.crt
+│   ├── client1.crt
+│   └── client2.crt
+├── private/
+│   ├── ca.key
+│   ├── server.key
+│   ├── client1.key
+│   └── client2.key
+└── reqs/
+    ├── server.req
+    ├── client1.req
+    └── client2.req
+```
+
+### 4. 验证方法与预期结果
+
+证书签完不等于能用，验证阶段要把「链能验通、用途正确、有效期合理、CRL 生效、分发到位」五件事逐一钉死。下面把核心验证合成一组命令，输出集中判读。
+
+```bash
+openssl verify -CAfile pki/ca.crt pki/issued/server.crt
+openssl verify -CAfile pki/ca.crt pki/issued/client1.crt
+openssl x509 -in pki/issued/server.crt -noout -subject -issuer -dates
+openssl crl -in pki/crl.pem -noout -nextupdate
+ls -l /etc/openvpn/server/
+```
+
+以下为示例输出，具体格式需对照实际版本核验。
+
+```text
+pki/issued/server.crt: OK
+pki/issued/client1.crt: OK
+subject=CN = server
+issuer=CN = Easy-RSA CA
+notBefore=Nov 11 10:07:00 2026 GMT
+notAfter=Nov 11 10:07:00 2028 GMT
+nextUpdate=Nov 11 10:20:00 2026 GMT
+-rw------- 1 root root 1704 Nov 11 10:12 server.key
+-rw------- 1 root root  424 Nov 11 10:12 ta.key
+-rw-r--r-- 1 root root 2033 Nov 11 10:12 ca.crt
+-rw-r--r-- 1 root root 4567 Nov 11 10:12 server.crt
+-rw-r--r-- 1 root root  424 Nov 11 10:12 dh.pem
+-rw-r--r-- 1 root root  980 Nov 11 10:12 crl.pem
+```
+
+这段输出值得逐行拆开，它是本篇「怎么算成功」的核心判读材料。前两行 `OK` 是最重要的一条证据：两张证书都能被 `ca.crt` 成功验证，说明签发链完整、CA 与证书匹配，若这里出现 `unable to get local issuer certificate` 一类报错，问题一定在链或文件对应关系上，而不在 OpenVPN 配置里。中间四行是服务端证书的元数据：`subject=CN = server` 与 `issuer=CN = Easy-RSA CA` 确认主体与签发者符合规划，`notBefore` / `notAfter` 给出有效期窗口，务必确认当前时间落在窗口内且登记进台账；用途扩展（服务端/客户端）要用 `openssl x509 -text` 或 `easyrsa show-cert` 另行查看，本篇按 `sign-req` 类型保证。`nextUpdate` 一行是 CRL 的下次更新时间，它往往比证书有效期短得多，正是第 2 节提醒「CRL 过期会导致集体拒绝」的量化依据，必须据此安排定期刷新与分发。最后那一组 `ls -l` 复核分发结果：两个私钥与 `ta.key` 是 0600，其余是 0644，文件齐全且落在服务端目录，`ca.key` 没有出现在这里。要特别克制：subject/issuer 的显示格式、时间格式、文件字节数、以及 `nextUpdate` 的具体值都会随版本与 `vars` 变化，需对照实际版本核验；`OK` 只证明链能验通，不等于握手一定成功，真正端到端的证据要看 03-01 第 4 节的 status 与连通性验证。链校验的判定逻辑见 06-06，指令见 04-03，模块见 07-04，本篇只用到「链通、用途对、CRL 新、文件齐」这四个判据。
+
+把验证动作与预期结果整理成下表，失败时可按图索骥反查。
+
+| 验证动作 | 命令 | 预期结果 | 不符时的含义 |
+|---|---|---|---|
+| 链校验 | openssl verify 加 CA 与证书 | 输出 OK | CA 与证书不匹配或链断 |
+| 主体与签发者 | openssl x509 -subject -issuer | 符合命名规划 | 名称写错或签错 CA |
+| 有效期 | openssl x509 -dates | 当前时间落在窗口内 | 时钟异常或已过期 |
+| CRL 新鲜度 | openssl crl -nextupdate | 未过期且含吊销项 | 未重新签发或未分发 |
+| 分发权限 | ls -l 运行目录 | 私钥 0600 其余 0644 | 权限过松或文件缺失 |
+
+表后再强调一条方法论：验证要「先验链、再验用途与有效期、再验 CRL、最后验分发」，顺序不能乱。若跳过链校验直接去查 OpenVPN 启动日志，会把「证书本身签错」误判成「配置写错」，白白绕一大圈。所有命令输出格式与字段需对照实际版本核验，本节给的是判读框架，不是可照抄的结论。
+
+### 5. 常见失败与排错
+
+第一类失败是 CA 相关，后果也最严重。`build-ca` 报目录已存在，多半是重复跑了 `init-pki` 或沿用了旧工作目录，先确认是否要保留已有 CA，别为了图快把整个 `pki/` 删掉重来——删掉等于换根，所有已签发证书立即失效。CA 私钥泄露或丢失是两种极端：泄露必须立即重建整套 PKI 并吊销旧 CA 签发的所有证书，丢失则意味着再也无法签发与吊销，只能重建。这也是第 2 节坚持「CA 与运行目录分离、最好离线」的根本原因，具体加固清单见 08-06。
+
+第二类是签发阶段的类型与命名错误。`sign-req` 把 `server` 与 `client` 写反，会让证书用途扩展不对，对端在校验时拒绝，现象是「链能验通、握手却失败」，排查时要用 `easyrsa show-cert` 或 `openssl x509 -text` 看扩展用途，而不是反复重签；签发时 `Type` 那一行就是最直接的线索。CN 重复同样要避免：easy-rsa 默认拒绝重复 subject，报错时不要靠 `duplicate-cn` 去绕过，正确做法是给每张客户端证书一个唯一名称，这关系到后续按客户端精细控制与单独吊销，风险在 03-06 展开。
+
+第三类是有效期与时钟类失败。证书 `notBefore` 晚于当前时间、或 `notAfter` 已过，握手会直接失败，判定属于控制通道机制，原理见 06-06。根因通常是签发主机时钟不准，或 `vars` 里有效期设得过短。CRL 过期是更具迷惑性的一种：证书都还有效，服务端却拒绝所有客户端，这时要看 `openssl crl -nextupdate` 是否早已过去，并确认服务端读取的是不是最新分发的 `crl.pem`。把证书有效期、CRL 有效期、签发时间、分发时间全部记进台账并设到期提醒，是避免这类集体故障的唯一稳妥办法，台账做法见 08-06。
+
+第四类是 CRL 与吊销的「看起来生效其实没生效」。`revoke` 只改索引、不刷新 CRL，忘记重跑 `gen-crl` 就等于没吊销；重跑了 CRL 却没分发到服务端、或服务端配置根本没挂 CRL 校验指令，同样不生效（指令见 04-03）。更隐蔽的是「吊销了错误的序列号」，`openssl crl -text` 里逐条核对 `Serial Number` 与 `easyrsa show-cert` 里的序列号，比凭客户端名称猜测可靠。CRL 更新在运行进程中的加载方式、是否需要重启或信号，需对照实际版本核验。
+
+第五类是工具与版本差异。`easyrsa` 报「unknown command」时先 `easyrsa help` 核对子命令拼写，多半是混用了 2.x 与 3.x 两代语法；`vars` 不生效时，确认文件放的位置是不是本版本读取的那一个（工作目录 `vars` 还是 `pki/vars`），变量名以 `vars.example` 为准，需对照实际版本核验；`openvpn --genkey tls-crypt` 报参数错误时，用 `openvpn --help` 核对当前版本的子命令形式，旧版等价写法见 04-07；`gen-dh` 长时间无输出是正常计算，别强杀。DH 参数与 NCP、ECDH 的关系同样需对照实际版本核验。
+
+最后集中列一组「陷阱与最佳实践」。其一，CA 私钥离线保存、绝不进版本库、绝不进运行主机，签发操作在受控环境完成；其二，一机一证、命名唯一、私钥不复用，为 03-06 的按客户端控制留出空间；其三，所有秘密材料分发走加密通道并校验完整性，落地权限立刻收紧到 0600；其四，CRL 定期刷新并同步到每一个服务端实例，多实例场景下任何一处漏分发都会留下可接入的吊销客户端，见 03-06；其五，把有效期、CRL 下次更新、签发与吊销记录做成台账并设提醒，见 08-06；其六，需要更强私钥保护或合规要求时再评估 PKCS#11 硬件密钥、`tls-crypt-v2`、外部认证等能力，这些属于 07-04 / 07-05 的模块范畴，社区版并未提供 Access Server 那种集中式证书与用户管理界面，别把商业能力写进验收清单。把失败现象与处理方向整理成下表。
+
+| 现象 | 优先怀疑层 | 优先查看 | 处理方向 |
+|---|---|---|---|
+| 链校验失败 | CA 与文件对应 | openssl verify 输出 | 核对 CA 与证书匹配 |
+| 握手被拒但链通 | 证书用途 | show-cert 扩展用途 | 用正确 sign-req 类型重签 |
+| 证书未生效或过期 | 时钟与有效期 | x509 -dates 与系统时间 | 对时并调整 vars 有效期 |
+| 集体拒绝接入 | CRL 过期 | crl -nextupdate | 重签并分发最新 CRL |
+| 吊销不生效 | 刷新与分发 | CRL 内容与服务端配置 | 重签 CRL 并挂载校验 |
+| 命令不被识别 | 工具版本 | easyrsa help 与版本 | 核对 3.x 子命令拼写 |
+
+### 6. 小结
+
+用一条主线收束本篇：一套可支撑接入的 PKI，是「先规划独立工作目录与 `vars`，用 `init-pki` 建骨架，用 `build-ca` 立起唯一信任锚，用 `gen-req` 加 `sign-req server` 产出服务端证书、用 `gen-req` 加 `sign-req client` 为每个客户端各产一张证书，再补上 `gen-dh` 与 `openvpn --genkey tls-crypt` 生成的共享参数与密钥，用 `gen-crl` 建立吊销能力并演示 `revoke` 后必须重签，最后按服务端与客户端两张清单分别分发、按保密级别收紧权限」。其中「CA 与运行目录分离」「一机一证」「吊销后必须重签并分发 CRL」三件事最容易被跳过，也最容易在后期演变成难以收拾的故障或安全事件，值得单独记牢。看到 `openssl verify` 输出 `OK`、用途与有效期符合规划、CRL 的 `nextUpdate` 未过期且含预期吊销项、运行目录里私钥 0600 而 `ca.key` 不在场，几条同时成立才算本篇目标达成。
+
+本篇始终守着实战册与去重边界：easy-rsa 与 `--genkey` 的完整命令清单写明「完整 PKI 工具命令见 04-07」，证书相关指令写明「完整指令族见 04-03」；X.509 链校验与控制通道如何使用证书只写「原理见 06-06」，证书模块能力、硬件密钥与吊销钩子只写「模块见 07-04」，结构体一律「（字段见 05-xx）」，没有把证书体系讲成模块原理，也没有把商业版 Access Server 的集中证书管理写成社区版功能。所有变量名、子命令形式、目录结构、输出格式与有效期数值都标注了「需对照实际版本核验」并给出 `vars.example`、`easyrsa help`、`openvpn --help`、`pki/` 等可定位线索，不凭印象编造。
+
+上一篇 03-01 已经用这批文件把单机服务端跑通，下一篇 03-03 会从客户端一侧接进同一条链路：把 `ca.crt`、客户端证书、私钥与 `ta.key` 组装成一份可分发的 ovpn profile，讲清内联证书与外链文件的取舍，以及 Windows、Linux、移动端在配置落地、服务形态与凭据存储上的差异。再往后 03-04 对比路由与桥接、03-05 搬进容器与云、03-06 叠加高可用，而它们共同信任的那套 CA 与 CRL，正是本篇建立起来的。
+
+## 03-03 客户端部署与配置文件分发（含 Windows / Linux / 移动端）
+
+### 1. 目标与拓扑
+
+前两篇分别在服务端一侧把进程跑起来、在签发侧把证书与密钥生产出来，本篇把链路的最后一段补上：把 03-02 产出的 `ca.crt`、某张客户端证书、对应私钥与 `ta.key`，组装成一份可分发、可导入的 `.ovpn` profile，并在 Linux、Windows、移动端三类平台上接入 03-01 那台服务端，最终得到与服务端的 status、连通性相互印证的接入结果。目标仍然收在「能连、能验、能分发」上：profile 怎么组织、外链文件与内联证书怎么选、三类平台各自把配置放在哪里、以什么形态常驻、凭据与私钥怎么存放，是本篇要回答的全部问题。至于接入之后如何接管全部流量、如何访问服务端背后多个网段、如何在多实例之间切换，分别属于 03-04 与 03-06，本篇不抢它们的活。
+
+先把「拓扑」在本篇的含义说清楚。客户端这边的拓扑不是网元连线，而是「一份 profile 的组成 + 三条分发路径 + 一个共同终点」：profile 由基础指令段与可选的证书内联块拼成，分别被 Linux、Windows、移动端三种形态的客户端导入，三者最终都连向服务端 tun0 的 `10.8.0.1`。下图 03-03-01 把这条组成与分发关系画出来，虚线表示凭据与私钥保护对客户端导入环节的回查约束。
+
+:::figure id=03-03-01 | name=客户端 profile 组成与多平台分发 | dir=TD
+node n1 "client.ovpn<br/>基础指令" blue
+node n2 "内联块<br/>ca cert key tls-crypt" teal
+node n3 "Linux 客户端<br/>systemd 或 NM" amber
+node n4 "Windows 客户端<br/>GUI config 目录" purple
+node n5 "移动端<br/>OpenVPN Connect" green
+node n6 "服务端 tun0<br/>10.8.0.1" gray
+node n7 "凭据存储<br/>与私钥保护" red
+edge n1 -> n2 "拼接内联"
+edge n2 -> n3 "分发导入"
+edge n2 -> n4 "分发导入"
+edge n2 -> n5 "分发导入"
+edge n3 -> n6 "建立隧道"
+edge n4 -> n6 "建立隧道"
+edge n5 -> n6 "建立隧道"
+edge n7 -> n3 dashed "凭据回查"
+edge n7 -> n4 dashed "凭据回查"
+:::
+
+对着这张图要先立住一个关键判断：外链文件与内联证书不是两种协议，而是同一份配置的两种打包形态。外链形态下 `.ovpn` 里写 `ca ca.crt` 一类相对路径，证书、私钥、密钥作为独立文件随 profile 一起分发，好处是文件可单独轮换、profile 文本短，坏处是分发时容易漏文件；内联形态下把证书内容直接包进 `<ca>` 起始标签与 `</ca>` 结束标签之间，私钥包进 `<key>` 标签对，`tls-crypt` 密钥包进 `<tls-crypt>` 标签对，整条链路收进单一文件，好处是「一个文件走天下」、极适合移动端扫码或邮件导入，坏处是文件变大、且私钥一旦随文件泄露就没有第二道边界。本套资料把内联文件块的语法归入 04-01 的权威范围，本篇只演示怎么用命令把独立文件拼成内联块，并写「内联块语法见 04-01」。选择哪一种不是审美问题，而是分发渠道与轮换策略问题，第 2 节与第 5 节会给出判据。
+
+去重与边界在本篇尤其要写清，因为「客户端部署」很容易滑向指令字典或协议原理。按唯一权威源约定，`client`、`remote`、`proto`、`dev`、`nobind`、`persist-key`、`persist-tun`、`remote-cert-tls`、`auth-user-pass`、`verb` 等指令的完整清单与语义以 04-02（网络与隧道）、04-04（服务端与客户端模式）、04-03（TLS 与认证）为准，本篇只取本场景必需的最小集合并写「完整指令族见 04-02 / 04-04」；`pull` 如何拿到地址与路由、TLS 握手如何校验证书，属于机制，原理见 06-06 与 06-11，本篇不展开；各平台的驱动、GUI、NetworkManager 集成属于客户端软件生态与模块能力的边界，模块见 07-01 / 07-02；结构体一律「（字段见 05-xx）」。还要特别点明生态边界：Linux 上的 `openvpn` 命令行与 systemd 服务来自社区版 `src/openvpn/`，而 Windows 官方 GUI、OpenVPN Connect 移动端属于官方发布的客户端程序，它们能识别哪些指令、是否支持内联块与 `tls-crypt`、是否支持某类凭据存储，都需对照各自实际版本核验，不能拿社区版命令行的能力去推断 GUI 或移动端的行为。更要避免把商业版 Access Server 那种「用户自助下载 profile、集中分发与吊销」的门户能力写成社区版功能——社区版只产出文件，分发渠道要靠管理员自己搭。
+
+版本基准与核验纪律照旧：本篇以 OpenVPN 2.6.x 稳定分支、2.7 开发分支（master）为参照，配置文件扩展名、各平台默认目录、systemd unit 命名、NetworkManager 导入子命令、GUI 配置路径、移动端导入方式都可能随版本与发行版变化，凡不确定处一律写「需对照实际版本核验」并给出 `man openvpn`、`distro/systemd/`、`nmcli help` 等可定位线索，绝不编造路径或命令拼写。
+
+### 2. 前置条件与环境
+
+第一项是材料齐备。按 03-02 的分发清单，为某一台客户端准备好 `ca.crt`、`client1.crt`、`client1.key`、`ta.key` 四个文件，并确认 `openssl verify -CAfile ca.crt client1.crt` 返回 `OK`、证书在有效期内、CRL 里没有该客户端的序列号。若这一步就发现证书被吊销或过期，后面无论客户端怎么配都连不上，先回 03-02 处理，不要在这里浪费时间。同时从服务端管理员处拿到公网地址、端口与协议（本例沿用 `203.0.113.1`、UDP 1194、`proto udp`），三样必须与 03-01 的 `server.conf` 完全一致，`remote` 行写错一个数字都会表现为超时，其排查在第 5 节。
+
+第二项是客户端软件到位，三类平台差别很大，必须分开确认。Linux 上需要安装社区版 `openvpn` 包，可选 NetworkManager 的 OpenVPN 插件以便图形化导入；用 `openvpn --version` 确认版本落在基准范围内。Windows 上通常是官方安装包提供的 OpenVPN GUI 与对应虚拟网卡驱动，驱动形态在较新版本里可能是 wintun 或 TAP-Windows6，属于 07-01 的平台驱动范畴，具体名称与所需权限需对照实际版本核验；安装后要确认配置目录位置与管理权限。移动端一般是官方 OpenVPN Connect 或第三方兼容客户端，它是不是社区版、支持哪些指令与内联块，需对照实际客户端版本核验——本篇把它当作「能导入标准 .ovpn 的客户端」来用，但不假定它具备命令行的全部能力。三类平台默认目录、服务形态与凭据后端的差异整理成下表，表中「凭据后端」一格写成 `文件\|系统密钥环` 用竖线表示两类取值，按表格约定转义为 `\|`。
+
+| 平台 | 客户端形态 | 配置落地路径 | 凭据后端 |
+|---|---|---|---|
+| Linux 命令行 | openvpn 加 systemd | /etc/openvpn/client/ | 文件\|系统密钥环 |
+| Linux 图形 | NetworkManager 插件 | NM 连接配置库 | 系统密钥环 |
+| Windows | OpenVPN GUI | 安装目录 config 子目录 | 文件\|系统凭据 |
+| 移动端 | OpenVPN Connect 等 | 应用内导入 | 应用沙箱存储 |
+
+表后补两点判读。第一，表里「配置落地路径」全部是语义化描述而非可直接照抄的绝对路径，具体值需对照实际发行版、安装包版本与应用版本核验，第 3 节会在每个平台的分步里给出「以某路径为例」并反复提醒替换。第二，凭据后端一列直接决定第 3 节步骤六的做法：能接系统密钥环或凭据管理器的平台，就不要把明文口令写进磁盘文件；只能读文件的形态，则必须把凭据文件权限收紧到仅当前用户可读。把这一列先想清楚，能避免后面「为了连通先把密码明文塞进 profile」这种埋雷做法。
+
+第三项是分发渠道与信任。profile 里含私钥，无论内联还是外链，都属于秘密材料，分发必须走加密通道（例如带访问控制的企业网盘、加密邮件、或面对面导入），并校验完整性；用明文聊天工具或公开链接传私钥，等于把接入凭证送出去。还要提前定好命名与台账：`client1.ovpn` 对应哪台设备、哪个使用者、哪张证书、什么时候签发，都要可追溯，这样 03-02 的吊销与 08-06 的生命周期管理才有落点。第四项是时间与权限：客户端时钟要与标准时间同步，否则证书有效期校验会失败，判定见 06-06；Linux 上无论是前台调试还是 systemd 托管，启动阶段通常需要 root 或相应能力才能创建 tun 设备、改路由，具体降权与能力需求需对照实际版本核验。
+
+把本篇的前置检查列成下表，逐项对照后再进入分步操作。
+
+| 检查项 | 命令或线索 | 预期结果 | 异常信号 |
+|---|---|---|---|
+| 证书可用 | openssl verify 加 CA 与证书 | 输出 OK | 链断或已被吊销 |
+| 版本匹配 | openvpn --version | 落在 2.6.x 或 2.7 基准 | 版本过旧能力缺失 |
+| 端点一致 | 与服务端核对 remote 与 proto | 地址端口协议全一致 | 任一项不符即超时 |
+| 驱动就绪 | 平台设备或 GUI 状态 | 虚拟网卡可用 | 驱动未装或权限不足 |
+| 时钟同步 | 系统时间设置 | 与标准时间一致 | 偏差过大致握手失败 |
+
+### 3. 分步操作
+
+下面按「写基础 profile、拼内联块、逐平台落地、处理凭据」的顺序给出完整命令。为便于判读，命令与典型输出分开列出；所有输出均写明「示例输出，具体格式需对照实际版本核验」，且刻意不使用任何省略行，每行都是一条完整示意记录。
+
+**步骤一：编写基础 client.ovpn（外链引用形态）**。这份配置只保留接入单机 tun 路由模式服务端所必需的指令，是最小可用的客户端侧定义。
+
+```conf
+# client.ovpn 最小可用示例，外链引用形态
+client
+dev tun
+proto udp
+remote 203.0.113.1 1194
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+ca ca.crt
+cert client1.crt
+key client1.key
+tls-crypt ta.key
+remote-cert-tls server
+verb 3
+```
+
+对着这份文件说明三处取舍，让读者理解「为什么这么少」。`client` 与 `remote` 定死了「我是客户端、连哪里」，配合 `dev tun` / `proto udp` 与服务端对齐；`ca` / `cert` / `key` / `tls-crypt` 四条把 03-02 的四个文件挂进来，其中 `tls-crypt` 的 `ta.key` 必须与服务端是同一个文件；`remote-cert-tls server` 要求对端证书具备服务端用途，正好对应 03-02 用 `sign-req server` 签发的那张证书，用途校验属于 X.509 链校验机制，原理见 06-06、模块见 07-04；`resolv-retry`、`nobind`、`persist-key`、`persist-tun` 保障重连体验，`verb 3` 是日常档。完整指令族见 04-02 / 04-04，本篇不逐条解释语义与可选值。这里刻意不写 `redirect-gateway`、不写 `auth-user-pass`、不写任何 `route`，是因为全局流量接管属于 03-04、认证凭据属于步骤六，最小接入阶段都不需要。相对路径 `ca.crt` 等以 profile 所在目录为基准，具体基准需对照实际客户端版本核验。
+
+**步骤二：把四个独立文件拼成内联 profile**。内联块语法见 04-01，下面用 shell 命令生成 `client-inline.ovpn`，避免手工粘贴证书内容时漏行或破坏 PEM 格式。
+
+```bash
+cp client.ovpn client-inline.ovpn
+{
+  echo '<ca>'
+  cat ca.crt
+  echo '</ca>'
+  echo '<cert>'
+  cat client1.crt
+  echo '</cert>'
+  echo '<key>'
+  cat client1.key
+  echo '</key>'
+  echo '<tls-crypt>'
+  cat ta.key
+  echo '</tls-crypt>'
+} >> client-inline.ovpn
+chmod 600 client-inline.ovpn
+```
+
+生成后的 `client-inline.ovpn` 里，基础指令段后面依次追加了四组标签对：`<ca>` 起始标签与 `</ca>` 结束标签之间是 CA 证书内容，`<cert>` 标签对之间是客户端证书，`<key>` 标签对之间是客户端私钥，`<tls-crypt>` 标签对之间是控制通道密钥。使用内联形态时，要把步骤一里那四行 `ca` / `cert` / `key` / `tls-crypt` 外链引用删掉，否则同一材料既外链又内联会造成解析歧义，具体优先级与解析顺序见 04-01。随后用 `chmod 600` 把整个单文件 profile 收紧到仅属主可读，因为它现在含私钥。这一步的价值在于「一个文件即可分发」，特别适合移动端导入；代价是文件体积变大、私钥随文件走，轮换时必须整份重发。标签名称、是否引用仍需保留、以及各客户端对内联块的支持程度，需对照实际版本核验。
+
+**步骤三：Linux 命令行形态落地**。把外链形态的四个文件与 profile 放进客户端目录，先前台验证再托管。
+
+```bash
+sudo install -d -m 0750 /etc/openvpn/client
+sudo install -m 0644 client.ovpn ca.crt client1.crt /etc/openvpn/client/
+sudo install -m 0600 client1.key ta.key /etc/openvpn/client/
+sudo openvpn --config /etc/openvpn/client/client.ovpn
+```
+
+前三行把材料归位并收紧私钥权限；第四行前台启动用于排错，日志直接打到终端，`--config` 是加载配置的标准入口，语法见 04-01。确认连通后 `Ctrl+C` 退出，改用 systemd 托管，unit 名以本机实际为准，此处用 `openvpn-client@client` 举例。
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now openvpn-client@client
+systemctl status openvpn-client@client --no-pager
+```
+
+若使用 NetworkManager 图形化管理，可用导入子命令把 profile 变成一条连接，完整命令见 04-07，具体子命令与参数需对照实际版本核验。
+
+```bash
+nmcli connection import type openvpn file /etc/openvpn/client/client.ovpn
+nmcli connection show
+```
+
+**步骤四：Windows GUI 形态落地**。Windows 侧以「把 `.ovpn` 放进 GUI 的配置目录」为核心动作，路径随安装包版本与是否按用户安装而变，需对照实际版本核验。
+
+```tree
+C:/Program Files/OpenVPN/config/
+└── client-inline.ovpn
+C:/Users/admin/OpenVPN/config/
+└── client-inline.ovpn
+```
+
+上面这棵目录树给出两种常见落点：系统级安装时放在安装目录的 `config` 子目录，按用户安装时放在用户目录的 `OpenVPN/config` 下；采用内联单文件形态最省事，避免四个外链文件散落。放入后通过 GUI 托盘图标选择该配置连接；若连接需要创建虚拟网卡或改路由，GUI 可能需要以管理员权限运行，具体行为与所需权限需对照实际客户端版本核验。驱动是 wintun 还是 TAP-Windows6、是否需要单独安装，属于 07-01 的平台驱动范畴，本篇不展开。这里要克制一句：把 `client-inline.ovpn` 直接双击或文本打开并不能保证被正确解析，务必通过 GUI 的「导入/连接」入口加载，导入方式需对照实际版本核验。
+
+**步骤五：移动端形态落地**。移动端一般通过官方 OpenVPN Connect 或兼容客户端导入内联 `.ovpn`，常见方式是从文件、加密链接或二维码导入，具体支持哪几种以应用版本为准，需对照实际版本核验。
+
+```bash
+sha256sum client-inline.ovpn
+```
+
+导入前用 `sha256sum` 之类命令记录指纹，是为了在「扫码/下载」这类非直面交付的渠道里核对文件完整性；真正的机密性仍要靠加密通道保证，指纹只防篡改、不防泄露。移动端客户端对指令的支持面比命令行窄，`tls-crypt`、`remote-cert-tls`、内联私钥块等是否可用，需对照实际客户端版本核验；遇到不支持的指令，应在服务端与客户端共同收敛到双方都支持的最小集合，而不是假定移动端等于桌面版。移动端同样不是商业版 Access Server 的自助门户，profile 仍由管理员按渠道分发。
+
+**步骤六：凭据存储**。若服务端额外启用了用户名口令认证，客户端才会用到 `auth-user-pass` 一类指令（完整指令见 04-03）。无论哪种平台，原则都是「口令不写进 profile 正文、明文凭据文件权限收紧、优先用系统凭据后端」。
+
+```ini
+# 凭据文件示例，仅当前用户可读；文件名由 auth-user-pass 指向
+client1
+s3cr3t-example-password
+```
+
+这个 `ini` 块只是示意凭据文件的两行结构：第一行用户名、第二行口令，真实环境必须替换并 `chmod 600`，且优先改用系统密钥环或凭据管理器，具体后端与指令写法见 04-03、需对照实际版本核验。证书私钥本身的保护同理：内联形态下靠整个 profile 的权限，外链形态下靠 `client1.key` 的 0600。把「证书认证」与「用户口令认证」分开看，前者的秘密在私钥，后者的秘密在口令文件，任何一处明文落盘且权限过松，都等于把接入凭证摊开。
+
+把 Linux 前台连接日志作为本节的输出判读材料，以下为示例输出，具体格式需对照实际版本核验。
+
+```text
+2026-11-11 10:20:00 OpenVPN 2.6.x x86_64-pc-linux-gnu [SSL (OpenSSL)] [LZO] [LZ4] [EPOLL]
+2026-11-11 10:20:00 UDPv4 link local: (not bound)
+2026-11-11 10:20:00 UDPv4 link remote: [AF_INET]203.0.113.1:1194
+2026-11-11 10:20:00 [server] Peer Connection Initiated with [AF_INET]203.0.113.1:1194
+2026-11-11 10:20:00 TUN/TAP device tun0 opened
+2026-11-11 10:20:00 /sbin/ip addr add dev tun0 10.8.0.2/24 broadcast 10.8.0.255
+2026-11-11 10:20:00 Initialization Sequence Completed
+```
+
+逐行判读这段输出，能把「客户端到底连到哪一步」看得很清楚。第一行是版本与编译期能力标签，确认客户端落在基准版本内；第二行 `UDPv4 link local: (not bound)` 配合 `nobind` 说明客户端不固定本地端口，这是正常行为而不是错误；第三行 `link remote` 给出实际连接的服务端地址与端口，正好用来核对 `remote` 行有没有写错；第四行 `Peer Connection Initiated` 且带 `[server]` 这个服务端 CN，说明控制通道握手已经发起并识别了对端证书主题，若这一步反复重试或报证书校验错误，问题在证书链、用途或时钟，原理见 06-06、模块见 07-04；第五、六行 `TUN/TAP device tun0 opened` 与 `ip addr add ... 10.8.0.2/24` 说明客户端侧虚拟网卡已创建并拿到地址池里的地址，与 03-01 规划的 `10.8.0.2` 对上；最后 `Initialization Sequence Completed` 是初始化完成的标记，看到它才算「接入成功」，但注意它只证明隧道建立，真正的数据可达还要靠第 4 节的 ping 与服务端 status。要特别克制：日志时间戳、能力标签、CN 显示、地址与命令路径都是示意，需对照实际版本核验，绝不能据这段示例断定某平台必然出现 `tun0` 这个接口名——Windows 与移动端的虚拟网卡命名完全不同。
+
+### 4. 验证方法与预期结果
+
+客户端侧的验证要和服务端侧相互印证，单看一边都容易误判。建议按「本地日志与进程、虚拟网卡与路由、到服务端隧道地址的可达性、服务端 status 是否出现本客户端」四层来做，下面合成一组命令。
+
+```bash
+ip addr show tun0
+ip route | grep 10.8.0
+ping -c 4 10.8.0.1
+systemctl status openvpn-client@client --no-pager
+```
+
+以下为示例输出，具体格式需对照实际版本核验。
+
+```text
+3: tun0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UNKNOWN group default qlen 500
+    inet 10.8.0.2 peer 10.8.0.1/32 scope global tun0
+10.8.0.2 via 10.8.0.1 dev tun0
+10.8.0.0/24 via 10.8.0.1 dev tun0
+PING 10.8.0.1 (10.8.0.1) 56(84) bytes of data.
+64 bytes from 10.8.0.1: icmp_seq=1 ttl=64 time=18.2 ms
+64 bytes from 10.8.0.1: icmp_seq=2 ttl=64 time=17.9 ms
+64 bytes from 10.8.0.1: icmp_seq=3 ttl=64 time=18.1 ms
+64 bytes from 10.8.0.1: icmp_seq=4 ttl=64 time=18.0 ms
+● openvpn-client@client.service - OpenVPN tunnel for client
+     Active: active (running) since Wed 2026-11-11 10:20:00 UTC; 3min ago
+```
+
+这段输出要从三个角度交叉判读。前两行 `ip addr` 与 `ip route` 证明客户端侧 tun 设备已就绪：`inet 10.8.0.2 peer 10.8.0.1` 与 03-01 的服务端 tun0 地址互为对端，路由表里出现经 `10.8.0.1` 到 `10.8.0.0/24` 的条目，说明服务端推送下来的隧道网段路由已经落到本机，路由推送机制见 06-11、指令见 04-04。中间四行 `ping` 稳定收到回包、时延在十几毫秒量级，是「数据真的穿过隧道到达服务端」最直接的证据；若 ping 不通但虚拟网卡与路由都在，立刻转向 03-01 第 5 节那套「转发、FORWARD、防火墙」排查，而不是回头重配客户端证书。最后 `systemctl status` 的 `active (running)` 说明托管服务稳定存活，排除了「起来就退」的循环重启。这里仍要克制：接口名、地址、路由表措辞、ping 时延与 unit 状态格式都随平台和版本变化，需对照实际版本核验；Windows 与移动端看不到 `ip addr` / `systemctl`，应改用各自客户端的连接状态页与内置日志，判读逻辑（隧道地址、是否有流量、是否稳定）是一致的。
+
+服务端一侧的印证不可省略：按 03-01 第 4 节查看服务端 status 文件，应能看到本客户端的 Common Name、真实公网地址、非零的收发字节数，以及 `ROUTING TABLE` 里把 `10.8.0.2` 关联到该 CN。客户端说「连上了」、服务端 status 却没有对应条目，多半是连到了另一台实例或另一个 profile，属于分发串号问题；两边同时对上，才能确认这条链路端到端成立。status 格式与字段含义见 04-06。
+
+把四层验证动作与预期结果整理成下表，失败时按图索骥反查。
+
+| 验证层 | 命令或入口 | 预期结果 | 不符时的含义 |
+|---|---|---|---|
+| 本地日志 | 前台日志或客户端状态页 | 有初始化完成标记 | 握手或证书校验失败 |
+| 网卡与路由 | ip addr 与 ip route | tun 设备与隧道路由就位 | 驱动或推送异常 |
+| 到服务端 | ping 10.8.0.1 | 稳定回包 | 转发或防火墙阻断 |
+| 服务端印证 | 服务端 status 文件 | 出现本客户端且字节增长 | 串号或未真正接入 |
+
+表后强调一条方法论：客户端排错最忌「只在本机反复重连」。凡 `ping 10.8.0.1` 不通，先把现象归到「本机网卡/路由」还是「服务端转发/过滤」，再决定查哪一侧；凡握手阶段报错，优先查证书、时钟与 `remote`。所有输出格式、字段与路径需对照实际版本核验。
+
+### 5. 常见失败与排错
+
+第一类失败是 profile 本身写错，其中最常见的是内联块与外链引用并存、标签对不闭合、或粘贴证书时破坏了 PEM 行。表现为解析期就报错、连接根本没发起。对策是用步骤二的拼接命令生成，而不是手工粘贴；若已手工改坏，删掉内联段重新拼一次，并确认基础指令段里的四条外链引用在内联形态下已移除，解析优先级见 04-01。Windows 上把 `.ovpn` 用文本编辑器另存成带 BOM 或 CRLF 混乱的编码，也可能引发解析异常，保存格式需对照实际客户端版本核验。
+
+第二类是端点与协议不一致：`remote` 的地址、端口、`proto` 与服务端任一不符，现象都是反复超时且服务端日志收不到握手包。逐字核对 03-01 的 `server.conf`，再确认云平台安全组放行了 UDP 1194；UDP 无连接，别用 TCP 工具去探端口。多 `remote` 条目的场景在 03-06 展开，本篇只强调「单点接入时三项必须完全一致」。
+
+第三类是证书与时钟类失败。链校验不过、用途不对、证书过期、时钟偏差，都会让握手停在 `Peer Connection Initiated` 之前或报错退出，判定属控制通道机制，原理见 06-06、模块见 07-04。先用 03-02 的 `openssl verify` 与 `openssl x509 -dates` 把证书本身验干净，再怀疑客户端配置；把「证书问题」误当成「配置问题」反复重连，是这类故障最浪费时间的走法。`remote-cert-tls server` 报错尤其要查服务端证书是不是真的用 `sign-req server` 签发。
+
+第四类是平台差异类失败。Linux 上 systemd 报 `Unit not found`，多半是 `openvpn-client@.service` 这一 unit 名与发行版不符，回到 03-01 反复提醒的命名核对；`nmcli connection import` 不被识别，说明 NetworkManager 版本或插件不到位，需对照实际版本核验。Windows 上连接失败并提示驱动或权限，先确认虚拟网卡驱动装好、GUI 以足够权限运行，驱动形态见 07-01；配置文件放错目录（系统级 vs 用户级）会表现为「GUI 里根本看不到这条连接」。移动端导入失败或连上即断，先确认该客户端是否支持 `tls-crypt` 与内联私钥块，必要时收敛到双方都支持的指令集合，支持面需对照实际客户端版本核验。三类平台的默认目录、unit 名与能力清单都需对照实际版本核验，绝不照抄示例。
+
+第五类是凭据与私钥类失败。口令文件路径写错、权限过松被拒绝读取、或把明文口令写进 profile 后随文件扩散，都属于这一类。优先改用系统凭据后端，必须用文件时收紧到 0600；私钥同理，内联形态下保护的是整个 `.ovpn`。还要提醒：如果多台设备复用了同一张客户端证书，服务端默认会拒绝或产生相互踢线，正确做法是 03-02 的一机一证，相关风险在 03-06 展开。
+
+最后集中列一组「陷阱与最佳实践」。其一，一机一 profile、命名与台账可追溯，便于 03-02 的单独吊销与 08-06 的生命周期管理；其二，分发走加密通道并校验指纹，内联单文件便于移动端但私钥随文件走，外链多文件便于轮换但容易漏发，按渠道二选一；其三，凭据与私钥绝不进版本库、绝不写进公开文档、落地权限立刻收紧；其四，日常 `verb 3`、排错临时调高、结束后调回，日志里避免长期留存敏感字段，分级见 04-01、脱敏见 08-06；其五，profile 里凡是「本场景不需要」的指令都别提前堆进去，`redirect-gateway`、`route`、`auth-user-pass` 分别留到 03-04 与认证场景，配置越短越容易排错；其六，牢记社区版只产出可被标准客户端读取的 profile，不提供 Access Server 的自助门户、集中分发与集中吊销，别把商业能力写进验收清单。把失败现象与处理方向整理成下表。
+
+| 现象 | 优先怀疑层 | 优先查看 | 处理方向 |
+|---|---|---|---|
+| 解析期报错 | profile 结构 | 内联标签对与外链引用 | 重新拼接并去重引用 |
+| 反复超时 | 端点与安全组 | remote proto 与放规则 | 逐项对齐服务端 |
+| 握手被拒 | 证书与时钟 | verify 与 x509 -dates | 回 03-02 修证书并对时 |
+| Unit not found | systemd 命名 | 已安装 unit 列表 | 换用本机真实服务名 |
+| GUI 看不到连接 | 配置目录 | 系统级或用户级路径 | 放对目录并核验权限 |
+| 移动端连上即断 | 指令支持面 | 客户端支持清单 | 收敛到双方都支持的集合 |
+| 多设备互相踢线 | 证书复用 | 服务端 CN 与日志 | 改一机一证 |
+
+### 6. 小结
+
+用一条主线收束本篇：客户端部署的本质，是把 03-02 产出的四个文件与一段最小基础指令，打包成一份外链或内联的 `.ovpn` profile，按 Linux 命令行 / systemd、Windows GUI、移动客户端三种形态分别落地，再把凭据与私钥收紧到合适的存储后端，最后用「本地日志、虚拟网卡与路由、ping 隧道地址、服务端 status 印证」四层验证把链路闭环。其中「内联块与外链引用不能并存」「端点三要素必须与服务端完全一致」「私钥与凭据不落明文」「客户端与服务端两侧相互印证」四件事最容易被忽略，也最容易在分发规模化之后演变成串号、泄露或集体连不上，值得单独记牢。看到客户端日志出现初始化完成标记、tun 设备拿到 `10.8.0.2`、`ping 10.8.0.1` 稳定回包、服务端 status 里出现对应 CN 且字节增长，四条同时成立才算本篇目标达成。
+
+本篇始终守着实战册与去重边界：客户端指令只取最小集合并写明「完整指令族见 04-02 / 04-04」，内联文件块语法写明「见 04-01」，`pull` 与证书校验机制只写「原理见 06-06 / 06-11」，平台驱动与客户端生态只写「模块见 07-01 / 07-02」，结构体一律「（字段见 05-xx）」；同时明确 Windows GUI、OpenVPN Connect 属于官方客户端程序而非社区版命令行，其能力需对照实际版本核验，也明确社区版不提供商业版 Access Server 的自助分发门户。所有路径、unit 名、子命令、导入方式与输出格式都标注了「需对照实际版本核验」并给出 `man openvpn`、`distro/systemd/`、`nmcli help` 等可定位线索。
+
+到本篇为止，「一台服务端 + 一套 PKI + 一台客户端」的最小闭环已经完整可复现。下一篇 03-04 会在这条闭环上做第一次拓扑扩展：把 tun 路由模式与 tap 桥接模式摆在一起对比，讲清 `topology` 选择、广播域差异，以及 `redirect-gateway` 如何把客户端全部流量接管到隧道；再往后 03-05 把服务端搬进容器与云、03-06 叠加多实例与故障切换。它们都建立在本篇这条已经验证过的客户端接入链路之上。
+
+## 03-04 路由模式与桥接模式部署：tun vs tap、redirect-gateway
+
+### 1. 目标与拓扑
+
+到 03-03 为止，「一台服务端 + 一套 PKI + 一台客户端」的最小闭环已经能连、能验。本篇在这条闭环上做第一次真正的拓扑扩展：把社区版两种根本不同的组网方式——基于 tun 的三层路由模式与基于 tap 的二层桥接模式——摆在一起讲清各自的部署形态、地址与广播域差异，并落到两个高频需求上：让客户端访问服务端背后的内网网段，以及用 `redirect-gateway` 把客户端的全部上网流量接管进隧道。目标不是列出所有指令，而是让读者在「我要不要广播域、要不要全局接管、后端网段怎么回指」这三个问题上有明确的选型依据，并能按分步命令把两种模式各自搭出来、验出来、排出错来。
+
+先立住最根本的一条分界：tun 是三层点到点设备，隧道两端各有虚拟 IP，跨隧道的是 IP 包，靠路由表与内核转发传递，不传二层广播帧；tap 是二层以太网设备，隧道把客户端的以太网帧原样送到服务端，配合网桥可以把客户端接进服务端所在的那个广播域，于是 DHCP、ARP、NetBIOS 一类二层协议都能穿透。这条分界决定了后面所有差异：tun 扩展性好、广播开销小、客户端平台支持面广，是绝大多数远程接入的默认选择；tap 能承载非 IP 协议与依赖广播的旧应用，但把广播域拉大、有环路风险、移动端与部分平台往往不支持，云环境还常因禁止混杂模式而直接不可用。本篇不展开 tun/tap 在驱动层如何读写帧，那是 07-01 的模块能力与 06-03 的封装机制；结构体一律「（字段见 05-xx）」。
+
+两种模式的拓扑分别画在下面两张图。图 03-04-01 是 tun 路由模式：客户端流量经隧道到达服务端 tun0，由内核查路由转发到后端内网，或经 `redirect-gateway` 走全局出网，虚线标出后端网段回指与 iroute 的回查关系。
+
+:::figure id=03-04-01 | name=tun 路由模式与后端网段拓扑 | dir=TD
+node n1 "远程客户端<br/>tun0 10.8.0.2" blue
+node n2 "加密隧道<br/>UDP 1194" teal
+node n3 "服务端 tun0<br/>10.8.0.1" amber
+node n4 "内核转发<br/>ip_forward" purple
+node n5 "服务端内网<br/>192.168.10.0/24" green
+node n6 "默认路由接管<br/>redirect-gateway" gray
+node n7 "iroute 与 ccd<br/>后端网段回指" red
+edge n1 -> n2 "客户端流量"
+edge n2 -> n3 "解密入 tun"
+edge n3 -> n4 "查路由转发"
+edge n4 -> n5 "访问内网"
+edge n4 -> n6 "全局出网"
+edge n5 -> n7 dashed "回程回查"
+edge n3 -> n7 dashed "iroute 回查"
+:::
+
+图 03-04-02 是 tap 桥接模式：服务端 tap0 与物理网卡 eth0 一起挂进网桥 br0，客户端被桥接进同一个广播域，拿到同网段地址，虚线标出环路/混杂风险与回包回查。
+
+:::figure id=03-04-02 | name=tap 桥接模式与广播域拓扑 | dir=TD
+node n1 "远程客户端<br/>tap0 同网段地址" blue
+node n2 "加密隧道<br/>UDP 1194" teal
+node n3 "服务端 tap0" amber
+node n4 "网桥 br0" purple
+node n5 "物理网卡 eth0" green
+node n6 "内网广播域<br/>DHCP 与二层广播" gray
+node n7 "环路与混杂<br/>风险点" red
+edge n1 -> n2 "二层帧"
+edge n2 -> n3 "解密入 tap"
+edge n3 -> n4 "桥接端口"
+edge n5 -> n4 "桥接端口"
+edge n4 -> n6 "同一广播域"
+edge n7 -> n4 dashed "风险回查"
+edge n6 -> n5 dashed "回包回查"
+:::
+
+对着两张图把「选型」先想清楚，能省掉后面大量返工。若需求是「远程员工访问公司内网若干网段」「出差时安全上网」「多平台客户端接入」，选 tun 路由模式；若需求是「某个只认二层广播的老工业软件」「需要跨站点跑非 IP 协议」「必须让客户端像插在办公室网线上一样拿到同网段地址」，才考虑 tap 桥接。后者在生产里要额外评估广播域规模、生成树、云上混杂模式限制与客户端支持面，属于「有明确理由才用」的选项。本篇的部署顺序也照这个优先级：先讲 tun 模式下的 `topology`、后端网段与 `redirect-gateway`，再讲 tap 桥接的搭建。
+
+去重与边界必须写清，因为「路由与桥接」极容易滑向机制或字典。`dev`、`topology`、`tun-mtu`、`mssfix` 属于 04-02 的网络与隧道指令族；`route`、`push`、`iroute`、`client-config-dir`、`redirect-gateway`、`server-bridge`、`ifconfig-pool` 属于 04-04 的服务端与客户端模式指令族；本篇只取本场景必需的几条并写「完整指令族见 04-02 / 04-04」。路由如何被推送、客户端如何 `pull` 并下发到系统路由表，属于机制，原理见 06-11；MTU 与分片推导见 06-04；路由与桥接的模块能力与典型组网见 07-09，多客户端 ccd 见 07-08；结构体一律「（字段见 05-xx）」。本篇回答「在什么拓扑下选哪种模式、按什么顺序配、怎么验证路由真的生效、不通往哪查」，不复述指令全集，也不展开转发原理。版本基准仍是 OpenVPN 2.6.x / 2.7(master)，`topology` 默认值、`server-bridge` 参数形态、网桥工具命令与云平台限制都需对照实际版本核验。
+
+### 2. 前置条件与环境
+
+第一项是沿用并扩展 03-01 的服务端。路由模式要求 `net.ipv4.ip_forward=1` 已持久化、服务端防火墙 FORWARD 链允许 tun0 进出、必要时配好 MASQUERADE，这些在 03-01 步骤四、五已经做过；本篇新增的是「后端网段可达」与「回程路由」——服务端本身能 ping 通 `192.168.10.0/24` 里的目标，且该网段的网关知道把回包送回服务端，否则客户端即便把包发过去也收不到回包。回程路由常被忽略，是「能连隧道、访问不了内网」的头号根因，第 5 节会展开。
+
+第二项是 `topology` 的取舍。它决定服务端怎样给客户端分配隧道地址、以及地址池怎样组织：`subnet` 用一个子网给所有客户端分配地址，简明且是现代推荐写法；`net30` 为每个客户端单独划一个 /30 小网段，是较旧的默认；`p2p` 用于点到点形态。三者的确切默认值、地址消耗与兼容客户端范围需对照实际版本核验，指令见 04-02。本篇以 `topology subnet` 为例，因为它与「把整个 `10.8.0.0/24` 当隧道网段」的规划最一致；改动这一项会牵动地址池与路由，务必在测试环境先验证再上线。
+
+第三项是 tap 桥接的额外前提。服务端内核要有桥接支持，用户态要有 `ip`（iproute2）或 `brctl` 一类工具；把物理网卡加入网桥意味着该网卡的 IP 通常要迁移到网桥接口 br0 上，操作不当会当场断掉 SSH，因此桥接部署强烈建议带外管理或本地控制台，绝不要只在一条远程 SSH 里试。还要评估广播域：客户端越多，广播帧经隧道复制得越多，带宽与 CPU 开销越大；网桥要防环路，必要时启用生成树，具体命令需对照实际版本核验。更要提前确认客户端平台支持 tap：部分移动端客户端与某些简化客户端根本不提供 tap 能力，需对照实际客户端版本核验。云主机通常不允许网卡进入混杂模式、也不允许自定义二层桥接，这类限制见 03-05，桥接方案上云前必须先确认平台是否放行。
+
+第四项是 `redirect-gateway` 的依赖。全局接管不只是加一条路由：客户端的 DNS 要一并处理（否则路由改了但域名解析仍走本地、或解析不到）、服务端要能为客户端的出网流量做 NAT、要保留到服务端公网地址的通路以免隧道自身断掉、`bypass-dhcp` 一类参数用来避开对本地 DHCP 的误伤。这些取值的行为需对照实际版本核验，指令见 04-04。若只想让特定网段走隧道（分流），就不要用全局接管，改用逐条 `push route`，两者是不同策略，不要混着配。
+
+把两种模式的关键差异整理成下表。表中「客户端平台」一格写成 `广\|受限` 用竖线表示支持面宽窄两类，按表格约定转义为 `\|`，避免整表错列。
+
+| 维度 | tun 路由模式 | tap 桥接模式 |
+|---|---|---|
+| 工作层次 | 三层 IP 包 | 二层以太网帧 |
+| 地址形态 | 独立隧道网段 | 与内网同网段地址 |
+| 广播域 | 不跨隧道 | 跨隧道同一广播域 |
+| 内核依赖 | ip_forward 与路由 | 网桥与混杂模式 |
+| 客户端平台 | 广\|受限 | 明显受限 |
+| 云上可用性 | 通常可用 | 常受平台限制 |
+| 典型指令 | route push redirect-gateway | server-bridge 与 dev tap |
+
+表后补两点判读。第一，「广播域」这一行是选型的真正分水岭：需要广播就用 tap，不需要就一律 tun，不要因为「桥接听起来更透明」而默认选它。第二，两种模式不是可以在运行中随手切换的开关——`dev tun` 与 `dev tap`、服务端是 `server` 还是 `server-bridge`、客户端拿地址的方式全都不同，切换等于重做一套配置，务必在规划阶段一次定好。把前置检查列成下表，逐项对照后再进入分步操作。
+
+| 检查项 | 命令或线索 | 预期结果 | 异常信号 |
+|---|---|---|---|
+| 转发持久化 | sysctl 与 sysctl.d | 运行时与配置均为 1 | 重启后回退 |
+| 后端可达 | 从服务端 ping 内网目标 | 有回包 | 回程路由缺失 |
+| topology | 当前 server.conf | 与地址规划一致 | 地址池与规划冲突 |
+| 桥接工具 | ip 或 brctl 可用 | 网桥可创建 | 内核或工具不支持 |
+| 客户端支持 | 平台 tap 能力 | 至少目标平台支持 | 移动端不支持 tap |
+
+### 3. 分步操作
+
+下面按「先定 topology、再扩 tun 后端网段、再接 redirect-gateway、最后搭 tap 桥接」的顺序给出完整命令。为便于判读，命令与典型输出分开列出；所有输出均写明「示例输出，具体格式需对照实际版本核验」，且刻意不使用任何省略行，每行都是一条完整示意记录。
+
+**步骤一：确认并固定 topology**。在 03-01 的 `server.conf` 里显式写出这一项，避免依赖不同版本的默认值。
+
+```conf
+# 在 03-01 的 server.conf 中显式固定隧道拓扑
+topology subnet
+server 10.8.0.0 255.255.255.0
+```
+
+把 `topology` 与 `server` 写在一起，是为了让「地址池怎么分」和「用哪种拓扑」在同一处可见，便于日后核对。这里不展开每个取值背后的地址分配算法，完整指令族见 04-02；改完用 `openvpn --config` 前台起一次确认配置能解析，再交回 systemd 托管，流程见 03-01 步骤七。任何取值调整都需对照实际版本核验，尤其从 `net30` 迁到 `subnet` 时，已分发客户端的 profile 与地址池要一起复核。
+
+**步骤二：让客户端访问服务端后端网段**。这一步要「服务端推路由、服务端知道后端网段怎么走、客户端背后网段回指」三件事配套，缺一不可。
+
+```conf
+# /etc/openvpn/server/server.conf 追加（服务端侧）
+push "route 192.168.10.0 255.255.255.0"
+route 192.168.10.0 255.255.255.0
+client-config-dir /etc/openvpn/ccd
+```
+
+```conf
+# /etc/openvpn/ccd/client1（按客户端 CN 命名，后端在客户端一侧时）
+iroute 192.168.20.0 255.255.255.0
+```
+
+```bash
+sudo install -d -m 0750 /etc/openvpn/ccd
+sudo install -m 0644 ccd-client1 /etc/openvpn/ccd/client1
+sudo sysctl -w net.ipv4.ip_forward=1
+sudo nft add rule ip nat postrouting oifname eth0 masquerade
+```
+
+第一份 `conf` 里 `push "route ..."` 把后端网段下发给客户端，`route` 让服务端自身路由表也指向隧道，`client-config-dir` 打开按客户端的定制配置；第二份 `ccd` 文件里的 `iroute` 用于「后端网段其实挂在某个客户端背后」的情形，告诉服务端该网段应转给哪台客户端，它与 `route` 的配对关系属于路由推送机制，原理见 06-11、模块见 07-08 / 07-09、指令见 04-04，本篇只按场景取用。`bash` 块把 ccd 文件归位、确认转发打开、补上出网 NAT。要清醒认识到：若后端网段在服务端这一侧，通常不需要 `iroute`；若在客户端这一侧，`route` 与 `iroute` 必须成对出现，且 ccd 文件名必须等于该客户端证书的 CN，写错一个字母就静默不生效。文件名、路径与指令取值需对照实际版本核验。
+
+**步骤三：用 redirect-gateway 接管全部流量**。在服务端侧推送，让所有客户端统一生效，比逐台改 profile 可靠。
+
+```conf
+# /etc/openvpn/server/server.conf 追加（全局接管）
+push "redirect-gateway def1 bypass-dhcp"
+push "dhcp-option DNS 192.168.10.1"
+push "dhcp-option DNS 8.8.8.8"
+```
+
+```bash
+sudo nft add rule ip nat postrouting oifname eth0 masquerade
+sudo systemctl restart openvpn-server@server
+```
+
+`redirect-gateway` 让客户端把默认流量导向隧道，`def1` 用两条更具体的半程路由覆盖默认路由而不删除原默认路由，`bypass-dhcp` 避免误伤本地 DHCP，`dhcp-option DNS` 把解析器一并推过去；这些参数的行为与取值需对照实际版本核验，完整指令族见 04-04，路由下发机制见 06-11。服务端必须能为客户端出网流量做 NAT，否则包出得去、回不来。重启后按第 4 节验证客户端路由表。这里刻意把「全局接管」与步骤二的「按网段推送」分开演示：两者可以共存，但意图不同，生产里应先明确「全部走隧道」还是「只走指定网段」，再决定用哪一组配置，别把两套一起堆上去造成路由冲突。
+
+以下为客户端启用全局接管后的路由表示例输出，具体格式需对照实际版本核验。
+
+```text
+0.0.0.0/1 via 10.8.0.1 dev tun0
+128.0.0.0/1 via 10.8.0.1 dev tun0
+10.8.0.0/24 via 10.8.0.1 dev tun0
+203.0.113.1 via 192.168.1.1 dev eth0
+default via 192.168.1.1 dev eth0
+```
+
+逐行判读这段输出，能把「全局接管到底做了什么」看明白，它是本篇最该吃透的一组证据。前两行 `0.0.0.0/1` 与 `128.0.0.0/1` 正是 `def1` 的典型效果：用两条 /1 覆盖整个地址空间，因为比 `default` 的 /0 更具体，所以优先命中，流量被导向 `10.8.0.1` 的隧道对端；同时原来的 `default via 192.168.1.1 dev eth0` 仍保留在最后一行，这就是「覆盖而非删除」，好处是隧道断开后原默认路由还在，不至于彻底断网。第三行 `10.8.0.0/24` 是隧道自身网段，保证管理流量走隧道。第四行 `203.0.113.1` 一类的主机路由指向原物理网关，是 `bypass-dhcp` 与到服务端公网地址直通保护的体现：到服务端公网 IP 的包必须走原来的物理网卡，否则隧道自身的 UDP 会被重新塞进隧道形成环路，连接立刻断掉。要特别克制：这里的地址、掩码、网卡名与路由措辞都是示意，需对照实际版本核验；看到少了那两条 /1，说明全局接管没生效，要回查 `push` 是否被客户端 `pull` 接受、客户端平台是否允许改默认路由；看到 `default` 被整条删掉，则要警惕断网风险与所用参数是否正确。DNS 是否真的切到推送的解析器，还要另查客户端解析器配置，不能只看路由表。
+
+**步骤四：搭建 tap 桥接模式**。这是与前面三套完全不同的配置，服务端从 `server` 换成 `server-bridge`，并把 tap 设备挂进网桥。以下命令以 iproute2 为例，`brctl` 旧式写法与网桥参数需对照实际版本核验。
+
+```bash
+sudo ip link add name br0 type bridge
+sudo ip link set eth0 master br0
+sudo ip addr flush dev eth0
+sudo ip addr add 192.168.10.1/24 dev br0
+sudo ip link set br0 up
+sudo ip link set eth0 up
+```
+
+```conf
+# /etc/openvpn/server/server-bridge.conf 要点示例
+dev tap0
+server-bridge 192.168.10.1 255.255.255.0 192.168.10.100 192.168.10.200
+client-to-client
+persist-key
+persist-tun
+```
+
+```bash
+sudo ip link set tap0 master br0
+sudo ip link set tap0 up
+ip link show br0
+```
+
+第一组 `bash` 先建网桥 br0、把 eth0 挂进去、把原 eth0 的 IP 迁移到 br0 上再拉起，顺序很重要：`ip addr flush dev eth0` 会短暂断网，务必在带外或本地控制台操作，前面第 2 节已经警告过。`conf` 里 `dev tap0` 声明二层设备，`server-bridge` 给出网关、掩码与分配给客户端的地址池起止（本例 `192.168.10.100` 到 `192.168.10.200` 与内网同网段），参数形态与是否还需要 `ifconfig-pool` 等需对照实际版本核验，完整指令族见 04-04。第三组 `bash` 把启动后出现的 tap0 挂进网桥并拉起——这一步通常靠 `up` 脚本在隧道建立时自动完成，脚本钩子与环境变量见 04-05，本篇用手工命令演示原理，生产环境应写成钩子，否则重启后 tap0 不会自动入桥。客户端侧相应把 `dev tun` 改成 `dev tap`、去掉独立的隧道网段概念，具体写法见 04-02，需对照实际版本核验。桥接模式下客户端拿到的地址与服务端内网同网段，广播帧经隧道在 br0 里转发，这正是图 03-04-02 的落地形态。
+
+以下为网桥状态示例输出，具体格式需对照实际版本核验。
+
+```text
+4: br0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP mode DEFAULT group default
+    inet 192.168.10.1/24 brd 192.168.10.255 scope global br0
+2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 master br0 state forwarding
+5: tap0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 master br0 state forwarding
+```
+
+判读要点：第一行 br0 处于 `UP` 且带 `inet 192.168.10.1/24`，证明 IP 已成功从 eth0 迁移到网桥接口，这是桥接能否对外通信的关键；后两行分别显示 `eth0` 与 `tap0` 的 `master br0` 与 `state forwarding`，说明物理网卡与虚拟 tap 设备都已成为网桥端口、处于转发状态，二者现在处于同一广播域。若 `tap0` 没有出现或 `master` 不是 br0，说明 `up` 钩子没生效或手工挂载漏了，客户端即便连上隧道也拿不到同网段地址、收不到 DHCP 广播。要克制：接口编号、状态措辞、`forwarding` 的显示与网桥工具输出格式都随内核与工具版本变化，需对照实际版本核验；看到广播量异常增大或出现环路告警，要立刻回到第 2 节的生成树与广播域评估，而不是继续加客户端。
+
+### 4. 验证方法与预期结果
+
+两种模式的验证重点不同，但都要落到「路由或广播域真的按预期工作」。下面合成一组命令，覆盖 tun 模式的分流/全局接管与 tap 模式的桥接状态。
+
+```bash
+ip route | grep -E '10.8.0|192.168.10|0.0.0.0/1'
+ping -c 3 192.168.10.20
+traceroute 8.8.8.8
+ip link show br0
+cat /etc/resolv.conf
+```
+
+以下为示例输出，具体格式需对照实际版本核验。
+
+```text
+10.8.0.0/24 via 10.8.0.1 dev tun0
+192.168.10.0/24 via 10.8.0.1 dev tun0
+0.0.0.0/1 via 10.8.0.1 dev tun0
+128.0.0.0/1 via 10.8.0.1 dev tun0
+PING 192.168.10.20 (192.168.10.20) 56(84) bytes of data.
+64 bytes from 192.168.10.20: icmp_seq=1 ttl=63 time=20.4 ms
+64 bytes from 192.168.10.20: icmp_seq=2 ttl=63 time=19.8 ms
+ 1  10.8.0.1  19.1 ms
+ 2  192.168.10.1  20.0 ms
+ 3  203.0.113.1  21.3 ms
+# resolv.conf 指向推送的解析器
+nameserver 192.168.10.1
+```
+
+这段输出要从四条判据交叉读。第一组路由表里 `192.168.10.0/24 via 10.8.0.1 dev tun0` 证明步骤二的后端网段路由已下发到位，那两条 /1 证明步骤三的全局接管生效；第二组 `ping 192.168.10.20` 有回包且 `ttl=63`（比直连少一跳），说明包确实经过了隧道与服务端转发抵达内网主机，而不只是本机路由表好看；第三组 `traceroute` 的第一跳是 `10.8.0.1`、第二跳是 `192.168.10.1`，把「先到服务端隧道地址、再到内网网关」这条路径直观展开，是判断「流量到底走没走隧道」最可信的证据之一；第四组 `nameserver` 指向推送的解析器，确认 DNS 没有留在本地造成「路由改了却解析异常」。tap 模式下则改看 `ip link show br0` 里 eth0 与 tap0 是否都是 `master br0`、客户端是否拿到 `192.168.10.100` 一类同网段地址、以及能否收到内网 DHCP/广播。要特别克制：路由措辞、TTL 数值、traceroute 跳数、解析器路径与地址全是示意，需对照实际版本核验；`ping` 不通但路由表正确，优先怀疑服务端转发、NAT、回程路由与内网防火墙（见 03-01 第 5 节），而不是重配客户端。
+
+把验证动作与预期结果整理成下表，失败时按图索骥反查。
+
+| 验证动作 | 命令 | 预期结果 | 不符时的含义 |
+|---|---|---|---|
+| 后端路由下发 | ip route 过滤目标网段 | 出现经隧道的路由 | push 未被接受或 ccd 未生效 |
+| 全局接管 | ip route 过滤 /1 | 两条 def1 路由存在 | redirect-gateway 未生效 |
+| 内网可达 | ping 后端主机 | 回包且 TTL 递减 | 转发 NAT 或回程路由问题 |
+| 流量路径 | traceroute 公网地址 | 首跳为隧道对端 | 流量未进隧道 |
+| DNS 切换 | 查看解析器配置 | 指向推送的 DNS | dhcp-option 未下发 |
+| 桥接状态 | ip link 与端口状态 | eth0 与 tap0 同属 br0 | up 钩子或桥接未生效 |
+
+表后强调一条方法论：路由类验证必须「看表、看包、看路径」三步齐全。只看 `ip route` 容易把「下发了但没转发」误判为成功；`ping` 加 `traceroute` 才能证明数据真的穿过了隧道并抵达目标。所有输出格式与字段需对照实际版本核验。
+
+### 5. 常见失败与排错
+
+第一类失败是「能连隧道、访问不了后端内网」，这是路由模式最高发的故障。按四层顺序排除：服务端 `route` / `push route` 有没有把网段下发给客户端（看客户端 `ip route`）；服务端 `net.ipv4.ip_forward` 是不是 1 且已持久化；服务端 FORWARD 链与 NAT 有没有放行 tun0 进出；最容易被漏的，后端网段的网关有没有把回包送回服务端。四者任一缺失都表现为 ping 不通，而路由表却可能完全正确，所以必须结合 03-01 的转发排查与 traceroute 一起看。若后端网段挂在客户端一侧，还要确认 `route` 与 `iroute` 成对、ccd 文件名等于 CN，机制见 06-11、模块见 07-08。
+
+第二类是 `redirect-gateway` 引发的断网或「路由改了却上不了网」。最常见三因：服务端没做 NAT，包出得去回不来；DNS 没推或客户端解析器没切换，域名解析失败；到服务端公网地址的主机路由没保留，隧道自身 UDP 被绕进隧道形成环路。用第 4 节的 /1 路由、traceroute 首跳、`nameserver` 三处逐项核对，再决定是否调整 `def1` / `bypass-dhcp` 一类参数，取值需对照实际版本核验、指令见 04-04。另一个软故障是「只想分流却误用了全局接管」，表现为所有流量 unexpectedly 走隧道、访问本地打印机或局域网设备异常，这时应撤掉 `redirect-gateway`、改用逐条 `push route`，把意图和配置对齐。
+
+第三类是 tap 桥接特有的失败。桥接部署中最危险的是把物理网卡 IP 迁移到 br0 时当场断掉 SSH，务必带外操作；`tap0` 没挂进网桥，通常是 `up` 钩子没写或没被执行，脚本钩子与环境变量见 04-05；客户端拿不到同网段地址、收不到 DHCP，先查 br0 端口状态与广播是否被中间网络过滤；广播域扩大后出现广播风暴或环路，要启用生成树并排查是否存在第二条桥接路径；云平台禁止混杂模式或自定义二层转发时，桥接方案根本不可用，这类限制见 03-05。还要确认客户端平台支持 tap——移动端与部分简化客户端不支持，遇到「连上却无地址」先查这一项，支持面需对照实际客户端版本核验。
+
+第四类是 `topology` 与 MTU 类软故障。服务端与客户端对 `topology` 的假设不一致，可能导致地址池与路由异常，改这一项必须两端一起复核，取值需对照实际版本核验、指令见 04-02。隧道封装后有效 MTU 变小，大包不通、网页卡在大响应、某些应用超时，是典型的 MTU 黑洞，`tun-mtu` / `mssfix` 的推导见 06-04、模块见 07-11、指令见 04-02，本篇只把它列为「路由通了但体验异常时优先怀疑」的方向，不展开推导链。
+
+最后集中列一组「陷阱与最佳实践」。其一，默认选 tun，只有明确需要二层广播或非 IP 协议才上 tap，别为「透明」二字付出广播域与云限制的代价；其二，后端网段要「服务端路由 + 客户端 push + 回程路由 + 必要时 iroute/ccd」四件配套，缺一不可；其三，`redirect-gateway` 明确「全局还是分流」，配好 NAT、DNS 与到服务端公网地址的直通，避免环路；其四，桥接部署带外操作、防环路、把 tap0 入桥写成 `up` 钩子而非手工命令；其五，改 `topology`、改 `dev`、从 `server` 换 `server-bridge` 都是结构性变更，先在测试环境验证、再同步所有客户端 profile；其六，社区版只提供 `src/openvpn/` 这一套用户态程序，路由与桥接都是靠标准指令加系统网络能力拼出来的，不存在商业版 Access Server 那种一键式网络拓扑管理，别把商业能力写进验收清单。把失败现象与处理方向整理成下表。
+
+| 现象 | 优先怀疑层 | 优先查看 | 处理方向 |
+|---|---|---|---|
+| 连上但访不了内网 | 转发与回程 | 路由表 转发 NAT traceroute | 补齐四件配套 |
+| 全局接管后断网 | DNS 与 NAT | /1 路由 解析器 NAT | 补 DNS 与直通路由 |
+| 分流却全部走隧道 | 配置意图 | redirect-gateway 配置 | 改用逐条 push route |
+| 桥接部署时 SSH 断 | 网卡 IP 迁移 | 带外控制台 | 带外操作并重排顺序 |
+| tap0 未入桥 | up 钩子 | 网桥端口状态 | 写成脚本钩子 |
+| 客户端拿不到地址 | 平台支持 | 客户端 tap 能力 | 换 tun 或换客户端 |
+| 大包不通网页卡 | MTU 与分片 | tun-mtu 与 mssfix | 见 06-04 与 07-11 |
+
+### 6. 小结
+
+用一条主线收束本篇：拓扑扩展的本质，是先在 tun 路由与 tap 桥接之间按「要不要广播域」做一次选型，再在 tun 模式下用 `topology subnet` 固定地址分配、用 `push route` 加 `route` 加回程路由（后端在客户端侧再补 `iroute` 与 ccd）打通后端网段、用 `redirect-gateway def1 bypass-dhcp` 配合 NAT 与 DNS 推送实现全局接管，最后若确需二层广播才用 `server-bridge` 加网桥 br0 把 tap0 与 eth0 桥进同一广播域，并把 tap0 入桥写成 `up` 钩子。其中「回程路由」「到服务端公网地址的直通」「桥接带外操作」三件事最容易被跳过，也最容易造成「路由表全对却不通」或「改配置当场断 SSH」这类难查的事故，值得单独记牢。看到客户端路由表出现预期网段与两条 /1、`ping` 后端主机有回包且 TTL 递减、`traceroute` 首跳为隧道对端、DNS 指向推送的解析器，或桥接模式下 eth0 与 tap0 同属 br0 且客户端拿到同网段地址，才分别算两种模式验证通过。
+
+本篇始终守着实战册与去重边界：网络与隧道指令写明「完整指令族见 04-02」，服务端与客户端模式指令写明「见 04-04」，脚本钩子写明「见 04-05」；路由推送与 `pull` 机制只写「原理见 06-11」，MTU 推导只写「见 06-04」，路由与桥接模块只写「模块见 07-09 / 07-08」，结构体一律「（字段见 05-xx）」；同时点明社区版不含商业版 Access Server 的一键拓扑管理。所有 `topology` 默认值、`server-bridge` 参数形态、`redirect-gateway` 取值、网桥工具命令与云平台限制都标注「需对照实际版本核验」并给出 `man openvpn`、`04-xx`、`distro/` 等可定位线索，不凭印象编造。
+
+下一篇 03-05 会把这套已经能跑路由与桥接的服务端搬进容器与云：处理 `/dev/net/tun` 设备映射、`NET_ADMIN` 能力集、K8s 的 `securityContext` 与设备访问、以及云安全组对 UDP 的放行，并说明桥接方案上云为何常受限。再往后 03-06 叠加多实例与故障切换。它们都以本篇确立的 tun 路由模式为默认基线。
+
+## 03-05 容器化与云上部署：Docker TUN 设备与 NET_ADMIN / K8s / 云安全组
+
+### 1. 目标与拓扑
+
+前四篇都在一台「有完整内核与 root 权限」的裸机或虚拟机上部署服务端。本篇把同一套服务端搬进容器编排与公有云，目标是把「换了运行环境之后多出来的那几道门槛」逐一解决：容器里怎么拿到 `/dev/net/tun`、怎么获得创建 tun 设备与改路由所需的能力集、K8s 里 Pod 如何声明设备与 `securityContext`、证书与密钥以什么形态挂载、云安全组怎样放行 UDP，以及云网络的叠加封装对 MTU 有什么影响。读完应当能把 03-01 的 `server.conf` 几乎原样放进一个容器或 Pod 里跑通，并知道每一层「不通」时该查哪一层控制面。
+
+先把「拓扑」从网络连线换成层次关系。容器化部署里，OpenVPN 进程不再直接面对宿主机内核，而是隔着一层运行时：设备节点要由运行时显式映射、能力集要由运行时显式授予、端口要由运行时显式转发、网络命名空间里的转发开关可能不在容器内可控。云上又多一层安全组与负载均衡。于是链路变成「远程客户端 → 云安全组/负载均衡 → 宿主机 → 容器/Pod → tun 设备 → 服务端内网」，每一层都是一段可能被拦住的边界。图 03-05-01 把 Docker 形态下设备、能力、卷与安全组的关系画出来。
+
+:::figure id=03-05-01 | name=Docker 容器化部署设备与能力映射 | dir=TD
+node n1 "云主机或物理机<br/>宿主机内核" blue
+node n2 "/dev/net/tun<br/>TUN 字符设备" teal
+node n3 "NET_ADMIN 能力<br/>与设备映射" amber
+node n4 "openvpn 容器<br/>监听 UDP 1194" purple
+node n5 "配置与证书卷<br/>只读挂载" green
+node n6 "云安全组<br/>放行 UDP 1194" gray
+node n7 "远程客户端" red
+edge n1 -> n2 "提供设备"
+edge n2 -> n3 "device 映射"
+edge n3 -> n4 "赋予能力"
+edge n5 -> n4 "挂载配置"
+edge n6 -> n1 "入站放行"
+edge n7 -> n6 "公网接入"
+edge n7 -> n4 "加密隧道"
+:::
+
+图 03-05-02 进一步把 K8s 与云上形态展开：Service 负责把 UDP 1194 引进集群、Pod 通过 `securityContext` 与设备映射拿到能力、`Secret` 挂证书、节点内核提供 `/dev/net/tun` 与转发。两张图合起来，正好覆盖从「单机进程」到「编排实例」多出来的每一层。
+
+:::figure id=03-05-02 | name=K8s 与云上部署层次拓扑 | dir=TD
+node n1 "远程客户端" blue
+node n2 "云负载均衡<br/>或安全组" teal
+node n3 "K8s Service<br/>UDP 1194" amber
+node n4 "openvpn Pod<br/>securityContext" purple
+node n5 "节点 /dev/net/tun<br/>hostPath 或插件" green
+node n6 "Secret 挂证书<br/>与 CRL" gray
+node n7 "宿主机内核<br/>转发与 TUN" red
+edge n1 -> n2 "公网接入"
+edge n2 -> n3 "转发到 Service"
+edge n3 -> n4 "选中 Pod"
+edge n4 -> n5 "申请设备"
+edge n7 -> n5 "提供设备"
+edge n6 -> n4 "挂载密钥"
+edge n4 -> n7 "能力依赖"
+:::
+
+对着两张图先立住一个判断：容器化并没有改变 OpenVPN 本身的工作方式，改变的只是「谁能碰内核资源」。进程仍然要打开 tun 字符设备、创建 tun0、配地址、改路由、绑定 UDP 端口，区别是这些动作在默认容器里全被能力集与设备白名单挡住。因此本篇的主线不是改 `server.conf`，而是把 `--device`、`--cap-add`、`securityContext`、卷挂载、端口转发、安全组这几层「授权」逐一补齐。凡是「容器内报打不开 TUN」「Operation not permitted」「能起容器但客户端连不上」，几乎都能归到某一层授权没给够。
+
+去重与边界照旧要写清。本篇出现的 `openvpn --config`、挂载路径里的 `server.conf`、以及 `proto udp` / `port 1194` 一类指令，只作最小引用，完整指令族见 04-02 / 04-03；tun 设备的平台抽象见 07-01；`ovpn-dco` 内核数据通道卸载能否在容器内启用、能力协商与用户态回退见 06-12 / 07-10；结构体一律「（字段见 05-xx）」。本篇不展开任何转发或封装机制，只讲「运行时与云平台这一层怎么放行」。还要点明生态边界：`OpenVPN Access Server` 一类商业形态可能提供打包好的镜像或云市场镜像与集中管理，但社区版只有 `src/openvpn/` 这一套程序，容器镜像要么自己基于发行版包构建、要么选用第三方社区镜像，二者的来源、版本与内置内容都需自行核验，不能假定存在某个官方社区版「一键镜像」。版本基准仍是 OpenVPN 2.6.x / 2.7(master)，Docker、containerd、Kubernetes 的字段名、API 版本与云厂商控制台措辞都需对照实际版本核验。
+
+### 2. 前置条件与环境
+
+第一项是宿主机内核与设备，这是容器化最容易被忽略的前提：容器不会自己长出一个 `/dev/net/tun`。先确认节点内核带 TUN 支持、`modprobe tun` 能加载、`ls -l /dev/net/tun` 看得到字符设备，具体路径与设备号需对照实际内核版本核验。若节点本身没有这个设备，容器里无论怎么 `--device` 都没有意义。还要确认 `net.ipv4.ip_forward=1` 在宿主机侧持久化开启——本机转发开关属于内核网络命名空间，容器与宿主机是否共享该命名空间取决于运行时网络模式，稳妥做法是在宿主机侧就把它打开并写进 `sysctl.d`，与 03-01 步骤四一致；容器内能否再设同名 sysctl 需对照实际版本核验。
+
+第二项是容器运行时与权限。Docker 或兼容运行时要支持 `--device`、`--cap-add`、端口映射与卷挂载；`NET_ADMIN` 是创建网络设备、配地址、改路由所需的能力，某些场景还需 `MKNOD`（设备节点不存在时创建）或干脆 `privileged`，但特权容器权限过大，应优先收窄到具体 capability，具体所需能力集需对照实际版本核验。镜像里要真的装了 `openvpn` 二进制与 `ip` 一类网络工具，否则容器起来了也配不了接口；镜像是自建还是第三方、基于哪个基础镜像、`openvpn --version` 落在哪个分支，都要先跑一遍确认，需对照实际版本核验。
+
+第三项是 K8s 集群侧的准入条件，这里字段最需要谨慎。Pod 要访问宿主机 `/dev/net/tun`，K8s 的 Pod spec 并没有一个通用、稳定的「直接声明宿主机设备」字段，常见做法是三选一：用 `hostPath` 卷把节点上的字符设备挂进容器、用设备插件（device plugin）暴露该资源、或在受控前提下使用 `privileged`。`securityContext` 可写 `capabilities.add: ["NET_ADMIN"]`，也可写 `privileged: true`，二者取其一即可，具体字段与 API 版本需对照实际版本核验。若要在 Pod 里设置 `net.ipv4.ip_forward` 这类 sysctl，它属于 unsafe sysctl，节点 kubelet 是否允许要由 `--allowed-unsafe-sysctls` 一类配置决定，具体参数名与取值形式需对照实际版本核验，本篇不编造。集群的 PodSecurity 策略或准入控制器也可能直接拒绝特权或 hostPath，需提前与集群管理员确认。证书与密钥建议放 `Secret` 并以只读方式挂载，CRL 与 status 的持久化另作考虑。
+
+第四项是云平台侧。云主机要有公网可达地址（EIP 或负载均衡），安全组入站要放行 UDP 1194；很多云平台的安全组默认只放行少量 TCP 端口，UDP 常被漏掉。负载均衡对 UDP 的支持、健康检查能否探 UDP、以及是否支持会话保持，都因厂商而异，需对照实际平台核验——这直接关系到 03-06 的多实例方案能不能在云上落地。云网络本身常有 overlay 封装，隧道再叠加一层后有效 MTU 会比物理网卡小，容易触发大包不通，方向见 06-04 / 07-11，指令见 04-02。桥接模式在这类环境里通常因禁止混杂模式而不可用，原因见 03-04。
+
+把三种部署形态的关键差异整理成下表，便于选型。表中「设备来源」一格写成 `hostPath\|device 映射` 用竖线表示两类方式，按表格约定转义为 `\|`。
+
+| 维度 | 裸机或虚拟机 | Docker 单机 | Kubernetes |
+|---|---|---|---|
+| 设备来源 | 节点自带 | device 映射 | hostPath\|device 映射 |
+| 能力授予 | root 或 sudo | --cap-add=NET_ADMIN | securityContext |
+| 端口暴露 | 直接监听 | -p 映射 | Service 与 LB |
+| 证书载体 | 本地目录 | 只读卷 | Secret 只读挂载 |
+| 转发开关 | sysctl.d 持久化 | 宿主机优先 | 受 kubelet 限制 |
+| 外层放行 | 本机防火墙 | 本机防火墙 | 云安全组与 LB |
+
+表后补两点判读。第一，「设备来源」与「能力授予」是两件独立的事：只映射了设备却没给 `NET_ADMIN`，进程打得开设备也配不了地址与路由；只给了能力却没映射设备，会直接报找不到 `/dev/net/tun`。第二，端口暴露与外层放行也是串联的：Docker 的 `-p` 或 K8s 的 Service 只解决「到宿主机/集群」，云安全组那一层没开 UDP，客户端照样超时。把前置检查列成下表。
+
+| 检查项 | 命令或线索 | 预期结果 | 异常信号 |
+|---|---|---|---|
+| 节点 TUN | ls -l /dev/net/tun 与 lsmod | 设备存在或模块加载 | 无设备则容器无从映射 |
+| 宿主机转发 | sysctl 与 sysctl.d | 运行时与配置均为 1 | 重启后回退 |
+| 运行时能力 | docker version 或 crictl | 支持 device 与 cap-add | 版本过旧不支持 |
+| 集群准入 | PodSecurity 与 kubelet 配置 | 允许所需能力或设备 | 准入直接拒绝 Pod |
+| 云安全组 | 平台控制台入站规则 | UDP 1194 已放行 | 仅放行 TCP |
+| 镜像内容 | openvpn --version | 落在 2.6.x 或 2.7 基准 | 镜像内无二进制 |
+
+### 3. 分步操作
+
+下面按「宿主机前置、准备配置卷、Docker 起容器、compose 固化、K8s 部署、云安全组放行」的顺序给出完整命令。为便于判读，命令与典型输出分开列出；所有输出均写明「示例输出，具体格式需对照实际版本核验」，且刻意不使用任何省略行，每行都是一条完整示意记录。
+
+**步骤一：宿主机前置**。与 03-01 一脉相承，只是把「给容器用」写进理由。
+
+```bash
+sudo modprobe tun
+ls -l /dev/net/tun
+sudo sysctl -w net.ipv4.ip_forward=1
+echo 'net.ipv4.ip_forward = 1' | sudo tee /etc/sysctl.d/99-openvpn-forward.conf
+sudo sysctl --system
+```
+
+`modprobe tun` 与 `ls -l` 确认节点上确实有设备可供映射；后面三行把转发同时做成运行时与持久化两层，理由在 03-01 步骤四已经讲透。这里强调一句：容器里再怎么设置，都不如宿主机这一层稳，因为网络命名空间归属与 sysctl 可见性随运行时配置变化，需对照实际版本核验。
+
+**步骤二：准备配置与证书目录**。沿用 03-02 的产出物，目录只读挂载给容器。
+
+```bash
+sudo install -d -m 0750 /srv/openvpn/server
+sudo install -m 0644 ca.crt server.crt dh.pem crl.pem server.conf /srv/openvpn/server/
+sudo install -m 0600 server.key ta.key /srv/openvpn/server/
+sudo chmod -R o-rwx /srv/openvpn/server
+ls -l /srv/openvpn/server/
+```
+
+这一步把 `server.conf` 与全部证书密钥集中到一个目录，供容器以只读方式挂载；私钥 0600、其余 0644，与 03-01 权限约定一致。把配置和证书放进同一个只读卷，好处是镜像本身不含任何机密、轮换证书只需替换卷内容并重启容器；`server.conf` 里的 `ca`、`cert`、`key` 等相对路径要与实际挂载点对齐，具体基准需对照实际版本核验。
+
+**步骤三：用 Docker 起容器**。这是本篇最核心的一条命令，把设备、能力、端口、卷、转发开关一次给齐。
+
+```bash
+docker run -d --name openvpn-server \
+  --cap-add=NET_ADMIN \
+  --device /dev/net/tun \
+  -p 1194:1194/udp \
+  -v /srv/openvpn/server:/etc/openvpn/server:ro \
+  --sysctl net.ipv4.ip_forward=1 \
+  openvpn-server:2.6 \
+  openvpn --config /etc/openvpn/server/server.conf
+docker ps
+docker logs --tail 20 openvpn-server
+```
+
+逐项说明这条命令的授权含义，因为它们正是「容器与裸机」的全部差别。`--cap-add=NET_ADMIN` 把创建网络设备、配地址、改路由所需的能力加进容器，若日志里出现 `Operation not permitted`，第一反应就是它没给够或还缺 `MKNOD`，所需能力集需对照实际版本核验；`--device /dev/net/tun` 把宿主机的 TUN 字符设备映射进容器，没有它就会报找不到设备或打不开 TUN；`-p 1194:1194/udp` 把容器 UDP 端口映射到宿主机，注意协议必须写 `udp`，写成默认 TCP 会静默不生效；`-v ...:ro` 把步骤二的目录只读挂进容器，`--config` 指向其中的配置；`--sysctl net.ipv4.ip_forward=1` 尝试在容器网络命名空间内开启转发，但 Docker 对可设置的 sysctl 有白名单，`net.ipv4.ip_forward` 是否允许在容器内设置需对照实际版本核验，因此步骤一在宿主机侧先开一层才是稳妥做法。镜像名 `openvpn-server:2.6` 是示意，实际镜像是自建还是第三方、标签与内置版本都需对照实际版本核验，不要照抄。`openvpn --config` 是加载配置的标准入口，语法见 04-01。
+
+以下为容器日志示例输出，具体格式需对照实际版本核验。
+
+```text
+TUN/TAP device tun0 opened
+/sbin/ip link set dev tun0 up mtu 1500
+/sbin/ip addr add dev tun0 10.8.0.1/24 broadcast 10.8.0.255
+UDPv4 link local (bound): [AF_INET][any]:1194
+UDPv4 link remote: [AF_UNSPEC]
+Initialization Sequence Completed
+```
+
+逐行判读这段日志，能确认「容器里的授权真的给够了」。前三行 `TUN/TAP device tun0 opened` 与随后的 `ip link` / `ip addr` 是最关键的证据：进程不仅打开了 `/dev/net/tun`，还成功创建了 tun0、拉起接口、配上 `10.8.0.1/24`，这一串动作同时依赖「设备映射」与 `NET_ADMIN` 两样都到位；只要看到 `Cannot open TUN/TAP dev` 或 `Operation not permitted`，就说明二者至少缺一，回到 `docker run` 那几行逐项核对，而不是去改 `server.conf`。第四、五行 `UDPv4 link local (bound)` 与 `link remote: [AF_UNSPEC]` 说明服务端已在容器内监听 UDP 1194、等待客户端接入，配合 `-p 1194:1194/udp` 才能被外部访问；最后 `Initialization Sequence Completed` 是初始化完成标记，与 03-01 第 3 节完全一致，证明配置解析、证书加载、设备打开、路由下发全走完了。要特别克制：日志时间戳、能力标签、接口名、地址与命令路径都是示意，需对照实际版本核验；`Initialization Sequence Completed` 只证明容器内服务端起来了，外部能不能连进来还要看 `-p` 映射与云安全组，那是第 4 节的事。
+
+**步骤四：用 compose 固化单机形态**。把上面的 `docker run` 写成可版本化的文件，便于复现与变更回滚。
+
+```yaml
+services:
+  openvpn:
+    image: openvpn-server:2.6
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "1194:1194/udp"
+    volumes:
+      - /srv/openvpn/server:/etc/openvpn/server:ro
+    restart: unless-stopped
+    command: openvpn --config /etc/openvpn/server/server.conf
+```
+
+`cap_add`、`devices`、`ports`、`volumes`、`command`、`restart` 是 compose 里与 `docker run` 一一对应的字段；`devices` 的写法把宿主机与容器内路径都写成 `/dev/net/tun`，`ports` 里 `"1194:1194/udp"` 的 `/udp` 不能省。字段名、语法与 compose 版本支持范围需对照实际版本核验。把这份文件纳入版本库时，注意里面**不含**任何私钥——机密仍在宿主机的只读卷里，这是「镜像与配置可入库、密钥不入库」的基本纪律。
+
+**步骤五：K8s 部署**。下面给一个最小可用的 Deployment 与 Service 示例，重点在 `securityContext`、设备访问与 `Secret` 挂载；字段名与 API 版本需对照实际版本核验。
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openvpn-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openvpn
+  template:
+    metadata:
+      labels:
+        app: openvpn
+    spec:
+      containers:
+        - name: openvpn
+          image: openvpn-server:2.6
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN"]
+          volumeMounts:
+            - name: tun
+              mountPath: /dev/net/tun
+            - name: server-config
+              mountPath: /etc/openvpn/server
+              readOnly: true
+          ports:
+            - containerPort: 1194
+              protocol: UDP
+          command: ["openvpn"]
+          args: ["--config", "/etc/openvpn/server/server.conf"]
+      volumes:
+        - name: tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice
+        - name: server-config
+          secret:
+            secretName: openvpn-server-certs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openvpn-udp
+spec:
+  type: LoadBalancer
+  selector:
+    app: openvpn
+  ports:
+    - port: 1194
+      protocol: UDP
+      targetPort: 1194
+```
+
+这份清单有四处需要谨慎说明，避免读者照抄后踩坑。第一，`securityContext.capabilities.add: ["NET_ADMIN"]` 是授予能力的较收敛写法；若集群策略允许且排查需要，也可改用 `privileged: true`，但特权容器权限过大，应优先收窄，二者取其一，具体行为需对照实际版本核验。第二，Pod spec 没有通用稳定的「直接声明宿主机设备」字段，这里用 `hostPath` 卷配 `type: CharDevice` 把节点的 `/dev/net/tun` 挂进容器，是常见做法之一；更规范的路径是用 device plugin 暴露该资源，或者由集群统一以特权方式运行，具体字段名、API 版本与准入要求都需对照实际版本核验，本篇不编造一个不存在的 `devices` 字段。第三，`net.ipv4.ip_forward` 若要在 Pod 内通过 `securityContext.sysctls` 设置，属于 unsafe sysctl，节点 kubelet 是否放行取决于 `--allowed-unsafe-sysctls` 一类配置，参数名与形式需对照实际版本核验；因此更稳妥的仍是步骤一在节点侧持久化开启。第四，证书走 `Secret` 且 `readOnly: true` 挂载，Service 的 `protocol: UDP` 不能写成默认 TCP，`type: LoadBalancer` 对 UDP 的支持与会话保持能力因云厂商而异，需对照实际平台核验。多副本与会话粘性的矛盾留到 03-06，这里先保持 `replicas: 1`。
+
+```bash
+kubectl create secret generic openvpn-server-certs --from-file=/srv/openvpn/server/
+kubectl apply -f openvpn-deploy.yaml
+kubectl get pods -l app=openvpn
+kubectl logs -l app=openvpn --tail=20
+kubectl exec deploy/openvpn-server -- ls -l /dev/net/tun
+```
+
+`create secret` 把配置目录里的文件做成 Secret，`apply` 部署清单，`get pods` 与 `logs` 看 Pod 是否起来、日志是否出现初始化完成标记，`exec ... -- ls -l /dev/net/tun` 直接确认容器内能不能看到映射进来的字符设备。`--from-file` 指向目录时会把其中每个文件做成一项数据，具体行为与 Secret 大小限制需对照实际版本核验；生产里还应把私钥与可公开材料拆成不同 Secret、配合 RBAC 限制读取权限。
+
+**步骤六：云安全组放行**。云控制台字段名因厂商而异，下面用语义化命令示意，具体值需对照实际平台核验。
+
+```bash
+# 示意：为实例所在安全组添加入站规则，协议 UDP、端口 1194、来源按需收紧
+# 实际请以云厂商控制台或 CLI 的字段名与取值为准，需对照实际版本核验
+nc -u -v 203.0.113.1 1194
+```
+
+这里刻意不编造某个云厂商的具体 CLI 与参数名，只把「协议、端口、方向、来源」四个要素写清，请读者用自己平台的控制台或 CLI 落地；`nc -u` 用来从外部向 UDP 端口发包做粗探，但 UDP 无连接，收不到回显不等于端口没开，最可信的判断仍是看服务端日志有没有收到首个握手包。若前面挂了负载均衡，还要确认 LB 监听的是 UDP、后端目标组指向正确的 Pod/实例端口、健康检查不会因「探不到 UDP」而把后端判为不健康，这些行为需对照实际平台核验。
+
+### 4. 验证方法与预期结果
+
+容器化与云上的验证要按「节点设备 → 容器/Pod 内授权 → 端口映射 → 外层放行 → 端到端接入」逐层取证，任一层不通就把故障域锁在那一层。下面合成一组命令。
+
+```bash
+docker ps --filter name=openvpn-server
+docker logs --tail 5 openvpn-server
+kubectl get pods -l app=openvpn
+kubectl exec deploy/openvpn-server -- ip addr show tun0
+sudo ss -lunp | grep 1194
+```
+
+以下为示例输出，具体格式需对照实际版本核验。
+
+```text
+CONTAINER ID   IMAGE                STATUS         PORTS
+a1b2c3d4e5f6   openvpn-server:2.6   Up 3 minutes   0.0.0.0:1194->1194/udp
+Initialization Sequence Completed
+NAME                              READY   STATUS    RESTARTS   AGE
+openvpn-server-7d9f8c6b5d-2xk4p   1/1     READY      0          3m
+3: tun0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UNKNOWN
+    inet 10.8.0.1 peer 10.8.0.2/32 scope global tun0
+UNCONN 0 0 0.0.0.0:1194 0.0.0.0:* users:(("openvpn",pid=1,fd=6))
+```
+
+这段输出要分四层交叉判读。第一行 `docker ps` 的 `PORTS` 列出现 `0.0.0.0:1194->1194/udp`，确认宿主机端口映射且协议是 UDP；若这里显示的是 TCP 或端口为空，客户端必然超时，问题在 `docker run` 的 `-p`。第二行容器日志的 `Initialization Sequence Completed` 证明容器内服务端初始化完成，`tun0` 能打开、证书能加载、能力给够了。第三行 `kubectl get pods` 的 `1/1 READY` 且 `RESTARTS 0` 说明 Pod 稳定，没有因权限或设备问题反复崩溃循环；第四、五行 `kubectl exec ... ip addr show tun0` 显示容器内 tun0 已拿到 `10.8.0.1`，这是「`NET_ADMIN` 与设备映射同时生效」的硬证据，比「Pod 是 Ready」强得多。最后一行宿主机 `ss -lunp` 显示 1194 被进程占用，把「容器端口 → 宿主机端口」这一段打通。要特别克制：容器 ID、Pod 名、状态措辞、接口编号与进程号全是示意，需对照实际版本核验；`Ready` 只说明容器进程活着，不等于外部可达，最后还要用 03-03 的客户端真正连一次、看服务端 status 是否出现客户端 CN 且字节增长，才算端到端成立。云安全组那一层无法从宿主机命令证明，必须靠「外部客户端能连入 + 服务端日志收到首包」反证。
+
+把验证动作与预期结果整理成下表，失败时按图索骥反查。
+
+| 验证层 | 命令或入口 | 预期结果 | 不符时的含义 |
+|---|---|---|---|
+| 节点设备 | ls -l /dev/net/tun | 字符设备存在 | 节点无设备可映射 |
+| 容器内授权 | docker logs 或 kubectl exec | 有初始化完成标记与 tun0 | 能力或设备映射缺失 |
+| 端口映射 | docker ps 或 ss -lunp | UDP 1194 已监听 | -p 或 Service 协议写错 |
+| Pod 稳定 | kubectl get pods | READY 且无重启 | 权限或准入导致崩溃 |
+| 外层放行 | 外部客户端接入 | 服务端日志收到首包 | 安全组或 LB 未放行 |
+| 端到端 | 服务端 status 文件 | 出现客户端且字节增长 | 未真正接入 |
+
+表后强调一条方法论：容器化故障最容易「只看 Pod 状态」。记住 `Ready` 不等于「能打开 tun」、更不等于「外部能连进来」，必须用日志、容器内 `ip addr`、宿主机 `ss`、以及外部客户端接入四段证据串起来。所有输出格式与字段需对照实际版本核验。
+
+### 5. 常见失败与排错
+
+第一类失败是容器内打不开 TUN，日志出现 `Cannot open TUN/TAP dev /dev/net/tun` 或 `No such device`。按顺序排除三处：节点上有没有 `/dev/net/tun`（`modprobe tun`、`ls -l`）、`--device` / `hostPath` 有没有把它映射进去、容器内有没有权限打开它。Docker 里补 `--device /dev/net/tun`，K8s 里核对 `hostPath` 的 `path` 与 `type: CharDevice`、以及节点上该文件是否存在，字段名需对照实际版本核验。若日志同时报 `Operation not permitted`，那是能力问题，不是设备问题，两者别混。
+
+第二类是能力不足导致的 `Operation not permitted`：能打开设备却配不了地址、加不了路由。补 `--cap-add=NET_ADMIN`，必要时核查是否还缺 `MKNOD`，K8s 里核对 `securityContext.capabilities.add` 或 `privileged`，并确认 PodSecurity / 准入控制器没有把特权或能力剥掉，具体所需能力集与策略字段需对照实际版本核验。这一类的规律是「设备打开成功、紧接着的 `ip link` / `ip addr` 失败」，日志里前后两三行就能定位。
+
+第三类是转发与 sysctl 类失败。客户端能连上隧道却访问不了内网、或出网流量不通，先回 03-01 与 03-04 那套「转发、FORWARD、NAT、回程路由」排查；容器环境下多一层：`net.ipv4.ip_forward` 到底在宿主机命名空间还是容器命名空间生效、容器内的 `--sysctl` 是否被运行时白名单接受、K8s 的 `securityContext.sysctls` 是否被 kubelet 的 `--allowed-unsafe-sysctls` 放行，这些行为都需对照实际版本核验。稳妥做法始终是步骤一在宿主机侧持久化开启，别把唯一希望寄托在容器内设置。
+
+第四类是端口与外层放行失败。最常见三种：`-p 1194:1194/udp` 或 Service 的 `protocol` 写成 TCP；云安全组只放了 TCP、漏了 UDP；负载均衡把后端判为不健康（因为用 TCP 健康检查去探 UDP 端口）。UDP 无连接、`nc -u`/`telnet` 都给不出可靠结论，最可信的是外部客户端接入后看服务端日志有没有收到首个握手包。LB 对 UDP 的支持、健康检查方式与会话保持能力因厂商而异，需对照实际平台核验，这一点与 03-06 的多实例方案强相关。
+
+第五类是挂载与权限失败。`server.conf` 里 `ca` / `cert` / `key` 的相对路径与卷挂载点对不上、`Secret` 里缺了某个文件、私钥被挂成 world-readable 被 OpenVPN 拒绝、或容器以非 root 运行却读不到只读卷——这些都会表现为「容器起来了但证书加载失败」。用 `kubectl exec ... -- ls -l /dev/net/tun` 的同款手法进到容器里看一眼真实文件布局，比反复改 yaml 快。Secret 的字段、挂载权限与容器内 UID 的对应关系需对照实际版本核验。还有一类是镜像里根本没有 `openvpn` 或 `ip` 工具，命令直接 `not found`，回到第 2 节先把镜像内容验干净。
+
+最后集中列一组「陷阱与最佳实践」。其一，能力授予优先收窄到 `NET_ADMIN`，不要动不动 `privileged`，特权容器跑的是要接触内核网络的进程，权限越大风险面越大；其二，镜像与配置可入库、证书私钥绝不入镜像或版本库，用只读卷与 Secret 挂载并按角色拆分，权限收紧到 0600；其三，节点侧统一下发 `modprobe tun` 与 `net.ipv4.ip_forward` 持久化，避免每个 Pod 各自为政；其四，把 status 与日志输出到可持久化的卷或标准输出并接入日志系统，容器一删日志就没了，排障会失去证据；其五，云上留意叠加封装后的有效 MTU，必要时按 06-04 / 07-11 的方向调整 `mssfix` 一类参数，指令见 04-02；其六，`ovpn-dco` 能否在容器内启用涉及宿主机内核模块、设备/netlink 访问与能力协商，需对照实际版本核验，回退行为见 06-12 / 07-10，本篇不假定容器里一定能用；其七，社区版没有官方「一键容器镜像 + 集中管理」的商业方案，镜像来源与内置版本务必自行核验，别把 Access Server 的云市场能力写成社区版功能。把失败现象与处理方向整理成下表。
+
+| 现象 | 优先怀疑层 | 优先查看 | 处理方向 |
+|---|---|---|---|
+| 打不开 TUN 设备 | 节点与映射 | 节点设备与 device/hostPath | 加载模块并正确映射 |
+| Operation not permitted | 能力集 | securityContext 与 cap-add | 补 NET_ADMIN 或核对策略 |
+| 能连但访不了内网 | 转发与命名空间 | sysctl NAT FORWARD | 宿主机侧开启转发 |
+| 客户端反复超时 | 端口与外层 | -p Service 协议 安全组 | 逐层放行 UDP 1194 |
+| LB 后端不健康 | 健康检查 | 平台 LB 配置 | 改用适配 UDP 的探测 |
+| 证书加载失败 | 卷与 Secret | 容器内文件布局 | 对齐路径与权限 |
+| 命令 not found | 镜像内容 | 镜像内 openvpn 与 ip | 换用装齐工具的镜像 |
+
+### 6. 小结
+
+用一条主线收束本篇：把服务端搬进容器与云，改的不是 `server.conf`，而是补齐「谁能碰内核资源」的几层授权——节点上先 `modprobe tun` 并持久化 `net.ipv4.ip_forward`，用只读卷或 Secret 挂好 03-02 产出的配置与证书，Docker 里用 `--cap-add=NET_ADMIN --device /dev/net/tun -p 1194:1194/udp` 给足设备、能力与端口，K8s 里用 `securityContext` 配合 `hostPath` 或 device plugin 暴露 `/dev/net/tun`、用 `Secret` 挂证书、用 UDP 类型的 Service 引流，最后在云安全组放行 UDP 1194 并确认负载均衡支持 UDP。其中「设备映射与能力授予是两件事」「转发开关优先在宿主机侧持久化」「端口协议必须显式写 UDP」「云安全组是最后一道独立边界」四件最容易被漏，也最容易制造「Pod 明明 Ready 却连不上」的假象，值得单独记牢。看到容器日志出现初始化完成标记、容器内 `tun0` 拿到 `10.8.0.1`、宿主机 `ss` 有 UDP 1194 监听、外部客户端能连入且服务端 status 出现对应 CN 与增长字节，几层同时成立才算本篇目标达成。
+
+本篇始终守着实战册与去重边界：配置指令只作最小引用并写明「完整指令族见 04-02 / 04-03」，`--config` 语法写明「见 04-01」，tun 设备平台抽象写明「模块见 07-01」，`ovpn-dco` 的能力协商与回退写明「原理见 06-12、模块见 07-10」，MTU 方向写明「见 06-04 / 07-11」，结构体一律「（字段见 05-xx）」；同时点明社区版不提供商用镜像与集中管理，镜像来源需自行核验。所有 Docker/Compose/Kubernetes 字段名、API 版本、`securityContext` 写法、`hostPath` 类型、kubelet unsafe sysctl 参数、云厂商控制台措辞与 LB 能力都标注「需对照实际版本核验」并给出 `man openvpn`、`kubectl explain`、平台控制台等可定位线索，不凭印象编造字段。
+
+下一篇 03-06 是整册收官，会把前面五篇的单点服务端扩展成多实例与故障切换：讲清多 `remote` 与 `remote-random`、共享 CA 与 CRL、会话不共享带来的重连代价，以及前置负载均衡在 UDP 与会话粘性上的约束。那套方案的落地环境，正是本篇在容器与云上铺好的这一层。
+
+## 03-06 高可用、多实例与负载均衡部署
+
+### 1. 目标与拓扑
+
+前五篇把「一台服务端、一套 PKI、一台客户端」这条链路从裸机一路铺到了容器与云上，但它始终是单点：服务端进程一旦宕机、主机一旦重启、云主机一旦被回收，所有客户端都会断线，而且没有任何机制把它们自动接到别处。本篇作为整册收官，目标就是把这条单点链路扩展成多实例、可切换的部署：让客户端在首选实例不可用时，能自动连到另一台实例；让多实例共享同一套信任体系与吊销能力；让运维清楚「切换要付出什么代价」以及「前置负载均衡在 UDP 上有哪些约束」。读完应当能搭出至少两种可验证的高可用形态，并独立完成一次故障切换演练。
+
+有一句话必须放在最前面，它决定整篇的基调：社区版 OpenVPN **没有内置集群**。商业版 Access Server 提供的多节点、故障切换、集中用户管理与 Web 控制台，是社区版 `src/openvpn/` 这一套用户态程序不具备的能力，绝不能把那些写成社区版功能。社区版的高可用完全靠外部拼装，本质是三件事的组合——客户端侧「多个可连接目标」、服务端侧「多个彼此独立但共享信任材料的实例」、以及网络侧「把流量引到某个存活实例的四层负载均衡」。每个实例都是独立的进程，持有自己的地址池、自己的客户端实例表与自己的 TLS 会话；它们之间不共享状态。这条「不共享」是本篇所有设计取舍的根源，后面会反复回到它。
+
+据此可以列出三条可落地路线，它们不互斥，生产里常叠加使用。路线 A 是客户端侧切换：在 profile 里写多条 `remote`，配合 `remote-random`、`resolv-retry` 与 `keepalive`，由客户端在首选不可达时自行挑下一个目标，成本最低、最贴近社区版原生能力。路线 B 是多实例并列：在同一台或不同主机上跑多个服务端实例，用不同端口或不同主机区分、共享同一 CA 签发的证书与统一的 CRL，客户端靠路线 A 的地址列表或靠外部机制选择实例。路线 C 是前置四层负载均衡：用 nginx stream、LVS、HAProxy 或云 CLB 把 UDP 1194 引到后端实例池，对客户端呈现单一入口，但 UDP 的会话保持与健康检查比 TCP 棘手得多。图 03-06-01 把三条路线叠成一张部署拓扑，虚线是切换与故障触发的回查关系。
+
+:::figure id=03-06-01 | name=多实例高可用部署拓扑 | dir=TD
+node n1 "远程客户端<br/>多 remote 列表" blue
+node n2 "前置四层负载<br/>或 DNS 轮询" teal
+node n3 "实例 A<br/>主机一 端口 1194" amber
+node n4 "实例 B<br/>主机二 端口 1194" purple
+node n5 "共享 CA 与 CRL<br/>统一吊销" green
+node n6 "各自 status<br/>与地址池" gray
+node n7 "客户端切换<br/>keepalive 触发" red
+edge n1 -> n2 "择一接入"
+edge n2 -> n3 "转发 UDP"
+edge n2 -> n4 "转发 UDP"
+edge n5 -> n3 "分发信任"
+edge n5 -> n4 "分发信任"
+edge n3 -> n6 "各记状态"
+edge n4 -> n6 "各记状态"
+edge n7 -> n1 dashed "切换回查"
+edge n3 -> n7 dashed "故障触发"
+:::
+
+对着这张图要把「共享什么、不共享什么」分清楚，这是多实例部署最容易出错的地方。共享的是信任材料：所有实例由同一个 CA 签发服务端证书、客户端用同一张 `ca.crt` 校验、所有实例挂同一份 `crl.pem` 执行吊销、控制通道保护密钥 `ta.key` 也必须一致，否则客户端切过去会因校验失败被拒。各自独立的是运行状态：每个实例有自己的 `ifconfig-pool` 地址池、自己的客户端实例表、自己的 TLS 会话与密钥状态、自己的 status 与日志文件。图里 `各自 status 与地址池` 和 `客户端切换` 两个节点正对应这一点：切换过去不是「接着用原来的会话」，而是重新握手、重新分配地址、重新建立路由。理解了这个代价，就不会对「切换要不要断一下」抱有不切实际的预期。
+
+去重与边界在本篇尤其要立住，因为「高可用」很容易滑向机制或故障案例库。`remote`、`remote-random`、`resolv-retry`、`float` 属于 04-02 的网络与隧道指令族；`server`、`ifconfig-pool`、`duplicate-cn`、`keepalive`、`ping-restart`、`client-config-dir` 属于 04-04 的服务端与客户端模式指令族；本篇只取本场景必需的最小集合并写「完整指令族见 04-02 / 04-04」。服务端实例表、会话查找与多客户端多路复用属于机制，原理见 06-10，结构体字段见 05-08；多客户端服务端与 ccd 模块见 07-08；切换相关的故障案例按现象反查见 08-04。本篇不展开握手与密钥状态机，也不列字段表，只回答「怎么搭多实例、怎么让客户端切、怎么验证切成功、切换失败往哪查」。版本基准仍是 OpenVPN 2.6.x / 2.7(master)，`remote-random` 行为、`keepalive` 触发逻辑、负载均衡对 UDP 的支持、以及各实例间状态是否可能通过 DCO 之类机制部分共享，都需对照实际版本核验。
+
+### 2. 前置条件与环境
+
+第一项是实例数量与形态。至少要准备两个彼此独立的服务端实例，可以是同一台主机上的两个进程（用不同端口区分），也可以是两台云主机或两台容器副本。前者成本低、适合演练，但共享同一台主机的内核与网卡，主机宕机就一起完蛋，不算真正的高可用；后者才能扛住单机故障，也是生产该选的形态。无论哪种，两个实例的软件版本要一致或至少兼容，配置结构要同构，否则切换后行为不一致，排障会非常痛苦。用 03-05 的容器/云形态时，每个实例对应一个 Deployment/Pod 与自己的设备映射、`NET_ADMIN` 能力、证书挂载与转发前置，别把两个实例塞进同一个共享设备与地址池的容器里。
+
+第二项是地址池规划，这是多实例最容易被忽略的冲突点。若两个实例都用 `server 10.8.0.0 255.255.255.0`，客户端切过去可能拿到与原来冲突的地址，或者在路由层面把两个实例混成一团。稳妥做法是给每个实例一个不重叠的隧道网段，例如实例 A 用 `10.8.0.0/24`、实例 B 用 `10.9.0.0/24`；若必须共用同一网段，则要保证同一时刻只有一个实例为某客户端分配地址、并有其它隔离手段，具体可行性与 `ifconfig-pool` 行为需对照实际版本核验，指令见 04-04。同理，两个实例的 `status` 文件、日志、`ipp.txt` 持久化文件、以及 `client-config-dir` 都要分开或做好同步，绝不能指向同一个文件互相覆盖。
+
+第三项是信任材料的一致分发。按 03-02 的产出，客户端 `ca.crt` 与 `ta.key` 必须能被两个实例接受，两个实例各自的服务端证书都要由同一 CA 用 `sign-req server` 签发、用途正确、在有效期内；`crl.pem` 必须在所有实例上是同一份且都是最新的，任何一处漏分发，就会留下一台「已吊销客户端仍能接入」的实例，这是多实例最危险的安全缺口。分发走加密通道、落地权限按 03-02 表格收紧，并用配置管理或 `rsync` 一类手段保证一致性，具体工具与路径需对照实际版本核验。还要提醒：让多个实例共享同一张服务端证书与私钥虽然配置最省，却把同一份私钥摊到多台主机，泄露面变大；更稳妥的是每个实例各自一张证书、同一 CA 签发，具体取舍需对照实际版本核验。
+
+第四项是客户端与网络侧的配合。客户端 profile 要能表达「多个目标」并支持故障重连，所需指令见 04-02 / 04-04；`keepalive` 与 `ping-restart` 决定多久感知到对端失联、`resolv-retry` 决定解析失败时是否持续重试，这些取值直接决定切换时长，需对照实际版本核验。若走路线 C 的负载均衡，要确认平台或软件支持 UDP 四层转发、能按源地址做会话保持、且健康检查不会因「探不到 UDP」把后端误判为不健康——这正是 03-05 反复强调的约束，具体能力因厂商而异，需对照实际平台核验。所有实例与客户端时钟要同步，证书有效期校验对偏差敏感，判定见 06-06。
+
+把三条 HA 路线整理成下表，便于按场景选型。表中「会话影响」一格写成 `重连\|可保持` 用竖线表示两类效果，按表格约定转义为 `\|`，避免整表错列。
+
+| 路线 | 依赖机制 | 会话影响 | 适用形态 |
+|---|---|---|---|
+| A 多 remote 切换 | 客户端 remote 列表 | 重连\|可保持 | 最简、原生 |
+| B 多实例并列 | 共享 CA 与 CRL | 必然重连 | 同机或异机 |
+| C 四层负载均衡 | UDP 会话保持 | 重连\|可保持 | 单一入口 |
+| 组合 A 加 B | 多目标加多实例 | 必然重连 | 推荐起点 |
+| 组合 B 加 C | 实例池加统一入口 | 必然重连 | 生产常用 |
+
+表后补两点判读。第一，「会话影响」一列里最该记住的是「必然重连」：由于实例间不共享会话，只要客户端从一个进程换到另一个进程，就一定要重新握手、重新拿地址、重新建路由，短时断流不可避免；把它当成设计前提，而不是待修复的 bug。第二，路线 A 之所以是「推荐起点」，是因为它只改客户端 profile、不动服务端拓扑，就能覆盖「首选实例宕机」这一类最常见故障，性价比最高；先把它做扎实，再叠加 B 与 C。把前置检查列成下表。
+
+| 检查项 | 命令或线索 | 预期结果 | 异常信号 |
+|---|---|---|---|
+| 实例数量 | systemctl 或 kubectl get | 至少两个独立实例 | 单点无法切换 |
+| 地址池 | 各 server.conf | 网段互不重叠 | 切换后地址冲突 |
+| 信任一致 | openssl verify 与 crl 对比 | 同 CA 同版本 CRL | 切过去校验失败 |
+| 状态文件 | status 与 ipp 路径 | 各实例分开 | 互相覆盖 |
+| 客户端能力 | profile 与版本 | 支持多 remote 与重连 | 切换不发生 |
+| LB 能力 | 平台控制台 | UDP 转发与会话保持 | 仅支持 TCP |
+
+### 3. 分步操作
+
+下面按「规划实例与分发材料、客户端多 remote、并列多实例、前置负载均衡、切换演练准备」的顺序给出完整命令。为便于判读，命令与典型输出分开列出；所有输出均写明「示例输出，具体格式需对照实际版本核验」，且刻意不使用任何省略行，每行都是一条完整示意记录。
+
+**步骤一：规划实例并分发共享信任材料**。本例设两个异机实例，A 用 `10.8.0.0/24`、B 用 `10.9.0.0/24`，端口同为 1194，CA 与 CRL 全量分发。
+
+```bash
+sudo install -d -m 0750 /etc/openvpn/server /etc/openvpn/ccd
+sudo install -m 0644 ca.crt dh.pem crl.pem /etc/openvpn/server/
+sudo install -m 0600 ta.key server-a.key /etc/openvpn/server/
+sudo install -m 0644 server-a.crt /etc/openvpn/server/
+rsync -a crl.pem admin@vpn-b:/etc/openvpn/server/crl.pem
+sha256sum ca.crt crl.pem ta.key
+```
+
+两个实例各自持有自己的服务端证书与私钥（`server-a.crt` / `server-a.key`、另一台为 `server-b` 一套），但 `ca.crt`、`dh.pem`、`ta.key`、`crl.pem` 是同一套材料；`rsync` 把最新 CRL 推到另一台，`sha256sum` 在两侧核对 `ca.crt`、`crl.pem`、`ta.key` 指纹是否一致，这是防止「信任材料不一致」最省事的办法。证书与 CRL 的生成与吊销见 03-02，`rsync` 的目标路径、账户与权限需对照实际版本核验。这里刻意把 `status` 与地址池留在各实例自己的配置里，下一步给出。
+
+**步骤二：配置客户端多 remote（路线 A）**。这是改动最小、见效最快的一步。
+
+```conf
+# client-ha.ovpn 要点示例，材料沿用 03-03 的 client1
+client
+dev tun
+proto udp
+remote vpn-a.example.net 1194
+remote vpn-b.example.net 1194
+remote-random
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+ca ca.crt
+cert client1.crt
+key client1.key
+tls-crypt ta.key
+remote-cert-tls server
+keepalive 10 60
+verb 3
+```
+
+两条 `remote` 列出全部实例地址，`remote-random` 让客户端在多个目标间随机挑选、避免所有客户端在故障后同时涌向同一台造成雪崩，`resolv-retry infinite` 让域名解析失败时持续重试而不是直接放弃，`keepalive 10 60` 定义心跳与失联判定窗口，直接决定切换多久发生。`remote-cert-tls server` 要求所有实例的服务端证书都是 `sign-req server` 签发的用途，正好由步骤一保证；`tls-crypt` 的 `ta.key` 必须与所有实例一致。完整指令族见 04-02 / 04-04，本篇不逐条解释；`remote-random`、`resolv-retry`、`keepalive` 的确切行为与取值需对照实际版本核验。这里有个易错点：`remote` 里若用域名，切换依赖 DNS 能解析到存活实例；若用 IP，则跳过解析但要自己维护地址列表，两种取舍要结合 03-05 的云上 DNS/LB 能力来定。
+
+**步骤三：并列多个服务端实例（路线 B）**。以同机两个进程演示，异机时把两份配置分别放到各自主机即可。
+
+```conf
+# /etc/openvpn/server/server-a.conf 要点
+port 1194
+proto udp
+dev tun
+ca ca.crt
+cert server-a.crt
+key server-a.key
+dh dh.pem
+tls-crypt ta.key
+crl-verify crl.pem
+server 10.8.0.0 255.255.255.0
+topology subnet
+ifconfig-pool-persist ipp-a.txt
+status /var/log/openvpn/status-a.log
+keepalive 10 120
+verb 3
+```
+
+```conf
+# /etc/openvpn/server/server-b.conf 要点
+port 1195
+proto udp
+dev tun
+ca ca.crt
+cert server-b.crt
+key server-b.key
+dh dh.pem
+tls-crypt ta.key
+crl-verify crl.pem
+server 10.9.0.0 255.255.255.0
+topology subnet
+ifconfig-pool-persist ipp-b.txt
+status /var/log/openvpn/status-b.log
+keepalive 10 120
+verb 3
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now openvpn-server@server-a
+sudo systemctl enable --now openvpn-server@server-b
+systemctl status openvpn-server@server-a openvpn-server@server-b --no-pager
+```
+
+两份配置刻意只差四处：`port`（1194 / 1195）、服务端证书与私钥、`server` 的隧道网段（`10.8.0.0/24` / `10.9.0.0/24`）、以及 `ipp` 与 `status` 文件名。共享的 `ca.crt`、`dh.pem`、`ta.key`、`crl.pem` 完全一致，其中 `crl-verify crl.pem` 让每个实例都执行吊销校验，指令见 04-03、CRL 分发见 03-02。unit 名以本机实际为准，需对照实际版本核验。若改到异机部署，两个实例可以都用 1194 端口（IP 不同即可），此时客户端 `remote` 列表写两台主机的地址；同机则必须像本例一样错开端口。无论哪种，`status` 与 `ipp` 绝不能共用文件，否则两个进程会互相覆盖，切换验证时根本分不清客户端连到了谁。多实例是否启用 `duplicate-cn`、以及 ccd 目录如何同步，见 04-04 / 07-08，本篇不展开。
+
+**步骤四：前置四层负载均衡（路线 C）**。下面用 nginx stream 的 UDP 转发示意，重点是「UDP 监听 + 按源地址会话保持」；具体指令、健康检查与后端探活写法需对照实际版本核验。
+
+```conf
+stream {
+    upstream openvpn_backend {
+        hash $remote_addr;
+        server 10.0.0.11:1194;
+        server 10.0.0.12:1194;
+    }
+    server {
+        listen 1194 udp;
+        proxy_pass openvpn_backend;
+    }
+}
+```
+
+`listen 1194 udp` 声明 UDP 监听，`hash $remote_addr` 按客户端源地址把同一客户端的报文固定送到同一个后端，这是 UDP 会话保持的关键：OpenVPN 的 TLS 会话绑定在具体实例上，若同一客户端的包在实例之间乱飘，握手与数据通道会立刻失败。后端两台地址对应步骤三的两个实例（异机形态下都用 1194）。要清醒认识到 UDP 无连接、健康检查比 TCP 难做，云 CLB 是否支持 UDP、能否按源地址保持、以及探活方式都需对照实际平台核验，这正是 03-05 第 5 节那条「LB 后端不健康」的由来。也可以不用软件 LB，改用 DNS 轮询或多条 `remote` 让客户端自己选，二者是不同层次的入口策略。LB 本身又成了新的单点，生产里还要为它再做冗余，这已超出社区版能力范围，属于整体架构设计。
+
+**步骤五：准备故障切换演练**。演练动作很简单，关键是先约好观测点。
+
+```bash
+sudo systemctl stop openvpn-server@server-a
+journalctl -u openvpn-client@client -n 30 --no-pager
+ping -c 10 10.8.0.1
+sudo tail -n 20 /var/log/openvpn/status-b.log
+sudo tail -n 20 /var/log/openvpn/status-a.log
+```
+
+`systemctl stop` 模拟实例 A 故障；随后从客户端日志看是否触发重连、从 `ping` 观察断流窗口、从两个实例的 status 文件确认客户端落到了谁头上。unit 名、status 路径与日志条目需对照实际版本核验。演练前务必确认客户端用的是步骤二那份带多 `remote` 的 profile，否则「停了 A 却没有任何反应」只是因为客户端压根不知道还有 B，而不是高可用方案失效。
+
+把切换的完整时序画成图，见图 03-06-02：从心跳丢失、触发重连、选中另一实例、重新握手、到恢复连通并核对状态，虚线是验证闭环。
+
+:::figure id=03-06-02 | name=实例故障切换与验证流程 | dir=TD
+node n1 "客户端连接实例 A" blue
+node n2 "停止实例 A<br/>模拟故障" teal
+node n3 "keepalive 超时<br/>触发重连" amber
+node n4 "remote-random<br/>选中实例 B" purple
+node n5 "重新握手协商<br/>会话重建" green
+node n6 "ping 短暂中断<br/>后恢复" gray
+node n7 "核对 status 与日志" red
+edge n1 -> n2 "演练动作"
+edge n2 -> n3 "心跳丢失"
+edge n3 -> n4 "换目标"
+edge n4 -> n5 "TLS 重协商"
+edge n5 -> n6 "恢复连通"
+edge n6 -> n7 "验证收口"
+edge n7 -> n1 dashed "闭环回查"
+:::
+
+### 4. 验证方法与预期结果
+
+高可用是否成立，不能靠「配置看起来对」，必须靠一次真实的故障切换演练来证明。本节按图 03-06-02 的时序给出客户端日志与两个实例 status 的判读，并把预期结果钉死。以下为演练期间客户端日志示例输出，具体格式需对照实际版本核验。
+
+```text
+2026-11-11 11:00:00 [vpn-a] Inactivity timeout (--ping-restart), restarting
+2026-11-11 11:00:00 SIGUSR1[soft,ping-restart] received, process restarting
+2026-11-11 11:00:01 TCP/UDP: Preserving recently used remote address
+2026-11-11 11:00:01 UDPv4 link remote: [AF_INET]198.51.100.12:1194
+2026-11-11 11:00:01 [vpn-b] Peer Connection Initiated with [AF_INET]198.51.100.12:1194
+2026-11-11 11:00:03 TUN/TAP device tun0 opened
+2026-11-11 11:00:03 Initialization Sequence Completed
+```
+
+逐行判读这段日志，能把「切换到底有没有发生」看得清清楚楚，它是本篇最核心的一组证据。第一行 `Inactivity timeout (--ping-restart)` 与第二行 `SIGUSR1[soft,ping-restart]` 说明 `keepalive` 在约定窗口内没收到实例 A 的心跳，客户端据此判定对端失联并软重启进程——这两行是「故障被感知到」的标志，若停掉 A 后始终不出现它们，问题一定在 `keepalive` / `ping-restart` 配置或客户端根本没启用心跳，指令见 04-04。第三行 `Preserving recently used remote address` 之后，第四行 `link remote` 的地址已变成 `198.51.100.12`（实例 B），证明客户端确实换了目标；第五行 `[vpn-b] Peer Connection Initiated` 里的 CN 也跟着换成 B，说明它连上的确实是另一张服务端证书，而不是 A 的残余连接。第六、七行 `tun0 opened` 与 `Initialization Sequence Completed` 表明新实例的隧道重新建立完成。要特别克制：时间戳、CN、地址、信号名与日志措辞都是示意，需对照实际版本核验；这组日志同时印证了第 1 节那句话——切换是「重新握手、重建会话」，中间必然有一个短时断流窗口，看到 `ping-restart` 与重新初始化不必惊慌，那是设计预期而非故障。
+
+服务端一侧的印证同样不可少。以下为实例 B 的 status 文件示例输出，具体格式需对照实际版本核验。
+
+```text
+OpenVPN Client Status
+Common Name,Real Address,Bytes Received,Bytes Sent,Connected Since
+client1,198.51.100.9:1194,3210,2988,Wed Nov 11 11:00:03 2026
+ROUTING TABLE
+Virtual Address,Common Name,Real Address,Last Ref
+10.9.0.2,client1,198.51.100.9:1194,Wed Nov 11 11:00:05 2026
+```
+
+这段输出有三个判据。第一，`CLIENT LIST` 里出现 `client1` 且收发字节非零、连接时间正好是切换完成时刻，说明客户端确实落到了实例 B；第二，`ROUTING TABLE` 里分配的虚拟地址是 `10.9.0.2`，而不是实例 A 网段的 `10.8.0.2`——这个地址变化正是「实例间不共享地址池与会话」的直接证据，也再次说明切换后路由要重新下发；第三，此时实例 A 的 status 文件里不应再有该客户端的活动记录（或已标记为断开），两份 status 一增一减，才能确认切换是「换了一台」而不是「两边都连着」。`ping -c 10 10.8.0.1` 在演练中会先丢几个包、随后恢复稳定回包，这个短暂窗口就是本方案的恢复时间，应由 `keepalive` 与重连参数共同决定，取值需对照实际版本核验。status 格式与字段含义见 04-06，服务端实例表与会话查找原理见 06-10、字段见 05-08。
+
+把验证动作与预期结果整理成下表，演练不通过时按图索骥反查。
+
+| 验证动作 | 命令或入口 | 预期结果 | 不符时的含义 |
+|---|---|---|---|
+| 故障被感知 | 客户端日志 | 出现 ping-restart 与软重启 | keepalive 未生效 |
+| 换了目标 | 客户端日志 link remote | 地址与 CN 指向实例 B | 多 remote 未配置或解析失败 |
+| 重新建隧道 | 客户端日志 | 重新出现初始化完成标记 | 新实例校验或端口不通 |
+| 落到新实例 | 实例 B 的 status | 出现客户端且字节增长 | 切换未真正完成 |
+| 地址重分配 | status 路由表 | 拿到实例 B 网段地址 | 地址池规划或复用异常 |
+| 老实例释放 | 实例 A 的 status | 不再有该客户端活动 | 可能存在重复连接 |
+| 恢复连通 | ping 隧道地址 | 短暂丢包后稳定回包 | 转发或路由下发异常 |
+
+表后强调一条方法论：切换演练必须「客户端日志 + 两端 status + 连通性」三方对账。只看客户端说「连上了」不够，要证明它连的是另一台、地址确实重分配、老实例确实释放，才能排除「两边都连着」「切过去又掉回来」这类假成功。所有输出格式与字段需对照实际版本核验。
+
+### 5. 常见失败与排错
+
+第一类失败是「根本不切换」：停掉实例 A 后客户端毫无反应、一直等到超时。按顺序排除：profile 里是不是只有一条 `remote`（客户端压根不知道有 B）；`keepalive` / `ping-restart` 有没有配上、窗口是不是长得不可接受；`resolv-retry` 是否在域名解析失败时直接放弃；客户端版本是否支持 `remote-random` 与多目标重连。指令见 04-02 / 04-04，行为需对照实际版本核验。若 `remote` 用的是域名，还要确认 DNS 能把故障实例解析到存活地址、或客户端能顺次尝试下一条记录。
+
+第二类是「切过去却被拒」：客户端日志出现新的 `Peer Connection Initiated`，却卡在证书校验或用途校验失败。根因几乎总在信任材料不一致——某个实例的服务端证书不是同一 CA 签发、用途不是 `sign-req server`、`ta.key` 不是同一份、或证书已过期。用 03-02 的 `openssl verify` 与 `openssl x509 -dates` 逐台核对，再用步骤一的 `sha256sum` 比对共享材料，链校验原理见 06-06、模块见 07-04。时钟偏差同样会让校验失败，判定见 06-06。这类故障的特点是「切换动作发生了，但新握手建不起来」，日志里换目标那几行是好的，卡在后面。
+
+第三类是「切换成功却路由异常」：连上了新实例，但访问不了内网或 ping 不通。多半是地址池规划问题——两个实例用了重叠网段、切过去拿到的地址与本地网络冲突、或新实例没有按 03-04 那套 `push route` / `iroute` / `ccd` 配好后端路由。回到步骤二、三核对 `server` 网段与 ccd 同步，路由推送机制见 06-11、指令见 04-04。另一个常见点是新实例的 `net.ipv4.ip_forward`、FORWARD、NAT 没配好，按 03-01 / 03-05 逐层查；容器与云形态还要再核对设备映射、能力集、端口映射与安全组，见 03-05。
+
+第四类是 CRL 与吊销一致性问题，这是多实例最危险的一类。只要有一个实例挂着旧 CRL 或根本没挂 `crl-verify`，已吊销的客户端就能从那台实例继续接入。排查时逐台核对 `crl.pem` 的指纹与 `nextUpdate`，确认配置里都启用了吊销校验，分发手段要覆盖每一个实例。证书生命周期台账与定期刷新见 08-06，吊销操作见 03-02。与之相邻的是 `duplicate-cn` 风险：为图省事让多台设备共用一张客户端证书，在单实例下会互相踢线，在多实例下更会让「谁连在哪台」彻底失去可追溯性，正确做法始终是 03-02 的一机一证，配置指令与风险见 04-04 / 07-08。
+
+第五类是负载均衡特有的问题。同一客户端的 UDP 包若没有按源地址做会话保持，会在实例之间乱飘，握手与数据通道立刻失败，表现为「连上就断、反复重协商」；解决办法是启用 `hash $remote_addr` 一类粘性策略，写法需对照实际版本核验。UDP 健康检查若沿用 TCP 探活，会把健康后端误判为不健康，后端被摘空后客户端连谁都不通，这类现象见 03-05 第 5 节，具体探活方式因平台而异需核验。还要记住 LB 自身成了新单点，以及「会话不共享」意味着即使有 LB，客户端漂到另一实例仍要重连——LB 只解决入口，不解决状态共享。
+
+最后集中列一组「陷阱与最佳实践」，作为整册部署经验的收束。其一，把「实例间不共享会话、切换必然重连并短时断流」写进设计文档与 SLA 预期，别把它当 bug 修；其二，共享信任材料（同一 CA、同一 `ta.key`、同一最新 CRL）必须全量分发到每一个实例并用指纹核对，任何一处漏分发都是安全缺口；其三，地址池、status、ipp、ccd 各实例分开规划、避免重叠，异机部署可同端口、同机部署必须错开端口；其四，路线 A（多 `remote` 加 `remote-random` 加 `keepalive`）作为推荐起点，先做扎实再叠加 B 与 C；其五，为每个实例单独监控进程、端口、status 与证书有效期，切换演练常态化，别等真故障才发现配置早已漂移；其六，故障案例按现象反查见 08-04，证书轮换与台账见 08-06，日志脱敏与权限降级见 08-06 / 04-04；其七，自始至终记住社区版没有内置集群，所有高可用都是客户端、多实例与四层负载均衡的外部拼装，商业版 Access Server 的集群、故障切换与集中管理不是社区版功能，不能写进验收清单。把失败现象与处理方向整理成下表。
+
+| 现象 | 优先怀疑层 | 优先查看 | 处理方向 |
+|---|---|---|---|
+| 停实例后不切换 | 客户端配置 | remote 列表与 keepalive | 补多目标与心跳参数 |
+| 切过去被拒 | 信任材料 | verify 指纹与证书用途 | 统一 CA 与 ta.key 与 CRL |
+| 切换后不通内网 | 地址池与路由 | server 网段与 push route | 消除重叠并补后端路由 |
+| 已吊销仍能接入 | CRL 一致性 | 逐台 crl 指纹与配置 | 全量分发并启用校验 |
+| 连上就反复重协商 | LB 会话保持 | 粘性策略与后端健康 | 按源地址固定后端 |
+| 两台都显示在线 | 状态与证书复用 | 两端 status 与 duplicate-cn | 改一机一证并核查 |
+
+### 6. 小结
+
+用一条主线收束整册：高可用的本质是承认社区版「每个实例各自独立、彼此不共享会话」这一事实，然后用三层外部手段拼装——客户端用多 `remote` 加 `remote-random` 加 `resolv-retry` 加 `keepalive` 表达多个可连接目标并在失联时自行切换；服务端用多个并列实例（异机同端口或同机错端口）承载流量，各自持有不重叠的地址池、status、ipp 与 ccd，却共享同一 CA 签发的证书、同一 `ta.key` 与同一份最新 CRL；网络侧可选地用支持 UDP 且按源地址会话保持的四层负载均衡提供单一入口。切换演练按「停一个实例 → 客户端日志出现 `ping-restart` 与换目标 → 新实例重新握手并分配新网段地址 → 两端 status 一增一减 → ping 短暂丢包后恢复」这条时序验证，缺任何一环都说明高可用只是配置上成立、实际没生效。其中「信任材料全量一致」「地址池与状态文件分开」「会话不共享、切换必然重连」「LB 只解决入口不解决状态」四件事最容易被忽略，也最容易在真故障时演变成「切不过去」或「切过去留后门」，值得单独记牢。
+
+本篇始终守着实战册与去重边界：多 `remote` 与心跳相关指令写明「完整指令族见 04-02 / 04-04」，CRL 校验指令写明「见 04-03」，status 格式写明「见 04-06」；服务端实例表、会话与多路复用机制只写「原理见 06-10」，结构体只写「（字段见 05-08）」，证书链校验只写「原理见 06-06、模块见 07-04」，多客户端服务端与 ccd 只写「模块见 07-08」，路由推送只写「原理见 06-11」，故障案例按现象反查只写「见 08-04」；并反复点明社区版没有内置集群，商业版 Access Server 的集群、故障切换、集中管理与 Web 控制台不是社区版能力。所有 `remote-random` 行为、`keepalive` 触发逻辑、`duplicate-cn` 风险、LB 对 UDP 的支持与会话保持、以及 DCO 等机制是否改变实例间状态共享，都标注「需对照实际版本核验」并给出 `man openvpn`、`04-xx`、`src/openvpn/` 相关线索，不凭印象编造。
+
+把六篇连起来看，正好是一条从零到可上线的完整路径：03-01 用 tun 路由模式在单机上跑通最小闭环、做好内核转发与持久化；03-02 用 easy-rsa 建立 CA、服务端与客户端证书、DH 参数、tls-crypt 密钥与 CRL，并按角色分发；03-03 把客户端材料组装成 ovpn profile，落到 Windows、Linux、移动端三类平台并管好凭据；03-04 对比 tun 路由与 tap 桥接，用 `topology`、后端网段路由与 `redirect-gateway` 扩展拓扑；03-05 把服务端搬进 Docker 与 K8s、处理 `/dev/net/tun`、`NET_ADMIN`、`securityContext` 与云安全组；03-06 最后叠加多实例与故障切换，把单点变成可切换的系统。六册之后，读者手里应当有一套「照着敲能跑通、跑通能验证、出错能定位、上线前知道还差什么」的部署底稿，而配置指令全集、结构体字段、机制调用链与模块功能，则分别由 04、05、06、07 四册作为唯一权威源承接，本册不与它们重复。后续 08 册的性能基准、调优、故障案例库与上线 checklist，正是站在这套已经能跑、能切的系统之上，把它变成能长期稳定运维的生产服务。
+
+
+
+
+
