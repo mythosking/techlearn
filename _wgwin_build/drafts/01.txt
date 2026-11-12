@@ -1,0 +1,840 @@
+# wireguard-windows 技术资料 · 01 基础与概述
+
+> 本册是整套资料的地基，共 4 篇，全部采用 A 论述型七节骨架：背景与动机 → 核心概念 → 关键数据结构与源码位置 → 关键流程与调用链 → 配置/命令/代码实例 → 注意事项、陷阱与最佳实践 → 小结与延伸阅读。四篇分别回答「它是什么」「它与别的实现有何不同」「它由哪几层构成」「以什么版本和口径来读这套资料」。本册只建立共同语言与边界，不重列配置全集与字段全集；配置键与命令以 04 全册为唯一权威源，结构体逐字段以 05 全册为唯一权威源，机制与调用链以 06 全册为唯一权威源，模块能力与组网以 07 全册为唯一权威源。交叉引用统一写作（字段见 05-02 ｜ 配置见 04-01 ｜ 原理见 06-01 ｜ 模块见 07-05）这样的格式。凡涉及具体版本号、哈希、下载路径与文件名格式，一律标注「需对照实际版本核验」并给出 `upstream_src/` 下可定位的源码路径。
+
+## 01-01 wireguard-windows 是什么：官方 Windows 客户端的定位与能力边界
+
+### 1. 背景与动机
+
+要读懂一套源码，第一件事不是打开某个函数，而是先弄清这套源码在整个系统里占据什么位置。wireguard-windows 恰恰是最容易被「望文生义」误读的一类仓库：名字里带着 WireGuard，于是很多读者会下意识地把别处积累的 WireGuard 经验整块搬过来，认为这里应当有握手状态机、有 ChaCha20-Poly1305 的加密循环、有 `wg-quick` 的脚本钩子，甚至认为它是一份可以跑在服务端的完整协议栈实现。这些预期一旦带错，后面读 `tunnel/service.go`、`driver/configuration_windows.go` 时就会到处找不存在的代码，或者把别的平台的行为硬套到 Windows 上，得出错误结论。
+
+真实的背景是：WireGuard 首先是一份跨平台的协议规范，规定了 Noise_IKpsk2 握手、Curve25519 密钥交换、ChaCha20-Poly1305 认证加密、BLAKE2s 与 HKDF 派生以及基于 Cookie 的抗重放机制；但协议规范本身不解决「在某个操作系统上如何创建虚拟网卡、如何写路由表、如何以服务形式常驻、如何保护私钥文件、如何给交互式用户显示托盘图标」这类宿主集成问题。Windows 的网络栈与进程模型和 Linux 差别极大：它用 NDIS 微型端口驱动而不是 `tun` 字符设备，用服务控制管理器 SCM 管理后台进程，用 WFP 而不是 iptables 做包过滤，用 DPAPI 与 ACL 而不是文件权限位保护配置，用窗口会话与访问令牌区分交互式用户。于是官方为 Windows 单独维护了一个仓库，专门负责这层宿主集成。
+
+仓库根目录的 `README.md` 把定位写得非常克制而明确：这是「a fully-featured WireGuard client for Windows that uses WireGuardNT」，并且是「the only official and recommended way of using WireGuard on Windows」。请注意两个关键词。其一是 `client`，它宣告了这是一份客户端软件，而不是协议库、不是服务端发行版、不是跨平台内核模块；其二是 `uses WireGuardNT`，它宣告了数据面来自另一个项目，本仓库是「使用者」而非「实现者」。`docs/attacksurface.md` 开篇第一句进一步把系统拆成「一个内核驱动加三个相互协作的用户态部分」，这四个组件的分工构成了本册 01-03 的主题，而在本篇里它首先服务于一个目的：划清仓库边界。
+
+因此本篇的动机可以归结为三句话。第一，先确认「官方 Windows 客户端」这一身份，避免把外部项目或其他平台的能力误记到本仓库账上。第二，先确认「控制面在本仓库、数据面在外部内核驱动」这一分界，避免后文在 Go 代码里徒劳地寻找密码学实现。第三，先建立「机制照抄、数值核验」的阅读纪律，`upstream_src/version/version.go`、`upstream_src/Makefile`、`upstream_src/build.bat` 里的版本与哈希都属于会随时间变化的时效性数值，本册 01-04 会专门处理。这三点合起来，就是 02 编译、03 部署、04 配置、05 字段、06 原理、07 模块、08 运维七个后续分册能够不互相打架的前提。
+
+### 2. 核心概念
+
+第一个核心概念是「官方客户端」。`README.md` 给出的分发形态是两类：面向普通用户的在线安装器 `wireguard-installer.exe`，以及面向系统管理员的独立 MSI 包；`docs/enterprise.md` 说明这些 MSI 可以通过组策略对象批量分发，并可用 `DO_NOT_LAUNCH` 属性抑制安装后自动启动。也就是说，这个仓库的产物是一个安装在 Windows 主机上的应用程序，其生命周期由 MSI、Windows 服务与系统托盘 UI 共同构成。它不是以库形式被其他程序链接的 SDK，虽然仓库里确实存在 `embeddable-dll-service/` 这样的扩展形态，但那是独立子项目，不能因此把主仓库理解成通用协议库。理解这一点，才能明白为什么 `main.go` 的入口逻辑围绕「提权、安装服务、唤起 UI」展开，而不是围绕「创建隧道对象」展开。
+
+第二个核心概念是「四组件」，其权威表述在 `docs/attacksurface.md`：WireGuardNT 是内核驱动，向 NDIS 栈暴露微型端口、暴露解析 WireGuard 报文的 UDP 端口、暴露若干 OID 调用与 PNP/Close 通知，并在 NDIS 设备文件上增加 IOCTL；Tunnel Service 是以 LocalSystem 运行的用户态服务，负责创建并配置 WireGuardNT 适配器；Manager Service 同样以 LocalSystem 运行，负责启停隧道服务并保证管理员桌面上有 UI 进程；UI 则是运行在每个管理员会话中的高完整性进程。这四者不是四个备选方案，而是同时存在、相互协作的四个角色。本篇只需记住「一个内核、三个用户态」这个数量关系，具体交互留到 01-03。
+
+第三个核心概念是控制面与数据面的分离，这是全册最重要的一条边界。本仓库的 Go 代码几乎全部属于控制面：`conf/` 负责把 INI 风格文本解析成内存结构，`manager/` 负责服务编排与 IPC，`tunnel/` 负责把配置翻译成 Windows 网络配置与驱动 IOCTL，`ui/` 负责呈现与编辑，`updater/` 负责版本清单与签名校验，`ringlogger/` 负责多进程共享日志。真正的数据面——Noise 握手、会话密钥派生、报文加解密、抗重放窗口、Cookie 应答——位于外部项目 WireGuardNT 的内核驱动里，本仓库只通过 `driver/` 包调用 `wireguard.dll` 导出的 `WireGuardCreateAdapter`、`WireGuardSetConfiguration`（具体导出名以 `driver/driver_windows.go` 的 `NewProc` 列表为准，需对照实际版本核验）等函数，把编组好的配置结构体通过 IOCTL 送下去。一个很实用的判据是：在 `conf/config.go` 里确实能见到 `crypto/ecdh` 的导入，但那只是 `NewPrivateKey()` 与 `Public()` 用来做 X25519 私钥钳位与公钥派生，属于密钥生成，不是数据面加密循环。
+
+第四个核心概念是「宿主集成即能力」。本仓库之所以「fully-featured」，靠的正是把 Windows 原生对象用足：`tunnel/winipcfg/` 封装 IP Helper API 写单播地址与路由，`tunnel/firewall/` 用 WFP 构造 kill-switch 规则，`conf/dpapi/` 与 `conf/path_windows.go` 用 DPAPI 与安全描述符保护配置目录，`installer/` 用 WiX 产出 MSI，`version/` 与 `updater/` 用 signify Ed25519 与 BLAKE2b-256 校验更新包。这些能力都不是 WireGuard 协议规定的，而是 Windows 客户端独有的工程实现（原理见 06-06、06-08、06-09、06-12 ｜ 模块见 07-02、07-06、07-07、07-11）。
+
+第五个核心概念是「容易被误迁移的三类外来语义」：Linux 的 `wg-quick` 语义、`wireguard-go` 的用户态 TUN 语义、以及把本仓库当成服务端或集中管理平台的期待。为便于速查，先把最容易混淆的能力边界列成下表，完整配置键见 04-01，字段定义见 05-02。
+
+| 判断项 | 本仓库是否具备 | 依据或归属 |
+|---|---|---|
+| 官方 Windows 客户端 | 是 | `README.md` 明确为唯一官方推荐方式 |
+| 内核态数据面（握手与加密） | 否，由外部 WireGuardNT 提供 | `docs/attacksurface.md`、`driver/` |
+| 用户态控制面（解析、服务、UI） | 是 | `conf/`、`tunnel/`、`manager/`、`ui/` |
+| Linux 内核 wg 模块源码 | 否 | 外部项目，本仓库无对应源码 |
+| wireguard-go 用户态 TUN 设备 | 否 | 外部项目；Windows 用 NDIS 微型端口 |
+| wg-quick 的 iptables、%i、SaveConfig | 否 | `docs/adminregistry.md`，需对照实际版本核验 |
+| PreUp 等四个脚本默认执行 | 否 | 需 `DangerousScriptExecution` 置 1 |
+| Windows 服务、WFP、DPAPI、MSI 集成 | 是 | `manager/`、`tunnel/firewall/`、`conf/dpapi/`、`installer/` |
+| 服务端发行版与集中管理控制台 | 否 | 客户端定位；批量分发见 `docs/enterprise.md` |
+
+需要特别说明的是最后一行。WireGuard 协议本身是对等模型，两端都是 peer，谁是「客户端」谁是「服务端」只由是否配置 `Endpoint`、谁主动发起握手决定，而不是由软件身份决定。因此把 wireguard-windows 称为客户端，说的是它的产品形态与分发方式，并不妨碍它在拓扑里承担被连接的一端（配置见 04-03）。把「客户端」误读成「只能主动外连、不能接受入站」是初学者最常见的语义错误之一。
+
+### 3. 关键数据结构与源码位置
+
+本节只做「点名 + 定位」，不展开逐字段定义。整套资料的字段全集在 05 全册，配置全集在 04 全册；01 册的职责是让读者知道遇到问题该去哪一层找，而不是把字段表提前搬过来（字段见 05-02 ｜ 配置见 04-01 ｜ 原理见 06-02 ｜ 模块见 07-01）。
+
+第一处锚点是 `upstream_src/README.md`。它除了给出官方定位，还列出了 `docs/` 下五份官方文档的索引：`adminregistry.md`（管理员注册表键）、`attacksurface.md`（组件与攻击面）、`buildrun.md`（构建与开发）、`enterprise.md`（企业部署）、`netquirk.md`（网络 quirks 与 kill-switch）。这五份文档是本册事实的第二手依据，凡涉及组件分工、服务名、注册表策略、路由与防火墙语义，都应回到它们核对。
+
+第二处锚点是 `upstream_src/main.go`。`usage()` 函数列出了 `wireguard.exe` 支持的开关，`main()` 的 switch 把它们分派到 `manager.InstallManager()`、`manager.Run()`、`tunnel.Run()`、`ui.RunUI()`、`ringlogger.DumpTo()`、`updater.DownloadVerifyAndExecute()`、`driver.Uninstall()` 等入口。这里不重列开关全集，那属于 04-04 的权威范围；本篇只用到其中与分层证据相关的一支，即 `/dumplog`。此外 `checkForWow64()`、`checkForAdminGroup()`、`checkForAdminDesktop()` 三个函数说明了这个程序对「原生架构」「管理员组成员」「管理员桌面」的前置要求，`setLogFile()` 则说明日志输出如何绑定到标准错误或标准输出句柄。
+
+第三处锚点是 `upstream_src/conf/config.go`。它定义了 `Config`、`Interface`、`Peer` 三个结构体以及 `Key`、`Endpoint`、`HandshakeTime`、`Bytes` 等辅助类型，另有 `IntersectsWith()`、`DeduplicateNetworkEntries()`、`Redact()`、`NewPrivateKey()` 等方法。`Key` 是 `[KeyLength]byte` 定长数组且 `KeyLength = 32`，对应 Curve25519 密钥的 32 字节长度；`NewPrivateKey()` 里 `k[0] &= 248`、`k[31] = (k[31] & 127) | 64` 正是 X25519 私钥钳位。这些是理解配置如何进入内存的起点，但逐字段含义、默认值与读写时机一律以 05-02、05-03 为准。
+
+第四处锚点是 `upstream_src/conf/path_windows.go` 与 `upstream_src/conf/store.go`。前者给出 `RootDirectory()`、`tunnelConfigurationsDirectory()`、`LogFile()` 三个路径函数，并用 `O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)` 这样的 SDDL 创建并加固 `Data` 目录；后者给出 `LoadFromPath()`、`LoadFromName()`、`ListConfigNames()`，并定义 `configFileSuffix = ".conf.dpapi"` 与 `configFileUnencryptedSuffix = ".conf"`，在读取 `.conf.dpapi` 时调用 `dpapi.Decrypt()`。这两处共同解释了「配置存哪里、以什么形态存、谁来读」，是 01-03 讲 Manager 与 Tunnel 分工时要引用的事实。
+
+第五处锚点是 `upstream_src/docs/attacksurface.md`。它给出的 IOCTL 安全描述符 `O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)S:(ML;;NWNRNX;;;HI)` 是「驱动只信任 SYSTEM 与 Administrators、且要求高完整性级别」的直接证据，也解释了为什么普通用户进程不能直接配置隧道。
+
+四层组件、仓库边界与外部项目之间的关系如图 01-01-01 所示，图中用虚线标出容易被误当作本仓库能力的部分。
+
+:::figure id=01-01-01 | name=官方 Windows 客户端的定位与能力边界 | dir=TD
+node n1 "WireGuard 协议规范" gray
+node n2 "WireGuardNT 内核驱动<br/>外部项目" red
+node n3 "本仓库控制面<br/>Go 用户态代码" blue
+node n4 "Windows 宿主<br/>服务/网络栈/DPAPI" teal
+node n5 "管理员与用户<br/>UI 与运维" green
+node n6 "wg-quick 语义<br/>非本仓库能力" amber
+edge n1 -> n3 "规范约束"
+edge n3 -> n2 "IOCTL 下发配置"
+edge n2 -> n4 "NDIS 适配器"
+edge n4 -> n3 "网络配置回写"
+edge n3 -> n5 "UI 与日志"
+edge n1 -> n2 dashed "协议在驱动实现"
+edge n6 -> n3 dashed "易被误迁移"
+:::
+
+图 01-01-01 想强调的是：蓝色节点才是本仓库的代码，红色节点是外部内核项目，灰色节点是抽象规范，琥珀色节点是应当被排除的迁移来源。仓库顶层目录的精简地图如下，可用于快速定位上面提到的各个包。
+
+```tree
+upstream_src/
+├── main.go
+├── conf/
+│   ├── config.go
+│   ├── parser.go
+│   ├── store.go
+│   ├── path_windows.go
+│   └── dpapi/
+├── driver/
+│   ├── driver_windows.go
+│   └── configuration_windows.go
+├── tunnel/
+│   ├── service.go
+│   ├── addressconfig.go
+│   ├── interfacewatcher.go
+│   ├── winipcfg/
+│   └── firewall/
+├── manager/
+│   ├── service.go
+│   ├── ipc_server.go
+│   ├── ipc_client.go
+│   ├── tunneltracker.go
+│   └── uiprocess.go
+├── ui/
+│   ├── ui.go
+│   └── confview.go
+├── services/
+│   ├── errors.go
+│   └── boot.go
+├── ringlogger/
+├── updater/
+├── version/
+│   └── version.go
+├── installer/
+├── Makefile
+├── build.bat
+└── docs/
+    ├── attacksurface.md
+    ├── enterprise.md
+    ├── netquirk.md
+    ├── adminregistry.md
+    └── buildrun.md
+```
+
+### 4. 关键流程与调用链
+
+把「用户双击图标」到「第一个加密报文发出」的链路拉直，是理解分层最有效的办法。这条链路完全发生在控制面，终点是把配置通过 IOCTL 交给内核驱动；内核里随后发生的握手与封装不在本仓库的调用链上。
+
+链路的起点是 `main.go` 的 `main()`。无参数时先调用 `ui.RaiseUI()` 尝试唤起已有 UI；若失败，则 `checkForAdminGroup()` 确认当前用户属于内置管理员组，再由 `execElevatedManagerServiceInstaller()` 通过 `elevate.ShellExecute()` 以 `/installmanagerservice` 提权重跑自身。带 `/managerservice` 时进入 `manager.Run()`，其内部是 `svc.Run("WireGuardManager", &managerService{})`，由 Windows 服务控制管理器托管；`managerService.Execute()` 依次完成 `conf.LogFile(true)`、`ringlogger.InitGlobalLogger(logFile, "MGR")`、`services.PrintStarting()`、`watchNewTunnelServices()`、`conf.RegisterStoreChangeCallback()` 注册、`WTSEnumerateSessions()` 枚举会话，再对每个活动会话调用 `startProcess()` 孵化 UI。UI 进程以 `/ui` 加四个句柄参数启动，`main.go` 里对应 `pipeFromHandleArgument()` 解析三根无名管道句柄，并用 `ringlogger.NewRingloggerFromInheritedMappingHandle()` 接管第四个日志映射句柄，最后 `manager.InitializeIPCClient()` 与 `ui.RunUI()`。
+
+当用户在 UI 里启用某条隧道时，请求经 IPC 到达 Manager，由 Manager 通过 SCM 启动对应的隧道服务（服务名形如 `WireGuardTunnel$<name>`，具体拼装函数 `conf.ServiceNameOfTunnel` 位于 `conf/name.go`，需对照实际版本核验）。隧道服务以 `/tunnelservice CONFIG_PATH` 运行，`tunnel.Run()` 取 `conf.NameFromPath()` 得到隧道名、`conf.ServiceNameOfTunnel()` 得到服务名，再 `svc.Run(serviceName, &tunnelService{confPath})`。`tunnelService.Execute()` 是控制面的主战场：`conf.LoadFromPath()` 读取并解密配置、`config.DeduplicateNetworkEntries()` 去重、`watchInterface()` 建立接口监听、`config.ResolveEndpoints()` 解析对端域名、`driver.CreateAdapter(config.Name, "WireGuard", deterministicGUID(config))` 创建适配器、`adapter.LUID()` 取 LUID、`driver.RunningVersion()` 读取驱动版本并打印 `Using WireGuardNT/%d.%d`、`adapter.SetLogging()` 打开驱动日志、`runScriptCommand()` 处理 `PreUp`、`enableFirewall()` 构造 WFP 规则、`elevate.DropAllPrivileges(true)` 降权，最后 `adapter.SetConfiguration(config.ToDriverConfiguration())` 与 `adapter.SetAdapterState(driver.AdapterStateUp)` 把配置真正送进内核。关停时 `defer` 以近似逆序执行 `PreDown`、`watcher.Destroy()`、`adapter.Close()`、`PostDown`。
+
+从用户双击到内核数据面开始转发，跨越用户态与内核态的边界如图 01-01-02 所示。
+
+:::figure id=01-01-02 | name=控制面到数据面的用户态内核态分界 | dir=TD
+node a "wireguard.exe<br/>main 入口" blue
+node b "Manager 服务<br/>WireGuardManager" teal
+node c "UI 进程<br/>四句柄参数" green
+node d "Tunnel 服务<br/>每条隧道一个" teal
+node e "conf.Config<br/>配置解析" blue
+node f "IOCTL 下发<br/>SetConfiguration" purple
+node g "WireGuardNT<br/>内核数据面" red
+node h "NDIS 与 UDP<br/>握手与加密" red
+edge a -> b "无参数唤起"
+edge b -> c "孵化会话 UI"
+edge c -> b "IPC 启停请求"
+edge b -> d "服务控制"
+edge d -> e "LoadFromPath"
+edge e -> f "ToDriverConfiguration"
+edge f -> g "适配器 IOCTL"
+edge g -> h "内核转发"
+edge a -> d "/tunnelservice" dashed
+:::
+
+图 01-01-02 中最关键的一条边是 `SetConfiguration` 到内核数据面那条：它是本仓库控制面的终点。为便于按阶段定位问题，把上述宏观链路整理成下表。
+
+| 阶段 | 触发条件 | 入口函数 | 所在层 | 源码位置 |
+|---|---|---|---|---|
+| 进程入口 | 双击图标或命令行 | `main()` | 用户态控制面 | `main.go` |
+| 管理服务安装 | 无参数且服务未运行 | `execElevatedManagerServiceInstaller()` | 用户态控制面 | `main.go`、`manager/install.go` |
+| 管理服务运行 | `/managerservice` | `manager.Run()` → `svc.Run()` | 用户态控制面 | `manager/service.go` |
+| UI 孵化 | 会话登录事件 | `startProcess()` → `launchUIProcess()` | 用户态控制面 | `manager/service.go` |
+| 隧道服务启动 | UI 的 IPC 启停请求 | `tunnel.Run()` → `Execute()` | 用户态控制面 | `tunnel/service.go` |
+| 适配器与配置下发 | 隧道服务主体流程 | `CreateAdapter()` → `SetConfiguration()` | 用户态到内核边界 | `tunnel/service.go`、`driver/` |
+| 握手与报文封装 | 首个数据报文 | 内核实现 | WireGuardNT 数据面 | 外部项目，需对照实际版本核验 |
+
+这张表也顺带给出了排障的分层顺序：先看进程有没有起来，再看 Manager 服务，再看 Tunnel 服务，再看适配器与配置下发，最后才怀疑握手与数据面。把顺序反过来，往往会盯着 `wg show` 的握手时间反复排查，却忽略了服务根本没启动（原理见 06-01、06-05 ｜ 模块见 07-05、07-08）。
+
+### 5. 配置/命令/代码实例
+
+本节给一条最能体现「四层组件同时在线」的命令：导出环形日志。`docs/enterprise.md` 说明 Manager 与所有 Tunnel 服务把诊断日志写进同一个基于环形缓冲区的共享日志，`wireguard /dumplog` 把它一次性导出到标准输出，`wireguard /dumplog /tail` 则持续跟随输出，便于接给日志采集系统。这里只用到这一条命令，其余开关全集见 04-04。
+
+```powershell
+wireguard /dumplog
+wireguard /dumplog /tail
+```
+
+以下为示例输出，具体格式需对照实际版本核验。
+
+```text
+2026-11-11 09:12:03.114 [MGR] Starting WireGuard/1.1.1
+2026-11-11 09:12:03.208 [MGR] Watching tunnel services
+2026-11-11 09:12:04.001 [TUN] [office] Starting WireGuard/1.1.1
+2026-11-11 09:12:04.113 [TUN] [office] Watching network interfaces
+2026-11-11 09:12:04.220 [TUN] [office] Resolving DNS names
+2026-11-11 09:12:04.336 [TUN] [office] Creating network adapter
+2026-11-11 09:12:04.502 [TUN] [office] Using WireGuardNT/1.1
+2026-11-11 09:12:04.617 [TUN] [office] Dropping privileges
+2026-11-11 09:12:04.701 [TUN] [office] Setting interface configuration
+2026-11-11 09:12:04.855 [TUN] [office] Startup complete
+```
+
+逐行判读如下。前两行的 `[MGR]` 前缀来自 `manager/service.go` 中 `ringlogger.InitGlobalLogger(logFile, "MGR")` 传入的组件标签，对应单例的 Manager 服务；第三行起 `[TUN]` 前缀来自 `tunnel/service.go` 中 `ringlogger.InitGlobalLogger(logFile, "TUN")`，方括号里的 `office` 是 `log.SetPrefix(fmt.Sprintf("[%s] ", config.Name))` 设置的隧道名，因此「一个 `[MGR]` 加多个 `[TUN]`」正是四层架构里「一个 Manager 服务、每条隧道一个 Tunnel 服务」在日志上的直接投影。`Starting` 行由 `services.PrintStarting()` 输出，其文案拼接了 `version.UserAgent()`（`services/boot.go`），其中 `1.1.1` 是快照里 `version/version.go` 的 `Number` 值，属于必须现场核验的时效性数值。`Watching network interfaces` 对应 `watchInterface()`，`Resolving DNS names` 对应 `config.ResolveEndpoints()`，`Creating network adapter` 对应 `driver.CreateAdapter()` 前的日志，`Using WireGuardNT/1.1` 来自 `driver.RunningVersion()` 打印的 `Using WireGuardNT/%d.%d`，`Dropping privileges` 对应 `elevate.DropAllPrivileges(true)`，`Setting interface configuration` 对应 `adapter.SetConfiguration()`，`Startup complete` 则来自接口监听器上报 `watcher.started` 之后的状态切换。要点在于：整段日志全部是用户态控制面的动作记录，看不到任何握手消息、密钥派生或 ChaCha20-Poly1305 的字样，因为它们发生在内核数据面。若日志停在 `Resolving DNS names` 之后不再前进，应优先怀疑 `ErrorDNSLookup`（错误码见 `services/errors.go`），而不是怀疑加密算法。
+
+与这条命令对应的源码分支如下，摘自 `main.go` 的 `/dumplog` case，可见 `/tail` 只是传给 `ringlogger.DumpTo()` 的布尔参数，命令本身并不解析日志内容。
+
+```go
+	case "/dumplog":
+		if len(os.Args) != 2 && len(os.Args) != 3 {
+			usage()
+		}
+		outputHandle, err := windows.GetStdHandle(windows.STD_OUTPUT_HANDLE)
+		if err != nil {
+			fatal(err)
+		}
+		if outputHandle == 0 {
+			fatal("Stdout must be set")
+		}
+		file := os.NewFile(uintptr(outputHandle), "stdout")
+		defer file.Close()
+		logPath, err := conf.LogFile(false)
+		if err != nil {
+			fatal(err)
+		}
+		err = ringlogger.DumpTo(logPath, file, len(os.Args) == 3 && os.Args[2] == "/tail")
+		if err != nil {
+			fatal(err)
+		}
+		return
+```
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把 `README.md` 里的 `fully-featured` 读成「功能齐全到包含数据面实现」。真相是功能齐全指的是宿主集成齐全：服务、UI、DPAPI、WFP、MSI、自动更新、日志一应俱全，而密码学数据面明确外包给 WireGuardNT。审计或做安全评估时，若把驱动代码当作本仓库的一部分去统计代码量或找漏洞，会得出完全错误的结论；正确做法是把 `docs/attacksurface.md` 当作组件清单，把内核驱动单列为外部依赖（模块见 07-03、07-04）。
+
+第二个陷阱是整块迁移 `wg-quick` 配置。`wg-quick` 在 Linux 上用 `iptables`/`nftables` 写规则、用 `%i` 指代接口名、用 `resolvconf` 管理 DNS、用 `SaveConfig` 回写运行时状态；这些语义在本仓库都不成立。Windows 侧若确需脚本钩子，`PreUp`、`PostUp`、`PreDown`、`PostDown` 四个键仅在管理员设置 `HKLM\Software\WireGuard\DangerousScriptExecution` 为 `DWORD(1)` 时才执行，且以 LocalSystem 最高权限运行，官方在 `docs/adminregistry.md` 里明确警告这是恶意软件的真实目标；接口名不用 `%i`，而用环境变量 `WIREGUARD_TUNNEL_NAME`。此外 `conf/config.go` 里存在的是 `TableOff` 而非通用的路由表选择语义，`SaveConfig` 在该结构体中并无对应成员，是否受支持需对照实际版本核验，可定位路径为 `conf/config.go` 与 `conf/parser.go`。配置写法一律以 04-02、04-03 为准。
+
+第三个陷阱是把 `wireguard-go` 的用户态 TUN 模型套到 Windows。`wireguard-go` 通过 `tun` 设备在用户态读写 IP 报文，性能与并发模型围绕 Go 协程与 socket；而 Windows 客户端面对的是 NDIS 微型端口适配器，适配器在隧道启动时动态创建、停止时销毁（`docs/netquirk.md` 的 Adapter Lifetime 一节），其 GUID 由配置确定性派生以便防火墙的网络位置分类保持一致。把两者混同，会导致对 MTU、对端绑定、日志来源和性能瓶颈的判断全部错位（原理见 06-05、06-07）。
+
+第四个陷阱是把 UI 当成服务、或把 Manager 当成转发进程。UI 只是 IPC 客户端，Manager 只是编排者，真正创建适配器、下发路由与配置的是每条隧道各自的 Tunnel 服务。一个直接后果是：关闭 UI 窗口并不会停止隧道，停止 Manager 服务也不会卸载驱动；反过来，若 `sc` 里只剩 Manager 而没有 `WireGuardTunnel$` 前缀的服务，说明隧道根本没被安装。服务名与控制的完整命令见 04-06。
+
+第五个陷阱是把「客户端」当成「单向发起方」。如前所述，WireGuard 是对等模型，是否接受入站握手取决于 `Endpoint` 与 `ListenPort` 的配置以及网络可达性，与软件身份无关（配置见 04-02、04-03）。
+
+最佳实践有四条。其一，读任何一篇之前先读 `docs/attacksurface.md`，把四个组件的名字与账户记牢。其二，遇到现象先按「进程 → Manager → Tunnel → 适配器/路由 → 握手」分层，用 `/dumplog` 的 `[MGR]`/`[TUN]` 前缀快速判断卡在哪一层。其三，配置、字段、机制、模块分别只认 04、05、06、07 四册，交叉引用按（字段见 05-02 ｜ 配置见 04-01 ｜ 原理见 06-01 ｜ 模块见 07-05）的格式写，避免在多处维护互相矛盾的表述。其四，凡遇到版本号、哈希、文件名格式、下载路径，一律回到 `version/version.go`、`Makefile`、`build.bat` 现场核验，不把快照值当成长期事实。
+
+### 7. 小结与延伸阅读
+
+本篇可以压缩成三句话。第一，wireguard-windows 是 WireGuard 官方为 Windows 提供的客户端软件，`README.md` 称其为唯一官方推荐方式，产物是 MSI 安装的应用程序而非协议库或服务端发行版。第二，整个系统由「外部内核数据面 WireGuardNT」加「本仓库的用户态控制面」构成，后者又拆成 Tunnel Service、Manager Service 与 UI 三个相互协作的部分；本仓库负责解析配置、编排服务、孵化 UI、把配置翻译成 Windows 网络设置与驱动 IOCTL，不负责 Noise 握手与报文加解密。第三，读这套资料必须先立边界：Linux `wg-quick`、`wireguard-go`、OpenVPN/IPsec 都不是本仓库的实现，配置与命令以 04 为权威源，字段以 05 为权威源，机制以 06 为权威源，模块以 07 为权威源，时效性数值一律现场核验。
+
+延伸阅读按「先官方后本套」的顺序。`upstream_src/README.md` 给出定位与五份官方文档索引；`upstream_src/docs/attacksurface.md` 是四组件与权限模型的第一手依据，务必精读；`upstream_src/docs/enterprise.md` 给出服务名、`wg show` 输出样例、日志导出、计划任务更新与 `/removedriver`；`upstream_src/docs/adminregistry.md` 说明两个注册表策略与 `WIREGUARD_TUNNEL_NAME`；`upstream_src/docs/netquirk.md` 说明路由、MTU、kill-switch、确定性 GUID 与适配器生命周期；`upstream_src/docs/buildrun.md` 说明构建与 `wg(8)` 的来源。源码方面建议按 `main.go` → `conf/config.go` → `conf/store.go` → `tunnel/service.go` → `manager/service.go` → `driver/driver_windows.go` 的顺序建立地图。本套资料里，本篇之后紧接着 01-02 做架构对比以彻底切断错误迁移，01-03 把四层展开成可跟踪的调用链，01-04 把版本基准与生态边界固化成阅读约定；再往后，02 全册讲如何把源码变成可执行文件，06-04 专门讲协议原理并再次标注内核实现的外部归属，08-05 从攻击面角度重访本篇提到的权限边界（字段见 05-02 ｜ 配置见 04-01 ｜ 原理见 06-04 ｜ 模块见 07-01）。
+
+## 01-02 与 Linux 内核实现、wireguard-go、OpenVPN / IPsec 的架构对比
+
+### 1. 背景与动机
+
+读 wireguard-windows 的人，绝大多数不是从空白开始的。他们要么在 Linux 上用 `wg-quick` 起过隧道，要么部署过 wireguard-go 作为容器或旁路的补充实现，要么从 OpenVPN、IPsec 这类传统 VPN 迁移过来。这些经验既是资产也是负担：资产在于对 VPN 的基本概念（隧道、路由、握手、密钥）已经熟悉；负担在于，人会把熟悉平台的实现细节当成「WireGuard 本来就这样」的公理，然后在 Windows 上找不到对应物时得出「这个客户端有缺陷」或者「把 Linux 配置原样搬过来就能用」的结论。01-01 已经划清了仓库边界，本篇的任务是把边界从「本仓库是什么」推进到「本仓库与别的实现到底差在哪」，用一张可核对的对比表把容易串味的地方逐条钉死。
+
+对比的对象有四类，性质并不相同，必须先分清楚。第一类是 Linux 内核实现，也就是合入 Linux 主线内核的 WireGuard 模块，它是同一种协议在另一种宿主上的内核态实现，`wg(8)` 与 `wg-quick(8)` 是它的用户态配套工具。第二类是 wireguard-go，它是用 Go 写的用户态协议实现，常见于 macOS、FreeBSD 以及各类跨平台客户端，通过 `tun` 设备在用户态收发 IP 报文。这两类都属于「WireGuard 家族」，共享同一份协议规范，差别主要在宿主集成与数据面位置。第三类是 OpenVPN，第四类是 IPsec，它们与 WireGuard 是完全不同的协议体系，加密层次、握手模型、信任模型都不一样；把它们拉进来不是为了比高下，而是因为迁移用户最容易拿它们的概念去套 WireGuard，例如拿 TLS 证书体系去理解静态公钥、拿 SPD 策略库去理解 AllowedIPs。
+
+必须先声明一条事实边界：本仓库 `upstream_src/` 里没有 Linux 内核模块、没有 wireguard-go、没有 OpenVPN 与 IPsec 的任何源码，本册对这四者的描述属于「架构层面的通用对照」，`docs/attacksurface.md` 与 `docs/netquirk.md` 只提供 Windows 侧的权威依据。凡涉及这四类外部实现的具体版本、参数名、性能数值与内部函数，一律写「需对照实际版本核验」，可定位的对照入口是 `upstream_src/docs/attacksurface.md`（组件归属）与 `upstream_src/docs/buildrun.md`（其中第 86 行起说明 `wg(8)` 在 Windows 上由外部 wireguard-tools 项目提供）。把外部项目的细节写成已核验的本仓库事实，是本册最需要避免的错误。
+
+做这项对比还有一个很实际的收益：它直接解释了 01-01 里那条「控制面在本仓库、数据面在外部驱动」的分界为何是设计使然而非偷工减料。Windows 没有可供用户态直接插入协议逻辑的内核接口，官方选择的路线是让 WireGuardNT 以 NDIS 微型端口驱动承载全部数据面，本仓库只做配置下发与宿主集成；这与 Linux 把数据面放进内核模块、与 wireguard-go 把数据面放在用户态，是同一个协议在三种宿主约束下的三种工程答案。理解这一点，后面读 `tunnel/service.go` 里 `driver.CreateAdapter()` 到 `adapter.SetConfiguration()` 的调用链时，就不会再问「为什么没有 socket 读写循环」这种问题。
+
+### 2. 核心概念
+
+第一个共同基线是协议规范。无论 Linux 内核实现、wireguard-go 还是 Windows 客户端背后的 WireGuardNT，只要自称 WireGuard，就必须实现同一套密码学构造：基于 Noise_IKpsk2 的握手、Curve25519 的密钥交换、ChaCha20-Poly1305 的认证加密、BLAKE2s 与 HKDF 的密钥派生、以及 Cookie 机制与抗重放窗口。这套规范是「为什么不同实现可以互通」的答案，也是本套 06-04 的主题。但请注意，规范相同不等于实现相同：`conf/config.go` 里能看到 `crypto/ecdh` 的导入，那只是 `NewPrivateKey()` 与 `Public()` 用来生成并派生本地密钥对，本仓库没有任何一行代码参与握手报文的构造或数据报文的加解密（原理见 06-04 ｜ 模块见 07-03）。
+
+第二个概念是数据面位置，这是本册对比表里最重要的一维。Linux 内核实现把数据面放在内核态，报文从协议栈经路由进入 `wgN` 虚拟网卡后由内核模块完成加密与 UDP 发送；wireguard-go 把数据面放在用户态，进程从 `tun` 设备读出原始 IP 报文，在 Go 协程里查表、加密、再经 UDP socket 发出；OpenVPN 同样是用户态进程读写 `tun`/`tap` 并把报文塞进 TLS 通道；IPsec 则由内核 IPsec 栈处理 ESP/AH 封装，用户态 IKE 守护进程只负责协商安全关联。Windows 客户端属于第一种形态的变体：数据面在内核，但那个内核驱动是独立的外部项目 WireGuardNT，本仓库的 Go 代码是它旁边的控制面。数据面位置直接决定了性能特征、特权要求、可调试性与崩溃影响范围，比较时必须先问「报文到底在哪个态被加密」。
+
+第三个概念是控制面与数据面的接口形态。Linux 侧常用 netlink 加上 `wg(8)` 的 UAPI 读写配置；wireguard-go 用 UAPI 与配置文件；IPsec 用 SPD/SAD 与 IKE 消息；OpenVPN 用管理通道与推送的路由；而 Windows 客户端用的是 `driver/` 包编组的结构体加上对 NDIS 设备文件的 IOCTL，网络配置则通过 `tunnel/winipcfg/` 调用 IP Helper API 写地址与路由。接口形态不同，意味着「配置下发」这件事在每个平台上的可观测点完全不同：在 Windows 上，最贴近下发的观测点是 `/dumplog` 里 `Setting interface configuration` 与 `Using WireGuardNT/%d.%d` 两行，而不是任何 socket 状态（字段见 05-05 ｜ 原理见 06-05、06-06）。
+
+第四个概念是接口模型与 Cryptokey Routing。WireGuard 没有「连接」的概念，只有接口、peer 与 AllowedIPs：AllowedIPs 同时承担出站路由选择与入站源地址校验两重职责，这一设计被称为 Cryptokey Routing，是三个 WireGuard 实现共有的。差别在于这份路由表如何落到宿主：Linux 由 `wg-quick` 或网络管理器写内核路由表，wireguard-go 由其网络配置逻辑写，Windows 则由 Tunnel 服务汇总去重所有 peer 的 AllowedIPs 后经 `winipcfg` 写入 WireGuard 接口路由，并配合 `docs/netquirk.md` 描述的 `IP_PKTINFO`/`IPV6_PKTINFO` 选择出接口、原路回包。相比之下，OpenVPN 依赖服务端推送路由与客户端脚本，IPsec 依赖 SPD 策略匹配，两者都没有「公钥即路由」这层语义，这是迁移时最容易混淆的地方。
+
+第五个概念是信任模型。OpenVPN 通常建立在 TLS 与证书颁发机构之上，涉及 CA、证书吊销与 TLS 版本协商；IPsec 依赖预共享密钥或证书配合 IKE 协商出 SA；而 WireGuard 家族使用静态公钥直接标识 peer，握手即认证，没有证书链，也没有协商密码套件的环节。这里要防止一个连环误解：`docs/attacksurface.md` 里更新链使用的 signify Ed25519 签名与 BLAKE2b-256 校验，是「验证 MSI 安装包是否来自官方」的软件供应链机制，与隧道身份认证毫无关系；把它当成 WireGuard 的证书体系，就会误以为 Windows 客户端存在 PKI（原理见 06-12 ｜ 配置见 04-03）。
+
+### 3. 关键数据结构与源码位置
+
+本节先给 Windows 侧可核对的结构锚点，再说明外部实现的边界。`upstream_src/driver/configuration_windows.go` 定义了下发到 IOCTL 的载荷类型：`AdapterState`（`AdapterStateDown` 与 `AdapterStateUp`）、`AllowedIP`（含 `Address [16]byte`、`AddressFamily`、`Cidr`、`Flags`）、`Peer` 与 `PeerFlag`、`InterfaceFlag` 等。这些类型与 Linux 的 netlink 属性、wireguard-go 的 UAPI 消息是同一份逻辑配置在不同接口形态下的编组结果；它们的逐字段含义、大小与对齐属于 05-05 的权威范围，本篇不展开（字段见 05-05）。与之对应，`upstream_src/conf/config.go` 里的 `netip.Prefix` 用于表达 `Address` 与 `AllowedIPs`，`Endpoint` 用 `Host string` 加 `Port uint16` 表达主机端口，其 `String()` 方法在主机含冒号时输出 `[host]:port` 的 IPv6 形式，这些是 05-02、05-03 的内容。
+
+第二个锚点是 `upstream_src/docs/netquirk.md`。它给出 Windows 侧三条独有的行为：Tunnel 服务把各 peer 的 AllowedIPs 去重后写入接口路由；未显式指定 MTU 时取「非本隧道的默认路由接口 MTU 减 80」；WireGuardNT 用 `IP_PKTINFO`/`IPV6_PKTINFO` 选择出接口并记录入接口与源地址以便原路回包。同一份文档还说明 kill-switch 仅在「单 peer 且该 peer 含 /0 的 AllowedIP」时启用，以及适配器在启动时创建、停止时销毁、GUID 由配置确定性派生。这些都是 Windows 宿主集成层的产物，在其他平台的 WireGuard 实现里没有等价物，对比时务必单列。
+
+第三个锚点是 `upstream_src/docs/buildrun.md` 与 `upstream_src/build.bat`。前者第 86 行起明确 `wg(8)` 在 Windows 上「works well」，但它来自 wireguard-tools 这个独立项目，用 `PLATFORM=windows make -C wireguard-tools/src` 编译成 `wg.exe`，只是与本程序运行的实例交互；后者第 23 行在下载依赖时带了 `--exclude wg-quick` 参数，把 `wg-quick` 明确排除在 Windows 构建之外。这两处合起来是「wg(8) 可用、wg-quick 语义不适用」这一边界最硬的证据，也提示我们：命令全集在 04-05，不要因为 `wg show` 能用就推断 `wg-quick` 的全套脚本能力都在。
+
+四类实现与本仓库的分层位置关系如图 01-02-01 所示，虚线表示「仅作架构对照，不是本仓库的组成部分」。
+
+:::figure id=01-02-01 | name=四类 VPN 实现的数据面与控制面位置对比 | dir=TD
+node n1 "WireGuard 协议规范" gray
+node n2 "Linux 内核实现<br/>内核数据面" red
+node n3 "wireguard-go<br/>用户态数据面" amber
+node n4 "OpenVPN<br/>TLS 用户态" purple
+node n5 "IPsec<br/>内核 SA 与 IKE" purple
+node n6 "Windows 客户端<br/>WireGuardNT 内核" blue
+node n7 "本仓库控制面<br/>IOCTL 与网络配置" teal
+node n8 "Windows 宿主<br/>NDIS 与 WFP" green
+node n9 "wg(8) 查询工具<br/>外部 wireguard-tools" gray
+edge n1 -> n2 "同协议"
+edge n1 -> n3 "同协议"
+edge n1 -> n6 "同协议"
+edge n1 -> n4 dashed "不同协议家族"
+edge n1 -> n5 dashed "不同协议家族"
+edge n7 -> n6 "配置下发"
+edge n6 -> n8 "NDIS 适配器"
+edge n9 -> n6 dashed "运行时查询"
+edge n2 -> n8 dashed "仅作对照"
+edge n3 -> n8 dashed "仅作对照"
+:::
+
+图 01-02-01 把「同协议不同宿主」与「不同协议家族」用实线和虚线分开：n2、n3、n6 共享 n1 这份规范，n4、n5 只作为迁移来源被对照。五个维度以上的完整对比见下表。
+
+| 对比维度 | Linux 内核实现 | wireguard-go | OpenVPN | IPsec | wireguard-windows |
+|---|---|---|---|---|---|
+| 数据面位置 | 内核态 | 用户态 Go 协程 | 用户态进程 | 内核 IPsec 栈 | 内核态，外部 WireGuardNT |
+| 控制面接口 | netlink 与 wg(8) | UAPI 与配置文件 | 管理通道与配置 | IKE 与 SPD | IOCTL 与 Windows 网络 API |
+| 密钥与握手 | 静态公钥 Noise | 静态公钥 Noise | TLS 证书与 PKI | IKE SA 协商 | Noise，实现在内核驱动 |
+| 接口模型 | wgN 虚拟网卡 | tun 设备 | tun 或 tap | SA 与策略数据库 | NDIS 微型端口适配器 |
+| 加密与封装 | ChaCha20-Poly1305 | 同左 | TLS 记录层 | ESP 或 AH | 内核实现，本仓库无代码 |
+| 路由与 ACL | Cryptokey Routing | 同左 | 路由推送与脚本 | SPD 策略 | winipcfg 下发 AllowedIPs |
+| 部署形态 | 内核模块加工具 | 单二进制 | 服务端与客户端进程 | 主机或网关 | MSI 加 Windows 服务 |
+| 特权模型 | 内核态 | 普通用户加 tun 权限 | 服务账户 | 内核态 | LocalSystem 加主动降权 |
+| 可运维性 | wg show、systemd | 进程日志 | 状态文件与日志 | setkey、ipsec | /dumplog、wg show、事件查看器 |
+
+表中「同左」指与同列上一行同维度前一项一致，不是省略内容。需要强调：表中关于四类外部实现的描述属于架构层面的通用对照，具体参数、版本与内部函数名需对照各自项目的实际版本核验，本仓库 `upstream_src/` 内没有它们的源码。
+
+### 4. 关键流程与调用链
+
+用一个出站 IP 报文的旅程做横向对照，比罗列特性更能说明分层差异。假设应用发出一个目的地址落在隧道网段内的报文，四条路径分别是这样的。
+
+Linux 内核实现的路径是：应用写 socket，内核路由表根据 `wg-quick` 或网络管理器下发的路由选中 `wg0`，内核 WireGuard 模块以目的地址查 AllowedIPs 找到对应 peer，若没有有效会话则触发 Noise 握手，随后用该 peer 的会话密钥做 ChaCha20-Poly1305 封装，加上 UDP 头后从绑定端口发往 Endpoint。全程在内核态完成，用户态的 `wg(8)` 只在配置阶段通过 netlink 介入。
+
+wireguard-go 的路径是：应用报文经路由进入 `tun` 设备，Go 进程从设备文件读出原始 IP 报文，在用户态查 AllowedIPs 与 peer 表，用 Go 实现的密码学原语加密，再经 UDP socket 发出。握手同样是用户态状态机，`tun` 设备只负责在内核与用户态之间搬运报文字节。这条路径的特权要求低，但每个报文都要经历内核态到用户态的拷贝与调度。
+
+OpenVPN 的路径是：应用报文进入 `tun` 或 `tap` 设备，用户态 openvpn 进程读取后经 TLS 通道封装，或走 UDP、或走 TCP，再发往服务端；服务端可以推送路由、DNS 与重定向网关等配置。IPsec 的路径则是：内核根据 SPD 策略判断报文需要保护，查 SAD 找到 SA，用 ESP 或 AH 封装后发出，IKE 守护进程只在 SA 建立与重协商时参与。
+
+Windows 客户端的路径是：应用报文按 `tunnel/winipcfg/` 下发的路由进入 WireGuardNT 创建的 NDIS 微型端口适配器；内核驱动查 peer、做握手与加密，并按 `docs/netquirk.md` 所述借助 `IP_PKTINFO`/`IPV6_PKTINFO` 选出一个不会回环到自身的出接口发出 UDP 报文，同时记录入接口与源地址以便原路回包。本仓库的 Go 调用链止于 `tunnel/service.go` 里的 `adapter.SetConfiguration(config.ToDriverConfiguration())` 与 `adapter.SetAdapterState(driver.AdapterStateUp)`：前者把 `conf.Config` 编组为 `driver` 包的结构体通过 IOCTL 送入驱动，后者把适配器置为 Up。此后所有握手、密钥派生、加解密、抗重放都在内核，不经过任何 Go 代码。
+
+各实现中「配置下发」到「报文加密」之间的阶段划分见下表，可见本仓库的控制面链路明显更长，而数据面链路完全外包。
+
+| 阶段 | Linux 内核实现 | wireguard-go | Windows 客户端 |
+|---|---|---|---|
+| 配置解析 | wg(8) 或 wg-quick 读 INI | 进程读配置与 UAPI | `conf.LoadFromPath()` 与解析器 |
+| 接口创建 | 内核建立 wgN | 打开 tun 设备 | `driver.CreateAdapter()` |
+| 路由下发 | 写内核路由表 | 写宿主路由表 | `winipcfg` 写接口地址与路由 |
+| 防火墙 | 依赖宿主 iptables | 依赖宿主防火墙 | `enableFirewall()` 构造 WFP 规则 |
+| 权限收敛 | 不适用 | 不适用 | `elevate.DropAllPrivileges(true)` |
+| 配置入数据面 | netlink 写内核 | 进程内直接生效 | `SetConfiguration()` 经 IOCTL |
+| 握手与加密 | 内核模块 | Go 用户态 | WireGuardNT 内核驱动 |
+
+这张表还揭示了一个常被忽略的事实：`enableFirewall()` 与 `elevate.DropAllPrivileges(true)` 这两步在 Linux 与 wireguard-go 的对照列里没有对应项，因为它们是 Windows 特有的宿主集成动作，分别对应 WFP kill-switch 与 LocalSystem 降权（原理见 06-09 ｜ 模块见 07-05、07-07）。把这两步当成 WireGuard 协议的一部分，就是典型的跨宿主串味。
+
+### 5. 配置/命令/代码实例
+
+`docs/enterprise.md` 给出了一条真实可用的运行时查询命令与输出样例，用它来观察「接口、peer、AllowedIPs」这一共同的抽象模型最合适。注意 `wg(8)` 是外部 wireguard-tools 提供的独立程序，不是 `wireguard.exe` 的子命令；命令全集见 04-05。
+
+```powershell
+wg show myconfname
+```
+
+以下为示例输出，具体格式需对照实际版本核验。
+
+```text
+> wg show myconfname
+interface: myconfname
+  public key: lfTRXEWxt8mZc8cjSvOWN3tqnTpWw4v2Eg3qF6WTklw=
+  private key: (hidden)
+  listening port: 53488
+
+peer: JRI8Xc0zKP9kXk8qP84NdUQA04h6DLfFbwJn4g+/PFs=
+  endpoint: 163.172.161.0:12912
+  allowed ips: 0.0.0.0/0
+  latest handshake: 3 seconds ago
+  transfer: 6.55 KiB received, 4.13 KiB sent
+```
+
+逐行判读如下。`interface: myconfname` 的 `myconfname` 是隧道名，来自配置文件名经 `conf.NameFromPath()` 的处理，也是 `WireGuardTunnel$myconfname` 服务名的来源（拼接函数位于 `conf/name.go`，需对照实际版本核验）。`public key` 一行是本地 `PrivateKey` 经 X25519 派生出的公钥，对应 `conf/config.go` 里 `func (k *Key) Public() *Key` 的返回值，输出为标准的 32 字节 base64；`private key: (hidden)` 不是字段缺失，而是 `wg(8)` 对私钥的固定脱敏显示，真实私钥只存在于加密后的 `.conf.dpapi` 文件与驱动配置中，导出配置时由 `conf.Config.Redact()` 再次抹除。`listening port: 53488` 对应 `Interface.ListenPort`，未显式配置时由系统分配，属于正常值范围，若长期为 0 或缺失则要怀疑适配器是否 Up。空行之后的 `peer:` 段按 peer 重复：`endpoint` 对应 `Peer.Endpoint`，其字符串形式由 `Endpoint.String()` 生成，IPv6 主机会显示为方括号包裹的形式；`allowed ips` 对应 `Peer.AllowedIPs`，这里的 `0.0.0.0/0` 正是 `docs/netquirk.md` 所述 kill-switch 与默认路由场景的触发条件之一，读到它就应当意识到 Windows 侧会有 WFP 规则收紧。`latest handshake: 3 seconds ago` 由 `HandshakeTime.String()` 生成，该方法在时间差为零时输出 `Now`、在系统时钟回拨时输出 `System clock wound backward!`，并按年月曰时分秒拼接「x ago」，因此握手时间突然变成很久以前通常意味着对端不可达或时钟异常，而不是加密失败。`transfer: 6.55 KiB received, 4.13 KiB sent` 对应 `RxBytes` 与 `TxBytes`，单位换算由 `Bytes.String()` 按 1024 进制在 B、KiB、MiB、GiB、TiB 之间切换；只有 received 增长而 sent 几乎不动，常见于对端未回包的场景。整体而言，这段输出是「运行时状态」而非「配置文本」，它证明的是 Cryptokey Routing 模型在 Windows 上同样可观测，但绝不意味着 `wg-quick` 的脚本语义也可用。
+
+本仓库里与公钥派生相关的代码只有下面这一段，摘自 `conf/config.go`，可以印证「Go 侧的 ecdh 只用于密钥生成，不参与数据面」。
+
+```go
+func (k *Key) Public() *Key {
+	key, err := ecdh.X25519().NewPrivateKey(k[:])
+	if err != nil {
+		panic(err)
+	}
+	return (*Key)(key.PublicKey().Bytes())
+}
+```
+
+最后给一份最小可对照的配置骨架，仅用于说明「同一份 INI 语法在不同宿主上语义不同」；其中密钥为全字符示意值，仅展示语法，不可用于真实隧道，完整配置见 04-01、04-02、04-03。
+
+```conf
+[Interface]
+PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+Address = 10.64.0.2/32
+DNS = 10.64.0.1
+
+[Peer]
+PublicKey = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
+AllowedIPs = 0.0.0.0/0
+Endpoint = vpn.example.net:51820
+```
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把 `wg-quick` 的 `PostUp` 规则整段粘到 Windows 配置里。Linux 上常见的 `PostUp = iptables -A FORWARD -i %i ...` 在 Windows 上既不认识 `iptables`，也不认识 `%i`；Windows 侧若确实需要脚本，必须设置 `HKLM\Software\WireGuard\DangerousScriptExecution` 为 `DWORD(1)`，四个脚本键才会以 LocalSystem 权限执行，且隧道名通过环境变量 `WIREGUARD_TUNNEL_NAME` 传递（`docs/adminregistry.md`）。更关键的是，`build.bat` 第 23 行下载 wireguard-tools 时明确带 `--exclude wg-quick`，官方从构建层面就排除了它。默认不执行、开启需谨慎、语义不对等，这三句话要一起记住（配置见 04-02、04-07）。
+
+第二个陷阱是把 `SaveConfig` 当成 Windows 客户端支持的能力。`wg-quick` 可以用它把运行时状态回写配置文件，而 `conf/config.go` 的 `Interface` 与 `Peer` 成员中并没有对应字段；是否受支持需对照实际版本核验，可定位路径为 `conf/config.go` 与 `conf/parser.go`。同理，`resolvconf` 管理 DNS、按接口名批量改路由的那些 Linux 工具语义，在 Windows 上分别由 `conf/dnsresolver_windows.go` 与 `tunnel/winipcfg/` 承担，行为并不等价（原理见 06-08）。
+
+第三个陷阱是把 wireguard-go 的 `tun` 设备模型套到 NDIS 适配器上。两者在「报文如何进出内核」这一步就分道扬镳：前者是字符设备加用户态读写循环，后者是微型端口驱动加 IOCTL 配置。由此派生的差异包括：适配器随隧道启停动态创建与销毁、GUID 由配置确定性派生以便网络位置分类稳定、MTU 缺省取默认路由接口 MTU 减 80、以及借 `IP_PKTINFO` 原路回包（`docs/netquirk.md`）。拿用户态 TUN 的调优经验去调 NDIS 适配器，往往南辕北辙。
+
+第四个陷阱是用 OpenVPN 的 TLS/PKI 心智模型理解 WireGuard。Windows 客户端没有 CA、没有证书链、没有密码套件协商，peer 由静态公钥直接标识；`docs/attacksurface.md` 里出现的 signify Ed25519 与 BLAKE2b-256 属于 MSI 更新链的供应链校验，与隧道认证无关。若把两者混为一谈，就会在配置里徒劳地寻找证书路径，或误以为需要部署 PKI 才能建立隧道。
+
+第五个陷阱是用 IPsec 的 SPD/SA 概念去理解 AllowedIPs。AllowedIPs 同时是路由与访问控制列表，不需要独立的策略数据库，也不存在「先协商 SA 再谈路由」的阶段；Windows 侧由 `enableFirewall()` 与 `winipcfg` 把这份语义落到 WFP 规则和系统路由表（原理见 06-06、06-09）。
+
+第六个陷阱是把对比表里的外部实现细节当成已核验的本仓库事实。表中 Linux、wireguard-go、OpenVPN、IPsec 四列是架构层面的通用对照，本仓库 `upstream_src/` 里没有对应源码；任何具体版本、参数名、性能数值都需对照各自项目核验。反过来，也不要因为本仓库用了 `wg(8)` 的输出格式，就推断 `wireguard.exe` 支持 `wg` 的全部子命令，命令清单以 04-05 为准。
+
+最佳实践有四条。其一，迁移前先列一张「我在原平台依赖了哪些能力」的清单，逐条到 04、06、07 分册查 Windows 侧的对等物，查不到就明确记为「不具备」，不要臆造。其二，把 `/dumplog`、`wg show`、`sc query` 作为三类事实来源：日志看控制面动作，wg show 看接口与 peer 状态，sc 看服务，三者互不替代。其三，做性能或行为对比时先对齐数据面位置，按 08-02 的方法学统一口径，别拿用户态实现的吞吐数字去要求内核实现，或反过来。其四，所有交叉引用按（字段见 05-02 ｜ 配置见 04-01 ｜ 原理见 06-04 ｜ 模块见 07-03）的格式写，保证同一事实只在一个分册维护。
+
+### 7. 小结与延伸阅读
+
+本篇的结论可以浓缩成一句话：同一份协议在不同宿主上有不同的工程形态，不同协议家族则在分层上根本不同，而 wireguard-windows 是「WireGuard 协议 + WireGuardNT 内核数据面 + Windows 宿主集成控制面」这一特定组合。它与 Linux 内核实现共享协议规范与 Cryptokey Routing 语义，但控制面接口从 netlink 换成了 IOCTL 与 IP Helper API；它与 wireguard-go 共享协议却把数据面放在内核而非用户态；它与 OpenVPN、IPsec 不属于同一协议家族，静态公钥、无证书、无 SA 协商是本质差异。最需要固化的边界是：本仓库没有握手与加密代码，`wg(8)` 来自外部 wireguard-tools，`wg-quick` 被构建脚本明确排除，四个脚本键默认不执行，更新链签名与隧道认证无关。
+
+延伸阅读建议从「本仓库的权威文档」开始，再看本套资料的对应分册。`upstream_src/docs/netquirk.md` 解释路由、MTU、kill-switch、确定性 GUID 与适配器生命周期，是理解 Windows 独有行为的第一手材料；`upstream_src/docs/attacksurface.md` 说明四组件与权限模型，可用来核对本篇的数据面归属；`upstream_src/docs/buildrun.md` 第 86 行起说明 `wg(8)` 的来源与编译方式；`upstream_src/build.bat` 第 16 至 24 行列出 Go、wireguard-tools 与 WireGuardNT 的依赖下载，其中 `--exclude wg-quick` 值得单独记住；`upstream_src/docs/enterprise.md` 给出本篇引用的 `wg show` 输出样例以及服务、日志、更新、驱动移除的运维命令。源码侧建议按 `conf/config.go` → `driver/configuration_windows.go` → `tunnel/service.go` → `tunnel/addressconfig.go` 的顺序，把「配置内存表示 → IOCTL 载荷 → 下发调用链 → 路由写入」串起来。本套资料内，01-03 会把本篇反复提到的四层展开成可跟踪的调用链，06-04 讲协议原理并再次标注内核实现的外部归属，06-06 讲 AllowedIPs 到路由表的下发，06-09 讲 WFP kill-switch，08-02 给出跨实现性能对比的方法学（字段见 05-05 ｜ 配置见 04-03 ｜ 原理见 06-04 ｜ 模块见 07-03）。
+
+## 01-03 整体架构：WireGuardNT、Tunnel 服务、Manager 服务与 UI 四层
+
+### 1. 背景与动机
+
+01-01 划清了「本仓库是官方 Windows 客户端、数据面在外部内核驱动」的边界，01-02 用对比表切断了跨宿主的能力迁移，本篇则要把剩下的核心问题讲透：本仓库内部到底由几层构成，它们为什么必须这样分，以及一次「启用隧道」的请求如何在层间流动。这个分层不是代码美学上的取舍，而是被 Windows 的进程、会话与特权模型逼出来的设计，也是 `docs/attacksurface.md` 整篇文档的骨架。
+
+该文档开篇第一句是全篇最权威的一句：「WireGuard for Windows consists of four components: a kernel driver, and three separate interacting userspace parts.」一个内核驱动加三个相互协作的用户态部分，合计四层。为什么不能合成一个进程？原因至少有四条。第一，数据面必须在内核：Windows 没有让用户态程序直接挂载虚拟网卡协议逻辑的通用接口，只有 NDIS 微型端口驱动能进入网络栈，因此 WireGuardNT 必须是内核驱动。第二，网络配置必须长期驻留：路由、地址、DNS、WFP 规则需要随系统启动并在后台持续维护，这正是 Windows 服务的职责，于是有了 Tunnel Service。第三，UI 必须出现在交互式用户的桌面上，而服务运行在 Session 0，无法直接显示窗口，于是必须有一个独立进程孵化进用户会话，并且需要有人负责枚举会话、判定令牌、创建 IPC 通道，于是有了 Manager Service 与 UI。第四，安全上希望每个组件都能单独降权：让持有最高权限的进程尽可能少、尽可能短，把渲染富文本配置这种高风险工作放进高完整性但已丢弃特权的 UI 进程。四条约束叠加，四层结构几乎是唯一解。
+
+理解分层还有很强的排障价值。Windows 客户端的故障现象看起来往往差不多——「隧道连不上」——但根因可能落在完全不同的层：驱动没装好、Tunnel 服务起不来、Manager 服务没在监视、UI 没被孵化、IPC 句柄传递失败、路由没写进去、WFP 规则把 DNS 挡了、或者内核里握手根本没成功。若没有一张分层地图，排查就会变成随机试探；有了地图，就能按 `docs/enterprise.md` 提供的 `/dumplog`、`wg show`、`sc` 三类观测手段逐层收敛。本篇的目标就是交付这张地图，并把它落到可核对的函数与源码路径上。
+
+最后要提醒一个贯穿全册的口径：本篇虽然大量出现函数名与调用顺序，但机制与状态机的唯一权威源是 06 全册，逐字段定义是 05 全册，模块能力是 07 全册。本篇只负责建立「谁调用谁、在哪一层、哪个文件」的骨架，交叉引用按（字段见 05-08 ｜ 配置见 04-04 ｜ 原理见 06-01 ｜ 模块见 07-05）的格式给出，不把字段表或调用链状态机提前搬过来。
+
+### 2. 核心概念
+
+第一层是 WireGuardNT 内核驱动。`docs/attacksurface.md` 说明它向 NDIS 栈暴露一个微型端口驱动，任何能以合理方式访问网络栈的进程都能让报文命中相关 NDIS 处理函数；它暴露一个解析 WireGuard 报文的 UDP 端口；还暴露若干 NDIS OID 调用、加在 NDIS 设备文件上的 PNP 与 Close 通知，以及同样加在该设备文件上的 IOCTL。IOCTL 是控制面与数据面之间唯一的正式通道，允许获取与设置配置、切换适配器状态、从环形缓冲区读取驱动日志，并且被安全描述符 `O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)S:(ML;;NWNRNX;;;HI)` 严格限制为 SYSTEM 与 Administrators 且要求高完整性级别。Noise 握手、会话密钥、报文加解密、抗重放都发生在这一层；本仓库没有它的源码，只有 `driver/` 包对 `wireguard.dll` 导出函数的调用封装（模块见 07-03）。
+
+第二层是 Tunnel Service。它以 LocalSystem 运行，是「每条隧道一个」的 Windows 服务，服务名形如 `WireGuardTunnel$<name>`，`docs/enterprise.md` 与 `manager/install.go` 都给出这一命名。它负责创建并配置 WireGuardNT 适配器：`tunnel/service.go` 的 `tunnelService.Execute()` 从 `conf.LoadFromPath()` 读配置开始，经过去重、接口监听、DNS 解析、创建适配器、打开驱动日志、脚本钩子、WFP 规则、降权，最后 `SetConfiguration()` 与 `SetAdapterState()` 下发。`docs/attacksurface.md` 特别指出它在初始设置后用 `AdjustTokenPrivileges` 丢弃除 `SeLoadDriverPrivilege` 之外的全部特权，保留这一项仅为在关停时能删除接口；这一取舍在文档里被坦率地标注为「rather unfortunate」，是理解其攻击面的关键。此外它用同名 DACL 的全局互斥量配合 `CreatePrivateNamespace` 保护 WireGuardNT 接口创建过程。
+
+第三层是 Manager Service。它是单例服务 `WireGuardManager`，同样以 LocalSystem 运行，职责是「编排」而非「转发」：`docs/attacksurface.md` 说它负责启停隧道服务并保证管理员桌面上存在带特定句柄的 UI 程序。它用 `WTSEnumerateSessions` 与 `WTSSESSION_NOTIFICATION` 遍历各会话，用 `WTSQueryUserToken` 取令牌，再以 `CheckTokenMembership`、`GetTokenInformation(TokenElevation)`、必要时 `GetTokenInformation(TokenLinkedToken)` 判定是否为管理员令牌；若管理员设置了 `HKLM\Software\WireGuard\LimitedOperatorUI`，还会对 `S-1-5-32-556`（Network Configuration Operators）组放行一个受限的 UI。它按字符串前缀 `WireGuardTunnel$` 监听隧道服务变化，管理 `%ProgramFiles%\WireGuard\Data` 下由 DPAPI 加密的配置文件，并向 UI 暴露基于无名管道的 IPC 与一个共享内存环形日志映射句柄。更新器 `updater/` 也运行在 Manager 服务进程内（`go checkForUpdates()`）。
+
+第四层是 UI。它是「每个管理员会话一个」的进程，以高完整性提升令牌运行，启动时同样用 `AdjustTokenPrivileges` 丢弃全部特权，以此抵御 shatter 类攻击；它用 `msftedit.dll` 控件渲染带语法高亮的配置文件。`ui/ui.go` 的 `RunUI()` 第一行就是 `runtime.LockOSThread()`，因为 Walk 界面库要求消息循环固定在线程上。UI 并不直接碰驱动，它的每一个动作都经 IPC 交给 Manager，再由 Manager 通过 SCM 作用于 Tunnel 服务。
+
+连接四层的概念有三个。其一是「服务与会话模型」：服务在 Session 0，UI 在用户会话，二者靠 Windows 会话枚举与令牌判定衔接。其二是「控制面与数据面交互点」：全部收敛到 `driver/` 包的 IOCTL 封装，其他层都不直接读写网络报文。其三是「IPC 契约」：`main.go` 的 `/ui` 分支要求恰好四个句柄参数——三根无名管道（命令读、命令写、事件）加一个日志映射句柄，`manager/service.go` 的 `startProcess()` 用三次 `os.Pipe()` 与 `ringlogger.Global.ExportInheritableMappingHandle()` 生成它们，并通过 `launchUIProcess()` 以可继承句柄传给子进程；`main.go` 侧用 `pipeFromHandleArgument()` 把字符串化的句柄值还原成 `*os.File`，再由 `manager.InitializeIPCClient()` 与 `ringlogger.NewRingloggerFromInheritedMappingHandle()` 接管。这三个概念合起来，就是「四层如何粘在一起」的答案。
+
+### 3. 关键数据结构与源码位置
+
+本节给出四层的定位表与目录地图，结构体逐字段仍以 05 全册为准（字段见 05-08 ｜ 配置见 04-04 ｜ 原理见 06-10 ｜ 模块见 07-08）。
+
+四层组件的形态、账户、入口与源码位置见下表。
+
+| 层 | 组件 | 进程与服务形态 | 运行账户 | 入口函数与源码位置 |
+|---|---|---|---|---|
+| 内核数据面 | WireGuardNT | NDIS 微型端口驱动，外部项目 | 内核态 | `driver/driver_windows.go` 的导出函数调用 |
+| 用户态隧道层 | Tunnel Service | 每隧道一个 `WireGuardTunnel$` 服务 | LocalSystem，主动降权 | `tunnel.Run()`、`tunnelService.Execute()`，`tunnel/service.go` |
+| 用户态编排层 | Manager Service | 单例 `WireGuardManager` 服务 | LocalSystem | `manager.Run()`、`managerService.Execute()`，`manager/service.go` |
+| 用户态呈现层 | UI | 每个管理员会话一个进程 | 高完整性提升令牌，丢弃特权 | `ui.RunUI()`，`ui/ui.go` |
+
+表中「运行账户」一列值得反复对照：两个服务都是 LocalSystem，但 Tunnel Service 还额外做了降权；UI 虽然以高完整性运行，却主动丢弃了全部特权。这三处细节共同构成 `docs/attacksurface.md` 所描述的权限收敛模型，也是 08-05 安全加固篇的起点。
+
+结构体层面只需点名四个锚点。`tunnel/service.go:27` 定义 `type tunnelService struct { Path string }`，是隧道服务的上下文；`manager/service.go:26` 定义 `type managerService struct{}`，是 Manager 服务的空上下文，状态其实保存在 `Execute()` 的局部变量 `procs`、`aliveSessions`、`procsLock` 里；`driver/driver_windows.go:28` 定义 `type Adapter struct { handle uintptr; lastGetGuessSize uint32 }`，是适配器句柄的封装；`manager/uiprocess.go` 定义 `uiProcess` 并在 `manager/service.go` 中以 `procs map[uint32]*uiProcess` 按会话 ID 管理 UI 进程。这四者的逐字段含义、生命周期与关联函数入口属于 05-08、05-06 的权威范围，本篇不展开。错误码方面，`services/errors.go` 定义 `Error` 枚举（如 `ErrorRingloggerOpen`、`ErrorLoadConfiguration`、`ErrorCreateNetworkAdapter`、`ErrorDNSLookup`、`ErrorFirewall`、`ErrorDeviceSetConfig`、`ErrorDeviceBringUp`、`ErrorSetNetConfig`、`ErrorDropPrivileges`、`ErrorRunScript` 等）以及 `DetermineErrorCode()`、`CombineErrors()`，`services/boot.go` 提供 `PrintStarting()` 与 `StartedAtBoot()`，它们是四层服务共同的退出码与日志基础设施（模块见 07-10）。
+
+四层之间、以及配置存储与 Windows 宿主之间的关系如图 01-03-01 所示。
+
+:::figure id=01-03-01 | name=WireGuardNT 与三个用户态组件的四层结构 | dir=TD
+node a "管理员会话<br/>交互式桌面" green
+node b "UI 进程<br/>高完整性令牌" green
+node c "Manager 服务<br/>WireGuardManager" teal
+node d "Tunnel 服务<br/>WireGuardTunnel 前缀" teal
+node e "配置存储<br/>conf.dpapi" blue
+node f "wireguard.dll<br/>资源内嵌" purple
+node g "WireGuardNT<br/>内核驱动" red
+node h "Windows 网络栈<br/>NDIS 与 WFP" red
+node i "三根无名管道<br/>加日志映射" amber
+edge a -> b "会话内运行"
+edge b -> c "IPC 请求"
+edge c -> b "状态与事件"
+edge c -> d "服务控制"
+edge d -> c "状态上报"
+edge c -> e "监视与加密"
+edge e -> d "LoadFromPath"
+edge d -> f "IOCTL 调用"
+edge f -> g "适配器配置"
+edge g -> h "创建 NDIS 适配器"
+edge c -> i "孵化时传入"
+edge i -> b "继承句柄"
+:::
+
+图 01-03-01 中，绿色是用户会话侧，青色是两个服务，蓝色是配置存储，紫色与红色是驱动与内核，琥珀色是 IPC 通道。可以看到 UI 与内核之间没有任何直连边，所有请求必须穿过 Manager 与 Tunnel 两层。仓库目录地图如下，便于把四层对应到实际包。
+
+```tree
+upstream_src/
+├── main.go                      进程入口与命令分派
+├── conf/                        配置解析、命名、DPAPI、路径
+│   ├── config.go
+│   ├── parser.go
+│   ├── store.go
+│   ├── name.go
+│   ├── path_windows.go
+│   └── dpapi/
+├── driver/                      WireGuardNT IOCTL 适配层
+│   ├── driver_windows.go
+│   ├── configuration_windows.go
+│   └── dll_windows.go
+├── tunnel/                      Tunnel Service 及其网络配置
+│   ├── service.go
+│   ├── addressconfig.go
+│   ├── interfacewatcher.go
+│   ├── mtumonitor.go
+│   ├── deterministicguid.go
+│   ├── winipcfg/
+│   └── firewall/
+├── manager/                     Manager Service、IPC、会话、更新
+│   ├── service.go
+│   ├── install.go
+│   ├── ipc_server.go
+│   ├── ipc_client.go
+│   ├── tunneltracker.go
+│   ├── uiprocess.go
+│   └── updatestate.go
+├── ui/                          UI 进程
+│   ├── ui.go
+│   ├── managewindow.go
+│   ├── tunnelspage.go
+│   ├── confview.go
+│   ├── editdialog.go
+│   └── logpage.go
+├── services/                    错误码、启动原因判定
+├── ringlogger/                  共享环形日志
+├── updater/                     更新链
+├── elevate/                     令牌与特权
+├── version/
+└── installer/                   WiX 与 MSI
+```
+
+### 4. 关键流程与调用链
+
+先看 Manager 服务的启动链。`main.go` 的 `main()` 在 `/managerservice` 分支调用 `manager.Run()`，其实现是 `svc.Run("WireGuardManager", &managerService{})`，把进程交给 SCM 托管。`managerService.Execute()` 的开头依次是 `changes <- svc.Status{State: svc.StartPending}`、`conf.LogFile(true)`、`ringlogger.InitGlobalLogger(logFile, "MGR")`、`services.PrintStarting()`、`os.Executable()` 取自身路径，随后 `watchNewTunnelServices()` 建立对 `WireGuardTunnel$` 前缀服务的跟踪，并用两次 `conf.RegisterStoreChangeCallback()` 注册配置变更回调：一次触发 `conf.MigrateUnencryptedConfigs(changeTunnelServiceConfigFilePath)`，一次触发 `IPCServerNotifyTunnelsChange`。接着 `go checkForUpdates()` 启动更新检查，`WTSEnumerateSessions()` 枚举当前活动与断开的会话，对每个会话调用 `goStartProcess(session)`。
+
+`startProcess(session)` 是会话侧的核心：它 `WTSQueryUserToken()` 取用户令牌，用 `elevate.TokenIsElevatedOrElevatable()` 判定管理员，在 `conf.AdminBool("LimitedOperatorUI")` 开启时再用 `DuplicateTokenEx()` 与 `IsMember()` 判定 `S-1-5-32-556` 操作员组；通过判定后取用户名与用户配置目录，管理员走 `GetLinkedToken()` 拿提升令牌，操作员走原令牌。随后它创建三对 `os.Pipe()`，`IPCServerListen(ourReader, ourWriter, ourEvents, elevatedToken)` 起 IPC 服务端，再 `ringlogger.Global.ExportInheritableMappingHandle()` 导出可继承日志句柄，最后 `launchUIProcess()` 以 `"/ui"` 加四个句柄值参数启动 UI 进程，并把四个句柄列入可继承句柄表。`main.go` 的 `/ui` 分支正好要求 `len(os.Args) == 6`（程序名 + `/ui` + 四个句柄），两边严格对齐。服务进入主循环后处理 `svc.Stop` 与 `svc.SessionChange`，登录时孵化、注销时 `proc.Kill()`，退出时 `IPCServerNotifyManagerStopping()` 并逐个回收 UI 进程。
+
+再看一条隧道的启动链。UI 的启用请求经 IPC 到 Manager，由 Manager 通过 SCM 启动 `WireGuardTunnel$<name>` 服务，服务以 `/tunnelservice CONFIG_PATH` 运行。`tunnel.Run(confPath)` 先 `conf.NameFromPath()` 取隧道名，再 `conf.ServiceNameOfTunnel(name)` 拼服务名，最后 `svc.Run(serviceName, &tunnelService{confPath})`。`tunnelService.Execute()` 的顺序是：`conf.LogFile(true)` → `ringlogger.InitGlobalLogger(logFile, "TUN")` → `conf.LoadFromPath(service.Path)` → `config.DeduplicateNetworkEntries()` → `log.SetPrefix()` 设置 `[name]` 前缀 → `services.PrintStarting()` → 开机启动时处理 SCM 锁 → `evaluateStaticPitfalls()` → `watchInterface()` → `config.ResolveEndpoints()` → `driver.CreateAdapter(config.Name, "WireGuard", deterministicGUID(config))`（开机启动失败会重试最多 15 次）→ `adapter.LUID()` → `driver.RunningVersion()` 打印 `Using WireGuardNT/%d.%d` → `adapter.SetLogging(driver.AdapterLogOn)` → `runScriptCommand(PreUp)` → `enableFirewall(config, luid)` → `elevate.DropAllPrivileges(true)` → `adapter.SetConfiguration(config.ToDriverConfiguration())` → `adapter.SetAdapterState(driver.AdapterStateUp)` → `watcher.Configure(adapter, config, luid)` → `runScriptCommand(PostUp)` → 进入 `svc.Status Running` 并等待 `svc.Stop`、`svc.Shutdown` 或 `watcher` 的事件。关停时 `defer` 以 `PreDown` → `watcher.Destroy()` → `adapter.Close()` → `PostDown` 的顺序清理，并有一个 30 秒看门狗在死锁时打印全部 goroutine 栈后 `os.Exit(777)`。
+
+从 `conf.Config` 到内核数据面的下发链路如图 01-03-02 所示，图中同时画出了路由、防火墙与接口监听三条旁路。
+
+:::figure id=01-03-02 | name=从配置内存结构到内核数据面的下发链路 | dir=TD
+node p1 "conf.Config<br/>解析去重" blue
+node p2 "ToDriverConfiguration<br/>结构体编组" blue
+node p3 "driver.Adapter<br/>句柄与 LUID" purple
+node p4 "SetConfiguration<br/>IOCTL" purple
+node p5 "SetAdapterState<br/>AdapterStateUp" purple
+node p6 "WireGuardNT<br/>内核数据面" red
+node p7 "winipcfg 写路由<br/>地址与 DNS" teal
+node p8 "enableFirewall<br/>WFP 规则" amber
+node p9 "watcher.Configure<br/>接口监听" teal
+edge p1 -> p2 "转换"
+edge p2 -> p4 "载荷"
+edge p3 -> p4 "适配器句柄"
+edge p4 -> p5 "先配置后 Up"
+edge p5 -> p6 "生效"
+edge p1 -> p7 "AllowedIPs"
+edge p7 -> p6 "路由就绪"
+edge p1 -> p8 "kill-switch 判定"
+edge p8 -> p6 "放行隧道 UDP"
+edge p5 -> p9 "启动监听"
+edge p9 -> p3 "LUID 绑定"
+:::
+
+图 01-03-02 强调 `SetConfiguration` 必须先于 `SetAdapterState(AdapterStateUp)`：先把编组后的 peer、密钥、监听端口等送进驱动，再把适配器置为可用，这个顺序在 `tunnel/service.go` 里是硬编码的。各阶段失败时对应的错误码见下表，可用于把 `/dumplog` 里的现象映射到具体环节（错误码枚举见 `services/errors.go`，字段见 05-09）。
+
+| 阶段 | 关键函数 | 所属层 | 失败错误码 | 源码位置 |
+|---|---|---|---|---|
+| 日志初始化 | `InitGlobalLogger()` | 服务公共基础 | `ErrorRingloggerOpen` | `manager/service.go`、`tunnel/service.go` |
+| 配置加载 | `conf.LoadFromPath()` | Tunnel 服务 | `ErrorLoadConfiguration` | `conf/store.go` |
+| 接口监听 | `watchInterface()` | Tunnel 服务 | `ErrorSetNetConfig` | `tunnel/interfacewatcher.go` |
+| 域名解析 | `config.ResolveEndpoints()` | Tunnel 服务 | `ErrorDNSLookup` | `conf/` |
+| 适配器创建 | `driver.CreateAdapter()` | 内核边界 | `ErrorCreateNetworkAdapter` | `driver/driver_windows.go` |
+| 防火墙规则 | `enableFirewall()` | Tunnel 服务 | `ErrorFirewall` | `tunnel/firewall/` |
+| 权限收敛 | `elevate.DropAllPrivileges()` | Tunnel 服务 | `ErrorDropPrivileges` | `elevate/` |
+| 配置下发 | `adapter.SetConfiguration()` | 内核边界 | `ErrorDeviceSetConfig` | `driver/` |
+| 适配器上线 | `adapter.SetAdapterState()` | 内核边界 | `ErrorDeviceBringUp` | `driver/` |
+| 会话枚举 | `WTSEnumerateSessions()` | Manager 服务 | `ErrorEnumerateSessions` | `manager/service.go` |
+
+### 5. 配置/命令/代码实例
+
+验证四层是否都在线，最直接的办法是查 Windows 服务。`docs/enterprise.md` 说明 `WireGuardManager` 与 `WireGuardTunnel$<name>` 都可以用 `services.msc` 或 `sc` 管理；这里只用到查询命令，服务管理命令全集见 04-06。
+
+```powershell
+sc query WireGuardManager
+sc query WireGuardTunnel$office
+```
+
+以下为示例输出，具体格式需对照实际版本核验。
+
+```text
+SERVICE_NAME: WireGuardManager
+        TYPE               : 10  WIN32_OWN_PROCESS
+        STATE              : 4  RUNNING
+                                (STOPPABLE, NOT_PAUSABLE, IGNORES_SHUTDOWN)
+        WIN32_EXIT_CODE    : 0  (0x0)
+        SERVICE_EXIT_CODE  : 0  (0x0)
+        CHECKPOINT         : 0x0
+        WAIT_HINT          : 0x0
+
+SERVICE_NAME: WireGuardTunnel$office
+        TYPE               : 10  WIN32_OWN_PROCESS
+        STATE              : 4  RUNNING
+                                (STOPPABLE, NOT_PAUSABLE, IGNORES_SHUTDOWN)
+        WIN32_EXIT_CODE    : 0  (0x0)
+        SERVICE_EXIT_CODE  : 0  (0x0)
+        CHECKPOINT         : 0x0
+        WAIT_HINT          : 0x0
+```
+
+逐行判读如下。两段输出的 `TYPE : 10 WIN32_OWN_PROCESS` 表明每个服务都运行在自己的进程里，这正是四层模型中「两个服务彼此独立」的落点：Manager 崩溃不会让某条隧道的服务一起消失，反之亦然，也让 `docs/attacksurface.md` 所述的按进程降权成为可能。`STATE : 4 RUNNING` 是服务已正常上报 `svc.Status{State: svc.Running, ...}` 的标志，对应 `managerService.Execute()` 中 `changes <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptSessionChange}` 与 `tunnelService.Execute()` 里 `watcher.started` 之后的状态切换；若停在 `2 START_PENDING`，应按上表逐阶段查 `/dumplog`。`WIN32_EXIT_CODE : 0` 与 `SERVICE_EXIT_CODE : 0` 都为 0 表示上次退出无错误，非 0 时应结合 `services.DetermineErrorCode()`（`services/errors.go:78`）与 `Error` 枚举反查是 `ErrorLoadConfiguration`、`ErrorCreateNetworkAdapter` 还是 `ErrorDeviceBringUp`，而不是直接重装。`(STOPPABLE, NOT_PAUSABLE, IGNORES_SHUTDOWN)` 一组标志要注意 `IGNORES_SHUTDOWN`：Tunnel 服务实际仍会响应 `svc.Shutdown`，因为 `Execute()` 的 select 里同时接了 `svc.Stop, svc.Shutdown`，所以不能仅凭这一标志推断关停行为。第二个服务名里的 `WireGuardTunnel$` 前缀是 Manager 用 `watchNewTunnelServices()` 监视服务变化的依据（`docs/attacksurface.md` 明确写了按该字符串前缀监听），`office` 是配置名，二者拼接由 `conf.ServiceNameOfTunnel()` 完成（`conf/name.go`，具体格式需对照实际版本核验）。最后，能看到「一个 `WireGuardManager` 加一个或多个 `WireGuardTunnel$`」正是四层分工在服务视角的证据：UI 不注册服务，驱动是内核对象也不以服务形式出现在这里，因此 `sc query` 只能看到中间两层。
+
+两个服务的入口实现如下，第一段摘自 `manager/service.go`，第二段摘自 `tunnel/service.go`，可见二者都只是把 `svc.Run` 包了一层，差别在于服务名是固定常量还是由配置名派生。
+
+```go
+func Run() error {
+	return svc.Run("WireGuardManager", &managerService{})
+}
+
+func Run(confPath string) error {
+	name, err := conf.NameFromPath(confPath)
+	if err != nil {
+		return err
+	}
+	serviceName, err := conf.ServiceNameOfTunnel(name)
+	if err != nil {
+		return err
+	}
+	return svc.Run(serviceName, &tunnelService{confPath})
+}
+```
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把 Manager 与 Tunnel 当成一个进程、或一个服务的两个线程。它们是两套独立的 Windows 服务，各自有 `Execute()`、各自的 `ringlogger` 组件标签（`MGR` 与 `TUN`）、各自的启动原因判定与退出码。由此派生一个常见误判：停止 Manager 服务后隧道仍在跑，或关掉 UI 后隧道仍在跑，都被当成「bug」，实际上前者是设计使然，后者更是 UI 与隧道解耦的必然结果。要停止隧道，应针对 `WireGuardTunnel$<name>` 服务或经 UI 的停用操作，命令见 04-06。
+
+第二个陷阱是以为 UI 直接操作驱动。UI 只是 IPC 客户端，路径是「UI → 三根无名管道 → Manager → SCM → Tunnel → IOCTL → WireGuardNT」。理解这条链，才能明白为什么 `/ui` 必须恰好四个句柄参数、为什么 `startProcess()` 里要调用 `ExportInheritableMappingHandle()`、以及为什么普通用户即使能看到托盘图标也改不了配置（`LimitedOperatorUI` 下 IPC 会拒绝私钥与编辑操作）。把 UI 当成配置下发者，会在审计 IPC 权限时找错对象（原理见 06-10、06-11）。
+
+第三个陷阱是把 WFP kill-switch 规则当成系统里永久存在的全局防火墙策略。它们由 `enableFirewall()` 在隧道服务启动时按配置临时构造，且只在「单 peer 且含 /0 的 AllowedIP」时启用；关停时随服务清理。`docs/netquirk.md` 进一步说明，若想保留默认路由又不想要收紧语义，可用 `0.0.0.0/1` 加 `128.0.0.0/1`、`::/1` 加 `8000::/1` 规避，UI 编辑器里有对应复选框。把临时规则当成永久策略，会导致在隧道停用后仍按 kill-switch 的行为去解释网络不通（原理见 06-09 ｜ 配置见 04-03）。
+
+第四个陷阱是把 LocalSystem 与脚本开关当成普通功能。`docs/adminregistry.md` 明确 `DangerousScriptExecution` 开启后四个脚本键以最高权限执行，且用 `WIREGUARD_TUNNEL_NAME` 而非 `%i`；`docs/attacksurface.md` 也坦承 Tunnel 服务保留 `SeLoadDriverPrivilege` 是一项尚待改进的取舍。企业环境里若必须开启，应把配置文件的 ACL、脚本内容与更新链一起纳入加固清单（模块见 07-05 ｜ 原理见 08-05）。
+
+第五个陷阱是跨会话与受限 UI 的误判。Manager 按 WTS 会话逐个孵化 UI，管理员走提升令牌，操作员组在 `LimitedOperatorUI` 下走受限接口，注销时 `proc.Kill()` 回收。多用户、RDP、快速用户切换场景下，托盘图标数量与可见性会随会话变化；把「某个会话没有图标」当成服务故障，是没把会话模型纳入分层图。同理，UI 以高完整性运行却丢弃全部特权，这两件事并不矛盾（原理见 06-10）。
+
+第六个陷阱是把 `wireguard.dll` 当成 Linux 的 `.ko` 或 wireguard-go 的二进制。它是通过 `driver/dll_*` 与 `-tags load_wgnt_from_rsrc` 从资源里加载的 DLL，`Makefile` 用 `windres` 配合 `.deps/wireguard-nt/bin/<arch>` 把对应架构的驱动资源编进 `resources_<arch>.syso`。把它当成可随意替换的系统级驱动文件，会忽略签名、架构与内存加载这几层约束（模块见 07-03、07-04）。
+
+最佳实践有四条。其一，排障严格按层：先用 `sc query` 确认两个服务在不在，再用 `/dumplog` 的 `[MGR]`/`[TUN]` 前缀定位到具体层，再用 `wg show` 看接口与 peer，最后才怀疑内核握手。其二，改动配置或服务前先明确影响哪一层，改配置文件影响的是 Manager 的加密存储与 Tunnel 的加载，改注册表策略影响的是 Manager 的 UI 孵化与 Tunnel 的脚本执行。其三，把 `docs/attacksurface.md` 当作分层与权限的第一手依据，任何关于「谁能配置驱动」「谁以什么账户运行」的争论都回到它。其四，交叉引用按（字段见 05-08 ｜ 配置见 04-04 ｜ 原理见 06-01 ｜ 模块见 07-05）的格式写，机制细节留给 06、字段细节留给 05。
+
+### 7. 小结与延伸阅读
+
+本篇把 01-01 的「一个内核、三个用户态」展开成可跟踪的四层结构。WireGuardNT 是内核数据面，通过受 SDDL 保护的 IOCTL 接受配置；Tunnel Service 是每条隧道一个的 LocalSystem 服务，负责创建适配器、写路由与 DNS、构造 WFP 规则、降权，并按「先 SetConfiguration 再 SetAdapterState(Up)」的顺序把配置送进内核；Manager Service 是单例的 LocalSystem 服务，负责会话枚举、令牌判定、UI 孵化、配置加密存储、按 `WireGuardTunnel$` 前缀跟踪隧道服务以及更新检查；UI 是每管理员会话一个的高完整性进程，经三根无名管道与一个共享日志句柄与 Manager 通信。四层之间没有捷径：UI 不碰驱动，Manager 不转发报文，Tunnel 不显示窗口，驱动不解析配置文件。这条分层原则既是安全设计，也是排障地图。
+
+延伸阅读建议按「官方文档 → IPC 与会话源码 → 本套分册」推进。`upstream_src/docs/attacksurface.md` 是四组件、IPC、DPAPI、会话令牌、权限收敛与更新链的第一手依据，应逐段精读；`upstream_src/docs/enterprise.md` 给出 `WireGuardTunnel$<name>`、`WireGuardManager`、`wg show`、`/dumplog`、计划任务更新与 `/removedriver` 的运维视角；`upstream_src/docs/adminregistry.md` 说明 `LimitedOperatorUI` 与 `DangerousScriptExecution` 两个策略如何改变 Manager 与 Tunnel 的行为；`upstream_src/docs/netquirk.md` 解释 Tunnel 服务下发的路由、MTU、kill-switch 与适配器生命周期。源码侧建议按 `main.go` → `manager/service.go` → `manager/ipc_server.go` → `manager/ipc_client.go` → `manager/tunneltracker.go` → `manager/uiprocess.go` → `tunnel/service.go` → `driver/driver_windows.go` → `ui/ui.go` 的顺序通读一遍，再用 `ringlogger/` 与 `services/errors.go` 补齐日志与错误码。本套资料内，01-04 接着把版本基准与生态边界固化成阅读约定；06-05 讲适配器创建与驱动加载，06-06 讲路由下发，06-09 讲 WFP 规则，06-10 讲 Manager 与 UI 进程模型，06-11 讲 IPC 与环形日志；07-05、07-08、07-09 分别对应 Tunnel、Manager、UI 三个模块；08-05 从攻击面角度重访本篇的权限收敛（字段见 05-08 ｜ 配置见 04-04 ｜ 原理见 06-10 ｜ 模块见 07-08）。
+
+## 01-04 版本基准、生态边界与资料使用约定
+
+### 1. 背景与动机
+
+一套技术资料最难的不是写清楚某个函数，而是在上游持续演进的前提下长期不撒谎。wireguard-windows 的 master 分支会不断变动：Go 工具链会升级，WireGuardNT 会发新版，MSI 文件名里的版本号会变化，依赖压缩包的 SHA256 会随重新打包而改变，注册表策略可能被调整，甚至 `docs/` 下的官方文档措辞也会更新。如果资料把某一时刻的数值写成永恒事实，交付之后很快就会与读者手上的版本对不上；反过来，如果因为怕过期就什么都不写，资料又会退化成没有坐标的空谈。01 册前三篇建立的都是机制性结论，本篇要补上的是「坐标系」：先固定版本基准，再划清生态边界，最后把「机制照抄、数值核验」的编辑约定固化成可执行的阅读方法。
+
+这个约定在总纲 `00.txt` 第 9 节已经确立：以本地 `upstream_src/` 的上游 master 快照为第一手依据，以 `docs/` 下五份官方文档为第二手依据，凡出现「`conf/config.go` 里不存在但其他平台 `wg-quick` 存在的配置键」「`main.go` 的 `usage()` 未列出的命令行开关」「上游仓库内没有源码、属于 WireGuardNT 外部项目的内核实现细节」「具体版本号、驱动版本、Go 版本、MSI 文件名与下载 URL 的时效性数值」这四类情形，一律写「需对照实际版本核验」并给出可定位的源码路径。总纲特别强调，这类标注不是内容缺口，而是把「版本相关事实」与「机制性结论」分离的编辑约定：机制、调用链、边界条件在本套资料中给全，具体数值请读者对照手上的上游版本复核。
+
+本篇的第二个动机是生态边界。前三篇反复出现「外部项目」这个词，但读者未必清楚到底有多少个外部实体与本仓库相邻：协议规范、WireGuardNT 内核驱动、Go 工具链、wireguard-tools 的 `wg(8)`、官方下载站与更新链、MSI 与安装器、社区与第三方客户端、`embeddable-dll-service` 子项目……把它们的归属画成一张图，才能避免 01-02 里那种「把别处经验搬过来」的错误在资料层面重演。第三个动机是资料使用约定本身：唯一权威源、三类骨架、交叉引用格式、图与表的语法、示例输出的标注方式，这些规则决定了后续八个分册能否被一致地编译与校验。
+
+因此本篇虽然排在 01 册最后，却是整套资料的「元规则」篇。它回答三个问题：我们以哪个版本说话，哪些东西不属于我们，以及这套资料该按什么口径读。三者的共同目标是：让 02 编译、03 部署、04 配置、05 字段、06 原理、07 模块、08 运维七个分册在任何一个未来版本下都不会自相矛盾。
+
+### 2. 核心概念
+
+第一个概念是版本基准，它由四组要素构成。其一是仓库快照：本套资料依据的是 2026 年 11 月抓取的上游 master 快照，解压在 `upstream_src/`，目录结构与官方仓库一致；所有源码路径引用都以这个根目录为基准。其二是内核数据面版本：WireGuardNT 1.1，其压缩包与 SHA256 同时出现在 `Makefile` 与 `build.bat` 的依赖下载段。其三是构建工具链：Go 1.27.1，`Makefile` 用 `go1.27.1.linux-amd64.tar.gz` 做 Linux 交叉构建，`build.bat` 用 `go1.27.1.windows-amd64.zip` 做 Windows 原生构建，两者都带 SHA256 校验。其四是目标平台与产物：Windows 10 与 Windows Server 2019 及以上（`docs/buildrun.md` 明确要求 64 位 Windows 10 或 Server 2019 加 Git for Windows），产物为 amd64、x86、arm64 三种架构的 `wireguard.exe` 与对应 MSI。这四组数字里，除了「支持的操作系统」属于相对稳定的机制性结论，其余都是会变的时效性数值（配置见 04-04 ｜ 原理见 06-12 ｜ 模块见 07-11）。
+
+第二个概念是版本来源与构建消费链。`version/version.go` 是版本的唯一来源，其中 `Number` 常量在快照里为 `1.1.1`，需对照实际版本核验。`Makefile` 第 6 行用 `sed` 从该文件抽取 `Number` 赋给 `VERSION`，第 10 行再把它拆成 `WIREGUARD_VERSION_ARRAY` 与 `WIREGUARD_VERSION_STR` 传给 `windres`；`build.bat` 第 33 至 35 行用 `findstr` 做同样的事并设置 `WIREGUARD_VERSION` 与 `WIREGUARD_VERSION_ARRAY`。运行侧，`version.UserAgent()` 被 `services.PrintStarting()` 用于日志首行，`updater/versions.go` 的 `versionNewerThanUs()` 把 `version.Number` 按点分段逐段用 `strconv.ParseUint` 比较，以判定清单里的 MSI 是否比当前版本更新。这条「常量 → 资源 → 运行日志 → 更新比较」的链条说明：版本号不是散落在各处的字符串，而是一个有单一来源、被多处消费的值；核验时应回到 `version/version.go`，而不是相信任何转述。
+
+第三个概念是「工具链版本」与「语言版本指令」的区分，这是最容易混淆的一处。`go.mod` 第 3 行写的是 `go 1.26.0`，它声明的是模块所使用的 Go 语言版本与语义，属于 `go` 指令；而 `Makefile` 与 `build.bat` 下载并放进 `PATH` 最前面的 `.deps/go` 是 Go 1.27.1 的实际编译器工具链。二者不相等并不矛盾，把 `go.mod` 的 `go 1.26.0` 当成「本仓库用 Go 1.26 编译」是典型误读。类似的还有 `go.mod` 里对 `github.com/lxn/walk` 与 `github.com/lxn/win` 的 `replace` 指令，它们被替换到 `golang.zx2c4.com/wireguard/windows` 的特定伪版本，说明 UI 依赖的是官方维护的分支；这些依赖版本同样属于需对照实际版本核验的时效性数值。
+
+第四个概念是生态边界分层。最内层是协议规范（WireGuard 的密码学构造，本仓库只遵守不实现）；往外一层是内核数据面 WireGuardNT（独立外部项目，本仓库只通过 `driver/` 调用其 DLL 导出函数）；再往外是本仓库自身，即 Windows 宿主集成层；与之并列的是工具层，即 wireguard-tools 提供的 `wg.exe`，`docs/buildrun.md` 第 86 行起说明它在 Windows 上可用但来自独立仓库，且 `build.bat` 第 23 行下载它时明确 `--exclude wg-quick`；再往外是分发层，包括 MSI、WiX 安装器、`DO_NOT_LAUNCH` 属性、更新链的 `list.sec` 与 `msiexec`；最外层是社区与第三方实现，它们不属于本仓库，也不属于官方推荐路径。另有一个容易忽略的边界：`embeddable-dll-service/` 是仓库内自带 README 的独立子项目，可用于把服务嵌入 DLL，但它不是主客户端的运行形态，不能据此把主仓库理解成通用 SDK。
+
+第五个概念是资料使用约定，包含四条。其一，唯一权威源：配置与命令认 04 全册，结构体逐字段认 05 全册，机制与调用链认 06 全册，模块能力与组网认 07 全册，其余只给最小必要并交叉引用。其二，三类骨架：A 论述型七节用于 01、06、07 等册，B 手册字典型用于 04、05，C 实战型用于 03 与部分 02、08 篇，手册不写「背景与动机」和调用链，实战必须给预期输出与判读。其三，交叉引用统一写作（字段见 05-02 ｜ 配置见 04-01 ｜ 原理见 06-01 ｜ 模块见 07-05）这样的格式。其四，示例与图示约定：代码块必须带语言标注，典型输出放 `text` 块并注明「示例输出，具体格式需对照实际版本核验」，图用 `:::figure` DSL 且图号与正文引用、图题同源，表格单元格不超过 90 字符且内部竖线转义。
+
+### 3. 关键数据结构与源码位置
+
+版本基准各项在快照中的值、是否为时效性数值、源码路径与核验方法见下表。
+
+| 基准项 | 快照中的值 | 时效性 | 源码路径 | 核验方法 |
+|---|---|---|---|---|
+| 仓库快照 | 2026-11 抓取的 master | 是 | `upstream_src/` 整个目录 | 对照手上仓库的提交时间 |
+| 客户端版本 | `Number = "1.1.1"` | 是 | `version/version.go` | 读取 `Number` 常量 |
+| 内核数据面 | WireGuardNT 1.1 | 是 | `Makefile`、`build.bat` 依赖段 | 查压缩包名与 SHA256 |
+| Go 工具链 | go1.27.1 | 是 | `Makefile` 第 30 行、`build.bat` 第 16 行 | 查下载文件名与 SHA256 |
+| Go 语言指令 | `go 1.26.0` | 是 | `go.mod` 第 3 行 | 与工具链版本分开记 |
+| 支持操作系统 | Windows 10、Server 2019 及以上 | 否 | `docs/buildrun.md` | 以官方文档为准 |
+| CPU 架构与产物 | amd64、x86、arm64 三种 MSI | 是 | `Makefile` 的 `all` 目标、`build.bat` | 查三架构产物名 |
+| 协议构造 | Noise_IKpsk2 等 | 否 | 外部规范，见 06-04 | 对照协议文档 |
+
+表中「时效性」一列为「是」的项目，任何写成绝对口吻的表述都应改成「需对照实际版本核验」。例如客户端版本 `1.1.1` 只是快照里的常量值，绝不等于「当前官方最新版」；`wireguard-nt-1.1.zip` 的 SHA256 `dceb30a9bc4be48cce0f74160fc88a585a2c2627366e8f846fc6658f9038dace` 与 Go 压缩包的 SHA256 `63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445` 都只是这次抓取对应的校验值，重新打包后就会变。可定位的源码路径分别是 `Makefile` 第 30、31 行与 `build.bat` 第 16、24 行。
+
+与版本、构建、分发相关的文件地图如下，读者核验时应优先打开这几个文件。
+
+```tree
+upstream_src/
+├── version/
+│   ├── version.go               Number 常量，版本唯一来源
+│   ├── official.go              官方构建判定
+│   ├── os.go                    操作系统信息
+│   ├── useragent.go             User-Agent 与日志首行
+│   └── certificate_test.go      证书相关测试
+├── go.mod                       语言版本指令与依赖
+├── go.mod.master                 remaster 目标的模板
+├── go.sum
+├── Makefile                     Linux 交叉构建、依赖下载与校验
+├── build.bat                    Windows 原生构建、依赖下载与校验
+├── resources.rc                 版本资源与图标
+├── manifest.xml
+├── updater/
+│   ├── versions.go              版本比较 versionNewerThanUs
+│   ├── constants.go
+│   ├── downloader.go            TLS 下载与进度
+│   ├── signify.go               Ed25519 签名校验
+│   └── msirunner.go             msiexec 执行
+├── installer/
+│   ├── wireguard.wxs            WiX 安装包定义
+│   ├── customactions.c
+│   └── build.bat
+├── quickinstall.bat             自制安装包脚本
+└── docs/
+    ├── buildrun.md              构建、本地化、签名、wg(8) 来源
+    ├── enterprise.md            企业部署、更新计划任务
+    └── attacksurface.md         更新链与权限模型
+```
+
+版本基准各要素与生态实体之间的关系如图 01-04-01 所示，虚线表示应当从本资料集中排除的第三方来源。
+
+:::figure id=01-04-01 | name=版本基准要素与生态边界分层 | dir=TD
+node v1 "WireGuard 协议规范" gray
+node v2 "WireGuardNT 1.1<br/>外部内核项目" red
+node v3 "Go 1.27.1 工具链<br/>依赖压缩包" amber
+node v4 "上游 master 快照<br/>2026-11 抓取" blue
+node v5 "三种架构 MSI<br/>amd64/x86/arm64" teal
+node v6 "wireguard-tools<br/>wg(8) 外部工具" purple
+node v7 "更新链 list.sec<br/>signify 与 BLAKE2b" green
+node v8 "社区与第三方<br/>非官方实现" gray
+node v9 "本资料集读者<br/>机制照抄数值核验" blue
+edge v1 -> v4 "规范约束"
+edge v2 -> v4 "数据面依赖"
+edge v3 -> v4 "构建依赖"
+edge v4 -> v5 "构建产物"
+edge v4 -> v6 "交互但不含源码"
+edge v5 -> v7 "版本清单"
+edge v7 -> v9 "更新与核验"
+edge v8 -> v9 dashed "需排除"
+edge v4 -> v9 "阅读对象"
+edge v6 -> v9 "运行时查询"
+:::
+
+图 01-04-01 把「本仓库」放在中心：它消费协议规范与两个外部依赖，产出三种架构的安装包，与 `wg(8)` 交互但不包含其源码，并把更新链作为分发层的信任根。读者位于最外侧，虚线提示社区与第三方实现不是本资料的依据。
+
+### 4. 关键流程与调用链
+
+第一条链是版本号的产生与消费，已在核心概念里点明，这里补上完整顺序：`version/version.go` 的 `Number` → `Makefile` 第 6 行 `sed` 抽取为 `VERSION` → 第 10 行 `RCFLAGS` 生成 `WIREGUARD_VERSION_ARRAY` 与 `WIREGUARD_VERSION_STR` → 第 49 至 56 行 `x86_64-w64-mingw32-windres`、`i686-w64-mingw32-windres`、`aarch64-w64-mingw32-windres` 分别把版本编入 `resources_amd64.syso`、`resources_386.syso`、`resources_arm64.syso` → `go build $(GOFLAGS)` 产出三架构 `wireguard.exe` → 运行时由 `version.UserAgent()` 进入日志首行，由 `versionNewerThanUs()` 参与更新判定。`build.bat` 走的是等价的 Windows 路线：第 33 行 `findstr` 抽 `Number`，第 35 行拆成 `WIREGUARD_VERSION_ARRAY`，再用 `:build_plat` 分别构建 x86、amd64 等平台（第 44 行起可见），第 40 至 43 行还处理 `GoGenerate=yes` 时的本地化生成。
+
+第二条链是构建依赖的获取与校验。`Makefile` 第 22 至 28 行定义 `download` 宏：`curl -L` 下载到 `.unverified`，`echo "$(3)  $$@.unverified" | sha256sum -c` 校验，`mv` 转正；第 30、31 行分别实例化 Go 与 WireGuardNT 两个压缩包，第 33 至 44 行把它们解到 `.deps/go` 与 `.deps/wireguard-nt` 并 `touch` 出 `prepared` 标记；第 46 至 47 行用 `convert` 把 SVG 图标转成 ico；第 49 至 56 行 `windres` 以 `-I .deps/wireguard-nt/bin/<arch>` 把对应架构的驱动资源编进 `.syso`。`GOFLAGS` 第 1 行里的 `-tags load_wgnt_from_rsrc` 正是「从资源加载 WireGuardNT DLL」的开关，`-ldflags="-H windowsgui -s -w"` 说明产物是 GUI 子系统程序，`-trimpath -buildvcs=false` 保证构建可复现。`build.bat` 第 16 至 24 行同样下载 Go、llvm-mingw、ImageMagick、make、wireguard-tools 与 WireGuardNT，其中 wireguard-tools 一项带 `--exclude wg-quick`，ImageMagick 与 make 也各有镜像与哈希。这两条链共同说明：本仓库不自带编译器，也不自带内核驱动，构建过程本身就是一次「外部依赖显式清单 + 哈希校验」的过程。
+
+第三条链是更新与分发的信任模型，`docs/attacksurface.md` 给出了服务端发布命令与客户端校验流程。服务端把 MSI 清单做 BLAKE2b-256 摘要并用 signify 私钥签名，客户端经 TLS 下载清单后验 Ed25519 签名，再找同架构更高版本的 MSI 下载到 `C:\Windows\Temp` 的随机文件名，验 BLAKE2b-256 后以 `msiexec.exe /qb!- /i` 执行。发布端的命令形态如下，属于服务端流程，不是客户端日常命令；其中文件名格式 `wireguard-${arch}-${version}.msi` 与下载 URL 均为需对照实际版本核验的时效性数值。
+
+```text
+b2sum -l 256 *.msi > list
+signify -S -e -s release.sec -m list
+upload ./list.sec
+```
+
+面向读者的核验动作整理成下表，建议在开始读源码或做构建之前先跑一遍，把「资料里的数」与「手上的数」对齐。
+
+| 核验目标 | 命令或动作 | 期望得到的信息 | 依据 |
+|---|---|---|---|
+| 客户端版本常量 | 读 `version/version.go` 的 `Number` | 当前快照的版本字符串 | `version/version.go` |
+| 工具链与内核版本 | 查 `Makefile` 第 30、31 行 | Go 与 WireGuardNT 压缩包名及 SHA256 | `Makefile` |
+| 语言版本指令 | 读 `go.mod` 第 3 行 | `go` 指令值，勿与工具链混淆 | `go.mod` |
+| 实际编译器 | `go version` | `.deps/go` 中的工具链版本 | `Makefile` 第 4 行 PATH |
+| 三架构产物 | 查 `Makefile` 的 `all` 目标 | amd64、x86、arm64 输出路径 | `Makefile` 第 20 行 |
+| 支持平台 | 读 `docs/buildrun.md` 构建段 | Windows 10 或 Server 2019 加 Git | `docs/buildrun.md` |
+| 更新与分发 | 读 `docs/attacksurface.md` 更新段 | 签名、哈希与 MSI 命名格式 | `docs/attacksurface.md` |
+
+### 5. 配置/命令/代码实例
+
+下面给出一条可直接执行的核验命令组，作用是把本篇提到的几类时效性数值一次性从源码里读出来。命令只用于核验，不构成配置或命令全集；完整的 `wireguard.exe` 开关见 04-04，`wg(8)` 子命令见 04-05。
+
+```powershell
+Select-String -Path version/version.go -Pattern 'Number'
+Select-String -Path Makefile -Pattern 'go1\.', 'wireguard-nt-1'
+Get-Content go.mod | Select-Object -First 3
+go version
+```
+
+以下为示例输出，具体格式需对照实际版本核验。
+
+```text
+version/version.go:9:    Number = "1.1.1"
+Makefile:30:            go1.27.1.linux-amd64.tar.gz  63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445
+Makefile:31:            wireguard-nt-1.1.zip  dceb30a9bc4be48cce0f74160fc88a585a2c2627366e8f846fc6658f9038dace
+go.mod:3:               go 1.26.0
+go version go1.27.1 windows/amd64
+```
+
+逐行判读如下。第一行 `Number = "1.1.1"` 是 `version/version.go` 里唯一的版本常量，也是 `Makefile` 的 `sed`、`build.bat` 的 `findstr`、`version.UserAgent()` 与 `updater/versions.go` 共同消费的源头；这里的 `1.1.1` 只是 2026 年 11 月快照里的值，读者手上的版本很可能不同，因此凡引用版本号都应回到这一行复核，绝不能把资料里的数字当成官方最新版。第二行给出 Linux 交叉构建所用的 Go 压缩包名与 64 位十六进制 SHA256，第三行给出 WireGuardNT 压缩包名与另一串 SHA256，两串哈希分别对应 `Makefile` 的 `download` 宏校验步骤，重新打包或换版本后必然改变；注意它们与 `build.bat` 第 16、24 行里的 Windows 侧下载是同一版本但不同压缩包，哈希也不同，不要交叉套用。第四行 `go 1.26.0` 是 `go.mod` 的 `go` 指令，声明模块采用的语言版本语义，不是编译器版本；把它和第五行 `go version go1.27.1` 放在一起看，正好印证本篇强调的「语言版本指令」与「工具链版本」之别。第五行的 `go1.27.1` 之所以生效，是因为 `Makefile` 第 4 行把 `.deps/go/bin` 放到了 `PATH` 最前面，`build.bat` 第 7 行也做了同样设置；若在系统里直接敲 `go version` 得到的是别的版本，说明当前 shell 没有加载项目自带的工具链，此时任何基于该工具链的构建结论都不可靠。最后，输出里完全没有 MSI 文件名、下载 URL 与更新清单内容，因为它们不在源码常量里，而是 `docs/attacksurface.md` 描述的发布期产物，文件名格式 `wireguard-${arch}-${version}.msi` 需对照实际版本核验。
+
+版本常量与版本比较的源码形态如下，第一段摘自 `version/version.go`，第二段摘自 `updater/versions.go` 的 `versionNewerThanUs()` 开头，可见更新判定直接以 `version.Number` 为基准按点分段比较。
+
+```go
+package version
+
+const (
+	Number = "1.1.1"
+)
+```
+
+```go
+func versionNewerThanUs(candidate string) (bool, error) {
+	candidateParts := strings.Split(candidate, ".")
+	ourParts := strings.Split(version.Number, ".")
+	if len(candidateParts) == 0 || len(ourParts) == 0 {
+		return false, errors.New("Empty version")
+	}
+	for i := range max(len(ourParts), len(candidateParts)) {
+```
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把快照值当成长期事实。`1.1.1`、`go1.27.1`、`wireguard-nt-1.1.zip`、两串 SHA256、以及 `docs/attacksurface.md` 里 `wireguard-${arch}-${version}.msi` 这样的文件名格式，全部属于时效性数值。资料里凡出现它们都带「需对照实际版本核验」的口径；读者引用时也应回到 `version/version.go`、`Makefile`、`build.bat` 现场核对。把快照版本写成「官方当前最新版」是最常见也最容易被时间证伪的错误。
+
+第二个陷阱是混淆 `go.mod` 的 `go 1.26.0` 与 `Makefile` 的 `go1.27.1`。前者是语言版本指令，后者是实际下载的编译器工具链；此外 `go.mod` 里还有对 `github.com/lxn/walk`、`github.com/lxn/win` 的 `replace` 伪版本与 `golang.org/x/*` 依赖版本，它们同样会随 upstream 更新。构建报错时先看是不是工具链没从 `.deps/go` 加载，而不是急着改 `go.mod`（原理见 02-04 ｜ 模块见 07-11）。
+
+第三个陷阱是把 WireGuardNT 当成仓库内的包。`upstream_src/` 里没有它的源码，只有 `driver/` 对 `wireguard.dll` 导出函数的封装与 `Makefile`/`build.bat` 里的压缩包下载；`-tags load_wgnt_from_rsrc` 与 `windres -I .deps/wireguard-nt/bin/<arch>` 说明驱动 DLL 是作为资源嵌进可执行文件的。把它当作可随意修改的 Go 包，会直接破坏对 01-01 能力边界的理解（模块见 07-03、07-04）。
+
+第四个陷阱是把 `wg(8)` 当成 `wireguard.exe` 的子命令，或把 `wg-quick` 当成 Windows 的组成部分。`docs/buildrun.md` 第 86 行起说明 `wg.exe` 来自 wireguard-tools 独立仓库，用 `PLATFORM=windows make -C wireguard-tools/src` 编译；`build.bat` 第 23 行下载该依赖时明确带 `--exclude wg-quick`。因此 `wg show` 能用，但 `wg-quick` 的 `iptables`、`%i`、`SaveConfig`、`resolvconf` 语义一概不适用；四个脚本键在 Windows 上还额外受 `DangerousScriptExecution` 策略控制，且用 `WIREGUARD_TUNNEL_NAME` 环境变量（配置见 04-02、04-05、04-07 ｜ 原理见 06-02）。
+
+第五个陷阱是把策略性、时效性内容当成默认行为。`HKLM\Software\WireGuard\LimitedOperatorUI` 与 `DangerousScriptExecution` 默认都不存在，`docs/adminregistry.md` 明确说它们「not recommended」「may also be removed at some point in the future」，卸载程序会清理整个 `HKLM\Software\WireGuard`。`DO_NOT_LAUNCH` 是 MSI 属性，`/update` 可由计划任务每日触发，`/removedriver` 仅在无适配器时使用——这些都是条件行为，不是开箱即用的默认值（配置见 04-07 ｜ 原理见 06-12）。
+
+第六个陷阱是引用不存在的源码路径。本套资料的源码引用一律以 `upstream_src/` 为根，例如 `conf/config.go`、`tunnel/service.go`、`manager/service.go`、`driver/configuration_windows.go`、`docs/attacksurface.md`。写到仓库里没有的文件，或把外部项目的文件当成 `upstream_src/` 下的文件，都会让「需对照实际版本核验」失去可定位性。总纲第 9 节列出的四类情形，是判断该不该加核验标注的准绳。
+
+最佳实践有五条。其一，先定版本再读源码：开工前跑一遍第 5 节的核验命令，把版本号、工具链、内核依赖记在手边。其二，机制照抄、数值核验：调用链、边界条件、分层结论可以按资料直接使用，具体数字一律现场复核。其三，交叉引用按（字段见 05-02 ｜ 配置见 04-01 ｜ 原理见 06-01 ｜ 模块见 07-05）的格式写，遇到配置、字段、机制、模块四类问题分别只去 04、05、06、07 找唯一权威源。其四，引用官方文档时给文件名与 `docs/` 路径，不引用未核验的第三方转述。其五，构建与分发前把 `Makefile`、`build.bat`、`docs/buildrun.md`、`docs/enterprise.md`、`docs/attacksurface.md` 对照读一遍，因为依赖下载、签名、MSI 属性与更新链这四件事恰好分散在这几处。
+
+### 7. 小结与延伸阅读
+
+本篇把 01 册的收尾落在三句话上。第一，版本基准是坐标系：以 2026 年 11 月抓取的 `upstream_src/` master 快照为第一手依据，以 WireGuardNT 1.1、Go 1.27.1、Windows 10 与 Server 2019 及以上、amd64/x86/arm64 三种 MSI 为基准要素，其中绝大多数数字是时效性数值，`version/version.go` 是版本的唯一来源。第二，生态边界是地图边界：协议规范、WireGuardNT 内核驱动、Go 工具链、wireguard-tools 的 `wg(8)`、MSI 与更新链、社区与第三方实现都与本仓库相邻但不等同于本仓库，本仓库只负责 Windows 宿主集成层，且不自带 `wg-quick` 语义。第三，资料使用约定是语法：唯一权威源、三类骨架、交叉引用格式、代码块与图表规则、以及「示例输出，具体格式需对照实际版本核验」这一标注习惯，共同保证九个分册在未来版本下仍能被一致地编译与校验。
+
+延伸阅读建议从「构建与版本」这条线切入。`upstream_src/Makefile` 全文只有百余行，却浓缩了依赖下载与 SHA256 校验、`GOFLAGS`、`windres` 三架构资源、`all`/`deploy`/`remaster`/`fmt`/`generate`/`crowdin`/`clean`/`distclean` 全部目标，是理解版本基准最值得精读的文件；`upstream_src/build.bat` 给出 Windows 原生路线与 `GoGenerate`、`findstr` 抽版本、`:build_plat` 三架构构建；`upstream_src/version/` 下的 `version.go`、`official.go`、`os.go`、`useragent.go` 说明版本与官方构建判定如何进入运行时；`upstream_src/updater/` 下的 `versions.go`、`downloader.go`、`signify.go`、`msirunner.go` 对应更新链；`upstream_src/docs/buildrun.md` 说明构建环境、本地化、签名与 `wg(8)` 来源；`upstream_src/docs/enterprise.md` 说明 MSI 分发、`DO_NOT_LAUNCH`、计划任务与 `/removedriver`；`upstream_src/docs/attacksurface.md` 说明更新链的信任模型与四组件权限；`upstream_src/installer/wireguard.wxs` 与 `quickinstall.bat` 说明安装包形态。本套资料内，02 全册把本篇的构建链展开成可操作的编译步骤，06-12 讲更新链与签名校验，07-11 讲 `updater` 与 `version` 模块，08-06 把版本核验写进上线 checklist；而 01-01 的能力边界、01-02 的架构对比、01-03 的四层结构，都应在本篇约定的版本口径下阅读（字段见 05-02 ｜ 配置见 04-01 ｜ 原理见 06-01 ｜ 模块见 07-05）。
+
+

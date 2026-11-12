@@ -1,0 +1,893 @@
+# wireguard-windows 技术资料 · 03 部署与环境配置
+
+## 03-01 单机安装与首个隧道上线
+
+### 1. 目标与拓扑
+
+本篇的目标是在一台干净的 Windows 主机上，把 wireguard-windows 从「一个安装包」变成「一条真正承载流量的隧道」。这是整套资料阅读主线里「先跑起来」的落点：01 册讲清楚它是什么，02 册讲清楚它怎么被编译出来，而 03 册从这里开始讲它在目标机器上如何被安放、如何被拉起、如何被验证、如何被回收。必须先把一个观念立住——安装成功的判据绝不是安装程序返回零退出码，也不是托盘图标出现，而是隧道服务成功创建了 WireGuardNT 适配器、`wg show` 能看到接口与 peer、握手时间落在合理区间、并且传输字节计数随着实际流量持续增长。把判据定在数据面而不是安装界面，是后面所有运维动作的共同前提。
+
+从拓扑上看，一次单机上线牵动的是「控制面」与「数据面」两条线。控制面由三个用户态部分加一个内核部分组成：`docs/attacksurface.md` 明确 wireguard-windows 由「一个内核驱动加三个相互协作的用户态部分」构成，三者分别是 UI、Manager 服务、以及每条隧道各自独立的 Tunnel 服务。安装器把 `wireguard.exe` 及其内嵌资源安放到 `%ProgramFiles%\WireGuard`，并按 `conf/path_windows.go` 中 `RootDirectory(true)` 的逻辑创建 `Data` 目录，再由 `tunnelConfigurationsDirectory()` 在其下拼出 `Configurations` 子目录作为配置安全存储区。用户导入一份 `.conf` 之后，Manager 服务把它转换成 `.conf.dpapi` 并删除明文；点击激活时，`manager/install.go` 的 `InstallTunnel()` 注册出名为 `WireGuardTunnel$<name>` 的服务，该服务进程以 `/tunnelservice` 参数运行 `tunnel.Run()`，通过 IOCTL 把配置下发给内核里的 WireGuardNT，由驱动动态创建适配器。数据面上，握手与加密封装由外部的 WireGuardNT 内核驱动完成，本仓库只负责配置下发与网络配置，二者的分界在 06 册展开。
+
+需要反复强调能力边界：本仓库是 WireGuard 官方 **Windows 客户端**，不是 Linux 内核实现、不是 wireguard-go 用户态数据面、也不是服务端发行版。因此 Linux `wg-quick` 的 `iptables`、`%i`、`SaveConfig`、`resolvconf` 语义在 Windows 客户端上并不成立；脚本钩子 `PreUp`/`PostUp`/`PreDown`/`PostDown` 默认不执行，只有设置了 `DangerousScriptExecution` 才生效，而且 Windows 用的是环境变量 `WIREGUARD_TUNNEL_NAME` 而非 `%i`（见 `docs/adminregistry.md` 与 `tunnel/scriptrunner.go`）。本册按去重铁律只给让隧道上线的最小必要配置，配置键全集不在这里罗列（字段见 05-02 ｜ 配置见 04-01、04-02、04-03 ｜ 原理见 06-01、06-05 ｜ 模块见 07-01、07-05）。凡涉及具体 MSI 文件名、版本号、下载路径这类时效性数值，一律写「需对照实际版本核验」，读者应对照手上的 `upstream_src/` 快照复核。
+
+下面用一张图把「安装器 → 文件与目录 → Manager 服务 → 配置加密 → 隧道服务 → 适配器」这条上线主链串起来，后续每一节的操作都对应图中的一段。
+
+:::figure id=03-01-01 | name=单机安装与首个隧道上线流程 | dir=TD
+node a "运行安装器<br/>选择架构 MSI" blue
+node b "校验签名<br/>msiexec /i" teal
+node c "落地文件与驱动<br/>创建 Data 目录" teal
+node d "启动 Manager<br/>WireGuardManager" amber
+node e "UI 导入 .conf" purple
+node f "转换为<br/>.conf.dpapi" purple
+node g "创建隧道服务<br/>WireGuardTunnel$name" green
+node h "WireGuardNT<br/>适配器上线" green
+edge a -> b "选型"
+edge b -> c "安装"
+edge c -> d "注册并启动"
+edge d -> e "托盘 UI"
+edge e -> f "加密存储"
+edge f -> g "注册服务"
+edge g -> h "IOCTL 下发"
+:::
+
+图 03-01-01 描述的链路中，最容易让初学者误解的是「导入配置」与「激活隧道」是两个独立动作：导入只触发配置加密与落盘，激活才创建并启动隧道服务。二者解耦的设计，正是 03-03 能够把隧道服务独立部署、03-04 能够单独讨论配置安全存储的原因。
+
+### 2. 前置条件与环境
+
+动手之前先把环境约束逐条对齐，可以省掉后面大半的排错时间。第一是操作系统与架构：`docs/enterprise.md` 与总纲给出的版本基准是 Windows 10 及以上、含 Windows Server 2019，官方提供 amd64、x86、arm64 三种 MSI。这里有一条硬约束来自 `main.go` 的 `checkForWow64()`：它调用 `IsWow64Process2`（在不支持时回退到 `IsWow64Process`）判断当前进程是否运行在 WOW64 兼容层，一旦判定为「非原生」，直接 `fatalf("You must use the native version of WireGuard on this computer.")` 退出。也就是说，64 位系统必须装 64 位 MSI，arm64 设备必须装 arm64 MSI，拿 x86 包凑合会被进程入口拦下，而不是等到驱动阶段才报含糊的错误。具体 MSI 文件名形如 `wireguard-${arch}-${version}.msi`，属时效性数值，需对照实际版本核验（见 `docs/attacksurface.md` 与 `upstream_src/installer/`）。
+
+第二是权限。`main.go` 的 `checkForAdminGroup()` 通过 `elevate.TokenIsElevatedOrElevatable()` 判断令牌是否属于内置 Administrators 组，注释里特意说明「这不是安全检查，而是避免用户困惑的检查」；`checkForAdminDesktop()` 进一步要求 UI 只能从 Administrators 组的桌面访问。安装器、服务的创建与删除、以及向 `%ProgramFiles%` 写配置，都要求管理员权限或 Local System 身份。普通标准用户即便能双击安装程序，也会在提权环节被系统拦住。第三是网络可达性：本机的 WireGuard 监听端口与到对端 `Endpoint` 的 UDP 通路必须打通，防火墙、NAT、对端 `AllowedIPs` 三者要一致，否则安装再顺利也只会出现「服务在跑、握手不来」的假上线。第四是配置：手里至少要有一份最小可用的 `.conf`，其隧道名要能通过 `conf/name.go` 的 `TunnelNameIsValid()` 校验。
+
+下表把上线前必须核对的检查项、判定方式与不满足时的典型现象列在一起，便于逐项打勾。表中命令属运维命令族，完整清单见 04-06。
+
+| 检查项 | 判定方式 | 不满足时的典型现象 |
+|---|---|---|
+| 操作系统版本 | Windows 10 / Server 2019 及以上 | 安装器拒绝运行或驱动无法加载 |
+| 安装包架构 | 与 CPU 原生架构一致 | 入口报 native version 要求 |
+| 当前权限 | 内置 Administrators 组、提升令牌 | 提权失败或无法写 Program Files |
+| 配置目录可写 | `Configurations` 存在且可复制 | 导入后明文不消失、无 dpapi 文件 |
+| 隧道名合法 | 匹配 `^[a-zA-Z0-9_=+.-]{1,32}$` | 服务创建失败、报 Tunnel name is not valid |
+| 到对端 UDP 可达 | Endpoint 主机与端口可通 | 服务运行但无 latest handshake |
+
+关于版本基准还要补一句方法论：本册以本地 `upstream_src/` 中的 master 快照为第一手依据，以 `docs/` 下官方文档为第二手依据。凡快照里不存在、其他平台却存在的配置键，凡 `main.go` 的 `usage()` 未列出的开关，以及属于 WireGuardNT 外部项目的内核实现细节，都不凭印象补全，而是标注「需对照实际版本核验」并给出可定位的源码路径。这不是内容缺口，而是把版本相关事实与机制性结论分开的编辑约定。
+
+### 3. 分步操作
+
+第一步，取得并运行安装器。`docs/enterprise.md` 说明面向个人用户的 `wireguard-installer.exe` 只做三件事：按架构挑选正确的 MSI、校验签名、执行它；企业管理员则可以直接下载对应架构的 MSI 用组策略分发，后者留到 03-02 与 03-05 讲。单机场景下双击安装器即可，安装器是 MSI 的标准前端，安装行为可被 `msiexec` 日志完整记录。若从命令行发起，可用提升后的 PowerShell 执行 `Start-Process` 并等待返回，同时用 `/l*v` 让 MSI 写出详细日志，便于安装失败时反查自定义动作。
+
+第二步，理解「无参数启动」这条隐含链路。`main.go` 的 `main()` 在 `len(os.Args) <= 1` 时先调 `ui.RaiseUI()` 尝试唤起已经运行的 UI；若 Manager 服务尚未运行，则依次 `checkForAdminGroup()`、`execElevatedManagerServiceInstaller()`，后者通过 `elevate.ShellExecute(path, "/installmanagerservice", "", windows.SW_SHOW)` 以提权方式触发管理服务安装。换句话说，第一次双击图标不只是「打开窗口」，它顺带把 `WireGuardManager` 服务装上并拉起，随后等待托盘图标出现；`main.go` 在 `/installmanagerservice` 分支里还会 `time.Sleep(30 * time.Second)`，超时则 `fatalf("WireGuard system tray icon did not appear after 30 seconds.")`。这一步解释了为什么单机安装看起来「只是点了一下」，背后却已经完成了一次服务注册。
+
+第三步，导入配置。可以在 UI 里用「导入隧道」选择 `.conf`，也可以按 `docs/enterprise.md` 给出的编程方式，直接把 `.conf` 复制进 `%ProgramFiles%\WireGuard\Data\Configurations\`。后者正是 03-04 与 03-05 批量下发的基础：Manager 服务监视该目录新增的 `.conf`，用 `CryptProtectData(bytes, "myconfname")` 加密成 `.conf.dpapi` 后删除明文。下面给出让一条隧道上线的最小必要配置，只保留地址、本端私钥、对端公钥、路由范围与端点；完整的配置键、脚本钩子与 DNS 语义见 04-01、04-02、04-03，字段结构见 05-02。
+
+```conf
+[Interface]
+PrivateKey = 4JgQnZ9fK3sBvXpLmRtYcE1wAqU7hD2oP6sN0iHkJlM=
+Address = 10.0.0.2/32
+
+[Peer]
+PublicKey = 8HbTqW2eR5yUiO0pAsDfGhJkLzXcVbNmQ1wE4rT6yUiK=
+AllowedIPs = 10.0.0.1/32
+Endpoint = 203.0.113.1:51820
+```
+
+上面的 `Address` 与 `AllowedIPs` 只覆盖单机互联的最小网段，`Endpoint` 用文档保留网段举例，实际部署需替换为真实对端地址；这些都是示例值，具体取值需对照实际版本与现场网络核验。注意配置里没有出现任何 `PostUp`/`PreUp` 脚本键——因为脚本默认不执行，把它们写进来只会让读者误以为会生效。
+
+第四步，激活隧道并观察服务落地。在 UI 里点击「激活」，等价于走 `manager/install.go` 的 `InstallTunnel()`：`NameFromPath()` 从文件名解析隧道名，`ServiceNameOfTunnel()` 拼出 `WireGuardTunnel$<name>`，`CreateService()` 以 `/tunnelservice <configPath>` 为命令行参数注册服务，`service.Start()` 启动它，并 `go trackTunnelService(name, service)` 开始状态跟踪。服务进程运行 `tunnel.Run()`，由它加载 WireGuardNT、创建适配器、下发地址与路由。第五步，把日志留档：`wireguard /dumplog` 会把共享环形日志导出到标准输出，重定向到文件即可作为上线证据；`wireguard /dumplog /tail` 则持续跟踪，适合交给日志采集端。相关命令族见 04-04、04-06，日志实现见 `ringlogger/dump.go` 与 `conf/path_windows.go` 的 `LogFile()`。
+
+下面是这一阶段常用命令的集中示例，注意每条都带完整参数，不含省略写法。
+
+```powershell
+Start-Process .\wireguard-installer.exe -Verb RunAs -Wait
+New-Item -ItemType Directory -Force C:\Temp | Out-Null
+Copy-Item .\office.conf "C:\Program Files\WireGuard\Data\Configurations\office.conf"
+Get-ChildItem "C:\Program Files\WireGuard\Data\Configurations\"
+& "C:\Program Files\WireGuard\wireguard.exe" /dumplog > C:\Temp\wg-boot.txt
+Get-Content C:\Temp\wg-boot.txt -Tail 40
+```
+
+### 4. 验证方法与预期结果
+
+验证要分层做：先看配置是否落盘，再看服务是否存在，最后看数据面是否握手并有流量。配置落盘用上面的 `Get-ChildItem` 即可，正常结果应当只看到 `office.conf.dpapi` 而看不到 `office.conf` 明文；服务存在可用 `sc query` 或 `Get-Service` 查 `WireGuardManager` 与 `WireGuardTunnel$office`（字段见 05-08 ｜ 配置见 04-06 ｜ 原理见 06-10 ｜ 模块见 07-08）；数据面判读则靠 `wg show`。下面给出 `wg show myconfname` 的典型输出，示例输出，具体格式需对照实际版本核验，其样式取自 `docs/enterprise.md` 的真实样例。
+
+```text
+interface: myconfname
+  public key: lfTRXEWxt8mZc8cjSvOWN3tqnTpWw4v2Eg3qF6WTklw=
+  private key: (hidden)
+  listening port: 53488
+
+peer: JRI8Xc0zKP9kXk8qP84NdUQA04h6DLfFbwJn4g+/PFs=
+  endpoint: 163.172.161.0:12912
+  allowed ips: 0.0.0.0/0
+  latest handshake: 3 seconds ago
+  transfer: 6.55 KiB received, 4.13 KiB sent
+```
+
+逐行判读如下。第一行 `interface: myconfname` 说明内核里确实存在以该隧道名命名的 WireGuardNT 适配器，若这行缺失，说明服务虽起但适配器没建起来，问题多半在驱动加载或配置下发阶段而不是安装阶段。第二行 `public key` 是由本端 `PrivateKey` 派生出的公钥，可用于与对端配置里登记的公钥比对，二者不一致时握手必然失败；第三行 `private key: (hidden)` 是 `wg(8)` 对私钥的默认遮蔽，属正常表现，不代表私钥没配置。`listening port: 53488` 是本端 UDP 监听端口，未显式配置 `ListenPort` 时由系统随机分配，每次重启隧道可能变化，这属于正常值范围，不是异常。`peer:` 行的长串是配置里 `PublicKey` 的回显，用来确认下发的是预期的那一个 peer；`endpoint: 163.172.161.0:12912` 是当前解析并正在通信的对端地址端口，若这里为空或与预期不符，优先查 DNS 解析与 `Endpoint` 拼写。`allowed ips: 0.0.0.0/0` 表示该 peer 承载全流量，样例里触发了 kill-switch 条件，实际单网段互联时通常是一段具体前缀，其汇总去重与路由下发见 06-06。`latest handshake: 3 seconds ago` 是最关键的活性证据，数值为几秒到几十秒说明握手新鲜；长时间显示 `（none）` 或分钟级以上， almost 一定是密钥、端点或防火墙不通。`transfer: 6.55 KiB received, 4.13 KiB sent` 双向计数都在增长才说明数据面真的通了，只有发送没有接收通常是对端没回包或 `AllowedIPs` 不对。综合看，判据是「接口存在、公钥匹配、握手新鲜、双向计数递增」四条同时成立。
+
+下面用一张图把 `wg show` 各字段的判读顺序与主动探测动作组织起来。
+
+:::figure id=03-01-02 | name=首个隧道的验证判读链路 | dir=TD
+node a "执行 wg show<br/>读取接口" blue
+node b "interface 段<br/>公钥与端口" teal
+node c "peer 段<br/>端点与 allowed ips" teal
+node d "latest handshake" amber
+node e "transfer 计数" amber
+node f "ping 隧道内地址" green
+node g "判定上线成功" purple
+edge a -> b "读取"
+edge a -> c "读取"
+edge c -> d "握手时效"
+edge d -> e "流量递增"
+edge e -> f "主动探测"
+edge f -> g "综合判读"
+:::
+
+图 03-01-02 中 `ping 隧道内地址` 是补充手段而非替代手段：握手新鲜已能证明控制面通，`ping` 用来进一步确认 `AllowedIPs` 路由确实指向隧道接口。下表把验证项、命令、预期结果和判读要点并排列出，便于做成上线检查单。
+
+| 验证项 | 命令 | 预期结果与判读要点 |
+|---|---|---|
+| 配置密文落盘 | `Get-ChildItem` 查 `Configurations` 目录 | 只见 `.conf.dpapi`，明文已删除 |
+| Manager 服务 | `sc query WireGuardManager` | STATE 为 RUNNING，开机自启 |
+| 隧道服务 | `sc query WireGuardTunnel$office` | STATE 为 RUNNING，服务名含 `$` 需引号 |
+| 接口与握手 | `wg show office` | 有 interface、握手新鲜、双向计数 |
+| 隧道内连通 | `ping 10.0.0.1` | 有回包且走隧道接口 |
+| 日志证据 | `wireguard /dumplog` | 有适配器创建与配置下发记录 |
+
+### 5. 常见失败与排错
+
+第一类失败发生在入口阶段。`checkForWow64()` 报「must use the native version」是架构选错，换对应架构 MSI 即可，不要在 64 位系统上强行装 x86 包；`checkForAdminGroup()` 相关报错说明当前不是提升令牌，需用管理员身份重新发起。第二类失败发生在配置阶段：`conf/name.go` 的 `TunnelNameIsValid()` 用正则 `^[a-zA-Z0-9_=+.-]{1,32}$` 限定隧道名，并额外拒绝 `CON`、`PRN`、`NUL`、`COM1` 等 Windows 保留名以及 `$`、斜杠、冒号等特殊字符，因为这些字符会污染服务名 `WireGuardTunnel$<name>` 与 `netsh` 接口名；文件名里带空格或中文、以点开头或结尾，都会让 `NameFromPath()` 直接返回错误，表现为导入后不生成服务。`serviceNameForbidden = "$"` 这条尤其要注意：隧道名本身不能含 `$`，服务名里的 `$` 是 `ServiceNameOfTunnel()` 自动加的分隔符。
+
+第三类失败是「服务在跑、握手不来」。这类问题与安装无关，排查顺序应是：先用 `wg show` 确认公钥与对端登记一致，再确认 `Endpoint` 的 UDP 可达、本机防火墙未拦截、对端 `AllowedIPs` 包含本端地址，最后看 `latest handshake` 是否刷新。若 `latest handshake` 始终为空而 `transfer` 的 sent 缓慢增长，多半是发出握手包但收不到回应。第四类失败是配置导入没有触发加密：目录路径写错、复制到错误的 `Data` 层级、或文件正被占用导致 `conf/migration_windows.go` 中 `migrateUnencryptedConfigs()` 因 `ERROR_SHARING_VIOLATION` 反复重试而迟迟不落地，都会表现为明文 `.conf` 长时间不消失；此时用 `wireguard /dumplog /tail` 观察 `Unable to ingest and encrypt` 一类日志即可定位，其机制见 06-03。
+
+下表按现象给出根因与排查动作，命令细节见 04-08 的排错速查。
+
+| 现象 | 可能根因 | 排查动作 |
+|---|---|---|
+| 提示必须用原生版本 | WOW64 架构不匹配 | 换与 CPU 一致的 MSI 重装 |
+| 导入后无服务 | 隧道名非法或后缀不对 | 校验文件名与 `.conf` 后缀 |
+| 明文 `.conf` 不消失 | 文件被占用或目录写错 | 看 `/dumplog /tail` 迁移日志 |
+| 无 latest handshake | 密钥、端点或防火墙不通 | 逐项比对公钥与 UDP 可达性 |
+| 只有 sent 无 received | 对端 AllowedIPs 或回程路由 | 核对对端路由与本机路由表 |
+| 脚本钩子不生效 | 默认关闭脚本执行 | 查 `DangerousScriptExecution` 策略 |
+
+最后再提示一个高频误解：有人照搬 Linux `wg-quick` 的配置，在 `[Interface]` 里写 `PostUp` 去调用 `iptables` 或使用 `%i` 引用接口名，期望它在 Windows 上自动执行路由或防火墙动作。这在 wireguard-windows 上不成立——`tunnel/scriptrunner.go` 的 `runScriptCommand()` 在 `!conf.AdminBool("DangerousScriptExecution")` 时直接打印 `Skipping execution of script, because dangerous script execution is safely disabled` 并返回，且执行时设置的是 `WIREGUARD_TUNNEL_NAME` 环境变量而非 `%i`。把它当成 Windows 客户端能力会直接导致「配置看着对、动作不发生」的困惑，注册表策略的完整语义见 04-07，攻击面分析见 08-05。
+
+### 6. 小结
+
+本篇把单机从零到首条隧道上线的链路走了一遍：安装器选架构 MSI 并校验签名 → `RootDirectory(true)` 建立数据目录 → 无参数启动触发 `/installmanagerservice` 装起 `WireGuardManager` → 导入 `.conf` 被转换为 `.conf.dpapi` → 激活时 `InstallTunnel()` 注册 `WireGuardTunnel$<name>` 并运行 `tunnel.Run()` → WireGuardNT 创建适配器。验证的落脚点始终是 `wg show` 里的接口、公钥、握手与双向计数，而不是安装界面。与之相关的源码分布在 `main.go`（`usage()`、`main()` 的 switch、`checkForWow64()`、`checkForAdminGroup()`）、`manager/install.go`（`InstallManager()`、`InstallTunnel()`）、`conf/store.go`（`Save()`、`LoadFromName()`）、`conf/migration_windows.go`（`MigrateUnencryptedConfigs()`）、`conf/name.go`（`TunnelNameIsValid()`、`ServiceNameOfTunnel()`）与 `docs/enterprise.md`、`docs/attacksurface.md`。字段结构见 05-02，配置键全集见 04-01、04-02、04-03，入口分派与适配器创建机制见 06-01、06-05，Manager 与 tunnel 模块见 07-08、07-05。下一篇转向无人值守场景，把「点一下」换成 `msiexec` 与 `DO_NOT_LAUNCH`，并单独验证管理服务（配置见 04-04、04-06 ｜ 字段见 05-08 ｜ 原理见 06-10 ｜ 模块见 07-08）。
+
+## 03-02 命令行静默安装：MSI、DO_NOT_LAUNCH 与管理服务
+
+### 1. 目标与拓扑
+
+03-01 走的是「有人坐在机器前双击」的交互路径，而真实的企业桌面、服务器与云主机场景里，安装往往是无人值守的：由配置管理工具、登录脚本或镜像制作流程发起，不允许弹窗、不允许等待用户点「下一步」、更不允许安装完自动蹦出一个托盘界面把自动化流程卡住。本篇的目标就是把 03-01 那条隐含链路拆开，用纯命令行完成一次可重复、可审计的静默安装：先由 `msiexec` 把 MSI 静默装到目标机，再用 `DO_NOT_LAUNCH` 属性抑制安装后的自动启动，最后显式调用 `wireguard /installmanagerservice` 把 Manager 服务注册为开机自启，并用日志重定向留下证据。
+
+拆开看，这里有三条彼此独立又能组合的链路。第一条是 MSI 安装链：`docs/enterprise.md` 明确企业管理员可以绕过 `wireguard-installer.exe`，直接下载对应架构的 MSI 并用组策略等标准手段分发，安装包使用标准 MSI 特性，易于自动化；还额外提供 `DO_NOT_LAUNCH` 属性来抑制安装后启动。第二条是自动启动抑制链：在 `installer/wireguard.wxs` 里，两个自定义动作都带 `NOT DO_NOT_LAUNCH` 条件，属性置位后 `LaunchApplication` 与 `LaunchApplicationAndAbort` 都不执行，于是装完不会拉起 UI。第三条是管理服务安装链：`wireguard /installmanagerservice` 经 `main.go` 的 switch 分派到 `manager.InstallManager()`，由它创建 `WireGuardManager` 服务并以 `/managerservice` 参数启动。把三者分开的价值在于：无人值守场景可以只装文件、不装 UI、把「何时弹界面」的决定权完全交给管理员；而 03-03 更进一步，连 Manager 服务都可以不要，只部署单条隧道服务。
+
+拓扑上，静默安装后的目标机状态与 03-01 的差别在于「进程是否立刻出现」：MSI 把 `wireguard.exe`、驱动资源与 `Data` 目录安放好，`DO_NOT_LAUNCH` 让安装序列跳过启动动作，`/installmanagerservice` 再单独把 Manager 服务注册为 `StartAutomatic`。此时内核驱动已就位、配置目录已建好、服务已开机自启，但当前会话里可能没有任何 UI 进程——这正是无人值守想要的稳定态。下图把这段条件抑制与补装链画出来。
+
+:::figure id=03-02-01 | name=MSI 静默安装与 DO_NOT_LAUNCH 抑制链 | dir=TD
+node a "msiexec /i<br/>wireguard-arch.msi" blue
+node b "DO_NOT_LAUNCH=1" amber
+node c "wxs 条件<br/>NOT DO_NOT_LAUNCH" gray
+node d "LaunchApplication<br/>被抑制" red
+node e "/installmanagerservice" teal
+node f "InstallManager()<br/>创建并启动" purple
+node g "WireGuardManager<br/>开机自启" green
+edge a -> b "传入属性"
+edge b -> c "条件求值为假"
+edge c -> d "跳过启动"
+edge a -> e "命令行补装"
+edge e -> f "main.go switch"
+edge f -> g "服务运行"
+edge d -> g dashed "不弹 UI"
+:::
+
+图 03-02-01 里那条虚线表达的是「被抑制的启动动作与最终服务态并不冲突」：不弹 UI 只是不拉起用户会话里的界面进程，Manager 服务本身仍可由命令行独立装好并运行。理解这一点，才能解释为什么静默装完 `sc query` 能看到服务、桌面却没有托盘图标。本册继续遵守去重铁律，只给本场景最小必要的命令与配置，开关全集见 04-04，服务命令见 04-06，注册表策略见 04-07（字段见 05-08 ｜ 配置见 04-04、04-06 ｜ 原理见 06-01、06-10 ｜ 模块见 07-08）。
+
+### 2. 前置条件与环境
+
+第一是拿到正确的 MSI。与 03-01 相同，架构必须与目标机原生架构一致，否则 `main.go` 的 `checkForWow64()` 会在进程入口终止；`docs/attacksurface.md` 给出的更新链里 MSI 文件名形如 `wireguard-${arch}-${version}.msi`，其中 `${arch}` 取 amd64、x86、arm64 之一，`${version}` 为版本号，这些属时效性数值，需对照实际版本核验（见 `upstream_src/version/version.go` 与 `upstream_src/installer/`）。企业分发时建议把 MSI 放在域内只读共享上，并预先校验签名，避免把未经校验的包推到全网。
+
+第二是执行身份与日志路径。`msiexec /i` 需要本地管理员权限；`wireguard /installmanagerservice` 通过 `elevate.ShellExecute` 提权，同样要求内置 Administrators 组。`main.go` 的 `setLogFile()` 决定日志去向：它先取 `STD_ERROR_HANDLE`，取不到再退到 `STD_OUTPUT_HANDLE`，两者都没有时 `log.SetOutput(io.Discard)`，此时 `fatal()` 会改用 `windows.MessageBox` 弹错误框。这个细节对静默部署非常关键——若不显式重定向 stderr/stdout，错误信息可能以弹窗形式出现并把自动化挂住；因此务必给命令接上 `2>` 或 `/l*v` 日志。第三是理解 MSI 属性的作用域：`DO_NOT_LAUNCH` 是附加的公有属性，只在本次安装序列里生效，合理写法是放在 `msiexec` 命令行末尾；它不是注册表策略，也不会持久改变系统。
+
+下表把静默安装涉及的属性、动作与预期行为对齐。表中涉及的服务与命令语义，完整清单见 04-04 与 04-06。
+
+| 项目 | 位置或写法 | 静默安装下的预期行为 |
+|---|---|---|
+| MSI 主安装 | `msiexec /i <包> /quiet` | 无交互界面、写文件与驱动 |
+| `DO_NOT_LAUNCH` | MSI 公有属性，命令行传入 | 抑制安装后启动 UI 的动作 |
+| `LaunchApplication` | `wireguard.wxs` Before InstallFinalize | 条件为假，不执行 |
+| `LaunchApplicationAndAbort` | `wireguard.wxs` After CostFinalize | 条件为假，不执行 |
+| 管理服务 | `wireguard /installmanagerservice` | 注册并启动 WireGuardManager |
+| 日志重定向 | `2>` 或 `/l*v` 文件 | 错误与进度落盘、不弹窗 |
+
+还要把「静默」与「无 UI 能力」区分开。`DO_NOT_LAUNCH` 只抑制安装序列末尾那一次启动，并不禁用 UI 功能；此后管理员在会话里运行无参数 `wireguard.exe`，仍会按 `main.go` 的 `ui.RaiseUI()` 逻辑唤起界面。如果目标是连 UI 都不提供，应该配合 03-05 的 `LimitedOperatorUI` 或干脆不装 Manager 服务、只按 03-03 部署隧道服务。把属性误当成「永久关闭图形界面」是这一篇最常见的认知偏差。
+
+### 3. 分步操作
+
+第一步，执行静默安装并留日志。标准写法是把 MSI 属性、静默级别与日志路径一次给全：`/quiet` 抑制安装界面，`/norestart` 避免自动重启打断后续步骤，`/l*v` 输出详细 MSI 日志，`DO_NOT_LAUNCH=1` 抑制装完启动。`DO_NOT_LAUNCH` 的具体大小写与取值在不同打包习惯下可能不同，需对照实际版本核验；其判定逻辑见 `installer/wireguard.wxs` 中两处 `NOT DO_NOT_LAUNCH` 条件。文件名里的版本部分同样需对照实际版本核验。
+
+```powershell
+msiexec /i \\filesrv\wg\wireguard-amd64-0.5.3.msi /quiet /norestart /l*v C:\Temp\wg-msi.log DO_NOT_LAUNCH=1
+if ($LASTEXITCODE -ne 0) { throw "MSI 安装失败，请检查 C:\Temp\wg-msi.log" }
+Get-Content C:\Temp\wg-msi.log -Tail 30
+```
+
+第二步，核对抑制动作确实生效。`installer/wireguard.wxs` 里 `LaunchApplicationAndAbort` 的条件是 `ProductState=5 AND NOT REMOVE AND NOT DO_NOT_LAUNCH`（挂在 `CostFinalize` 之后），`LaunchApplication` 的条件是 `(&WireGuardFeature = 3) AND NOT DO_NOT_LAUNCH`（挂在 `InstallFinalize` 之前，且 `Impersonate="no"`、`Return="asyncNoWait"`）。属性置位后两处条件都为假，安装序列不会拉起 `wireguard.exe`。同时 `wxs` 里还有 `EvaluateWireGuardServices`（`After="FindRelatedProducts"`）、`KillWireGuardProcesses`（`After="StopServices"`）、`RemoveConfigFolder`（`After="DeleteServices"`）、`RemoveAdapters`（`Before="RemoveFiles"`）等动作，分别负责升级时评估已有服务、清理残留进程、卸载时清理配置目录与适配器；这些在 03-06 的卸载与升级里还会细讲。若日志里出现 `LaunchApplication` 相关行，说明属性没传进去，需要回到第一步检查命令行。
+
+第三步，显式安装 Manager 服务。执行 `wireguard /installmanagerservice`，`main.go` 的 `case "/installmanagerservice"` 校验 `len(os.Args) == 2` 后，先 `go ui.WaitForRaiseUIThenQuit()` 等待可能的 UI 唤起，再调 `manager.InstallManager()`。`InstallManager()` 的流程见 `manager/install.go`：`serviceManager()` 连接 SCM，`os.Executable()` 取自身路径，`m.OpenService("WireGuardManager")` 检查同名服务，若已存在且处于非停止态则返回 `ErrManagerAlreadyRunning`；若已存在但已停止，则 `service.Delete()` 并循环等待 `ERROR_SERVICE_MARKED_FOR_DELETE` 消失；随后以 `mgr.Config{StartType: mgr.StartAutomatic, DisplayName: "WireGuard Manager", ServiceType: windows.SERVICE_WIN32_OWN_PROCESS}` 调用 `m.CreateService(serviceName, path, config, "/managerservice")`，最后 `service.Start()`。注意命令行参数是 `/managerservice` 而非 `/installmanagerservice`——前者是服务被 SCM 拉起时运行的实际入口。
+
+```powershell
+& "C:\Program Files\WireGuard\wireguard.exe" /installmanagerservice 2> C:\Temp\wg-manager-install.log
+Get-Content C:\Temp\wg-manager-install.log
+& "C:\Program Files\WireGuard\wireguard.exe" /dumplog > C:\Temp\wg-boot.txt
+& "C:\Program Files\WireGuard\wireguard.exe" /dumplog /tail | Select-Object -First 20
+```
+
+第四步，把日志与状态收口。`wireguard /dumplog` 读取 `conf/path_windows.go` 中 `LogFile(false)` 指向的 `log.bin` 共享环形日志并导出到 stdout，`wireguard /dumplog /tail` 则持续跟踪，`docs/enterprise.md` 还给出用 PowerShell 管道接 `select` 的写法。环形日志由 Manager 与各 Tunnel 服务共享，实现见 `ringlogger/dump.go`、`ringlogger/global.go`。若要做「装完即验证」的自动化，可把 `sc query`、`Get-Service`、`/dumplog` 串成一个脚本，任何一步不达预期就非零退出。仓库根目录的 `quickinstall.bat` 也演示了类似的无人值守思路：先 `build.bat` 与 `installer\build.bat` 构建，再用 `reg query HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall /s /d /c /e /f WireGuard` 配合 `findstr` 找出旧版本并 `msiexec /qb /x` 逐个卸载，最后 `msiexec /qb /i` 安装新版本；它面向开发者本机快速迭代，生产分发应改用带 `/quiet` 与日志的写法。
+
+### 4. 验证方法与预期结果
+
+静默安装没有界面可看，验证必须全部落到命令输出上。核心命令是 `sc query WireGuardManager`，下面是典型输出，示例输出，具体格式需对照实际版本核验。
+
+```text
+SERVICE_NAME: WireGuardManager
+        TYPE               : 10  WIN32_OWN_PROCESS
+        STATE              : 4  RUNNING
+                                (STOPPABLE, NOT_PAUSABLE, ACCEPTS_SHUTDOWN)
+        WIN32_EXIT_CODE    : 0  (0x0)
+        SERVICE_EXIT_CODE  : 0  (0x0)
+        CHECKPOINT         : 0x0
+        WAIT_HINT          : 0x0
+```
+
+逐行判读如下。第一行 `SERVICE_NAME: WireGuardManager` 确认 SCM 里确实注册了这个固定名字，名字来自 `manager/install.go` 里的 `serviceName := "WireGuardManager"`，若查不到，说明 `/installmanagerservice` 没成功或安装序列里的自定义动作把它删了。`TYPE: 10 WIN32_OWN_PROCESS` 表示它是独占进程、不与其他服务共享的 Win32 服务，与 `CreateService` 时传入的 `windows.SERVICE_WIN32_OWN_PROCESS` 一致，这个类型值异常通常意味着有人手工改过服务配置。`STATE: 4 RUNNING` 是本节最关键的判读点，数字 4 对应 `SERVICE_RUNNING`，说明 `service.Start()` 生效、服务已进入运行态；若这里是 1（STOPPED）或 2（START_PENDING），要分别查启动失败原因与启动是否卡住。紧随其后的 `(STOPPABLE, NOT_PAUSABLE, ACCEPTS_SHUTDOWN)` 描述服务可接受的控制码，Manager 服务可停止、不可暂停、接受关机通知，属正常能力集。`WIN32_EXIT_CODE: 0` 与 `SERVICE_EXIT_CODE: 0` 都为 0 表示当前没有遗留的失败退出码，若这里是非零值，说明上一次运行异常退出，需要结合 `/dumplog` 定位；`CHECKPOINT` 与 `WAIT_HINT` 都是 `0x0`，说明服务不在启停的进度等待中，状态已稳定。综合看，「名字对、类型对、STATE 为 RUNNING、两个退出码为 0、无挂起进度」五条同时成立，才算静默安装与服务启动都成功。注意 `sc query` 的输出字段与本地化语言、Windows 版本相关，具体格式需对照实际版本核验，判读以状态码语义为准而非字符串字面。
+
+除 `sc query` 外，还应用 `Get-Service WireGuardManager` 复核 `StartType` 为 Automatic，并确认 `main.go` 里 `/managerservice` 这个运行参数被正确写进服务的 `BinaryPathName`。`/dumplog` 的输出判读要点是：能看到 `MGR` 前缀的启动记录、`WTSEnumerateSessions` 相关会话枚举、以及 `Starting UI process for user` 之类的行（来自 `manager/service.go`）；若日志为空或只有错误，先确认 `LogFile()` 指向的 `log.bin` 是否生成、`setLogFile()` 是否因无 stderr 而把日志丢弃。下表把验证项并排列出。
+
+| 验证项 | 命令 | 预期结果与判读要点 |
+|---|---|---|
+| 服务存在且运行 | `sc query WireGuardManager` | STATE 为 4 RUNNING，退出码为 0 |
+| 开机自启 | `Get-Service WireGuardManager` | StartType 为 Automatic |
+| 运行参数正确 | `sc qc WireGuardManager` | BINARY_PATH_NAME 含 `/managerservice` |
+| 日志可读 | `wireguard /dumplog` | 有 MGR 启动记录、无致命错误 |
+| 未弹出 UI | 任务管理器查 `wireguard.exe` | 无用户会话 UI 进程或符合预期 |
+| MSI 日志无异常 | `Get-Content wg-msi.log` | 无 LaunchApplication 执行行 |
+
+### 5. 常见失败与排错
+
+第一类是属性没生效。`DO_NOT_LAUNCH` 拼写错误、大小写不符、或放在了 `/quiet` 之前被当成别的参数，都会让 `wxs` 里的 `NOT DO_NOT_LAUNCH` 求值为真，`LaunchApplication` 照常执行，现象是静默安装后突然弹出托盘或主窗口、自动化脚本被挂住。排查方法是查 MSI 日志里该属性的值与自定义动作的执行行，必要时重新以标准顺序传参；属性名以 `docs/enterprise.md` 与 `installer/wireguard.wxs` 为准，具体取值写法需对照实际版本核验。
+
+第二类是服务已存在。`InstallManager()` 在同名服务处于非停止态时返回 `ErrManagerAlreadyRunning`，`main.go` 对该错误会先 `checkForAdminDesktop()` 再 `fatal(err)`；若服务处于 `StartPending`，代码注释说明「刚被别的东西启动」，会直接返回成功。现象是重复执行安装命令报「already installed and running」，这通常是幂等脚本重跑导致，不算故障，先 `sc query` 看状态再决定是否跳过。第三类是「30 秒超时」：`/installmanagerservice` 分支在 `InstallManager()` 返回后 `checkForAdminDesktop()`，再 `time.Sleep(30 * time.Second)`，超时则 `fatalf("WireGuard system tray icon did not appear after 30 seconds.")`。在无人值守、无交互桌面或 Server Core 场景下，托盘图标本来就不会出现，这条报错容易被误判为安装失败；此时应改用 `sc query` 判断服务是否其实已经 RUNNING，而不是依赖图标等待逻辑，这也是企业场景更推荐「MSI + 独立验证」而非直接依赖无参数启动的原因之一。
+
+第四类是日志丢失。`setLogFile()` 在拿不到 stderr/stdout 句柄时把日志设为 `io.Discard`，`fatal()` 于是改用 `MessageBox` 弹框。若自动化宿主没有为子进程分配标准句柄，错误就会以弹窗形式卡住流程。稳妥做法是始终给命令接 `2>` 重定向，或让调用方以管道方式捕获输出；`docs/enterprise.md` 也给出 `wireguard /update 2> C:\path\to\update\log.txt`、`wireguard /removedriver 2> C://Temp//removedriver.log` 的同款写法。第五类是架构与权限：MSI 架构不匹配触发 `checkForWow64()` 的 native version 报错，非提升令牌触发 `checkForAdminGroup()` 相关报错，二者都在 `main.go` 入口阶段，换对应架构 MSI、以管理员身份重跑即可。
+
+还有一类问题出在自动化脚本自身的设计上，值得单独说明。静默安装只负责把文件、驱动与数据目录安放到位，并不携带任何隧道配置；配置仍需按 03-04 的方式单独下发到 `Configurations` 目录，再由 Manager 服务转换为 `.conf.dpapi`。因此一个完整的无人值守脚本应当拆成「装包」「验证服务」「下发配置」「激活隧道」四段，而不是指望装完 MSI 就自动有一条可用隧道，把这两件事混为一谈是批量部署里最隐蔽的逻辑错误。其次是幂等性：配置管理工具常常周期性重跑，MSI 在 `ProductState=5` 的重配置分支会命中 `LaunchApplicationAndAbort` 的动作，而 `/installmanagerservice` 重复执行时 `InstallManager()` 会返回 `ErrManagerAlreadyRunning`——脚本应当把这两类返回判为「目标已达成」而不是失败，稳妥做法是先 `sc query` 看状态，再决定跳过还是补装，避免每次巡检都把一条正常运行的隧道误报成故障。第三是路径基准：`wireguard.exe` 的实际位置由 `os.Executable()` 决定，安装后落在 `%ProgramFiles%\WireGuard\` 下；脚本里若写死绝对路径，应同时用 `sc qc WireGuardManager` 复核服务的 `BINARY_PATH_NAME` 确实指向它，防止 03-06 讲到的升级与架构迁移之后出现路径漂移。把这些设计点固化进脚本，静默安装才真正具备成百上千台批量复制的价值，而不是只在单机上偶然成功一次。
+
+下表按现象汇总根因与动作，命令细节见 04-04、04-06、04-08。
+
+| 现象 | 可能根因 | 排查动作 |
+|---|---|---|
+| 装完弹出 UI | `DO_NOT_LAUNCH` 未生效 | 查 wxs 条件与 MSI 日志 |
+| 报 already installed and running | 服务已运行、脚本重跑 | 先 `sc query` 再跳过或先停 |
+| 30 秒后报托盘未出现 | 无交互桌面、图标逻辑超时 | 以 `sc query` 判定服务状态 |
+| 错误弹窗卡住自动化 | 无 stderr 句柄、日志被丢弃 | 给命令接 `2>` 重定向 |
+| 提示必须用原生版本 | MSI 架构与 CPU 不一致 | 换对应架构 MSI 重装 |
+| `sc query` 查不到服务 | 提权失败或安装未完成 | 查 MSI 日志与权限 |
+
+### 6. 小结
+
+本篇把交互安装改写为无人值守可复现的三段式：`msiexec /i` 加 `/quiet` 与 `DO_NOT_LAUNCH=1` 完成静默落盘、`installer/wireguard.wxs` 的两处 `NOT DO_NOT_LAUNCH` 条件抑制安装后启动、`wireguard /installmanagerservice` 经 `manager.InstallManager()` 把 `WireGuardManager` 注册为开机自启服务。验证不依赖任何界面，而以 `sc query WireGuardManager` 的 STATE、退出码、`sc qc` 的运行参数与 `/dumplog` 的启动记录为准；日志重定向既是审计证据，也是避免「无 stderr 时弹框卡住自动化」的必要手段。相关源码集中在 `main.go`（`setLogFile()`、`usage()`、`main()` 各 case、`checkForWow64()`）、`manager/install.go`（`InstallManager()`、`ErrManagerAlreadyRunning`、`serviceManager()`）、`installer/wireguard.wxs`（两处 `LaunchApplication` 自定义动作）、`conf/path_windows.go`（`LogFile()`）、`ringlogger/dump.go` 与 `quickinstall.bat`，事实依据来自 `docs/enterprise.md`。字段与错误码见 05-08、05-09，开关与服务命令全集见 04-04、04-06，入口分派与 Manager 进程模型见 06-01、06-10，Manager 模块见 07-08。下一篇把 Manager 服务也放下，讨论如何只部署一条隧道服务并用 `sc` 全权控制它（配置见 04-04、04-06 ｜ 字段见 05-08 ｜ 原理见 06-05 ｜ 模块见 07-05）。
+
+## 03-03 隧道服务独立部署与服务控制
+
+### 1. 目标与拓扑
+
+上一篇用 `DO_NOT_LAUNCH` 压住了安装后的自动启动，但仍在机器上装了 `WireGuardManager` 服务。本篇要再往前走一步：完全不依赖 Manager 服务与图形界面，把一条隧道当作一个普普通通的 Windows 服务独立部署，之后所有生命周期管理都交给服务控制管理器（SCM）与标准运维命令。这类形态在服务器、无桌面会话、容器宿主、以及「一台机器只跑一条固定隧道」的边缘节点上非常常见：那里既不需要托盘图标，也不需要多用户会话里孵化 UI 进程，管理员要的是「开机自启、崩溃可恢复、能用 `sc` 查状态、能用 `wg` 查流量」的干净模型。
+
+`docs/enterprise.md` 明确给出了这个能力：manager service 负责在选定用户桌面显示 UI 并响应增删启停请求，而 tunnel service 是每条隧道各自独立的 Windows 服务；文档原话是二者「可以一起使用，也可以分开使用」。分开使用的入口就是两条命令——`wireguard /installtunnelservice C:\path\to\some\myconfname.conf` 安装、`wireguard /uninstalltunnelservice myconfname` 卸载，前者创建名为 `WireGuardTunnel$myconfname` 的服务，随后可用 `services.msc` 或 `sc` 等标准工具控制。这条设计把「隧道」从 UI 的附属物还原成了操作系统原生服务对象，也意味着本册讨论的服务控制手段与域环境里的任何其他服务完全一致。
+
+从调用链看，`/installtunnelservice CONFIG_PATH` 经 `main.go` 的 switch 分派到 `manager/install.go` 的 `InstallTunnel(configPath)`：`NameFromPath()` 从文件路径解析隧道名，`ServiceNameOfTunnel()` 拼出服务名，`CreateService()` 以 `/tunnelservice <configPath>` 为命令行参数注册服务，`service.Start()` 启动，并由 `go trackTunnelService(name, service)` 开始状态跟踪。服务进程实际运行的是 `tunnel.Run(os.Args[2])`，由它完成 WireGuardNT 适配器创建、配置下发、地址与路由设置。拓扑上与 03-01 的差别只在于「谁发起激活」：交互路径由 UI 经 Manager IPC 发起，独立部署路径由管理员的命令行直接发起，下游的 `tunnel.Run()` 与内核驱动完全一样。因此本篇不重列配置键与字段结构（字段见 05-02、05-08 ｜ 配置见 04-01、04-03、04-04、04-06 ｜ 原理见 06-05、06-06 ｜ 模块见 07-05、07-08），只给让服务落地的最小必要配置与命令。
+
+下图把「命令行 → 名称解析 → 服务注册 → 启动 → 状态跟踪 → 外部控制」这条独立部署主链画出来，注意图中没有任何 UI 或 Manager 节点，这正是本篇与 03-01、03-02 的结构性差别。
+
+:::figure id=03-03-01 | name=隧道服务独立部署与服务控制 | dir=TD
+node a "/installtunnelservice<br/>配置路径" blue
+node b "NameFromPath<br/>解析隧道名" teal
+node c "ServiceNameOfTunnel<br/>WireGuardTunnel$name" teal
+node d "CreateService<br/>StartAutomatic" purple
+node e "service.Start()<br/>运行 /tunnelservice" purple
+node f "trackTunnelService<br/>状态跟踪" amber
+node g "sc query / sc stop<br/>/ sc start" green
+edge a -> b "InstallTunnel()"
+edge b -> c "校验名称"
+edge c -> d "注册服务"
+edge d -> e "启动"
+edge e -> f "监视"
+edge f -> g "外部控制"
+:::
+
+图 03-03-01 里的 `trackTunnelService` 值得先点一句：它是 Manager 进程里 `manager/tunneltracker.go` 的函数，独立部署时 Manager 可能并不运行，但这不影响隧道服务本身——`InstallTunnel()` 里的 `go trackTunnelService` 只在调用它的那个进程生命周期内有效，服务本身由 SCM 托管，开机自启与崩溃恢复是服务配置的属性，不依赖任何常驻跟踪者。把这两层分开，是理解「独立部署为何稳定」的关键。
+
+### 2. 前置条件与环境
+
+第一是配置路径与后缀语义。`main.go` 的 `case "/installtunnelservice"` 要求 `len(os.Args) == 3`，即命令名、开关、配置路径三者缺一不可，参数个数不对会走 `usage()` 打印开关清单并退出。`docs/enterprise.md` 对后缀有精确约定：文件名以 `.conf` 结尾时按普通 wg-quick 配置解释；以 `.conf.dpapi` 结尾时，视为同一份配置但已用 `CryptProtectData(bytes, "myconfname")` 加密。这一区分直接影响谁能操作它——文档说明，若配置是 `.conf.dpapi`，用 `wg(8)` 交互需要 Local System 或 Administrator 权限；若是普通 `.conf`，则要求 Local System、Administrator，或与 `.conf` 文件所有者相同的权限。换句话说，独立部署时把配置放在受控目录并用 DPAPI 加密，等于把「谁能改隧道」绑定到了系统级身份上。
+
+第二是隧道名合法性。`conf/name.go` 的 `ServiceNameOfTunnel()` 先调 `TunnelNameIsValid()`，通过后才返回 `"WireGuardTunnel$" + tunnelName`。校验用正则 `^[a-zA-Z0-9_=+.-]{1,32}$` 限制长度与字符集，并拒绝 `CON`、`PRN`、`AUX`、`NUL`、`COM1`…`LPT9` 等保留名，以及 `$`、斜杠、冒号、星号、问号、引号、尖括号、竖线、制表符等特殊字符；`serviceNameForbidden = "$"` 尤其关键，因为 `$` 是服务名里的内部分隔符，隧道名自带 `$` 会破坏 `WireGuardTunnel$<name>` 的解析。第三是权限与依赖：`CreateService`、`StartService`、`DeleteService` 都需要管理员权限；`mgr.Config` 里显式声明 `Dependencies: []string{"Nsi", "TcpIp"}`，说明隧道服务要在网络栈相关服务就绪后启动。第四是运行时查询工具：`wg(8)` 的 `show` 等子命令在 Windows 沿用其他平台的调用习惯，具体用法见 04-05，输出样例见 `docs/enterprise.md`。
+
+下表把配置后缀、可读取身份与适用场景对齐，单元格内不含任何未转义的竖线。完整配置键见 04-01、04-02、04-03。
+
+| 配置后缀 | 解释方式 | `wg(8)` 所需身份 | 典型场景 |
+|---|---|---|---|
+| `.conf` | 普通 wg-quick 明文配置 | Local System 或管理员或文件所有者同等 | 受控目录、导入前暂存 |
+| `.conf.dpapi` | 经 CryptProtectData 加密 | Local System 或管理员 | 生产常驻、防普通用户读 |
+| 后缀非法 | `NameFromPath()` 直接报错 | 服务无法创建 | 文件名写错需修正 |
+
+版本相关事实仍需按约定处理：`wireguard.exe` 与 MSI 的具体版本、`sc` 输出字段的本地化字面、`wg(8)` 各子命令的可用范围，都可能随上游版本变化，统一写「需对照实际版本核验」，可定位到 `upstream_src/main.go` 的 `usage()` 与 `upstream_src/docs/enterprise.md`。机制性结论——例如服务名固定前缀、依赖 `Nsi`/`TcpIp`、自动启动类型——则以 `manager/install.go` 的 `mgr.Config` 为准，不随版本轻易改动。
+
+### 3. 分步操作
+
+第一步，准备一份最小必要配置并放到受控路径。配置内容只保留让隧道上线所必需的键（字段见 05-02，完整配置见 04-01、04-02、04-03），文件名即隧道名，后缀取 `.conf` 或已加密的 `.conf.dpapi`。下面用 `.conf` 明文演示，路径中的目录需已存在且当前身份可写。
+
+```conf
+[Interface]
+PrivateKey = 4JgQnZ9fK3sBvXpLmRtYcE1wAqU7hD2oP6sN0iHkJlM=
+Address = 10.0.0.2/32
+
+[Peer]
+PublicKey = 8HbTqW2eR5yUiO0pAsDfGhJkLzXcVbNmQ1wE4rT6yUiK=
+AllowedIPs = 10.0.0.1/32
+Endpoint = 203.0.113.1:51820
+```
+
+第二步，执行安装。命令取自 `docs/enterprise.md` 的原始形式，注意配置路径要写全，服务名里的隧道名由文件名派生，不需要也不能在命令里另给一个名字。
+
+```powershell
+& "C:\Program Files\WireGuard\wireguard.exe" /installtunnelservice "C:\Program Files\WireGuard\Data\Configurations\myconfname.conf"
+sc.exe query 'WireGuardTunnel$myconfname'
+sc.exe qc 'WireGuardTunnel$myconfname'
+```
+
+`InstallTunnel()` 的内部顺序值得逐条对照 `manager/install.go`。它先 `serviceManager()` 连接 SCM、`os.Executable()` 取自身路径；`NameFromPath(configPath)` 解析出隧道名，`ServiceNameOfTunnel(name)` 生成 `WireGuardTunnel$myconfname`；接着 `m.OpenService(serviceName)` 检查同名服务，若已存在且状态不是 `svc.Stopped`（且不是 `ERROR_SERVICE_MARKED_FOR_DELETE`），返回 `errors.New("Tunnel already installed and running")`；若已存在但已停止，则 `service.Delete()` 并进入一个循环反复 `OpenService`，直到不再是 `ERROR_SERVICE_MARKED_FOR_DELETE` 为止，每次 `time.Sleep(time.Second / 3)`。这段轮询是 Windows 服务删除的固有语义，手工排错时看到「服务标记为删除」不要惊慌。随后构造 `mgr.Config`：`ServiceType: windows.SERVICE_WIN32_OWN_PROCESS`、`StartType: mgr.StartAutomatic`、`ErrorControl: mgr.ErrorNormal`、`Dependencies: []string{"Nsi", "TcpIp"}`、`DisplayName: "WireGuard Tunnel: " + name`、`SidType: windows.SERVICE_SID_TYPE_UNRESTRICTED`。最后 `m.CreateService(serviceName, path, config, "/tunnelservice", configPath)` 把 `/tunnelservice` 与配置路径写成服务命令行参数，`service.Start()` 启动，并 `go trackTunnelService(name, service)` 跟踪状态。
+
+第三步，用标准服务命令控制。下面这组命令覆盖查询、停止、启动、改启动类型与恢复策略；注意服务名含 `$`，在 PowerShell 里用单引号包住可避免被当作变量前缀，在 bash 里则要用单引号或反斜杠转义。服务命令全集见 04-06。
+
+```powershell
+sc.exe query 'WireGuardTunnel$myconfname'
+sc.exe stop 'WireGuardTunnel$myconfname'
+sc.exe start 'WireGuardTunnel$myconfname'
+sc.exe config 'WireGuardTunnel$myconfname' start= auto
+sc.exe failure 'WireGuardTunnel$myconfname' reset= 86400 actions= restart/5000/restart/10000/restart/30000
+sc.exe qc 'WireGuardTunnel$myconfname'
+```
+
+下图把开机自启、依赖、SID 类型与恢复策略这些「服务配置要素」单独组织，便于对照 `mgr.Config` 逐项核验。
+
+:::figure id=03-03-02 | name=隧道服务开机自启与恢复策略要素 | dir=TD
+node a "服务安装配置" blue
+node b "StartType<br/>Automatic" teal
+node c "Dependencies<br/>Nsi 与 TcpIp" teal
+node d "SidType<br/>UNRESTRICTED" gray
+node e "sc failure<br/>恢复动作" amber
+node f "sc config<br/>改启动类型" purple
+node g "开机后自动上线" green
+edge a -> b "默认"
+edge a -> c "依赖"
+edge a -> d "SID 类型"
+edge b -> g "触发启动"
+edge c -> g "网络栈就绪"
+edge e -> g "失败重启"
+edge f -> g "策略调整"
+:::
+
+图 03-03-02 中 `StartType: Automatic` 来自 `mgr.Config`，是「开机自启」的源头；`sc failure` 与 `sc config` 则是部署后由管理员追加的运维策略，二者不冲突。第四步是卸载：`wireguard /uninstalltunnelservice myconfname` 走 `main.go` 的对应 case，调 `manager/install.go` 的 `UninstallTunnel(name)`，它 `ServiceNameOfTunnel(name)` 后 `OpenService`、`service.Control(svc.Stop)`、`service.Delete()`，并容忍 `ERROR_SERVICE_MARKED_FOR_DELETE`。注意这里传的是**隧道名**而不是完整服务名、也不是配置路径。第五步，配置迁移时服务命令行参数会同步更新：`manager/install.go` 的 `changeTunnelServiceConfigFilePath(name, oldPath, newPath)` 用 `DecomposeCommandLine` 拆开 `BinaryPathName`，校验三段参数恰为 `exePath`、`/tunnelservice`、`oldPath` 后替换第三段并 `UpdateConfig`；它正是 `manager/service.go` 里 `conf.MigrateUnencryptedConfigs(changeTunnelServiceConfigFilePath)` 注册的回调，对应 03-04 的明文转加密流程。
+
+最后补一段关于「独立部署与 Manager 服务共存」的说明，避免读者把二者对立起来。Manager 进程里的 `manager/tunneltracker.go` 提供了 `watchNewTunnelServices()`：它用 `SubscribeServiceChangeNotifications` 以 `SC_EVENT_DATABASE_CHANGE` 订阅 SCM 数据库变化，回调里调 `trackExistingTunnels()`，后者枚举 `conf.ListConfigNames()`、逐个拼出 `ServiceNameOfTunnel(name)`、`OpenService` 成功后 `go trackTunnelService(name, service)` 开始跟踪；`docs/attacksurface.md` 也明确说 Manager「按字符串前缀 `WireGuardTunnel$` 监听隧道服务的变化」。`trackTunnelService()` 内部的 `checkForDisabled()` 负责发现被禁用或标记删除的服务并清理，`releaseDriverAdapter(tunnelName)` 在隧道停止时释放适配器，`IPCServerNotifyTunnelChange()` 把状态推给 UI，而服务退出码则由 `services/errors.go` 的 `services.Error` 与 `services.DetermineErrorCode` 判定，相关错误码字段见 05-09。这里的关键结论是：以上跟踪逻辑全部运行在 Manager 进程里，**并不是隧道服务能够运行的前提**。独立部署时即使完全没有 Manager，SCM 仍会按 `StartAutomatic` 在开机时拉起服务、按管理员用 `sc failure` 配置的策略做崩溃恢复，`sc query` 与 `wg show` 也照常可用；反过来，一旦日后在同一台机器上按 03-02 装了 Manager，它又会自动发现并纳管这些已经存在的 `WireGuardTunnel$` 前缀服务，不需要重新导入配置或重建服务。把「服务归 SCM 托管、状态跟踪归 Manager」这条分工厘清，就能解释一个容易让人困惑的现象：03-02 装了 Manager 与 03-03 不装 Manager 两条路径部署出来的隧道服务，在 `sc qc` 的输出里几乎长得一模一样——因为它们本来就是同一个 `InstallTunnel()` 用同一份 `mgr.Config` 注册的，差别的只是有没有一个额外的观察者进程。
+
+### 4. 验证方法与预期结果
+
+独立部署没有任何界面可看，验证全靠 `sc` 与 `wg show`。先看服务配置，`sc qc` 的典型输出如下，示例输出，具体格式需对照实际版本核验。
+
+```text
+[SC] QueryServiceConfig SUCCESS
+SERVICE_NAME: WireGuardTunnel$myconfname
+        TYPE               : 10  WIN32_OWN_PROCESS
+        START_TYPE         : 2   AUTO_START
+        ERROR_CONTROL      : 1   NORMAL
+        BINARY_PATH_NAME   : "C:\Program Files\WireGuard\wireguard.exe" /tunnelservice "C:\Program Files\WireGuard\Data\Configurations\myconfname.conf"
+        LOAD_ORDER_GROUP   :
+        TAG                : 0
+        DISPLAY_NAME       : WireGuard Tunnel: myconfname
+        DEPENDENCIES       : Nsi
+                           : TcpIp
+        SERVICE_START_NAME : LocalSystem
+```
+
+逐行判读如下。首行 `[SC] QueryServiceConfig SUCCESS` 只说明查询本身成功，不代表隧道已通，别把它当成上线证据。`SERVICE_NAME: WireGuardTunnel$myconfname` 确认服务名由固定前缀 `WireGuardTunnel$` 加隧道名组成，与 `ServiceNameOfTunnel()` 的返回值一致；若这里出现别的名字，说明有人绕过 `/installtunnelservice` 手工建过服务。`TYPE: 10 WIN32_OWN_PROCESS` 对应 `mgr.Config` 里的 `SERVICE_WIN32_OWN_PROCESS`，表示独占进程。`START_TYPE: 2 AUTO_START` 是开机自启的直接证据，数字 2 即 `SERVICE_AUTO_START`，与 `mgr.StartAutomatic` 吻合；被改成 3（DEMAND_START）后重启就不会自动拉起，是常见的人为变更。`ERROR_CONTROL: 1 NORMAL` 表示启动失败按普通级别记录。`BINARY_PATH_NAME` 是信息量最大的一行：三段依次是可执行文件路径、`/tunnelservice` 开关、配置路径，正是 `CreateService` 以 `/tunnelservice` 与配置路径写进去的参数；若第三段仍是 `.conf` 而目录里已变成 `.conf.dpapi`，说明 `changeTunnelServiceConfigFilePath` 尚未回调更新，需检查 03-04 的迁移是否完成。`DISPLAY_NAME: WireGuard Tunnel: myconfname` 对应 `DisplayName: "WireGuard Tunnel: " + name`，方便在 `services.msc` 里肉眼定位。`DEPENDENCIES` 两行 `Nsi`、`TcpIp` 与 `mgr.Config` 的依赖列表一致，缺了它们可能导致开机时网络栈未就绪而启动失败。末行 `SERVICE_START_NAME : LocalSystem` 说明服务以最高权限账户运行，与 `docs/attacksurface.md` 对 tunnel 服务「running as Local System」的描述一致，也解释了为何操作 `.conf.dpapi` 需要系统级身份。
+
+状态查询用 `sc query`，重点看 `STATE` 为 `4 RUNNING`、`WIN32_EXIT_CODE` 为 0；数据面用 `wg show myconfname`，其输出样式与判读见 `docs/enterprise.md` 及 03-01 第 4 节，重点仍是 `latest handshake` 是否新鲜、`transfer` 双向计数是否递增。若还要确认适配器与路由，可用 `Get-NetAdapter`、`Get-NetRoute`（命令见 04-06，原理见 06-05、06-06）。下表把验证项并排列出。
+
+| 验证项 | 命令 | 预期结果与判读要点 |
+|---|---|---|
+| 服务配置正确 | `sc qc WireGuardTunnel$name` | AUTO_START、参数为三段、依赖 Nsi 与 TcpIp |
+| 服务运行中 | `sc query WireGuardTunnel$name` | STATE 为 4 RUNNING、退出码为 0 |
+| 数据面握手 | `wg show myconfname` | 握手新鲜、双向计数递增 |
+| 适配器存在 | `Get-NetAdapter` | 出现对应 WireGuard 接口 |
+| 路由已下发 | `Get-NetRoute` | AllowedIPs 对应网段指向隧道接口 |
+| 开机自启生效 | 重启后 `sc query` | 服务自动回到 RUNNING |
+
+### 5. 常见失败与排错
+
+第一类是命令形态错误：`/installtunnelservice` 少给配置路径会触发 `usage()`；`/uninstalltunnelservice` 误传完整服务名或配置路径而非隧道名，会让 `ServiceNameOfTunnel()` 对 `WireGuardTunnel$xxx` 这类含 `$` 的名字判为非法，表现为「Tunnel name is not valid」。第二类是隧道名非法：文件名带空格、中文、保留名、以点开头结尾，或长度超过 32，都会被 `TunnelNameIsValid()` 拒绝。第三类是同名服务冲突：`InstallTunnel()` 在同名服务处于非停止态时返回 `Tunnel already installed and running`；处于 `ERROR_SERVICE_MARKED_FOR_DELETE` 时代码会循环 `OpenService` 等待其消失，此时反复执行安装命令只会看到「服务已标记删除」，应等待或重启再试，不要手工删注册表。
+
+第四类是配置后缀与权限。把 `.conf.dpapi` 交给 `wg(8)` 却用普通用户身份运行，会因权限不足读不到配置；反过来，把明文 `.conf` 放在普通用户可写目录，又会削弱 03-04 要讲的安全模型。第五类是依赖与启动顺序：`Dependencies` 为 `Nsi`、`TcpIp`，若这些基础服务异常，隧道服务可能停在 START_PENDING 或直接失败，用 `sc query` 看状态、`wireguard /dumplog` 看日志即可定位。第六类是脚本钩子误判：`tunnel/scriptrunner.go` 的 `runScriptCommand()` 在 `DangerousScriptExecution` 未开启时打印 `Skipping execution of script` 并返回，Windows 侧用 `WIREGUARD_TUNNEL_NAME` 环境变量而非 `%i`；独立部署若依赖 `PostUp` 做路由或防火墙动作，必须显式评估该策略，且要清楚它以 Local System 执行带来的攻击面（策略见 04-07，攻击面见 08-05）。
+
+下表按现象汇总根因与动作，命令细节见 04-06、04-08。
+
+| 现象 | 可能根因 | 排查动作 |
+|---|---|---|
+| 打印开关清单后退出 | 参数个数不对 | 补齐配置路径或改用隧道名 |
+| 报 Tunnel name is not valid | 名称含特殊字符或保留名 | 按 `conf/name.go` 规则改名 |
+| 报 already installed and running | 同名服务已在运行 | 先 `sc query`，需要时先 stop |
+| 服务一直标记删除 | MARKED_FOR_DELETE 未消失 | 等待轮询结束或重启 |
+| `wg show` 权限不足 | `.conf.dpapi` 需系统级身份 | 以管理员或 Local System 运行 |
+| PostUp 动作不执行 | 脚本钩子默认关闭 | 核对 `DangerousScriptExecution` |
+
+### 6. 小结
+
+本篇把隧道从 UI 依赖里彻底剥离：`wireguard /installtunnelservice <配置路径>` 经 `main.go` 分派到 `manager/install.go` 的 `InstallTunnel()`，由 `NameFromPath()` 与 `ServiceNameOfTunnel()` 生成 `WireGuardTunnel$<name>`，以 `StartAutomatic`、`Nsi`/`TcpIp` 依赖、`SERVICE_SID_TYPE_UNRESTRICTED` 的配置注册服务，命令行参数为 `/tunnelservice <configPath>`，启动后由 SCM 托管，管理员用 `sc query`、`sc qc`、`sc stop`、`sc start`、`sc config`、`sc failure` 全权控制，卸载走 `/uninstalltunnelservice <隧道名>` 对应的 `UninstallTunnel()`。验证以 `sc qc` 的启动类型、三段参数、依赖列表与 `wg show` 的握手流量为准。相关源码集中在 `main.go`（switch 与参数个数校验）、`manager/install.go`（`InstallTunnel()`、`UninstallTunnel()`、`changeTunnelServiceConfigFilePath()`）、`conf/name.go`（`ServiceNameOfTunnel()`、`TunnelNameIsValid()`）、`conf/store.go`（`LoadFromPath()`、`PathIsEncrypted()`）、`manager/tunneltracker.go`（`trackTunnelService()`、`watchNewTunnelServices()`），事实依据来自 `docs/enterprise.md`。字段见 05-02、05-08，配置与命令见 04-01、04-03、04-05、04-06，适配器创建与路由下发机制见 06-05、06-06，tunnel 与 manager 模块见 07-05、07-08。下一篇专门拆解配置文件在磁盘上的安全存储：DPAPI 加密、目录 ACL、明文删除与导入导出（配置见 04-01 ｜ 字段见 05-02 ｜ 原理见 06-03 ｜ 模块见 07-02）。
+
+## 03-04 配置安全存储：DPAPI 加密、目录 ACL 与配置导入
+
+### 1. 目标与拓扑
+
+前面三篇反复出现一个动作：把 `.conf` 放进某个目录，过一会儿它变成 `.conf.dpapi`，明文消失。本篇专门把这个「黑盒」拆开，讲清楚 wireguard-windows 如何保护隧道配置——这是整套安全模型的地基，因为配置里含有 `PrivateKey`、`PresharedKey` 这类一旦泄露就等同于身份失陷的材料。目标是让读者能独立完成四件事：理解配置目录的层次与 ACL、把一份明文配置正确导入安全存储、验证它已被加密并收紧权限、以及在迁移与排错时看懂背后的调用链。
+
+`docs/attacksurface.md` 对这套机制有权威描述：Manager 服务以 Local System 运行，「管理 `C:\Program Files\WireGuard\Data` 下的 DPAPI 加密配置文件」，该目录以 `O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)` 创建；而 DPAPI 加密文件本身以 `O:SYG:SYD:PAI(A;;FA;;;SY)(A;;SD;;;BA)` 创建。两段 SDDL 的差别很关键：目录给 SYSTEM 与 Administrators 完全控制并向下继承（`OICI`），单个加密文件则只给 Administrators `SD`（标准删除权），也就是管理员能删不能读。再叠加 `docs/enterprise.md` 的说明——Manager 服务监视 `%ProgramFiles%\WireGuard\Data\Configurations\` 下新增的 `.conf`，用 `CryptProtectData(bytes, "myconfname")` 加密为 `.conf.dpapi`，使其对 Local System 之外的用户不可读，仅授予管理员删除权，然后删除原始明文——整条链路就完整了：目录监视、DPAPI 加密、ACL 收紧、明文删除，四步一环扣一环。
+
+拓扑上，这套机制横跨 `conf`、`manager` 两个包：`conf/path_windows.go` 决定路径与目录安全描述符，`conf/storewatcher_windows.go` 与 `conf/storewatcher.go` 负责监视与回调注册，`conf/migration_windows.go` 负责把明文迁移成密文，`conf/store.go` 提供读写删的接口，真正做加解密的是 `conf/dpapi/dpapi_windows.go`，落盘并收紧 ACL 的是 `conf/filewriter_windows.go`，而把这些串起来的是 `manager/service.go` 里两行 `conf.RegisterStoreChangeCallback` 回调注册。本册按去重铁律只讲「做什么」与「怎么落地」，不展开 DPAPI 机制状态机、不重列配置字段、不铺开模块能力，配置键全集见 04-01、04-02、04-03；按全册统一写法，本篇的交叉引用为（字段见 05-02、05-04 ｜ 配置见 04-01、04-02、04-03 ｜ 原理见 06-03 ｜ 模块见 07-02），读者可据此回到各权威源随查。
+
+下图把明文 `.conf` 从被复制进目录到变成 `.conf.dpapi` 的完整转换链画出来，每个节点都对应一段可定位的源码。
+
+:::figure id=03-04-01 | name=明文 .conf 到 .conf.dpapi 的转换链 | dir=TD
+node a "复制 .conf 到<br/>Configurations" blue
+node b "FindFirstChange<br/>Notification" teal
+node c "RegisterStore<br/>ChangeCallback" teal
+node d "MigrateUnencrypted<br/>Configs()" purple
+node e "O_RDWR 打开<br/>文件锁确认写完" purple
+node f "dpapi.Encrypt<br/>CryptProtectData" amber
+node g "writeLockedDownFile<br/>原子重命名" amber
+node h "os.Remove<br/>删除明文" red
+node i ".conf.dpapi<br/>仅 SYSTEM 可读" green
+edge a -> b "目录变更"
+edge b -> c "回调触发"
+edge c -> d "迁移扫描"
+edge d -> e "逐个处理"
+edge e -> f "加密字节"
+edge f -> g "写入"
+edge g -> h "清理"
+edge g -> i "落地"
+:::
+
+图 03-04-01 中 `O_RDWR 打开` 这一步容易被忽略，却是整套流程可靠性的关键：迁移代码刻意不用 `os.ReadFile`，而是以读写方式打开明文文件，借 Windows 的文件锁确保配置已完整写完再处理，避免把写了一半的文件加密进去。这个细节也是排错时理解「明文迟迟不消失」的钥匙，本篇第 5 节还会回到它。
+
+### 2. 前置条件与环境
+
+第一是搞清楚目录层次。`conf/path_windows.go` 的 `RootDirectory(create bool)` 先用 `windows.KnownFolderPath` 以 `FOLDERID_ProgramFiles` 取 Program Files 路径，拼上 `WireGuard`；`create` 为真时用 `CreateDirectory` 建目录，并强调「根目录继承 Program Files 的 ACL，不去动它」；随后构造 `Data` 子目录，其安全描述符来自 `SecurityDescriptorFromString("O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")`，用带 `SecurityAttributes` 的 `CreateDirectory` 创建，再以 `CreateFile` 打开目录句柄做三重校验——必须是目录（`FILE_ATTRIBUTE_DIRECTORY`）、不能是重解析点（`FILE_ATTRIBUTE_REPARSE_POINT`，否则报 `Data directory is reparse point`）、用 `GetFinalPathNameByHandle` 确认最终路径没跳到别处（否则报 `Data directory jumped to unexpected location`），最后 `SetKernelObjectSecurity` 把安全描述符固定上去。`tunnelConfigurationsDirectory()` 则在 `RootDirectory(true)` 的结果上再拼 `Configurations`，用 `os.Mkdir(c, os.ModeDir|0o700)` 创建。`LogFile(false)` 返回 `root/log.bin`，是共享环形日志的路径，与配置目录同级。
+
+第二是理解两级 ACL 与 DPAPI 的绑定关系。目录级 SDDL 带 `OICI`（对象继承、容器继承），保证其下新建文件自动继承保护；文件级 SDDL 在 `conf/filewriter_windows.go` 的 `writeLockedDownFile()` 里通过 `SecurityDescriptorFromString("O:SYG:SYD:PAI(A;;FA;;;SY)(A;;SD;;;BA)")` 再度收紧。`conf/dpapi/dpapi_windows.go` 的 `Encrypt()` 调用 `windows.CryptProtectData(bytesToBlob(data), windows.StringToUTF16Ptr(name), nil, 0, nil, windows.CRYPTPROTECT_UI_FORBIDDEN, &out)`：第二参数把隧道名作为描述/熵传入，第五参数为 nil、未带跨机器标志，密文因此与加密时的账户与机器上下文绑定；`Decrypt()` 用 `CryptUnprotectData` 解密后会取回 `outName` 与期望的 `name` 逐字符比对，不一致返回 `input name does not match the stored name`，`outName` 为空则返回 `decrypted data has no associated name`。这意味着 `.conf.dpapi` 不是可以随意拷贝到另一台机器直接用的普通密文，跨机搬运的边界需对照实际版本核验；源码里那段 `strcmp` 注释还自嘲「不是恒定时间比较」，属实现细节，不影响功能判读。
+
+下表把路径层次、保护对象与 ACL 对齐，表中 SDDL 均为源码中的真实字符串，不含未转义的竖线。
+
+| 层次 | 源码函数 | 安全描述符或用途 |
+|---|---|---|
+| Program Files 下的 WireGuard | `RootDirectory()` | 继承 Program Files ACL，不改动 |
+| `Data` 目录 | `RootDirectory()` | `O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)` |
+| `Configurations` 目录 | `tunnelConfigurationsDirectory()` | `os.Mkdir` 0700，受上层 ACL 保护 |
+| 单个 `.conf.dpapi` | `writeLockedDownFile()` | `O:SYG:SYD:PAI(A;;FA;;;SY)(A;;SD;;;BA)` |
+| `log.bin` 环形日志 | `LogFile()` | 与配置同根目录，多服务共享 |
+
+第三是权限前置：向 `Configurations` 复制文件、查看其 ACL、触发迁移，都需要管理员或 Local System 身份；普通用户既读不到密文，也无法把明文塞进去。第四是版本约定：SDDL 字符串、`CryptProtectData` 的标志位、`os.Mkdir` 的权限位都以本地快照为准，具体取值需对照实际版本核验，可定位到 `conf/path_windows.go`、`conf/filewriter_windows.go`、`conf/dpapi/dpapi_windows.go` 与 `docs/attacksurface.md`。
+
+下图把目录层次与权限收束关系单独画成一张，与图 03-04-01 的「时间链」互补，便于从空间维度记忆。
+
+:::figure id=03-04-02 | name=配置安全存储的目录与权限层次 | dir=TD
+node a "FOLDERID_ProgramFiles" blue
+node b "WireGuard 目录<br/>继承上级 ACL" teal
+node c "Data 目录<br/>SY 与 BA 完全控制" purple
+node d "Configurations<br/>监视目录" purple
+node e ".conf.dpapi<br/>SDDL 收紧" amber
+node f "log.bin<br/>共享环形日志" gray
+node g "明文 .conf<br/>处理后删除" red
+edge a -> b "KnownFolderPath"
+edge b -> c "RootDirectory"
+edge c -> d "tunnelConfigurationsDirectory"
+edge c -> f "LogFile"
+edge d -> e "加密落盘"
+edge d -> g "迁移删除"
+:::
+
+图 03-04-02 里 `Data` 与 `Configurations` 分两级展示，是因为前者由 `RootDirectory()` 用显式 SDDL 创建并校验，后者只是 `os.Mkdir` 建出的普通子目录、靠上层 `OICI` 继承获得保护；把两者混为一谈，容易在排查 ACL 时找错对象。
+
+### 3. 分步操作
+
+第一步，导入配置。`docs/enterprise.md` 给出的编程方式最简洁：「配置可以简单地复制到该目录，从而被程序化加入 Manager 服务的安全存储」。因此批量下发的最小动作就是把 `.conf` 复制进 `%ProgramFiles%\WireGuard\Data\Configurations\`；UI 里的「导入隧道」走的也是同一套落盘逻辑。配置内容本身最小必要即可（字段见 05-02，完整配置见 04-01、04-02、04-03），文件名决定隧道名，须通过 `conf/name.go` 的 `TunnelNameIsValid()`。
+
+第二步，理解监视与回调链。`conf/storewatcher_windows.go` 的 `startWatchingConfigDir()` 起一个 goroutine，用 `windows.FindFirstChangeNotification` 带一组 `FILE_NOTIFY_CHANGE_*` 变更标志监视目录，循环 `WaitForSingleObject(h, INFINITE)`，触发后遍历 `storeCallbacks` 逐个调用 `cb()`，再 `FindNextChangeNotification(h)` 继续；任何一环出错都会 `FindCloseChangeNotification` 并 `goto startover` 重建。`conf/store.go` 之外，`conf/storewatcher.go` 的 `RegisterStoreChangeCallback(cb)` 用 `watchConfigDirOnce.Do(startWatchingConfigDir)` 保证监视只启动一次，注册时还会立即 `cb()` 跑一遍。真正把「目录变化」接到「加密迁移」上的是 `manager/service.go` 中 `managerService.Execute()` 里的两行：`conf.RegisterStoreChangeCallback(func() { conf.MigrateUnencryptedConfigs(changeTunnelServiceConfigFilePath) })` 与 `conf.RegisterStoreChangeCallback(IPCServerNotifyTunnelsChange)`——前者做明文转密文并同步更新隧道服务命令行参数，后者通知 UI 隧道列表变化。注意第一行用的是 `manager/install.go` 的 `changeTunnelServiceConfigFilePath`，这正是 03-03 讲过的服务参数迁移回调。
+
+第三步，跟踪迁移本身。`conf/migration_windows.go` 的 `MigrateUnencryptedConfigs(migrated)` 调 `migrateUnencryptedConfigs(3, migrated)`：先 `migrating.Lock()` 保证串行，`os.ReadDir` 枚举目录，跳过非 `.conf` 后缀、非普通文件、以及权限位里没有读位（`info.Mode().Perm()&0o444 == 0`）的条目；对每个候选以 `os.OpenFile(path, os.O_RDWR, 0)` 打开——注释明确写「不用 `os.ReadFile`，因为要 RDWR，借 Windows 文件锁确保文件写完」——`io.ReadAll` 读出字节后 `FromWgQuickWithUnknownEncoding(string(bytes), name)` 解析成 `*conf.Config`，再 `config.Save(false)` 写成密文，`os.Remove(path)` 删除明文，`config.Path()` 取新路径，最后调用 `migrated(config.Name, path, newPath)` 回调。`ERROR_SHARING_VIOLATION`（文件仍被写入方占用）会触发退避重试：`time.AfterFunc` 以 `sharingBase` 从 3 递减递归再跑，`ignoreSharingViolations` 标志避免同批次重复等待；迁移失败统一 `log.Printf("Unable to ingest and encrypt %#q: %v", path, err)` 进环形日志。
+
+第四步，看 `Save` 与落盘。`conf/store.go` 的 `(config *Config) Save(overwrite bool)` 校验名称后拼出 `config.Name + ".conf.dpapi"`，把 `config.ToWgQuick()` 序列化成字节，调 `dpapi.Encrypt(bytes, config.Name)`，再交给 `writeLockedDownFile(filename, overwrite, bytes)`。`conf/filewriter_windows.go` 的 `writeLockedDownFile()` 先把文件级 SDDL 缓存进 `encryptedFileSd`（用 `atomic.LoadPointer` / `StorePointer`），`randomFileName()` 生成 32 字节随机十六进制加 `.tmp` 的临时名，`CreateFile` 以 `CREATE_ALWAYS`、`FILE_SHARE_READ` 和该安全属性建临时文件，`Write` 后校验 `n == len(contents)`，`FlushFileBuffers` 刷盘，最后用 `SetFileInformationByHandle` 配合 `FileRenameInfo` 原子重命名到目标名，`replaceIfExists` 由 `overwrite` 决定；任一步失败都通过 `deleteIt()` 把临时文件标记删除。这个「同目录临时文件 + 原子重命名」的写法保证密文要么完整出现、要么根本不出现，不会留下半截文件。
+
+第五步，读取与导出。`conf/store.go` 的 `LoadFromName(name)` 校验名称后拼出 `.conf.dpapi` 路径交给 `LoadFromPath()`；后者读文件，若后缀是 `.conf.dpapi` 则 `dpapi.Decrypt(bytes, name)`，再 `FromWgQuickWithUnknownEncoding` 还原为 `*Config`。`ListConfigNames()`、`PathIsEncrypted()`、`DeleteName()`、`(config *Config) Path()`、`Delete()` 构成完整的增删查接口。明文不会长期留存，需要备份或迁移时，按 `docs/enterprise.md` 所述用 UI 的导出功能把配置导成明文再另存，而不是直接拷贝 `.conf.dpapi` 到处走。
+
+下面是把明文导入并核对落盘的常用命令，注意每条都给全参数。
+
+```powershell
+Copy-Item .\myconfname.conf "C:\Program Files\WireGuard\Data\Configurations\myconfname.conf"
+Get-ChildItem "C:\Program Files\WireGuard\Data\Configurations\"
+icacls "C:\Program Files\WireGuard\Data\Configurations\myconfname.conf.dpapi"
+& "C:\Program Files\WireGuard\wireguard.exe" /dumplog > C:\Temp\wg-store.txt
+Select-String -Path C:\Temp\wg-store.txt -Pattern "migrate|encrypt|ingest"
+```
+
+下面这段 Go 片段摘自调用链要点，用来对照上面的文字描述定位函数，非可独立编译的完整程序。
+
+```go
+// conf/store.go: Save 的加密落盘链
+bytes := []byte(config.ToWgQuick())
+bytes, err = dpapi.Encrypt(bytes, config.Name)
+if err != nil {
+    return err
+}
+return writeLockedDownFile(filename, overwrite, bytes)
+
+// conf/dpapi/dpapi_windows.go: 以隧道名为描述调用 DPAPI
+err := windows.CryptProtectData(bytesToBlob(data), windows.StringToUTF16Ptr(name), nil, 0, nil, windows.CRYPTPROTECT_UI_FORBIDDEN, &out)
+
+// manager/service.go: 把目录变化接到迁移与 UI 通知
+conf.RegisterStoreChangeCallback(func() { conf.MigrateUnencryptedConfigs(changeTunnelServiceConfigFilePath) })
+conf.RegisterStoreChangeCallback(IPCServerNotifyTunnelsChange)
+```
+
+### 4. 验证方法与预期结果
+
+导入之后不要凭「命令没报错」就下结论，要看目录里到底发生了什么。下面给出 `Get-ChildItem` 与 `icacls` 的典型输出，示例输出，具体格式需对照实际版本核验。
+
+```text
+PS> Get-ChildItem "C:\Program Files\WireGuard\Data\Configurations\"
+
+    Directory: C:\Program Files\WireGuard\Data\Configurations
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----        2026/11/11     10:02            612 myconfname.conf.dpapi
+
+PS> icacls "C:\Program Files\WireGuard\Data\Configurations\myconfname.conf.dpapi"
+myconfname.conf.dpapi NT AUTHORITY\SYSTEM:(F)
+                      BUILTIN\Administrators:(SD)
+```
+
+逐行判读如下。`Get-ChildItem` 的结果里**只出现 `myconfname.conf.dpapi`、没有 `myconfname.conf`**，这是迁移已完成、明文已被 `os.Remove` 删除的最直接证据；若两份同时存在，说明迁移还没跑完或卡在共享冲突上（回到第 5 节排查）。`Length` 一栏的 612 是加密后字节数，通常比明文大，因为 DPAPI blob 带有头部与完整性数据，这个数值没有固定正常范围，随配置长度与密钥材料变化，不能用它判断对错。`Mode` 的 `-a----` 表示普通归档文件，说明它不是重解析点或目录，符合 `tunnelConfigurationsDirectory()` 下普通文件的预期。`icacls` 输出第一行 `NT AUTHORITY\SYSTEM:(F)` 表示 SYSTEM 拥有完全控制，对应文件级 SDDL 里的 `(A;;FA;;;SY)`；第二行 `BUILTIN\Administrators:(SD)` 表示管理员组只有 `SD`（标准删除）权，对应 `(A;;SD;;;BA)`——也就是说管理员能删这个文件却读不到内容，这正是 `docs/enterprise.md` 所说「授予管理员仅删除能力」的落地形态。输出里**没有**为 `Users`、`Authenticated Users` 或任何普通账户列出 ACE，说明非特权用户既不能读也不能改，配置里的私钥因此不会被本机普通用户直接取走。两段输出合起来的判据是：明文消失、密文存在、SYSTEM 完全控制、管理员仅删除、无普通用户 ACE；再配合 `wireguard /dumplog` 里没有 `Unable to ingest and encrypt` 错误行，才算一次干净的安全存储落地。注意 `icacls` 的账户显示名与权限缩写会随系统语言与版本变化，具体格式需对照实际版本核验，判读以 ACE 语义为准。
+
+下表把验证项、命令与判读要点并排列出，ACL 与日志命令见 04-06。
+
+| 验证项 | 命令 | 预期结果与判读要点 |
+|---|---|---|
+| 明文已删除 | `Get-ChildItem` 查 `Configurations` 目录 | 只有 `.conf.dpapi`，无 `.conf` |
+| 密文权限 | `icacls <密文路径>` | SYSTEM 为 F、管理员为 SD、无普通用户 ACE |
+| 目录权限 | `icacls` 查 `Data` 目录 | 与 `O:SYG:SYD:PAI` SDDL 一致 |
+| 迁移无错误 | `wireguard /dumplog` | 无 Unable to ingest and encrypt 行 |
+| 配置可读回 | UI 导出或 `LoadFromName()` | 能还原出等价明文配置 |
+| 服务参数同步 | `sc qc WireGuardTunnel$name` | 配置路径已指向 `.conf.dpapi` |
+
+### 5. 常见失败与排错
+
+第一类是「明文不消失」，最常见也最容易被误判为 Manager 服务没跑。真实原因往往是文件仍被写入方占用：`migrateUnencryptedConfigs()` 以 `O_RDWR` 打开时命中 `ERROR_SHARING_VIOLATION`，于是按 `sharingBase` 从 3 递减安排 `time.AfterFunc` 重试，短则几百毫秒、多则数轮之后才处理完。大文件或慢速网络复制刚落地时看到明文短暂存在属正常，若长时间不消失，用 `wireguard /dumplog /tail` 观察是否反复出现 `Unable to ingest and encrypt`，并检查是否有编辑器、同步工具或杀毒软件正持有该文件句柄。第二类是配置内容本身有问题：`FromWgQuickWithUnknownEncoding` 解析失败会走 `error:` 标签记录日志，明文保留、密文不生成，此时应回到 04-01、04-02、04-03 核对语法与键名，而不是反复重导。
+
+第三类是名称与路径问题。文件名带非法字符、超过 32 字符、用了保留名，会让 `TunnelNameIsValid()` 或 `LoadFromName()` 失败；把 `.conf` 复制到错误的 `Data` 层级、或误放进 `Configurations` 的子目录，目录监视虽可能触发但迁移枚举只看顶层候选文件。第四类是权限问题：普通用户既无法写入 `Configurations`，也无法读取密文；若用计划任务或配置管理工具下发，必须确认执行身份是 SYSTEM 或管理员，否则复制动作本身就会失败。`RootDirectory()` 还会拒绝 `Data` 目录被换成文件、被做成重解析点、或最终路径跳到别处，分别报 `Data directory is actually a file`、`Data directory is reparse point`、`Data directory jumped to unexpected location`——这些是防止目录被符号链接劫持的防护，遇到时应恢复目录结构，不要试图绕过。
+
+第五类是跨机搬运密文。由于 `Encrypt()` 调用 `CryptProtectData` 时未使用跨机器标志，且 `Decrypt()` 会校验隧道名与期望 `name` 是否一致，把一台机器的 `.conf.dpapi` 直接拷到另一台机器或换账户后，常见结果是解密失败或 `input name does not match the stored name`；正确做法是按 `docs/enterprise.md` 用 UI 导出的明文在新环境重新导入，跨机复用的具体边界需对照实际版本核验。第六类仍是脚本钩子：`tunnel/scriptrunner.go` 的 `runScriptCommand()` 在 `DangerousScriptExecution` 未开启时跳过执行，Windows 用 `WIREGUARD_TUNNEL_NAME` 而非 `%i`；配置里若写了 `PostUp` 之类键，既不会生效也不影响 DPAPI 存储，别把「脚本没跑」误判成「配置没导入成功」（策略见 04-07，攻击面见 08-05）。
+
+下表按现象汇总根因与动作，命令细节见 04-06、04-08。
+
+| 现象 | 可能根因 | 排查动作 |
+|---|---|---|
+| 明文 `.conf` 长时间不消失 | 文件被占用、共享冲突重试 | 看 `/dumplog /tail` 迁移日志 |
+| 无 `.conf.dpapi` 生成 | 配置解析失败或名称非法 | 核对语法与隧道名合法性 |
+| 复制时报权限不足 | 执行身份非管理员 | 改用 SYSTEM 或提升身份 |
+| 报 reparse point 相关错误 | `Data` 目录被链接劫持 | 恢复真实目录结构 |
+| 换机后解密失败 | DPAPI 密文绑定原上下文 | 用 UI 导出明文重新导入 |
+| 管理员能删不能读密文 | 属预期 SDDL 行为 | 属正常，不必修 ACL |
+
+### 6. 小结
+
+本篇把配置安全存储拆成可验证的四个动作：按 `docs/enterprise.md` 把 `.conf` 复制进 `%ProgramFiles%\WireGuard\Data\Configurations\`；`conf/storewatcher_windows.go` 的 `FindFirstChangeNotification` 监视链触发回调；`manager/service.go` 注册的两行 `RegisterStoreChangeCallback` 把变化接到 `conf/migration_windows.go` 的 `MigrateUnencryptedConfigs()`；后者以 `O_RDWR` 借文件锁确认写完、解析后 `config.Save(false)`，经 `conf/store.go` → `conf/dpapi/dpapi_windows.go` 的 `CryptProtectData`（以隧道名为描述、`CRYPTPROTECT_UI_FORBIDDEN`）加密，再由 `conf/filewriter_windows.go` 的 `writeLockedDownFile()` 用「同目录随机临时文件 + `FlushFileBuffers` + `FileRenameInfo` 原子重命名」落盘并套上 `O:SYG:SYD:PAI(A;;FA;;;SY)(A;;SD;;;BA)`，最后 `os.Remove` 删除明文。目录一级的 `O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)` 由 `conf/path_windows.go` 的 `RootDirectory()` 创建并做重解析点与最终路径校验，`Configurations` 由 `tunnelConfigurationsDirectory()` 建立并继承保护。验证以「明文消失、密文存在、SYSTEM 完全控制、管理员仅删除、无普通用户 ACE、服务参数已同步到 `.conf.dpapi`」为准。字段见 05-02、05-04，配置键见 04-01、04-02、04-03，DPAPI 与原子写入机制见 06-03，安全存储模块见 07-02。下一篇把单机视角放大到域环境，讲 GPO 分发、计划任务更新与受限 UI（配置见 04-06、04-07 ｜ 字段见 05-08 ｜ 原理见 06-10、06-12 ｜ 模块见 07-08、07-11）。
+
+## 03-05 企业批量分发：GPO / 计划任务 / 受限 UI
+
+### 1. 目标与拓扑
+
+前四篇都是「一台机器」的视角，本篇把尺度放大到 Active Directory 域：几十台到上万台终端要统一装上客户端、统一下发同一套隧道配置、统一保持版本更新，同时又要让日常使用者只拥有完成本职工作所需的最小权限。这正是 `docs/enterprise.md` 开篇那句话的落点——wireguard-windows「从设计之初就充分利用标准 Windows 服务、ACL 与命令行能力，使其可部署于企业场景或作为 Active Directory 域的一部分」。本篇的目标是给出一条可落地的批量分发链：用组策略软件安装分发 MSI、用域脚本把配置灌进安全存储、用计划任务触发 `/update`、用 `LimitedOperatorUI` 把非管理员的使用者限制在「启停隧道」这一最小能力集内。
+
+四条链各有明确出处。第一，安装链：`docs/enterprise.md` 说明企业管理员可绕过安装器、直接下载 MSI 并用组策略对象分发，安装包使用标准 MSI 特性、易于自动化，`DO_NOT_LAUNCH` 属性可抑制安装后启动。第二，配置链：同文档说明把 `.conf` 复制进 `%ProgramFiles%\WireGuard\Data\Configurations\` 即可程序化加入 Manager 服务的安全存储，这正是 03-04 讲过的 DPAPI 转换链，域环境下把复制动作交给启动脚本或配置管理工具即可批量完成。第三，更新链：`docs/enterprise.md` 给出 `wireguard /update` 可由计划任务每日触发，并附上一条 `schtasks /create` 的完整示例。第四，受限 UI 链：`docs/adminregistry.md` 定义 `HKLM\Software\WireGuard\LimitedOperatorUI` 为 `DWORD(1)` 时，Network Configuration Operators 内置组（S-1-5-32-556）成员的桌面会出现受限 UI，且列出四条明确限制。
+
+拓扑上，域控制器一侧是 GPO 与软件分发点，客户端一侧仍是那套熟悉的四组件，只是「谁触发」变了：GPO 触发 MSI 安装、启动脚本触发配置导入、任务计划程序触发更新、注册表策略决定 UI 以何种权限形态出现。管理员会话拿到完整 UI，Network Configuration Operators 会话拿到受限 UI，普通用户桌面不出现 UI。这里要特别澄清一条边界：受限 UI 不是「给普通用户开后门」，而是把「启停已有隧道」这一项操作下放给网络运维岗位，同时把密钥、配置编辑、导入导出、更新与退出 Manager 全部收走。本篇继续只给最小必要的命令与配置，开关全集见 04-04、服务与计划任务命令见 04-06、注册表策略见 04-07（字段见 05-08 ｜ 配置见 04-06、04-07 ｜ 原理见 06-10、06-12 ｜ 模块见 07-08、07-11）。
+
+下图把域侧分发动作与客户端侧组件、权限形态画在一起，虚线表示策略对 UI 能力的收敛关系。
+
+:::figure id=03-05-01 | name=企业批量分发的组件与权限关系 | dir=TD
+node a "GPO 软件安装<br/>分发 MSI" blue
+node b "DO_NOT_LAUNCH<br/>抑制启动" teal
+node c "配置批量下发<br/>Configurations" teal
+node d "计划任务<br/>/update 每日" purple
+node e "LimitedOperatorUI<br/>S-1-5-32-556" amber
+node f "受限 UI<br/>仅启停隧道" amber
+node g "管理员完整 UI" green
+edge a -> b "属性"
+edge a -> c "配置"
+edge c -> f "加密存储"
+edge b -> d "静默底座"
+edge d -> g "更新通知"
+edge e -> f "启用受限"
+edge a -> g "管理员会话"
+:::
+
+图 03-05-01 里 `DO_NOT_LAUNCH` 与 `计划任务/update` 之间那条边表达的是因果：正因为静默安装不弹 UI，才更需要一条独立的、有固定节奏的更新通道，否则终端会长期停留在旧版本而无人察觉。把这条链补上，批量分发才算闭环，而不是「装完就不管」。
+
+### 2. 前置条件与环境
+
+第一是域侧基础设施：需要能下发软件安装的 GPO、一个存放 MSI 与配置模板的域内只读共享、以及能把文件复制到客户端 `%ProgramFiles%` 的启动脚本或配置管理通道。`docs/enterprise.md` 只要求「标准 MSI 特性」，不依赖 WireGuard 私有协议，因此 SCCM、Intune、PDQ 或纯粹的组策略启动脚本都可以。第二是 MSI 与架构：企业里往往同时存在 amd64、x86、arm64 终端，分发时必须按架构分组，否则 `main.go` 的 `checkForWow64()` 会在入口报「must use the native version」；`DO_NOT_LAUNCH` 属性建议在软件安装策略里统一附加，避免每台机器装完都弹托盘。第三是注册表策略的写入位置：`docs/adminregistry.md` 明确两个键都在 `HKLM\Software\WireGuard` 下，且「没有 UI 可以开启它们，将来也不计划提供」；`conf/admin_windows.go` 的 `openAdminKey()` 用 `registry.OpenKey(registry.LOCAL_MACHINE, adminRegKey, registry.QUERY_VALUE|registry.WOW64_64KEY)` 读取，`AdminBool(name)` 取 `GetIntegerValue` 后以「非 0 即真」判定。这里 `WOW64_64KEY` 是个容易踩的坑：必须由 64 位视图写入，若用 32 位 `reg.exe` 或被重定向到 `Wow6432Node`，读侧看到的值与写侧不一致，策略会静默不生效。
+
+第四是内置组与能力矩阵。`docs/adminregistry.md` 给出的受限 UI 四条限制是：配置里的公钥、私钥、预共享密钥全部被剥离；不显示版本更新弹窗、也不允许更新（但仍有一个标签页提示可用性）；禁止添加、删除、编辑、导入、导出配置；禁止退出 Manager；而「启动与停止隧道」这类基本功能保留。`docs/attacksurface.md` 补充了实现侧判定：Manager 在 `LimitedOperatorUI` 为 1 时，用 `CheckTokenMembership(CreateWellKnownSid(WinBuiltinNetworkConfigurationOperatorsSid))`（Go 侧是 `windows.CreateWellKnownSid(windows.WinBuiltinNetworkConfigurationOperatorsSid)` 配合 `IsMember`）判断会话令牌及其链接令牌是否属于 S-1-5-32-556，并为这些非管理员会话提供「更受限的 IPC 接口」。
+
+下表把两个注册表策略键、取值与效果对齐，表中不含未转义的竖线。策略的完整语义与危险脚本执行的安全代价见 04-07。
+
+| 注册表键 | 取值与读取方 | 主要效果 |
+|---|---|---|
+| `LimitedOperatorUI` | `DWORD(1)`，`AdminBool()` 读 | S-1-5-32-556 组获受限 UI，仅可启停 |
+| `DangerousScriptExecution` | `DWORD(1)`，`AdminBool()` 读 | 以 Local System 执行四个脚本键 |
+| 二者默认 | 键不存在即 `false` | 脚本不执行、无受限 UI |
+
+第五是版本与时效约定：MSI 文件名形如 `wireguard-${arch}-${version}.msi`、更新清单 `list.sec` 的 URL、计划任务的具体时间，都属时效性数值，需对照实际版本核验（见 `upstream_src/updater/`、`docs/attacksurface.md`）。`docs/adminregistry.md` 还提醒「这些键将来可能被移除」，因此生产环境应把策略当作有生命周期的配置项纳入变更管理，而不是一次性写入就永久有效。
+
+### 3. 分步操作
+
+第一步，用 GPO 分发 MSI。在组策略的「软件安装」里指向共享上的 MSI，并附加 `DO_NOT_LAUNCH` 属性抑制装完启动；`installer/wireguard.wxs` 里 `LaunchApplication` 与 `LaunchApplicationAndAbort` 两处 `NOT DO_NOT_LAUNCH` 条件因此求值为假，客户端不会弹 UI。若不用软件安装策略而用脚本，可沿用 03-02 的 `msiexec /i` 加 `/quiet`、`/norestart`、`DO_NOT_LAUNCH=1` 写法，并统一把日志写到集中目录。属性名与 MSI 文件名需对照实际版本核验。
+
+第二步，批量下发配置。把标准化后的 `.conf` 通过启动脚本或配置管理工具复制到 `%ProgramFiles%\WireGuard\Data\Configurations\`，由 Manager 服务按 03-04 的链转换成 `.conf.dpapi`。配置内容只保留最小必要键（字段见 05-02，完整配置见 04-01、04-02、04-03）；若不同部门需要不同隧道，文件名即隧道名，按部门分组下发即可。注意执行身份必须是 SYSTEM 或管理员，普通用户无权写该目录。
+
+第三步，建立更新计划任务。`docs/enterprise.md` 给出的原始命令如下，以 SYSTEM 身份每日 03:00 触发 `/update`；`main.go` 的 `case "/update"` 会遍历 `updater.DownloadVerifyAndExecute(0)` 返回的进度通道，把下载百分比与错误打到标准错误，因此命令尾部接 `2>` 重定向可留档。下面把安装、下发、计划任务与策略写入整理成一组可复用命令。
+
+```cmd
+msiexec /i \\filesrv\wg\wireguard-amd64-0.5.3.msi /quiet /norestart /l*v C:\Windows\Temp\wg-msi.log DO_NOT_LAUNCH=1
+copy \\filesrv\wg\configs\office.conf "C:\Program Files\WireGuard\Data\Configurations\office.conf"
+schtasks /create /f /ru SYSTEM /sc daily /tn "WireGuard Update" /tr "%PROGRAMFILES%\WireGuard\wireguard.exe /update" /st 03:00
+reg add HKLM\Software\WireGuard /v LimitedOperatorUI /t REG_DWORD /d 1 /f
+```
+
+第四步，启用并理解受限 UI。`reg add HKLM\Software\WireGuard /v LimitedOperatorUI /t REG_DWORD /d 1 /f` 直接取自 `docs/adminregistry.md`。`conf/admin_windows.go` 的 `AdminBool("LimitedOperatorUI")` 以 `LOCAL_MACHINE` 加 `WOW64_64KEY` 打开 `Software\WireGuard`，`GetIntegerValue` 非 0 返回真；`manager/service.go` 的 `managerService.Execute()` 在 `startProcess` 里对非管理员会话做判定：`if !isAdmin && conf.AdminBool("LimitedOperatorUI") && operatorGroupSid != nil`，随后用 `userToken.GetLinkedToken()`、`DuplicateTokenEx` 配合 `SecurityImpersonation` 得到模拟令牌，再 `impersonationToken.IsMember(operatorGroupSid)` 确认属于 S-1-5-32-556，成立则 `isOperator = true`，该会话才会被拉起受限 UI。也就是说，注册表键、组成员身份、令牌判定三者缺一不可，光写键不加组、或把用户加到别的组，都不会出现受限 UI。管理员会话不受影响，仍走 `TokenIsElevatedOrElevatable()` 与提升令牌路径拿到完整 UI。
+
+第五步，处理更新与权限的交互。`docs/adminregistry.md` 明确受限 UI「不显示更新弹窗、也不允许更新，但仍有一个标签页提示可用性」，因此 `/update` 计划任务的意义恰恰在于绕过这一限制：由 SYSTEM 身份的计划任务统一执行，不需要终端用户点击。更新链本身（`updater/` 的 `DownloadVerifyAndExecute`、`docs/attacksurface.md` 描述的 `list.sec` signify Ed25519 校验、BLAKE2b-256、`C:\Windows\Temp` 随机名、`msiexec /qb!- /i`）属于机制范畴，原理见 06-12、模块见 07-11，本册不展开，只强调它是「管理员触发、系统级执行」的通道。
+
+第六步，把脚本开关的安全代价讲清楚。`docs/adminregistry.md` 对 `DangerousScriptExecution` 的措辞是「utmost trepidation」（极度审慎）：置 1 后 tunnel 服务会以 Local System 执行 `PreUp`/`PostUp`/`PreDown`/`PostDown`，这是操作系统里最高权限，因此是恶意软件的真实目标；`tunnel/scriptrunner.go` 的 `runScriptCommand()` 在未开启时打印 `Skipping execution of script` 并返回，执行时设置 `WIREGUARD_TUNNEL_NAME` 环境变量而非 `%i`。企业批量分发里，除非有经过评审的明确需求，否则不应在域级 GPO 里统一打开这个键；把它当作日常功能普遍启用，等于把每台终端的 Local System 执行权交给了配置文件内容。配置里若出现这四个脚本键而策略未开，属「静默跳过」，不是故障（策略详见 04-07，攻击面见 08-05）。
+
+下面是核对策略与任务是否落地的查询命令，PowerShell 侧用 `Get-ItemProperty` 可避开注册表视图歧义。
+
+```powershell
+reg query "HKLM\Software\WireGuard" /s
+Get-ItemProperty -Path "HKLM:\Software\WireGuard" | Select-Object LimitedOperatorUI, DangerousScriptExecution
+schtasks /query /tn "WireGuard Update" /fo LIST
+Get-Service WireGuardManager | Select-Object Name, Status, StartType
+```
+
+### 4. 验证方法与预期结果
+
+批量分发的验证要同时覆盖「策略写没写对」「任务建没建对」「服务跑没跑对」。下面给出 `reg query` 与 `schtasks /query` 的典型输出，示例输出，具体格式需对照实际版本核验。
+
+```text
+PS> reg query "HKLM\Software\WireGuard" /s
+
+HKEY_LOCAL_MACHINE\Software\WireGuard
+    LimitedOperatorUI    REG_DWORD    0x1
+
+PS> schtasks /query /tn "WireGuard Update" /fo LIST
+
+Folder: \
+HostName:                             WKS-042
+TaskName:                             \WireGuard Update
+Status:                               Ready
+Logon Mode:                           Interactive/Background
+Last Run Time:                        2026/11/11 3:00:00
+Last Result:                          0
+Task To Run:                          "C:\Program Files\WireGuard\wireguard.exe" /update
+Schedule Type:                        Daily
+Start Time:                           3:00:00
+```
+
+逐行判读如下。`reg query` 第一段里出现 `HKEY_LOCAL_MACHINE\Software\WireGuard` 说明键确实写在 64 位视图的正确位置；`LimitedOperatorUI    REG_DWORD    0x1` 三列分别是值名、类型、数据，`0x1` 表示 DWORD 值为 1，正是 `AdminBool()` 判定为真的条件；若这里显示 `0x0`、类型不是 `REG_DWORD`、或整个键查不到，要分别检查写入命令、是否被 32 位视图重定向、以及组策略是否覆盖。输出里**不应**出现 `DangerousScriptExecution`，除非经过评审确实启用了脚本执行，看到它反而应触发一次安全复核。`schtasks /query` 部分：`Status: Ready` 表示任务已就绪而非被禁用或正在运行的异常态；`Logon Mode: Interactive/Background` 与 `/ru SYSTEM` 配合，说明任务无论用户是否登录都能执行；`Last Run Time` 为当日 03:00 附近说明节奏生效，若是从未运行过的旧值或 1999 年的占位时间，要确认任务是否真的被触发过；`Last Result: 0` 是最近一次退出码，0 表示成功，非零则要查 `/update` 的 `2>` 日志；`Task To Run` 一行显示 `"C://Program Files//WireGuard//wireguard.exe" /update`，应与 `docs/enterprise.md` 给出的命令一致，路径不符说明 `%PROGRAMFILES%` 展开或引号处理有问题；`Schedule Type: Daily` 与 `Start Time: 3:00:00` 对应 `/sc daily /st 03:00`。综合判据是：键值类型数据三者正确、任务状态 Ready、最近结果 0、执行命令与日程都符合预期；再以 `Get-Service WireGuardManager` 为 RUNNING、`Get-ChildItem Configurations` 里只有 `.conf.dpapi` 作旁证，才算一批终端部署到位。注意 `reg.exe` 与 `schtasks` 的输出字段、时间格式会随系统语言与版本变化，具体格式需对照实际版本核验，判读以语义为准。
+
+下表把验证项并排列出，命令细节见 04-06、04-07。
+
+| 验证项 | 命令 | 预期结果与判读要点 |
+|---|---|---|
+| 策略键生效 | `reg query HKLM\Software\WireGuard /s` | `LimitedOperatorUI` 为 `REG_DWORD 0x1` |
+| 64 位视图 | `Get-ItemProperty HKLM:\Software\WireGuard` | 读到值，排除 Wow6432Node 重定向 |
+| 计划任务就绪 | `schtasks /query /tn "WireGuard Update"` | Status Ready、Last Result 0 |
+| 服务运行 | `Get-Service WireGuardManager` | Status Running、StartType Automatic |
+| 配置已加密 | `Get-ChildItem Configurations` | 只有 `.conf.dpapi`，无明文 |
+| 更新日志 | `wireguard /dumplog` 或 `2>` 日志 | 无下载或签名校验错误 |
+
+### 5. 常见失败与排错
+
+第一类是 GPO 没落地：软件安装策略未链接到正确 OU、共享权限未给到计算机账户、或客户端没刷新组策略，都会表现为机器上根本没有 `wireguard.exe`。先 `gpresult /h` 看应用的 GPO，再查 MSI 日志，不要急着重装。第二类是架构与属性：把 amd64 包推给 arm64 终端会触发 `checkForWow64()` 的 native version 报错；漏配 `DO_NOT_LAUNCH` 则装完弹 UI，自动化与终端体验都受影响，排查方法见 03-02。第三类是受限 UI 不出现，这是本篇最高频的问题，按「键 → 组 → 令牌」三层排查：键是否写在 `HKLM\Software\WireGuard` 的 64 位视图（`conf/admin_windows.go` 用 `WOW64_64KEY` 读取，32 位 `reg.exe` 或被重定向到 `Wow6432Node` 会静默失效）；用户是否真的属于 Network Configuration Operators 内置组 S-1-5-32-556 而非同名自定义组；会话令牌及其链接令牌是否能通过 `manager/service.go` 的 `IsMember` 判定。三者任一不满足，`startProcess` 里的 `if !isAdmin && !isOperator` 就会关掉该会话的 UI。
+
+第四类是计划任务与更新：任务建了但 `Last Result` 非零，常见原因是 `/update` 无标准错误句柄时 `main.go` 的 `setLogFile()` 把日志丢弃、或更新链下载/签名校验失败，应给命令接 `2>` 并查 `wireguard /dumplog`；任务以非 SYSTEM 身份运行也可能因权限不足失败。第五类是「受限 UI 里点不了更新」被误报为故障：`docs/adminregistry.md` 明确受限 UI 不允许更新、也不弹更新提示，这属预期行为，更新由 SYSTEM 计划任务统一完成，不需要也不能由受限用户触发。第六类是脚本开关误开：域级 GPO 统一写入 `DangerousScriptExecution` 后，任何含 `PostUp` 的配置都会以 Local System 执行，攻击面显著扩大（见 08-05）；若非必需，应从策略中移除该键，并确认 `tunnel/scriptrunner.go` 的跳过日志重新出现。
+
+下表按现象汇总根因与动作，命令细节见 04-06、04-07、04-08。
+
+| 现象 | 可能根因 | 排查动作 |
+|---|---|---|
+| 客户端未安装 | GPO 未应用或共享不可达 | 查 gpresult 与 MSI 日志 |
+| 装完弹 UI | `DO_NOT_LAUNCH` 漏配 | 核对 wxs 条件与属性值 |
+| 受限 UI 不出现 | 键视图错或用户不在 S-1-5-32-556 | 三层排查键、组、令牌 |
+| 计划任务 Last Result 非零 | `/update` 失败或无日志句柄 | 接 `2>` 重定向并查日志 |
+| 受限 UI 无法更新 | 属策略预期限制 | 由 SYSTEM 计划任务执行 |
+| 脚本意外执行 | `DangerousScriptExecution` 被误开 | 移除键并复核安全评审 |
+
+### 6. 小结
+
+本篇把单机部署扩展成域级闭环：GPO 软件安装分发对应架构 MSI 并附加 `DO_NOT_LAUNCH`（`installer/wireguard.wxs` 两处 `NOT DO_NOT_LAUNCH` 条件抑制启动）；启动脚本把 `.conf` 复制进 `Configurations`，由 03-04 的 DPAPI 链转换为 `.conf.dpapi`；`schtasks /create /f /ru SYSTEM /sc daily /tn "WireGuard Update" /tr "C://Program Files//WireGuard//wireguard.exe /update" /st 03:00` 建立 SYSTEM 身份的每日更新通道，绕过受限 UI 的更新限制；`reg add HKLM\Software\WireGuard /v LimitedOperatorUI /t REG_DWORD /d 1 /f` 让 S-1-5-32-556 组成员获得「仅启停隧道」的受限 UI，其判定链是 `conf/admin_windows.go` 的 `AdminBool()`（LOCAL_MACHINE + WOW64_64KEY）与 `manager/service.go` 的 `IsMember` 令牌检查。验证以注册表值类型数据、计划任务状态与结果、服务状态、配置密文落盘为准。全程强调权限最小化：`DangerousScriptExecution` 默认关闭、需极度审慎，Windows 脚本钩子用 `WIREGUARD_TUNNEL_NAME` 而非 `%i`。事实依据来自 `docs/enterprise.md`、`docs/adminregistry.md`、`docs/attacksurface.md`，源码落在 `conf/admin_windows.go`、`manager/service.go`、`main.go`、`installer/wireguard.wxs` 与 `updater/`。字段见 05-08、05-09，策略与命令见 04-06、04-07，Manager 进程模型与更新校验见 06-10、06-12，Manager 与 updater 模块见 07-08、07-11。下一篇作为本册收尾，讲清卸载顺序、升级链、驱动移除与跨架构迁移（配置见 04-04、04-06 ｜ 字段见 05-08 ｜ 原理见 06-12 ｜ 模块见 07-03、07-11）。
+
+## 03-06 卸载、升级、驱动移除与多架构迁移
+
+### 1. 目标与拓扑
+
+部署册的最后一篇处理「退出」：把一台机器上的 wireguard-windows 干净地卸掉、把版本安全地升上去、把内核驱动彻底移除、以及在 amd64、x86、arm64 之间迁移时不出岔子。这几件事看似是安装的逆操作，实则顺序敏感度更高——服务、配置、适配器、驱动、注册表键之间有严格依赖，先删哪一个、后删哪一个，直接决定会不会留下一个半残状态：比如配置还在但服务没了、适配器还在导致驱动卸不掉、或者注册表里残留的策略让下一次安装行为诡异。本篇的目标就是给出一条可复现、可验证、可回滚的清理与升级顺序。
+
+先把对象列清楚。动态对象是服务：`WireGuardManager` 与各条 `WireGuardTunnel$<name>`；持久对象是 `%ProgramFiles%\WireGuard\Data\Configurations\` 下的 `.conf.dpapi`、`log.bin`、以及 `HKLM\Software\WireGuard` 下的策略键；内核对象是 WireGuardNT 驱动与运行时创建的适配器。`docs/enterprise.md` 对适配器生命周期有明确一句：「tunnel 服务在启动时创建网络适配器、在停止时销毁」；紧接着给出 `/removedriver` 的前提——「如果没有更多网络适配器，驱动可用 `wireguard /removedriver` 移除」。这句话把「先停隧道、再移驱动」的顺序钉死了。`docs/adminregistry.md` 又补了一句：「卸载程序会清理整个 `HKLM\Software\WireGuard`」，说明注册表策略不需要管理员手工逐键删除，但前提是走的是正规卸载路径。
+
+拓扑上，清理是自顶向下的：先让所有隧道服务停止（适配器随之销毁），再停并删 Manager 服务，然后由 MSI 卸载程序清理文件、配置目录、适配器与注册表，最后在确认「已无适配器」后调 `/removedriver` 移除驱动。升级则是另一条链：`/update` 经 `updater/` 完成签名校验后以 `msiexec /qb!- /i` 就地升级，属于「不清理、只替换」；而跨架构迁移因为涉及不同 MSI 与 `checkForWow64()` 的原生约束，必须退回「先卸载、再重装」。本册只给最小必要命令，开关全集见 04-04、服务与驱动命令见 04-06、注册表策略见 04-07（字段见 05-08、05-09 ｜ 配置见 04-04、04-06 ｜ 原理见 06-12 ｜ 模块见 07-03、07-11）。
+
+下图把「停隧道 → 删隧道服务 → 停删 Manager → MSI 卸载 → 移除驱动 → 核验残留」这条清理顺序画出来，红色节点标出会被清除的注册表键。
+
+:::figure id=03-06-01 | name=卸载升级与驱动移除顺序 | dir=TD
+node a "停止隧道服务<br/>WireGuardTunnel$name" blue
+node b "/uninstalltunnel<br/>service 删服务" teal
+node c "停止 Manager<br/>WireGuardManager" teal
+node d "/uninstallmanager<br/>service 删服务" teal
+node e "MSI /x 卸载<br/>清理配置目录" purple
+node f "wireguard<br/>/removedriver" amber
+node g "pnputil 核验<br/>驱动残留" amber
+node h "注册表<br/>HKLM WireGuard 清空" red
+edge a -> b "先停隧道"
+edge b -> c "再停管理"
+edge c -> d "删服务"
+edge d -> e "卸载包"
+edge e -> f "移除驱动"
+edge f -> g "核验"
+edge e -> h "清理键"
+:::
+
+图 03-06-01 里 `MSI /x` 与 `wireguard /removedriver` 是两条独立的清理通道：前者由 WiX 自定义动作负责文件、配置与适配器，后者由 `main.go` 的 `case "/removedriver"` 调 `driver.Uninstall()` 负责驱动本身。二者缺一不可，且顺序不能颠倒——适配器没销毁就调 `/removedriver`，驱动仍处于占用状态，必然失败。
+
+### 2. 前置条件与环境
+
+第一是权限与身份：停止服务、删除服务、运行 MSI 卸载、移除驱动、清理 HKLM 注册表，全部需要管理员或 Local System 身份；计划任务若承担卸载，也要以 SYSTEM 运行。第二是理解「清理什么、保留什么」：正规卸载会清掉配置目录与整个 `HKLM\Software\WireGuard`，因此若这台机器上的隧道配置还有价值，卸载前必须先按 `docs/enterprise.md` 用 UI 导出功能把配置导成明文另存——直接备份 `.conf.dpapi` 到别处通常无效，因为 `conf/dpapi/dpapi_windows.go` 的 `Encrypt()` 未使用跨机器标志、`Decrypt()` 还会校验隧道名，密文与加密时的账户机器上下文绑定（边界需对照实际版本核验，见 03-04）。这一步是回滚预案的地基，跳过它等于放弃配置。
+
+第三是熟悉卸载程序内部顺序。`installer/wireguard.wxs` 里与清理相关的自定义动作依次为：`EvaluateWireGuardServices`（`After="FindRelatedProducts"`，升级时评估已有服务）、`KillWireGuardProcesses`（`After="StopServices"`，`Impersonate="no"`，清理残留进程）、`RemoveConfigFolder`（`After="DeleteServices"`，卸载时清配置目录）、`RemoveAdapters`（`Before="RemoveFiles"`，`Impersonate="no"`，清理适配器）。这些动作解释了为什么「MSI 卸载」不只是删文件：它同时处理服务、进程、配置与适配器，管理员不必也不应手工去删 `Configurations` 目录。第四是升级与迁移的差异：就地升级走 `/update`，跨架构迁移必须走卸载重装，因为 `main.go` 的 `checkForWow64()` 要求进程原生架构一致，x86 包不能留在 amd64 或 arm64 系统上凑合（版本基准与三种 MSI 见总纲第 9 节，具体文件名需对照实际版本核验）。
+
+下表把清理对象、负责动作与顺序对齐，表中不含未转义的竖线。
+
+| 顺序 | 清理对象 | 负责动作或命令 |
+|---|---|---|
+| 1 | 各隧道服务与适配器 | `/uninstalltunnelservice` 或停服务 |
+| 2 | `WireGuardManager` 服务 | `/uninstallmanagerservice` |
+| 3 | 文件、配置目录、适配器 | `msiexec /x` 的 WiX 自定义动作 |
+| 4 | `HKLM\Software\WireGuard` | 卸载程序清理整个键 |
+| 5 | WireGuardNT 驱动 | 无适配器后 `wireguard /removedriver` |
+
+第五是产物与时效约定：`quickinstall.bat` 演示了开发机上的「先卸旧、再装新」循环——用 `reg query HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall /s /d /c /e /f WireGuard` 配合 `findstr` 找出旧版本 GUID 后逐个 `msiexec /qb /x`，再 `msiexec /qb /i` 安装新 MSI；生产环境应改用 `/quiet` 与日志。更新链里的 `list.sec`、`C:\Windows\Temp` 随机名、MSI 文件名与版本号都属时效性事实，需对照实际版本核验，可定位到 `upstream_src/updater/`、`upstream_src/version/version.go` 与 `docs/attacksurface.md`。
+
+### 3. 分步操作
+
+第一步，逐条停止并删除隧道服务。对每一条已安装的隧道执行 `wireguard /uninstalltunnelservice <隧道名>`，它经 `main.go` 的 switch 调 `manager/install.go` 的 `UninstallTunnel(name)`：`ServiceNameOfTunnel(name)` 拼出服务名，`OpenService` 后 `service.Control(svc.Stop)`、`service.Delete()`，并容忍 `ERROR_SERVICE_MARKED_FOR_DELETE`。停止服务的同时，运行时创建的 WireGuardNT 适配器被销毁，这是后面 `/removedriver` 能成功的前提。注意传的是隧道名而非完整服务名。若隧道很多，可先用 `conf.ListConfigNames()` 对应的思路枚举配置名，或 `sc query` 过滤 `WireGuardTunnel$` 前缀逐个处理。
+
+第二步，停并删 Manager 服务：`wireguard /uninstallmanagerservice` 对应 `manager/install.go` 的 `UninstallManager()`，它 `OpenService("WireGuardManager")` 后 `Control(svc.Stop)`、`Delete()`、`Close()`。顺序上务必先隧道后 Manager，因为 Manager 进程里的 `manager/tunneltracker.go` 会订阅服务数据库变化并跟踪隧道服务状态，先删 Manager 会让后续跟踪与 IPC 通知失去宿主，虽不影响 SCM 删除服务本身，却容易在日志里留下一串无意义的错误。
+
+第三步，用 MSI 正规卸载并留日志。走卸载程序而不是手工删目录，是为了让 `installer/wireguard.wxs` 里的 `RemoveConfigFolder`、`RemoveAdapters`、`KillWireGuardProcesses` 都执行到位；`docs/adminregistry.md` 所述「清理整个 `HKLM\Software\WireGuard`」也由这一步完成。下面是把上述步骤与升级、驱动移除、架构迁移整理成的一组命令。
+
+```cmd
+wireguard /uninstalltunnelservice office
+wireguard /uninstallmanagerservice
+msiexec /x "\\filesrv\wg\wireguard-amd64-0.5.3.msi" /quiet /norestart /l*v C:\Windows\Temp\wg-uninstall.log
+wireguard /removedriver 2> C:\Windows\Temp\wg-removedriver.log
+pnputil /enum-drivers | findstr /i wireguard
+```
+
+第四步，移除驱动并核验。`main.go` 的 `case "/removedriver"` 调 `driver.Uninstall()`；`docs/enterprise.md` 明确它只在「没有更多网络适配器」时适用，并给出 `wireguard /removedriver 2> C:\path\to\removal\log.txt` 的日志写法。若此时 `Get-NetAdapter` 仍能看到 WireGuard 接口，说明还有隧道服务在跑或适配器没销毁，回头补第一步，不要在占用状态下反复重试。第五步，注册表清理核对：`reg query HKLM\Software\WireGuard /s` 应查不到键；若残留，说明走的是非正规卸载（比如只删了文件），需手工清理并复核 `conf/admin_windows.go` 的 `openAdminKey()` 读取路径，避免旧策略影响下一次安装。
+
+第六步，就地升级链。`wireguard /update` 对应 `main.go` 中遍历 `updater.DownloadVerifyAndExecute(0)` 进度通道的分支；`docs/attacksurface.md` 给出完整链路：服务端以 `b2sum -l 256 *.msi > list` 生成清单、用 signify 私钥签出 `list.sec`，客户端经 TLS 下载并验 Ed25519 签名，找同架构更高版本的 `wireguard-${arch}-${version}.msi`，下载到 `C:\Windows\Temp` 下 256 位随机名文件（权限 `O:SYD:PAI(A;;FA;;;SY)(A;;FR;;;BA)`，并以 `MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT)` 安排重启清理），验 BLAKE2b-256，最后以 `msiexec.exe /qb!- /i` 执行。`updater/msirunner.go` 的 `msiTempFile()` 生成该临时文件、`runMsi()` 用 `os.StartProcess` 以 `/qb!-`、`/i` 参数启动 `msiexec.exe`，并在 `ExclusivePath()` 里先关闭文件句柄以满足 msiexec 的独占要求。计划任务每日触发 `/update` 的写法见 03-05。升级不改配置、不动服务定义，属「替换可执行文件」；机制细节见 06-12、模块见 07-11。
+
+第七步，跨架构迁移。三种 MSI 分别对应 amd64、x86、arm64，`checkForWow64()` 要求原生运行，因此从一种架构迁到另一种不能靠 `/update` 就地完成（更新链只找「同架构更高版本」），必须走「导出配置备份 → 完整卸载 → 安装目标架构 MSI → 重新导入配置 → 按 03-03 重建隧道服务」的链路。由于 `.conf.dpapi` 与账户机器上下文绑定，备份必须是 UI 导出的明文，重新导入后由 Manager 重新加密。下面给出迁移后的重装与复核命令。
+
+```powershell
+msiexec /i "\\filesrv\wg\wireguard-arm64-0.5.3.msi" /quiet /norestart /l*v C:\Windows\Temp\wg-migrate.log DO_NOT_LAUNCH=1
+& "C:\Program Files\WireGuard\wireguard.exe" /installmanagerservice
+Copy-Item C:\Backup\office.conf "C:\Program Files\WireGuard\Data\Configurations\office.conf"
+& "C:\Program Files\WireGuard\wireguard.exe" /installtunnelservice "C:\Program Files\WireGuard\Data\Configurations\office.conf"
+sc.exe query 'WireGuardTunnel$office'
+```
+
+升级与卸载阶段都建议用 `wireguard /dumplog` 留档；`docs/enterprise.md` 给出的 `wireguard /update 2> C:\path\to\update\log.txt` 与 `/removedriver 2> C://Temp//removedriver.log` 同款写法可避免无标准错误句柄时 `setLogFile()` 把日志丢弃、错误改以弹窗呈现。所有命令与开关的权威清单见 04-04、04-06，本册不重列。
+
+### 4. 验证方法与预期结果
+
+清理是否干净，要用「查不到」来证明，而不是「没报错」。下面给出一组卸载完成后的典型查询输出，示例输出，具体格式需对照实际版本核验。
+
+```text
+PS> sc query WireGuardManager
+[SC] EnumQueryServicesStatus:OpenService FAILED 1060:
+指定的服务未安装。
+
+PS> reg query "HKLM\Software\WireGuard" /s
+错误: 系统找不到指定的注册表项或值。
+
+PS> Get-NetAdapter | Where-Object { $_.InterfaceDescription -like "*WireGuard*" }
+（无输出）
+
+PS> pnputil /enum-drivers | findstr /i wireguard
+（无输出）
+```
+
+逐行判读如下。`sc query WireGuardManager` 返回 `OpenService FAILED 1060`，其中 1060 即 `ERROR_SERVICE_DOES_NOT_EXIST`，这一行不是命令失败，恰恰是「Manager 服务已被删除」的正面证据；同理对每条 `WireGuardTunnel$<name>` 也应得到 1060，若某条仍返回 `STATE: 4 RUNNING`，说明第一步漏了那条隧道，必须补停补删，否则适配器不会销毁、`/removedriver` 会失败。`reg query` 输出「系统找不到指定的注册表项或值」说明整个 `HKLM\Software\WireGuard` 已被卸载程序清掉，与 `docs/adminregistry.md` 的承诺一致；若还能查到 `LimitedOperatorUI` 或 `DangerousScriptExecution`，说明走的是非正规卸载，残留策略可能让下次安装出现「脚本意外执行」或「受限 UI 莫名出现」，必须手工清除。`Get-NetAdapter` 过滤 `WireGuard` 后无输出，证明运行时创建的适配器都已随服务停止而销毁，这是 `/removedriver` 的前置条件；若这里还有接口，回到第一步而不是继续。`pnputil /enum-drivers | findstr /i wireguard` 无输出，说明驱动已从驱动存储中移除，`driver.Uninstall()` 生效。四条合起来的判据是：所有相关服务查不到、注册表键查不到、适配器无残留、驱动枚举无残留；再配合 `/removedriver` 的 `2>` 日志无错误、`wireguard /dumplog` 无致命记录，才算一次干净的退出。注意 `sc`、`reg`、`pnputil` 的错误码字面与本地化文案会随系统语言与版本变化，具体格式需对照实际版本核验，判读以错误码语义与「有无输出」为准。
+
+升级场景的验证口径不同：升级后服务应仍在、`WireGuardManager` 为 RUNNING、配置目录里的 `.conf.dpapi` 保持不变、`wg show` 握手与流量正常，只是可执行文件版本变化；跨架构迁移后则还要确认 `sc qc` 的 `BINARY_PATH_NAME` 指向新装的原生 `wireguard.exe`、且 `checkForWow64()` 不再报 native version 要求。下表把验证项并排列出。
+
+| 验证项 | 命令 | 预期结果与判读要点 |
+|---|---|---|
+| Manager 服务已删 | `sc query WireGuardManager` | 返回 1060 服务未安装 |
+| 隧道服务已删 | `sc query WireGuardTunnel$name` | 每条都返回 1060 |
+| 注册表已清 | `reg query HKLM\Software\WireGuard /s` | 查不到键或值 |
+| 适配器无残留 | `Get-NetAdapter` 过滤 WireGuard | 无输出 |
+| 驱动已移除 | `pnputil /enum-drivers` 过滤 wireguard | 无输出 |
+| 升级后仍可用 | `wg show <name>` 与 `Get-Service` | 服务在、握手新鲜 |
+
+### 5. 常见失败与排错
+
+第一类是顺序错误：先删 Manager 再删隧道、或跳过 `/uninstalltunnelservice` 直接 `msiexec /x`，都可能让适配器来不及销毁、`/removedriver` 报占用失败。正确做法永远是先逐条停隧道、再停 Manager、再 MSI 卸载、最后移驱动。第二类是 `ERROR_SERVICE_MARKED_FOR_DELETE`：`UninstallTunnel()` 与 `UninstallManager()` 都调用了 `Delete()`，Windows 会先把服务标记为删除，直到所有句柄关闭才真正消失；`manager/install.go` 的 `InstallTunnel()` 里专门有循环 `OpenService` 等待该状态结束。反复执行卸载命令看到「服务标记为删除」时，等待或重启即可，不要手工删注册表服务项。
+
+第三类是适配器残留导致驱动卸不掉：`Get-NetAdapter` 仍能看到 WireGuard 接口时调 `/removedriver` 必然失败，因为 `docs/enterprise.md` 的前提是「没有更多网络适配器」；也可能是某个隧道服务没停干净，或 `installer/wireguard.wxs` 的 `RemoveAdapters` 自定义动作没执行到位。第四类是升级失败回滚：`/update` 链里任何一步——TLS 下载、signify Ed25519 签名校验、BLAKE2b-256 校验、`msiexec /qb!- /i` 执行——出错都会让升级中止，此时旧版本通常仍在，先查 `/update` 的 `2>` 日志与 `wireguard /dumplog` 定位，再决定是否改用 MSI 就地修复或重装；不要删配置目录「重来」。第五类是跨架构迁移踩 WOW64：把 x86 包装到 amd64 或 arm64 机器上，`main.go` 的 `checkForWow64()` 会在入口 `fatalf("You must use the native version of WireGuard on this computer.")`，唯一解法是卸干净后装对应架构 MSI，不能靠 `/update` 混过去（更新链只找同架构更高版本）。
+
+第六类是配置丢失与残留策略：卸载前没导出明文配置，卸载后 `RemoveConfigFolder` 已把 `.conf.dpapi` 清掉，只能重新生成密钥并到对端登记新公钥；`HKLM\Software\WireGuard` 若没被正规卸载清理，`conf/admin_windows.go` 的 `AdminBool()` 仍会读到旧值，导致下次安装后 `DangerousScriptExecution` 或 `LimitedOperatorUI` 意外生效。第七类仍是脚本钩子：`tunnel/scriptrunner.go` 的 `runScriptCommand()` 默认跳过四个脚本键、Windows 用 `WIREGUARD_TUNNEL_NAME` 而非 `%i`，卸载阶段若依赖 `PostDown` 做清理动作，必须确认 `DangerousScriptExecution` 确实开启且动作幂等，否则「脚本没跑」会被误当成「清理没做」（策略见 04-07，攻击面见 08-05）。
+
+下表按现象汇总根因与动作，命令细节见 04-06、04-08。
+
+| 现象 | 可能根因 | 排查动作 |
+|---|---|---|
+| `/removedriver` 失败 | 适配器或隧道服务残留 | 补停隧道、确认无适配器再试 |
+| 服务一直标记删除 | MARKED_FOR_DELETE 未消失 | 等待或重启，勿手工删注册表 |
+| 升级后仍是旧版本 | 下载或签名校验失败 | 查 `/update` 的 `2>` 日志 |
+| 迁移报 native version | MSI 架构与 CPU 不一致 | 卸载后装对应架构 MSI |
+| 配置无法恢复 | 卸载前未导出明文 | 重新生成密钥并到对端登记 |
+| 旧策略仍生效 | 注册表键未被正规卸载清理 | 手工清除 HKLM 残留 |
+
+### 6. 小结
+
+本篇给整个部署册收尾。卸载顺序是「逐条 `/uninstalltunnelservice`（`UninstallTunnel()` 停止并删服务、适配器随之销毁）→ `/uninstallmanagerservice`（`UninstallManager()`）→ `msiexec /x` 让 `installer/wireguard.wxs` 的 `RemoveConfigFolder`、`RemoveAdapters`、`KillWireGuardProcesses` 清理文件与配置目录，并清空整个 `HKLM\Software\WireGuard` → 在确认无适配器后 `wireguard /removedriver`（`main.go` 调 `driver.Uninstall()`）→ 用 `sc`、`reg`、`Get-NetAdapter`、`pnputil` 四处「查不到」验证干净」。卸载前必须用 UI 导出明文配置作回滚预案，因为 `.conf.dpapi` 与账户机器上下文绑定。升级走 `/update` → `updater.DownloadVerifyAndExecute` → `list.sec` signify Ed25519 校验 → 同架构更高版本 MSI → `C:\Windows\Temp` 随机名 → BLAKE2b-256 → `msiexec /qb!- /i`（`updater/msirunner.go` 的 `msiTempFile()` 与 `runMsi()`），属不清理就地替换；跨架构迁移因 `checkForWow64()` 的原生约束必须卸载重装，并重新导入配置。事实依据来自 `docs/enterprise.md`、`docs/adminregistry.md`、`docs/attacksurface.md` 与 `quickinstall.bat`，源码落在 `main.go`、`manager/install.go`、`installer/wireguard.wxs`、`driver/`、`updater/`、`conf/dpapi/dpapi_windows.go`。字段见 05-08、05-09，命令与策略见 04-04、04-06、04-07，更新校验机制见 06-12，driver 与 updater 模块见 07-03、07-11。
+
+回看 03 全册，六篇依次回答了「单机怎么上线」「无人值守怎么装」「怎么只跑一条服务」「配置怎么被保护」「域里怎么批量铺」「怎么干净退出」，始终只给最小必要配置、把全集交给 04（配置与命令唯一权威源）、把字段交给 05、把机制交给 06、把模块能力交给 07（字段见 05-xx ｜ 配置见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）。同时反复守住能力边界：这是 Windows 官方客户端，内核数据面由外部 WireGuardNT 提供，不是 Linux `wg-quick`、不是 wireguard-go、不是服务端发行版；脚本钩子默认不执行，Windows 用 `WIREGUARD_TUNNEL_NAME` 而非 `%i`。后续排障、性能基准与上线检查表由 08 册承接（模块见 07-05 ｜ 原理见 06-11 ｜ 配置见 04-08）。
+
+### 全册交叉引用速查
+
+下表把 03 册各篇与其余各册的对应关系集中列出，便于按图索骥，表中不含未转义的竖线。
+
+| 本篇 | 配置权威源 | 字段权威源 | 机制权威源 | 模块权威源 |
+|---|---|---|---|---|
+| 03-01 | 04-01 至 04-03 | 05-02 | 06-01、06-05 | 07-01、07-05 |
+| 03-02 | 04-04、04-06 | 05-08 | 06-01、06-10 | 07-08 |
+| 03-03 | 04-03、04-06 | 05-08 | 06-05、06-06 | 07-05 |
+| 03-04 | 04-01 至 04-03 | 05-04 | 06-03 | 07-02 |
+| 03-05 | 04-06、04-07 | 05-09 | 06-10、06-12 | 07-11 |
+| 03-06 | 04-04、04-06 | 05-09 | 06-12 | 07-03、07-11 |

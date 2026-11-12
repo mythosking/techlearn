@@ -1,0 +1,1420 @@
+# wireguard-windows 技术资料 · 08 运维、性能基准与排障（分片 A）
+
+## 08-01 日志与状态采集实战
+
+### 1. 目标与拓扑
+
+运维现场最稀缺的资源不是命令，而是证据。一次隧道故障发生后，适配器可能已经被销毁、路由可能已经回滚、进程可能已经被重启，等到"再复现一次"时，现场参数早已变化。本篇把采集本身当成一项有交付物的操作：在不对故障机做写操作的前提下，产出一个带统一时间基准、可以离线复核、能够直接交给二线或驱动维护者的证据包。衡量采集是否合格只看三条：能不能回答"坏在哪一层"、能不能保留"坏之前的最后一批日志"、能不能给出"当时的最小状态"。
+
+采集对象天然是分散的。Windows 官方客户端由内核驱动 WireGuardNT 与三个用户态部分组成（`docs/attacksurface.md`），因此证据不在一个文件里：共享环形日志 `log.bin` 记录 manager、各隧道服务与驱动回调；服务控制管理器（SCM）记录服务生命周期与退出码；`wg show` 暴露运行时的 peer、握手时间与字节计数；IP Helper 暴露地址、路由、DNS 与接口 MTU；WFP 的状态决定全隧道场景下哪些流量被允许。只抓其中一项，很容易得到"看起来正常"的假象，例如 `wg show` 显示接口存在但握手停在数分钟前，此时真正的原因可能藏在日志的 DNS 解析阶段，也可能藏在路由表里。
+
+本篇使用的拓扑是一台 Windows 11 客户端，安装两条隧道。第一条名为 `corp`，单 peer、`AllowedIPs` 含 `0.0.0.0/0` 与 `::/0`，因此会进入 kill-switch 模式；第二条名为 `split`，只承载 `10.0.0.0/8`，走 Windows 常规路由与 DNS 行为。两条隧道的远端各有一个 peer，采集端优先选本机，其次选同网段管理机。之所以要同时准备两条隧道，是因为全隧道与分流隧道在日志、路由与 DNS 上的表现差异很大，采集脚本必须能覆盖两种形态。
+
+一次故障窗口内各采集面的关系如图 08-01-01 所示：时间与版本基线先行，四类状态并行采集，最后统一归档并计算校验和。
+
+:::figure id=08-01-01 | name=故障现场的证据采集面与流向 | dir=TD
+node n1 "故障现象" red
+node n2 "时间与版本基线" blue
+node n3 "共享环形日志 log.bin" teal
+node n4 "wg show 运行时" amber
+node n5 "IP Helper 网络状态" purple
+node n6 "SCM 与系统事件" gray
+node n7 "证据包与校验和" green
+edge n1 -> n2 "先定基准"
+edge n2 -> n3 "一次性 dump"
+edge n2 -> n4 "握手与计数"
+edge n2 -> n5 "地址路由 DNS"
+edge n2 -> n6 "服务生命周期"
+edge n3 -> n7 "归档"
+edge n4 -> n7 "归档"
+edge n5 -> n7 "归档"
+edge n6 -> n7 "归档"
+:::
+
+必须先划清能力边界。这里的日志不含私钥、预共享密钥与明文载荷，`wg show` 也永远把私钥显示为隐藏；`wireguard.exe` 没有向 Windows 事件日志注册自定义提供程序，系统日志里能看到的只是 SCM 对服务启动、停止、异常终止的记录；`/dumplog` 读取的是共享内存映射而不是滚动文本文件，因此不能用普通文本跟随工具直接监控。理解这三点，才不会在"为什么事件查看器里没有 WireGuard 日志"上浪费时间。
+
+### 2. 前置条件与环境
+
+第一是权限。采集需要本地管理员或 LocalSystem。原因不是命令本身挑剔，而是对象 ACL 严格：`%ProgramFiles%\WireGuard\Data` 目录由 `conf/path_windows.go` 的 `RootDirectory()` 以 `O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)` 创建，加密配置只给 SYSTEM 完全控制、给管理员删除权。普通用户既读不到 `.conf.dpapi`，也无法完成 `wg show` 的完整查询。受限 UI 模式（`HKLM\Software\WireGuard\LimitedOperatorUI` 为 1）虽然能看隧道列表，但被明确拒绝私钥与编辑能力，不适合作为采集身份（策略细节见 04-07）。
+
+第二是可执行文件的一致性。应使用安装目录下的 `wireguard.exe` 与 `wg.exe`，不要从旧版本目录或开发机构建产物里随便取一个。`/dumplog` 本身只做内存映射读取，格式由 `ringlogger` 的编译期常量决定；但 `wg` 的字段集合会随版本变化，混用旧工具可能读不到新字段，具体差异需对照实际版本核验（命令全集见 04-05）。
+
+第三是标准输出。`main.go` 的 `/dumplog` 分支先调用 `windows.GetStdHandle(windows.STD_OUTPUT_HANDLE)`，句柄为 0 就直接 `fatal("Stdout must be set")`，随后才去解析日志路径。这意味着在任何没有控制台的执行环境里，失败原因是"没有 stdout"，而不是"日志不存在"。用 `Start-Process -RedirectStandardOutput` 或 `cmd /c` 重定向可以稳定提供句柄。
+
+第四是日志容量。`ringlogger/ringlogger.go` 顶部定义了 `maxLines = 2048`、`maxLogLineLength = 512`、`maxTagLength = 5`。三个用户态组件与驱动回调共享同一块环形区，每行带 `[TUN]`、`[GUI]` 或 `[DMP]` 标签。2048 行是全体写入者的总量，不是每个进程各自一份；一次高频重连、一次开启驱动日志后的批量握手失败，就足以在几分钟内覆盖最早的现场。因此第一条纪律是"先 dump，再重启"，而不是"重启看看好了没"。
+
+第五是时间基准。每行时间戳由写入进程各自调用 `time.Now().UnixNano()` 得到，源码注释里明确标注了跨进程写入的竞争："This isn't synchronized with the fetch_add below, so items might be slightly out of order." 所以日志只能用于判断大致顺序，不能当作严格的全序时钟。采集开始时记录一次当前 UTC 时间与 `w32tm /query /status`，后续把事件日志、抓包、用户复现时刻都对齐到这个基准。
+
+第六是输出目录与只读原则。建议使用 `C:\wg-evidence\<yyyyMMdd-HHmmss>\`，全过程不修改配置、不重启服务、不删除适配器、不执行 `/removedriver`。如果业务方坚持"先重启试试"，正确顺序是先跑完第 3 节的第 2 步与第 4 步，再谈变更。最后是编码问题：Windows PowerShell 5.1 的 `>` 默认写 UTF-16LE，很多日志平台会把它当二进制；脚本统一用 `Out-File -Encoding utf8`，或者用 `Start-Process` 的原生重定向保留字节。
+
+### 3. 分步操作
+
+第 1 步，建立现场基线。目标是把"机器是谁、版本是什么、服务在什么状态"固定下来。下面的脚本创建带时间戳的目录，并写出版本、服务、适配器三份基线文件。
+
+```powershell
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$out = Join-Path 'C:\wg-evidence' $stamp
+New-Item -ItemType Directory -Path $out -Force | Out-Null
+$wgDir = Join-Path $env:ProgramFiles 'WireGuard'
+Get-Date -Format o | Out-File "$out\00-time.txt" -Encoding utf8
+w32tm /query /status | Out-File "$out\00-w32time.txt" -Encoding utf8
+& "$wgDir\wg.exe" --version 2>&1 | Out-File "$out\01-wg-version.txt" -Encoding utf8
+Get-Service -Name 'WireGuard*' | Format-List Name,Status,StartType | Out-File "$out\02-services.txt" -Encoding utf8
+Get-NetAdapter | Format-Table Name,InterfaceDescription,Status,LinkSpeed -AutoSize | Out-File "$out\03-adapters.txt" -Encoding utf8
+```
+
+第 2 步，一次性取出全部历史。`/dumplog` 不带 `/tail` 时走 `ringlogger.DumpTo` 的非连续分支，最终调用 `WriteTo`；`WriteTo` 从当前写指针 `nextIndex` 开始绕环一周，因此输出顺序是"从最旧到最新"，最后几行才是最新现场。很多人误以为第一行是最新，结果把最早的启动记录当成了故障瞬间。这里用 `Start-Process` 而不是管道，既避免 PowerShell 的编码转换，也能拿到退出码。
+
+```powershell
+$p = Start-Process -FilePath "$wgDir\wireguard.exe" -ArgumentList '/dumplog' -NoNewWindow -Wait -PassThru `
+     -RedirectStandardOutput "$out\10-dumplog.txt" -RedirectStandardError "$out\10-dumplog.err.txt"
+"exit=$($p.ExitCode)" | Out-File "$out\10-dumplog.exit.txt" -Encoding utf8
+```
+
+第 3 步，连续跟随。`/dumplog /tail` 进入 `DumpTo` 的连续分支，游标从 `CursorAll` 开始；`FollowFromCursor` 把起点设为 `nextIndex`，即环形区里最旧的一格，因此它会先按"从最旧到最新"输出当前保留的全部历史，再每 100 毫秒轮询并跟随新行。它不是只给末尾若干行，也不会在结束时给出汇总；停止由外部 `Stop-Process` 控制。历史由第 2 步固化，tail 负责覆盖复现瞬间，两者文件名按 `10-` 与 `11-` 排序后可以按时间拼接。
+
+```powershell
+$tail = Start-Process -FilePath "$wgDir\wireguard.exe" -ArgumentList '/dumplog','/tail' -NoNewWindow -PassThru `
+        -RedirectStandardOutput "$out\11-tail.txt" -RedirectStandardError "$out\11-tail.err.txt"
+Start-Sleep -Seconds 20
+Stop-Process -Id $tail.Id
+```
+
+一次性导出与连续跟随并不是两套实现，而是同一条读取链路上的两个分支：前者调用 `WriteTo` 绕环输出，后者先绕环输出历史再按游标跟随。其调用关系如图 08-01-02 所示。
+
+:::figure id=08-01-02 | name=/dumplog 读取共享环形日志的链路 | dir=TD
+node n1 "wireguard.exe /dumplog" blue
+node n2 "conf.LogFile(false)" teal
+node n3 "log.bin 文件映射" amber
+node n4 "ringlogger.DumpTo" purple
+node n5 "DMP 只读标签" gray
+node n6 "stdout 或管道" green
+edge n1 -> n2 "定位路径"
+edge n2 -> n3 "打开文件"
+edge n3 -> n4 "CreateFileMapping"
+edge n4 -> n5 "以 DMP 读取"
+edge n5 -> n6 "逐行格式化"
+:::
+
+第 4 步，抓运行时状态。先不带参数列出全部接口，再对可疑隧道单独查询。`wg show` 走的是本地驱动 IOCTL，不经过网络，所以即使 kill-switch 正在阻断管理流量，本机的查询仍然可用。需要机器可读格式时使用 `wg show <name> dump`，字段顺序与版本差异见 04-05，本篇只讲判读。
+
+```powershell
+& "$wgDir\wg.exe" show 2>&1 | Out-File "$out\20-wg-show-all.txt" -Encoding utf8
+& "$wgDir\wg.exe" show corp 2>&1 | Out-File "$out\21-wg-show-corp.txt" -Encoding utf8
+& "$wgDir\wg.exe" show split 2>&1 | Out-File "$out\22-wg-show-split.txt" -Encoding utf8
+```
+
+第 5 步，抓网络状态。隧道名就是适配器别名，因为 `driver.CreateAdapter(config.Name, "WireGuard", deterministicGUID(config))` 把配置名直接用作适配器名。需要采集接口 MTU、地址、路由与 DNS 四组，其中 MTU 要看 `NlMtu` 而不是链路层 `LinkSpeed`；未在配置里写 `MTU` 时，这个值由 `tunnel/mtumonitor.go` 按默认路由接口 MTU 减 80 动态设置，并带 IPv4 576、IPv6 1280 的下限。
+
+```powershell
+Get-NetIPInterface -InterfaceAlias corp -AddressFamily IPv4 |
+    Format-List InterfaceAlias,NlMtu,ConnectionState,Forwarding | Out-File "$out\30-ipif-corp.txt" -Encoding utf8
+Get-NetIPAddress -InterfaceAlias corp | Format-Table AddressFamily,IPAddress,PrefixLength -AutoSize |
+    Out-File "$out\31-addr-corp.txt" -Encoding utf8
+Get-NetRoute -InterfaceAlias corp | Format-Table DestinationPrefix,NextHop,RouteMetric -AutoSize |
+    Out-File "$out\32-route-corp.txt" -Encoding utf8
+Get-DnsClientServerAddress -InterfaceAlias corp | Format-Table AddressFamily,ServerAddresses -AutoSize |
+    Out-File "$out\33-dns-corp.txt" -Encoding utf8
+```
+
+第 6 步，抓服务与系统事件。隧道服务名由 `conf/name.go` 的 `ServiceNameOfTunnel()` 生成，固定为 `WireGuardTunnel$<name>`；`$` 在 PowerShell 双引号里会被当变量前缀，所以查询时要转义或用单引号。SCM 的退出码与自定义错误码含义不同，前者是 Windows 服务框架的口径，后者来自 `services/errors.go`，两者的映射关系放到 08-03 展开。
+
+```powershell
+sc.exe query 'WireGuardTunnel$corp' | Out-File "$out\40-scm-corp.txt" -Encoding utf8
+sc.exe qc 'WireGuardTunnel$corp' | Out-File "$out\41-scm-qc-corp.txt" -Encoding utf8
+Get-WinEvent -FilterHashtable @{LogName='System'; StartTime=(Get-Date).AddHours(-4)} -ErrorAction SilentlyContinue |
+    Where-Object { $_.ProviderName -eq 'Service Control Manager' } |
+    Select-Object TimeCreated,Id,LevelDisplayName,Message |
+    Out-File "$out\42-scm-events.txt" -Encoding utf8
+```
+
+第 7 步，归档并计算校验和。证据包应包含一个 `manifest.txt`，写清主机名、采集人、采集起止时间、wireguard 版本、是否发生过重启。压缩后计算 SHA256，避免传递过程中被误改。
+
+```powershell
+Get-ChildItem $out | Select-Object Name,Length,LastWriteTime |
+    Out-File "$out\manifest.txt" -Encoding utf8
+Compress-Archive -Path "$out\*" -DestinationPath "$out.zip" -Force
+Get-FileHash "$out.zip" -Algorithm SHA256 | Out-File "$out.zip.sha256.txt" -Encoding utf8
+```
+
+### 4. 验证方法与预期结果
+
+第一组验证是 `wg show` 的输出。下面是一份典型样例，字段顺序与官方文档 `docs/enterprise.md` 一致；示例输出，具体格式需对照实际版本核验。
+
+```text
+interface: corp
+  public key: lfTRXEWxt8mZc8cjSvOWN3tqnTpWw4v2Eg3qF6WTklw=
+  private key: (hidden)
+  listening port: 53488
+
+peer: JRI8Xc0zKP9kXk8qP84NdUQA04h6DLfFbwJn4g+/PFs=
+  endpoint: 163.172.161.0:12912
+  allowed ips: 0.0.0.0/0, ::/0
+  latest handshake: 3 seconds ago
+  transfer: 6.55 KiB received, 4.13 KiB sent
+```
+
+判读要逐行落到事实上。`interface` 后的名字应当等于配置文件名去掉后缀，如果这里出现的是别的名字，说明命令查错了对象。`public key` 是本机接口公钥，必须与对端配置里写的 `PublicKey` 完全一致；不一致时握手必然失败，而且日志里通常只会表现为"没有 handshake"，不会直接告诉你密钥错。`private key: (hidden)` 是正常状态，任何工具都不应显示私钥。`listening port` 是本地 UDP 源端口，配置了 `ListenPort` 时应固定，未配置时每次启动都可能变化；显示 0 通常意味着接口刚起来还没有成功绑定或还没有发过包。`peer` 后的公钥应与对端 `[Interface]` 的 `PublicKey` 一致，`endpoint` 显示的是当前解析或学习到的 IP 与端口，而不是配置里的域名，经过 NAT 后它会变化。`allowed ips` 是去重合并后的集合，出现 `0.0.0.0/0` 说明这条隧道承担默认路由。`latest handshake` 是关键健康指标：持续有流量时应该在协议重密钥窗口内（约三分钟，原理见 06-04），空闲时不更新是正常的，显示"Never"才说明从未握手成功。`transfer` 是双向累计计数，服务重启后归零；只有 sent 增长而 received 不增长，说明本机在发但对端没有回或者回程被丢，这时要结合路由与 WFP 判断，而不是先怀疑加密算法。
+
+第二组验证是环形日志的阶段序列。下面是一段正常启动的摘录，示例输出，具体格式需对照实际版本核验。
+
+```text
+2026-11-12 10:14:02.118372: [TUN] [corp] Starting WireGuard/1.1.1 (Windows 10; amd64)
+2026-11-12 10:14:02.119004: [TUN] [corp] Watching network interfaces
+2026-11-12 10:14:02.121877: [TUN] [corp] Resolving DNS names
+2026-11-12 10:14:02.187213: [TUN] [corp] Creating network adapter
+2026-11-12 10:14:02.452906: [TUN] [corp] Using WireGuardNT/1.1
+2026-11-12 10:14:02.455310: [TUN] [corp] Dropping privileges
+2026-11-12 10:14:02.461002: [TUN] [corp] Setting interface configuration
+2026-11-12 10:14:02.503118: [TUN] [corp] Startup complete
+```
+
+这段序列本身就是一张调用链地图，对应 `tunnel/service.go` 的 `tunnelService.Execute`。`Starting` 行带 `version.UserAgent()`，是版本核验锚点；`Watching network interfaces` 对应 `watchInterface()`，缺失或报错说明网络配置回调注册失败；`Resolving DNS names` 对应 `config.ResolveEndpoints()`，这里失败会返回 `ErrorDNSLookup`，通常不是隧道本身的问题，而是 Endpoint 域名在当前 DNS 环境下解析不了；`Creating network adapter` 对应 `driver.CreateAdapter()`，开机自启时这一步最多尝试 15 次、每次间隔一秒；`Using WireGuardNT/x.y` 来自 `driver.RunningVersion()`，取不到版本只会打警告，不致命；`Dropping privileges` 说明即将降权，之后的 `Setting interface configuration` 才是 `SetConfiguration` 与 `SetAdapterState`。最关键的是最后一行：`Startup complete` 由 `interfaceWatcher.started` 事件触发，只有它出现才代表"接口、地址、路由、DNS 都已经配好且服务进入 Running"。如果开机自启且 SCM 被锁，服务会先上报 Running 再继续创建适配器；此时若永远没有这一行，多半是适配器的 TCP/IP 接口没有出现，`watchInterface()` 里的 watchdog 会在一分钟后写入 "TCP/IP interface for adapter did not appear after one minute"。
+
+采集完整性的核对项如下表所示。逐项打勾比"日志我看过了"可靠得多。
+
+| 证据项 | 采集方式 | 正常特征 | 异常特征 |
+|---|---|---|---|
+| 服务状态 | `Get-Service WireGuard*` | 隧道与 manager 均 Running | StartPending 停滞或反复重启 |
+| 日志阶段 | `/dumplog` 一次性导出 | 从 Starting 到 Startup complete | 缺阶段或末行停在某一步 |
+| 握手 | `wg show <name>` | 有流量时三分钟内 | Never 或长时间不更新 |
+| 字节计数 | `wg show <name>` | 收发双向增长 | 单向增长或长期不动 |
+| 地址 | `Get-NetIPAddress` | 与配置 Address 一致 | 缺失、重复或前缀错误 |
+| 路由 | `Get-NetRoute` | 覆盖 AllowedIPs 且指向隧道 | 缺路由或指向物理网卡 |
+| DNS | `Get-DnsClientServerAddress` | 等于配置的 DNS | 为空或混入物理网卡地址 |
+| 驱动版本 | 日志中的 Using 行 | 与安装包匹配 | 缺失或明显过旧 |
+
+### 5. 常见失败与排错
+
+**症状一：命令立即失败并提示 "Stdout must be set"。** 这不是日志损坏，而是执行环境没有标准输出句柄。远程管理框架、某些计划任务、以服务身份直接调用的场景都会触发。解决方式是显式重定向：`Start-Process -RedirectStandardOutput`，或 `cmd /c "wireguard.exe /dumplog > file.txt"`。顺便注意，`/dumplog` 分支在结束时 `defer file.Close()` 关闭的是 stdout 包装对象，在同一进程里连续调用两次并不可靠，脚本应当一次一个进程。
+
+**症状二：提示找不到 log.bin 或拒绝访问。** `main.go` 通过 `conf.LogFile(false)` 取路径，`false` 表示不创建根目录；如果这台机器从未成功启动过任何隧道或 manager，`%ProgramFiles%\WireGuard\Data` 可能根本不存在，`DumpTo` 里的 `os.Open` 会直接返回系统错误，例如 "The system cannot find the file specified"。另一种情况是 ACL 被第三方安全软件改写，管理员也打不开，错误会是 "Access is denied"。先确认路径存在、再确认权限，最后才怀疑日志内容为空。不要把这里的系统错误与隧道服务日志里的 "Unable to open log file"（`ErrorRingloggerOpen`）混为一谈：后者是服务启动阶段的错误码文案，前者是 CLI 读取文件失败。
+
+**症状三：`/dumplog /tail` 长时间没有任何输出。** 先确认它的行为：连续分支会从环形区最旧的一格开始，把现存历史全部输出，然后才进入跟随；"空白"通常意味着 `log.bin` 里没有有效行，而不是"没有新事件"。再确认 PowerShell 管道是否缓冲：`wireguard.exe /dumplog /tail | Select-String` 在 5.1 下可能等到缓冲区满才显示，应改成文件重定向，边复现边观察文件大小。最后确认服务确实在写日志：`log.bin` 的修改时间会随新行变化，若长时间不变，说明没有进程在写或日志句柄已失效。
+
+**症状四：`wg show` 报拒绝访问或提示找不到接口。** 加密配置 `.conf.dpapi` 只允许 SYSTEM 与管理员交互；受限 UI 用户即使能在托盘看到隧道，也不具备完整查询权限。找不到接口则通常说明隧道服务已经停止，适配器随 `adapter.Close()` 销毁，路由与 DNS 也一并撤销。此时应回到 `log.bin` 与 SCM 事件，而不是继续在 `wg` 上打转。
+
+**症状五：日志内容被截断、覆盖或时间乱序。** 单行上限 512 字节，超出部分由 `WriteWithTimestamp` 直接截断；Go 的 panic 栈会被拆成多行写入，读的时候要按时间与标签拼接，不能只看一行。2048 行的环在高频事件下很快回绕，早期现场会被覆盖。跨进程时间可能轻微倒序，判断因果关系时应以阶段序列和外部时间为主，不要因为相邻两行时间差 1 毫秒就下结论。
+
+**症状六：全隧道场景下远程采集失败。** kill-switch 生效时，除隧道服务自身 UDP、配置指定的 DNS 53 端口、环回、隧道内流量、DHCP 与 NDP 之外，其余流量被阻断（规则语义见 06-09）。管理机的 SMB、WinRM、RPC 拉取都会失败，表现为"网络通但文件拷不走"。正确做法是本地落盘后通过隧道内的管理通道传输，或者由用户在本地打包；不要为了采集而临时拆掉安全策略，那属于变更，不属于采集。
+
+**症状七：服务停止后才发现什么都没留下。** 这是最常见的流程性错误。隧道停止会销毁适配器、撤销路由与 DNS，`wg show` 什么都看不到，只剩 `log.bin` 与 SCM 记录。也正因如此，第 2 步必须排在任何重启、重装、删除驱动之前。若日志中出现 "Failed to shutdown after 30 seconds. Probably dead locked. Printing stack and killing."，说明清理阶段超过 30 秒，进程以 777 退出并打印了全部 goroutine 栈，这份栈恰恰是定位死锁的关键证据，务必完整保留。
+
+### 6. 小结
+
+本篇把采集拆成"基线、历史、跟随、运行时、网络、服务事件、归档"七件事，核心纪律只有两条：先取证再变更，历史与跟随分开做。合格的证据包应当能独立回答四个问题：服务是否曾经成功进入 `Startup complete`、握手最后一次成功在什么时候、数据包按路由应该走哪个接口、DNS 查询被允许发往哪些服务器。只要这四问有答案，08-03 的决策树才有输入，08-04 的案例复盘才有证据链。
+
+需要强调的是，本篇只讲采集场景与输出判读，不重列命令全集与配置全集；开关语义、日志字段与读取链分别有独立权威源（字段见 05-09 ｜ 配置见 04-04 ｜ 原理见 06-11 ｜ 模块见 07-10），`wg(8)` 子命令与服务命令见 04-05 与 04-06。下一片 08-02 会把同一套可观测信号用于性能基准，说明怎样设计对照实验、怎样隔离 MTU、CPU 与驱动变量，以及为什么不能把某一次测得的绝对数值当成产品结论。
+
+## 08-02 性能基准方法学
+
+### 1. 背景与动机
+
+WireGuard 的性能讨论很容易变成数字攀比：某个博主贴出一张接近线速的 iperf3 截图，读者就默认"Windows 客户端也应该是这个数"。这种结论在工程上几乎没有价值，因为测出来的不是同一个东西。Windows 官方客户端的数据面不在 `wireguard.exe` 里：用户态只负责解析配置、创建适配器、下发 IOCTL、配置地址路由与防火墙，真正的加解密与 UDP 封装由内核驱动 WireGuardNT 完成（组件边界见 `docs/attacksurface.md`）。因此"客户端进程 CPU 很低"与"数据面没有开销"是两件事，前者只能说明控制面空闲。
+
+第二个动机是变量太多。同一条千兆链路，换一个 MTU 就可能从 930 Mbps 掉到 300 Mbps；同一个驱动，在虚拟机里用旧版 NetKVM 会出现莫名其妙的吞吐塌陷，而 `tunnel/pitfalls.go` 已经专门为它写了一条警告；同一条隧道，单流跑不满但四流能跑满，说明瓶颈在单条 UDP 流的串行化而不是链路。若不设计对照实验，这些因素会互相伪装，最后得出"WireGuard 慢"或"驱动有问题"这类无法行动的结论。
+
+本篇的目标是给一套可复用的方法：明确指标口径、指出 Windows 客户端真实的瓶颈位置、用 iperf3 设计单变量对照、给出判读标准与排除变量的顺序。需要提前声明：**数据必须在目标机型实测，本文只给方法与判读标准，不给绝对数值**。任何脱离硬件、网卡驱动、Windows 版本、WireGuardNT 版本与链路 RTT 的吞吐数字，都只能当作轶事。
+
+### 2. 核心概念
+
+**吞吐与有效吞吐（goodput）**。链路速率是物理层口径，IP 吞吐要扣除以太网帧开销，TCP 有效吞吐还要扣除 TCP/IP 头与 WireGuard 封装。WireGuard 的封装开销是每包 IPv4 60 字节（20 IP + 8 UDP + 32 协议头）、IPv6 80 字节（40 + 8 + 32），这正是默认 MTU 取"物理接口 MTU 减 80"的原因。千兆链路上无隧道时单流 TCP 跑到 930 至 940 Mbps 已经接近上限；经 WireGuard 封装后，900 Mbps 左右就接近该链路的上限，看到 890 至 910 不必怀疑被测设备；反过来，若只有 300 Mbps 且重传为 0，问题通常不在链路。
+
+**单流与多流**。iperf3 默认一条 TCP 连接，受拥塞窗口与往返时延共同约束。带宽时延积（BDP）决定了"窗口不够时，链路再快也跑不满"：RTT 100 毫秒、窗口 256 KiB 时，理论上限约 20 Mbps。跨地域隧道必须先算 BDP，再用 `-w` 调窗口或 `-P` 增加并行流，否则测到的是 TCP 自己的限制。
+
+**握手耗时**。它衡量的是控制面建立能力，不是吞吐。无负载时一次完整握手是一个往返：发起方发 initiation，响应方回 response；在高负载或疑似 DoS 时可能插入 cookie 往返，变成两个往返（协议细节见 06-04）。测量时应记录"从服务启动到 `latest handshake` 首次非空"的时间，而不是用 ping 的 RTT 代替。
+
+**CPU 口径**。要分三层看：`wireguard.exe` 进程占用（控制面，稳态应接近 0）、System 进程的内核时间与 DPC 时间（数据面与中断）、以及每个逻辑核的分布。只报一个"CPU 使用率 30%"没有意义，必须说明是哪一层、是否包含 DPC、是否按核。若单核打满而总体不高，典型原因是单条流被固定在某一个队列或工作线程上。
+
+**MTU 与分片**。MTU 过高会触发分片或 PMTUD 黑洞：TCP 三次握手能成功（小包），一到传数据就卡住；ICMP 被阻断时尤其隐蔽。MTU 过低会增加包数与每字节的头部开销，先把 CPU 打满而不是把链路打满。判断方向要看"小包通、大包不通"还是"能通但 PPS 异常高"，两者的结论相反。
+
+**包速率（PPS）与包大小**。吞吐相同不代表成本相同：同样 900 Mbps，1400 字节大包约 80 kpps，而 200 字节小包约 560 kpps，后者对中断、DPC、每包加密与连接建立的压力高一个量级。很多"隧道跑数据库或游戏就卡"的问题并不是带宽不足，而是 PPS 把某一颗核打满。测试时应至少补一组小包场景（例如 iperf3 的 `-l 200`，或 UDP 模式下限制带宽），并同时记录 PPS 与每核 CPU；只做大包测试，漂亮的数字会掩盖真实瓶颈。
+
+**单一 UDP 流与多队列**。一条隧道对一个 peer 的全部流量，通常封装在同一个 UDP 四元组里（本机监听端口、对端 endpoint 地址与端口）。网卡的 RSS 按四元组（部分驱动可配置为二元组）哈希分流，不同连接能分散到多个队列，但同一条流仍然落在同一个队列上。因此"多队列网卡"并不会自动让单条隧道单流跑得更快；能否并行还取决于 WireGuardNT 自身的队列模型，这一点属于外部驱动实现，需对照实际版本核验，主机侧只能通过每核 CPU 分布与多流对照来间接判断。
+
+**WFP 的位置**。本仓库安装的过滤器集中在 `FWPM_LAYER_ALE_AUTH_CONNECT_V4`、`FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4` 及 V6 对应层（`tunnel/firewall/rules.go`），这些层做的是连接建立与接收授权判定，稳态大流量不会逐包重走整组条件。因此把吞吐下降直接归因于"WFP 每包过滤"通常不成立；真正会放大成本的是大量短连接、第三方杀软的 NDIS 轻量过滤驱动或 WFP callout，它们不在本仓库的控制范围内。
+
+### 3. 关键数据结构与源码位置
+
+第一个关键点是 **MTU 不在驱动配置结构里**。`driver/configuration_windows.go` 的 `driver.Interface` 只有 `Flags`、`ListenPort`、私钥、公钥与 `PeerCount`，没有 MTU 字段；MTU 是通过 `winipcfg` 写到 IP 接口的 `NLMTU` 上的。`tunnel/mtumonitor.go` 的 `doIt()` 里写着 `iface.NLMTU = uint32(max(int(mtu)-80, minMTU))`，IPv4 下限 576、IPv6 下限 1280，并且只有当配置里的 `MTU` 为 0 时才启动监视（`tunnel/interfacewatcher.go` 的 `setup()` 中有 `if iw.conf.Interface.MTU == 0` 判断）。这解释了两个常见困惑：为什么 `wg show` 看不到 MTU，以及为什么显式写死 MTU 后默认路由变化不再自动调整。
+
+第二个关键点是 **计数器与握手时间**。`driver.Peer` 结构里有 `TxBytes`、`RxBytes`、`LastHandshake`、`AllowedIPsCount`，都是通过 `GetConfiguration` 从驱动读出的快照；`wg show` 的 transfer 与 latest handshake 就来自这一层。做吞吐测试时应当用前后两次快照做差分，而不是相信某一瞬间的绝对值；差分窗口要与 iperf3 的采样窗口对齐，否则会把测试前的流量算进来（字段定义见 05-05）。
+
+第三个关键点是 **日志成本**。`tunnel/service.go` 在创建适配器后调用 `adapter.SetLogging(driver.AdapterLogOn)`，驱动回调经 `driver/driver_windows.go` 的 `logMessage` 写入环形日志；环形区固定 2048 行、单行 512 字节（`ringlogger/ringlogger.go`）。正常吞吐测试期间日志量不大，但如果同时开着 `/dumplog /tail` 并把输出写进慢速磁盘或网络共享，采样进程本身会成为干扰项。基准测试时应关闭无关的日志跟随。
+
+第四个关键点是 **防火墙规则的权重与条件**。`tunnel/firewall/rules.go` 中，服务自身放行、DNS 允许/拒绝、环回、隧道接口、DHCP、NDP 与兜底阻断各自有权重，权重决定同一子层内的评估顺序。性能测试不需要记住权重表，但要知道：kill-switch 只在"单 peer + AllowedIPs 含 /0"时启用，分流配置不会安装这套阻断规则，两者的性能对比其实是"两种配置形态"的对比，不是"防火墙开/关"的对比。
+
+### 4. 关键流程与调用链
+
+先看数据路径。应用写入 socket 后，WFP 在 ALE 层做连接/接收授权，包进入 TCP/IP 协议栈，再由 NDIS 交给 WireGuardNT 的微型端口；驱动完成加密、加封装，把结果作为一个 UDP 包交给物理网卡。回程相反：物理网卡收包，UDP 层交给 WireGuardNT 解密，再经 NDIS 与 TCP/IP 回到应用。用户态的 `wireguard.exe` 不在这条路径上，它只在启动、配置变更、停止时出现。
+
+这条路径上的潜在瓶颈逐段标出如图 08-02-01 所示，读图时应把"单条 UDP 流"理解为横向扩展的天然限制，而不是某个具体函数的缺陷。
+
+:::figure id=08-02-01 | name=Windows 客户端数据路径与瓶颈点 | dir=TD
+node n1 "应用 socket" blue
+node n2 "WFP ALE 授权" amber
+node n3 "TCP/IP 协议栈" teal
+node n4 "NDIS 微型端口" purple
+node n5 "WireGuardNT 加密" red
+node n6 "单条 UDP 四元组" red
+node n7 "物理网卡与队列" gray
+edge n1 -> n2 "连接建立"
+edge n2 -> n3 "放行"
+edge n3 -> n4 "逐包递交"
+edge n4 -> n5 "加密封装"
+edge n5 -> n6 "同源同宿"
+edge n6 -> n7 "RSS 单队列"
+:::
+
+再看控制路径。`tunnelService.Execute` 启动后依次打开日志、加载配置、解析 Endpoint、创建适配器、开启驱动日志、安装防火墙、降权、下发配置、拉起适配器，最后由 `interfaceWatcher` 配置地址、路由、DNS 与 MTU。性能相关的只有两个时刻：启动时确定 MTU 与路由，以及默认路由变化时重新计算 MTU。稳态转发期间控制面不再参与，所以"加大 `wireguard.exe` 的优先级"不会提升吞吐，反而可能干扰中断处理。
+
+对照实验的闭环如图 08-02-02 所示。关键不是"多测几次"，而是每轮只改一个变量，并且每轮都能回到同一个基线。
+
+:::figure id=08-02-02 | name=单变量对照实验的闭环 | dir=TD
+node n1 "物理链路基线" blue
+node n2 "建立隧道基线" teal
+node n3 "只改一个变量" amber
+node n4 "同步采样" purple
+node n5 "恢复并复测" gray
+node n6 "结论与记录" green
+edge n1 -> n2 "先证链路"
+edge n2 -> n3 "控制变量"
+edge n3 -> n4 "同窗口"
+edge n4 -> n5 "排除偶发"
+edge n5 -> n6 "可复现才成立"
+edge n6 -> n3 dashed "下一变量"
+:::
+
+### 5. 配置/命令/代码实例
+
+实验的最小拓扑是：一台被测 Windows 客户端、一台同城或可控 RTT 的 iperf3 服务端，二者之间只隔被测隧道。先在**不走隧道**的情况下测物理链路基线，再建立隧道复测；没有基线就无法判断下降来自隧道还是来自链路本身。服务端命令如下。
+
+```bash
+iperf3 -s -p 5201 -1
+```
+
+客户端做三组：单流上行、四流上行、单流下行。每组 30 秒，丢弃前 5 秒的慢启动，采样间隔 5 秒。`-R` 表示反向（服务端发、客户端收），`--bidir` 表示双向同时。
+
+```powershell
+$iperf = 'C:\tools\iperf3\iperf3.exe'
+& $iperf -c 10.0.0.10 -p 5201 -t 30 -i 5 -P 1 | Tee-Object -FilePath C:\wg-evidence\iperf-1up.txt
+& $iperf -c 10.0.0.10 -p 5201 -t 30 -i 5 -P 4 | Tee-Object -FilePath C:\wg-evidence\iperf-4up.txt
+& $iperf -c 10.0.0.10 -p 5201 -t 30 -i 5 -P 1 -R | Tee-Object -FilePath C:\wg-evidence\iperf-1down.txt
+```
+
+典型输出如下。示例输出，具体格式需对照实际版本核验。
+
+```text
+Connecting to host 10.0.0.10, port 5201
+[  5] local 10.7.0.2 port 51422 connected to 10.0.0.10 port 5201
+[ ID] Interval           Transfer     Bitrate         Retr  Cwnd
+[  5]   0.00-5.00   sec   520 MBytes   872 Mbits/sec    0   1.25 MBytes
+[  5]   5.00-10.00  sec   540 MBytes   906 Mbits/sec    0   1.31 MBytes
+[  5]  10.00-15.00  sec   538 MBytes   902 Mbits/sec    0   1.31 MBytes
+[  5]   0.00-30.00  sec  3.10 GBytes   888 Mbits/sec    0   1.31 MBytes  sender
+[  5]   0.00-30.00  sec  3.10 GBytes   888 Mbits/sec            receiver
+```
+
+判读这份输出要抓四条线。第一条是 `Bitrate` 的稳定性：三段都在 872 至 906 之间，说明没有周期性拥塞或队列抖动；如果每 5 秒从 900 掉到 200 再回升，优先怀疑链路整形、无线重传或 CPU 降频。第二条是 `Retr`：为 0 表示没有 TCP 重传，此时吞吐仍低就不该归因于丢包；若 `Retr` 持续增长而 `Bitrate` 抖动，才进入"丢包/MTU/链路"分支。第三条是 `Cwnd`：拥塞窗口长期停在 1.3 MB 左右并稳定，说明 BDP 已被满足；如果窗口一直很小且 RTT 很大，说明是窗口限制而非隧道限制。第四条是 sender 与 receiver 两行的差值：差值大意味着发送端已把数据交给协议栈，但接收端没有在窗口内全部收到，通常指向路径缓冲或接收侧处理能力。单流 888 Mbps 在千兆链路经 WireGuard 封装后已经接近上限，此时再做多流测试不会显著提升，而应用 `-P 4` 验证"多流不下降"来确认没有单队列瓶颈。
+
+实际执行时应把变量矩阵固定下来，如下表所示。每一行只改一个变量，其余列保持基线值。
+
+| 变量 | 取值示例 | 观察指标 | 判读标准 |
+|---|---|---|---|
+| MTU | 1420 / 1400 / 1280 | 吞吐、Retr、PPS | 大包卡住小包正常即 MTU 问题 |
+| 流数 | 1 / 4 / 8 | 总吞吐与每核 CPU | 多流显著提升说明单流受限 |
+| 方向 | 上行 / 下行 / 双向 | 双向吞吐与 DPC | 单向正常双向塌陷查中断与队列 |
+| 驱动 | 当前版本 / 回退版本 | 吞吐与错误计数 | 仅版本变化即可复现才归因驱动 |
+| CPU | 默认 / 绑定单核 | 每核占用与吞吐 | 绑核后下降说明并行度不足 |
+| 虚拟化 | 物理机 / 虚拟机 | 吞吐与 steal time | VM 内数据不能代表物理路径 |
+
+采样 CPU 时不要只看任务管理器。下面这段 PowerShell 同时取总处理器时间、System 进程的内核时间与 DPC 时间，采样间隔 1 秒，跑 30 秒，输出可以直接与 iperf3 的时间窗对齐。
+
+```powershell
+$log = 'C:\wg-evidence\cpu.csv'
+$counters = @(
+    '\Processor(_Total)\% Processor Time',
+    '\System\% Processor Time',
+    '\System\Processor Queue Length',
+    '\Processor Information(_Total)\% DPC Time'
+)
+Get-Counter -Counter $counters -SampleInterval 1 -MaxSamples 30 |
+    Export-Counter -Path $log -FileFormat CSV -Force
+```
+
+### 6. 注意事项、陷阱与最佳实践
+
+**陷阱一：把 `wireguard.exe` 的 CPU 当作数据面 CPU。** 稳态转发不经过用户态进程，任务管理器里它接近 0 是正常现象。真正要看的开销分布在 System 进程、DPC 与各逻辑核上。若只看用户态进程，会得出"加密几乎不耗 CPU"的错误结论，进而把瓶颈误判为链路。
+
+**陷阱二：用 ping 估算吞吐或 MTU。** 64 字节的 ICMP 既不触发大包分片，也不代表 TCP 的行为；很多网络对 ICMP 限速甚至阻断。判断 MTU 要用"大包 TCP 是否卡住"配合 `ping -f -l` 逐步试探，且必须意识到 ICMP 被过滤时该方法无效。更稳妥的做法是对比 1420、1400、1280 三档 MTU 下的 iperf3 结果，看是否存在"小流量正常、大流量停摆"的断层。
+
+**陷阱三：在旧版 VirtIO 驱动上测虚拟机。** `tunnel/pitfalls.go` 的 `pitfallVirtioNetworkDriver()` 会检查 `netkvm.sys` 的版本，低于 100.85.104.20800 时打印 "Warning: the VirtIO network driver (NetKVM) is out of date and may cause known problems"。这类环境下的吞吐数字不能代表物理机，也不能用来比较 WireGuardNT 版本。先在日志里确认没有这条警告，再谈数据。
+
+**陷阱四：忽略 TCP 自身的限制。** 跨地域链路的 RTT 可能是 30 至 200 毫秒，默认窗口下单流跑不满是 TCP 的正常行为。应先用 `-P 4` 或 `-w` 排除窗口因素；如果多流能线性叠加，说明隧道本身没问题，问题在单流窗口或应用并发度。把这种情况写成"WireGuard 带宽不足"会误导后续所有优化。
+
+**陷阱五：把 kill-switch 当成性能开关。** 全隧道配置会安装 WFP 阻断规则，但规则位于连接授权层，稳态大流量并不逐包过滤；把 `0.0.0.0/0` 换成 `0.0.0.0/1 + 128.0.0.0/1` 只是绕开 kill-switch 语义，加密与封装完全不变。若两者测出明显差异，先怀疑测量顺序、DNS 行为或路由选路变化，而不是直接归因于防火墙。
+
+**陷阱六：短时间、单向、无基线的测量。** 10 秒测试会被慢启动支配，只测下行会漏掉上行队列问题，没有物理链路基线则无法区分"隧道慢"与"链路本来就慢"。最低要求是：30 秒以上、双向、每方向至少单流与四流各一次、每次重复两轮并取稳定区间。
+
+**陷阱七：忽略环境噪声。** 杀毒软件的 NDIS 过滤驱动、Windows 更新、备份任务、无线链路重传、笔记本电源策略导致的降频，都会让结果漂移。测试前固定电源计划、关闭无线改用有线、记录网卡驱动版本与 Windows 内部版本号。虚拟化环境还要记录宿主负载与 CPU steal time，否则同一台 VM 两次测试可以差出一倍。
+
+**陷阱八：把服务端放在被测机或同一台宿主机上。** 这样流量只经过 loopback 或虚拟交换机，根本不走物理网卡与真实链路，测出来的是内存拷贝速度，既没有 MTU 约束，也没有中断与队列行为。正确的对照必须让流量穿过被测隧道所依赖的真实路径；如果只能在一台机器上做实验，至少要用两台虚拟机并明确标注"结果不代表物理链路"。
+
+**最佳实践**：把"配置快照"作为实验记录的一部分。每次测试前保存 `wg show`、`Get-NetIPInterface`、`Get-NetRoute`、`Get-NetAdapter` 与日志中的驱动版本行；测试后用 `wg show` 的字节差分核对 iperf3 的传输量是否对得上。若两者差异很大，说明还有别的流量混入，或者计数窗口没有对齐。最后，在报告里同时写"测得的数"和"不能外推的边界"：这台机型、这个驱动、这条 RTT 下的结论，不能直接搬到另一台机器上。
+
+### 7. 小结与延伸阅读
+
+性能基准的可信度来自三点：口径清楚、变量可控、结论可复现。Windows 客户端的特殊性在于数据面位于 WireGuardNT 内核驱动，用户态只做控制；真实瓶颈通常落在单条 UDP 流的串行化、MTU 选择、网卡与 NDIS 过滤驱动、CPU 单核与 DPC，而不是 `wireguard.exe` 进程本身。用 iperf3 做单变量对照、用 `wg show` 做字节核对、用 PowerShell 计数器做每核采样，三者时间窗对齐，才能把"快慢"变成"哪一段慢"。
+
+本篇不重列 MTU、DNS、AllowedIPs 的配置写法：完整配置键见 04-02 与 04-03，MTU 推导机制见 06-07，驱动 IOCTL 与适配器生命周期见 07-03 与 06-05（字段见 05-05 ｜ 配置见 04-02 ｜ 原理见 06-07 ｜ 模块见 07-03）。下一片 08-03 会把本篇出现的信号组织成诊断决策树，说明当吞吐、握手、DNS、服务状态同时异常时，应该按什么顺序排除，以及哪些"看起来像性能问题"的现象其实是配置或驱动陷阱。
+
+## 08-03 常见故障分类与诊断决策树
+
+### 1. 背景与动机
+
+隧道故障的现场描述往往只有一句话："连不上"。这句话背后可能是服务没起来、驱动没加载、路由没写对、DNS 被阻断、密钥不匹配，也可能是更新器把旧版本装了回来。若没有分类，排查就会退化成试错：重启服务、重装客户端、删掉驱动、换一份配置，每一步都可能把原始证据破坏掉，而且成功率取决于运气。分类与决策树的价值，是把"无限多种现象"压缩成六个互斥分支，并规定一个代价从低到高的排除顺序。
+
+本篇采用六类分支：安装与服务、驱动与适配器、路由与转发、DNS 与名称解析、握手与密钥、更新与签名。它们不是按组件划分的，而是按"故障发生在哪一层、下一层还能不能观测"划分。比如"服务启动失败"会直接让后面五层不可观测，所以必须排在第一；"握手失败"时路由与 DNS 通常已经正常，否则包根本到不了对端；"更新失败"与隧道数据面基本无关，放在最后，避免把签名问题误诊成网络问题。
+
+判定顺序还有一条现实约束：Windows 的服务启动是异步的。开机自启且 SCM 被锁时，服务会先上报 Running，再继续创建适配器、等待 TCP/IP 接口出现；`interfaceWatcher` 为此设了一分钟 watchdog，开机自启时 `CreateAdapter` 还会最多尝试 15 次、每次间隔一秒。若在启动后 10 秒就断言"服务有问题"，得到的结论大概率是假的。决策树因此把"稳定运行 60 秒"作为第一个判定点，而不是"`sc query` 是否显示 RUNNING"。
+
+### 2. 核心概念
+
+**三层证据**。对任何一层，都可以问三个问题：对象是否存在（服务、适配器、路由、DNS 服务器、peer）、状态是否正确（Running、Up、握手时间、解析结果）、内容是否匹配（配置名、公钥、AllowedIPs、Endpoint）。存在性用 SCM 与 IP Helper 查，状态用 `wg show` 与 `Get-NetIPInterface` 查，内容用配置与日志对照。三者缺一，结论就会悬空。例如"适配器存在且 Up"只证明驱动加载成功，不证明路由覆盖了目标网段。
+
+**两套错误码口径**。第一套是 Windows 服务框架的 `WIN32_EXIT_CODE`，常见 1067（进程意外终止）、1066（服务特定错误）、1053（启动超时）。第二套是本仓库 `services.Error` 的自定义枚举，从 `ErrorSuccess` 到 `ErrorWin32` 共 17 个值（`services/errors.go`）。`DetermineErrorCode()` 的判断逻辑是：先用 `errors.As` 尝试把错误解析成 `windows.Errno`，成功就返回 Win32 码；否则返回自定义 `serviceError`。`CombineErrors()` 则把自定义错误文案与底层错误拼在一起写进日志。理解这一点，才不会把 1067 当成根因：它只说明"进程死了"，真正的原因在日志和 `SERVICE_EXIT_CODE` 里。
+
+**启动阶段与失败点的映射**。`tunnelService.Execute` 的顺序是固定的：打开环形日志、加载配置、打印启动信息、处理开机 SCM 锁、评估静态陷阱、注册接口监视、解析 Endpoint、创建适配器、开启驱动日志、执行 `PreUp`、安装防火墙、降权、下发驱动配置、拉起适配器、执行 `PostUp`、等待 `interfaceWatcher` 的 started 事件。每个阶段都有对应的 `serviceError` 赋值，这套映射就是决策树的骨架（调用链原理见 06-05 与 07-05）。
+
+**陷阱信号**。`tunnel/pitfalls.go` 会在启动时异步检查三件事：`dnscache` 服务是否被禁用、`netkvm.sys` 是否过旧、Endpoint 所在接口是否开启了 Forwarding 或 WeakHostSend。三者都不会让服务启动失败，但会分别造成"DNS 不工作""吞吐异常""路由环路"。这类"服务正常、体验异常"的问题，必须靠日志里的 `Warning:` 行识别，不能只看服务状态。
+
+**判定的时间窗**。服务启动后至少观察 60 秒：前 15 秒可能在做适配器重试，第 60 秒是接口 watchdog 的边界。握手判定则要看流量：有持续流量时 `latest handshake` 应在三分钟内；完全空闲的隧道可以长时间不握手，这不是故障。DNS 判定要区分"解析慢"与"解析错"：前者看响应时间，后者看返回的地址是否属于预期。
+
+还有一类"多因一果"必须在顺序里显式处理。用户说"域名打不开"，可能同时存在三个问题：物理网卡下发的 DNS 仍是首选、kill-switch 只放行配置里的 DNS、目标域名本身解析失败。若先改加密配置，三个问题会互相掩盖；按树先确认服务、适配器、路由，再单独对比"向配置 DNS 直接查询"与"向其他 DNS 查询"的结果，就能把三个变量拆开。决策树不是因果证明，它的作用是保证每次只引入一个可验证的差异。
+
+### 3. 关键数据结构与源码位置
+
+`services/errors.go` 是本篇的核心索引。枚举顺序为 `ErrorSuccess`、`ErrorRingloggerOpen`、`ErrorLoadConfiguration`、`ErrorCreateNetworkAdapter`、`ErrorDNSLookup`、`ErrorFirewall`、`ErrorDeviceSetConfig`、`ErrorDeviceBringUp`、`ErrorBindSocketsToDefaultRoutes`、`ErrorMonitorMTUChanges`、`ErrorSetNetConfig`、`ErrorDetermineExecutablePath`、`ErrorTrackTunnels`、`ErrorEnumerateSessions`、`ErrorDropPrivileges`、`ErrorRunScript`、`ErrorWin32`。每个值都有固定文案，例如 `ErrorLoadConfiguration` 对应 "Unable to load configuration from path"，`ErrorDNSLookup` 对应 "Unable to resolve one or more DNS hostname endpoints"。日志里出现这些句子时，可以直接反推阶段，不需要猜。
+
+`tunnel/service.go` 给出了失败点与错误码的绑定关系。日志文件打不开或 `ringlogger.InitGlobalLogger` 失败赋 `ErrorRingloggerOpen`；`conf.LoadFromPath` 失败赋 `ErrorLoadConfiguration`；`watchInterface()` 失败赋 `ErrorSetNetConfig`；`config.ResolveEndpoints()` 失败赋 `ErrorDNSLookup`；`driver.CreateAdapter` 失败赋 `ErrorCreateNetworkAdapter`；`adapter.SetLogging` 失败也归到 `ErrorCreateNetworkAdapter`；`PreUp` 与 `PostUp` 失败赋 `ErrorRunScript`；`enableFirewall` 失败赋 `ErrorFirewall`；`elevate.DropAllPrivileges` 失败赋 `ErrorDropPrivileges`；`adapter.SetConfiguration` 失败赋 `ErrorDeviceSetConfig`；`adapter.SetAdapterState(driver.AdapterStateUp)` 失败赋 `ErrorDeviceBringUp`。接口监视器异步上报的两类错误则分别映射到 `ErrorMonitorMTUChanges` 与 `ErrorSetNetConfig`。
+
+`conf/path_windows.go` 提供了另一组容易被误判为"安装损坏"的错误。`RootDirectory()` 会检查 `Data` 目录是否是普通目录、是否是重解析点、最终路径是否与预期一致，分别返回 "Data directory is actually a file"、"Data directory is reparse point"、"Data directory jumped to unexpected location"。这些是安全防护，不是随机故障；出现时不要反复重装，而应检查目录是否被 junction、符号链接或安全软件重定向。
+
+还有一条常被遗漏的分支是 manager 服务。`WireGuardManager` 负责托盘 UI 与会话枚举，失败时对应 `ErrorTrackTunnels` 与 `ErrorEnumerateSessions`；这两个错误不会让已有隧道断开，但会让用户看不到界面、无法启停。现象是"托盘图标消失但隧道还在跑"，此时应查 manager 服务、WTS 会话与管理员令牌判定，而不是隧道配置（会话模型见 06-10）。把 UI 缺失当成隧道故障，是决策树里最常见的越级判断。
+
+`tunnel/pitfalls.go` 的三条警告文案同样可以直接检索："the \"dnscache\" service is disabled; please re-enable it"、"the VirtIO network driver (NetKVM) is out of date and may cause known problems; please update to v100.85.104.20800 or later"、"the \"%s\" interface has Forwarding/WeakHostSend enabled, which will cause routing loops"。它们分别落在 DNS 分支、性能分支与路由分支，是决策树里的"旁路证据"。
+
+### 4. 关键流程与调用链
+
+决策树的主干如图 08-03-01 所示。每个判定点只回答一个是非问题，否定时立刻落到对应分支，不再往下走。这样做的目的是避免"同时怀疑五件事"，也避免在服务没起来时去分析握手。
+
+:::figure id=08-03-01 | name=隧道故障的六层判定主干 | dir=TD
+node n1 "用户现象：连不上" red
+node n2 "服务稳定 60 秒" blue
+node n3 "适配器存在且 Up" teal
+node n4 "路由覆盖目标" amber
+node n5 "握手已完成" purple
+node n6 "DNS 解析正确" gray
+node n7 "定位到具体层" green
+node n8 "服务与日志分支" red
+edge n1 -> n2 "第一问"
+edge n2 -> n8 "否"
+edge n2 -> n3 "是"
+edge n3 -> n4 "是"
+edge n4 -> n5 "是"
+edge n5 -> n6 "是"
+edge n6 -> n7 "是"
+:::
+
+服务层的失败点与错误码映射如图 08-03-02 所示。图中只列最常遇到的五类失败，脚本钩子与降权失败归入"其他"，实际排查时按日志文案对照 `services/errors.go` 即可。
+
+:::figure id=08-03-02 | name=启动阶段失败点到错误码的映射 | dir=TD
+node n1 "tunnelService.Execute" blue
+node n2 "日志或配置失败" teal
+node n3 "适配器创建失败" amber
+node n4 "DNS 解析失败" purple
+node n5 "WFP 安装失败" gray
+node n6 "驱动配置失败" red
+node n7 "DetermineErrorCode" blue
+node n8 "SCM 退出码" green
+edge n1 -> n2 "打开或加载"
+edge n1 -> n3 "创建"
+edge n1 -> n4 "解析"
+edge n1 -> n5 "防火墙"
+edge n1 -> n6 "下发或拉起"
+edge n2 -> n7 "自定义码"
+edge n3 -> n7 "自定义码"
+edge n4 -> n7 "自定义码"
+edge n5 -> n7 "自定义码"
+edge n6 -> n7 "自定义码"
+edge n7 -> n8 "1066 加特定码"
+:::
+
+这张映射图有一个重要含义：错误码只告诉你"在哪一步失败"，不告诉你"为什么失败"。同一个 `ErrorCreateNetworkAdapter`，可能是驱动未加载、服务权限不足、适配器名称冲突，也可能是系统刚启动资源未就绪；同一个 `ErrorDeviceSetConfig`，可能是密钥格式错误、AllowedIPs 非法，也可能是驱动版本不匹配。因此每一层在拿到错误码之后，还要回答"内容是否匹配"：配置里的公钥与对端是否成对、Endpoint 是否可达、AllowedIPs 是否覆盖目标、DNS 是否在允许列表里。把错误码当结论，排查会停在半路。
+
+实际排查时按下面的文本流程走。每一步都先取证据再判断，命令只保留最小必要集合；完整命令清单见 04-06，配置键见 04-02 与 04-03。
+
+```text
+第一步  取时间基准，记录 wireguard 版本与驱动版本
+第二步  sc query WireGuardTunnel$<name>，看 STATE 与两个退出码
+        若 STATE 不是 RUNNING，或 60 秒内反复重启 -> 服务与日志分支
+第三步  Get-NetAdapter 找同名适配器，确认 Status 为 Up
+        若不存在 -> 驱动与适配器分支
+第四步  Get-NetRoute 查目标网段是否指向该适配器
+        若缺失或指向物理网卡 -> 路由与转发分支
+第五步  wg show <name> 看 latest handshake 与 transfer
+        若 Never 或计数不动 -> 握手与密钥分支
+第六步  Resolve-DnsName 与 Get-DnsClientServerAddress
+        若解析失败或服务器不对 -> DNS 分支
+第七步  仅在以上都正常时，才检查 /update 与版本签名
+```
+
+### 5. 配置/命令/代码实例
+
+先看服务状态。对 `corp` 隧道执行查询的命令如下。
+
+```powershell
+sc.exe query 'WireGuardTunnel$corp'
+```
+
+典型输出如下，示例输出，具体格式需对照实际版本核验。
+
+```text
+SERVICE_NAME: WireGuardTunnel$corp
+        TYPE               : 10  WIN32_OWN_PROCESS
+        STATE              : 4  RUNNING
+                                (STOPPABLE, NOT_PAUSABLE, ACCEPTS_SHUTDOWN)
+        WIN32_EXIT_CODE    : 0  (0x0)
+        SERVICE_EXIT_CODE  : 0  (0x0)
+        CHECKPOINT         : 0x0
+        WAIT_HINT          : 0x0
+```
+
+判读时先看 `STATE`：4 表示 RUNNING，1 表示 STOPPED，2 表示 START_PENDING，3 表示 STOP_PENDING。`START_PENDING` 长时间不动，通常对应启动超时（1053）或适配器创建卡住；`STOP_PENDING` 长时间不动，则可能是清理阶段死锁，日志里会出现 30 秒后打印 goroutine 栈并以 777 退出的记录。`WIN32_EXIT_CODE` 为 0 且 `SERVICE_EXIT_CODE` 为 0，只说明"当前运行中没有错误码"，不代表隧道可用，仍要继续看适配器与握手。若服务已停止，`WIN32_EXIT_CODE` 为 1066 表示"服务特定错误"，真正的自定义码在 `SERVICE_EXIT_CODE`，例如 4 对应 `ErrorDNSLookup`、2 对应 `ErrorLoadConfiguration`、3 对应 `ErrorCreateNetworkAdapter`；若为 1067，则表示进程被异常终止，SCM 没有拿到自定义码，必须回到日志找最后一条阶段记录。把 1066 当成 Windows 错误去搜索是常见误区，它是 Go 服务框架把自定义码转交给 SCM 的约定。
+
+再看日志证据。下面是一段 Endpoint 域名解析失败的摘录，示例输出，具体格式需对照实际版本核验。
+
+```text
+2026-11-12 10:20:11.004211: [TUN] [corp] Starting WireGuard/1.1.1 (Windows 10; amd64)
+2026-11-12 10:20:11.006913: [TUN] [corp] Watching network interfaces
+2026-11-12 10:20:11.008420: [TUN] [corp] Resolving DNS names
+2026-11-12 10:20:11.511004: [TUN] [corp] Unable to resolve one or more DNS hostname endpoints: no such host
+2026-11-12 10:20:11.511772: [TUN] [corp] Shutting down
+```
+
+这段只有五行，但信息足够定位：`Watching network interfaces` 成功，说明接口监视注册没问题；`Resolving DNS names` 之后直接出现 "Unable to resolve one or more DNS hostname endpoints"，对应 `ErrorDNSLookup`，说明失败发生在 `config.ResolveEndpoints()`，适配器还没创建；最后的 `Shutting down` 是 defer 里的统一收尾，不是另一个故障。此时不要查 WireGuardNT 版本，也不要重装驱动，应先确认 Endpoint 的域名在当前 DNS 环境下能否解析、DNS 服务器是否可达、是否被全隧道的 53 端口规则阻断。若 Endpoint 写的是 IP，则这一分支可以直接跳过。
+
+`wg show` 的握手字段还可以进一步拆成三种组合。第一种是显示 `endpoint` 但 `latest handshake` 永远为 Never：说明本机知道往哪里发，但对端没有回应，优先查 UDP 可达性、对端监听端口与公钥是否匹配。第二种是连 `endpoint` 都没有：说明配置缺 Endpoint、域名未解析或解析被延迟，回到 DNS 与配置分支。第三种是有握手但 `transfer` 长时间不增长：说明控制面通了而数据面没有回流，常见于对端 AllowedIPs 不含本机地址、回程路由不对称或中间设备只放行了握手包。三种组合对应三种完全不同的修复动作，不能都归为"隧道不稳定"。
+
+下面的 PowerShell 脚本按决策树顺序输出一份"分层结论"，适合作为一线自查模板。它不修改任何状态，只读服务、适配器、路由、DNS 与 `wg show`。
+
+```powershell
+$name = 'corp'
+$svc = Get-Service -Name "WireGuardTunnel`$$name" -ErrorAction SilentlyContinue
+if (-not $svc) { '结论：服务未安装或名称不符'; return }
+"服务状态：$($svc.Status)"
+Start-Sleep -Seconds 3
+$adapter = Get-NetAdapter -Name $name -ErrorAction SilentlyContinue
+if (-not $adapter) { '结论：适配器不存在，转驱动与适配器分支'; return }
+"适配器状态：$($adapter.Status)"
+$route = Get-NetRoute -InterfaceAlias $name -ErrorAction SilentlyContinue |
+    Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' }
+if (-not $route) { '结论：无默认路由，转路由分支' } else { '默认路由：已存在' }
+& "$env:ProgramFiles\WireGuard\wg.exe" show $name |
+    Select-String 'latest handshake|transfer|endpoint'
+Get-DnsClientServerAddress -InterfaceAlias $name |
+    Format-Table AddressFamily,ServerAddresses -AutoSize
+```
+
+各类现象与首查证据的对应关系如下表所示。表格只给"第一眼该看什么"，不替代逐层判定。
+
+| 现象 | 首查证据 | 判定分支 | 常见根因 |
+|---|---|---|---|
+| 服务启动后立即停止 | `SERVICE_EXIT_CODE` 与日志末段 | 服务与日志 | 配置加载失败或 DNS 解析失败 |
+| 服务 Running 但无适配器 | `Get-NetAdapter` | 驱动与适配器 | 驱动未加载或被安全软件拦截 |
+| 适配器 Up 但目标不通 | `Get-NetRoute` | 路由与转发 | 路由缺失、掩码错误或走错接口 |
+| 能 ping IP 不能解析域名 | `Resolve-DnsName` | DNS | DNS 服务器错误或 53 端口被阻断 |
+| 握手 Never | `wg show` | 握手与密钥 | 公钥不匹配、Endpoint 错误、UDP 被挡 |
+| 握手正常但吞吐极低 | 日志 Warning 与每核 CPU | 路由与转发 | WeakHostSend 环路或旧 VirtIO 驱动 |
+| 更新反复失败 | 更新日志与系统时间 | 更新与签名 | TLS 代理、时间偏差、签名校验失败 |
+
+### 6. 注意事项、陷阱与最佳实践
+
+**陷阱一：把 1067 当根因。** 1067 只是"进程意外终止"，它不携带阶段信息。真正有用的是日志最后一条阶段记录与 `SERVICE_EXIT_CODE`。若日志停在 "Creating network adapter" 之后，就查驱动与适配器；停在 "Resolving DNS names" 之后就查 DNS。反过来，看到 1066 也不要当成 Windows 错误码去搜，它是"服务特定错误"的容器，具体值才对应 `services.Error`。
+
+**陷阱二：服务 Running 就认为隧道可用。** 开机自启且 SCM 被锁时，服务会先上报 Running，再继续创建适配器；非开机场景下，Running 也要等 `interfaceWatcher` 发出 started 事件，也就是地址、路由、DNS、MTU 都配置完成。两种情况下都应以日志中的 `Startup complete` 作为"可用"标志。开机自启时适配器创建最多尝试 15 次，接口 watchdog 给 60 秒；在这之前断言失败，会把正常的启动窗口当成故障。正确的等待策略是：先等 60 秒，再看日志有没有 `Startup complete`，最后才看握手。
+
+**陷阱三：DNS 分支的两个假阳性。** 第一，`dnscache` 服务被禁用时，`pitfallDnsCacheDisabled()` 会打印警告，但不会阻止隧道启动；表现为解析时好时坏或完全不解析。第二，全隧道的 kill-switch 只允许发往配置指定 DNS 服务器的 53 端口，若系统里还有别的 DNS（例如物理网卡下发的），查询会被阻断；表现为"ping 8.8.8.8 通、域名不通"。这两种情况都不该去改加密配置。
+
+**陷阱四：路由环路被误判为性能问题。** `pitfallWeakHostSend()` 会在 Endpoint 所在接口开启 Forwarding 或 WeakHostSend 时打印 "will cause routing loops"。此时握手可能成功、`wg show` 看起来正常，但吞吐极低或时断时续。看到这条警告应先处理主机转发设置，而不是调 MTU 或换驱动。
+
+**陷阱五：旧 VirtIO 驱动被误判为配置问题。** NetKVM 低于 100.85.104.20800 时，握手、路由、DNS 都可能正常，只有吞吐异常。`pitfallVirtioNetworkDriver()` 的警告是唯一直接证据；在虚拟机里遇到"其他都正常就是慢"，先去日志搜 `NetKVM`。
+
+**陷阱六：先删驱动。** 适配器不存在时，很多人的第一反应是 `/removedriver` 再重装。这个动作会删除驱动包，可能让本来只是服务未启动的问题变成需要重启的驱动安装问题。正确顺序是：确认服务状态、确认驱动版本（日志中的 `Using WireGuardNT/x.y`）、确认是否有安全软件拦截，最后才考虑删除驱动；删除前先 dump 日志。
+
+**陷阱七：把更新失败当隧道故障。** `/update` 走 TLS 下载清单、验 Ed25519 签名、下载 MSI、验 BLAKE2b-256，任何一步失败都只影响升级，不影响现有隧道（更新链原理见 06-12）。反过来，隧道故障时也不要寄希望于"升级一下就好"，版本变化会引入新变量，反而破坏对照。
+
+**陷阱八：服务恢复策略掩盖了反复失败。** 若给隧道服务配置了"失败后自动重启"，SCM 会在每次异常退出后拉起进程，用户看到的是"偶尔断一下又好了"，事件日志里则是一串 7031 或 7034。反复重启会加速 2048 行环形日志的回绕，把第一次失败的现场冲掉。排查这类问题要先看服务的恢复策略与重启次数，再找最早的一次失败记录，而不是只看当前这次"看起来正常"的运行。
+
+**最佳实践**：把决策树固化成一张只读检查表，每次故障按顺序打勾并附证据文件路径。结论必须写成"哪一层、哪条证据、下一步动作"，而不是"可能是网络问题"。对无法当场解释的现象，保留日志与 `wg show` 快照，交给 08-04 的案例库做模式匹配；不要为了"让它先通"而连续变更多个变量，那会让后续复盘失去因果。
+
+### 7. 小结与延伸阅读
+
+本篇把故障空间压缩为六层：服务、驱动与适配器、路由与转发、DNS、握手与密钥、更新与签名，并给出"服务稳定 60 秒 → 适配器 → 路由 → 握手 → DNS → 更新"的判定顺序。支撑这套顺序的是两类硬证据：`services/errors.go` 的自定义错误码与 `tunnel/service.go` 的阶段绑定，以及 `wg show`、IP Helper 与环形日志的运行时快照。只要按层取证，绝大多数"连不上"都能在十分钟内收敛到一条可验证的假设。
+
+需要再次强调边界：本篇讲的是诊断顺序与判读，不重列配置键与命令全集；`wireguard.exe` 开关见 04-04，`wg(8)` 子命令见 04-05，服务与 PowerShell 命令见 04-06，错误码字段与退出码映射见 05-09，适配器创建与驱动加载见 06-05，WFP 规则语义见 06-09（字段见 05-09 ｜ 配置见 04-04 ｜ 原理见 06-05 ｜ 模块见 07-05）。08-04 会在这个骨架上填入六个完整案例，每个案例给出复现步骤、日志证据、根因、修复与回归验证；08-05 则从攻击面角度解释为什么某些"图省事"的修复会削弱安全边界。
+
+## 08-04 故障案例库：从握手失败到 DNS 泄漏
+
+### 1. 目标与拓扑
+
+08-03 给出的是判定顺序，本篇给出的是可对照的故障模式。二者的差别很像医学里的"分诊流程"与"典型病例"：流程告诉你先量体温还是先拍片，病例告诉你"体温 39 度伴右下腹痛"大概是什么、该查哪一项、查出来长什么样。现场工程师真正缺少的往往不是命令，而是"这个输出正常吗"的判断力。本篇因此把六个高频故障写成同等厚度的完整案例，每例都按同一套结构展开：现象与影响面、复现步骤、日志与命令证据、根因（指到源码或官方文档）、修复动作、验证方法。读者可以按顺序读，也可以在遇到现象时直接跳到对应案例。
+
+案例的选取遵循两条标准。第一是覆盖不同层：握手属于协议与 UDP 可达性，业务不通属于路由与 AllowedIPs 语义，MTU 属于封装与分片，kill-switch 属于 WFP 策略，DNS 属于多宿主解析与搜索域，开机自启与升级属于服务配置与更新链。第二是覆盖"看起来正常但其实坏了"的类型：后四类故障中，服务通常是 Running、适配器通常是 Up、`wg show` 甚至能显示握手成功，如果只看服务状态就会误判。这也解释了为什么本篇反复强调"先取证、再判断"，而不是"重启一下看看"。
+
+实验拓扑是一台 Windows 11 客户端加一台对端。客户端安装两条隧道：`corp` 为单 peer 全隧道，`AllowedIPs` 含 `0.0.0.0/0` 与 `::/0`，并按需配置 `DNS`；`split` 只承载 `10.0.0.0/8`，用于对照分流场景。两条隧道共用同一个对端地址的不同端口，便于在实验时只改一个变量。客户端另有一块物理网卡，网段 `192.168.1.0/24`，网关 `192.168.1.1`，默认路由由它提供。对端在实验网内，UDP 端口可控，便于人为制造丢包与阻断。所有案例都可以在这套拓扑上复现；生产环境不便复现时，应在一台同版本实验机上复现，再把结论带回生产核对，而不是在生产机上边猜边改。
+
+六个案例共享同一条取证路径，如图 08-04-01 所示。现象先归入"服务是否稳定、接口是否 Up"这一层，再按路由、MTU、WFP、DNS 四个方向分流；服务本身的异常则单独走服务与更新分支。图中箭头表达的是"下一步看什么"，不是因果链，因此允许在证据互相矛盾时回退。
+
+:::figure id=08-04-01 | name=六个案例共享的取证与分流路径 | dir=TD
+node n1 "现场现象与影响面" red
+node n2 "服务与日志基线" blue
+node n3 "适配器与路由" teal
+node n4 "MTU 与分片行为" amber
+node n5 "WFP 放行与阻断" purple
+node n6 "DNS 与搜索域" gray
+node n7 "服务配置与更新链" green
+node n8 "根因域与修复动作" green
+edge n1 -> n2 "先定层级"
+edge n2 -> n3 "接口已 Up"
+edge n2 -> n7 "服务异常"
+edge n3 -> n4 "小包通大包断"
+edge n3 -> n5 "前缀含 /0"
+edge n5 -> n6 "仅放行指定 DNS"
+edge n4 -> n8 "确诊"
+edge n6 -> n8 "确诊"
+edge n7 -> n8 "确诊"
+:::
+
+读图时要注意两点。第一，"服务与日志基线"不是可跳过的一步：`corp` 若在 Endpoint 解析阶段就退出，后面四层根本没有观测对象，此时去查 MTU 只会得到"接口不存在"的假象。第二，"WFP 放行与阻断"与"DNS"之间存在依赖：全隧道下 DNS 能否工作，取决于配置里的 DNS 是否被 WFP 的 53 端口规则放行，这也是案例五容易被误诊为"DNS 服务器坏了"的原因。
+
+本篇仍受去重约束：不重列配置键与命令全集，只讲场景组合与输出判读。配置键的完整语义见 04-02 与 04-03，`wireguard.exe` 开关见 04-04，`wg(8)` 子命令见 04-05，服务与 PowerShell 命令见 04-06；结构体字段见 05-05 与 05-09；握手、路由、MTU、DNS、WFP、更新链的机制分别在 06-04、06-06、06-07、06-08、06-09、06-12；模块边界见 07-03、07-05、07-07、07-11。理解这一点，才不会把本篇当成"第二份命令手册"。
+
+### 2. 前置条件与环境
+
+第一是身份与权限。案例中的查询大量依赖 `wg show`、服务配置读取与 WFP 状态判断，这些都需要本地管理员。`corp` 若是加密存储的 `.conf.dpapi`，按 `docs/enterprise.md` 的说明，交互需要 LocalSystem 或管理员权限；受限 UI 用户即使能在托盘看到隧道，也被拒绝私钥与编辑能力（策略见 04-07）。用一个权限不足的会话做排查，最常见的后果不是报错，而是"字段缺失"——例如 `wg show` 只显示接口不显示 peer，于是误判成配置里没有 peer。
+
+第二是版本基线。客户端版本、WireGuardNT 版本、Windows 内部版本、网卡驱动版本四项必须记录。版本不一致会让同一个输出有不同字段：`wg show` 的字段集合随上游版本变化，日志前缀与阶段文案也可能调整，具体格式需对照实际版本核验。日志里的 `Using WireGuardNT/x.y` 是驱动版本的直接证据，来自 `tunnel/service.go` 对 `driver.RunningVersion()` 的调用；如果这一行缺失，只能说明取版本失败，不能据此断言驱动没加载。
+
+第三是证据包。每个案例都应先按 08-01 的方法导出一次 `/dumplog`，再取 `wg show`、`Get-NetAdapter`、`Get-NetIPInterface`、`Get-NetRoute`、`Get-NetIPAddress`、`Get-DnsClientServerAddress` 六组快照。案例中的"日志与命令证据"默认你已经拥有这些文件。没有证据包就复现，等于把唯一一次现场毁掉：隧道一停，适配器销毁、路由撤销、DNS 回滚，`wg show` 立刻什么也看不到。
+
+第四是实验纪律。每轮只改一个变量，改完必须能回到基线。所谓基线不是"上次好的时候"，而是本次实验开始时记录的一组确定值：版本、配置哈希、路由表、DNS 列表、MTU。建议在实验机上用一份独立的配置副本，避免把生产配置改坏后又无法还原。若必须改生产，先导出配置、记录 `wg show` 与路由，再动手；改动前后各存一份，便于比对。
+
+第五是"预期输出"的写法。本文所有 `text` 块都是示例输出，具体格式需对照实际版本核验。时间戳、端口、公钥、字节数都是占位性的真实格式，不应被当作固定值；真正稳定的是字段名、段落结构与先后顺序。判读时要看"结构对不对、关系对不对"，而不是"数字是否与样例一致"。
+
+六个案例的索引如下表所示。表格只给"第一眼该看什么"，详细证据与判读在各案例内部展开；不要用这张表替代逐层取证。
+
+| 案例 | 典型现象 | 首查证据 | 根因域 | 修复方向 |
+|---|---|---|---|---|
+| 一 | 握手 Never、sent 增长 received 为 0 | `wg show` 与日志阶段 | UDP 可达性或 Endpoint | 放行 UDP 或修正地址 |
+| 二 | 握手正常、目标网段不通 | `Get-NetRoute` 与 `Find-NetRoute` | AllowedIPs 或 `Table` | 修正前缀或补路由 |
+| 三 | 小包通、大包与 TLS 卡住 | `ping -f -l` 与 `NlMtu` | MTU 过大且 ICMP 被过滤 | 去掉显式 MTU 或下调 |
+| 四 | 隧道可用、局域网全断 | 局域网连通性测试 | 单 peer 加 /0 触发 kill-switch | 改用 /1 拆分或接受隔离 |
+| 五 | 域名解析失败或走错服务器 | `Get-DnsClientServerAddress` | DNS 未配置或多宿主竞争 | 补 DNS 与搜索域 |
+| 六 | 重启后隧道未起、升级不生效 | `sc qc` 与 `/update` 输出 | 服务命令行路径或更新链 | 重装服务或修复更新条件 |
+
+### 3. 分步操作
+
+以下六个案例按现场出现频率排序，彼此独立。每个案例都给出可复现的最小动作，但复现动作本身具有破坏性：阻断 UDP、改小 AllowedIPs、写死 MTU 都会让隧道短时不可用，只能在实验机或维护窗口内执行。生产环境的原则是"只取证、不改动"，把复现留到实验机。
+
+#### 案例一：握手长期不完成
+
+**现象与影响面。** 用户报告"连不上"，但服务是 Running，适配器是 Up，`wg show` 里 peer 的 `endpoint` 也在，只有 `latest handshake` 显示 `Never`，`transfer` 呈现"本机持续发送、接收为 0"的形态。影响面取决于配置：分流隧道只影响目标网段；全隧道会连带 DNS 与所有业务，若又启用了 kill-switch，用户会同时感到"内外网都断"。这类现象最容易被误判为"密钥错误"，因为两者在 `wg show` 上的表现相似，必须靠日志阶段与网络可达性区分。
+
+**复现步骤。** 在实验机上保留正确的 `corp` 配置，用一条出站防火墙规则阻断到对端 UDP 端口的流量，然后重启隧道服务。规则只阻断去往对端地址的 UDP，避免影响管理通道。复现前后各取一次 `wg show`，对比 `latest handshake` 与 `transfer`。
+
+```powershell
+$endpoint = '203.0.113.10'
+$port = 51820
+New-NetFirewallRule -DisplayName 'WG-BLOCK-UDP-TEST' -Direction Outbound -Action Block `
+    -Protocol UDP -RemoteAddress $endpoint -RemotePort $port -Profile Any
+Restart-Service -Name 'WireGuardTunnel$corp'
+Start-Sleep -Seconds 20
+& "$env:ProgramFiles\WireGuard\wg.exe" show corp
+```
+
+**日志与命令证据。** 服务侧日志会一路走到 `Startup complete`，没有任何错误行，这恰恰是本案例的关键特征：客户端只知道自己发了包，无法知道包被本机防火墙或中间设备丢掉。`wg show` 的典型形态如下，示例输出，具体格式需对照实际版本核验。
+
+```text
+interface: corp
+  public key: lfTRXEWxt8mZc8cjSvOWN3tqnTpWw4v2Eg3qF6WTklw=
+  private key: (hidden)
+  listening port: 53488
+
+peer: JRI8Xc0zKP9kXk8qP84NdUQA04h6DLfFbwJn4g+/PFs=
+  endpoint: 203.0.113.10:51820
+  allowed ips: 0.0.0.0/0, ::/0
+  latest handshake: Never
+  transfer: 0 B received, 24.6 KiB sent
+```
+
+逐行判读要把"有没有"和"对不对"分开。`interface` 与 `peer` 段落存在，说明配置已成功下发、驱动已接受该 peer，服务侧不是空的；`private key: (hidden)` 是正常基线，任何显示明文私钥的工具都应被视为异常。`listening port` 非 0，说明本机 UDP 套接字已绑定，问题不在"没监听"。`endpoint` 显示的是解析或学习后的地址，若配置里写的是域名而这里显示 IP，说明解析成功；若配置里写域名而这里仍显示域名，则更可能是显示层未刷新，应回日志确认 `Resolving DNS names` 是否通过。`allowed ips` 含 `0.0.0.0/0` 说明这条隧道承担默认路由，故障影响面因此是全局。`latest handshake: Never` 与 `0 B received` 组合，表达的是"从未收到过任何能通过校验的握手响应"；`24.6 KiB sent` 说明客户端在按重试节奏发包，而不是完全没动静。三者合起来只支持一个结论：出站方向有东西在发，回程或对端处理没有结果，绝不能直接推成"私钥错"。
+
+对照另一种形态：如果 Endpoint 是域名且在日志里出现 `Unable to resolve one or more DNS hostname endpoints`，服务会在创建适配器之前退出，`wg show` 根本查不到接口。这个错误来自 `conf/dnsresolver_windows.go` 的 `ResolveEndpoints()`，由 `tunnel/service.go` 映射为 `services.ErrorDNSLookup`（枚举值 4）。因此"握手 Never"与"接口不存在"是两条完全不同的分支：前者说明解析已通过、问题在 UDP 或对端，后者说明连解析都没过。
+
+服务侧日志则完全没有错误，这正是"UDP 被拦"最难解释的地方，示例输出，具体格式需对照实际版本核验。
+
+```text
+2026-11-12 10:31:07.004211: [TUN] [corp] Starting WireGuard/1.1.1 (Windows 10; amd64)
+2026-11-12 10:31:07.006913: [TUN] [corp] Watching network interfaces
+2026-11-12 10:31:07.008420: [TUN] [corp] Resolving DNS names
+2026-11-12 10:31:07.187004: [TUN] [corp] Creating network adapter
+2026-11-12 10:31:07.452906: [TUN] [corp] Enabling firewall rules
+2026-11-12 10:31:07.461002: [TUN] [corp] Dropping privileges
+2026-11-12 10:31:07.503118: [TUN] [corp] Setting interface configuration
+2026-11-12 10:31:07.612004: [TUN] [corp] Startup complete
+```
+
+这八行说明"启动成功"与"隧道可用"是两个不同结论。`Resolving DNS names` 之后直接进入 `Creating network adapter`，说明 Endpoint 解析成功；`Enabling firewall rules` 与 `Dropping privileges` 相邻出现，说明规则已安装、服务开始降权；`Setting interface configuration` 与 `Startup complete` 则说明地址、路由、DNS 都已配置完成。整段没有任何 `Warning:` 或错误行，因此不能从日志判断"哪里坏了"，只能结合 `wg show` 的接收计数与外部可达性。若日志停在其中某一行，则应改走对应的失败分支，而不是继续用本案例的结论。
+
+**根因。** 握手由内核驱动 WireGuardNT 完成，本仓库只负责把配置通过 IOCTL 下发（协议细节见 06-04，驱动边界见 07-03）。客户端没有任何机制能观测"UDP 包被中间设备丢弃"，因为丢包发生在协议栈之外；WFP 的 kill-switch 也只约束本机流量，不会替对端放行。`docs/netquirk.md` 明确说明驱动会用 `IP_PKTINFO`/`IPV6_PKTINFO` 选择不回环自身的出接口，这说明出接口选择本身有保护，但不能解决路径阻断。常见根因有四类：路径上的防火墙或云安全组未放行 UDP；对端 `ListenPort` 变更而客户端 Endpoint 仍旧；NAT 设备对 UDP 会话超时过短且没有 `PersistentKeepalive`；Endpoint 域名解析到了错误地址（例如被 DNS 污染或 hosts 覆盖）。
+
+**修复动作。** 先确认对端监听端口与地址，再确认路径放行。客户端侧可用 `Get-NetFirewallRule` 检查是否有出站阻断，用 `Test-NetConnection -Port` 只能验证 TCP，对 UDP 无效，不要用它下结论。若 Endpoint 使用域名，改为固定 IP 做一次对照：能通说明是解析问题，仍不通说明是路径问题。NAT 场景下给 peer 增加 `PersistentKeepalive`，让会话保持活跃；该键的语义见 04-03。修复后必须删除实验用的阻断规则，避免把排障动作留成新故障。
+
+```powershell
+Remove-NetFirewallRule -DisplayName 'WG-BLOCK-UDP-TEST'
+Restart-Service -Name 'WireGuardTunnel$corp'
+```
+
+**验证方法。** 观察 `latest handshake` 是否在三分钟内出现，并确认 `transfer` 双向增长。仅有握手没有流量，说明控制面通了但数据面仍可能被 AllowedIPs 或对端策略限制，应继续走案例二。若握手周期性出现又消失，优先查 NAT 超时与 keepalive，而不是密钥。
+
+#### 案例二：隧道起但业务不通
+
+**现象与影响面。** 握手正常、`transfer` 双向都有增长，ping 对端隧道地址也通，但访问目标网段的应用失败。影响面通常局限于某个网段或某类地址，容易被误认为"对端没开服务"。这类故障的危险在于它"看起来全绿"：服务 Running、适配器 Up、握手新鲜，一线很容易把它升级为"WireGuard 不稳定"，从而错过真正的配置问题。
+
+**复现步骤。** 把 `corp` 的 `AllowedIPs` 从 `0.0.0.0/0` 改为 `10.0.0.0/24`，或加入 `Table = off`，然后重启服务。两种改法的现象不同：前者会让目标网段没有路由，后者会让所有 AllowedIPs 都不写入系统路由表。复现时先记录目标地址（例如 `10.1.0.5`）与当前路由，再改动。
+
+```powershell
+Get-NetRoute -InterfaceAlias corp | Format-Table DestinationPrefix,NextHop,RouteMetric -AutoSize
+Find-NetRoute -RemoteIPAddress 10.1.0.5 | Select-Object -First 2
+```
+
+**日志与命令证据。** 日志仍然是正常的启动序列，`Setting device v4 addresses` 与 `Startup complete` 都会出现，因为地址配置成功；差别在路由。`Get-NetRoute` 里找不到覆盖 `10.1.0.5` 的前缀，只有 `10.0.0.0/24` 这类随 AllowedIPs 下发的路由；`Find-NetRoute` 会把 `10.1.0.5` 判给物理网卡。示例输出如下，具体格式需对照实际版本核验。
+
+```text
+InterfaceAlias       : corp
+DestinationPrefix    : 10.0.0.0/24
+NextHop              : 0.0.0.0
+RouteMetric          : 0
+
+InterfaceAlias       : Ethernet
+DestinationPrefix    : 0.0.0.0/0
+NextHop              : 192.168.1.1
+RouteMetric          : 25
+```
+
+判读的关键是"目标是否被某个前缀覆盖，且该前缀是否指向 `corp`"。`Get-NetRoute` 只列该接口的路由，看到 `10.0.0.0/24` 指向 `0.0.0.0` 说明这是接口上的直连式路由，符合 `tunnel/addressconfig.go` 写入 `NextHop` 为未指定地址的做法；`RouteMetric` 为 0 也符合源码：当 AllowedIPs 含默认前缀时，`ipif.UseAutomaticMetric` 被设为 false 且 `Metric` 置 0。第二段 `Find-NetRoute` 才是判决性证据：目标 `10.1.0.5` 匹配到了物理网卡的默认路由，说明系统根本没打算把它送进隧道。此时 ping 对端隧道地址仍会成功，因为那属于 `10.0.0.0/24`，于是产生"能 ping 通却用不了"的错觉。若 `Table = off`，`Get-NetRoute` 里连 `10.0.0.0/24` 都不会出现，`Find-NetRoute` 会直接落到物理网卡。
+
+**根因。** `tunnel/addressconfig.go` 的 `configureInterface()` 会把所有 peer 的 `AllowedIPs` 去重后写入接口路由，但有一段明确的条件：`if !conf.Interface.TableOff && ((foundRoute4 && family == windows.AF_INET) || (foundRoute6 && family == windows.AF_INET6))`，也就是 `Table = off` 时完全跳过 `luid.SetRoutesForFamily()`。同一份配置还会影响防火墙：`enableFirewall()` 里只有"单 peer、非 `TableOff`、存在长度 0 且未带主机位的 AllowedIP"三者同时成立，才把 `doNotRestrict` 置为 false，也就是启用 kill-switch。这说明 `Table = off` 不是"只关路由"的开关，它会连带改变安全语义，必须明确知道自己在做什么。
+
+另一类根因是"AllowedIPs 既是加密选择器又是路由来源"。在 WireGuard 的语义里，发往某个地址的包要进隧道，必须命中某个 peer 的 AllowedIPs；Windows 客户端又把同一组前缀写成系统路由。因此前缀写窄会导致两个后果同时发生：包不会被加密进隧道，路由也不会指向隧道。把 AllowedIPs 当成"访问控制列表"随意收窄，是这类故障最常见的人为原因。
+
+**修复动作。** 如果目标是全隧道，恢复 `0.0.0.0/0` 与 `::/0`；如果是分流，把目标网段补进 AllowedIPs，并确认对端也允许该源地址。只有在确实需要外部系统管理路由时才使用 `Table = off`，此时必须自行用 `New-NetRoute` 把前缀指到隧道接口的 `ifIndex`，否则流量不会进隧道。修复后要重新检查 kill-switch 是否符合预期：从 `Table = off` 改回默认值，可能突然启用阻断规则，导致原本可用的局域网断开（见案例四）。
+
+```powershell
+$if = Get-NetAdapter -Name corp
+New-NetRoute -DestinationPrefix '10.1.0.0/16' -InterfaceIndex $if.ifIndex -NextHop 0.0.0.0
+```
+
+**验证方法。** 用 `Find-NetRoute -RemoteIPAddress 10.1.0.5` 确认命中的是 `corp`，再用 `Test-NetConnection` 或业务客户端验证。仅看 `ping` 不够：ICMP 可能被对端策略放行而 TCP 被拒绝，反之亦然。最后用 `wg show corp` 的字节差分确认流量确实经过隧道，而不是走了物理网卡的其它路径。
+
+#### 案例三：MTU 黑洞
+
+**现象与影响面。** 网页打不开、TLS 握手卡住、SSH 登录后执行大输出命令就冻结，但 `ping` 小包正常、DNS 解析正常、`wg show` 握手新鲜。影响面具有强烈的"大小相关"特征：小请求能过，大响应卡死。用户往往描述为"网速慢"或"某些网站打不开"，这类描述会把排查引向带宽与 DNS，从而错过 MTU。
+
+**复现步骤。** 在 `corp` 中显式写 `MTU = 1500`，而物理链路实际 MTU 为 1500（PPPoE 场景为 1492），使封装后的包超过链路可承载长度。重启服务后先 ping 小包，再用禁止分片的探测包逐步加大载荷。IPv4 下 ICMP 载荷上限约为 MTU 减 28，因此 1500 对应 1472，1420 对应 1392。
+
+```powershell
+ping -n 2 10.1.0.5
+ping -f -l 1472 -n 2 10.1.0.5
+ping -f -l 1392 -n 2 10.1.0.5
+```
+
+**日志与命令证据。** 日志里没有错误，只有一条容易被忽略的差异：当配置里写死 MTU 时，`interfaceWatcher.setup()` 不会打印 `Monitoring MTU of default v4 routes`，因为自动监视只在 `conf.Interface.MTU == 0` 时启动。接口值可以用 `Get-NetIPInterface` 读到。示例输出如下，具体格式需对照实际版本核验。
+
+```text
+InterfaceAlias : corp
+AddressFamily  : IPv4
+NlMtu          : 1500
+ConnectionState: Connected
+Forwarding     : Disabled
+
+Pinging 10.1.0.5 with 1472 bytes of data:
+Request timed out.
+Request timed out.
+
+Pinging 10.1.0.5 with 1392 bytes of data:
+Reply from 10.1.0.5: bytes=1392 time=38ms TTL=63
+Reply from 10.1.0.5: bytes=1392 time=39ms TTL=63
+```
+
+判读要抓住三件事。第一，`NlMtu` 为 1500 与物理口相同，意味着隧道没有为 80 字节封装预留空间；正常自动推导应得到"物理 MTU 减 80"，即 1420。第二，`ping -f -l 1472` 超时说明"不允许分片的大包"过不去，而 `ping -f -l 1392` 成功说明路径本身可达、只是容量不够；这个"阶梯式"结果比单纯"ping 不通"有价值得多。第三，如果连小包 ping 也不通，本案例不成立，应回到案例一或案例二。需要提醒：很多网络直接丢弃带 DF 位的 ICMP 或屏蔽 ICMP，此时上述探测会全部超时，不能据此断言 MTU 正常；应改用 TCP 大响应或 `Test-NetConnection` 配合应用层现象判断。
+
+MTU 黑洞的确诊不能只靠一次 ping，它依赖"大小相关性、接口值、路径反馈"三条证据交叉，判断顺序如图 08-04-02 所示。图中的虚线表示"探测无回执"这一分支：当 ICMP 被过滤时，不能从超时直接推出 MTU 过大，只能回到接口值与配置来源继续核对。
+
+:::figure id=08-04-02 | name=MTU 黑洞的三段证据链 | dir=TD
+node n1 "ping 小包成功" blue
+node n2 "ping 大包 DF 超时" red
+node n3 "NlMtu 等于物理口" teal
+node n4 "配置写死 MTU" amber
+node n5 "自动推导被跳过" purple
+node n6 "ICMP 被过滤无法 PMTUD" gray
+node n7 "删除 MTU 或下调" green
+edge n1 -> n2 "加大载荷"
+edge n2 -> n3 "读接口值"
+edge n3 -> n4 "对照配置"
+edge n4 -> n5 "日志无监视行"
+edge n5 -> n6 "大包被静默丢弃"
+edge n6 -> n7 "手动收敛"
+edge n2 -> n6 dashed "无回执"
+:::
+
+**根因。** `docs/netquirk.md` 说明，未指定 MTU 时客户端取"非本隧道的默认路由接口 MTU 减 80"。这 80 字节在 IPv6 下正好是 40 字节 IP 头、8 字节 UDP 头与 32 字节 WireGuard 协议头之和；IPv4 下实际开销为 20 + 8 + 32 = 60 字节，源码仍统一按减 80 处理，属于覆盖两种地址族的保守取值。`tunnel/mtumonitor.go` 的实现是 `iface.NLMTU = uint32(max(int(mtu)-80, minMTU))`，IPv4 下限 576、IPv6 下限 1280，并且只在默认路由变化或接口参数变化时重算。显式写 `MTU` 会跳过这条推导（`tunnel/addressconfig.go` 里直接使用配置值），于是把"链路 MTU"当成了"隧道 MTU"。当路径上的 ICMP 被过滤时，TCP 的 PMTUD 无法收敛，形成典型的 MTU 黑洞：握手包小，能过；证书链或大响应超过阈值，被静默丢弃。
+
+**修复动作。** 首选删除显式 `MTU`，让客户端按默认路由自动推导，并在日志中确认出现 `Monitoring MTU of default v4 routes`。若必须写死（例如链路 MTU 不稳定或对端要求固定值），按最窄链路设置：以太网 1420、PPPoE 1400 左右、IPv6 最低 1280。修改后重启服务，让 `configureInterface()` 重新写入 `NLMTU`；仅改配置不重启不会生效，因为配置在服务启动时一次性下发。
+
+**验证方法。** 重复 `ping -f -l` 阶梯测试，确认在预期阈值处成功；再用一次大文件传输或 TLS 连接验证不再卡住。最后检查 `wg show` 的字节计数是否随传输增长，排除"包根本没进隧道"的另一种可能。
+
+#### 案例四：kill-switch 生效后本地网络全断
+
+**现象与影响面。** 启用全隧道后，隧道本身工作正常，能访问远端资源，但本地局域网共享、网络打印机、管理机、甚至本地 DNS 全部不可达。用户描述常是"上了 VPN 之后整个网都断了"。影响面是"非隧道目的地全部受影响"，包括 RFC1918 私网地址、链路本地地址与部分组播。这个行为不是 bug，而是设计：单 peer 加 `/0` 会触发 kill-switch，除明确放行的流量外一律阻断。
+
+**复现步骤。** 使用单 peer 配置，`AllowedIPs` 写 `0.0.0.0/0` 与 `::/0`，不配置 `DNS` 或只配置远端 DNS；启动隧道后访问局域网主机 `192.168.1.10` 的共享端口。对照组把 `AllowedIPs` 换成 `0.0.0.0/1` 与 `128.0.0.0/1`（IPv6 用 `::/1` 与 `8000::/1`），其余不变，观察行为差异。
+
+```powershell
+Test-NetConnection -ComputerName 192.168.1.10 -Port 445
+Test-NetConnection -ComputerName 10.1.0.5 -Port 443
+```
+
+**日志与命令证据。** 日志里只有一行 `Enabling firewall rules`，没有错误；WFP 规则不出现在 Windows 防火墙的常规规则列表里，用 `Get-NetFirewallRule` 看不到，因此"看不到规则"不等于"规则没装"。连通性测试的典型结果如下，示例输出，具体格式需对照实际版本核验。
+
+```text
+ComputerName     : 192.168.1.10
+RemotePort       : 445
+TcpTestSucceeded : False
+
+ComputerName     : 10.1.0.5
+RemotePort       : 443
+TcpTestSucceeded : True
+```
+
+判读要点是"隧道内通、隧道外断"这一组合。`10.1.0.5:443` 成功说明隧道数据面、路由与对端策略都正常；`192.168.1.10:445` 失败且 `ping` 同样失败，说明阻断发生在本地出站方向，而不是局域网主机宕机。此时若 `Get-NetRoute` 显示 `192.168.1.0/24` 仍在物理网卡上且为直连路由，就更印证了"路由没问题、策略在拦"：包本来可以走物理网卡，但被 WFP 的阻断规则先一步拒绝。反过来，如果 `192.168.1.0/24` 的路由被删掉，问题在路由而非防火墙，应回到案例二。
+
+**根因。** `tunnel/addressconfig.go` 的 `enableFirewall()` 在"单 peer、非 `TableOff`、AllowedIPs 含长度 0 且无主机位的前缀"时把 `doNotRestrict` 置为 false，随后调用 `firewall.EnableFirewall()`。`tunnel/firewall/rules.go` 里依次安装：放行隧道接口自身流量、放行 WireGuard 服务进程（按可执行文件路径加进程安全描述符匹配，避免同目录其它进程冒用）、放行环回、放行 DHCPv4/v6 与 NDP、放行 Hyper-V 同宿流量、按配置放行发往指定 DNS 的 53 端口，最后 `blockAll()` 兜底阻断。`docs/netquirk.md` 对这一语义有完整描述，并给出用 `/1` 前缀对替代 `/0` 以绕开限制的做法。因此局域网被断不是"路由被劫持"，而是"没有一条规则允许它"。
+
+**修复动作。** 先确认业务意图。如果确实需要全隧道并接受局域网隔离，正确做法是把它写进交付说明，并给用户提供例外清单，而不是临时关规则。如果既要默认路由又要访问局域网，可改用 `0.0.0.0/1` 与 `128.0.0.0/1` 组合：它覆盖的地址空间与 `/0` 几乎相同，但不会触发上述条件，路由与 DNS 回到 Windows 常规行为，局域网直连路由自然生效。代价是失去 kill-switch 的防泄漏语义，必须由终端防火墙或其它手段补足。UI 编辑器里有对应复选框可切换这一形态（配置写法见 04-02，规则语义见 06-09）。
+
+**验证方法。** 同时验证三件事：隧道内资源可达、局域网资源可达（若业务需要）、公网出口确实在隧道内。第三点不能只看"能上网"，要看出口 IP 或对端计数。改回 `/0` 后应重新确认局域网再次被阻断，以证明你理解的是机制而不是碰巧恢复。
+
+#### 案例五：DNS 不生效或泄漏
+
+**现象与影响面。** 表现为三类：完全解析失败（浏览器报 DNS 错误）、解析到错误地址（内网域名得到公网结果）、解析时快时慢（多宿主竞争）。影响面往往被低估：用户说"网卡"，实际是域名；等排查到 DNS 时，已经重启过服务、重装过客户端，现场证据被破坏。全隧道下这类问题更隐蔽，因为 kill-switch 会把"发往非配置 DNS 的查询"直接阻断，表现为"ping IP 通、域名不通"。
+
+**复现步骤。** 在 `corp` 中不写 `DNS`，同时让物理网卡保留运营商 DNS；或写入远端 DNS 但内网域名依赖 `DNSSearch` 后缀。启动隧道后分别测试默认解析与直查指定服务器，再对比物理网卡与隧道接口的 DNS 列表。
+
+```powershell
+Get-DnsClientServerAddress | Format-Table InterfaceAlias,AddressFamily,ServerAddresses -AutoSize
+Resolve-DnsName corp.example.com
+Resolve-DnsName corp.example.com -Server 10.7.0.1
+Get-DnsClientGlobalSetting | Select-Object SuffixSearchList
+```
+
+**日志与命令证据。** 服务日志不会报 DNS 配置错误，因为下发给 Windows 是成功的；问题出在"下发了什么"和"解析器选了谁"。示例输出如下，具体格式需对照实际版本核验。
+
+```text
+InterfaceAlias     AddressFamily ServerAddresses
+--------------     ------------- ---------------
+Ethernet           IPv4          {192.168.1.1}
+corp               IPv4          {10.7.0.1}
+corp               IPv6          {fd00:7::1}
+
+Name                          Type   TTL   Section    IPAddress
+----                          ----   ---   -------    ---------
+corp.example.com              A      0     Answer     10.7.0.10
+```
+
+判读分三层。第一层看"隧道接口有没有 DNS"：`corp` 下出现 `10.7.0.1` 说明配置已通过 `SetDNS` 下发；若该行为空，说明配置里没有 `DNS` 键，或下发失败但被上层忽略。第二层看"物理网卡是否仍在下发 DNS"：`Ethernet` 仍有 `192.168.1.1` 是正常的，Windows 本来就是多宿主解析，客户端不会去改物理网卡的 DNS；关键在于查询最终发给谁。第三层看"解析结果属于哪一侧"：`10.7.0.10` 是内网地址，说明走了隧道 DNS；若返回公网地址，说明查询泄漏到了物理网卡。`Resolve-DnsName` 默认查询成功不代表没泄漏，必须与 `-Server 10.7.0.1` 的结果对比，并与对端 DNS 查询日志对照。
+
+DNS 问题的证据分散在"接口配置、解析器选择、策略放行"三处，只看其中一个就会误判，判读顺序如图 08-04-03 所示。图中把"向指定 DNS 直查"放在最后，是因为它绕过了缓存与后缀逻辑，适合做最终对照，而不适合作为第一步。
+
+:::figure id=08-04-03 | name=DNS 缺失与泄漏的三处证据 | dir=TD
+node n1 "域名解析异常" red
+node n2 "接口 DNS 列表" blue
+node n3 "接口跃点与度量" teal
+node n4 "DNSSearch 后缀" amber
+node n5 "WFP 53 端口放行" purple
+node n6 "向指定 DNS 直查" gray
+node n7 "判定缺失或泄漏" green
+edge n1 -> n2 "先看服务器"
+edge n2 -> n3 "多宿主排序"
+edge n3 -> n4 "后缀匹配"
+edge n4 -> n5 "全隧道收紧"
+edge n5 -> n6 "绕过缓存"
+edge n6 -> n7 "对比结果"
+edge n2 -> n7 dashed "列表为空"
+:::
+
+**根因。** `tunnel/addressconfig.go` 在配置接口时调用 `luid.SetDNS(family, conf.Interface.DNS, conf.Interface.DNSSearch)`；`tunnel/winipcfg/luid.go` 的 `SetDNS()` 使用 `SetInterfaceDnsSettings` 写入 `Nameserver` 与 `SearchList` 两个标志，Windows 10 1809 以前回退到注册表 `NameServer`/`SearchList`。这说明客户端只做"按接口下发"，不做"全局劫持"：Windows 的解析器仍按多宿主规则选择服务器，接口跃点、路由度量与后缀匹配都会影响结果。全隧道场景下，`docs/netquirk.md` 说明 53 端口只允许发往配置指定的 DNS，因此其它服务器的查询会被阻断，表现为"解析不了"而不是"解析泄漏"；反过来，分流场景没有这条限制，若配置里没写 `DNS`，查询就会走物理网卡，形成真正的泄漏。`conf/dnsresolver_windows.go` 的 `resolveHostname()` 只负责解析 Endpoint 域名，与业务域名解析是两条不同的链路，不能混为一谈。
+
+**修复动作。** 全隧道必须在配置里显式给出 `DNS`，并确认这些地址在隧道内可达；需要内网短域名时补 `DNSSearch`，让解析器按后缀追加。分流场景若要求特定域名走隧道 DNS，应使用 Windows 的 NRPT（名称解析策略表）按域分流，而不是期望客户端自动处理；NRPT 属于 Windows 能力，不是本客户端的配置项。若发现物理网卡 DNS 抢先，可通过接口跃点调整优先级，但要意识到这会改变全局解析行为，属于系统级变更。修复后重启服务，使 `SetDNS` 重新下发。
+
+**验证方法。** 用 `Resolve-DnsName` 分别做默认查询与指定服务器查询，结果应一致；用 `Get-DnsClientServerAddress -InterfaceAlias corp` 确认列表等于配置；再取一次对端 DNS 的查询计数或日志，确认请求确实到达。三者缺一，就不能断言"DNS 已修好"。
+
+#### 案例六：开机自启或升级失败
+
+**现象与影响面。** 两种子形态。自启失败：重启后隧道服务存在但处于 Stopped，或反复重启，用户开机后无网络；升级失败：`/update` 返回错误或看似成功但版本未变，UI 仍提示可更新。影响面分别是"整机断网"与"长期停留在旧版本"，后者是安全风险，因为更新往往包含驱动与协议修复。
+
+**复现步骤。** 自启失败可在实验机上把隧道服务的可执行命令行指向一个已被移动的配置文件路径，或删除配置后重启；升级失败可在阻断下载域名、设置错误系统时间或使用非管理员会话执行 `/update` 的情况下复现。复现前记录 `sc qc` 与当前版本。
+
+```powershell
+sc.exe qc 'WireGuardTunnel$corp'
+& "$env:ProgramFiles\WireGuard\wireguard.exe" /update 2> C:\wg-evidence\update.log
+Get-Content C:\wg-evidence\update.log -Tail 20
+```
+
+**日志与命令证据。** 自启问题的判决性证据是服务命令行里的配置路径；升级问题则要看 `/update` 的标准错误输出。示例输出如下，具体格式需对照实际版本核验。
+
+```text
+SERVICE_NAME: WireGuardTunnel$corp
+        TYPE               : 10  WIN32_OWN_PROCESS
+        START_TYPE         : 2   AUTO_START
+        ERROR_CONTROL      : 1   NORMAL
+        BINARY_PATH_NAME   : "C:\Program Files\WireGuard\wireguard.exe" /tunnelservice "C:\Program Files\WireGuard\Data\Configurations\corp.conf.dpapi"
+        DEPENDENCIES       : Nsi
+                             TcpIp
+        SERVICE_START_NAME : LocalSystem
+```
+
+判读时先看 `START_TYPE`：`AUTO_START` 说明自启已配置，问题不在"没设自动"。再看 `BINARY_PATH_NAME`：路径必须是当前存在的配置文件，且后缀与实际存储形态一致；如果配置被移到别处、改名，或从 `.conf` 换成 `.conf.dpapi` 而服务命令行没更新，启动时就会在 `conf.LoadFromPath` 失败，映射为 `ErrorLoadConfiguration`（枚举值 2），服务以 1066 加特定码退出。`DEPENDENCIES` 里的 `Nsi` 与 `TcpIp` 来自 `manager/install.go` 创建服务时的 `mgr.Config`，它们保证网络栈先就绪；若被第三方工具改掉，开机早期可能拿不到适配器。`SERVICE_START_NAME` 为 `LocalSystem` 是设计使然，也意味着任何能改这个服务配置的人都拥有极高权限，应纳入变更管控。
+
+升级输出需要另一种判读。更新链的顺序是：TLS 下载 `list.sec`、验证 signify Ed25519 签名、按架构找更高版本、下载 MSI 到 `C:\Windows\Temp` 的随机文件名、校验 BLAKE2b-256、最后以提升令牌执行 `msiexec.exe /qb!- /i`（原理见 06-12，模块见 07-11）。任何一步失败都会终止后续步骤，因此"日志最后一行停在下载"与"停在签名"对应完全不同的修复动作。若输出显示下载完成但版本未变，优先怀疑 MSI 安装被策略拦截、`msiexec` 返回码非 0，或安装后管理器服务未重启。
+
+**根因。** 自启失败的三类根因：配置路径失效（移动、改名、加密形态变化）；服务依赖或启动类型被组策略、优化工具改写；开机早期资源未就绪，适配器创建在 15 次重试（每次间隔 1 秒）后仍失败，服务退出。`tunnel/service.go` 对开机场景有专门处理：若 SCM 被锁，会先上报 Running 再继续创建适配器，因此"服务显示 Running 但还没 Startup complete"在开机后几十秒内是正常的。升级失败的根因集中在信任链与环境：系统时间偏差导致 TLS 证书校验失败、代理未配置、下载域名被阻断、磁盘或 Temp ACL 异常、安装权限不足。
+
+**修复动作。** 自启问题先用 `sc qc` 对照真实路径，再决定是重装隧道服务还是修正路径。重装的标准动作是卸载后重新安装，确保服务命令行指向新路径；不要手工改注册表里的 `ImagePath` 而不改配置，容易留下不一致。升级问题先看 `/update` 的错误文本：证书类错误查时间与代理，签名类错误查版本与下载完整性，安装类错误查 `msiexec` 日志与策略。修复后重新执行一次并确认版本号变化，而不是只看"没有报错"。
+
+**验证方法。** 自启要在真实重启后验证：等待 60 秒，检查日志出现 `Startup complete`，再查 `wg show` 的握手。升级要验证三件事：`wireguard.exe` 文件版本、日志中的 `Using WireGuardNT/x.y`、以及 UI 是否还提示可更新。只验证其中一项，可能得到"版本号变了但驱动仍是旧的"这种半升级状态。
+
+### 4. 验证方法与预期结果
+
+六个案例的验证动作不同，但验收标准可以统一成一张表。下表给出"修好"的可观测定义，避免用"用户说好了"作为唯一结论。
+
+| 验收项 | 命令或证据 | 预期结果 | 不达标时的含义 |
+|---|---|---|---|
+| 服务稳定 | `sc query` 连续两次间隔 60 秒 | STATE 均为 RUNNING | 仍在重启或启动超时 |
+| 启动完成 | 日志末段 | 出现 `Startup complete` | 地址或接口未就绪 |
+| 握手 | `wg show <name>` | 三分钟内有时间戳 | UDP 或对端仍未通 |
+| 双向流量 | 两次 `wg show` 差分 | received 与 sent 均增长 | 单向不通或未走隧道 |
+| 路由 | `Find-NetRoute` | 命中隧道接口 | 前缀或 Table 配置错 |
+| MTU | `ping -f -l` 阶梯 | 阈值处成功且无卡顿 | MTU 仍过大或被过滤 |
+| DNS | 默认与指定服务器查询 | 结果一致且为内网地址 | 未下发或发生泄漏 |
+| 策略 | 局域网与隧道内各测一次 | 与业务意图一致 | kill-switch 语义未确认 |
+
+一份"全部正常"的基线应该同时满足服务、握手、双向流量、路由与 DNS 五项，示例输出如下，具体格式需对照实际版本核验。
+
+```text
+interface: corp
+  public key: lfTRXEWxt8mZc8cjSvOWN3tqnTpWw4v2Eg3qF6WTklw=
+  private key: (hidden)
+  listening port: 53488
+
+peer: JRI8Xc0zKP9kXk8qP84NdUQA04h6DLfFbwJn4g+/PFs=
+  endpoint: 203.0.113.10:51820
+  allowed ips: 0.0.0.0/0, ::/0
+  latest handshake: 42 seconds ago
+  transfer: 18.72 MiB received, 3.41 MiB sent
+```
+
+这段输出的判读要结合时间与比例。`latest handshake` 为 42 秒前，说明隧道在最近一个重密钥窗口内活跃；若业务空闲，几分钟不更新也属正常，只有 `Never` 或与当前时间相差数十分钟且期间有流量，才说明握手停摆。`transfer` 的接收远大于发送，符合"下载为主"的常见负载；如果两个方向都很大但业务仍失败，说明流量进了隧道却被对端或上层拒绝，应查对端策略而不是客户端。`allowed ips` 列出 `/0` 与 `::/0`，提示这条隧道处于全隧道形态，后续任何"局域网不通"的投诉都应先想到案例四，而不是先改 DNS。`listening port` 固定为 53488，说明配置里写了 `ListenPort`；若每次重启都变化，则 NAT 场景下更需要 keepalive。把这段输出与 08-01 的日志阶段序列对照，就能在三十秒内判断"是没起来、没握手，还是握手了但不通"。
+
+还需要一组反向验证：故意制造一个已知故障，确认你的检测手段能发现它。例如临时把 Endpoint 端口改错，确认 `latest handshake` 变成 `Never` 且 `received` 归零；恢复后再确认握手回来。这一步看似多余，实际是在校准工具：如果改错了端口你的脚本仍然报"健康"，那脚本的判据就是错的，后面所有结论都不可信。
+
+### 5. 常见失败与排错
+
+**误判一：把 `Never` 直接当成密钥错误。** 密钥不匹配确实会导致握手失败，但同样会表现为 `Never`。区分方法是看对端是否也显示握手失败、以及 `received` 是否为 0；更可靠的是在实验机上用一对确定匹配的密钥替换测试。直接改密钥的风险很高：一旦改错，连原本正常的隧道也会断，且现场证据被覆盖。
+
+**误判二：先重启再取证。** 重启会销毁适配器、撤销路由与 DNS，`wg show` 归零，WFP 规则被清理，唯一留下的只有环形日志与 SCM 事件。正确顺序永远是先 `/dumplog`、再快照、最后才重启。若已经重启，至少保留重启前的日志文件，并从 SCM 事件反推退出码。
+
+**误判三：一次改多个变量。** 同时改 MTU、DNS 与 AllowedIPs，即使恢复了也不清楚是哪一项起的作用；下一次复发时仍然不会修。每次只改一项，并在改动前后各存一份 `wg show` 与路由快照。
+
+**误判四：用 `ping` 判断 UDP 可达性。** ICMP 与 UDP 是不同协议，路径完全可能放行 ICMP 而阻断 UDP，或反之。`Test-NetConnection -Port` 默认测 TCP，也不能证明 UDP 通。判断握手问题要看 `wg show` 的 `received` 与对端计数，必要时在两端抓包。
+
+**误判五：把 `Table = off` 当成"更安全"。** 它同时关闭路由写入与 kill-switch 触发条件，等于把路由与防泄漏都交给外部系统。若没有配套的路由与防火墙管理，得到的不是更安全，而是"流量绕过隧道且无人阻断"。
+
+**误判六：用 `Get-NetFirewallRule` 判断 kill-switch 是否存在。** 该命令读的是 Windows 防火墙存储，而本客户端的规则装在 WFP 子层，二者不是同一套视图。判断依据应是配置条件（单 peer、`/0`、非 `TableOff`）、日志中的 `Enabling firewall rules`，以及实际的连通性差异。
+
+**误判七：MTU 探测被 ICMP 过滤欺骗。** `ping -f` 全超时既可能是 MTU 过大，也可能是 ICMP 被丢弃。应结合 `NlMtu`、`tunnel/mtumonitor.go` 的推导规则与应用层"小包通、大包断"的现象综合判断；只看 ping 会得出相反结论。
+
+**误判八：把升级失败当成隧道故障。** 更新链只影响版本，不影响已建立的隧道；反过来，隧道故障也不要靠"升级试试"来解决，版本变化会引入新变量。升级前后各记录一次版本与驱动版本，才能判断是否真的升级成功。
+
+### 6. 小结
+
+本篇用六个案例覆盖了从握手到 DNS 的主要故障面，并刻意让每个案例都包含"看起来正常"的陷阱：案例一服务全绿但握手从未成功，案例二握手正常但路由没覆盖，案例三小包全通但大包黑洞，案例四隧道通畅但本地全断，案例五接口有 DNS 但解析走了别处，案例六服务自启已配置但路径已失效。共同的方法只有一句：先用证据把故障压缩到一层，再用最小变更验证一个假设。
+
+六个案例的根因都能回到可定位的源码或文档：`tunnel/service.go` 的阶段与错误码、`tunnel/addressconfig.go` 的路由与防火墙条件、`tunnel/mtumonitor.go` 的减 80 规则、`tunnel/firewall/rules.go` 的放行与兜底阻断、`tunnel/winipcfg/luid.go` 的 DNS 下发、`manager/install.go` 的服务配置，以及 `docs/netquirk.md`、`docs/enterprise.md`、`docs/attacksurface.md` 的官方说明。把这些位置记住，比记住命令更有用，因为命令会随版本变化，机制不会。
+
+本篇不重列配置与命令：完整配置键见 04-02 与 04-03，`wireguard.exe` 开关见 04-04，`wg(8)` 见 04-05，服务命令见 04-06；字段定义见 05-05 与 05-09；握手、路由、MTU、DNS、WFP、更新链原理见 06-04、06-06、06-07、06-08、06-09、06-12；模块边界见 07-03、07-05、07-07、07-11（字段见 05-09 ｜ 配置见 04-04 ｜ 原理见 06-09 ｜ 模块见 07-07）。下一篇 08-05 会换一个视角：不再问"怎么修"，而问"这些机制本身把信任交给了谁"，以及在生产环境中哪些"图省事"的修复会削弱安全边界。
+
+## 08-05 安全加固与攻击面
+
+### 1. 背景与动机
+
+WireGuard for Windows 不是一个普通桌面应用。它由四部分组成：一个内核驱动 WireGuardNT，以及 Tunnel 服务、Manager 服务与 UI 三个用户态组件（`docs/attacksurface.md` 开篇即给出这一分层）。其中两个服务以 LocalSystem 运行，UI 以管理员的高完整性令牌运行，驱动则暴露可读写配置、可读日志的 IOCTL。这样的组合带来一个不可避免的结论：**能改写 WireGuard 配置的人，实质上获得了以最高权限执行代码的能力**。这不是实现缺陷，而是"VPN 客户端必须能改路由、改 DNS、装防火墙规则"这一功能定位的必然结果。安全加固的目标不是消除这一事实，而是把"谁有能力触发它"收缩到最小，并把每一次触发留下证据。
+
+第二个动机来自部署现实。企业里常见的做法是把 MSI 交给 GPO 分发、把 `.conf` 直接拷进配置目录、用受限操作员账号做日常启停。这些做法各自都会改变攻击面：GPO 决定了谁能改安装参数，配置目录的 ACL 决定了谁能植入隧道，受限 UI 决定了非管理员能看到什么。如果只读官方文档的"功能"部分，很容易把"支持静默部署"理解成"可以随便放开权限"。本篇要回答的正是这些边界问题：哪些对象由谁拥有、哪些接口对哪一级完整性开放、更新链的信任锚在哪里、哪些"图省事"的加固反而会制造新洞。
+
+第三，官方 `docs/attacksurface.md` 本身是一份"进行中的文档"，它明确写着这是当前理解、会随认识演进而更新，并列出若干开放问题，例如隧道服务保留 `SeLoadDriverPrivilege` 的不理想之处、未来可能拆分进程。这意味着读者不能把某一版的缓解措施当成永恒结论。本篇在引用这些内容时会同时给出源码位置，并注明"需对照实际版本核验"的地方，目的是让结论可复核，而不是制造确定性的错觉。
+
+需要先划清范围：本篇讲信任模型与加固动作，不重列注册表键、配置键与命令全集。两个管理员注册表策略的完整语义见 04-07，配置键见 04-02 与 04-03，服务与 PowerShell 命令见 04-06；服务上下文、适配器与 WFP 的字段见 05-08 与 05-09；权限降级、UI 进程模型、WFP 规则与更新校验的机制分别见 06-05、06-10、06-09、06-12；模块边界见 07-05、07-07、07-08、07-11。
+
+### 2. 核心概念
+
+**完整性级别与令牌。** Windows 用完整性级别（integrity level）约束"低级别进程能否写入高级别对象"。普通用户进程通常是中等完整性，管理员提升后的进程为高完整性，服务为系统完整性。驱动的 IOCTL 安全描述符里带有 `S:(ML;;NWNRNX;;;HI)`，含义是"高完整性及以上、且不允许向上写/读/执行"的强制标签策略；配合 DACL 只给 SYSTEM 与 Administrators 完全访问，结果是中等完整性的进程即使属于管理员组，也无法直接打开该设备。这一条经常被忽略：以普通权限运行的自研工具调 IOCTL 会得到"拒绝访问"，并不是驱动坏了。
+
+**特权与降权。** 服务令牌里的"特权"（privilege）与"完整性"是两个维度。Tunnel 服务启动时是 LocalSystem，拥有大量特权；`tunnel/service.go` 在安装防火墙之后调用 `elevate.DropAllPrivileges(true)`，把除 `SeLoadDriverPrivilege` 之外的特权全部移除。保留这一项是为了在关停时能卸载/删除接口，官方文档也直言这是一个"不理想"的折中，因为 `SeLoadDriverPrivilege` 本身可用于提权，未来可能通过拆分进程解决。加固时不能假设"降权之后这个进程就无害"：它仍然持有装载驱动的能力。
+
+**服务身份与服务 SID。** 两个服务都以 LocalSystem 运行。`manager/install.go` 创建隧道服务时把 `StartType` 设为自动、依赖 `Nsi` 与 `TcpIp`，并把 `SidType` 设为 `SERVICE_SID_TYPE_UNRESTRICTED`。这意味着服务令牌里会加入服务 SID，但不启用"写受限"模式；真正的访问控制来自 DACL 与特权，而不是服务 SID。理解这一点，才不会误以为"有服务 SID 就自动隔离"。
+
+**ACL 与 SDDL。** 本仓库大量使用 SDDL 字符串直接设置安全描述符。数据目录 `%ProgramFiles%\WireGuard\Data` 由 `conf/path_windows.go` 的 `RootDirectory()` 以 `O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)` 创建，`Configurations` 子目录继承这份 ACL：属主与属组都是 SYSTEM，DACL 受保护（`PAI` 表示不继承父级 ACE），SYSTEM 与 Administrators 各有一条容器继承的完全访问。单个加密配置文件由 `conf/filewriter_windows.go` 的 `writeLockedDownFile()` 以 `O:SYG:SYD:PAI(A;;FA;;;SY)(A;;SD;;;BA)` 创建：SYSTEM 完全访问，Administrators 只有删除权（`SD`），没有读权。这个设计很关键：管理员能删掉配置，但读不到明文；想读必须通过 Manager 服务的 IPC 或 UI 导出。
+
+**DPAPI 与作用域。** `conf/dpapi/dpapi_windows.go` 调用 `CryptProtectData`，把隧道名作为描述串传入，解密后再逐字符比对描述串，不一致就报 "input name does not match the stored name"。这里没有使用 `CRYPTPROTECT_LOCAL_MACHINE`，而调用方是 LocalSystem 的 Manager 服务，因此密文绑定在"本机 + LocalSystem 用户"这一作用域内。把 `.conf.dpapi` 拷到另一台机器通常无法解密，这不是文件损坏，而是设计使然；跨机迁移必须走 UI 的导出功能，导出的是明文，需按密钥材料同等保护。
+
+**WFP 子层与权重。** kill-switch 不是 Windows 防火墙规则，而是 WFP 过滤器，装在私有子层里，按权重决定评估顺序。`tunnel/firewall/rules.go` 里的放行规则与兜底 `blockAll()` 各有权重，权重高的先评估。`Get-NetFirewallRule` 看不到它们，`netsh advfirewall` 也看不到；判断是否生效只能看配置条件、日志与连通性。这条概念在第 08-04 的案例四已经用过，这里再一次强调，是因为它直接决定了"审计时该采信哪个视图"。
+
+**信任锚。** 更新链的信任锚是一个内置的 Ed25519 公钥：服务端用 `signify` 对清单签名，客户端用 `updater/signify.go` 验签；清单里是各 MSI 的 BLAKE2b-256 摘要，下载后再校验摘要，最后交给 `msiexec`。TLS 只保护传输，不构成最终信任；即使攻击者能劫持 TLS，没有签名私钥也造不出可安装的包。反过来，若本机的公钥被替换，整条链就失效，因此"程序目录不可被普通用户写入"是这套模型的前提。
+
+**攻击面与缓解的区别。** 攻击面是"可达的接口集合"，缓解是"让接口难以被滥用"。二者不能互相替代：把配置目录 ACL 收紧不会让 IOCTL 消失，关掉 `DangerousScriptExecution` 也不会让服务不再以 LocalSystem 运行。评估加固方案时，要分别回答"接口还在不在"和"谁能够到它"。
+
+### 3. 关键数据结构与源码位置
+
+第一个位置是 `docs/attacksurface.md`，它按组件列出了暴露面。WireGuardNT 暴露 NDIS 微型端口、UDP 解析、若干 OID、PNP/Close 通知与 IOCTL；Tunnel 服务暴露一个用于接口创建的全局互斥体（DACL 与管道一致，并先以 LocalSystem SID 调用 `CreatePrivateNamespace`），并在初始化后降权；Manager 服务暴露无名管道 IPC、可读的共享日志映射、按 `WireGuardTunnel$` 前缀的服务监视、DPAPI 配置目录，以及基于 `WTSEnumerateSessions` 的会话枚举与 UI 孵化；UI 暴露高完整性进程与 `msftedit.dll` 渲染面，并主动移除全部特权。这份文档还给出配置目录与配置文件的 SDDL、IOCTL 的 SDDL、更新文件在 `C:\Windows\Temp` 的 SDDL，是核对 ACL 的第一手依据。
+
+第二个位置是 `tunnel/service.go` 的启动顺序。它先初始化环形日志、加载配置、打印启动信息，处理开机时 SCM 被锁的特殊情况，评估静态陷阱，注册接口监视，解析 Endpoint，创建适配器，开启驱动日志，执行 `PreUp`，安装防火墙，然后才 `DropAllPrivileges(true)`，再下发驱动配置、拉起适配器、执行 `PostUp`。这个顺序有两个安全含义：`PreUp` 在降权之前执行，因此脚本拥有完整的 LocalSystem 特权；代码把防火墙安装在降权之前，说明安装过滤器依赖尚未丢弃的权限，这一顺序同时保证规则在配置下发前就位。审计脚本执行风险时，不能只看"服务已降权"，还要看脚本在时间线上的位置。
+
+第三个位置是 `conf/path_windows.go` 与 `conf/filewriter_windows.go`。前者不仅设置目录 ACL，还做了三项防重定向检查：`Data` 必须是目录、不能是重解析点、按句柄取到的最终路径必须等于预期路径，否则分别返回 "Data directory is actually a file"、"Data directory is reparse point"、"Data directory jumped to unexpected location"。后者用随机临时文件名写入、`FlushFileBuffers` 落盘、再以 `FileRenameInfo` 原子替换目标，避免半写文件与符号链接竞争。这两处是"配置存储可信"的基础，绕过它们去手工放文件，等于放弃这些保护。
+
+第四个位置是 `tunnel/firewall/rules.go` 的 `permitWireGuardService()`。它放行 WireGuard 服务自身的流量时用了两个条件：当前进程的可执行文件路径（`FWPM_CONDITION_ALE_APP_ID`）与当前进程的安全描述符（`FWPM_CONDITION_ALE_USER_ID`）。第二个条件的作用是防止"同一 exe 里宿主的其他进程"冒用这条规则。这个细节说明作者考虑过"路径相同但身份不同"的绕过方式，也提示加固时不要把 `wireguard.exe` 复制到别处再赋予高权限运行。
+
+第五个位置是 `main.go` 与 `elevate` 包。`main` 一进来就调用 `windows.SetDllDirectory("")` 与 `windows.SetDefaultDllDirectories(windows.LOAD_LIBRARY_SEARCH_SYSTEM32)`，把 DLL 搜索限制在 System32，降低 DLL 侧加载风险；`/ui` 分支先判断当前令牌是否管理员或可提升，是则 `elevate.DropAllPrivileges(false)`，再从继承的句柄构造三根管道与日志映射，最后 `ui.RunUI()`。`driver/memmod` 则把驱动 DLL 从资源映射进内存，减少磁盘落地（模块见 07-04）。这些措施共同缩小"二进制被替换"的面，但不改变"配置可执行脚本"的面。
+
+第六个位置是更新器。`updater/signify.go` 负责 Ed25519 验签，`updater/downloader.go` 负责 TLS 下载与摘要校验，`updater/msirunner.go` 负责以提升令牌启动 `msiexec.exe /qb!- /i`；下载落到 `C:\Windows\Temp` 的 256 位随机文件名，权限为 `O:SYD:PAI(A;;FA;;;SY)(A;;FR;;;BA)`，并用 `MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT)` 安排重启后清理。官方文档也坦承一个残余风险：`msiexec` 需要独占文件，下载完成后句柄会关闭，理论上存在"关闭到执行之间被替换"的窗口，只能依赖 Temp 目录权限足够严格。
+
+第七个位置是两个管理员注册表策略，定义在 `docs/adminregistry.md`：`HKLM\Software\WireGuard\LimitedOperatorUI` 与 `HKLM\Software\WireGuard\DangerousScriptExecution`。两者都明确写着"没有 UI、不推荐、未来可能移除、使用风险自负"，卸载会清理整个 `HKLM\Software\WireGuard`。它们不是常规配置项，而是"把攻击面主动扩大"的开关，必须纳入变更审批。
+
+四类组件的信任边界与主要交互如下图所示。图中把"配置存储"与"更新链"单独画出，是因为它们不是进程，却是权限与代码执行的入口；红色节点表示持有 LocalSystem 或内核级权限，读图时应把它们视为"一旦被写入即等同于最高权限"。
+
+:::figure id=08-05-01 | name=四组件与两条信任入口的边界 | dir=TD
+node n1 "WireGuardNT 内核驱动" purple
+node n2 "Tunnel 服务 LocalSystem" red
+node n3 "Manager 服务 LocalSystem" red
+node n4 "UI 高完整性管理员" amber
+node n5 "DPAPI 配置存储" teal
+node n6 "WFP 规则子层" blue
+node n7 "更新链与 MSI" green
+node n8 "受限操作员 UI" gray
+edge n1 -> n2 "IOCTL 限高完整性"
+edge n2 -> n5 "读取加密配置"
+edge n3 -> n5 "写入并监视"
+edge n3 -> n4 "CreateProcessAsUser"
+edge n4 -> n3 "IPC 请求"
+edge n2 -> n6 "安装 kill-switch"
+edge n3 -> n7 "下载并校验"
+edge n3 -> n8 "组 S-1-5-32-556"
+:::
+
+图 08-05-01 有一个容易被误读的地方：UI 到 Manager 的箭头是双向的，但权限并不对等。UI 的 IPC 能力里没有"改配置文件 ACL"或"执行任意命令"这样的接口，所有操作都要经 Manager 判断；UI 即使被完全控制，也不能凭 IPC 让 Tunnel 服务执行任意命令——除非配置里本来就有脚本且 `DangerousScriptExecution` 已开启。当然，若攻击者已能在 UI 进程里执行任意代码，他本身就是一个高完整性管理员进程，那是另一个层面的失陷，不能与"IPC 越权"混为一谈。真正的高价值目标仍是"能写配置目录"或"能替换安装包"。
+
+### 4. 关键流程与调用链
+
+**权限时间线。** 以一次正常的隧道启动为例：SCM 以 LocalSystem 启动 `WireGuardTunnel$name`，进程加载配置（可能是 DPAPI 密文，需要 LocalSystem 作用域解密），创建适配器，开启驱动日志，执行 `PreUp`，安装 WFP 规则，然后丢弃除 `SeLoadDriverPrivilege` 外的全部特权，下发配置并拉起适配器，执行 `PostUp`，最后等待接口监视器报告 started。关停时反向执行：`PreDown`、销毁监视器与适配器、`PostDown`，并在 30 秒未完成时打印全部 goroutine 栈后以 777 退出。加固视角下要关注三个点：`PreUp`/`PostUp` 的实际权限、WFP 规则在降权前安装这一事实、以及关停阶段仍保留的驱动卸载能力。
+
+**UI 孵化链。** Manager 服务用 `WTSEnumerateSessions` 遍历会话，用 `WTSQueryUserToken` 取会话令牌，先用 `CheckTokenMembership(CreateWellKnownSid(WinBuiltinAdministratorsSid))` 判断是否属于管理员组，再用 `GetTokenInformation(TokenElevation)` 判断是否已提升；任一为假就取 `TokenLinkedToken` 再查一次。只有确认是"管理员且可提升"的会话，才用 `CreateProcessAsUser` 以提升令牌拉起 UI，并把三根无名管道与日志映射句柄继承过去。若 `LimitedOperatorUI` 为 1，还会对 `S-1-5-32-556`（Network Configuration Operators）成员拉起受限 UI，但其 IPC 能力被裁剪。这条链的意义是：UI 的高完整性不是自己申请的，而是 Manager 在确认会话身份后授予的；因此"以普通用户身份启动 wireguard.exe"不会得到完整 UI，也不应期待它能改配置。
+
+**配置写入链。** 管理员把 `.conf` 放进 `%ProgramFiles%\WireGuard\Data\Configurations\`，Manager 的目录监视发现新文件，读取后用 DPAPI 加密为 `.conf.dpapi`，以受限 SD 写入临时文件并原子改名，然后删除明文。此后只有 SYSTEM 能读密文，Administrators 只能删除；UI 导出时由 Manager 解密并经 IPC 返回。这条链的信任假设是"能往这个目录写文件的人已经等于管理员"，因此目录 ACL 必须禁止普通用户写入；一旦某个部署脚本为了"方便"给 Users 授予修改权，整个 DPAPI 保护就被绕过——攻击者可以直接投放配置，等 Manager 加密并启动。
+
+**更新链。** 客户端下载 `list.sec`，用内置公钥验 Ed25519 签名；签名有效后按本机架构找版本更高的 MSI；下载到 Temp 随机名并校验 BLAKE2b-256；校验通过后关闭句柄，用请求更新的 UI 会话所链接的提升令牌执行 `msiexec.exe /qb!- /i`。任何一步失败都不会安装。注意"验签"与"校验摘要"是两道独立的门：前者防伪造清单，后者防传输损坏或替换；只做其中一道都不够。更新链的信任锚与校验点如图 08-05-02 所示。
+
+:::figure id=08-05-02 | name=更新链的信任锚与三道校验 | dir=TD
+node n1 "list.sec 版本清单" blue
+node n2 "signify Ed25519 验签" teal
+node n3 "按架构选更高版本" amber
+node n4 "TLS 下载 MSI" purple
+node n5 "BLAKE2b-256 校验" teal
+node n6 "Temp 随机名与 ACL" gray
+node n7 "msiexec 提升执行" green
+edge n1 -> n2 "内置公钥"
+edge n2 -> n3 "签名有效"
+edge n3 -> n4 "匹配 arch"
+edge n4 -> n5 "落盘后校验"
+edge n5 -> n6 "句柄关闭"
+edge n6 -> n7 "提升令牌"
+:::
+
+**降权之后还剩什么。** 这是评估"服务被攻破"后果的核心问题。根据 `docs/attacksurface.md` 与 `tunnel/service.go`，降权后仍保留 `SeLoadDriverPrivilege`，仍能通过已打开的适配器句柄下发配置、仍能读写环形日志、仍能在关停时删除接口。需要看清的是：降权移除的是特权，不是身份，进程仍然是 LocalSystem，仍具备创建进程等基本能力，因此不能把"已降权"理解成"已沙箱化"。真正的任意执行入口依然是配置里的脚本键与更新链，区别在于它们要求攻击者先能写配置或替换安装包，而不是仅靠控制 UI 或发一条 IPC 消息。
+
+### 5. 配置/命令/代码实例
+
+第一步，核对服务身份与启动配置。下面两条命令分别读 SCM 配置与 WMI 视图，二者应一致；示例输出，具体格式需对照实际版本核验。
+
+```powershell
+sc.exe qc WireGuardManager
+Get-CimInstance Win32_Service -Filter "Name='WireGuardManager'" |
+    Select-Object Name,StartName,StartMode,PathName
+```
+
+```text
+SERVICE_NAME: WireGuardManager
+        TYPE               : 10  WIN32_OWN_PROCESS
+        START_TYPE         : 2   AUTO_START
+        ERROR_CONTROL      : 1   NORMAL
+        BINARY_PATH_NAME   : "C:\Program Files\WireGuard\wireguard.exe" /managerservice
+        DEPENDENCIES       :
+        SERVICE_START_NAME : LocalSystem
+```
+
+判读这份输出，重点不在启动类型，而在三个身份字段。`SERVICE_START_NAME : LocalSystem` 确认了最高权限身份，任何能修改该服务 `ImagePath` 或二进制文件的人都等同于获得 SYSTEM，因此 `C:\Program Files\WireGuard` 的写权限必须只给 Administrators 与 SYSTEM。`BINARY_PATH_NAME` 必须指向受保护的安装目录，若出现用户可写的路径（例如某个用户目录下的副本），应立即视为被篡改。`START_TYPE : AUTO_START` 说明服务随开机启动，这既是可用性需求，也意味着攻击者一旦改了二进制，重启后会自动获得执行；加固时应把该服务的配置变更纳入监控。`DEPENDENCIES` 为空对 Manager 是正常的，隧道服务才有 `Nsi` 与 `TcpIp` 依赖。
+
+第二步，核对配置目录与配置文件的 ACL。`icacls` 输出较长，建议保存后比对，示例输出，具体格式需对照实际版本核验。
+
+```powershell
+icacls "$env:ProgramFiles\WireGuard\Data"
+icacls "$env:ProgramFiles\WireGuard\Data\Configurations"
+```
+
+```text
+C:\Program Files\WireGuard\Data NT AUTHORITY\SYSTEM:(OI)(CI)(F)
+                               BUILTIN\Administrators:(OI)(CI)(F)
+
+C:\Program Files\WireGuard\Data\Configurations NT AUTHORITY\SYSTEM:(OI)(CI)(F)
+                                                BUILTIN\Administrators:(OI)(CI)(F)
+```
+
+判读时先看"有没有多余的主体"。正常情况下只应出现 SYSTEM 与 Administrators 两条继承项；若出现 `BUILTIN\Users`、`Authenticated Users`、`Everyone` 或某个具体用户，说明 ACL 被改写，DPAPI 的"只有 SYSTEM 能读"前提已被破坏。注意 `(OI)(CI)` 表示对象继承与容器继承，`(F)` 是完全控制；如果管理员那条变成 `(RX)` 或只读，UI 的删除/替换操作会失败，表现为"导入配置没反应"。还要区分目录与文件的差异：目录给管理员完全控制，是为了让 UI 能创建和删除配置；单个 `.conf.dpapi` 只给管理员 `SD`（删除），不给读，这是 `conf/filewriter_windows.go` 的 SDDL 决定的。用 `icacls` 看单个配置时若发现管理员有 `(F)`，说明文件不是由本客户端创建，或者 ACL 被外部工具重置，应重新导入而不是继续使用。
+
+第三步，核对安装包与二进制签名。更新链的信任最终落在"这个 MSI 是谁签的"，因此部署前应验证 Authenticode 签名与文件哈希，而不是只看文件名。
+
+```powershell
+$msi = 'C:\Users\Public\Downloads\wireguard-amd64-0.5.3.msi'
+Get-AuthenticodeSignature $msi | Format-List Status,SignerCertificate,TimeStamperCertificate
+Get-FileHash $msi -Algorithm SHA256
+Get-AuthenticodeSignature "$env:ProgramFiles\WireGuard\wireguard.exe" | Select-Object Status,StatusMessage
+```
+
+第四步，核对两个危险开关的状态。查询是只读的，不会改变配置；若发现键存在且为 1，应确认是否有书面审批与对应的脚本清单。
+
+```powershell
+reg query HKLM\Software\WireGuard /v DangerousScriptExecution
+reg query HKLM\Software\WireGuard /v LimitedOperatorUI
+Get-ItemProperty 'HKLM:\Software\WireGuard' -ErrorAction SilentlyContinue
+```
+
+第五步，做一次只读审计并落盘。下面的脚本把服务身份、目录 ACL、危险开关与版本信息汇总成一个文件，适合纳入月度巡检；它不修改任何状态。
+
+```powershell
+$out = 'C:\wg-evidence\security-audit.txt'
+$wg = Join-Path $env:ProgramFiles 'WireGuard'
+"== services ==" | Out-File $out -Encoding utf8
+sc.exe qc WireGuardManager | Out-File $out -Append -Encoding utf8
+sc.exe qc 'WireGuardTunnel$corp' | Out-File $out -Append -Encoding utf8
+"== acl ==" | Out-File $out -Append -Encoding utf8
+icacls (Join-Path $wg 'Data') | Out-File $out -Append -Encoding utf8
+"== registry ==" | Out-File $out -Append -Encoding utf8
+reg query HKLM\Software\WireGuard | Out-File $out -Append -Encoding utf8
+"== binaries ==" | Out-File $out -Append -Encoding utf8
+Get-ChildItem $wg -Filter *.exe | ForEach-Object {
+    $sig = Get-AuthenticodeSignature $_.FullName
+    "{0} {1} {2}" -f $_.Name, $sig.Status, $_.VersionInfo.FileVersion
+} | Out-File $out -Append -Encoding utf8
+```
+
+各类暴露面与现有缓解、以及建议的加固动作对照如下表所示。表格中的"残余风险"一列是刻意保留的：没有任何一条缓解能把风险降为零，运维要做的是知情接受，而不是假装消除。
+
+| 暴露面 | 现有缓解 | 加固动作 | 残余风险 |
+|---|---|---|---|
+| 驱动 IOCTL | SDDL 仅 SYSTEM/管理员且要求高完整性 | 不给普通用户提权，限制本地管理员数量 | 管理员进程被控制即可改配置 |
+| Tunnel 服务 | 降权，仅保留 `SeLoadDriverPrivilege` | 监控服务配置变更与二进制哈希 | 保留的驱动特权仍可用于提权 |
+| Manager 服务 | LocalSystem，IPC 句柄继承，受限 UI 裁剪 | 仅管理员可登录交互式会话 | IPC 可被慢速消费或垃圾数据消耗 |
+| 配置存储 | 目录与文件 SDDL，DPAPI，原子写入 | 禁止 Users 写目录，定期核对 ACL | 能写目录者等同管理员 |
+| 脚本钩子 | 默认不执行，需注册表开启 | 保持关闭，确需开启则逐条审批 | 开启后脚本以 LocalSystem 运行 |
+| UI | 高完整性，移除全部特权 | 不在 UI 机器上运行不可信输入法/插件 | 高完整性不免除渲染面漏洞 |
+| 更新链 | Ed25519 验签加 BLAKE2b-256 | 固定下载源，校时，验证发布者 | Temp 目录替换的短窗口 |
+| 日志 | 环形缓冲，不含私钥 | 证据包按敏感信息归档 | 含隧道名、路径与对端地址 |
+
+### 6. 注意事项、陷阱与最佳实践
+
+**陷阱一：把 `DangerousScriptExecution` 当成普通功能开关。** 它开启后，`PreUp`/`PostUp`/`PreDown`/`PostDown` 会以 LocalSystem 执行，而 `PreUp` 又发生在降权之前，等于"配置文件的写入者可以要求系统执行任意命令"。Windows 用环境变量 `WIREGUARD_TUNNEL_NAME` 传递隧道名，而不是 Linux `wg-quick` 的 `%i`；把 Linux 脚本原样搬过来，既不会生效，也会误导排错。正确做法是默认关闭；确需开启时，把配置目录的写权限收缩到极少数账号，并对脚本内容做版本化审核。
+
+**陷阱二：以为 `LimitedOperatorUI` 是"安全模式"。** 它确实裁剪了能力：配置被剥离公钥、私钥与预共享密钥，不显示更新弹窗、不允许更新，禁止增删改导入导出配置，也禁止退出 Manager。但它同时扩大了 IPC 的暴露面：官方文档明确列出，非管理员用户可能通过过慢地消费通知、创建过多 watcher goroutine 耗尽内存，或发送 `gob` 解码器不期望的垃圾数据来对 Manager 造成拒绝服务。也就是说，开启它是"用可用性换操作便利"，不是纯粹的加固。若组织不需要非管理员启停隧道，保持关闭更简单。
+
+**陷阱三：给配置目录放权以"方便批量下发"。** 这是最常见、也最危险的加固错误。配置目录一旦对 Users 可写，攻击者可以直接投放 `.conf`，Manager 会主动加密并启动它；若配置里带脚本且危险开关已开，直接就是 SYSTEM 执行。批量下发的正确姿势是：由受控的管理通道（GPO、配置管理工具、SYSTEM 计划任务）以管理员身份写入，写完立即核对 ACL 未被继承规则改坏。
+
+**陷阱四：把 DPAPI 密文当可移植备份。** 密文绑定本机与 LocalSystem 作用域，拷到另一台机器通常解不开；而"为了能迁移"去关闭 DPAPI 或改用明文 `.conf`，等于把私钥长期落在磁盘上。正确做法是用 UI 导出、按密钥材料保管、迁移后重新导入并删除中间明文；备份介质要加密，且与配置分开存放。
+
+**陷阱五：用中等完整性工具直接调驱动。** IOCTL 的强制标签要求高完整性，普通权限的自研排障工具会收到拒绝访问；这不是驱动版本问题。应通过 `wg(8)` 或提升后的会话操作，并接受"工具必须高完整性"这一约束，而不是想办法降低驱动的要求。
+
+**陷阱六：把 kill-switch 当终端防火墙。** 它只覆盖"单 peer + `/0` + 非 `TableOff`"这一种形态，且只放行隧道服务自身、指定 DNS、环回、隧道内、DHCP 与 NDP。分流配置根本没有这套规则；用 `/1` 前缀绕开后也没有。把它当成"不泄漏"的唯一保证，会在配置稍作调整时出现缺口。终端侧仍应有独立的防火墙与 EDR 策略。
+
+**陷阱七：随意执行 `/removedriver`。** 它删除驱动包，前提是没有适配器在使用；在有隧道运行时执行会失败或造成不一致。更重要的是，它不清理配置、不清理服务、不清理注册表策略，误以为"删驱动等于重置"会留下半套状态。标准顺序是先停并卸载隧道服务、确认无适配器、再删驱动，最后按需重装。
+
+**陷阱八：忽略二进制与安装目录的写权限。** 更新链的签名校验再强，也假设本机的 `wireguard.exe` 没有被替换；DLL 搜索限制再严，也假设安装目录不可被普通用户写入。审计时应把 `C:\Program Files\WireGuard` 的 ACL 与可执行文件哈希一起纳入基线，发现变化就按安全事件处理，而不是"重启试试"。
+
+**最佳实践。** 第一，按角色分权：日常操作使用受限操作员账号，配置变更使用受控的管理账号，二者不共用。第二，保持两个危险开关关闭，确需开启时走变更审批并记录脚本哈希。第三，把安装目录、配置目录、服务配置、驱动版本、可执行文件签名纳入月度基线，发现漂移先取证再修复。第四，更新只走官方渠道，校时服务保持正常，代理配置显式化，避免"因为证书错误而临时关闭校验"这种不可逆的坏习惯。第五，日志与证据包按敏感信息管理：它们不含私钥，但含隧道名、内网地址与对端端点，泄露同样有情报价值。第六，应用白名单（WDAC/AppLocker）应允许 WireGuard 的安装目录与更新器，而不是允许整个下载目录，避免把更新链的信任扩大到不可控范围。
+
+### 7. 小结与延伸阅读
+
+本篇的核心结论可以压缩成三句话。第一，WireGuard for Windows 的安全模型建立在"配置写入者等同高权限"这一前提上，因此所有加固都应围绕"谁能写配置、谁能换二进制、谁能改服务"展开，而不是围绕 UI 按钮做文章。第二，现有缓解是分层的：驱动用 SDDL 与完整性标签限制调用者，服务用降权与最小特权运行，配置用 ACL 加 DPAPI 保护，UI 用高完整性并移除特权，更新用 Ed25519 与 BLAKE2b-256 双重校验；每一层都有明确的残余风险，官方文档也承认其中若干项仍待改进。第三，最有效的加固往往不是"加一个开关"，而是"减一个权限"：关闭脚本执行、收紧目录 ACL、减少本地管理员、保持更新链完整，收益远大于任何复杂的检测规则。
+
+延伸阅读建议按三条线走。想理解"为什么这样设计"，读 `docs/attacksurface.md` 与 `docs/netquirk.md`，前者给信任边界，后者给网络语义；想理解"代码在哪里做"，从 `tunnel/service.go`、`conf/path_windows.go`、`conf/filewriter_windows.go`、`tunnel/firewall/rules.go`、`updater/` 五个入口往下跟；想知道"运维怎么落地"，把本篇的审计脚本与 08-06 的上线 checklist 结合使用。注册表策略的完整语义见 04-07，配置键见 04-02 与 04-03，服务命令见 04-06，权限与进程模型见 06-10，WFP 规则见 06-09，更新链见 06-12，模块边界见 07-05、07-07、07-08、07-11（字段见 05-08 ｜ 配置见 04-07 ｜ 原理见 06-10 ｜ 模块见 07-08）。下一篇 08-06 会把这些结论固化成可执行的上线检查表、巡检节奏与回滚预案。
+
+## 08-06 上线 checklist 与运维手册
+
+### 1. 目标与拓扑
+
+上线与"装好能用"是两件不同的事。装好只证明当前这台机器上一次成功；上线要证明"一批机器在受控条件下可持续运行，出问题能回退，换人接手不会失忆"。这两者的差距，通常由三样东西填补：一张逐项可打勾的检查表、一套有明确触发条件的回滚预案、一份不依赖个人记忆的交接文档。本篇把三者组织成部署前、上线中、运行期三个阶段，每个阶段都有"门禁"——不满足就不进入下一阶段，而不是"先上再看"。
+
+之所以需要门禁，是因为 WireGuard 客户端的行为具有"配置即路由、配置即 DNS、配置即防火墙"的放大效应。一份写错的 `AllowedIPs` 可以让整机断网，一个误开的脚本开关可以把配置写入者变成 LocalSystem 执行者，一次不完整的卸载会留下服务、驱动与注册表策略。单个用户的机器可以靠重装恢复，批量环境里则意味着成片的工单与不可控的安全暴露。检查表的作用不是形式主义，而是把这些"单点错误"提前到可控阶段暴露。
+
+本篇的参考拓扑是：一个总部站点、一个分支机构、一批终端（先 5 台试点，再 25% 放量，最后全量），终端通过全隧道或分流隧道接入对端；管理侧有 GPO 或配置管理工具、软件分发系统、日志采集与工单系统；升级由 `wireguard /update` 或 MSI 重新分发完成。所有终端使用同一版本基线，架构按 amd64 与 arm64 分组，x86 仅在确有 32 位系统时保留。拓扑不追求复杂，重点是让"分批"和"回滚"有实际意义：如果只有一台机器，任何回滚预案都只是纸面文章。
+
+三阶段与门禁的关系如图 08-06-01 所示。图中用两个并列节点表达"通过/不通过"：验证门禁通过才放量，不通过则进入回滚，而不是继续往下一批推。
+
+:::figure id=08-06-01 | name=上线三阶段与验证门禁 | dir=TD
+node n1 "部署前评估与备份" blue
+node n2 "安装与配置下发" teal
+node n3 "上线验证门禁" amber
+node n4 "分批放量与巡检" purple
+node n5 "升级与版本基线" gray
+node n6 "交接与归档" green
+node n7 "回滚预案" red
+edge n1 -> n2 "基线确认"
+edge n2 -> n3 "逐项打勾"
+edge n3 -> n4 "通过才放量"
+edge n3 -> n7 "不通过"
+edge n4 -> n5 "稳定窗口后"
+edge n5 -> n6 "变更留痕"
+edge n5 -> n7 dashed "失败回退"
+:::
+
+需要提前说明交付物的形态。检查表应当是可以复制到工单系统里的文本或表格，而不是某个人脑子里的清单；回滚预案应当写明"谁在什么条件下执行哪条命令、预计中断多久、回滚后如何验证"；交接文档应当包含资产、拓扑、配置来源、版本、已知问题与联系人。三者都不追求长，追求"新人照着能做、审计照着能查"。
+
+本篇不重列配置键与命令全集：配置键见 04-02 与 04-03，`wireguard.exe` 开关见 04-04，`wg(8)` 见 04-05，服务与 PowerShell 命令见 04-06，注册表策略见 04-07；字段定义见 05-05 与 05-09；安装、服务、DPAPI 与更新链的原理见 06-03、06-05、06-10、06-12；模块边界见 07-05、07-08、07-11。本篇只讲"在什么阶段组合哪些动作、看到什么才算通过"。
+
+### 2. 前置条件与环境
+
+第一是版本与架构基线。上线前必须确定唯一版本号，并把安装包、哈希、签名主体记录在案。架构选择不能靠"看机器是 64 位就装 amd64"：`main.go` 的 `checkForWow64()` 会在进程处于 WOW64 时直接报 "You must use the native version of WireGuard on this computer."，这说明在 64 位系统上运行 32 位客户端是不被支持的。正确做法是按操作系统架构选 MSI，而不是按某个管理工具的默认值。混合架构环境要分别准备 amd64、x86、arm64 三个包，并在分发系统里按资产属性分组，避免"同一策略推到所有机器"导致一半安装失败。
+
+第二是网络可达性。至少要验证四件事：终端能解析对端 Endpoint（若使用域名）；能向对端 UDP 端口发包；能访问更新源（若启用 `/update`）；系统时间与标准源偏差在可接受范围内。前三项决定"能不能连"，第四项决定"能不能升级"。很多上线失败不是加密问题，而是分支机构只放行了 TCP 443、没有放行 UDP，或者代理要求认证导致更新下载失败。验证时应从终端侧发起，而不是从管理侧"看起来通"。
+
+第三是账号与权限。安装、导入配置、安装隧道服务都需要管理员；日常启停若交给受限操作员，需要提前开启并验证 `LimitedOperatorUI` 的边界（策略见 04-07）。不要用某个人的日常账号做服务账号，也不要把管理员账号密码写进脚本。配置目录的 ACL 要在上线前核对：只允许 SYSTEM 与 Administrators，任何 `Users` 写权限都必须在上线前移除，否则 DPAPI 保护形同虚设。
+
+第四是配置准备。配置应来自受控模板，占位符（地址、密钥、Endpoint）在导入前替换完毕；隧道名必须符合 `conf/name.go` 的约束：长度 1 到 32，只允许字母、数字与 `_=+.-`，不能是 `CON`、`NUL`、`COM1` 等保留名，不能含 `$`、路径分隔符或控制字符。名字不合法会在 `ServiceNameOfTunnel()` 处直接失败，表现为"安装服务报错但看不出原因"。配置里是否写 `MTU`、是否写 `DNS`、是否使用 `Table = off`，都应在模板评审时定稿，不要留到现场决定。
+
+第五是备份与回滚素材。上线前要导出可恢复的配置（通过 UI 导出，而不是直接拷 `.conf.dpapi`，因为密文绑定本机与 LocalSystem 作用域），记录当前路由、DNS、MTU、服务状态与版本；准备上一版 MSI 与卸载顺序说明。若终端原本由其它 VPN 客户端接管路由，还要准备"停用旧客户端、恢复其配置"的步骤，避免两套客户端互相抢路由。
+
+第六是观测与验收人。上线前确认日志采集能拿到 `/dumplog` 的输出，服务状态能被监控，工单系统有对应分类；指定验收人，并约定"什么现象算通过、什么现象必须回滚"。没有验收人的上线，最后往往以"用户没再报障"作为结论，这不构成验收。
+
+第七是变更窗口与沟通。窗口要避开业务高峰与其它网络变更，明确开始、观察、回退三个时间点；提前通知服务台与分支机构现场联系人，给出"断网时先停哪个服务、如何本地自救"的一句话指引。全隧道配置一旦出错，远程管理通道可能同时中断，因此必须假设"推送下去就失联"，事先准备本地管理员账号或现场人员可执行的停止命令。沟通内容还应包括回退后的预期状态，避免用户把回滚误认为"彻底修好"。
+
+部署前检查项如下表所示。表格按"项目、判据、证据"三列组织，证据一栏是审计时真正要看的东西；没有证据的勾选等于没做。
+
+| 检查项 | 通过判据 | 证据 |
+|---|---|---|
+| 版本基线 | 全量终端同一版本号 | 安装包哈希与版本清单 |
+| 架构匹配 | 与 OS 架构一致，无 WOW64 运行 | 资产表与安装日志 |
+| 签名有效 | Authenticode 状态为 Valid | `Get-AuthenticodeSignature` 输出 |
+| UDP 可达 | 终端到对端端口可发包 | 抓包或对端计数 |
+| 名称合法 | 符合 1 到 32 位字符集 | 配置评审记录 |
+| 目录 ACL | 仅 SYSTEM 与 Administrators | `icacls` 输出 |
+| 配置备份 | 可导出并可重新导入 | 导出文件与校验和 |
+| 回滚素材 | 上一版 MSI 与步骤齐备 | 回滚演练记录 |
+| 监控接入 | 服务与握手指标可见 | 监控截图或查询结果 |
+| 验收人 | 明确到岗位 | 变更单签字 |
+
+### 3. 分步操作
+
+#### 3.1 部署前：把不确定性消掉
+
+第 1 步，冻结基线。把版本、架构、安装参数、配置模板、注册表策略、DNS 与 MTU 策略写成一份"部署基线"，后续所有机器按它执行。基线里要明确"不允许现场改"的项：隧道名、AllowedIPs、DNS、是否启用脚本。现场自由发挥是批量故障的主要来源。
+
+第 2 步，验证安装包。除了看文件名，还要验签名与哈希，并把结果写进变更单。下面的命令只读，不会安装任何东西；示例输出中的版本号与文件名为占位示例，具体格式需对照实际版本核验。
+
+```powershell
+$msi = '\\fileserver\deploy\wireguard\wireguard-amd64-0.5.3.msi'
+$sig = Get-AuthenticodeSignature $msi
+$sig | Format-List Status,StatusMessage,SignerCertificate
+Get-FileHash $msi -Algorithm SHA256 | Format-List Algorithm,Hash,Path
+```
+
+```text
+Status           : Valid
+StatusMessage    : Signature verified.
+SignerCertificate: CN=WireGuard LLC, O=WireGuard LLC, L=London, C=GB
+
+Algorithm : SHA256
+Hash      : 9F2C1B7E4A6D3C58B0E1F7A2D9C4B6E8A1F3D5C7B9E2A4F6D8C0B2E4A6F8D0C2
+Path      : \\fileserver\deploy\wireguard\wireguard-amd64-0.5.3.msi
+```
+
+判读这份输出要分清"签名有效"与"签名者可信"。`Status : Valid` 只表示文件未被篡改且证书链在当时有效；`SignerCertificate` 的主体必须与组织认可的发布者一致，若出现陌生公司名，即使状态为 Valid 也不能安装。`StatusMessage` 为 "Signature verified." 是正常文案，若为 "A certificate chain could not be built to a trusted root authority" 则说明根证书缺失或被策略拦截，应先修信任链而不是绕过校验。哈希值要与发布清单逐字比对，不能只比前几位；把哈希写进变更单，后续出现"同版本但行为不同"时才有对照依据。注意这里验证的是 MSI 的 Authenticode 签名，与更新链内部的 signify Ed25519 清单签名是两套机制，不能互相替代。
+
+第 3 步，验证配置但不泄露密钥。配置评审应只看结构、前缀、DNS、Endpoint 与是否含脚本键，不要把私钥贴进工单。可以在实验机上导入同一模板（使用测试密钥），确认能被解析、能启动、能握手；生产密钥只在目标机上替换。配置里若出现 `PreUp`/`PostUp` 等键，必须确认 `DangerousScriptExecution` 的状态：默认关闭时它们不会执行，但这不代表可以留在模板里——一旦有人为了"临时用一下"打开开关，历史配置就会立刻变成执行入口。
+
+第 4 步，准备静默安装。MSI 支持 `DO_NOT_LAUNCH` 属性来抑制安装后自动启动，适合批量分发；安装完成后再单独安装 Manager 服务，避免"装完弹 UI"打断自动化。下面的命令给出顺序与验证点，参数含义见 02-05 与 04-04。
+
+```powershell
+$msi = '\\fileserver\deploy\wireguard\wireguard-amd64-0.5.3.msi'
+$log = 'C:\Windows\Temp\wg-install.log'
+Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart DO_NOT_LAUNCH=1 /l*v `"$log`"" -Wait
+& "$env:ProgramFiles\WireGuard\wireguard.exe" /installmanagerservice
+Get-Service -Name WireGuardManager | Format-List Name,Status,StartType
+```
+
+第 5 步，投放配置并等待加密。把 `.conf` 复制到 `%ProgramFiles%\WireGuard\Data\Configurations\`，Manager 监视到新文件后会加密为 `.conf.dpapi` 并删除明文。验证时要同时确认三件事：`.conf.dpapi` 出现、明文消失、文件 ACL 只给 SYSTEM 完全控制与 Administrators 删除。若明文长时间不消失，说明 Manager 未运行或目录监视失效，应先修服务，不要手工加密。
+
+```powershell
+$dir = Join-Path $env:ProgramFiles 'WireGuard\Data\Configurations'
+Get-ChildItem $dir -Force | Select-Object Name,Length,LastWriteTime
+icacls (Join-Path $dir 'corp.conf.dpapi')
+```
+
+第 6 步，安装隧道服务并启动。安装动作会把配置路径写进服务命令行，之后移动或改名配置都会导致启动失败；因此配置路径一旦确定就不要改。启动后至少观察 60 秒，等待 `Startup complete`，再做业务验证。
+
+```powershell
+$dir = Join-Path $env:ProgramFiles 'WireGuard\Data\Configurations'
+& "$env:ProgramFiles\WireGuard\wireguard.exe" /installtunnelservice "$dir\corp.conf.dpapi"
+Start-Sleep -Seconds 60
+sc.exe query 'WireGuardTunnel$corp'
+```
+
+#### 3.2 上线中：分批与门禁
+
+第 7 步，试点。选 5 台覆盖不同网段、不同网卡、不同使用场景的终端，而不是 5 台配置完全相同的机器。试点要采集：安装是否成功、服务是否自启、握手是否建立、业务系统是否可达、DNS 是否正确、是否有 WFP 相关投诉。试点期内不做全量推送，也不在试点机上叠加其它变更。
+
+第 8 步，门禁判定。通过标准应事先写死：服务稳定运行 60 秒以上、日志出现 `Startup complete`、`latest handshake` 在三分钟内、目标业务抽样可用、DNS 解析结果符合预期、无"局域网全断"类工单。任何一项不达标就停在试点，进入回滚或修复，不得"边修边放量"。
+
+第 9 步，分批放量。按 25%、50%、100% 三批推进，每批之间留出观察窗口。每批开始前确认上一批的工单曲线已回落，避免把上一批的故障误判为这一批的问题。放量期间保持版本与配置完全一致，不同时改 DNS 或 MTU，否则无法归因。
+
+放量期间的观测要固定三个窗口：推送后 10 分钟看"安装失败与适配器缺失"，1 小时看"握手失败与业务不可达"，24 小时看"稳定性与用户报障"。三个窗口关注的指标不同，不能只盯第一个。若某个窗口的异常率超过试点基线，应暂停下一批并回看该批次的配置哈希与安装日志；确认是批次差异后再决定继续、修复还是回滚。把每个窗口的实际数字写进变更单，既是对本次上线的记录，也是下一次上线的基线。
+
+#### 3.3 运行期：巡检、升级与回滚
+
+第 10 步，日常巡检。每天看服务状态、握手新鲜度、日志中的 `Warning:` 行与磁盘空间；每周看版本漂移、ACL 漂移、配置变更；每月做一次恢复演练（导出、重导入、启停）与回滚演练。巡检脚本应只读，输出可直接进工单。
+
+```powershell
+$name = 'corp'
+$wg = Join-Path $env:ProgramFiles 'WireGuard\wg.exe'
+$svc = Get-Service -Name "WireGuardTunnel`$$name" -ErrorAction SilentlyContinue
+$ad = Get-NetAdapter -Name $name -ErrorAction SilentlyContinue
+$hs = & $wg show $name 2>$null | Select-String 'latest handshake|transfer|endpoint'
+$wgExit = $LASTEXITCODE
+$dns = (Get-DnsClientServerAddress -InterfaceAlias $name -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses -join ','
+[pscustomobject]@{
+    Service = if ($svc) { $svc.Status } else { 'Missing' }
+    Adapter = if ($ad) { $ad.Status } else { 'Missing' }
+    Handshake = ($hs | Select-Object -First 1)
+    Routes = (Get-NetRoute -InterfaceAlias $name -ErrorAction SilentlyContinue).Count
+    DNS = $dns
+    WgExit = $wgExit
+} | Format-List
+```
+
+第 11 步，升级。升级应作为独立变更执行，不与配置变更同批。执行 `/update` 时把标准错误重定向到文件，失败后据此判断是网络、签名还是安装阶段的问题；批量环境更稳妥的做法是重新分发已验证的 MSI，而不是让每台机器自行联网更新。升级后必须核对文件版本与日志中的 `Using WireGuardNT/x.y`，两者都变才算完成。
+
+```powershell
+& "$env:ProgramFiles\WireGuard\wireguard.exe" /update 2> C:\Windows\Temp\wg-update.log
+Get-Content C:\Windows\Temp\wg-update.log -Tail 30
+(Get-Item "$env:ProgramFiles\WireGuard\wireguard.exe").VersionInfo.FileVersion
+```
+
+第 12 步，回滚。触发条件应写死：批量断网、握手大面积失败、关键业务不可用、发现安全配置被篡改。回滚顺序是"先止损、再还原、后复盘"：停止并卸载隧道服务，卸载当前版本，安装上一版 MSI，重新导入配置，验证服务与握手，最后恢复监控与工单分类。回滚后不要立即删除故障机的日志与配置，它们是复盘材料。
+
+#### 3.4 交接文档
+
+第 13 步，形成交接包。至少包含：资产与分组清单、网络与端口矩阵、配置模板与版本、服务与注册表策略、监控项与阈值、已知问题与规避方式、回滚步骤、联系人。文档要能被审计读懂，而不是只有作者能懂；每次变更后更新版本与日期，避免"文档比现实晚三个版本"。
+
+第 14 步，做一次演练。上线前至少完成一次桌面推演与一次实机回滚：桌面推演确认每个人都知道自己在那一步做什么，实机回滚确认卸载、重装、重导配置的总耗时在可接受范围内。演练要记录实际耗时与卡点，而不是只写"已演练"。如果回滚耗时超过业务容忍的中断窗口，说明方案还不具备上线条件，应先缩短步骤或准备旁路接入，而不是假设"不会用到回滚"。
+
+演练还有一项容易被忽略的收益：它会暴露文档里的隐含假设。例如"配置能从备份恢复"这句话，实际依赖导出文件存在、密码可得、目标机 DPAPI 作用域可用；任何一项不成立，回滚就会停在半路。把这些假设逐条写进交接包，比在故障现场才发现要有效得多。
+
+运行期巡检的闭环如图 08-06-02 所示。图中把"版本基线"放在告警之前，是因为很多"性能下降"其实是版本漂移或驱动不一致，先对齐版本能排除一整类噪声。
+
+:::figure id=08-06-02 | name=运行期巡检与告警闭环 | dir=TD
+node n1 "服务与适配器状态" blue
+node n2 "握手与字节差分" teal
+node n3 "路由与 DNS 一致性" amber
+node n4 "日志 Warning 扫描" purple
+node n5 "驱动与版本基线" gray
+node n6 "健康或告警" green
+node n7 "工单与复盘" red
+edge n1 -> n2 "隧道在跑"
+edge n2 -> n3 "数据面有流量"
+edge n3 -> n4 "配置一致"
+edge n4 -> n5 "无陷阱信号"
+edge n5 -> n6 "版本匹配"
+edge n6 -> n7 "异常时"
+:::
+
+### 4. 验证方法与预期结果
+
+上线验收不应只看"能上网"。建议按"服务、隧道、网络、业务、DNS、安全"六组各取一条硬证据，形成一份可归档的验收记录。验收矩阵如下表所示，每行都给出预期与不通过时的处置。
+
+| 验收组 | 检查动作 | 预期结果 | 不通过处置 |
+|---|---|---|---|
+| 服务 | `sc query` 两次间隔 60 秒 | 均为 RUNNING | 查退出码与日志末段 |
+| 隧道 | `wg show` | 三分钟内有握手 | 转 08-04 案例一 |
+| 网络 | `Find-NetRoute` 查目标 | 命中隧道接口 | 转 08-04 案例二 |
+| 业务 | 抽样访问核心系统 | 成功且时延可接受 | 查 MTU 与对端策略 |
+| DNS | 默认与指定服务器查询 | 结果一致 | 转 08-04 案例五 |
+| 安全 | ACL、签名、开关 | 与基线一致 | 停止放量并审计 |
+
+一份合格的验收输出大致如下，示例输出，具体格式需对照实际版本核验。
+
+```text
+Service   : Running
+Adapter   : Up
+Handshake : latest handshake: 18 seconds ago
+Transfer  : 4.21 MiB received, 1.07 MiB sent
+Routes    : 3
+DNS       : 10.7.0.1
+WgExit    : 0
+```
+
+判读时先看服务与适配器是否同时成立：`Service : Running` 只说明进程在，`Adapter : Up` 才说明驱动与接口就绪；两者缺一，后面的字段都不可信。`Handshake : 18 seconds ago` 说明隧道在最近一个窗口内活跃，若业务是间歇性的，几十分钟不更新也可能是正常，因此要结合 `Transfer` 判断：接收与发送都不为零且随时间增长，才证明数据面真的在走。`Routes : 3` 不是越多越好，而是要与配置的 AllowedIPs 去重后的数量对得上；数量偏少通常意味着 `Table = off` 或前缀写窄，偏多则可能有残留路由。`DNS : 10.7.0.1` 必须与配置一致，若显示的是物理网卡地址，说明查询可能泄漏。`WgExit : 0` 只代表本次 `wg show` 查询成功返回，不能替代日志中的 `Startup complete`；验收时应把这份摘要与日志、路由快照一起归档，三者时间戳要对齐。
+
+反向验证同样重要。挑一台试点机，临时把 Endpoint 端口改错，确认巡检能在一次采样内发现"握手变 Never、接收归零"；恢复后再确认指标回到基线。这一步是在验证"监控能不能发现故障"，而不是验证"隧道会不会坏"。如果改错端口后巡检仍显示健康，说明脚本的判据写错了，必须先修脚本再放量。
+
+### 5. 常见失败与排错
+
+**失败一：静默安装后没有 UI。** 使用 `DO_NOT_LAUNCH=1` 只抑制安装后的启动，不会自动安装 Manager 服务；若分发脚本漏掉 `/installmanagerservice`，用户会看到"程序装了但托盘没有图标"。这不是安装失败，检查 `Get-Service WireGuardManager` 即可确认。补装服务后，UI 会在管理员会话中出现；若仍不出现，查会话令牌与 `LimitedOperatorUI` 设定，而不是重装。
+
+**失败二：配置放进目录却一直不加密。** 说明 Manager 未运行、目录监视未生效，或文件不是合法 `.conf`。先看服务状态与日志，再确认文件名符合 `conf/name.go` 的规则；名字含 `$`、空格或超长会被拒绝，表现为"文件还在，什么都没发生"。不要手工改后缀冒充 `.conf.dpapi`，解密会因名称不匹配而失败。
+
+**失败三：批量安装后一半机器没有适配器。** 常见原因是架构选错或分发策略把 x86 包推给了 64 位系统。`checkForWow64()` 会在启动时直接拒绝并提示 "You must use the native version of WireGuard on this computer."（交互运行时表现为消息框或标准错误），此时不是驱动问题，换正确架构的包即可。另一种原因是安全软件拦截驱动加载，日志会停在创建适配器阶段并带系统错误码，需要厂商配合加白名单，而不是反复重装。
+
+**失败四：试点正常、放量后大面积断网。** 优先怀疑配置模板在放量批次里被改过（例如为了"解决 DNS 问题"临时加了 `Table = off` 或改了 `AllowedIPs`），其次怀疑对端容量或 NAT 端口耗尽。对比试点机与故障机的配置哈希、路由表与 `wg show`，能快速判断是"配置漂移"还是"容量问题"。不要在故障机上直接改配置验证，先取证。
+
+**失败五：升级后版本号没变。** `/update` 可能下载并校验成功，但 `msiexec` 被策略拦截或返回非 0；也可能更新的是另一套安装（例如用户目录下的旧副本）。检查安装日志、文件版本与服务命令行指向的路径，三者一致才算升级成功。批量环境应优先重新分发 MSI，减少每台机器自行更新的不确定性。
+
+**失败六：回滚后仍不通。** 常见原因是只卸了隧道服务、没卸驱动或没清理注册表策略；也可能是旧版本配置与新版本字段不兼容。按"停服务、卸隧道、卸 Manager、卸 MSI、删驱动（确认无适配器）、清理策略、重装旧版、重导配置"的顺序执行，每一步都验证，而不是一条命令走到底。
+
+**失败七：巡检数据看起来正常但用户仍报障。** 巡检采的是"服务与隧道"指标，用户感知的是"业务与会话"。若握手正常、路由正确，但某个业务系统不可达，应查 MTU、对端 ACL、DNS 后缀与应用层代理，而不是继续盯 `wg show`。这也是验收矩阵要包含"业务抽样"的原因。
+
+**失败八：交接文档与实际不一致。** 典型表现是文档写着旧版本、旧 Endpoint、旧联系人。把文档更新设为变更流程的必填项，并在每月巡检时抽查一项（例如随机挑一台机器核对版本与配置路径），比年底集中补文档可靠。
+
+### 6. 小结
+
+上线的本质是把"一次成功"变成"可重复的成功"，再把"可重复的成功"变成"可回退的成功"。本篇用三阶段把这件事拆开：部署前消掉版本、架构、网络、权限、配置与备份的不确定性；上线中用试点与门禁控制影响面；运行期用巡检、升级与回滚维持基线。每一阶段都要求"有证据"，因为勾选本身不产生可信度，证据才产生可信度。
+
+三份交付物各有重心。检查表解决"漏项"，回滚预案解决"失控"，交接文档解决"失忆"。三者都不应写成长篇大论：检查表要能在一页内打勾，回滚预案要能在压力下照着执行，交接文档要能让新人独立完成一次启停与一次取证。把它们与 08-01 的采集方法、08-03 的判定顺序、08-04 的案例库、08-05 的加固清单结合，才构成完整的运维闭环。
+
+最后再强调边界：本篇讲的是上线与运维的场景组合，不重列配置与命令；配置键见 04-02 与 04-03，开关见 04-04，`wg(8)` 见 04-05，服务命令见 04-06，注册表策略见 04-07；字段见 05-05 与 05-09；安装与服务机制见 06-05 与 06-10，DPAPI 见 06-03，更新链见 06-12；模块见 07-05、07-08、07-11（字段见 05-09 ｜ 配置见 04-06 ｜ 原理见 06-12 ｜ 模块见 07-11）。版本号、下载地址、驱动版本等时效性数值，请以手上的上游版本与官方发布页为准，本文的示例输出仅用于说明格式与判读方法。

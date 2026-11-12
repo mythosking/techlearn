@@ -1,0 +1,733 @@
+# wireguard-windows 技术资料 · 04 配置与命令行（分片 B）
+
+## 04-03 [Peer] 段配置键逐项详解
+
+### 1. 本篇定位与覆盖范围
+
+本册（04 配置与命令行）是整套资料里「全部配置键、`wireguard.exe` 开关、`wg(8)` 子命令、`sc` / PowerShell 服务命令、注册表策略」的唯一权威源，其余各册凡涉及配置与命令只给本场景最小必要片段并写「完整配置见 04-xx」，不再重列全集。本篇在其中承担 `[Peer]` 段的逐键字典职能：把每一个对端配置键的合法取值、解析入口、省略时的默认行为、序列化的写出条件、以及多 peer 组合时的规则讲清楚，使读者在编写或审查 `.conf` 文件时能逐条对照，而不必回头翻源码。手册型册子的价值在于「查得到、查得全、查得准」，因此本篇给出的参数表与逐项详解都不做删减，也不以「举例若干」代替全集。
+
+覆盖的键严格以 `conf/config.go` 中 `conf.Peer` 的成员为准，共五个：`PublicKey`、`PresharedKey`、`AllowedIPs`、`Endpoint`、`PersistentKeepalive`。这五个键在 `conf/parser.go` 的 `FromWgQuick` 函数中对应 `parserState == inPeerSection` 分支下的五个 `case`，在 `conf/writer.go` 的 `ToWgQuick` 函数中对应五条 `writeField` 调用，在 `conf/writer.go` 的 `ToDriverConfiguration` 中对应下发给驱动的对端标志与载荷。除此之外，`conf.Peer` 还有 `RxBytes`、`TxBytes`、`LastHandshakeTime` 三个成员，它们是运行时统计值而非配置键：解析配置文件时不会被写入，序列化回 `.conf` 时也不会被输出，只在通过 `conf/parser.go` 的 `FromDriverConfiguration` 从驱动读回运行状态时填充，供 UI 状态页与 `wg show` 之类的运行时查询呈现。本篇会把这组「只读状态」与「可写配置键」明确区分开，避免读者把 `transfer`、`latest handshake` 之类的输出行误当成可以写回配置文件的键。
+
+能力边界必须前置说明。本仓库是 WireGuard 官方 Windows 客户端，不是 Linux 内核实现，也不是 `wg-quick(8)` 脚本。Linux `wg-quick` 里 `AllowedIPs` 会同时驱动路由与 `iptables` 规则、脚本里的 `%i` 会被替换成接口名、DNS 通过 `resolvconf` 设置、`SaveConfig` 会把运行时状态回写到配置文件——这四组语义都不是 Windows 客户端的能力。Windows 侧把 `AllowedIPs` 汇总去重后下发为 WireGuard 接口的路由，全流量场景的封锁由 WFP 规则实现而非 `iptables`；自定义脚本键用的是环境变量 `WIREGUARD_TUNNEL_NAME` 而不是 `%i`，且默认不执行，需 `DangerousScriptExecution` 注册表键（见 04-07）；DNS 是作为接口配置下发而不是调用 `resolvconf`；`conf/config.go` 的 `Interface` 与 `Peer` 都没有 `SaveConfig` 成员，`conf/parser.go` 的 `switch` 也没有对应的 `case`，把它写进配置只会得到「段内无效键」的解析错误。逐条边界会在第 7 节结合误用再展开。
+
+本篇不展开结构体字段的内存布局与类型定义，不展开配置解析状态机、路由下发与 WFP 规则的实现，也不罗列 `conf` 包与 `tunnel` 包的模块能力清单，统一收敛到交叉引用：`字段见 05-02 ｜ 原理见 06-02 ｜ 模块见 07-01`。更细的类型（32 字节密钥、主机端口结构、时间与流量格式化）见 05-03，路由与 kill-switch 机制见 06-06 与 06-09，隧道服务模块见 07-05。本册内部分工：`[Interface]` 段逐键见 04-02，INI 语法与全集索引见 04-01，运行时查询与修改见 04-05，配置排错见 04-08。后文所有「解析报错」文本取自 `conf/parser.go` 中 `l18n.Sprintf` 的英文原串，运行时会按本地化资源显示为对应语言，具体显示文案需对照实际版本核验。
+
+### 2. 索引与全参数表
+
+下表把 `[Peer]` 段五个键一次列全，列依次为键名、必填性、合法取值、解析入口、省略行为与序列化写出条件。解析入口列均为 `conf/parser.go` 内的函数，写出条件列均为 `conf/writer.go` 内 `ToWgQuick` 的判定表达式。
+
+| 键名 | 必填性 | 合法取值 | 解析入口（conf/parser.go） | 省略时的行为 | 写出条件（conf/writer.go） |
+|---|---|---|---|---|---|
+| `PublicKey` | 必填，缺失即整份配置解析失败 | Base64 编码且解码后恰为 32 字节 | `parseKeyBase64` | 返回 `All peers must have public keys` | 恒为真，每个 peer 都输出 |
+| `PresharedKey` | 可选 | Base64 编码且解码后恰为 32 字节 | `parseKeyBase64` | 保持全零，视为未设置 | `!peer.PresharedKey.IsZero()` |
+| `AllowedIPs` | 可选 | 逗号分隔的 CIDR 或裸 IP 列表 | `splitList` 加 `parseIPCidr` | 空列表，该 peer 不贡献路由 | 列表长度大于 0 时输出 |
+| `Endpoint` | 可选 | `主机:端口` 或 `[IPv6]:端口` | `parseEndpoint` 加 `parsePort` | 空主机，视为未设置 | `!peer.Endpoint.IsEmpty()` |
+| `PersistentKeepalive` | 可选 | `off` 或 0 到 65535 的整数 | `parsePersistentKeepalive` | 0，等同关闭保活 | `peer.PersistentKeepalive > 0` |
+
+表中「必填性」一列只有 `PublicKey` 为真，依据是 `conf/parser.go` 在 `FromWgQuick` 收尾处的循环：只要某个 peer 的 `PublicKey.IsZero()` 成立就返回错误并中止整份配置的解析；而 `PrivateKey` 的必填校验针对的是 `[Interface]` 段，与本段无关。其余四键在源码里都没有「必须出现」的检查，省略后保留各自的零值，由 `ToWgQuick` 按写出条件决定是否回写该行。另需注意，写出条件与「是否曾出现在原文件里」无关：即使原配置显式写了 `PersistentKeepalive = off`，解析后值为 0，`ToWgQuick` 也不会再输出这一行；`PresharedKey` 若写了一个恰好全零的 32 字节值，同样会被 `IsZero()` 判为未设置而丢弃。这是配置往返（导入再导出）后文本可能发生变化的直接原因。
+
+下表汇总五个键在解析阶段可能触发的错误，便于把编辑器的报错信息反查到具体键与具体函数。错误文本为 `l18n.Sprintf` 的英文原串，实际界面文案需对照实际版本核验。
+
+| 错误文本（英文原串） | 触发条件 | 关联解析函数 |
+|---|---|---|
+| `Invalid key for [Peer] section` | 段内出现五个白名单之外的键 | `FromWgQuick` 的 `default` 分支 |
+| `All peers must have public keys` | 任一 peer 未写 `PublicKey` | `FromWgQuick` 收尾校验 |
+| `Invalid key: %v` | Base64 字符串无法解码 | `parseKeyBase64` |
+| `Keys must decode to exactly 32 bytes` | 解码后字节数不是 32 | `parseKeyBase64` |
+| `Two commas in a row` | 列表里出现连续逗号或首尾逗号 | `splitList` |
+| `Invalid IP address: ` | CIDR 与裸 IP 都解析失败 | `parseIPCidr` |
+| `Missing port from endpoint` | 端点字符串不含冒号 | `parseEndpoint` |
+| `Invalid endpoint host` | 冒号前的主机部分为空 | `parseEndpoint` |
+| `Brackets must contain an IPv6 address` | 方括号内不是合法 IPv6 | `parseEndpoint` |
+| `Invalid port` | 端口不在 0 到 65535 | `parsePort` |
+| `Invalid persistent keepalive` | 保活值越界且不是 `off` | `parsePersistentKeepalive` |
+| `Key must have a value` | 等号后为空 | `FromWgQuick` 通用校验 |
+| `Config key is missing an equals separator` | 行内没有等号 | `FromWgQuick` 通用校验 |
+
+最后一类容易混淆的是「配置键」与「只读运行时统计」的界线，如下表所示。`conf/config.go` 的 `Peer` 同时容纳两类成员，但只有前五个能出现在 `.conf` 文本里。
+
+| 名称 | 归属 | 数据来源 | 能否写入 .conf |
+|---|---|---|---|
+| `PublicKey` 等五键 | 可写配置键 | `FromWgQuick` 解析文本 | 能，见本节第一张表 |
+| `RxBytes` / `TxBytes` | 只读运行时统计 | `FromDriverConfiguration` 读回驱动 | 不能，写出时被忽略 |
+| `LastHandshakeTime` | 只读运行时统计 | `FromDriverConfiguration` 读回驱动 | 不能，写出时被忽略 |
+| `Comments` | 段内注释保真 | `FromWgQuick` 收集注释行 | 由注释语法体现，非键值 |
+
+补充三条通用语法规则，它们对五个键一视同仁。其一，键名在 `FromWgQuick` 里先经 `strings.ToLower` 归一，因此 `PublicKey`、`publickey`、`PUBLICKEY` 等价，导出时统一回写为标准驼峰写法。其二，行内以 `#` 起始的部分被 `strings.Cut` 切为注释，不参与取值，但注释会被保留在 `Comments` 结构里以便往返还原（字段见 05-04）。其三，同一 peer 段内重复写同一个键并不报错：标量键如 `PublicKey`、`PresharedKey`、`Endpoint`、`PersistentKeepalive` 采用直接赋值，后写覆盖前写；列表键 `AllowedIPs` 采用 `append` 累加，重复写会累积条目，之后再经 `DeduplicateNetworkEntries` 在同一 peer 内按字符串精确去重。因此「重复键」不会让解析失败，却可能产生与直觉不同的最终值，编写配置时应避免。
+
+### 3. 逐项详解
+
+#### 3.1 `PublicKey`
+
+`PublicKey` 是对端（远程节点）的 Curve25519 公钥，Base64 编码，解码后必须恰为 32 字节，对应 `conf/config.go` 中 `Key` 类型（底层为 `[32]byte`）。它是 `[Peer]` 段唯一强制键：`FromWgQuick` 收尾会遍历所有 peer，调用 `Key.IsZero()` 判定，任何全零公钥都会让整份配置解析失败。这与 `[Interface]` 段的 `PrivateKey` 形成配对——本地私钥用来派生本地公钥，对端公钥用来标识并认证该 peer，二者经 X25519 参与 Noise_IKpsk2 握手；本仓库只负责把密钥下发到驱动，握手与加密的数据面由外部项目 WireGuardNT 实现（原理见 06-04）。写配置时最常见的来源是 `wg genkey` 与 `wg pubkey` 的组合（见 04-05），或由对端管理员提供。
+
+解析入口 `parseKeyBase64` 用 `base64.StdEncoding.DecodeString`，随后检查 `len(k) != KeyLength`，`KeyLength` 在 `conf/config.go` 中定义为 32。这意味着粘贴时多余空格、换行、被邮件客户端改写过的字符、少一位或 trailing padding 错误都会让解码失败；`FromWgQuick` 已对值做过 `TrimSpace`，所以行首行尾空白无害，但字符串中间的空白不行。写出侧 `ToWgQuick` 对 `PublicKey` 的 `present` 参数恒传 `true`，即每个 `[Peer]` 段都会输出一行公钥，值由 `Key.String()` 以标准 Base64 重新编码。
+
+还须区分 `conf/config.go` 里两个与密钥相关但不属于配置键的方法：`Key.Public()` 用 `ecdh.X25519().NewPrivateKey` 从私钥派生公钥，`Config.Redact()` 则把私钥、四个脚本键以及每个 peer 的公钥与预共享密钥清零后用于日志脱敏，其中公钥被替换成小端序号以便日志里区分 peer。前者是工具方法，后者是日志输出前的处理，都不改变 `.conf` 里的值，也不该被误读为「配置里可以写派生结果」。字段与类型细节统一见 05-02 与 05-03。
+
+#### 3.2 `PresharedKey`
+
+`PresharedKey` 是可选的第二层对称密钥，同样要求 Base64 解码为 32 字节，解析入口仍是 `parseKeyBase64`。它在协议里与 Noise_IKpsk2 的 psk2 环节相关，作用是在 Curve25519 之外再叠加一层双方共享的对称秘密；是否启用完全取决于对端是否配置了相同的值，两端不一致会导致握手失败，而不是「降级为不加密」。本仓库只把它作为普通 `Key` 成员保存并下发，不做密钥协商，密钥的生成可用 `wg genpsk`（见 04-05）。
+
+零值语义是该键最需要留意的点。`conf/config.go` 的 `Peer` 里 `PresharedKey` 是值类型 `Key` 而非指针，未配置时是 32 个零字节；`conf/writer.go` 用 `!peer.PresharedKey.IsZero()` 决定是否写出该行，`ToDriverConfiguration` 也用同一判断决定是否为该 peer 追加 `driver.PeerHasPresharedKey` 标志。也就是说，「没写这一行」与「写了一个全零值」在语义上等价：前者不设置标志，后者同样被判为未设置。反过来，只要写出条件成立，导出文本里就会出现 `PresharedKey` 这一行，因此导入一份带 PSK 的配置再导出，PSK 会原样保留，这点是配置往返无损的关键。
+
+由于 `PresharedKey` 是明文敏感材料，它与 `[Interface]` 的 `PrivateKey` 一样受 Windows 侧的存储保护约束：manager 服务把新增 `.conf` 用 DPAPI 加密为 `.conf.dpapi` 后删除明文（见 03-04、原理见 06-03），因此不应把带 PSK 的明文配置长期留在共享目录或版本库里。本篇只讲键的用法，存储与加解密机制不在此展开。
+
+#### 3.3 `AllowedIPs`
+
+`AllowedIPs` 是本段语义最重的键：它既定义「哪些目标地址的数据包应该发往这个 peer」（出站路由选择），也定义「来自这个 peer 的数据包允许携带哪些源地址」（入站校验），在 Windows 客户端里由 tunnel 服务汇总所有 peer 的该值、去重后写入 WireGuard 接口的路由表（原理见 06-06）。取值是逗号分隔的列表，每一项经 `conf/parser.go` 的 `splitList` 切分、再由 `parseIPCidr` 解析：先尝试 `netip.ParsePrefix` 接受 `10.0.0.0/8` 这类 CIDR；失败后尝试 `netip.ParseAddr` 接受裸地址，并按 `netip.PrefixFrom(addr, addr.BitLen())` 补成主机路由，即 IPv4 裸地址等价于 `/32`、IPv6 裸地址等价于 `/128`。因此 `AllowedIPs = 192.168.5.7` 是合法写法，等价于 `192.168.5.7/32`；两者都失败才返回 `Invalid IP address`。`splitList` 会对每段 `TrimSpace`，但遇到空段（连续逗号、行尾多余逗号）直接返回 `Two commas in a row`，所以结尾多打一个逗号会让整份配置解析失败。
+
+多 peer 场景下该键的规则尤其重要。配置文件里每出现一次 `[Peer]`，`FromWgQuick` 就调用 `maybeAddPeer` 收起上一个 peer 并新建一个 `Peer`，因此 `AllowedIPs` 的作用域严格限于所在段，不会自动继承到下一个 peer。多个 peer 之间若写了重叠网段，源码层面的 `DeduplicateNetworkEntries` 只在**单个 peer 内部**按 `addr.String()` 精确去重，并不跨 peer 合并；跨隧道的路由冲突则由 `Config.IntersectsWith` 判定（原理见 06-06，排障见 04-08）。全流量场景通常写 `0.0.0.0/0` 与 `::/0`；按 `docs/netquirk.md` 的约定，单 peer 且该 peer 含 `/0` 的 AllowedIP 会触发 WFP kill-switch 规则，而用 `0.0.0.0/1 + 128.0.0.0/1`、`::/1 + 8000::/1` 的拆分写法可规避该触发条件（原理见 06-09）。这些是 Windows 侧的路由与防火墙语义，不是 Linux `iptables` 规则；Windows 客户端不提供也不执行 `iptables`。
+
+写出侧 `ToWgQuick` 在列表非空时以 `", "` 连接各 `netip.Prefix.String()` 输出，顺序保持解析时的先后顺序。`ToDriverConfiguration` 则把每一项编组为 `driver.AllowedIP`：用 `prefix.Bits()` 填 `Cidr`，按地址族写 `AF_INET` 或 `AF_INET6`，并把地址字节拷入固定数组。这里只需知道「配置里的每个网段最终成为驱动侧的一条允许 IP 记录」即可，结构与标志定义见 05-05。
+
+#### 3.4 `Endpoint`
+
+`Endpoint` 指定对端的网络可达地址与 UDP 端口，格式为 `主机:端口`；当主机是 IPv6 字面地址时必须用方括号包裹，如 `[2001:db8::1]:51820`。解析入口 `parseEndpoint` 用 `strings.LastIndexByte(s, ':')` 找最后一个冒号来切分主机与端口，因此带方括号的 IPv6 也能正确切出末尾端口；找不到冒号返回 `Missing port from endpoint`，冒号前为空返回 `Invalid endpoint host`。端口交给 `parsePort`，合法范围 0 到 65535，越界返回 `Invalid port`。方括号的校验比较严格：源码要求括号内必须是能被 `netip.ParseAddr` 解析且 `Is6()` 为真的地址，否则返回 `Brackets must contain an IPv6 address`；同时也处理了形如 `[fe80::1%eth0]:51820` 的区域标识，会在最后一个 `%` 处截断后再校验地址。写出侧 `Endpoint.String()` 会在主机含冒号时自动补回方括号，因此导入导出的文本格式一致。
+
+该键是可选的：省略后 `Endpoint.IsEmpty()`（判据是 `len(e.Host) == 0`）为真，`ToWgQuick` 不输出该行，`ToDriverConfiguration` 也不追加 `driver.PeerHasEndpoint` 标志，此时该 peer 只能被动等待对端先发起连接，常见于服务端为对端预置公钥、由客户端主动连入的拓扑。还有一层容易忽略的事实：`ToDriverConfiguration` 只在 `netip.ParseAddr(config.Peers[i].Endpoint.Host)` 成功时才设置 `PeerHasEndpoint` 并写入 `RawSockaddrInet`，也就是下发到驱动时端点主机必须是**字面 IP 地址**；配置里写域名是可接受的写法，域名在真正下发前会被解析为地址，这一解析属于运行时机制，原理见 06-02，本篇不展开。
+
+`Endpoint` 与 `[Interface]` 段的 `ListenPort` 分工不同：前者是「我要连到哪里」，后者是「我在本地哪个 UDP 端口监听」。二者都可为 0（未设置时由系统选择），但语义不可互换。另须强调，配置端点不涉及 Linux `resolvconf` 或任何 DNS 解析器配置文件，DNS 服务器由 `[Interface]` 的 `DNS` 键作为接口配置下发（见 04-02，原理见 06-08）。
+
+#### 3.5 `PersistentKeepalive`
+
+`PersistentKeepalive` 控制是否周期性发送保活报文以维持 NAT / 防火墙上的 UDP 映射，取值是 `off` 或 0 到 65535 的整数（秒）。解析入口 `parsePersistentKeepalive` 先特判字符串 `off` 返回 0，再用 `strconv.Atoi` 转换，越界返回 `Invalid persistent keepalive`。零值即等同于关闭保活，因此 `off`、不写、`0` 三者在 `conf.Peer.PersistentKeepalive`（`uint16`）里最终都是 0。写出侧 `ToWgQuick` 仅在 `peer.PersistentKeepalive > 0` 时输出该行；`ToDriverConfiguration` 却把 `driver.PeerHasPersistentKeepalive` 作为基础标志恒定追加给每个 peer，再把该值填入 `driver.Peer.PersistentKeepalive` 字段，这一点与「不写就不设置」的直觉不同，值得留意。
+
+典型用法是位于 NAT 之后、且需要被对端随时访问的一端设置 15 到 25 秒量级的保活，例如 `PersistentKeepalive = 25`；对端有固定公网地址、或只在有流量时才需要连通的场景则无需设置。取值过大不会带来额外收益，只会产生周期性空流量；取值过小则增加握手与设备唤醒频率。它不影响 `AllowedIPs` 的路由选择，也不参与密钥派生，纯粹是链路保活参数。该键按 peer 生效，多 peer 配置里可以只对需要穿透 NAT 的那个 peer 设置。
+
+#### 3.6 多 Peer 组合规则
+
+一份配置可以包含任意多个 `[Peer]` 段，`FromWgQuick` 用 `parserState` 在 `inInterfaceSection`、`inPeerSection`、`notInASection` 三态间切换：遇到 `[interface]` 或 `[peer]` 时先 `maybeAddPeer` 收起当前 peer（若非空），再重置状态与注释收集器；段外的非注释行统一返回 `Line must occur in a section`。因此 `[Peer]` 段之间可以穿插注释，但不能把键值行写在任何段之外。每个 peer 各自持有完整的五个键，互不共享；`PublicKey` 的必填校验是「每个 peer 都要有」，而不是「整份配置有一个即可」。
+
+组合时要注意三点。第一，五个键都属于 peer 作用域，把 `PreUp`、`PostUp`、`PreDown`、`PostDown` 或 `Table` 之类 `[Interface]` 专用键误写进 `[Peer]` 段，会命中 `default` 分支并返回 `Invalid key for [Peer] section`；反之把 `PublicKey` 写进 `[Interface]` 段同样会报 `Invalid key for [Interface] section`。第二，多个 peer 的 `AllowedIPs` 会在运行时被汇总，重叠网段可能引发路由归属不明，配置阶段应主动规划网段划分。第三，`PersistentKeepalive` 与 `PresharedKey` 都是按 peer 独立判断的，导出时 `ToWgQuick` 逐 peer 输出，段间以空行分隔。多 peer 与 AllowedIPs 的汇总、去重及 kill-switch 判定关系见图 04-03-02，五个键从文本到驱动的总体去向则见图 04-03-01。
+
+#### 3.7 运行时统计字段（只读）
+
+`conf/config.go` 的 `Peer` 末尾三个成员 `RxBytes`、`TxBytes`、`LastHandshakeTime` 不属于本章参数表，因为它们不是配置键，没有任何一个 `case` 会从 `.conf` 文本里读取它们，`ToWgQuick` 也不会写出。它们的填充路径是 `conf/parser.go` 的 `FromDriverConfiguration`：该函数从 `driver.Interface` 逐个取出 `driver.Peer`，把 `p.TxBytes`、`p.RxBytes` 转成本仓库的 `Bytes` 类型，把 `p.LastHandshake` 由 Windows FILETIME 基准换算成 `HandshakeTime`，并同时读回公钥、预共享密钥、端点、保活与允许 IP 列表，用于 UI 展示与运行时查询（字段见 05-03，原理见 06-05）。展示格式由 `conf/config.go` 的 `Bytes.String()` 与 `HandshakeTime.String()` 决定：前者按 1024 进制输出 B / KiB / MiB / GiB / TiB 并保留两位小数，后者输出「Now」、类似 `3 seconds ago` 的相对时间字串，或在系统时钟回拨时输出告警串。这正是 `wg show` 里 `transfer` 与 `latest handshake` 两行的数据来源，判读见第 4 节。
+
+### 4. 典型示例
+
+下面是一份包含两个 peer 的完整配置，用于把五个键的取值与组合规则落到实例上。第一台对端使用 IPv4 端点、预共享密钥与保活，承载内网网段与全流量 IPv4 默认路由；第二台对端使用 IPv6 字面端点、站点网段，且不设置保活。
+
+```conf
+[Interface]
+PrivateKey = yAnz5TF+lXXJte14tfi3MtAFlb1qppTVR0kH4bqvkUwqU=
+Address = 10.2.0.2/32
+DNS = 10.2.0.1
+
+[Peer]
+# 主网关：全流量 + 内网
+PublicKey = JRI8Xc0zKP9kXk8qP84NdUQA04h6DLfFbwJn4g+/PFs=
+PresharedKey = FpKy5hBZDeXKnjBRbwQZ8Fp9pUcVZ3mHtLxNrS1vQaE7c=
+AllowedIPs = 0.0.0.0/0, 10.2.0.0/24
+Endpoint = 163.172.161.0:12912
+PersistentKeepalive = 25
+
+[Peer]
+# 站点到站点分支
+PublicKey = lfTRXEWxt8mZc8cjSvOWN3tqnTpWw4v2Eg3qF6WTklw=
+AllowedIPs = 10.42.0.0/16, 2001:db8:42::/48
+Endpoint = [2001:db8:1::1]:51820
+```
+
+把这类配置安装为隧道服务并用 `wg show` 查询，可以得到类似下面这份输出。输出样例取自 `docs/enterprise.md`，此处为原样引用；示例输出，具体格式需对照实际版本核验。
+
+```text
+> wg show myconfname
+interface: myconfname
+  public key: lfTRXEWxt8mZc8cjSvOWN3tqnTpWw4v2Eg3qF6WTklw=
+  private key: (hidden)
+  listening port: 53488
+
+peer: JRI8Xc0zKP9kXk8qP84NdUQA04h6DLfFbwJn4g+/PFs=
+  endpoint: 163.172.161.0:12912
+  allowed ips: 0.0.0.0/0
+  latest handshake: 3 seconds ago
+  transfer: 6.55 KiB received, 4.13 KiB sent
+```
+
+逐行判读如下。第一行 `interface: myconfname` 给出实例名，Windows 侧对应隧道服务名 `WireGuardTunnel$myconfname`，因此 `wg show` 的参数用的是隧道名而非 Linux 意义上的内核接口名，写错名字会查不到实例。第二行 `public key` 是本地公钥，由 `[Interface]` 的 `PrivateKey` 经 X25519 派生，与 `[Peer]` 里的 `PublicKey` 不是一回事，切勿混淆。第三行 `private key: (hidden)` 表明私钥被隐藏，属正常保护行为；若查询工具把它打印为具体 Base64 值，应视为异常并核查工具版本与权限。第四行 `listening port: 53488` 是本地 UDP 监听端口，未配置 `ListenPort` 时由系统随机选取，每次启动可能变化。第五行 `peer:` 之后是第一个对端的公钥，应与配置中该 `[Peer]` 段的 `PublicKey` 完全一致，不一致说明查到了别的 peer 或配置被改动。第六行 `endpoint` 是实际协商出的对端地址端口，与配置里的 `Endpoint` 对得上说明解析与 DNS 解析链正常；显示 `(none)` 则说明对端尚未连入。第七行 `allowed ips: 0.0.0.0/0` 表明该 peer 承载 IPv4 全流量，此时按 06-09 的判定会启用 WFP kill-switch，需要额外确认 DNS 与本地网段放行。第八行 `latest handshake: 3 seconds ago` 对应 `LastHandshakeTime`，数值很小说明握手刚完成、链路活跃；长时间不更新（例如几分钟甚至几小时）通常指向端点不可达、公钥不匹配或 `PresharedKey` 两端不一致。第九行 `transfer: 6.55 KiB received, 4.13 KiB sent` 对应 `RxBytes` 与 `TxBytes`，是判断「握手成功但业务不通」的关键证据：若 received 持续增长而 sent 几乎为零，多为本地路由或 AllowedIPs 方向问题；若两个方向都不动，则更可能是握手尚未建立。以上六个运行时字段都不写回 `.conf`，运行时修改方式见 04-05。
+
+### 5. 速查表
+
+下表按常见组网意图给出五个键的建议组合，读者可据此快速起稿，再回到第 3 节核对每项取值约束。
+
+| 场景 | 建议键组合 | 关键约束 |
+|---|---|---|
+| 客户端连固定公网网关 | `PublicKey` + `AllowedIPs` + `Endpoint` | 端点须写端口，IPv6 用方括号 |
+| NAT 后需被随时访问 | 在上述基础上加 `PersistentKeepalive = 25` | 仅对需要保活的 peer 设置 |
+| 启用第二层对称密钥 | 在上述基础上加 `PresharedKey` | 两端取值必须完全一致 |
+| IPv4 全流量并启用 kill-switch | 单 peer 且 `AllowedIPs = 0.0.0.0/0` | 触发条件见 06-09 |
+| 规避 kill-switch 触发 | 拆分 `0.0.0.0/1, 128.0.0.0/1` | 原理见 06-09 |
+| 站点到站点分支 | `PublicKey` + `AllowedIPs` 写对端网段 | 避免与其他 peer 网段重叠 |
+| 服务端预置对端公钥 | 仅 `PublicKey` 加 `AllowedIPs`，省略 `Endpoint` | 等待对端主动连入 |
+
+下表把「零值 / 省略」与「导出时是否输出该行」对应起来，用于预判配置导入再导出后的文本差异。
+
+| 键 | 省略或零值时的内存态 | `ToWgQuick` 是否输出该行 |
+|---|---|---|
+| `PublicKey` | 全零，但解析阶段即被判为非法 | 恒输出 |
+| `PresharedKey` | 全零，`IsZero()` 为真 | 不输出 |
+| `AllowedIPs` | 空列表 | 不输出 |
+| `Endpoint` | 空主机，`IsEmpty()` 为真 | 不输出 |
+| `PersistentKeepalive` | 0，等价 `off` | 不输出 |
+
+两张表合起来给出一条实用结论：只有 `PublicKey` 是任何合法 peer 都必然存在的行，其余四行是否出现在导出文本里取决于取值是否非零、非空。若用脚本比对导入前后的 `.conf` 文本，应先把显式写的 `off`、全零 PSK、空列表等归一化为「该行不存在」，否则会把无害的序列化差异误判为配置篡改。
+
+### 6. 版本差异
+
+本篇事实以上游仓库 master 快照（2026-11 抓取）、WireGuardNT 1.1、Go 1.27.1 与 Windows 10 / Server 2019 及以上为版本基准。就 `conf/config.go`、`conf/parser.go`、`conf/writer.go` 三份文件而言，`[Peer]` 段的五个键与 `Peer` 的八个成员（五个配置字段加三个运行时统计字段）是稳定的核心契约：`FromWgQuick` 的 peer 分支只认这五个键，`ToWgQuick` 只回写这五个键，`ToDriverConfiguration` 只把这五个键编组进驱动载荷。凡在其他平台的 `wg-quick` 里见过、但 `conf/config.go` 里不存在的键，本仓库一律在 `default` 分支报「段内无效键」，不会静默忽略，也不会被当作扩展点。
+
+以下项目属于版本相关事实，使用时应写「需对照实际版本核验」并回到给出的源码路径复核，不要凭印象补全。其一，`PresharedKey` 与 `AllowedIPs` 是否在某些发行版被改为必填：本快照的 `FromWgQuick` 收尾只校验 `PublicKey` 与 `[Interface]` 的 `PrivateKey`，没有对这两项做非空检查，核验路径为 `conf/parser.go` 的收尾校验段。其二，端点主机对域名与 IPv6 区域标识的支持范围：`parseEndpoint` 目前接受方括号内带 `%` 的区域标识，但 `ToDriverConfiguration` 只把能 `netip.ParseAddr` 的字面 IP 设为 `PeerHasEndpoint`，域名解析发生在本仓库之外，核验路径为 `conf/parser.go` 与 `conf/writer.go`。其三，`PersistentKeepalive` 与端口的上限 65535 来自 `uint16` 与 `parsePort` / `parsePersistentKeepalive` 的显式范围检查，具体错误文案与边界是否随本地化或版本调整，核验路径同为 `conf/parser.go`。其四，驱动侧 `driver.PeerHasPresharedKey`、`driver.PeerHasEndpoint`、`driver.PeerHasPersistentKeepalive` 等标志位的命名与取值，核验路径为 `driver/configuration_windows.go`（字段见 05-05）。其五，`wg show` 输出行的具体措辞、单位与本地化，核验路径为 `docs/enterprise.md` 与 `wireguard-tools` 的 `wg(8)` 实现（见 04-05）。凡涉及具体版本号、驱动版本、MSI 文件名与下载 URL 的时效性数值，一律按总纲第 9 节约定处理，不在本篇写死。
+
+### 7. 常见误用与调试
+
+误用一：把 Linux `wg-quick` 语义搬进来。最常见的是在 `[Peer]` 段附近写 含 `iptables` 规则的 `PostUp` 行，或引用 `%i` 占位符，或期望 `SaveConfig = true` 把运行时状态回写。本仓库 `conf/config.go` 无 `SaveConfig` 成员、`conf/parser.go` 无对应 `case`，`PostUp` 等脚本键只在 `[Interface]` 段被识别；Windows 用 WFP 规则实现封锁、用 `WIREGUARD_TUNNEL_NAME` 环境变量替代 `%i`、用接口 DNS 配置替代 `resolvconf`，且四个脚本键默认不执行（见 04-02 与 04-07）。把这些写法当 Windows 能力会导致解析直接失败或配置「看起来生效、实际什么都没发生」。
+
+误用二：`AllowedIPs` 语法细节。行尾多一个逗号触发 `Two commas in a row`；写了既非 CIDR 也非裸地址的字符串触发 `Invalid IP address`；把 IPv6 端点写成 `2001:db8::1:51820` 而不加方括号会命中 `Missing port from endpoint` 或方括号校验错误。另需注意 `0.0.0.0/0` 与 `::/0` 是两条独立记录，只写前者不会覆盖 IPv6 流量。
+
+误用三：端点与公钥错配。`Endpoint` 省略后该 peer 只能被动等待连入，却仍期待它主动出站；`PublicKey` 与对端实际公钥不一致、`PresharedKey` 两端取值不同，都会表现为「配置能解析、服务能启动，但 `latest handshake` 一直不更新」。此时应先用第 4 节的判读方法看 `wg show` 输出，再逐项比对两端密钥文本。
+
+误用四：把运行时统计当配置键。有人看到 `transfer: 6.55 KiB received` 就往 `.conf` 里加 `RxBytes` 这样的赋值行，或在 `latest handshake` 长时间不更新时试图改配置文件里的 `LastHandshakeTime`。这三者由 `FromDriverConfiguration` 从驱动读回，写入文本只会得到「段内无效键」错误；正确做法是排查端点可达性、密钥一致性、防火墙与路由归属。
+
+误用五：多 peer 网段重叠。两个 peer 写了重叠或包含的 `AllowedIPs`，`DeduplicateNetworkEntries` 只在单个 peer 内去重，不会替你裁决归属；重叠会让数据包被发往非预期的 peer。排查时把每个 peer 的网段列成清单逐个比对，跨隧道冲突可借助 `Config.IntersectsWith` 的判定（原理见 06-06，工具化排错见 04-08）。
+
+调试顺序建议固定为四步：第一步，用 UI 的配置编辑器或 `FromWgQuick` 等价的解析动作确认配置能被接受，先排除语法与必填错误；第二步，确认隧道服务已启动、适配器已创建，再执行 `wg show <隧道名>` 取回运行时状态；第三步，按第 4 节逐行判读 `endpoint`、`latest handshake`、`transfer` 三行，定位是「握手未建立」还是「握手已建立但业务不通」；第四步，用 `wireguard /dumplog` 与 `wireguard /dumplog /tail` 读取共享环形日志（见 04-04、08-01），结合 `docs/enterprise.md` 给出的权限要求确认查询进程是否具备 LocalSystem 或 Administrator 权限。整条链路里，配置键只负责第一步之前的静态正确性，运行期的一切状态都要回到 `wg show` 与日志判读，而不是反复改 `.conf` 猜结果。
+
+五个键从配置文本到驱动下发的整体链路如图 04-03-01 所示：文本先经 `FromWgQuick` 按段归类，密钥类、网络类与保活键分别填入 `conf.Peer`，再由 `ToDriverConfiguration` 编组为 IOCTL 载荷下发给 WireGuardNT 适配器。
+:::figure id=04-03-01 | name=[Peer] 五个配置键的解析与下发去向 | dir=TD
+node a "[Peer] 段文本" blue
+node b "FromWgQuick<br/>conf/parser.go" teal
+node c "PublicKey<br/>PresharedKey" amber
+node d "AllowedIPs<br/>Endpoint" amber
+node e "PersistentKeepalive" amber
+node f "conf.Peer 内存对象" purple
+node g "ToDriverConfiguration" purple
+node h "WireGuardNT 适配器" green
+edge a -> b "逐行解析"
+edge b -> c "密钥类键"
+edge b -> d "网络类键"
+edge b -> e "保活键"
+edge c -> f "填充字段"
+edge d -> f "填充字段"
+edge e -> f "填充字段"
+edge f -> g "编组 IOCTL"
+edge g -> h "SetConfiguration"
+:::
+
+多 peer 场景下 `AllowedIPs` 的汇总、去重与全流量判定关系如图 04-03-02 所示，图中同时给出把 `/0` 拆分为两个 `/1` 以规避 kill-switch 触发条件的写法。
+:::figure id=04-03-02 | name=多 Peer 组合与 AllowedIPs 路由及 kill-switch 判定 | dir=TD
+node a "Peer 1 AllowedIPs" teal
+node b "Peer 2 AllowedIPs" teal
+node c "汇总去重<br/>DeduplicateNetworkEntries" blue
+node d "写接口路由<br/>winipcfg" purple
+node e "单 Peer 且含 /0" amber
+node f "启用 WFP kill-switch" red
+node g "放行隧道 UDP 与 DNS" green
+node h "0.0.0.0/1 拆分规避" gray
+edge a -> c "合并"
+edge b -> c "合并"
+edge c -> d "下发路由"
+edge a -> e "判定"
+edge e -> f "触发条件"
+edge f -> g "放行白名单"
+edge f -> h "规避手段"
+:::
+
+## 04-04 `wireguard.exe` 命令行开关全集
+
+### 1. 本篇定位与覆盖范围
+
+本篇是 04 册「配置与命令行」中专门穷举 `wireguard.exe` 进程入口开关的一篇，事实依据只有两处：`main.go` 里 `usage()` 函数的 `flags` 数组，以及 `main()` 函数里按 `os.Args[1]` 分派的 `switch`。前者决定「官方承认哪些开关」，后者决定「每个开关接受几个参数、调用哪个入口、参数个数不对时怎么处理」。两者合起来才是完整契约，只读其一都会漏掉细节：例如 `usage()` 里写的是 `/ui CMD_READ_HANDLE CMD_WRITE_HANDLE CMD_EVENT_HANDLE LOG_MAPPING_HANDLE`，而 `main()` 用 `len(os.Args) != 6` 精确校验「程序名加开关再加四个句柄」共六个参数；又如 `/dumplog [/tail]` 里的方括号表示可选参数，对应的校验是 `len(os.Args) != 2 && len(os.Args) != 3`。
+
+覆盖范围包含三类行为。第一类是「无参数」默认行为：`wireguard.exe` 不带任何开关时先尝试唤起已运行的 UI（`ui.RaiseUI()`），若失败则检查管理员组、提权并触发 manager 服务安装，因此它是交互式启动入口，而 `/installmanagerservice` 才是静默安装入口。第二类是十个斜杠开关，逐个覆盖安装 / 卸载 manager 服务、安装 / 卸载 / 运行 tunnel 服务、以四个继承句柄启动 UI、导出日志、触发更新、移除驱动。第三类是这些开关共有的前置检查与输出行为：`SetDllDirectory` 与 `SetDefaultDllDirectories` 的 DLL 搜索路径收敛、`checkForWow64` 的原生架构检查、`checkForAdminGroup` 的管理员组检查、`setLogFile` 的标准错误 / 标准输出分流，以及 `fatal` 在无标准错误时改用 MessageBox 的兜底。
+
+必须先把三类命令区分清楚，这是本篇最容易被误用的边界。这里列的是 `wireguard.exe` 的 Windows 风格 `/` 开关，由本仓库 `main.go` 直接分派；`wg(8)` 的 `show`、`set`、`genkey` 等子命令属于外部项目 wireguard-tools 的 `wg.exe`，与本进程不是同一个可执行文件（见 04-05）；`sc`、`Get-Service`、`reg`、`schtasks` 等属于 Windows 自带运维命令，由 04-06 收录。三者都可在命令行里出现，但不要互相拼接或混淆参数风格。另须强调，这些开关只负责进程分派、服务安装与诊断，**不是** Linux `wg-quick` 的接口配置工具：`wireguard.exe` 没有 `up` / `down` 之类的 `wg-quick` 子命令，不解析 `iptables` 规则，不识别 `%i` 占位符，不调用 `resolvconf`，也不提供 `SaveConfig` 式的运行时回写。配置的持久化靠 `.conf` 文件与 manager 服务的 DPAPI 存储（见 03-04、原理见 06-03），运行时查询与修改靠 `wg(8)`（见 04-05）。
+
+本篇不展开进程入口之后的服务实现、IPC 协议、环形日志格式与更新校验链，统一收敛到交叉引用：`字段见 05-09 ｜ 原理见 06-01 ｜ 模块见 07-08`。更具体的错误码与退出码映射见 05-09，入口分派与前置检查见 06-01，manager 服务与隧道跟踪见 07-08，环形日志见 07-10，更新器见 07-11，驱动卸载见 07-03。本篇只回答「有哪些开关、怎么传参、会调用什么、输出去哪里」，实现细节一律不重列。
+
+### 2. 索引与全参数表
+
+下表按 `usage()` 中 `flags` 数组的顺序列出全部开关，含无参数默认行为，共十一行。参数个数一列是 `main()` 里 `len(os.Args)` 的实际校验值，入口调用一列是 `main()` 的 `switch` 分支所调用的函数。
+
+| 开关 | 参数个数 | 参数占位 | `len(os.Args)` 校验 | 入口调用（main.go） | 作用 |
+|---|---|---|---|---|---|
+| 无参数 | 1 | 无 | `<= 1` 进入默认分支 | `ui.RaiseUI` 或提权安装 | 唤起已有 UI，否则提权装 manager 服务 |
+| `/installmanagerservice` | 2 | 无 | `!= 2` 则 `usage()` | `manager.InstallManager` | 安装 `WireGuardManager` 服务并等托盘 |
+| `/uninstallmanagerservice` | 2 | 无 | `!= 2` 则 `usage()` | `manager.UninstallManager` | 卸载 manager 服务 |
+| `/managerservice` | 2 | 无 | `!= 2` 则 `usage()` | `manager.Run` | 以服务方式运行 manager 主循环 |
+| `/installtunnelservice` | 3 | `CONFIG_PATH` | `!= 3` 则 `usage()` | `manager.InstallTunnel` | 安装 `WireGuardTunnel$<name>` |
+| `/uninstalltunnelservice` | 3 | `TUNNEL_NAME` | `!= 3` 则 `usage()` | `manager.UninstallTunnel` | 按隧道名卸载隧道服务 |
+| `/tunnelservice` | 3 | `CONFIG_PATH` | `!= 3` 则 `usage()` | `tunnel.Run` | 以服务方式运行隧道主循环 |
+| `/ui` | 6 | 四个句柄，见下方参数说明 | `!= 6` 则 `usage()` | `ui.RunUI` | 由 manager 孵化并接管 UI |
+| `/dumplog` | 2 或 3 | 可选 `/tail` | `!= 2` 且 `!= 3` 则 `usage()` | `ringlogger.DumpTo` | 导出共享环形日志到标准输出 |
+| `/update` | 2 | 无 | `!= 2` 则 `usage()` | `updater.DownloadVerifyAndExecute` | 检查并执行 MSI 更新 |
+| `/removedriver` | 2 | 无 | `!= 2` 则 `usage()` | `driver.Uninstall` | 无适配器时移除 WireGuardNT 驱动 |
+
+表中「参数个数」含 `os.Args[0]` 程序名本身，因此 `/installtunnelservice CONFIG_PATH` 对应 3、`/ui` 加四个句柄对应 6。凡是参数个数不符、或传入了 `switch` 未匹配的开关，`main()` 末尾统一落到 `usage()`：先用 `info` 打印命令行选项清单，再 `os.Exit(1)`。也就是说，本进程没有「未知开关静默忽略」的行为，也没有多级子命令与帮助开关，`--help`、`-h` 这类写法都会走 `usage()` 并以退出码 1 结束。
+
+`usage()` 打印的选项清单本身就是一份权威索引，其格式可由 `main.go` 精确还原：`info` 把标题 `Command Line Options` 与格式串 `Usage: %s [\n%s]` 拼起来，`builder` 则把 `flags` 数组逐行以四个空格缩进。下表把这份清单与 `main()` 分支的对应关系再压缩一次，便于速查。
+
+| `usage()` 中的行 | `main()` 分支 | 是否需管理员组检查 |
+|---|---|---|
+| `(no argument): elevate and install manager service` | `len(os.Args) <= 1` | 是，仅 UI 唤起失败后 |
+| `/installmanagerservice` | 同名 `case` | 间接，由服务安装路径负责 |
+| `/installtunnelservice CONFIG_PATH` | 同名 `case` | 由 `manager.InstallTunnel` 路径负责 |
+| `/uninstallmanagerservice` | 同名 `case` | 由 `manager.UninstallManager` 路径负责 |
+| `/uninstalltunnelservice TUNNEL_NAME` | 同名 `case` | 由 `manager.UninstallTunnel` 路径负责 |
+| `/managerservice` | 同名 `case` | 由服务控制管理器约束 |
+| `/tunnelservice CONFIG_PATH` | 同名 `case` | 由服务控制管理器约束 |
+| `/ui 4 个句柄` | 同名 `case` | 内部判定令牌并降权 |
+| `/dumplog [/tail]` | 同名 `case` | 由日志文件 ACL 约束 |
+| `/update` | 同名 `case` | 由更新器与 MSI 权限约束 |
+| `/removedriver` | 同名 `case` | 由驱动卸载权限约束 |
+
+`/ui` 的四个句柄在 `usage()` 中的完整占位为 `CMD_READ_HANDLE CMD_WRITE_HANDLE CMD_EVENT_HANDLE LOG_MAPPING_HANDLE`，详见下方参数说明；为避免表格单元格过长，第二张表以「4 个句柄」概括。所有开关的输出与退出行为见下表，依据是 `setLogFile`、`info`、`fatal` 三个辅助函数。
+
+| 行为 | 触发条件 | 具体表现（main.go） |
+|---|---|---|
+| 标准错误优先 | `GetStdHandle(STD_ERROR_HANDLE)` 成功 | 日志写到 stderr |
+| 退而求其次 | 前者失败但 `STD_OUTPUT_HANDLE` 成功 | 日志写到 stdout |
+| 无控制台兜底 | 两个句柄都取不到 | `log.SetOutput(io.Discard)`，改用 MessageBox |
+| 打印选项清单 | 参数不匹配或未知开关 | `info` 输出后 `os.Exit(1)` |
+| 致命错误 | 各分支返回 `err` | `fatal` 输出后以 1 退出 |
+| 正常完成 | 分支成功返回 | `main` 直接返回，退出码 0 |
+
+`docs/enterprise.md` 对输出分流有一句概括性说明：这些命令把错误和状态写到标准错误，若标准错误不存在则写到标准输出。这正是上表前三行的行为，也是 `/update 2> C:\path\to\update\log.txt`、`/dumplog > C:\path\to\diagnostic\log.txt` 之类重定向写法能生效的原因。
+
+### 3. 逐项详解
+
+#### 3.1 无参数：交互式启动
+
+当 `len(os.Args) <= 1` 时，`main()` 不进入 `switch`，而是先调用 `ui.RaiseUI()` 尝试把已经运行的 UI 窗口提到前台；若返回 true 就直接返回，进程结束。若 UI 尚不存在，则调用 `checkForAdminGroup()`（用 `elevate.TokenIsElevatedOrElevatable` 判断当前令牌是否属于内建管理员组，否则 `fatalf` 报「WireGuard may only be used by users who are a member of the Builtin Administrators group」），随后调用 `execElevatedManagerServiceInstaller()`：取自身可执行路径，用 `elevate.ShellExecute` 以 `/installmanagerservice` 参数、窗口模式 `SW_SHOW` 提权重启自己，随后 `os.Exit(0)`。因此「双击 wireguard.exe」与「运行 `wireguard /installmanagerservice`」最终都会走到同一安装入口，区别是前者先尝试唤起 UI、且按需弹出 UAC 提权。`docs/enterprise.md` 把这句话总结为：无参数适合交互式启动，`/installmanagerservice` 适合静默安装。
+
+#### 3.2 `/installmanagerservice`
+
+参数个数必须为 2。分支先起一个 goroutine 执行 `ui.WaitForRaiseUIThenQuit()`，再调用 `manager.InstallManager()`。若返回 `manager.ErrManagerAlreadyRunning`，说明服务已在运行，此时调用 `checkForAdminDesktop()` 检查当前桌面，随后仍以 `fatal(err)` 结束；若安装成功，同样调用 `checkForAdminDesktop()`，然后 `time.Sleep(30 * time.Second)` 等待托盘图标出现，超时则 `fatalf` 报「WireGuard system tray icon did not appear after 30 seconds.」。这条 30 秒等待解释了为什么静默安装命令在脚本里看起来「卡住」——它在等服务孵化出 UI。服务名固定为 `WireGuardManager`（见 `docs/enterprise.md` 与 `manager/install.go`）。安装后可用 `services.msc` 或 `sc` 查询（见 04-06）。
+
+#### 3.3 `/uninstallmanagerservice` 与 `/managerservice`
+
+两者参数个数都必须为 2。前者调用 `manager.UninstallManager()` 卸载 `WireGuardManager` 服务；后者调用 `manager.Run()` 进入 manager 服务主循环，是服务控制管理器实际启动服务时执行的入口，不应由管理员手动在普通命令行里长期运行。二者都是「无额外参数」的开关，多传一个参数就会命中 `usage()` 并退出码 1。卸载顺序、服务清理与注册表清理的运维流程见 03-06，服务内部实现见 07-08，机制见 06-10。
+
+#### 3.4 `/installtunnelservice CONFIG_PATH`
+
+参数个数必须为 3，`os.Args[2]` 是配置文件路径，交给 `manager.InstallTunnel(os.Args[2])`。`docs/enterprise.md` 给出了两条最典型的用法：
+
+```text
+> wireguard /installtunnelservice C:\path\to\some\myconfname.conf
+> wireguard /uninstalltunnelservice myconfname
+```
+
+安装后生成的服务名为 `WireGuardTunnel$myconfname`，隧道名取自配置文件名。文件扩展名决定解读方式：以 `.conf` 结尾按普通 `wg-quick(8)` 配置文件解析；以 `.conf.dpapi` 结尾则视为同一份配置经 `CryptProtectData(bytes, "myconfname")` 加密后的版本。这一区分很重要：manager 服务会把放进 `%ProgramFiles%\WireGuard\Data\Configurations\` 的明文 `.conf` 加密为 `.conf.dpapi` 并删除明文（见 03-04），因此脚本化部署时可以直接投放 `.conf`，也可以投放预先生成的 `.conf.dpapi`。注意这里说的「按 `wg-quick(8)` 配置文件解析」仅指 INI 配置键语法（见 04-01 至 04-03），**不表示**本命令会执行 `wg-quick` 的 `iptables`、`%i`、`resolvconf` 或 `SaveConfig` 逻辑。
+
+#### 3.5 `/uninstalltunnelservice TUNNEL_NAME` 与 `/tunnelservice CONFIG_PATH`
+
+两者参数个数都必须为 3。`os.Args[2]` 的含义不同：前者是隧道名（`TUNNEL_NAME`），交给 `manager.UninstallTunnel` 按名卸载，对应服务名 `WireGuardTunnel$<name>`；后者是配置文件路径（`CONFIG_PATH`），交给 `tunnel.Run` 进入隧道服务主循环，是服务控制管理器启动隧道服务时的实际入口。把隧道名误传给 `/tunnelservice` 或把路径误传给 `/uninstalltunnelservice`，参数个数虽然对了，但入口函数拿到的是错误类型的实参，会在各自内部报错，这是脚本里最常见的参数错配。`docs/enterprise.md` 明确隧道服务可以独立于 manager 服务与 UI 使用，二者也可组合使用，这类部署形态见 03-03。
+
+#### 3.6 `/ui` 与四个继承句柄
+
+`/ui` 是本进程唯一需要四个额外参数的开关，`main()` 要求 `len(os.Args) == 6`，即 `wireguard.exe`、`/ui` 加四个句柄值。四个占位依次为 `CMD_READ_HANDLE`、`CMD_WRITE_HANDLE`、`CMD_EVENT_HANDLE`、`LOG_MAPPING_HANDLE`，在 `usage()` 里已按此顺序列出。分支先用 `windows.OpenProcessToken` 取当前进程令牌，用 `elevate.TokenIsElevatedOrElevatable` 判定 `isAdmin`；若为真则 `elevate.DropAllPrivileges(false)` 主动丢弃特权，再把结果写入 `ui.IsAdmin`。随后 `pipeFromHandleArgument` 依次把 `os.Args[2]`、`os.Args[3]`、`os.Args[4]` 三个十进制整数字符串转成 `*os.File`，分别作为读管道、写管道、事件管道，交给 `manager.InitializeIPCClient(readPipe, writePipe, eventPipe)` 初始化 IPC 客户端；`os.Args[5]` 则交给 `ringlogger.NewRingloggerFromInheritedMappingHandle(os.Args[5], "GUI")` 复用 manager 传入的共享日志映射。最后调用 `ui.RunUI()`。
+
+四个句柄的含义与去向见下表，这一组参数是 manager 服务孵化 UI 进程时通过句柄继承传入的，**不是**供管理员手工拼装的公开接口：手工运行 `/ui` 几乎必然因为句柄值无效而在 `pipeFromHandleArgument` 或日志映射初始化处 `fatal`。
+
+| 顺序 | `usage()` 占位 | `os.Args` 下标 | 用途（main.go） |
+|---|---|---|---|
+| 1 | `CMD_READ_HANDLE` | `os.Args[2]` | IPC 命令读管道 |
+| 2 | `CMD_WRITE_HANDLE` | `os.Args[3]` | IPC 命令写管道 |
+| 3 | `CMD_EVENT_HANDLE` | `os.Args[4]` | IPC 事件通知管道 |
+| 4 | `LOG_MAPPING_HANDLE` | `os.Args[5]` | 环形日志共享映射，名称 `GUI` |
+
+句柄继承、会话枚举与 `CreateProcessAsUser` 的机制见 06-10，IPC 三根无名管道与 gob 编解码见 06-11，字段与结构见 05-09。四个句柄从 manager 服务到 UI 进程的传递关系如图 04-04-02 所示。
+
+#### 3.7 `/dumplog [/tail]`
+
+参数个数允许 2 或 3；当为 3 时，只有 `os.Args[2] == "/tail"` 才会把 `tail` 参数置为 true，其他任意第三个参数虽能通过个数校验，但不会进入跟随模式，等效于普通导出。分支先 `windows.GetStdHandle(STD_OUTPUT_HANDLE)`，取不到则 `fatal("Stdout must be set")`；随后 `conf.LogFile(false)` 定位共享环形日志，再调用 `ringlogger.DumpTo(logPath, file, tail)` 把日志写到标准输出。`docs/enterprise.md` 给出三种典型用法：重定向到文件（`wireguard /dumplog > log.txt`）、持续跟随并交给日志采集（`wireguard /dumplog /tail | log-ingest`）、在 PowerShell 里用 `select` 监视（`wireguard /dumplog /tail | select`）。日志实现见 07-10，读取链见 06-11，运维采集见 08-01。
+
+#### 3.8 `/update`
+
+参数个数必须为 2。分支遍历 `updater.DownloadVerifyAndExecute(0)` 返回的进度通道：若 `progress.Activity` 非空，且 `BytesTotal` 或 `BytesDownloaded` 大于 0，就按 `log.Printf` 的 `"%s: %d/%d (%.2f%%)\n"` 格式串打印活动名、已下载 / 总字节数与百分比，否则用 `log.Println` 只打印活动名；若 `progress.Error` 非空则打印错误；当 `progress.Complete` 为真或出现错误时 `return` 结束。`docs/enterprise.md` 给出重定向状态日志的写法，以及用计划任务每日触发的命令（计划任务命令的完整写法见下方示例，属 04-06 的 `schtasks` 范畴，此处仅作引用）。更新链的签名校验与 MSI 执行见 06-12，更新器模块见 07-11。
+
+#### 3.9 `/removedriver`
+
+参数个数必须为 2，调用 `driver.Uninstall()`。`docs/enterprise.md` 说明隧道服务在启动时创建网络适配器、关停时销毁适配器，因此该开关的适用前提是「已经没有任何 WireGuard 适配器」；在适配器仍存在时执行会失败。典型用法是 `wireguard /removedriver` 或带状态重定向的 `wireguard /removedriver 2> log.txt`。驱动卸载的权限与顺序见 03-06，驱动模块见 07-03。
+
+#### 3.10 共有的前置检查
+
+无论走哪条分支，`main()` 开头先执行 `windows.SetDllDirectory("")` 与 `windows.SetDefaultDllDirectories(windows.LOAD_LIBRARY_SEARCH_SYSTEM32)` 收敛 DLL 搜索路径，失败直接 `panic("failed to restrict dll search path")`；随后 `setLogFile()` 建立日志输出，再 `checkForWow64()` 判定架构——它通过 `IsWow64Process2`（旧系统上回退 `IsWow64Process`）比较进程机器类型与 `runtime.GOARCH` 对应的原生类型，若发现运行在 WOW64 下则 `fatalf("You must use the native version of WireGuard on this computer.")`，即 32 位程序跑在 64 位系统上会被拒绝。这两项发生在 `switch` 之前，因此「用错架构 MSI」和「日志句柄异常」会在任何开关上先暴露。入口分派全貌如图 04-04-01 所示。
+
+### 4. 典型示例
+
+第一组示例展示最容易在脚本里踩到的行为：传入 `switch` 未匹配的开关会落到 `usage()` 并打印完整选项清单。下面的输出依据 `main.go` 的 `usage()` 与 `info()` 格式串还原；示例输出，具体格式需对照实际版本核验（程序名路径与本地化文案随环境与版本变化）。
+
+```text
+> wireguard.exe /bogus
+Command Line Options:
+Usage: C:\Program Files\WireGuard\wireguard.exe [
+    (no argument): elevate and install manager service
+    /installmanagerservice
+    /installtunnelservice CONFIG_PATH
+    /uninstallmanagerservice
+    /uninstalltunnelservice TUNNEL_NAME
+    /managerservice
+    /tunnelservice CONFIG_PATH
+    /ui CMD_READ_HANDLE CMD_WRITE_HANDLE CMD_EVENT_HANDLE LOG_MAPPING_HANDLE
+    /dumplog [/tail]
+    /update
+    /removedriver
+]
+```
+
+逐行判读如下。第一行是标题，`info` 把 `l18n.Sprintf("Command Line Options")` 作为标题拼进日志前缀，实际界面可能显示为本地化后的「命令行选项」。第二行的 `Usage:` 后是 `os.Args[0]`，也就是本机实际可执行文件路径，据此可确认脚本调用的是amd64、x86 还是 arm64 版本，若路径指向意料之外的安装目录，应立即核查是否装错了架构或多版本并存。第三行 `(no argument): elevate and install manager service` 说明「不带参数」并非无事可做，而是提权并安装 manager 服务，这正是无参数双击与静默安装的关系。第四到第九行是三对成对开关：manager 服务的安装 / 卸载 / 运行与 tunnel 服务的安装 / 卸载 / 运行，注意带 `CONFIG_PATH` 的两个安装 / 运行开关与带 `TUNNEL_NAME` 的卸载开关参数类型不同。第十行 `/ui` 后面跟着四个大写占位，说明该开关必须由 manager 服务附带四个继承句柄调用，管理员不应手工拼接。第十一行 `/dumplog [/tail]` 的方括号表示可选参数，对应「导出一次」与「持续跟随」两种模式。第十二、十三行分别是更新与驱动移除。最后的 `]` 来自格式串 `Usage: %s [\n%s]` 的收尾，并非配置语法。整份清单出现意味着本次调用以退出码 1 结束，脚本应把「打印 Usage」视为失败而不是帮助信息。
+
+第二组示例给出 `docs/enterprise.md` 里的典型运维命令序列，覆盖服务安装、隧道查询、日志导出、更新与驱动移除，具体命令见下方配置示例。
+
+```text
+> wireguard /installtunnelservice C:\path\to\some\myconfname.conf
+> wg show myconfname
+> wireguard /dumplog > C:\path\to\diagnostic\log.txt
+> wireguard /dumplog /tail | log-ingest
+> wireguard /update 2> C:\path\to\update\log.txt
+> schtasks /create /f /ru SYSTEM /sc daily /tn "WireGuard Update" /tr "%PROGRAMFILES%\WireGuard\wireguard.exe /update" /st 03:00
+> wireguard /removedriver 2> C:\path\to\removal\log.txt
+```
+
+判读这组命令时要抓住「输出去哪里」。前两条里 `/installtunnelservice` 本身成功时通常不打印内容，错误与状态走标准错误或标准输出，因此静默脚本应显式重定向；`wg show` 属于 `wg.exe` 而非 `wireguard.exe`（见 04-05）。第三、四条用 `>` 与管道消费 `/dumplog` 的标准输出，若当前会话没有标准错误，`setLogFile` 会把日志改写到标准输出，重定向依然有效；`/tail` 表示持续跟随而非一次性导出，适合交给日志采集进程。第五条把 `/update` 的状态写到文件，依据是 `main.go` 的分支用 `log.Printf` 打印活动名与百分比。第六条是 `docs/enterprise.md` 给出的计划任务示例，用 SYSTEM 账户每日 03:00 触发 `/update`，其中 `schtasks` 属 04-06 收录的运维命令。第七条在确认没有适配器后移除驱动并留状态日志。整组命令体现了 04 册的分工：`wireguard.exe` 的 `/` 开关管进程与服务生命周期，`wg(8)` 管运行时状态，`sc` / `schtasks` 管 Windows 服务与任务，三者不可混为一谈。
+
+### 5. 速查表
+
+下表按运维意图把开关收敛成「一行动作」，参数细节回到第 3 节核对。
+
+| 意图 | 使用的开关 | 参数要点 |
+|---|---|---|
+| 交互式启动或唤起 UI | 无参数 | 会按需弹 UAC 提权 |
+| 静默安装管理服务 | `/installmanagerservice` | 会等待托盘最多 30 秒 |
+| 卸载管理服务 | `/uninstallmanagerservice` | 无额外参数 |
+| 部署一条隧道为服务 | `/installtunnelservice` | 传 `.conf` 或 `.conf.dpapi` 路径 |
+| 删除一条隧道服务 | `/uninstalltunnelservice` | 传隧道名而非路径 |
+| 导出一次诊断日志 | `/dumplog` | 标准输出需可写 |
+| 持续跟随日志 | `/dumplog /tail` | 第三个参数必须是 `/tail` |
+| 命令行触发更新 | `/update` | 进度写到日志输出 |
+| 移除内核驱动 | `/removedriver` | 前提是无任何适配器 |
+
+下表把参数个数与错误表现对应起来，便于脚本里预判退出码。
+
+| 参数个数错误示例 | `main()` 的判定 | 表现 |
+|---|---|---|
+| `/installtunnelservice` 少传路径 | `len(os.Args) != 3` | 打印 Usage，退出码 1 |
+| `/dumplog /tail extra` 多传一项 | `len` 既不是 2 也不是 3 | 打印 Usage，退出码 1 |
+| `/ui` 只传三个句柄 | `len(os.Args) != 6` | 打印 Usage，退出码 1 |
+| `/update extra` 多传一项 | `len(os.Args) != 2` | 打印 Usage，退出码 1 |
+| 传入 `/bogus` | `switch` 末尾默认 | 打印 Usage，退出码 1 |
+| 32 位程序跑在 64 位系统 | `checkForWow64` 先行 | 报原生版本错误后退出 |
+
+两张表合起来给出一条实用结论：本进程的开关契约是「位置参数 + 精确个数」，没有长短选项、没有 `--` 前缀、没有默认值填充。写自动化脚本时应先把参数个数与类型检查放在最前面，避免把 `usage()` 的输出误当成正常结果继续往下走。
+
+### 6. 版本差异
+
+本篇以上游仓库 master 快照（2026-11 抓取）、WireGuardNT 1.1、Go 1.27.1、Windows 10 / Server 2019 及以上、amd64 / x86 / arm64 三种 MSI 为基准。`main.go` 的 `usage()` 数组与 `main()` 的 `switch` 是本仓库最稳定的对外契约之一，但「稳定」指的是结构，不是逐字文案：所有提示串都经 `l18n.Sprintf` 走本地化，中文环境下的「Command Line Options」与「Usage」显示会随语言资源变化，因此脚本不应靠匹配提示文本判断结果，而应看退出码与服务状态。
+
+以下项目属于版本相关事实，应写「需对照实际版本核验」并回到给出的源码路径复核。其一，开关全集是否随版本增删：本快照 `usage()` 的 `flags` 数组共十一行（无参数一行加十个斜杠开关），`main()` 的 `switch` 有十个 `case` 加末尾默认分支，任何未列出的开关都会落到 `usage()`，核验路径为 `main.go` 的 `usage()` 与 `main()`。其二，`/ui` 四个句柄的个数与顺序：本快照要求 `len(os.Args) == 6`，顺序为读管道、写管道、事件管道、日志映射，核验路径同为 `main.go` 的 `/ui` 分支。其三，`/installmanagerservice` 等待托盘的 30 秒与 `ErrManagerAlreadyRunning` 的处理逻辑，核验路径为 `main.go` 对应分支与 `services/errors.go`。其四，`os.Exit(1)` 之外的退出码细节：`fatal` 在无标准错误时用 MessageBox 后 `os.Exit(1)`，有标准错误时走 `log.Fatal`，更细的错误码映射见 05-09 与 `services/errors.go`，需对照实际版本核验。其五，`conf.LogFile(false)` 解析出的日志路径、`driver.Uninstall()` 的成功条件、`updater.DownloadVerifyAndExecute(0)` 的进度字段，核验路径分别为 `conf/path_windows.go`、`driver/driver_windows.go`、`updater/downloader.go`。其六，`docs/enterprise.md` 里示例命令的路径、服务名 `WireGuardManager` 与 `WireGuardTunnel$<name>` 的前缀，以及 `DO_NOT_LAUNCH` 等 MSI 属性，核验路径为 `docs/enterprise.md` 与 `manager/install.go`。凡涉及具体版本号、驱动版本、MSI 文件名与下载 URL 的时效性数值，按总纲第 9 节约定处理，不在本篇写死。
+
+### 7. 常见误用与调试
+
+误用一：把三类命令混用。把 `wg show` 写成 `wireguard.exe show`、把 `/installtunnelservice` 写成 `/installtunnelservice up`、或以为 `wireguard.exe` 有 `--help`，都会命中 `switch` 末尾的 `usage()` 并以退出码 1 结束。前者属于 `wg.exe` 的子命令（见 04-05），后者属于 Windows 服务运维命令（见 04-06）。同理，`wireguard.exe` 没有 `wg-quick` 的 `up` / `down`，也没有 `SaveConfig`、`iptables`、`%i`、`resolvconf` 语义，把它当 Linux 配置工具会一无所获。
+
+误用二：参数个数与类型错配。最常见的是 `/installtunnelservice` 漏传路径、`/uninstalltunnelservice` 传了文件路径而非隧道名、`/tunnelservice` 传了隧道名而非路径、`/ui` 少传句柄、`/dumplog` 传了 `/tail` 之外的第三个参数。前四者会打印 Usage 退出，最后一种不会报错但也不会进入跟随模式，属于「静默失效」，排查时应回到 `main.go` 的 `len(os.Args)` 判定逐条核对。
+
+误用三：手工调用 `/ui`。四个句柄是 manager 服务孵化 UI 进程时通过句柄继承传入的内部值，不是可公开拼装的命令行参数。手工运行 `/ui 1 2 3 4` 之类会在 `pipeFromHandleArgument` 或 `NewRingloggerFromInheritedMappingHandle` 处 `fatal`，报句柄或映射无效。正确做法是用无参数启动或 `/installmanagerservice` 让 manager 服务自行孵化 UI。
+
+误用四：忽略架构与权限前置检查。`checkForWow64` 在 `switch` 之前执行，用错架构（例如在 64 位系统上运行 x86 版）会直接报「必须使用原生版本」；`checkForAdminGroup` 要求调用者属于内建管理员组。企业分发时应确认 GPO 下发的 MSI 与目标架构一致（见 03-05、02-05），并留意 `LimitedOperatorUI` 只放宽受限 UI、不改变这些开关的权限要求（见 04-07）。
+
+误用五：把 usage 输出当成功。任何参数不匹配都会 `info` 打印清单后 `os.Exit(1)`，但清单本身不含「错误」字样，日志采集脚本若只匹配 stdout 文本容易漏判。应检查退出码，或配合 `sc query WireGuardManager`、`Get-Service` 之类确认服务是否真的存在（见 04-06）。
+
+调试顺序建议固定为四步。第一步，确认二进制路径与架构：无参数或 `/bogus` 触发的 Usage 里 `os.Args[0]` 会打印实际路径，据此排除多版本并存与 WOW64 问题。第二步，确认日志去向：`setLogFile` 优先 stderr、其次 stdout、都没有则 MessageBox，因此脚本里一定要显式做 `2>` 或 `>` 重定向，否则在计划任务等无控制台环境下错误只会以弹窗形式出现并被忽略。第三步，用 `/dumplog` 导出共享环形日志、必要时用 `/dumplog /tail` 持续跟随，观察服务安装、适配器创建与 IPC 相关记录（日志判读见 08-01）。第四步，对照 `docs/enterprise.md` 的权限说明确认调用账户，隧道服务与 manager 服务均以 LocalSystem 运行，普通用户执行这些开关通常失败。整个链路里，`wireguard.exe` 的开关只负责把进程分派到正确入口，真正的隧道状态要用 `wg show` 查询（见 04-05），服务状态要用 `sc` / PowerShell 查询（见 04-06）。
+
+`wireguard.exe` 的入口分派与十类开关去向如图 04-04-01 所示：初始化与 WOW64 检查之后，`main()` 按 `os.Args[1]` 分派到无参数、manager 类、tunnel 类、UI、诊断更新、驱动清理或 Usage 分支。
+:::figure id=04-04-01 | name=wireguard.exe 入口分派与十类开关 | dir=TD
+node a "main.go main()" blue
+node b "setLogFile<br/>checkForWow64" gray
+node c "无参数<br/>RaiseUI 或提权安装" teal
+node d "manager 类开关<br/>安装卸载运行" amber
+node e "tunnel 类开关<br/>安装卸载运行" amber
+node f "/ui 四句柄" purple
+node g "/dumplog<br/>/update" green
+node h "/removedriver" red
+node i "usage() 打印并退出" gray
+edge a -> b "初始化"
+edge b -> c "无参数分支"
+edge b -> d "manager 分派"
+edge b -> e "tunnel 分派"
+edge b -> f "UI 分派"
+edge b -> g "诊断与更新"
+edge b -> h "驱动清理"
+edge b -> i "开关不匹配"
+:::
+
+`/ui` 的四个继承句柄与 manager 服务孵化 UI 进程的链路如图 04-04-02 所示，四个句柄分别对应三根 IPC 管道与一份共享日志映射。
+:::figure id=04-04-02 | name=/ui 四个继承句柄与 manager 服务到 UI 的链路 | dir=TD
+node a "manager 服务<br/>WireGuardManager" blue
+node b "CreateProcessAsUser<br/>孵化 UI 进程" teal
+node c "CMD_READ_HANDLE" amber
+node d "CMD_WRITE_HANDLE" amber
+node e "CMD_EVENT_HANDLE" amber
+node f "LOG_MAPPING_HANDLE" amber
+node g "InitializeIPCClient" purple
+node h "ringlogger GUI 映射" green
+node i "ui.RunUI()" gray
+edge a -> b "启动"
+edge b -> c "句柄 1"
+edge b -> d "句柄 2"
+edge b -> e "句柄 3"
+edge b -> f "句柄 4"
+edge c -> g "命令读"
+edge d -> g "命令写"
+edge e -> g "事件通知"
+edge f -> h "日志映射"
+edge g -> i "IPC 就绪"
+edge h -> i "日志就绪"
+:::
+
+## 04-05 `wg(8)` 在 Windows 的运行时查询与修改
+
+### 1. 本篇定位与覆盖范围
+
+本篇是 04 册「配置与命令行」中专门讲运行时查询与修改的一篇，覆盖大纲列出的九个子命令：`show`、`showconf`、`set`、`setconf`、`addconf`、`syncconf`、`genkey`、`pubkey`、`genpsk`。它与前两篇的分工是清晰的：04-01 至 04-03 讲的是静态 `.conf` 配置文件里的键，04-04 讲的是 `wireguard.exe` 的进程与服务的 `/` 开关，本篇讲的是隧道服务**跑起来之后**如何查状态、如何临时改状态、以及如何离线生成密钥材料。三者的权威源都在 04 册，但操作对象完全不同，混用是排障中最常见的错误来源。
+
+有一条边界必须先讲透，否则后面所有结论都会被误置：`wg(8)` 的 `wg.exe` **不是本仓库的产物**。`docs/buildrun.md` 专设「`wg(8)` Support for Windows」一节，明确它是 以 Unix 为中心的 wireguard-tools 项目，用 `PLATFORM=windows make -C wireguard-tools/src` 交叉编译，产物为 `wireguard-tools/src/wg.exe`；Windows 上的 `build.bat` 会顺带构建它；它「与主 WireGuard for Windows 程序所运行的 WireGuard 实例交互」。`upstream_src/` 这份快照里没有 wireguard-tools 的源码，`main.go` 的 `usage()` 里也没有任何 `wg` 子命令。因此本篇关于子命令全集、参数形式与输出格式的描述，属于对 wg(8) 通用手册的引用与对 `docs/enterprise.md` 输出样例的判读，**具体行为需对照实际版本核验**，可定位的资料路径是 `docs/buildrun.md`、`docs/enterprise.md` 以及它们指向的 wireguard-tools 仓库与 `wg.8` 手册。凡本仓库源码里查不到的字段与措辞，本篇一律不写死。
+
+在本仓库能确证的事实有四项。其一，`docs/enterprise.md` 给出了 `wg show myconfname` 的完整输出样例，含 interface、public key、private key、listening port、peer、endpoint、allowed ips、latest handshake、transfer 等行，本篇第 4 节据此逐行判读。其二，同一文档明确「隧道服务可在运行时用标准 `wg(8)` 命令行工具查询与修改」，并说明调用遵循其他平台上的惯用模式。其三，交互对象是正在运行的隧道服务实例，Windows 侧服务名为 `WireGuardTunnel$<name>`（见 `docs/enterprise.md`、`manager/install.go`），`wg show` 的参数用的是隧道名（样例里是 `myconfname`），而不是 Linux 意义上的内核网络接口名。其四，权限有硬要求：`docs/enterprise.md` 规定，若配置文件是 `.conf.dpapi`，则需要 Local System 或 Administrator 权限才能用 `wg(8)` 交互；若是普通 `.conf`，则需要 Local System、Administrator，或与 `.conf` 文件所有者相同的权限。这四点构成 Windows 上使用 `wg(8)` 的基本盘。
+
+同样必须写清能力边界。`wg(8)` 不是 `wg-quick(8)`：它不负责把配置文件「起」成接口，也不执行 `iptables` 规则、不展开 `%i` 占位符、不调用 `resolvconf`、不提供 `SaveConfig` 式的运行时回写。Windows 客户端把 `[Interface]` 的 `DNS` 作为接口配置下发（见 04-02、原理见 06-08），把 `[Peer]` 的 `AllowedIPs` 汇总为接口路由（见 04-03、原理见 06-06），全流量封锁用 WFP 规则（原理见 06-09）。运行时用 `wg set` 改的是内存中的驱动状态，本仓库 `conf/config.go` 的 `Interface` 与 `Peer` 都没有 `SaveConfig` 成员，`conf/parser.go` 也没有对应 `case`，配置文件与 DPAPI 密文不会因为 `wg set` 而改变（存储链路见 03-04、原理见 06-03）。换言之，运行时修改是临时的，重启隧道服务后以配置文件为准。
+
+本篇不展开驱动 IOCTL 载荷、UAPI 交互通道与状态回查的实现，统一收敛到交叉引用：`字段见 05-02 ｜ 原理见 06-05 ｜ 模块见 07-03`。更细的密钥、端点、时间与流量类型见 05-03，驱动配置结构见 05-05，运行时状态回查见 06-05，路由下发联动见 06-06，隧道服务模块见 07-05，驱动适配模块见 07-03。本篇只回答「有哪些子命令、各自做什么、需要什么权限、输出怎么读、改了会不会持久」。
+
+### 2. 索引与全参数表
+
+下表把大纲列出的九个子命令一次列全。类别一列区分「查询」「修改」「密钥生成」；是否需要运行实例一列区分「必须连到已启动的隧道」与「纯本地计算」；是否写回配置文件一列是本仓库能力边界的直接体现。
+
+| 子命令 | 类别 | 作用 | 需运行实例 | 权限要求 | 写回 .conf |
+|---|---|---|---|---|---|
+| `show` | 查询 | 显示接口与各 peer 的运行时状态 | 是 | 见第 2 节权限矩阵 | 否 |
+| `showconf` | 查询 | 以配置格式输出当前运行配置 | 是 | 见第 2 节权限矩阵 | 否 |
+| `set` | 修改 | 按参数增量修改运行中的接口或 peer | 是 | 见第 2 节权限矩阵 | 否 |
+| `setconf` | 修改 | 从文件整体替换运行时配置 | 是 | 见第 2 节权限矩阵 | 否 |
+| `addconf` | 修改 | 从文件追加配置到运行实例 | 是 | 见第 2 节权限矩阵 | 否 |
+| `syncconf` | 修改 | 按文件同步配置并尽量保留运行时状态 | 是 | 见第 2 节权限矩阵 | 否 |
+| `genkey` | 密钥生成 | 生成一段 Base64 私钥 | 否 | 无，纯本地 | 否 |
+| `pubkey` | 密钥生成 | 从标准输入读私钥并派生公钥 | 否 | 无，纯本地 | 否 |
+| `genpsk` | 密钥生成 | 生成一段 Base64 预共享密钥 | 否 | 无，纯本地 | 否 |
+
+表中「写回 .conf」一列全部为否，这不是逐个子命令的偶然结果，而是 Windows 客户端架构决定的：配置的权威副本在 `%ProgramFiles%\WireGuard\Data\Configurations\` 下的 `.conf` 或 `.conf.dpapi` 文件里，由 manager 服务与 tunnel 服务读取；`wg(8)` 作用于已经跑起来的实例，不参与该目录的写入。所以「用 `wg set` 改了端点，重启后又变回去」是预期行为，不是 bug；要让改动持久，应修改配置文件并重启隧道服务（或用 UI 编辑配置，见 03-01、04-08）。九个命令的具体参数形式、字段选择器名称与输出措辞，均需对照 wireguard-tools 实际版本核验，路径见 `docs/buildrun.md` 指向的外部仓库与 `wg.8` 手册。
+
+`wg show` 的输出字段与本仓库结构体的对应关系见下表，左侧取自 `docs/enterprise.md` 的输出样例，右侧取自 `conf/config.go` 与 `conf/parser.go`。这张表是「只读运行时状态」与「可写配置键」之间的桥梁。
+
+| 输出行（docs/enterprise.md） | 数据来源 | 能否写进 .conf |
+|---|---|---|
+| `interface: myconfname` | 隧道名，对应服务名后缀 | 由文件名决定，非配置键 |
+| `public key`（接口段） | `PrivateKey` 经 X25519 派生 | 否，派生结果 |
+| `private key: (hidden)` | `[Interface]` 的 `PrivateKey` | 能，但查询时被隐藏 |
+| `listening port` | `[Interface]` 的 `ListenPort` | 能 |
+| `peer: 公钥值` | `[Peer]` 的 `PublicKey` | 能 |
+| `endpoint` | `[Peer]` 的 `Endpoint` | 能 |
+| `allowed ips` | `[Peer]` 的 `AllowedIPs` | 能 |
+| `latest handshake` | `Peer.LastHandshakeTime` | 否，只读统计 |
+| `transfer` | `Peer.RxBytes` 与 `Peer.TxBytes` | 否，只读统计 |
+
+`latest handshake` 与 `transfer` 两行对应 `conf/config.go` 中 `Peer` 的三个运行时统计成员，它们由 `conf/parser.go` 的 `FromDriverConfiguration` 从驱动读回后填充，`conf/writer.go` 的 `ToWgQuick` 不会写出（见 04-03 第 3.7 节、字段见 05-03）。展示格式由 `conf/config.go` 的 `HandshakeTime.String()` 与 `Bytes.String()` 决定：前者输出类似 `3 seconds ago` 的相对时间字串或「Now」，时钟回拨时输出告警串；后者按 1024 进制输出 B / KiB / MiB / GiB / TiB 并保留两位小数。样例里的 `3 seconds ago`、`6.55 KiB received, 4.13 KiB sent` 正是这两种格式化的结果。
+
+权限矩阵见下表，完全依据 `docs/enterprise.md` 的表述整理。
+
+| 配置存储形态 | 允许使用 `wg(8)` 的身份 | 依据 |
+|---|---|---|
+| `.conf.dpapi` 加密配置 | Local System 或 Administrator | `docs/enterprise.md` |
+| 普通 `.conf` 明文配置 | Local System、Administrator，或与文件所有者相同权限 | `docs/enterprise.md` |
+| `genkey` / `pubkey` / `genpsk` | 任意用户，纯本地计算，不接触实例 | 子命令性质，需对照实际版本核验 |
+| 未启动的隧道 | 查询与修改均无法定位实例 | 实例由 tunnel 服务创建 |
+
+三点补充。第一，`.conf.dpapi` 是 manager 服务用 `CryptProtectData(bytes, "myconfname")` 加密后的文件，只有 Local System 能解，因此权限要求更严（见 03-04、原理见 06-03）。第二，「与文件所有者相同权限」是普通 `.conf` 场景下的放宽路径，企业批量投放明文配置时尤为相关（见 03-05）。第三，权限不足时不会得到半份输出，通常表现为打不开实例或直接报错；具体报错文本需对照实际版本核验，排查顺序见第 7 节。
+
+### 3. 逐项详解
+
+#### 3.1 `show`
+
+`show` 是最常用的运行时查询子命令，用于查看接口与每个 peer 的当前状态。`docs/enterprise.md` 的样例写法是 `wg show myconfname`，其中 `myconfname` 是隧道名，对应服务名 `WireGuardTunnel$myconfname`。按 wg(8) 通用手册，`show` 还可只取某一类字段（如公钥、监听端口、端点、允许 IP、最近握手、流量、保活间隔等），字段名与是否支持 `dump` 之类的机器可读输出需对照 wireguard-tools 实际版本核验，路径见 `docs/buildrun.md` 指向的 `wg.8` 手册。在 Windows 上，能查到实例的先决条件是该隧道服务已启动、适配器已由驱动创建（原理见 06-05）。
+
+判读时要把「配置里写了什么」与「运行时实际是什么」分开：`endpoint` 行显示的是协商出的实际对端地址，可能与静态配置里的域名不同；`allowed ips` 行是驱动侧当前生效的允许 IP 列表；`listening port` 行在未配置 `ListenPort` 时是系统随机选取的端口，每次启动都可能变化。这些行都来自运行实例，不是对 `.conf` 文本的直接回显。完整逐行判读见第 4 节。
+
+#### 3.2 `showconf`
+
+`showconf` 以配置文件的格式输出当前运行配置，相当于把实例状态反序列成一份可阅读的 `[Interface]` / `[Peer]` 文本。它与 `show` 的区别是：`show` 给的是「状态视图」，含握手时间、流量等运行时统计；`showconf` 给的是「配置视图」，主体是可写配置键。就本仓库而言，`conf/writer.go` 的 `ToWgQuick` 正是这类文本的格式基准：每个 `[Peer]` 段恒定输出 `PublicKey`，仅在非零 / 非空时输出 `PresharedKey`、`AllowedIPs`、`Endpoint`、`PersistentKeepalive`，运行时统计字段一律不输出。因此 `showconf` 的输出里不会出现 `latest handshake`、`transfer` 之类的行。字段选择范围与具体序列化措辞需对照实际版本核验，可定位源码路径为 `conf/writer.go` 的 `ToWgQuick`。
+
+实践中常把 `wg showconf <name>` 的输出重定向成文件作为备份，但要注意：它反映的是「当前运行态」，若此前用 `wg set` 做过临时修改，这份输出会包含那些临时值，却不会写回管理器的配置存储。把它当作配置备份时，应先确认没有未落盘的运行时改动。
+
+#### 3.3 `set`
+
+`set` 按参数增量修改运行中的接口或某个 peer，是「运行时修改」这一类的代表。按 wg(8) 通用手册，常见参数包括改监听端口、改私钥、按公钥定位 peer 后改端点 / 保活间隔 / 允许 IP / 预共享密钥，以及移除某个 peer 等；具体参数名与文件传参方式需对照 wireguard-tools 实际版本核验，路径见 `docs/buildrun.md` 指向的 `wg.8` 手册。在 Windows 语境下有三点必须记住。
+
+第一，`set` 的第一个参数是隧道名，不是接口索引，也不是服务全名 `WireGuardTunnel$myconfname`。第二，它改的是运行实例的状态，权限受第 2 节矩阵约束；若目标配置是 `.conf.dpapi`，普通用户执行会失败。第三，也是最容易踩坑的一点：改动不落盘。本仓库没有 `SaveConfig` 键，`conf/config.go` 无对应成员，`conf/parser.go` 无对应 `case`，`wg set` 不会改写 `%ProgramFiles%\WireGuard\Data\Configurations\` 里的文件；隧道服务重启后，配置重新从文件载入，临时改动随之消失。这与 Linux `wg-quick` 的 `SaveConfig = true` 语义完全不同，把后者当成 Windows 能力会导致「改了没生效」的误判。若 `set` 涉及 `AllowedIPs` 等会影响路由的字段，Windows 侧的路由联动属于运行时机制，原理见 06-06，具体联动行为需对照实际版本核验。
+
+#### 3.4 `setconf`、`addconf` 与 `syncconf`
+
+这三个子命令都以配置文件为输入，作用于运行实例，常被放在一起比较。按 wg(8) 通用手册的语义：`setconf` 从文件整体替换运行时配置（原有 peer 若不在新文件里会被清掉）；`addconf` 在现有配置基础上追加文件中的内容；`syncconf` 按文件同步配置，但尽量保留现有 peer 的握手与流量等运行时状态，因此在「只改一两项又不想打断已建立会话」的场景更常用。三者的精确差异、对已有 peer 的处理顺序、以及是否接受标准输入，需对照 wireguard-tools 实际版本核验，路径同为 `docs/buildrun.md` 指向的 `wg.8` 手册。
+
+把它们放到 Windows 客户端里看，还有两层约束。其一，文件格式是 wg-quick 风格的 INI 文本，但本仓库 `conf/parser.go` 的 `FromWgQuick` 只认白名单内的键（见 04-01 至 04-03），把含 `iptables` 规则的 `PostUp` 行、`SaveConfig`、`%i` 之类写进去不会被当作扩展能力执行，反而可能报错（脚本键的执行条件见 04-07）。其二，这三个命令同样不写回管理器配置存储，`docs/enterprise.md` 所说的「可在运行时查询与修改」指的是实例状态，不是配置文件持久化。要让改动在重启后仍在，必须回到 `.conf` / `.conf.dpapi` 文件本身（见 03-04、03-06）。这一点与 04-04 里 `/installtunnelservice CONFIG_PATH` 的「以文件为准」正好互相印证：文件是权威副本，`wg(8)` 只是运行态入口。
+
+#### 3.5 `genkey`、`pubkey` 与 `genpsk`
+
+这三个是纯本地的密钥工具，不需要运行实例、不需要管理员权限，也不接触隧道服务。`genkey` 生成一段 Base64 私钥；`pubkey` 从标准输入读私钥、派生并输出对应公钥；`genpsk` 生成一段 Base64 预共享密钥。三者输出都是解码后恰为 32 字节的密钥，正好对应 `conf/config.go` 里的 `Key` 类型与 `KeyLength = 32`，也对应 `conf/parser.go` 的 `parseKeyBase64` 校验（见 04-03）。因此它们是编写 `.conf` 时生成 `PrivateKey`、`PublicKey`、`PresharedKey` 取值的标准来源。
+
+本仓库 `conf/config.go` 里能看到同类的本地方法作为佐证：`NewPrivateKey` 先取随机 32 字节再做 X25519 的钳位（`k[0] &= 248`、`k[31] = (k[31] & 127) | 64`），`Key.Public()` 用 `ecdh.X25519().NewPrivateKey` 派生公钥，`NewPresharedKey` 直接取 32 字节随机数。也就是说，`wg genkey` / `wg pubkey` 产出的值与 UI「生成密钥对」按钮背后的运算是同一类，只是入口不同（字段见 05-03）。命令行里常用管道把两者串起来生成密钥对，示例见第 4 节；注意管道符属于 shell 语法，写在表格单元格里必须转义为 `\|`，代码块里则按原样书写。
+
+#### 3.6 隧道名与实例定位
+
+Windows 上 `wg(8)` 的第一个关键参数是「要连到哪个实例」。`docs/enterprise.md` 用 `wg show myconfname` 演示，其中名字来自配置文件名：`/installtunnelservice C:\path\to\some\myconfname.conf` 安装出的服务是 `WireGuardTunnel$myconfname`。因此排查「`wg show` 查不到东西」时，第一步是确认隧道名拼写与已安装服务列表一致（服务查询命令见 04-06），第二步是确认该隧道服务确实处于运行状态。Linux 上常见的 `wg show wg0` 用的是内核接口名，Windows 客户端在启动隧道时动态创建适配器、停止时销毁（见 `docs/netquirk.md`、`docs/enterprise.md` 的 Driver Removal 一节），并不存在一个长期叫 `wg0` 的固定接口，把 Linux 习惯照搬会找不到实例。示例输出里 `interface: myconfname` 这一行正是这个隧道名的回显。
+
+#### 3.7 权限模型
+
+第 2 节的权限矩阵需要在调用链上再落实一遍。`docs/enterprise.md` 的原话是：隧道服务可在运行时用标准 `wg(8)` 工具查询和修改；若配置文件是 `.conf.dpapi`，则用 `wg(8)` 交互需要 Local System 或 Administrator 权限；否则用户需要 Local System、Administrator，或与 `.conf` 文件所有者相同的权限。这解释了两个常见现象：其一，在普通用户会话里对 UI 导入的配置执行 `wg show` 常常报权限错误，因为那份配置已被 manager 服务转成 `.conf.dpapi`（见 03-04）；其二，企业场景里直接把明文 `.conf` 投放到配置目录、且投放账户与查询账户相同，权限路径会宽松一些（见 03-05）。
+
+`genkey` / `pubkey` / `genpsk` 是例外：它们不接触实例，因此不受上述矩阵约束。另需注意，权限检查与 04-04 里 `wireguard.exe` 的 `checkForAdminGroup` 是两回事：后者约束的是主程序的 `/` 开关，前者约束的是 `wg.exe` 与隧道服务实例的交互，二者由不同进程、不同文档分别规定（受限 UI 策略见 04-07）。
+
+### 4. 典型示例
+
+第一组是 `docs/enterprise.md` 给出的 `wg show` 输出样例，原样引用。示例输出，具体格式需对照实际版本核验。
+
+```text
+> wg show myconfname
+interface: myconfname
+  public key: lfTRXEWxt8mZc8cjSvOWN3tqnTpWw4v2Eg3qF6WTklw=
+  private key: (hidden)
+  listening port: 53488
+
+peer: JRI8Xc0zKP9kXk8qP84NdUQA04h6DLfFbwJn4g+/PFs=
+  endpoint: 163.172.161.0:12912
+  allowed ips: 0.0.0.0/0
+  latest handshake: 3 seconds ago
+  transfer: 6.55 KiB received, 4.13 KiB sent
+```
+
+逐行判读（本篇侧重运行时语义，与 04-03 第 4 节侧重配置键的角度互补）。第一行 `interface: myconfname` 回显隧道名，它同时是服务名 `WireGuardTunnel$myconfname` 的后缀，据此可确认查到的是哪一条隧道，写错名字会在这一步就查不到实例。第二行 `public key` 是本地公钥，由 `[Interface]` 的私钥派生，属于只读派生结果，不能写进配置；第三行 `private key: (hidden)` 说明查询工具主动隐藏私钥，属正常保护，若某版本把它打印成 Base64 明文，应核查工具版本与调用权限。第四行 `listening port: 53488` 是本次启动实际占用的 UDP 端口，未配置 `ListenPort` 时由系统选择，重启后可能变化，因此脚本不应硬编码该值。空行之后是 peer 段：第五行的公钥应与该 `[Peer]` 段的 `PublicKey` 一致，是定位与比对配置的锚点；第六行 `endpoint` 显示协商出的实际对端地址端口，配置里若写的是域名，这里通常已是解析后的地址，显示为空则说明对端尚未连入；第七行 `allowed ips: 0.0.0.0/0` 表示驱动侧当前生效的允许 IP 为 IPv4 全流量，按 06-09 的判定会触发 WFP kill-switch，需额外确认 DNS 与本地网段放行。第八行 `latest handshake: 3 seconds ago` 与第九行 `transfer: 6.55 KiB received, 4.13 KiB sent` 是纯运行时统计，对应 `Peer.LastHandshakeTime`、`RxBytes`、`TxBytes`，由 `FromDriverConfiguration` 从驱动读回，任何 `wg(8)` 修改命令都不会把它们写回 `.conf`。判读链路活性的要点是：握手时间长期不更新指向端点不可达、公钥或预共享密钥两端不一致；received 增长而 sent 不动多与本地路由或 AllowedIPs 方向有关；两个方向都不动则优先怀疑握手未建立。这九行里只有 `private key`、`listening port`、`peer`、`endpoint`、`allowed ips` 对应的值能在配置文件里找到源头，其余都是运行态信息。
+
+第二组给出密钥生成与运行时修改的常用命令序列，命令形式见下方示例。
+
+```text
+> wg genkey > private.key
+> wg pubkey < private.key
+> wg genpsk > preshared.key
+> wg set myconfname peer JRI8Xc0zKP9kXk8qP84NdUQA04h6DLfFbwJn4g+/PFs= endpoint 163.172.161.0:12912
+> wg show myconfname endpoints
+> wg showconf myconfname > running.conf
+```
+
+这组命令覆盖三类动作。前三行是离线密钥生成：`wg genkey` 把私钥写入 `private.key`，`wg pubkey` 从标准输入读回并输出公钥用于填 `[Peer]` 的 `PublicKey`，`wg genpsk` 产出预共享密钥用于填 `PresharedKey`；三者都不需要隧道在跑，也不需要管理员权限。第四行是运行时修改：按公钥定位 peer 并改端点，`set` 的具体参数名与是否支持文件传参需对照 wireguard-tools 实际版本核验（`docs/buildrun.md` 指向 `wg.8` 手册）；改动只作用于内存中的运行态，重启隧道服务即失效，因为没有 `SaveConfig` 能力。第五行按字段选择器只看端点，字段名需对照实际版本核验。第六行把当前运行配置导出到 `running.conf`，输出格式以 `conf/writer.go` 的 `ToWgQuick` 为参照，不会包含握手时间与流量等运行时统计行。
+
+第三组给出 `showconf` 输出的示意，格式依据 `conf/writer.go` 的 `ToWgQuick` 写出条件推演；示例输出，具体格式需对照实际版本核验。
+
+```text
+> wg showconf myconfname
+[Interface]
+PrivateKey = yAnz5TF+lXXJte14tfi3MtAFlb1qppTVR0kH4bqvkUwqU=
+ListenPort = 53488
+Address = 10.2.0.2/32
+
+[Peer]
+PublicKey = JRI8Xc0zKP9kXk8qP84NdUQA04h6DLfFbwJn4g+/PFs=
+AllowedIPs = 0.0.0.0/0
+Endpoint = 163.172.161.0:12912
+PersistentKeepalive = 25
+```
+
+判读要点如下。`[Interface]` 与 `[Peer]` 两段结构对应 `conf/config.go` 的 `Config`，`PrivateKey`、`ListenPort`、`Address` 与 `PublicKey`、`AllowedIPs`、`Endpoint`、`PersistentKeepalive` 都是可写配置键（见 04-02、04-03）。输出中没有 `PresharedKey` 行说明该值全零或该版本未导出，没有 `Table` 行说明 `TableOff` 为假，没有任何握手与流量行则印证了「运行时统计不属于配置文本」。若此前用 `wg set` 临时改过端点，这份输出里的 `Endpoint` 会是改后的值，但磁盘上的 `.conf` 或 `.conf.dpapi` 仍是旧值——这正是 `showconf` 与「配置文件」之间最容易混淆的地方。把它当备份使用前，应先用 UI 或文件比对确认没有未落盘的改动。
+
+### 5. 速查表
+
+下表按意图把九个子命令收敛成速查项，参数细节回到第 3 节。
+
+| 意图 | 子命令 | 关键前提 |
+|---|---|---|
+| 查看隧道整体状态 | `show <隧道名>` | 隧道服务已启动 |
+| 只看某类字段 | `show <隧道名> <字段>` | 字段名需对照实际版本核验 |
+| 导出当前运行配置 | `showconf <隧道名>` | 注意可能含临时改动 |
+| 临时改端点或保活 | `set` 指定 peer 与新端点 | 不落盘，重启失效 |
+| 按文件整体替换 | `setconf <隧道名> <文件>` | 文件用白名单内的键 |
+| 按文件追加 | `addconf <隧道名> <文件>` | 不覆盖既有 peer |
+| 按文件同步 | `syncconf <隧道名> <文件>` | 尽量保留运行时状态 |
+| 生成私钥 | `genkey` | 纯本地，无权限要求 |
+| 派生公钥 | `pubkey` | 从标准输入读私钥 |
+| 生成预共享密钥 | `genpsk` | 纯本地，无权限要求 |
+| 一行生成密钥对 | `wg genkey \| wg pubkey` | 单元格内管道已转义 |
+
+下表把 `show` 输出行与判读结论对应起来，供排障时快速定位。
+
+| 输出现象 | 优先怀疑 | 关联章节 |
+|---|---|---|
+| 查不到实例 | 隧道名写错或服务未启动 | 04-04、04-06 |
+| 提示权限不足 | `.conf.dpapi` 需 LocalSystem 或 Administrator | 本篇第 3.7 节 |
+| `endpoint` 为空 | 对端尚未连入或端点未解析 | 04-03、06-02 |
+| `latest handshake` 长期不动 | 端点不可达或密钥两端不一致 | 04-03、08-04 |
+| `transfer` 只有单向增长 | 本地路由或 AllowedIPs 方向 | 04-03、06-06 |
+| `listening port` 每次变化 | 未配置 `ListenPort`，系统随机选取 | 04-02 |
+| `wg set` 后重启失效 | 运行时修改不落盘，无 `SaveConfig` | 本篇第 3.3 节 |
+
+两张表合起来给出一条主线：`show` 与 `showconf` 负责「看见」，`set` 及三个文件型命令负责「临时改变」，`genkey` 家族负责「备料」。任何需要「永久生效」的改动都要回到配置文件与隧道服务生命周期，而不是反复执行 `wg set`。
+
+### 6. 版本差异
+
+本篇的版本基准是上游仓库 master 快照（2026-11 抓取）、WireGuardNT 1.1、Go 1.27.1、Windows 10 / Server 2019 及以上。但必须强调：`wg.exe` 的版本由 wireguard-tools 决定，不由 wireguard-windows 的 `version/version.go` 决定。`docs/buildrun.md` 说明 Windows 侧 `build.bat` 会构建 `wg.exe`，Linux 侧用 `PLATFORM=windows make -C wireguard-tools/src` 交叉编译，产物路径为 `wireguard-tools/src/wg.exe`；这两条命令的具体 flags、依赖版本与产物名需对照实际版本核验，路径为 `docs/buildrun.md` 与 `Makefile`。
+
+以下项目一律写「需对照实际版本核验」并给出可定位路径。其一，九个子命令的全集与各自参数：本仓库 `upstream_src/` 内没有 wg 源码，可定位资料是 `docs/buildrun.md` 指向的 wireguard-tools 仓库与 `wg.8` 手册；`docs/enterprise.md` 只明确「遵循其他平台上的惯用模式」并给出 `wg show` 一例。其二，`show` 的字段选择器名称、`dump` 之类的输出形式、`setconf` / `addconf` / `syncconf` 对已有 peer 的精确处理顺序，同样以 `wg.8` 手册为准，需对照实际版本核验。其三，`wg show` 输出行的措辞、单位与本地化：`docs/enterprise.md` 给出的是英文样例，`conf/config.go` 的 `Bytes.String()` 与 `HandshakeTime.String()` 决定了 UI 侧同类数值的格式化，两者是否完全一致需对照实际版本核验。其四，权限矩阵：`docs/enterprise.md` 对 `.conf.dpapi` 与普通 `.conf` 的规定是本快照的表述，具体 ACL 与身份判定见 `docs/attacksurface.md` 与 `conf/dpapi/`，需对照实际版本核验。其五，`wg(8)` 与运行实例之间的具体交互通道、以及修改 `AllowedIPs` 后 Windows 路由的联动时机，本仓库可见的相邻机制在 `conf/writer.go` 的 `ToDriverConfiguration` 与 `conf/parser.go` 的 `FromDriverConfiguration`（原理见 06-05、06-06），但交互细节属外部项目，需对照实际版本核验。其六，具体版本号、驱动版本、MSI 文件名与下载 URL 等时效性数值，按总纲第 9 节约定处理，不在本篇写死。
+
+### 7. 常见误用与调试
+
+误用一：把 `wg(8)` 当 `wg-quick(8)`，或把 Linux 语义带进来。有人期望 `wg` 能「起」一条隧道，或在配置里写含 `iptables` 规则的 `PostUp` 行、`%i`、`resolvconf`、`SaveConfig = true`。本仓库是 Windows 客户端：接口由 tunnel 服务启动时动态创建（见 `docs/enterprise.md` 的 Driver Removal 一节），封锁用 WFP 而非 `iptables`，脚本键用 `WIREGUARD_TUNNEL_NAME` 环境变量且默认不执行（见 04-07），DNS 作为接口配置下发（原理见 06-08），`conf/config.go` 无 `SaveConfig` 成员。把 `wg(8)` 当 `wg-quick` 会既起不了隧道，也得不到期望的持久化效果。
+
+误用二：混淆三类命令。把 `wg show` 写成 `wireguard.exe show`、把 `wireguard /installtunnelservice` 写成 `wg setconf`、或把服务查询写成 `wg show WireGuardTunnel$name`，都是把 04-04、04-05、04-06 三块内容串了线。`wireguard.exe` 的 `/` 开关管进程与服务生命周期，`wg.exe` 的子命令管运行态，`sc` / PowerShell 管 Windows 服务与任务，各管一段。
+
+误用三：用错实例名。`wg show wg0` 是 Linux 习惯，Windows 侧应传隧道名（样例为 `myconfname`），该名字来自配置文件名并构成服务名 `WireGuardTunnel$myconfname`。查不到实例时先列服务、再核拼写，而不是反复改配置。
+
+误用四：忽略权限。对 UI 导入后已被转成 `.conf.dpapi` 的配置，普通用户执行 `wg show` 会因权限不足失败；按 `docs/enterprise.md`，这需要 Local System 或 Administrator。排查时应确认配置文件形态（明文 `.conf` 还是加密 `.conf.dpapi`）、调用账户，以及是否为提权会话。受限 UI 策略（见 04-07）只影响 UI，不会放宽 `wg(8)` 的这些要求。
+
+误用五：把运行时修改当持久化。`wg set` 改端点、`syncconf` 同步配置，改的都是内存中的运行态；重启隧道服务后以配置文件为准。若发现「改了又变回去」，不要反复执行 `wg set`，而应修改 `.conf` / `.conf.dpapi` 并重启服务，或用 UI 编辑配置（见 03-01、04-08）。用 `showconf` 导出的文本也可能包含这些临时值，作为备份前要核对磁盘上的权威副本。
+
+误用六：把运行时统计当可写字段。看到 `latest handshake` 长时间不更新就试图在配置里改 `LastHandshakeTime`，或往 `.conf` 里加 `transfer` 行，只会得到「段内无效键」错误。这三者由 `FromDriverConfiguration` 从驱动读回，只能通过排查链路来间接改变。
+
+调试顺序建议固定为五步。第一步，确认隧道服务已启动、适配器已创建，服务名与隧道名对应（命令见 04-06）。第二步，确认调用账户满足 `docs/enterprise.md` 的权限矩阵，必要时用提权会话重跑。第三步，执行 `wg show <隧道名>`，按第 4 节逐行判读 `endpoint`、`latest handshake`、`transfer` 三行，区分「握手未建立」与「握手已建立但业务不通」。第四步，若怀疑有临时改动，用 `wg showconf <隧道名>` 导出运行配置，与磁盘上的 `.conf` / `.conf.dpapi` 比对。第五步，用 `wireguard /dumplog` 与 `wireguard /dumplog /tail` 读取共享环形日志（见 04-04、08-01），结合 UI 的配置编辑器确认静态配置本身合法。整条链路里，`wg(8)` 负责「看见运行态」，静态正确性仍要回到 04-01 至 04-03 的配置键与 `conf/parser.go` 的解析规则。
+
+九个子命令按类别与数据流向的划分如图 04-05-01 所示：查询类与修改类都要连到运行中的 tunnel 服务并经驱动交互，密钥生成类纯本地计算、只写标准输出；三类都不写回配置文件。
+:::figure id=04-05-01 | name=wg(8) 子命令分类与运行时数据流向 | dir=TD
+node a "wg.exe<br/>wireguard-tools" blue
+node b "查询类 show showconf" teal
+node c "修改类 set setconf<br/>addconf syncconf" amber
+node d "密钥类 genkey pubkey<br/>genpsk" green
+node e "运行中的 tunnel 服务" purple
+node f "WireGuardNT 驱动状态" red
+node g "本地标准输出<br/>不落盘" gray
+edge a -> b "查询分派"
+edge a -> c "修改分派"
+edge a -> d "本地生成"
+edge b -> e "读取实例"
+edge c -> e "改写实例"
+edge e -> f "IOCTL 交互"
+edge b -> g "打印状态"
+edge d -> g "打印密钥"
+:::
+
+`wg show` 输出行与 `conf.Peer` 运行时统计字段的对应关系如图 04-05-02 所示，握手与流量两行由 `FromDriverConfiguration` 从驱动读回，不属于可写配置键。
+:::figure id=04-05-02 | name=wg show 输出字段与 conf.Peer 统计字段的对应 | dir=TD
+node a "wg show 隧道名" blue
+node b "interface 段<br/>public key 端口" teal
+node c "peer 段<br/>公钥 端点 允许 IP" teal
+node d "latest handshake" amber
+node e "transfer 收发字节" amber
+node f "LastHandshakeTime" purple
+node g "RxBytes TxBytes" purple
+node h "FromDriverConfiguration" gray
+edge a -> b "接口段"
+edge a -> c "peer 段"
+edge c -> d "握手行"
+edge c -> e "流量行"
+edge d -> f "映射字段"
+edge e -> g "映射字段"
+edge f -> h "来自驱动"
+edge g -> h "来自驱动"
+:::

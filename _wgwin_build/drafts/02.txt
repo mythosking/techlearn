@@ -1,0 +1,849 @@
+# wireguard-windows 技术资料 · 02 编译与构建
+
+> 本册定位：把一份上游 master 快照变成三个架构上可运行的 `wireguard.exe`、配套的 `wg.exe`、以及可分发的 MSI 安装包。全册以 `upstream_src/` 下的真实文件为第一手依据，重点核对 `Makefile`、`build.bat`、`docs/buildrun.md`、`resources.rc`、`manifest.xml`、`quickinstall.bat`、`installer/`、`version/version.go`、`go.mod`。凡涉及版本号、下载哈希、工具链日期等时效性数值，均给出可定位的源码路径并标注「需对照实际版本核验」。本册只给构建所需的最小必要配置，配置键、命令行开关、注册表策略的完整清单不在此重列，统一写「完整配置见 04-xx」。
+
+---
+
+## 02-01 源码获取、仓库目录结构与依赖
+
+### 1. 背景与动机
+
+把 wireguard-windows 从「能下载安装」推进到「能从源码复现」，是整套资料从概述走向运维的第一道工程关口。这套仓库与普通 Go 项目有一个本质差别：它不是一个自洽的纯 Go 工程，而是一个把 Go 编译、Windows 资源编译、内核驱动 DLL 嵌入、本地化代码生成、Authenticode 代码签名、WiX 安装包链接串在一起的混合构建系统。产物 `wireguard.exe` 里既要有 Go 编译出的用户态逻辑，也要有通过 `windres` 编译进 `.syso` 的版本信息、应用清单、图标和 WireGuardNT 驱动 DLL；最终还要由 `installer/` 目录下的 WiX 工程打包成 MSI，并加上有效签名才能在开启了驱动签名强制的 Windows 上装载内核驱动。任何一环缺失，得到的都只是「能编译但装不上」或「能启动但连不上」的半成品。
+
+理解这条链路的动机还来自排障与定制两个现实场景。排障侧，很多「构建成功但运行异常」的问题，根因不在 Go 源码，而在 `.deps/` 里下载的依赖版本、`resources.rc` 里嵌入的 DLL 架构、或者 `sign.bat` 是否提供了有效的 `SigningProvider` 与 `TimestampServer`。定制侧，企业要做本地化翻译、要改升级通道、要内嵌自己的证书，都必须先知道每个文件在构建图里的位置，否则改动会落在被忽略或被覆盖的产物上。因此本册不按「一条命令跑通」来组织，而是先把仓库目录、外部依赖和两条构建入口的边界讲清楚，再由 02-02 给 Windows 原生分步实战、02-03 给 Linux 交叉构建与 Makefile 目标全解、02-04 拆开工具链自举与资源编译、02-05 收尾到 MSI 与签名。
+
+按总纲第 2 节的去重铁律，02 册属于「构建维度」，只负责回答「怎么把源码变成产物」，不承担配置语义、结构体字段、运行机制与模块能力的权威解释。因此本册涉及 `.conf` 配置键时一律只给最小必要片段，涉及 `conf.Config`、`driver` IOCTL 结构时一律点名后写「字段见 05-xx」，涉及适配器创建、路由下发、IPC 等机制时写「原理见 06-xx」，涉及 `conf`、`driver`、`manager`、`ui` 等包的能力时写「模块见 07-xx」，涉及命令开关时写「配置见 04-xx」。这样既保证构建链条完整，又不会把 04 至 07 册的内容重复铺开。需要读者始终记住的能力边界是：本仓库是 Windows 官方客户端，内核数据面由外部项目 WireGuardNT 提供，本仓库不实现 Noise 握手，也不包含 Linux `wg-quick` 的 `iptables`、`%i`、`SaveConfig`、`resolvconf` 语义。
+
+### 2. 核心概念
+
+第一个概念是「仓库即构建说明」。`docs/buildrun.md` 开篇就写明，构建需要 64 位 Windows 10 或 Windows Server 2019 以及 Git for Windows，之后 `git clone https://git.zx2c4.com/wireguard-windows`、`cd wireguard-windows`、`build` 三条命令即可启动；这句「build」在 Windows 上实际解析为同目录的 `build.bat`，在 Linux 上则由 `Makefile` 承接 `make`。同一份源码因此有两条对等的构建入口：Windows 侧用批处理脚本自举全部依赖，Linux 侧依赖系统预装的 mingw-w64 与 imagemagick，用 GNU make 驱动。两条入口共用 `resources.rc`、`manifest.xml`、`go.mod`、`version/version.go`，但依赖的获取方式、辅助工具的来源、`wg.exe` 是否一并产出存在差异，这些差异会在 02-02 与 02-03 逐条对照。
+
+第二个概念是「自举工具链」。`Makefile:4` 把 `$(CURDIR)/.deps/go/bin` 前置到 `PATH`，`build.bat:7` 同样把 `.deps\go\bin`、`.deps\bin`、`.deps` 加进 `PATH`，说明构建不信任宿主机器上已安装的 Go，而是从 `.distfiles/` 或 `.deps/` 下载指定版本并解压到仓库内部，用这一份私有工具链编译。当前快照中 `Makefile:30` 下载 `go1.27.1.linux-amd64.tar.gz`，`build.bat:16` 下载 `go1.27.1.windows-amd64.zip`，二者都随脚本附带 SHA256 校验值。这种「把编译器也纳入依赖锁定」的做法，是为了让 `GOFLAGS` 里的 `-trimpath`、`-buildvcs=false`、`-ldflags` 等标志在不同机器上产生一致的可复现产物。
+
+第三个概念是「外部依赖的四个来源」。除 Go 工具链外，`build.bat` 还自举 llvm-mingw（提供 `windres` 与 `gcc`）、ImageMagick 便携版（提供 `convert.exe` 把 SVG 渲染成多尺寸 ICO）、GNU make（供 `wg.exe` 子构建调用）、wireguard-tools 快照（提供 `wg(8)` 源码）以及 `wireguard-nt-1.1.zip`（提供内核驱动 DLL）。`Makefile` 侧则把这些工具视为系统已安装，只负责下载 Go 与 WireGuardNT 两个压缩包。这两种假设是理解 02-02 与 02-03 差异的钥匙：Windows 脚本是「零前置依赖、全自动下载」，Linux 构建是「先装系统包、再 make」。
+
+第四个概念是「产物分层」。最内层是三个架构的 `amd64/wireguard.exe`、`x86/wireguard.exe`、`arm64/wireguard.exe`；`build.bat` 还额外在每个架构目录产出 `wg.exe`；再外层是 `installer/dist/` 下的 `wireguard-<arch>-<version>.msi`；README.md 里提到的 `wireguard-installer.exe` 则由 `installer/fetcher/` 独立构建，是一个按架构挑选并下载 MSI 的引导安装器。版本号的唯一来源是 `version/version.go` 中的 `Number` 常量，当前快照为 `1.1.1`，MSI 文件名、资源版本、WiX 的 `Product Version` 都由它派生，具体数值需对照实际版本核验。
+
+### 3. 关键数据结构与源码位置
+
+本节的「数据结构」指构建系统所操作的文件与目录对象，而非运行时内存结构；运行时的 `conf.Config`、`conf.Interface`、`conf.Peer`、`driver` IOCTL 载荷、`winipcfg` MIB 结构等逐字段定义属于 05 册权威范围，本册只点名并写「字段见 05-02」「字段见 05-05」，不重列字段表。仓库顶层目录与构建相关文件的职责如下表所示，路径均相对于 `upstream_src/`。
+
+| 路径 | 类型 | 在构建中的作用 | 关联文件 |
+|---|---|---|---|
+| `Makefile` | 构建脚本 | Linux 交叉构建主入口，定义 GOFLAGS 与全部目标 | `build.bat` |
+| `build.bat` | 构建脚本 | Windows 原生构建主入口，自举依赖并编译三架构 | `quickinstall.bat` |
+| `version/version.go` | Go 源文件 | 唯一版本来源，`Number` 常量被两套脚本提取 | `resources.rc` |
+| `go.mod` / `go.sum` | 模块声明 | Go module 路径、语言版本与依赖锁定 | `go.mod.master` |
+| `resources.rc` | 资源脚本 | 版本信息、清单、图标、驱动 DLL 的 RCDATA | `manifest.xml` |
+| `manifest.xml` | 应用清单 | 声明 supportedOS、Common-Controls、DPI 感知 | `resources.rc` |
+| `installer/` | 子工程 | WiX 工程、自定义动作 C 源码、fetcher | `quickinstall.bat` |
+| `docs/` | 官方文档 | `buildrun.md` 等五份说明，本册事实第二手依据 | `README.md` |
+| `.gitignore` | 版本控制 | 忽略 `.deps`、`.distfiles`、三架构产物与 `*.syso` | `.gitattributes` |
+
+`go.mod` 的依赖面很窄，这本身就是一个值得注意的事实：它只直接依赖 `github.com/lxn/walk`、`github.com/lxn/win` 两个 Windows GUI 库，以及 `golang.org/x/crypto`、`golang.org/x/net`、`golang.org/x/sys`、`golang.org/x/text` 四个官方扩展库，另有 `golang.org/x/mod`、`golang.org/x/sync`、`golang.org/x/tools` 三个间接依赖。两个 `lxn` 库都通过 `replace` 指令指向 `golang.zx2c4.com/wireguard/windows` 上的 fork 分支，说明 UI 层并非直接采用上游 `walk`，而是使用了经 WireGuard 项目维护的定制版本。下表列出 `go.mod` 的关键声明，版本号为当前快照值，需对照实际版本核验。
+
+| 声明项 | 当前快照值 | 说明 |
+|---|---|---|
+| module | `golang.zx2c4.com/wireguard/windows` | Go module 路径 |
+| go 指令 | `1.26.0` | 语言版本，与自举工具链 1.27.1 不同，见第 6 节 |
+| `golang.org/x/crypto` | `v0.57.0` | 密钥与加密相关能力 |
+| `golang.org/x/sys` | `v0.48.0` | Windows 系统调用封装 |
+| `golang.org/x/text` | `v0.42.1-...` | `gotext` 本地化流水线依赖 |
+| `replace lxn/walk` | 指向 windows 仓库 fork | UI 框架定制分支 |
+| `replace lxn/win` | 指向 windows 仓库 fork | Win32 封装定制分支 |
+
+各 Go 包的职责可归为四层，与 `docs/attacksurface.md` 的「一个内核驱动 + 三个用户态部分」分层一致：`conf/`、`driver/` 属于配置与驱动适配层；`tunnel/`、`services/`、`ringlogger/` 属于隧道服务层；`manager/`、`elevate/` 属于管理与提权层；`ui/`、`l18n/`、`updater/`、`version/` 属于界面与辅助层。完整的模块能力索引写「模块见 07-01」至「模块见 07-12」，本册不展开。`driver/` 目录下同时存在 `dll_fromrsrc_windows.go` 与 `dll_fromfile_windows.go` 两个文件，分别由 `//go:build load_wgnt_from_rsrc` 与 `//go:build !load_wgnt_from_rsrc` 约束，这一对构建标签正是 `GOFLAGS` 中 `-tags load_wgnt_from_rsrc` 的作用对象，也是 02-04 要展开的核心。
+
+### 4. 关键流程与调用链
+
+从源码到产物的主干调用链可以拆成七段：获取源码、判定依赖是否已就绪、下载并校验依赖、渲染图标、提取版本号、逐架构编译资源与程序、可选签名。`build.bat:11` 用 `if exist .deps\prepared goto :render` 做幂等判定，`Makefile:33` 与 `Makefile:40` 则用 `.deps/go/prepared`、`.deps/wireguard-nt/prepared` 两个标记文件让 make 决定是否需要解压。两种实现都遵循「先校验后落地」：`build.bat:63` 用 `CertUtil -hashfile %1 SHA256` 比对，`Makefile:26` 用 `echo "$(3)  $@.unverified" | sha256sum -c` 比对，校验失败即删除未验证文件并退出，避免把被篡改或残包当成依赖。
+
+版本号流动是第二条关键链。`Makefile:6` 用 `sed -n` 从 `version/version.go` 抽出 `Number` 的值赋给 `VERSION`，`Makefile:10` 再把它拆成 `WIREGUARD_VERSION_ARRAY` 与 `WIREGUARD_VERSION_STR` 两个宏传给 `windres`；`build.bat:33` 至 `build.bat:35` 用 `findstr` 加 `for /f` 做等价提取，去掉引号后按点号拆成四个数补零。`resources.rc:21` 至 `resources.rc:22` 把 `WIREGUARD_VERSION_ARRAY` 写进 `FILEVERSION` 与 `PRODUCTVERSION`，`resources.rc:33` 把 `WIREGUARD_VERSION_STR` 写进 `FileVersion` 字符串。也就是说，改版本号只需要改一处 `version/version.go`，三架构的 exe 版本资源、WiX 的 `Product Version`、MSI 文件名会自动跟随，这个「单一版本源」的设计在 02-05 还会再遇到。
+
+仓库目录、构建脚本、资源与依赖之间的分层关系见图 02-01-01，请先对照图再往下读各段的细节。
+
+:::figure id=02-01-01 | name=仓库目录与构建依赖分层 | dir=TD
+node n1 "仓库 master 快照" blue
+node n2 "Makefile / build.bat" teal
+node n3 "Go 源码包<br/>conf driver tunnel" amber
+node n4 "manager ui updater" amber
+node n5 "resources.rc" purple
+node n6 "manifest.xml / version.go" purple
+node n7 "go.mod / go.sum" gray
+node n8 "installer/ WiX" green
+node n9 "外部工具链<br/>Go / WireGuardNT" red
+node n10 "docs/ 文档" gray
+edge n1 -> n2 "构建入口"
+edge n1 -> n3 "核心源码"
+edge n1 -> n5 "资源定义"
+edge n1 -> n7 "依赖声明"
+edge n1 -> n8 "打包工程"
+edge n1 -> n10 "事实依据"
+edge n2 -> n9 "下载并校验"
+edge n9 -> n5 "提供驱动 DLL"
+edge n3 -> n4 "进程分层"
+edge n2 -> n6 "提取版本号"
+edge n6 -> n5 "注入版本宏"
+:::
+
+图 02-01-01 中，`外部工具链` 到 `resources.rc` 的边对应 `resources.rc:17` 的 `wireguard.dll RCDATA wireguard.dll`：`windres` 通过 `-I .deps/wireguard-nt/bin/<arch>` 找到外部压缩包里的驱动 DLL，把它作为一个 RCDATA 资源编进 `.syso`，运行时再由 `driver/dll_fromrsrc_windows.go` 的 `lazyDLL.Load()` 取出并交给 `driver/memmod` 内存加载。这条「构建期嵌入、运行期内存加载」的链，是本仓库不需要在目标机器上单独释放 `wireguard.dll` 的原因，也是 02-04 的重点。至于 `docs/` 到仓库的「事实依据」边，指向的是 `docs/buildrun.md` 给出的构建前置条件、`docs/enterprise.md` 给出的 `DO_NOT_LAUNCH` 与 `wireguard /update`、`docs/attacksurface.md` 给出的驱动签名与更新链信任模型，本册在引用这些结论时都会回标到具体文件。
+
+### 5. 配置/命令/代码实例
+
+先看获取源码的最小命令序列。`docs/buildrun.md` 给出的 Windows 步骤是三条，Linux 步骤则先装系统包再 `make`。以下命令块照抄官方文档并在注释里标出对应的源码依据；本册只给构建所需命令，不展开任何配置键，完整配置见 04-xx。
+
+```bash
+# Windows：docs/buildrun.md 的 Building 段
+git clone https://git.zx2c4.com/wireguard-windows
+cd wireguard-windows
+build
+
+# Linux：docs/buildrun.md 的 Alternative: Building from Linux 段
+sudo apt install mingw-w64 imagemagick
+git clone https://git.zx2c4.com/wireguard-windows
+cd wireguard-windows
+make
+```
+
+下面是一次 Windows 构建启动阶段的典型控制台输出。示例输出，具体格式需对照实际版本核验。
+
+```text
+[+] Downloading go.zip
+[+] Verifying go.zip
+[+] Extracting go.zip
+[+] Cleaning up go.zip
+[+] Downloading llvm-mingw-ucrt.zip
+[+] Verifying llvm-mingw-ucrt.zip
+[+] Extracting llvm-mingw-ucrt.zip
+[+] Cleaning up llvm-mingw-ucrt.zip
+[+] Rendering icons
+[+] Assembling resources x86
+[+] Building program x86
+[+] Building command line tools x86
+[+] Assembling resources amd64
+[+] Building program amd64
+[+] Building command line tools amd64
+[+] Assembling resources arm64
+[+] Building program arm64
+[+] Building command line tools arm64
+[+] Success. Launch wireguard.exe.
+```
+
+逐行判读如下。第一组四行是 `build.bat:60` 至 `build.bat:67` 的 `:download` 子过程在打印「下载、校验、解压、清理」四个阶段，每一组都对应 `build.bat:16` 至 `build.bat:24` 的一个依赖包；如果只看到 `Downloading` 而没有 `Verifying`，通常是 `curl` 已失败但脚本尚未跳到 `:error`，正常值应当四个阶段连续出现且无 `[-] Failed` 行。`[+] Rendering icons` 来自 `build.bat:29`，表示 `convert` 已把 `ui/icon/*.svg` 渲染为 ICO，若此行缺失而后续报找不到图标，应检查 ImageMagick 便携版是否完整解压。随后每个架构固定出现三行：`Assembling resources <arch>` 对应 `build.bat:74` 的 `windres` 调用，`Building program <arch>` 对应 `build.bat:76` 的 `go build`，`Building command line tools <arch>` 只在 `%~1\wg.exe` 尚不存在时由 `build.bat:78` 触发，说明脚本正在用 `make -C .deps\src` 编译 wireguard-tools。三个架构 x86、amd64、arm64 必须各出现一组，缺任一组都意味着 `:build_plat` 中途失败。最后 `[+] Success. Launch wireguard.exe.` 是 `build.bat:56` 的成功标志；若配置了 `sign.bat`，在它之前还会插入一行 `[+] Signing`。整个输出里没有出现驱动安装或隧道启动字样是正常的，因为构建阶段只产出文件，运行与驱动装载发生在 `amd64\wireguard.exe` 首次启动时（运行详见 03-01）。
+
+再看 `go.mod` 与 `go.mod.master` 的对照，理解 `remaster` 目标为何要重写模块文件。
+
+```go
+// go.mod（当前快照，节选）：版本已锁定
+module golang.zx2c4.com/wireguard/windows
+
+go 1.26.0
+
+require (
+	github.com/lxn/walk v0.0.0-20210112085537-c389da54e794
+	github.com/lxn/win v0.0.0-20210218163916-a377121e959e
+	golang.org/x/crypto v0.57.0
+	golang.org/x/net v0.59.0
+	golang.org/x/sys v0.48.0
+	golang.org/x/text v0.42.1-0.20260918223412-6dcc5b674302
+)
+
+// go.mod.master（remaster 用的模板，节选）：版本用 latest / master
+// go 1.20
+// require ( github.com/lxn/walk latest  golang.org/x/text master )
+// replace ( ... => golang.zx2c4.com/wireguard/windows pkg/walk )
+```
+
+两份文件的差异说明：日常构建使用带精确版本的 `go.mod`，可复现；`Makefile:70` 至 `Makefile:76` 的 `remaster` 目标会先 `rm -f go.sum go.mod`、再 `cp go.mod.master go.mod`、然后 `go get` 拉最新依赖，最后用 `sed` 依据 go.dev 的 JSON 接口同时改写 `Makefile` 和 `build.bat` 里的下载文件名与哈希。也就是说，升级 Go 工具链或刷新依赖不是手改脚本，而是走 `make remaster`，这也是第 6 节要强调的陷阱来源。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是「语言版本与工具链版本被混为一谈」。`go.mod:3` 写的是 `go 1.26.0`，而 `Makefile:30`、`build.bat:16` 自举的是 `go1.27.1`。前者是 Go 语言/模块语义版本，后者是实际编译器发行版，两者不必相同也不应当被改写成相同值；若读者手上的快照与此不一致，需对照实际版本核验 `go.mod` 与两处下载链接。把这两个数字当成同一个概念，是升级工具链时最常见的误判。
+
+第二个陷阱是 `.overlay/overlay.json`。`Makefile:1` 的 `GOFLAGS` 与 `build.bat:76` 的 `go build` 都带 `-overlay .overlay/overlay.json`，`Makefile:13` 的 `SOURCE_FILES` 也把 `.overlay/` 下所有文件列为输入。Go 的 `-overlay` 机制允许用一个 JSON 文件把磁盘上的某些路径映射到替代文件，从而在不改动源码树的前提下替换编译输入；但当前 master 快照中并未附带 `.overlay` 目录，`.gitignore` 也未列出它。因此本册不臆测 `overlay.json` 里具体映射了哪些条目，只说明它参与编译这一事实，并明确写：该文件的生成方式、内容与是否由某个 `go:generate` 步骤产出，需对照实际版本核验，定位路径为 `Makefile:1`、`build.bat:76` 与 `Makefile:13`。读者若在真实仓库中看到该目录，应以实际内容为准。
+
+第三个陷阱是「改动落在被忽略的产物上」。`.gitignore` 明确忽略 `/.deps`、`/.distfiles`、`/x86`、`/amd64`、`/arm`、`/arm64`、`/sign.bat`、`*.syso`、`*.ico`。这意味着手工编辑 `resources_amd64.syso`、`amd64/wireguard.exe`、`ui/icon/wireguard.ico` 都不会进入版本控制，且下一次 `make clean` 或 `build.bat` 的 `:installdeps` 会把它们清掉。正确的做法是改源头：改图标改 `ui/icon/*.svg`，改版本改 `version/version.go`，改资源改 `resources.rc`，改依赖改 `go.mod` 或走 `remaster`。`.gitattributes` 还规定 `*.bat text eol=crlf`、其余 `text=auto eol=lf`，在 Linux 上编辑 `build.bat` 若被改成 LF 行尾，可能在 Windows 批处理里出现解析异常，这一点在跨平台维护时要特别留意。
+
+第四个最佳实践是「把 SHA256 校验当成构建的一部分而非可跳过步骤」。`build.bat` 的六个依赖、`installer/build.bat` 的 `wix-binaries.zip`、`Makefile` 的两个压缩包都随脚本附带哈希。以 `wireguard-nt-1.1.zip` 为例，`Makefile:31` 与 `build.bat:24` 使用同一个 SHA256 值，说明两条链锁定的是同一份驱动包；若本地网络被代理劫持或下载残包，校验会立刻失败并删除 `.unverified` 文件，这比让错误 DLL 被编进资源、到运行时才报「无法加载驱动」要安全得多。禁止为了「先跑通」而注释掉校验逻辑。
+
+第五个边界提醒：`wg.exe` 属于 wireguard-tools 项目，不是本仓库的 Go 代码，它的构建由 `build.bat:81` 的 `make -C .deps\src PLATFORM=windows` 完成，源码来自 `build.bat:23` 下载的 wireguard-tools 快照；`docs/buildrun.md` 也单独用一节说明 `PLATFORM=windows make -C wireguard-tools/src`。因此不要在本仓库的 Go 包里寻找 `wg` 子命令实现，也不要把 Linux `wg-quick` 的能力写成 Windows 客户端能力。相关运行时查询命令的完整清单写「配置见 04-05」。
+
+### 7. 小结与延伸阅读
+
+本篇把仓库当成一个可复现的构建对象来读：明确了 Windows `build.bat` 与 Linux `Makefile` 两条入口、`.deps` 自举工具链、Go 与 WireGuardNT 两个被 SHA256 锁定的外部依赖、`version/version.go` 作为单一版本源、以及 `resources.rc` 把清单图标与驱动 DLL 一并编进 `.syso` 的事实。图 02-01-01 给出了目录与依赖的分层关系，两张表格分别固定了顶层文件职责与 `go.mod` 的关键声明，命令加输出的组合则把「一次构建应当看到什么」变成了可判读的清单。最重要的三个结论是：构建不是纯 `go build`；版本与资源同源；外部 DLL 在构建期嵌入、运行期内存加载。
+
+跨册引用按约定统一写作（字段见 05-xx ｜ 配置见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）。就本篇而言，运行时结构体的逐字段定义见 05-01 与 05-02，配置键与命令行开关见 04-01 与 04-04，进程入口与驱动加载机制见 06-01 与 06-05，`driver`、`l18n`、`installer` 等模块能力见 07-03 与 07-12。延伸阅读建议按三条线走：想立刻动手的读者接 02-02 的 Windows 分步实战；想理解每个 make 目标语义的读者接 02-03；想深挖 `windres`、`-overlay`、gotext 与签名的读者接 02-04，最终由 02-05 落到 MSI 与多架构产物。官方文档方面，`docs/buildrun.md` 是本册的第一手说明，`README.md` 给出 `wireguard-installer.exe` 与 Standalone MSIs 的区分，`docs/attacksurface.md` 与 `docs/enterprise.md` 分别补充驱动签名与批量分发的背景。所有版本号、哈希与工具链日期均为当前快照值，需对照实际版本核验，定位路径已在正文逐处给出。
+
+---
+
+## 02-02 从源码构建实战：Windows build.bat 全步骤
+
+### 1. 目标与拓扑
+
+本篇是 C 型实战篇，目标只有一个：在一台干净的 64 位 Windows 10 或 Windows Server 2019 机器上，用 `build.bat` 从上游源码完整产出 `amd64\wireguard.exe`、`x86\wireguard.exe`、`arm64\wireguard.exe` 三个程序，以及每个架构目录下的 `wg.exe`，并让构建过程以 `[+] Success. Launch wireguard.exe.` 结束。这里的「完整」有明确边界：构建阶段只负责把文件编译出来，不负责安装内核驱动、不负责创建隧道服务、不负责导入配置；后三件事发生在首次运行 `amd64\wireguard.exe` 或安装 MSI 之后，属于 03 册的部署范围。把这两阶段混在一起，是新手最常见的误判——看到 `Success` 就以为 VPN 已经可用，实际上此时连 WireGuardNT 驱动都还没被装载。
+
+拓扑上，这台构建机是唯一的节点，所有依赖都从公网下载到仓库内的 `.deps/` 与 `.distfiles/`，没有任何需要预先安装到系统的编译工具（Git for Windows 除外，它提供 `curl`、`tar`、`findstr`、`CertUtil` 所依赖的 shell 环境以及 `bash` 类工具）。`build.bat` 自己会下载 Go、llvm-mingw、ImageMagick、GNU make、wireguard-tools 与 WireGuardNT 六个压缩包，逐个做 SHA256 校验后解压。产物落在仓库根目录下按架构命名的三个子目录；若根目录存在 `sign.bat` 且其中设置了有效变量，还会对六个 exe 做 Authenticode 签名。整个流程的时序见图 02-02-01，依赖包与产物落盘的对应关系见图 02-02-02，请先把两张图对照起来看，再进入分步操作。
+
+### 2. 前置条件与环境
+
+前置条件分「硬性」与「可选」两类。硬性条件来自 `docs/buildrun.md`：64 位 Windows 10 或 Windows Server 2019，以及 Git for Windows。之所以要求 64 位，是因为脚本下载的 Go 工具链是 `go1.27.1.windows-amd64.zip`，llvm-mingw 是 `x86_64` 版本，ImageMagick 是 `Q16-x64` 版本；它们只是宿主机工具，并不限制产物架构，`build.bat:44` 至 `build.bat:46` 仍会通过 `GOARCH` 依次编出 x86、amd64、arm64 三种目标。之所以要求 Git for Windows，是因为 `build.bat:61` 用 `curl` 下载、`build.bat:65` 用 `tar -xf` 解压、`build.bat:63` 用 `CertUtil` 校验、`build.bat:33` 用 `findstr` 提取版本号，这些命令在纯净的 `cmd.exe` 里不一定齐全。
+
+磁盘与网络方面需要预留空间：六个压缩包加上解压后的 Go 工具链、llvm-mingw、wireguard-nt 与 `gopath` 缓存会占用可观容量，且首次构建必须能访问 `go.dev`、`download.wireguard.com`、`git.zx2c4.com` 等域名。若处在离线或代理环境，应提前把 `build.bat:16` 至 `build.bat:24` 列出的六个包按原文件名放进可访问位置，并确认哈希与脚本内一致，哈希值需对照实际版本核验。权限方面，`build.bat` 本身不需要管理员权限，但后续若要运行 `amd64\wireguard.exe` 安装 manager 服务，或要用 `quickinstall.bat` 安装 MSI，则必须以管理员身份执行。
+
+可选条件有三个。其一是签名：根目录放一个 `sign.bat`，内容形如 `docs/buildrun.md` 给出的两行 `set SigningProvider=...` 与 `set TimestampServer=...`，并且要在 PATH 里有 `signtool.exe` 的 shell（例如 Visual Studio 命令提示）里执行 `build`。其二是本地化：设置环境变量 `GoGenerate=yes` 会触发 `build.bat:40` 至 `build.bat:43` 的 `go generate ./...`，这一步展开在 02-04。其三是安装包：本篇只产出 exe，若要 MSI 需另外执行 `installer\build.bat`，见 02-05；`quickinstall.bat` 只是把两步串起来并顺带卸载旧版本、安装新 MSI，不属于编译必需环节。配置键与运行开关的完整清单写「配置见 04-04」，本篇不重列。
+
+为了让前置条件可核验，建议在开始构建前用三条只读命令确认环境：用 `where curl` 与 `where tar` 确认 Git for Windows 提供的工具确实在 PATH 里，用 `git --version` 确认仓库工具可用，用 `echo %PROCESSOR_ARCHITECTURE%` 确认当前 `cmd` 运行在 AMD64 上下文而非 WOW64。这三条都不改动系统状态，却能把后续八成以上的「命令找不到」「架构错配」类失败提前暴露。另需确认磁盘剩余空间足以容纳六个压缩包解压后的 Go 工具链、llvm-mingw 与 `gopath` 缓存；`.deps` 目录在首次构建后会持续生长，而重复构建又会因 `gopath` 缓存命中而明显加速，因此不建议把它放在空间紧张的系统盘临时目录。网络方面，若企业环境只能通过代理出网，应提前为 `curl` 配好代理变量并确认 `download.wireguard.com` 与 `go.dev` 的证书链可被 Windows 信任，否则脚本会在 `[+] Downloading` 之后立刻停在 `[-] Failed with error #`，而命令行回显并不总是直接指向证书或代理问题，需要结合上一阶段打印的包名来判断。
+
+### 3. 分步操作
+
+第一步，准备目录并获取源码。选一个不含空格与中文的路径，避免 `for /f` 与 `tar` 在带空格路径上出问题。`docs/buildrun.md` 示例使用 `C:\Projects`，读者可自行替换。命令块如下，注释对应官方说明与本册核对到的源码位置。
+
+```bat
+rem 对应 docs/buildrun.md 的 Building 段
+C:
+mkdir C:\Projects
+cd \Projects
+git clone https://git.zx2c4.com/wireguard-windows
+cd wireguard-windows
+```
+
+第二步，确认工作树状态。构建开始前应确保根目录没有残留的 `.deps\prepared` 标记文件，否则 `build.bat:11` 会直接跳到 `:render` 而跳过依赖下载；若上一轮构建中途失败残留了半解压的 `.deps`，应手工删除整个 `.deps` 目录后重来。同样要确认 `.gitignore` 忽略的 `x86`、`amd64`、`arm64`、`*.syso`、`*.ico` 是否是上轮遗留，需要干净构建就先清掉。这一步不需要额外命令，但决定了后续输出是否可判读。
+
+第三步，执行构建。在普通 `cmd.exe` 中直接输入 `build`（等价于 `build.bat`），不要加参数——脚本没有参数分派逻辑，所有行为由文件系统状态与两个环境变量决定。
+
+```bat
+build
+```
+
+第四步，逐段观察输出。首轮会依次出现六组 `[+] Downloading / [+] Verifying / [+] Extracting / [+] Cleaning up`，对应 `build.bat:16` 至 `build.bat:24` 的六个 `:download` 调用；随后 `[+] Rendering icons`；再随后按 `x86`、`amd64`、`arm64` 顺序各出现 `[+] Assembling resources`、`[+] Building program`、以及条件性的 `[+] Building command line tools`；若存在有效 `sign.bat`，在收尾前出现 `[+] Signing`；最后 `[+] Success. Launch wireguard.exe.`。第六步会给出带逐行判读的完整示例输出，此处先建立「阶段顺序」的心智模型。
+
+第五步，理解 `:build_plat` 内部做了什么，以便在出错时定位。该子过程在 `build.bat:70` 至 `build.bat:84`：先 `set GOARCH=%~3`，再用 `%~2-w64-mingw32-windres` 把 `resources.rc` 编成 `resources_%~3.syso`，其中 `-I ".deps\wireguard-nt\bin\%~1"` 让 `resources.rc:17` 的 `wireguard.dll RCDATA wireguard.dll` 能找到对应架构的驱动 DLL；接着 `go build -overlay .overlay/overlay.json -tags load_wgnt_from_rsrc -ldflags="-H windowsgui -s -w" -trimpath -buildvcs=false -v -o "%~1\wireguard.exe"` 产出主程序；最后若 `%~1\wg.exe` 不存在，用 `make --no-print-directory -C .deps\src PLATFORM=windows ...` 编译 wireguard-tools 并 `move` 到架构目录。注意 `build.bat:37` 还设了 `GOARM=7`，`build.bat:38` 与 `build.bat:39` 把 `GOPATH`、`GOROOT` 都指向 `.deps` 内部，进一步印证「工具链自举」这一设计。
+
+第六步，可选签名的接线。`build.bat:48` 至 `build.bat:53` 的 `:sign` 段先 `if exist .\sign.bat call .\sign.bat`，然后检查 `SigningProvider` 与 `TimestampServer` 两个变量是否都非空，任一为空就 `goto :success` 跳过签名；都非空才执行 `signtool sign %SigningProvider% /fd sha256 /tr "%TimestampServer%" /td sha256 /d WireGuard` 对六个 exe 签名。也就是说，没有 `sign.bat` 时构建依然成功，只是产物未签名。官方给出的 `sign.bat` 样例如下（证书指纹与时间戳地址为示例，需对照实际版本核验并替换为企业自己的值）。
+
+```bat
+rem 根目录 sign.bat，形如 docs/buildrun.md 的 Optional: Signing Binaries 段
+set SigningProvider=/sha1 1b3afa5e2a76bb51f00020002dccadb165689c33
+set TimestampServer=http://timestamp.digicert.com
+```
+
+`build.bat` 全流程的时序关系见图 02-02-01。
+
+:::figure id=02-02-01 | name=build.bat 全流程时序 | dir=TD
+node n1 "执行 build.bat" blue
+node n2 ".deps/prepared<br/>是否存在" teal
+node n3 ":installdeps<br/>下载六个压缩包" amber
+node n4 "CertUtil SHA256<br/>校验" amber
+node n5 ":render<br/>SVG 转 ICO" purple
+node n6 ":build<br/>提取版本号" blue
+node n7 ":build_plat ×3<br/>windres 资源" teal
+node n8 "go build<br/>三架构 exe" green
+node n9 "make 编译 wg.exe" green
+node n10 ":sign<br/>signtool 签名" red
+edge n1 -> n2 "检查依赖"
+edge n2 -> n3 "否，首次"
+edge n2 -> n5 "是，跳过"
+edge n3 -> n4 "逐个校验"
+edge n4 -> n5 "通过后渲染"
+edge n5 -> n6 "图标就绪"
+edge n6 -> n7 "设置 GOOS/GOARCH"
+edge n7 -> n8 "生成 syso"
+edge n8 -> n9 "按需补编 wg"
+edge n9 -> n10 "六个 exe 就绪"
+:::
+
+依赖压缩包与最终产物目录的对应关系见图 02-02-02。
+
+:::figure id=02-02-02 | name=依赖下载与产物落盘 | dir=TD
+node n1 ".deps/ 与 .distfiles/" blue
+node n2 "go1.27.1.windows-amd64.zip" teal
+node n3 "llvm-mingw-ucrt.zip" teal
+node n4 "imagemagick.zip" teal
+node n5 "make.zip" teal
+node n6 "wireguard-tools.zip" teal
+node n7 "wireguard-nt-1.1.zip" teal
+node n8 "amd64 / x86 / arm64<br/>wireguard.exe + wg.exe" green
+node n9 "sign.bat<br/>可选签名" red
+node n10 "UI 图标 .ico" purple
+edge n1 -> n2 "包含"
+edge n1 -> n3 "包含"
+edge n1 -> n4 "包含"
+edge n1 -> n5 "包含"
+edge n1 -> n6 "包含"
+edge n1 -> n7 "包含"
+edge n4 -> n10 "convert 渲染"
+edge n7 -> n8 "提供驱动 DLL"
+edge n2 -> n8 "Go 工具链编译"
+edge n6 -> n8 "编出 wg.exe"
+edge n8 -> n9 "签名就绪"
+edge n3 -> n8 "windres 与 gcc"
+:::
+
+图 02-02-01 里的判断节点对应 `build.bat:11`，图 02-02-02 里 `wireguard-nt-1.1.zip` 到产物目录的边对应 `resources.rc:17` 与 `build.bat:74` 的 `-I` 参数。两张图合起来说明一件事：`build.bat` 不是「编译一个 Go 程序」，而是「先自举一整套工具链，再为每个架构分别做资源编译与程序编译，最后统一签名」。
+
+### 4. 验证方法与预期结果
+
+构建结束后的验证分三层：文件存在性、版本资源、可启动性。第一层直接列目录，检查三个架构目录下是否各有 `wireguard.exe` 与 `wg.exe`，根目录是否留下 `resources_386.syso`、`resources_amd64.syso`、`resources_arm64.syso` 以及 `ui/icon/` 下生成的 ICO 文件。`.syso` 与 `.ico` 是中间产物，被 `.gitignore` 忽略，属于正常残留。
+
+```bat
+dir amd64\wireguard.exe x86\wireguard.exe arm64\wireguard.exe
+dir amd64\wg.exe x86\wg.exe arm64\wg.exe
+findstr /r "Number.*=.*[0-9.]*" .\version\version.go
+```
+
+下面是一次完整 Windows 构建（含签名配置）的收尾段典型输出。示例输出，具体格式需对照实际版本核验。
+
+```text
+[+] Assembling resources arm64
+[+] Building program arm64
+[+] Building command line tools arm64
+[+] Signing
+[+] Success. Launch wireguard.exe.
+```
+
+逐行判读如下。前三行属于 arm64 这一架构的 `:build_plat`：`Assembling resources arm64` 表示 `aarch64-w64-mingw32-windres` 已成功把 `resources.rc` 编成 `resources_arm64.syso`，若此处报 `windres: failed` 通常是 `-I .deps\wireguard-nt\bin\arm64` 下缺少对应架构的 `wireguard.dll`；`Building program arm64` 表示 `go build` 以 `GOARCH=arm64` 产出 `arm64\wireguard.exe`，`-H windowsgui` 决定它是 GUI 子系统程序而非控制台程序，所以直接双击不会有控制台窗口；`Building command line tools arm64` 表示该架构的 `wg.exe` 此前不存在，`build.bat:81` 正在用 llvm-mingw 的 gcc 编译 wireguard-tools，正常值是一次成功后被 `move` 到 `arm64\wg.exe`，重复构建时这一行应当消失，因为 `build.bat:77` 的 `if not exist` 会跳过。第四行 `[+] Signing` 来自 `build.bat:52`，说明 `sign.bat` 提供的 `SigningProvider` 与 `TimestampServer` 都非空且 `signtool` 已对六个 exe 完成带 RFC3161 时间戳的 SHA256 签名；若两变量任一为空，这一行不会出现，构建仍算成功。第五行 `[+] Success. Launch wireguard.exe.` 是 `build.bat:56` 的唯一成功标志，出现它才代表 `:build_plat` 三次调用与可选签名全部通过。需要强调的异常特征是：输出里若出现 `[-] Failed with error #` 前缀，来自 `build.bat:87` 的 `:error` 段，此时 `errorlevel` 会被 `cmd /c exit` 传递出去，必须据其上一个阶段判断是下载、校验、渲染、资源编译、go build 还是签名失败，不能只看最后一行。
+
+第三层可启动性验证要诚实区分「构建产物」与「可用客户端」。`docs/buildrun.md` 明确写道，运行 `amd64\wireguard.exe` 或 `x86\wireguard.exe` 会安装 manager 服务并显示 UI；但 WireGuard 需要驱动，而驱动一般需要有效的 Microsoft 签名，因此官方建议先安装一份 `wireguard.com` 的正式发行版（其中捆绑了微软签名驱动），再运行自己编译的 `wireguard.exe`，或者用 `quickinstall.bat` 自制安装包。也就是说，本机验证到「UI 能弹出、manager 服务能装上」是合理的；若进一步要求隧道能握手，则必须解决驱动签名这一外部前置条件，这属于 02-05 与 03 册的范围，不是 `build.bat` 能覆盖的。启动后的命令行开关与日志采集写「配置见 04-04」，本册不展开。
+
+### 5. 常见失败与排错
+
+下表把构建期高频失败按现象归类，给出定位入口与处置方向。表中「阶段」列对应图 02-02-01 的节点，完整命令与配置键不在此重列，写「完整配置见 04-xx」。
+
+| 现象 | 阶段 | 定位入口 | 处置方向 |
+|---|---|---|---|
+| 下载后立即退出，无 Verifying 行 | `:installdeps` | `build.bat:61` 的 curl | 检查网络与代理，确认六个域名可达 |
+| 出现 `[-] Failed` 且停在 Verifying | `:download` | `build.bat:63` 的 CertUtil | 哈希不符，删包重下并核对脚本内 SHA256 |
+| `Rendering icons` 后报找不到 convert | `:render` | `build.bat:30` | 确认 ImageMagick 便携版完整解压 |
+| `Assembling resources` 报找不到 dll | `:build_plat` | `build.bat:74` 的 -I | 确认 wireguard-nt 对应架构目录存在 |
+| `go build` 报 overlay 文件缺失 | `:build` | `build.bat:76` | 核对 `.overlay/overlay.json`，见 02-01 第 6 节 |
+| `wg.exe` 编译失败 | `:build_plat` | `build.bat:81` 的 make | 确认 GNU make 与 llvm-mingw gcc 可用 |
+| 未出现 `[+] Signing` | `:sign` | `build.bat:50` | 两个变量需同时非空且 PATH 有 signtool |
+| 能编译但运行时无驱动 | 构建之后 | `docs/buildrun.md` | 先装官方签名驱动或走 quickinstall |
+
+几类需要展开的排错逻辑如下。第一类是哈希校验失败，这几乎总是「脚本内的哈希与当前下载到的文件不匹配」，可能因为上游发布了新版本而本地快照较旧，也可能因为代理返回了错误页面；处置方式是核对 `build.bat:16` 至 `build.bat:24` 与 `Makefile:30` 至 `Makefile:31` 的哈希是否仍与上游一致，需对照实际版本核验，不要直接注释掉 `build.bat:63` 的校验分支。第二类是 `windres` 找不到 `wireguard.dll`，根因是 `wireguard-nt-1.1.zip` 解压后的 `bin/<arch>` 目录结构与 `resources.rc:17` 的引用不匹配；`build.bat:74` 用 `-I ".deps\wireguard-nt\bin\%~1"` 指定搜索路径，`%~1` 依次是 `x86`、`amd64`、`arm64`，三个目录缺一不可。
+
+第三类是 `wg.exe` 子构建失败。`build.bat:79` 会先 `del .deps\src\*.exe` 等中间文件，再以 `CC=%~2-w64-mingw32-gcc`、`WINDRES=%~2-w64-mingw32-windres`、`-j%NUMBER_OF_PROCESSORS%` 调用 make；若 llvm-mingw 未正确解压，或系统里先命中了别的 `make.exe`，就会在这里失败。由于 `build.bat:7` 已把 `.deps\bin` 提到 PATH 前部，正常情况下应优先命中自带的 GNU make。第四类是签名阶段「静默跳过」：`build.bat:50` 与 `build.bat:51` 只要发现 `SigningProvider` 或 `TimestampServer` 为空就 `goto :success`，不会报错，因此「构建成功但产物未签名」不是失败，而是配置缺失；若期望签名，需确认 `sign.bat` 位于仓库根目录、被 `call` 后两个变量确实赋值、且执行 shell 的 PATH 里有 `signtool.exe`。
+
+最后一个陷阱是「用 WOW64 或 32 位环境构建」。`build.bat:16` 下载的是 amd64 工具链，`docs/buildrun.md` 要求 64 位系统；`installer/wireguard.wxs:107` 的 `CheckWow64` 自定义动作还会在安装期主动拒绝 WOW64 场景。虽然那是安装包阶段的检查，但它反映了整个项目对 32 位宿主运行 64 位工具链的不信任。构建机上若只有 32 位 `cmd`，应在 64 位上下文里启动，避免 `CertUtil`、`tar` 与 Go 工具链出现架构错配。运行时的服务名、隧道名与句柄参数写「配置见 04-04」与「原理见 06-10」，本篇不展开。
+
+还有一类不容易归因的失败是「构建成功但产物架构不全」。`build.bat:44` 至 `build.bat:46` 三次 `:build_plat` 调用的参数顺序是「目录名、工具链前缀、GOARCH」，依次是 `x86 i686 386`、`amd64 x86_64 amd64`、`arm64 aarch64 arm64`；若有人为图省事删掉其中一次调用，输出仍会以 `[+] Success. Launch wireguard.exe.` 结束，只是少了一个架构目录，脚本本身不会察觉。因此验证阶段绝不能只看成功标志，必须按第 4 节的三层方法逐一 `dir` 三个目录，确认每个目录下 `wireguard.exe` 与 `wg.exe` 都在。同理，`build.bat:71` 的 `set GOARCH=%~3` 是每次 `:build_plat` 调用内部重新赋值的目标专属变量，而 `build.bat:36` 的 `set GOOS=windows` 是全局量，二者作用域不同；在启动脚本前预先设置用户级 `GOARCH` 环境变量并不会改变三次子过程的结果，理解这一点可以避免排错时错误地怀疑系统里残留的 Go 变量。最后，若同一台机器上先后构建过不同快照，务必留意 `.deps\prepared` 标记文件会让新快照直接复用旧工具链：当上游升级了 Go 或 WireGuardNT 而本地脚本里的哈希已变时，应删除 `.deps` 目录强制重新下载校验，否则会出现「脚本已更新、工具链仍旧」的隐性不一致。
+
+### 6. 小结
+
+本篇按 C 型骨架完成了一次 Windows 原生构建的完整闭环：目标是三个架构的 `wireguard.exe` 加各自的 `wg.exe`；前置条件收敛到 64 位 Windows、Git for Windows、可访问公网的下载环境，以及可选的 `sign.bat` 与 `GoGenerate=yes`；分步操作覆盖了取源码、清残留、执行 `build`、理解 `:build_plat` 内部三段命令、接线签名；验证方法给了目录检查、版本提取与带逐行判读的收尾输出；常见失败表把八类现象映射回 `build.bat` 的具体行号。两张图分别固定了流程时序与依赖到产物的落盘关系。
+
+需要带走的核心判断有三条。第一，`build` 成功的唯一标志是 `[+] Success. Launch wireguard.exe.`，但它只代表文件编译完成，不代表驱动已装载或隧道已可用。第二，脚本是幂等的：`.deps\prepared` 决定要不要重新下载依赖，`if not exist "%~1\wg.exe"` 决定要不要重编命令行工具，因此重复构建的输出会比首轮短，这是正常值而非异常。第三，签名与本地化都是「有则做、无则跳过」的旁路，不会阻断编译，缺签名的影响要等到部署阶段才显现。跨册引用按约定写作（字段见 05-xx ｜ 配置见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）；本篇涉及的运行时字段见 05-05，命令开关见 04-04，驱动加载机制见 06-05，`driver` 模块能力见 07-03。下一步可接 02-03 看 Linux 侧如何用 `Makefile` 完成等价但更精简的构建，或接 02-04 深入 `windres`、`-overlay` 与签名工具链。
+
+---
+
+## 02-03 Linux 交叉构建与 Makefile 目标全解
+
+### 1. 背景与动机
+
+`docs/buildrun.md` 用「Alternative: Building from Linux」一节给出了一条与 Windows 完全不同的路径：先 `sudo apt install mingw-w64 imagemagick`，再 `git clone`、`cd`、`make`。这条路径的存在不是为了方便，而是为了可复现与可自动化。Windows 的 `build.bat` 把整个工具链当作依赖下载到 `.deps/`，好处是零前置、坏处是首次构建要拉六个压缩包且高度依赖 Windows 批处理环境；Linux 的 `Makefile` 反过来，把 mingw-w64 与 imagemagick 交给系统包管理器，只把 Go 工具链与 WireGuardNT 驱动包锁定在仓库内，于是 CI 容器、构建农场、发布流水线可以用一条 `make` 复现三个架构的产物。理解这条链，就等于理解了上游发布流程是如何把「源码」变成「MSI 输入」的。
+
+本篇的动机还在于「目标全解」四个字。`Makefile` 只有一百余行，却同时承担了依赖下载与哈希校验、图标渲染、三架构资源编译、三架构程序编译、依赖刷新、格式化、代码生成、翻译导入、远程部署、两级清理共十类职责。`all`、`remaster`、`fmt`、`generate`、`crowdin`、`deploy`、`clean`、`distclean` 八个目标之间既有依赖关系又有副作用边界：例如 `remaster` 会删除并重写 `go.mod` 与 `go.sum`，`distclean` 会把下载缓存一并删掉，`deploy` 会先在远程 `taskkill` 再 `scp`。不清楚这些边界，很容易在维护时用错目标，把「想刷新依赖」变成「把锁定文件删了」，或者把「想清理中间产物」变成「把几个 GB 的下载包也清了」。
+
+按去重约定，本篇仍属构建维度，只给最小必要配置。变量如 `DEPLOYMENT_HOST`、`DEPLOYMENT_ARCH`、`DEPLOYMENT_PATH` 属于构建期变量，不是 `.conf` 配置键，也不是 `wireguard.exe` 的命令行开关，因此不写「配置见 04-xx」的完整清单；运行时配置与服务命令一律不在此展开。凡涉及 `driver` 结构体字段写「字段见 05-05」，涉及适配器创建与驱动加载机制写「原理见 06-05」，涉及 `l18n`、`installer` 等模块能力写「模块见 07-12」。能力边界同样要守住：本仓库是 Windows 官方客户端，内核数据面由外部 WireGuardNT 提供，Linux 侧只做交叉编译，不实现任何数据面，也不提供 `wg-quick` 语义。
+
+### 2. 核心概念
+
+第一个概念是「GOFLAGS 是整条链的宪法」。`Makefile:1` 把它定义为 `:=` 立即展开的全局变量，随后所有 `go build` 都通过 `$(GOFLAGS)` 引用，Windows 侧 `build.bat:76` 也逐字重复了同一组标志。这组标志共有六项，逐项含义如下表所示，值均来自 `Makefile:1`，需对照实际版本核验。
+
+| 标志 | 取值 | 作用 |
+|---|---|---|
+| `-overlay` | `.overlay/overlay.json` | 把指定路径映射到替代文件，替换编译输入 |
+| `-tags` | `load_wgnt_from_rsrc` | 选中 `dll_fromrsrc_windows.go` 分支 |
+| `-ldflags` | `-H windowsgui -s -w` | GUI 子系统、去符号表与调试信息 |
+| `-trimpath` | 无值 | 去掉产物里的本地绝对路径 |
+| `-buildvcs=false` | 无值 | 不向二进制嵌入版本控制信息 |
+| `-v` | 无值 | 逐个打印被编译的包名 |
+
+其中 `-tags load_wgnt_from_rsrc` 与 `resources.rc:17` 的 `wireguard.dll RCDATA wireguard.dll` 是一对：前者让编译选中从资源加载 DLL 的 Go 文件，后者让 windres 把 DLL 真的编进资源；二者缺一，产物要么找不到资源、要么退回从磁盘加载 DLL 的分支。`-trimpath` 与 `-buildvcs=false` 则是可复现构建的关键，它们保证不同构建目录、不同 git 状态下产出的二进制不含机器相关字符串。`-H windowsgui` 决定 `wireguard.exe` 是 GUI 子系统程序，这解释了为什么双击它不会弹出控制台窗口，也解释了为什么日志要走 `ringlogger` 与 `/dumplog` 而不是标准输出（机制见 06-11，字段见 05-09）。
+
+第二个概念是「导出环境而非命令行传参」。`Makefile:2` 至 `Makefile:4` 用 `export` 把 `GOOS := windows`、`PWD := $(CURDIR)`、`PATH := $(CURDIR)/.deps/go/bin:$(PATH)` 注入所有子命令环境；三个架构目标再用目标专属变量 `amd64/wireguard.exe: export GOARCH := amd64`、`x86/wireguard.exe: export GOARCH := 386`、`arm64/wireguard.exe: export GOARCH := arm64` 分别设定 `GOARCH`。注意 x86 用的是 Go 的 `386` 而非目录名 `x86`，arm64 用 `arm64`，目录名与 `GOARCH` 的映射关系是理解产物命名的要点。构建期的环境变量关系可概括为 `GOOS=windows \| GOARCH 由目标指定`，其中 `\|` 表示「且」的并列关系，避免与表格列分隔符混淆。
+
+第三个概念是「依赖的两级缓存」。`download` 模板（`Makefile:22` 至 `Makefile:28`）把下载物放在 `.distfiles/`，先写 `.unverified` 后缀，`sha256sum -c` 通过后才 `mv` 成正式文件；`.deps/go/prepared` 与 `.deps/wireguard-nt/prepared` 则是解压完成的标记文件。于是 `clean` 只删 `.deps` 与产物，`distclean` 再删 `.distfiles`，形成「重新编译」与「重新下载」两个粒度。这种分级在带宽受限或离线环境里非常实用：`make clean && make` 不需要重新下载工具链，`make distclean && make` 才会触发完整拉取。
+
+第四个概念是「三个 windres 对应三套交叉工具链」。`Makefile:49` 至 `Makefile:56` 分别用 `x86_64-w64-mingw32-windres`、`i686-w64-mingw32-windres`、`aarch64-w64-mingw32-windres`，并通过 `-I .deps/wireguard-nt/bin/amd64`、`-I .deps/wireguard-nt/bin/x86`、`-I .deps/wireguard-nt/bin/arm64` 指向对应架构的驱动 DLL 目录，产出 `resources_amd64.syso`、`resources_386.syso`、`resources_arm64.syso`。Go 链接器会自动把与包名同目录、且命名符合 `*_<GOARCH>.syso` 的文件链接进对应架构的二进制，这就是为什么 syso 的命名必须与 `GOARCH` 对齐。
+
+### 3. 关键数据结构与源码位置
+
+本节固定 `Makefile` 的变量、文件集合与目标清单，全部以 `Makefile` 行号为索引。首先是版本与资源参数：`Makefile:6` 用 `sed -n 's/^\s*Number\s*=\s*"\([0-9.]\+\)"$$/\1/p' version/version.go` 抽出版本号；`Makefile:10` 的 `RCFLAGS` 通过 `$(subst ...)` 把点分版本拆成最多四个数字、不足补零，生成 `-DWIREGUARD_VERSION_ARRAY=...`，再附 `-DWIREGUARD_VERSION_STR=$(VERSION) -O coff -c 65001`。`-O coff` 指定输出 COFF 格式供 Go 链接，`-c 65001` 指定 UTF-8 代码页，与 `resources.rc:8` 的 `#pragma code_page(65001)` 呼应。
+
+其次是文件集合。`Makefile:12` 定义递归通配函数 `rwildcard`，`Makefile:13` 用它拼出 `SOURCE_FILES`（所有 `.go`、`.overlay/` 下全部文件、`.deps/go/prepared`、`go.mod`、`go.sum`），`Makefile:14` 定义 `RESOURCE_FILES`（`resources.rc`、`version/version.go`、`manifest.xml`、由 `ui/icon/*.svg` 映射出的 `*.ico`、`.deps/wireguard-nt/prepared`）。这两个集合分别作为 `go build` 目标与 `syso` 目标的依赖，决定了改一个 Go 文件会触发三架构重编，而只改图标只会触发资源重编。部署默认值在 `Makefile:16` 至 `Makefile:18`：`DEPLOYMENT_HOST ?= winvm`、`DEPLOYMENT_ARCH ?= amd64`、`DEPLOYMENT_PATH ?= Desktop`，`?=` 表示可被环境变量或命令行覆盖。
+
+全部目标的作用与依赖如下表所示，长命令串不塞进单元格，完整形式见第 5 节的代码块。
+
+| 目标 | 关键依赖或命令 | 作用 |
+|---|---|---|
+| `all` | 三个 `wireguard.exe` | 默认目标，产出三架构主程序 |
+| `remaster` | `go.mod.master`、`go get`、`sed` | 刷新依赖并同步两脚本的工具链哈希 |
+| `fmt` | `.deps/go/prepared` | 格式化全部 Go 包 |
+| `generate` | `.deps/go/prepared` | 以 `GOOS` 清空态重生成代码 |
+| `crowdin` | `CROWDIN_ZIP`、`bsdtar`、`jq` | 导入翻译包并递归调用 generate |
+| `deploy` | `$(DEPLOYMENT_ARCH)/wireguard.exe` | 远程结束旧进程后 scp 新程序 |
+| `clean` | 无 | 删 syso、ico、三架构目录与 `.deps` |
+| `distclean` | `clean` | 追加删除 `.distfiles` 下载缓存 |
+
+依赖锁定方面，`Makefile:30` 与 `Makefile:31` 通过 `$(eval $(call download,...))` 实例化两行规则：Go 工具链为 `go1.27.1.linux-amd64.tar.gz`，WireGuardNT 为 `wireguard-nt-1.1.zip`，二者各带一个 SHA256 值；`build.bat:16` 与 `build.bat:24` 使用对应的 Windows 包与同一个 WireGuardNT 哈希。这些哈希与文件名是时效性数值，需对照实际版本核验，定位路径即上述四处。运行时的 `driver` IOCTL 结构与 `winipcfg` 结构不在本册展开，写「字段见 05-05」与「字段见 05-07」；交叉构建只关心它们被编译进哪个架构的二进制。
+
+### 4. 关键流程与调用链
+
+`make` 不带参数时命中 `Makefile:20` 的 `all`，它依赖三个 exe。以 `amd64/wireguard.exe` 为例，依赖链是：`amd64/wireguard.exe`（`Makefile:59`）→ `resources_amd64.syso` 与 `$(SOURCE_FILES)` → `resources_amd64.syso`（`Makefile:49`）→ `$(RESOURCE_FILES)` → `.deps/wireguard-nt/prepared`（`Makefile:40`）→ `.distfiles/wireguard-nt.zip`（`Makefile:31` 生成的规则）→ `curl` 下载与 `sha256sum -c` 校验。另一条并行链是 `$(SOURCE_FILES)` 里的 `.deps/go/prepared`（`Makefile:33`）→ `.distfiles/go.tar.gz`（`Makefile:30`）→ 同样的下载校验模板，再 `bsdtar -C .deps -xf`、`chmod -R +w`、`touch` 标记。也就是说，一条 `make` 会先把两个外部包拉下来并验证，然后才允许任一编译步骤开始。
+
+图标链是第三条：`Makefile:46` 至 `Makefile:47` 的 `%.ico: %.svg` 规则调用 `convert -background none $< -define icon:auto-resize="256,192,128,96,64,48,40,32,24,20,16" -compress zip $@`，把 `ui/icon/wireguard.svg` 与 `ui/icon/dot.svg` 渲染成多尺寸 ICO；这些 ICO 通过 `RESOURCE_FILES` 成为 syso 的依赖，再由 `resources.rc:15` 至 `resources.rc:16` 的 `7 ICON` / `8 ICON` 引用。Windows 侧 `build.bat:30` 用完全相同的 `convert` 参数，两条链在这里是逐字对齐的。
+
+编译链的最后一段是 `go build $(GOFLAGS) -o $@`，三条规则分别在 `Makefile:60`、`Makefile:64`、`Makefile:68`。因为 `GOOS := windows` 已全局导出、`GOARCH` 由目标专属变量导出、`PATH` 前置了 `.deps/go/bin`，这条命令实际使用的是仓库内自举的 Go，而不是系统 Go。产物只有 `wireguard.exe`，不含 `wg.exe`——这是与 `build.bat` 最显著的差异：`build.bat:77` 至 `build.bat:83` 会额外用 make 编译 wireguard-tools，而 `Makefile` 的 `all` 完全不碰它；`docs/buildrun.md` 为此单独用一节说明如何在 Linux 上用 `PLATFORM=windows make -C wireguard-tools/src` 自行构建 `wg.exe`。签名同样不在 Linux 链里：`Makefile` 没有任何 `signtool` 调用，签名是 `build.bat:48` 与 `installer/build.bat:43` 的职责。
+
+`Makefile` 各目标之间的依赖关系见图 02-03-01，请先对照图再进入命令实例。
+
+:::figure id=02-03-01 | name=Makefile 目标与依赖图 | dir=TD
+node n1 "make all" blue
+node n2 "三个 wireguard.exe<br/>amd64 x86 arm64" green
+node n3 "resources_*.syso" purple
+node n4 ".deps/go/prepared" teal
+node n5 ".deps/wireguard-nt/prepared" teal
+node n6 ".distfiles/*.tar.gz<br/>与 SHA256 校验" amber
+node n7 "remaster / fmt<br/>generate / crowdin" gray
+node n8 "deploy" red
+node n9 "clean / distclean" gray
+node n10 "ui/icon/*.ico" purple
+edge n1 -> n2 "默认目标"
+edge n3 -> n2 "syso 参与链接"
+edge n4 -> n2 "自举 Go 工具链"
+edge n5 -> n3 "驱动 DLL 入资源"
+edge n6 -> n4 "解压 Go"
+edge n6 -> n5 "解压 WGNT"
+edge n10 -> n3 "convert 出图标"
+edge n2 -> n8 "make deploy"
+edge n1 -> n9 dashed "clean / distclean"
+edge n7 -> n6 dashed "remaster 刷新哈希"
+edge n7 -> n1 dashed "generate 后重建"
+:::
+
+图 02-03-01 里 `remaster / fmt / generate / crowdin` 到 `.distfiles` 与 `all` 的两条虚线是「维护型目标」：它们不直接产出 exe，但会改动 `go.mod`、`go.sum`、下载哈希或 `zgotext.go`，从而间接触发后续重建。`deploy` 到远程主机的边对应 `Makefile:93` 至 `Makefile:95`：先 `-ssh $(DEPLOYMENT_HOST) -- 'taskkill /im wireguard.exe /f'` 结束远端旧进程（前缀 `-` 表示失败也继续），再 `scp $< $(DEPLOYMENT_HOST):$(DEPLOYMENT_PATH)` 推送 `$(DEPLOYMENT_ARCH)/wireguard.exe`。这条链把「编译」和「在 Windows 上试跑」连成了一步，是开发期迭代的常用入口。
+
+### 5. 配置/命令/代码实例
+
+先看 Linux 侧的最小命令序列，前两行来自 `docs/buildrun.md`，后几行是本篇补充的目标用法。本册只给构建所需命令，运行时配置键与服务命令写「完整配置见 04-xx」。
+
+```bash
+# 前置：docs/buildrun.md 的 Alternative: Building from Linux
+sudo apt install mingw-w64 imagemagick
+git clone https://git.zx2c4.com/wireguard-windows
+cd wireguard-windows
+make
+
+# 把 amd64 产物推送到名为 winvm 的远程 Windows 主机桌面
+make deploy DEPLOYMENT_HOST=winvm DEPLOYMENT_ARCH=amd64 DEPLOYMENT_PATH=Desktop
+
+# 只清中间产物、保留下载缓存
+make clean
+
+# 连下载缓存一起清，下次 make 会重新校验并解压
+make distclean
+```
+
+下面是一次全新 `make` 的关键阶段输出（`-v` 会打印被编译的包名，此处按阶段节选）。示例输出，具体格式需对照实际版本核验。
+
+```text
+mkdir -p .distfiles
+curl -L#o .distfiles/go.tar.gz.unverified https://go.dev/dl/go1.27.1.linux-amd64.tar.gz
+sha256sum -c
+bsdtar -C .deps -xf .distfiles/go.tar.gz
+x86_64-w64-mingw32-windres -DWIREGUARD_VERSION_ARRAY=1,1,1,0 -DWIREGUARD_VERSION_STR=1.1.1 -O coff -c 65001 -I .deps/wireguard-nt/bin/amd64 -i resources.rc -o resources_amd64.syso
+go build -overlay .overlay/overlay.json -tags load_wgnt_from_rsrc -o amd64/wireguard.exe
+i686-w64-mingw32-windres -DWIREGUARD_VERSION_ARRAY=1,1,1,0 -O coff -c 65001 -I .deps/wireguard-nt/bin/x86 -i resources.rc -o resources_386.syso
+go build -overlay .overlay/overlay.json -tags load_wgnt_from_rsrc -o x86/wireguard.exe
+aarch64-w64-mingw32-windres -DWIREGUARD_VERSION_ARRAY=1,1,1,0 -O coff -c 65001 -I .deps/wireguard-nt/bin/arm64 -i resources.rc -o resources_arm64.syso
+go build -overlay .overlay/overlay.json -tags load_wgnt_from_rsrc -o arm64/wireguard.exe
+```
+
+逐行判读如下。第一行 `mkdir -p .distfiles` 来自 `Makefile:24`，是 `download` 模板为下载物准备的目录；第二行 `curl -L#o ...go.tar.gz.unverified` 来自 `Makefile:25`，注意文件名带 `.unverified` 后缀，表示此时尚未被信任；第三行 `sha256sum -c` 对应 `Makefile:26` 的 `echo "$(3)  $@.unverified" | sha256sum -c`，正常值是通过后不报错，若失败脚本会 `rm -f` 未验证文件并 `exit 1`，这正是依赖完整性防线。第四行 `bsdtar -C .deps -xf` 对应 `Makefile:36`，用 bsdtar 而非 tar 是为了统一处理压缩包格式，其后还有 `chmod -R +w .deps/go` 与 `touch .deps/go/prepared` 两步未在节选中列出。第五行是 amd64 的 windres 命令：`WIREGUARD_VERSION_ARRAY=1,1,1,0` 由 `Makefile:10` 把 `version/version.go` 的 `1.1.1` 补零成四段，`-O coff -c 65001` 固定输出格式与代码页，`-I .deps/wireguard-nt/bin/amd64` 指向该架构驱动 DLL，输出 `resources_amd64.syso`。第六行 `go build -overlay ... -o amd64/wireguard.exe` 是 `Makefile:60` 的实际展开，节选中省略了 `-ldflags`、`-trimpath`、`-buildvcs=false`、`-v` 以突出主线，完整值见 `Makefile:1`。第七至第十行按同样模式完成 x86（syso 名为 `resources_386.syso`、`GOARCH=386`、目录 `x86/`）与 arm64。需要警惕的异常特征有三类：syso 文件名与 `GOARCH` 不对齐会导致该架构资源没被链接；三个 `-I` 目录任一缺失会让 windres 找不到 `wireguard.dll`；三行 `go build` 缺任一行都说明 `all` 未完整达成。版本号 `1.1.1` 与数组 `1,1,1,0` 为当前快照值，需对照实际版本核验。
+
+再看 `remaster` 与 `crowdin` 两个维护型目标的实际动作，理解它们为何不能被当作普通编译目标使用。
+
+```makefile
+# Makefile:70-76 的 remaster 目标（节选）
+# remaster: export GOARCH := amd64
+# remaster: export GOPROXY := direct
+# rm -f go.sum go.mod
+# cp go.mod.master go.mod
+# go get
+# sed -i ... Makefile build.bat
+
+# Makefile:87-91 的 crowdin 目标（节选）
+# find locales -maxdepth 1 -mindepth 1 -type d ! -name en -exec rm -rf {} +
+# bsdtar -C locales -x -f "$(CROWDIN_ZIP)" --strip-components 2 wireguard-windows
+# find locales -name messages.gotext.json -exec bash -c '...' \;
+# $(MAKE) --no-print-directory generate
+```
+
+`remaster` 会删掉锁定的 `go.sum` 与 `go.mod`、换上 `go.mod.master` 模板、`go get` 拉最新依赖，再用 go.dev 的 JSON 接口通过 `sed` 同步改写 `Makefile` 与 `build.bat` 里的下载文件名和哈希，因此它是「升级工具链/刷新依赖」的专用入口，绝不能在日常构建里顺手执行。`crowdin` 则清空 `locales/` 下除 `en` 外的目录、从 `CROWDIN_ZIP` 解包翻译、用 `jq` 剔除没有有效消息的目录、最后递归调用 `generate`，本地化细节在 02-04 展开。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，系统包必须齐备且版本足够新。`docs/buildrun.md` 只写 `sudo apt install mingw-w64 imagemagick`，但 `Makefile` 实际还隐含依赖 `curl`、`sha256sum`、`bsdtar`、`convert`、`jq`、`ssh`、`scp` 以及三种前缀的 `windres`。`x86_64-w64-mingw32-windres`、`i686-w64-mingw32-windres`、`aarch64-w64-mingw32-windres` 必须同时存在，缺 `aarch64` 那套时 arm64 目标会在资源阶段失败；`crowdin` 与 `remaster` 还分别需要 `jq` 与 `curl` 访问 go.dev 的 JSON 接口。最小化安装的系统上应先补齐这些命令，再谈构建。
+
+第二，`.overlay/overlay.json` 的处理要延续 02-01 的谨慎。`Makefile:1` 与 `build.bat:76` 都引用它，`Makefile:13` 把整个 `.overlay/` 列为 `SOURCE_FILES`，但当前 master 快照未附带该目录，`.gitignore` 亦未列出。本册只说明 Go `-overlay` 的通用语义与「它参与编译」这一事实，不臆测映射条目；其生成方式、内容与是否由 `go:generate` 产出，需对照实际版本核验，定位路径为 `Makefile:1`、`Makefile:13`、`build.bat:76`。若在本地仓库里确实缺少该文件，`go build` 会直接报找不到 overlay 文件，此时不要手写一份猜测内容的 JSON，应回到上游实际版本取回原文件。
+
+第三，分清 `clean` 与 `distclean` 的粒度。`Makefile:98` 的 `clean` 删除 `*.syso`、`ui/icon/*.ico`、`x86/`、`amd64/`、`arm64/`、`.deps`；`Makefile:101` 的 `distclean` 在 `clean` 基础上再删 `.distfiles`。也就是说 `make clean && make` 会重新解压已通过校验的工具链但不重新下载，`make distclean && make` 才会重跑 `curl` 与 `sha256sum -c`。在带宽昂贵或需要完全离线复现的场景里，误用 `distclean` 会造成不必要的下载；反过来，当怀疑下载包被污染时，又必须用 `distclean` 才能强制重新校验，仅 `clean` 是不够的。
+
+第四，`.deps/go/prepared` 与 `.deps/wireguard-nt/prepared` 是「信任标记」，不要手工 `touch`。`Makefile:38` 与 `Makefile:44` 在解压成功后才 `touch`，make 靠这两个文件判断依赖是否就绪；手工创建空标记会让 make 跳过解压，后续 windres 因找不到 `.deps/wireguard-nt/bin/<arch>` 而失败，且错误信息会指向资源脚本而非真正原因。同理，`download` 模板里的 `.unverified` 中间文件不应被重命名成正式文件来「绕过」校验。
+
+第五，理解 Linux 链的能力边界。`Makefile` 的 `all` 只产出三个 `wireguard.exe`，不产出 `wg.exe`、不做任何签名、不生成 MSI。需要 `wg.exe` 时按 `docs/buildrun.md` 单独用 wireguard-tools 的 Makefile 交叉编译；需要签名时回到 `build.bat:48` 或 `installer/build.bat:43`；需要 MSI 时执行 `installer/build.bat`，见 02-05。`make deploy` 也只是把 exe 推到远程 Windows 主机，并不安装驱动或服务，远端要是没有有效签名的驱动，程序依旧只能起 UI 不能建隧道。把「Linux 上 make 成功」等同于「得到了可分发产品」是典型误判。运行时服务控制与 `wg show` 等命令写「配置见 04-05」「配置见 04-06」，本册不重列。
+
+### 7. 小结与延伸阅读
+
+本篇把 `Makefile` 读成了一张依赖图：`GOFLAGS` 统一了三架构的编译行为，`export GOOS` 与目标专属 `GOARCH` 完成交叉设定，`download` 模板用 SHA256 把 Go 工具链与 WireGuardNT 锁进 `.distfiles`，`RESOURCE_FILES` 与 `SOURCE_FILES` 决定重编范围，三个 windres 产出与 `GOARCH` 对齐的 syso，最后三条 `go build` 落到 `amd64/`、`x86/`、`arm64/`。八个 phony 目标里，`all` 与 `deploy` 面向产出，`remaster`、`fmt`、`generate`、`crowdin` 面向维护，`clean` 与 `distclean` 面向缓存分级。图 02-03-01 固定了它们的依赖与副作用方向，命令加输出的组合让「一次干净 make 应当看到哪些阶段」变得可判读。
+
+与 `build.bat` 对照后的三条差异最值得记住：Linux 链依赖系统预装 mingw-w64 与 imagemagick 而非自举六包；`all` 不含 `wg.exe` 与 MSI；没有任何 `signtool` 调用。这些差异决定了 Linux 更适合 CI 与可复现编译，Windows 更适合「一条命令拿到完整可分发物」。跨册引用按约定写作（字段见 05-xx ｜ 配置见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）；本篇涉及的驱动与网络配置结构字段见 05-05 与 05-07，运行时命令见 04-05，驱动加载与路由机制见 06-05 与 06-06，`l18n` 与 `installer` 模块见 07-12。延伸阅读建议接 02-04 深入 `windres`、构建标签、gotext 与签名，再接 02-05 看 WiX 如何把三架构 exe 收进 MSI。所有哈希、Go 版本、`1.1.1` 版本号与 `WIREGUARD_VERSION_ARRAY` 展开值均为当前快照值，需对照实际版本核验，定位路径已逐处给出。
+
+---
+
+## 02-04 Go 工具链自举、资源编译、本地化与代码签名
+
+### 1. 背景与动机
+
+02-02 与 02-03 分别走通了 Windows 与 Linux 两条构建路径，但都把若干环节当成黑盒：为什么 `go build` 用的是仓库内的 `.deps/go` 而不是系统 Go？为什么一个纯 Go 工程需要 `windres` 和 `resources.rc`？为什么 `set GoGenerate=yes` 会让构建多出一步、又为什么会冒出一个巨大的 `zgotext.go`？为什么根目录放一个 `sign.bat` 就能让产物带上签名，而少了它构建依然成功？本篇把这四个黑盒拆开，分别对应工具链自举、资源编译与驱动 DLL 嵌入、本地化代码生成、Authenticode 代码签名。它们是 02 册里最容易被「照抄命令」跳过、却最常在定制与排障时卡住的部分。
+
+这四件事有一个共同的设计动机：把构建对宿主环境的依赖降到最低，同时把产物的完整性提到最高。工具链自举解决「不同机器上的 Go 版本不一致导致产物不一致」；资源编译把版本信息、应用清单、图标、以及最关键的 WireGuardNT 驱动 DLL 一次性编进 exe，解决「目标机器上要不要额外释放文件」；本地化生成把几十种语言的翻译在编译期固化成 `zgotext.go`，解决「运行时不依赖外部语言包」；签名则解决「驱动能不能被 Windows 装载」这一外部强制要求。四者合起来，才让一个 `wireguard.exe` 成为自包含、可验证、可分发的实体。
+
+按去重铁律，本篇只讲构建期的机制与文件，运行时结构体的逐字段定义写「字段见 05-05」「字段见 05-06」，适配器创建与内存加载的完整调用链写「原理见 06-05」，`driver/memmod` 与 `l18n` 的模块能力写「模块见 07-04」「模块见 07-12」，`.conf` 配置键与 `wireguard.exe` 开关写「配置见 04-04」。能力边界再强调一次：本仓库是 Windows 官方客户端，内核数据面在外部项目 WireGuardNT；本篇所说的「驱动 DLL」是被当作资源嵌入的用户态可加载模块，不是本仓库实现的协议栈，也不包含 Linux `wg-quick` 的任何语义。
+
+### 2. 核心概念
+
+第一个概念是「自举工具链」。`Makefile:4` 把 `$(CURDIR)/.deps/go/bin` 前置到 `PATH`，`build.bat:7` 把 `.deps\go\bin`、`.deps\bin`、`.deps` 前置到 `PATH`，`build.bat:38` 与 `build.bat:39` 再把 `GOPATH`、`GOROOT` 一并指向 `.deps` 内部。于是 `Makefile:60` 与 `build.bat:76` 里那句看似普通的 `go build`，实际执行的是从 `go1.27.1` 压缩包解压出来的私有编译器。下载环节两侧都做了完整性校验：Linux 侧 `Makefile:26` 用 `sha256sum -c`，Windows 侧 `build.bat:63` 用 `CertUtil -hashfile %1 SHA256`；Linux 侧用 `bsdtar` 解压并 `chmod -R +w`，Windows 侧用 `tar -xf`。Go 版本、压缩包名与哈希均为时效性数值，需对照实际版本核验，定位路径为 `Makefile:30` 与 `build.bat:16`。
+
+第二个概念是「构建标签决定 DLL 从哪来」。`GOFLAGS` 中的 `-tags load_wgnt_from_rsrc` 直接对应 `driver/` 下一对互斥文件：`driver/dll_fromrsrc_windows.go:1` 声明 `//go:build load_wgnt_from_rsrc`，`driver/dll_fromfile_windows.go:1` 声明 `//go:build !load_wgnt_from_rsrc`。选中前者时，`lazyDLL.Load()` 依次调用 `windows.FindResource(0, d.Name, windows.RT_RCDATA)`、`windows.LoadResourceData`、`memmod.LoadLibrary(data)`，把资源里的 DLL 字节在内存中做 PE 映射后取出导出函数地址；选中后者时，走 `windows.LoadLibraryEx` 从应用程序目录或 System32 加载磁盘上的 DLL。官方构建恒定使用前者，因此发布物里不需要附带独立的 `wireguard.dll`。`driver/dll_windows.go` 里的 `newLazyDLL`、`lazyProc.Find`、`lazyProc.Addr` 与 `Version()` 是两条分支共用的骨架，`Version()` 还会从 `modwireguard.Base` 的 `RT_VERSION` 资源里读出驱动 DLL 版本（见 `driver/dll_windows.go:64` 至 `driver/dll_windows.go:91`）。相关结构体字段与内存布局写「字段见 05-06」，加载机制的完整时序写「原理见 06-05」。
+
+第三个概念是「资源脚本是构建契约」。`resources.rc` 用 `#pragma code_page(65001)` 固定 UTF-8，用 `CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST manifest.xml` 内嵌应用清单，用 `7 ICON` / `8 ICON` 内嵌两个图标，用 `wireguard.dll RCDATA wireguard.dll` 内嵌驱动 DLL，再用 `VERSIONINFO_TEMPLATE` 宏为几十种语言生成 `VS_VERSION_INFO` 块。`windres` 的 `-I .deps/wireguard-nt/bin/<arch>` 参数正是为最后那条 RCDATA 服务的：它把外部压缩包里对应架构的 `wireguard.dll` 作为输入文件搜到并编进资源。版本宏 `WIREGUARD_VERSION_ARRAY` 与 `WIREGUARD_VERSION_STR` 由 `Makefile:10` 或 `build.bat:35` 从 `version/version.go` 派生，注入 `FILEVERSION`、`PRODUCTVERSION` 与 `FileVersion` 字符串。这条链把「单一版本源」落到了二进制资源层面。
+
+第四个概念是「生成与签名都是旁路」。本地化由 `GoGenerate=yes` 触发 `build.bat:42` 的 `go generate`，或由 `Makefile:84` 的 `generate` 目标触发，最终落到 `gotext.go` 生成的 `zgotext.go`；签名由根目录 `sign.bat` 提供 `SigningProvider` 与 `TimestampServer` 两个变量，`build.bat:49` 与 `installer/build.bat:34` 各自 `call` 它，再由 `signtool sign` 完成。两者都不是编译的必要条件：不设 `GoGenerate` 就沿用仓库里已有的 `zgotext.go`，没有 `sign.bat` 就跳过签名。这种「可选但可验证」的结构，是理解构建输出长短变化的关键。
+
+### 3. 关键数据结构与源码位置
+
+本节固定资源脚本、应用清单、生成入口与签名变量四类对象。`resources.rc` 的关键条目如下表所示，路径为 `upstream_src/resources.rc`。
+
+| 行 | 资源类型 | 内容与作用 |
+|---|---|---|
+| `resources.rc:8` | 预处理 | `#pragma code_page(65001)` 固定 UTF-8 |
+| `resources.rc:14` | RT_MANIFEST | 内嵌 `manifest.xml` 应用清单 |
+| `resources.rc:15` | ICON | `7 ICON ui/icon/wireguard.ico` 主图标 |
+| `resources.rc:16` | ICON | `8 ICON ui/icon/dot.ico` 状态图标 |
+| `resources.rc:17` | RCDATA | `wireguard.dll RCDATA wireguard.dll` 嵌入驱动 DLL |
+| `resources.rc:19` | 宏 | `VERSIONINFO_TEMPLATE` 生成多语言版本块 |
+
+`VERSIONINFO_TEMPLATE` 展开后包含 `CompanyName "WireGuard LLC"`、`InternalName "wireguard-windows"`、`OriginalFilename "wireguard.exe"`、`ProductName "WireGuard"`、`LegalCopyright` 与 `Comments` 等固定字段，语言块从 `resources.rc:48` 的英语 `040904b0` 一直列到 `resources.rc:314` 的简体中文 `080404b0`（`WireGuard：快速、现代、安全的 VPN 隧道`）与 `resources.rc:307` 的繁体中文 `040404b0`。这些字符串在 `windres` 时被编进 `.syso`，最终成为 exe 的「详细信息」页内容，也是本地化除 UI 文案之外的另一条翻译线。
+
+`manifest.xml` 的四项声明值得单独记：`assemblyIdentity` 的 `name="wireguard"`、`type="win32"`、`processorArchitecture="*"`；`supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"` 表示 Windows 10 与 11；`dependency` 指向 `Microsoft.Windows.Common-Controls` 6.0.0.0，保证 UI 使用新版公共控件；`dpiAwareness` 为 `PerMonitorV2, PerMonitor` 且 `dpiAware=True`。这些声明与 `docs/buildrun.md` 要求的 64 位 Windows 10 / Server 2019 及以上互相印证，也解释了 `wireguard.wxs:99` 的 `CheckWinVer` 自定义动作为何要在安装期再校验一次系统版本。
+
+生成与签名侧的变量、入口如下表所示，值为当前快照，需对照实际版本核验。
+
+| 名称 | 设置或读取位置 | 作用 |
+|---|---|---|
+| `GoGenerate=yes` | `build.bat:40` | 触发 `go generate`，重生成本地化代码 |
+| `generate` 目标 | `Makefile:82` | 以清空 `GOOS` 态运行代码生成 |
+| `gotext.go` | `//go:generate go run gotext.go` | 本地化生成入口 |
+| `zgotext.go` | 仓库根目录 | 生成的翻译数据，参与 `go build` |
+| `SigningProvider` | `sign.bat` | 证书选择参数，如 `/sha1` 指纹 |
+| `TimestampServer` | `sign.bat` | RFC3161 时间戳服务地址 |
+| `CROWDIN_ZIP` | `Makefile:89` | CrowdIn 翻译压缩包路径 |
+
+`gotext.go` 的 `main()` 逻辑清晰可循：`os.ReadDir("locales")` 遍历语言目录，读 `messages.gotext.json` 并用 `pipeline.Messages` 解析出 `Language`，若语言标签与目录名不一致就 `os.Rename` 目录；收集完 `langs` 后 `os.CreateTemp` 建一个临时 `gotext*.exe`，先 `go build -o <tmp> golang.org/x/text/cmd/gotext` 编译工具，再执行 `gotext -srclang=en update -out=zgotext.go -lang=<langs>`，并通过 `cmd.Env` 追加 `GOOS=windows, GOARCH=amd64`；最后把每个语言目录的 `out.gotext.json` 重命名为 `messages.gotext.json`。`zgotext.go` 在当前快照中体量很大，正是几十种语言译文被编译进单一 Go 文件的结果。运行时的本地化模块能力写「模块见 07-12」。
+
+### 4. 关键流程与调用链
+
+把四条链按顺序串起来看。第一条是自举：`Makefile:22` 的 `download` 模板或 `build.bat:59` 的 `:download` 下载并校验压缩包 → 解压到 `.deps/go` → `touch .deps/go/prepared` 或 `copy /y NUL prepared` 写标记 → `PATH` 前置 `.deps/go/bin` → 后续所有 `go build` 使用私有编译器。第二条是资源：`version/version.go` 的 `Number` 被 `Makefile:6` 或 `build.bat:33` 提取 → 拆成 `WIREGUARD_VERSION_ARRAY` 与 `WIREGUARD_VERSION_STR` → 与 `-O coff -c 65001`、`-I .deps/wireguard-nt/bin/<arch>` 一起传给 `windres` → `resources.rc` 把清单、图标、驱动 DLL、多语言版本块编成 `resources_<GOARCH>.syso` → Go 链接器按 `*_<GOARCH>.syso` 规则把它链进对应架构的 exe。
+
+第三条是运行期回读，它与资源编译构成闭环：`driver/dll_fromrsrc_windows.go:39` 用 `windows.FindResource(ourModule, d.Name, windows.RT_RCDATA)` 在自身模块里找名为 `wireguard.dll` 的资源 → `windows.LoadResourceData` 取出字节 → `driver/memmod` 的 `LoadLibrary(data)` 在内存里完成 PE 映射 → `lazyProc.nameToAddr()` 通过 `ProcAddressByName` 取导出函数 → `driver/dll_windows.go:64` 的 `Version()` 再从该模块的 `RT_VERSION` 资源读驱动版本。这条「构建期嵌入、运行期内存加载」的链，是 `load_wgnt_from_rsrc` 这个标签名字的由来，也是本仓库不需要在 `%ProgramFiles%\WireGuard\` 下额外释放 `wireguard.dll` 的原因。
+
+第四条是生成与签名：`GoGenerate=yes` 或 `make generate` → `go generate` 触发 `gotext.go` → 生成 `zgotext.go` 与 `locales/<lang>/messages.gotext.json` → `zgotext.go` 参与 `go build` → 产物就绪；与此同时 `build.bat:49` 判断 `sign.bat` 是否存在并 `call` 它 → 检查 `SigningProvider` 与 `TimestampServer` 是否都非空 → `signtool sign %SigningProvider% /fd sha256 /tr "%TimestampServer%" /td sha256 /d WireGuard` 对六个 exe 签名。资源编译与 DLL 内嵌加载的关系见图 02-04-01，本地化生成与签名的时序见图 02-04-02。
+
+资源编译、驱动 DLL 内嵌与运行期回读的完整链路见图 02-04-01。
+
+:::figure id=02-04-01 | name=资源编译与驱动 DLL 内嵌加载链 | dir=TD
+node n1 "resources.rc" blue
+node n2 "windres 三架构<br/>生成 .syso" teal
+node n3 "WIREGUARD_VERSION<br/>_ARRAY / _STR 宏" amber
+node n4 "manifest.xml<br/>RT_MANIFEST" purple
+node n5 "wireguard.dll<br/>RCDATA 资源" purple
+node n6 "go build<br/>load_wgnt_from_rsrc" teal
+node n7 "dll_fromrsrc_windows.go<br/>lazyDLL.Load" green
+node n8 "memmod.LoadLibrary<br/>内存 PE 映射" green
+node n9 "sign.bat + signtool<br/>Authenticode 签名" red
+node n10 "locales/ gotext<br/>zgotext.go" gray
+edge n1 -> n2 "windres 输入"
+edge n3 -> n2 "版本宏注入"
+edge n4 -> n1 "资源引用"
+edge n5 -> n1 "RCDATA 声明"
+edge n2 -> n6 "syso 参与 go build"
+edge n6 -> n7 "构建标签选中"
+edge n7 -> n8 "FindResource 后加载"
+edge n6 -> n9 "编译后签名"
+edge n10 -> n6 "生成源码参与编译"
+edge n3 -> n1 dashed "FILEVERSION 宏"
+:::
+
+图 02-04-01 中 `wireguard.dll RCDATA 资源` 到 `resources.rc` 的边对应 `resources.rc:17`，`go build` 到 `dll_fromrsrc_windows.go` 的边对应 `//go:build load_wgnt_from_rsrc` 与 `GOFLAGS` 的 `-tags`，`memmod.LoadLibrary` 是 `driver/memmod/memmod_windows.go` 提供的内存 PE 映射实现。这条图把「为什么官方构建不需要附带独立 DLL」讲成了一条可追踪的链，而不是一句结论。
+
+本地化代码生成与 Authenticode 代码签名的时序见图 02-04-02。
+
+:::figure id=02-04-02 | name=本地化生成与签名时序 | dir=TD
+node n1 "set GoGenerate=yes" blue
+node n2 "go generate ./..." blue
+node n3 "gotext.go main()" teal
+node n4 "locales/<lang>/<br/>messages.gotext.json" purple
+node n5 "go build gotext<br/>临时 exe" teal
+node n6 "zgotext.go 生成" green
+node n7 "go build 主程序" green
+node n8 "sign.bat<br/>SigningProvider" amber
+node n9 "TimestampServer" amber
+node n10 "signtool sign /tr" red
+edge n1 -> n2 "触发"
+edge n2 -> n3 "go:generate 指令"
+edge n3 -> n4 "读取语言目录"
+edge n3 -> n5 "编译 gotext 工具"
+edge n5 -> n6 "update -out"
+edge n4 -> n6 "提供译文"
+edge n6 -> n7 "参与编译"
+edge n8 -> n10 "提供证书"
+edge n9 -> n10 "提供时间戳"
+edge n7 -> n10 "待签名 exe"
+edge n10 -> n1 dashed "完成一轮构建"
+:::
+
+图 02-04-02 里 `go generate ./...` 是 `build.bat:42` 与 `gotext.go:3` 的 `//go:generate go run gotext.go` 的展开，`zgotext.go 生成` 对应 `gotext.go:67` 的 `update -out=zgotext.go`，`signtool sign /tr` 对应 `build.bat:53` 带 `/tr` 与 `/td sha256` 的 RFC3161 时间戳签名。虚线表示生成与签名完成后回到新一轮构建，二者都不改变编译主链的结构。
+
+### 5. 配置/命令/代码实例
+
+先看本地化的最小操作序列，来自 `docs/buildrun.md` 的「Optional: Localizing」六步中的关键三步与 `build.bat:40` 的触发条件。本册只给构建相关命令，配置键与运行开关写「完整配置见 04-xx」。
+
+```bat
+rem 对应 docs/buildrun.md 的 Optional: Localizing
+mkdir locales\zh-CN
+set GoGenerate=yes
+build
+copy locales\zh-CN\out.gotext.json locales\zh-CN\messages.gotext.json
+```
+
+再看签名配置与验证。`sign.bat` 的两行变量与 `docs/buildrun.md` 一致；验证签名可用 `signtool verify`，以下命令块给出配置与检查命令，证书指纹与时间戳地址为示例，需对照实际版本核验。
+
+```bat
+rem 根目录 sign.bat
+set SigningProvider=/sha1 1b3afa5e2a76bb51f00020002dccadb165689c33
+set TimestampServer=http://timestamp.digicert.com
+
+rem 构建后在有 signtool 的 shell 中验证
+signtool verify /pa /v amd64\wireguard.exe
+```
+
+下面是一次带签名的构建在 `:sign` 阶段的典型输出。示例输出，具体格式需对照实际版本核验。
+
+```text
+[+] Signing
+Successfully signed: x86\wireguard.exe
+Successfully signed: x86\wg.exe
+Successfully signed: amd64\wireguard.exe
+Successfully signed: amd64\wg.exe
+Successfully signed: arm64\wireguard.exe
+Successfully signed: arm64\wg.exe
+Number of files successfully Signed: 6
+Number of warnings: 0
+Number of errors: 0
+```
+
+逐行判读如下。首行 `[+] Signing` 来自 `build.bat:52`，说明 `build.bat:50` 与 `build.bat:51` 对 `SigningProvider`、`TimestampServer` 的非空检查都通过，且执行 shell 的 PATH 里能找到 `signtool.exe`；若两个变量任一为空，这一行根本不会出现，构建会直接跳到 `[+] Success`，这是「静默跳过」而非失败。随后六行 `Successfully signed` 逐一对应 `build.bat:53` 参数列表里的六个文件：`x86\wireguard.exe`、`x86\wg.exe`、`amd64\wireguard.exe`、`amd64\wg.exe`、`arm64\wireguard.exe`、`arm64\wg.exe`，顺序与三个 `:build_plat` 调用一致，说明 `wg.exe` 也被纳入签名范围——这一点常被忽略，未签名的 `wg.exe` 在严格策略环境下同样可能被拦截。倒数三行是 signtool 的汇总：`Number of files successfully Signed: 6` 正常值应恒为 6，少于 6 说明有文件缺失或某次签名失败；`Number of warnings: 0` 与 `Number of errors: 0` 正常值均为 0，任一非 0 都应停下来核对证书是否有效、时间戳服务是否可达。命令里的 `/fd sha256` 指定文件摘要算法，`/tr "%TimestampServer%" /td sha256` 指定 RFC3161 时间戳及其摘要算法，`/d WireGuard` 是签名描述；`installer/build.bat:46` 对 MSI 使用同样的参数但描述改为 `WireGuard Setup`，`installer/build.bat:67` 对 `customactions.dll` 又改为 `WireGuard Setup Custom Actions`。需要提醒的是，这里的签名是用户态二进制的 Authenticode 签名；内核驱动能否装载还取决于驱动本身的微软签名，`docs/buildrun.md` 因此建议先安装捆绑了微软签名驱动的官方发行版，二者不是同一件事。
+
+最后给出资源编译的等价命令对照，说明 Windows 与 Linux 两侧如何把同一份 `resources.rc` 编成不同架构的 syso。
+
+```bash
+# Linux 侧，Makefile:50 的 amd64 规则展开
+x86_64-w64-mingw32-windres -DWIREGUARD_VERSION_ARRAY=1,1,1,0 -DWIREGUARD_VERSION_STR=1.1.1 -O coff -c 65001 -I .deps/wireguard-nt/bin/amd64 -i resources.rc -o resources_amd64.syso
+```
+
+```bat
+rem Windows 侧，build.bat:74 的 :build_plat 片段
+i686-w64-mingw32-windres -I ".deps\wireguard-nt\bin\x86" -DWIREGUARD_VERSION_ARRAY=1,1,1,0 -DWIREGUARD_VERSION_STR=1.1.1 -i resources.rc -o "resources_386.syso" -O coff -c 65001
+```
+
+两侧参数集合一致：`-D` 注入版本宏、`-O coff` 指定输出格式、`-c 65001` 指定 UTF-8、`-I` 指向对应架构的驱动 DLL 目录、`-i resources.rc` 指定输入、`-o` 指定输出。差异只在 windres 前缀与路径分隔符，而输出名 `resources_amd64.syso` 与 `resources_386.syso` 必须分别与 `GOARCH=amd64`、`GOARCH=386` 对齐。`1.1.1` 与 `1,1,1,0` 为当前快照值，需对照实际版本核验。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，自举的 Go 版本与 `go.mod` 的语言版本不是一回事。`go.mod:3` 声明 `go 1.26.0`，`Makefile:30` 与 `build.bat:16` 下载 `go1.27.1` 编译器；前者管语言与模块语义，后者是实际发行版。二者不一致是正常的，不要为了让数字对齐去改 `go.mod`，也不要在系统里另装一个 Go 来代替 `.deps/go/bin`——一旦 `PATH` 前缀被覆盖，`-trimpath`、`-buildvcs=false` 之外的可复现性假设就失效了。具体数值需对照实际版本核验。
+
+第二，`.overlay/overlay.json` 的内容本册不臆测。`Makefile:1`、`Makefile:13` 与 `build.bat:76` 都引用它，但当前 master 快照未附带 `.overlay` 目录，`.gitignore` 也未列出。Go 的 `-overlay` 允许把磁盘路径映射到替代文件以替换编译输入，本册只采用这一通用语义与「它参与构建」的事实；其具体映射条目、生成方式与是否由 `go:generate` 产出，需对照实际版本核验，定位路径为上述三处。遇到 `go build` 报 overlay 文件缺失时，应从上游实际版本取回原文件，不要手写猜测内容。
+
+第三，RCDATA 资源名与 `FindResource` 参数必须一致。`resources.rc:17` 写的是 `wireguard.dll RCDATA wireguard.dll`，`driver/dll_fromrsrc_windows.go:39` 用 `d.Name` 作为资源名查找 `RT_RCDATA`；若改动资源名或文件查找路径，运行期会报 `Unable to find "..." RCDATA resource`。同理，`-I .deps/wireguard-nt/bin/<arch>` 指向的目录必须真的含对应架构的 DLL，三个架构各一套，缺一即在该架构的资源阶段失败。这是「改构建脚本时最不容易被发现的破坏」之一。
+
+第四，本地化生成有副作用，不能随手跑。`gotext.go` 会 `os.Rename` 语言目录、把 `out.gotext.json` 覆盖为 `messages.gotext.json`，`Makefile:88` 的 `crowdin` 更会删除 `locales/` 下除 `en` 外的全部目录。因此 `set GoGenerate=yes` 与 `make crowdin` 都应在确认翻译包来源后执行，并先备份 `locales/`；`docs/buildrun.md` 给出的流程是「先建目录、带 `GoGenerate=yes` 跑一次 build 拿到 `messages.gotext.json`、翻译、再跑一次 build、测试、迭代」，本身就是为了避免把生成物当成手工维护文件。`zgotext.go` 是生成物，不应直接编辑。翻译平台方面，`docs/buildrun.md` 明确当前使用 CrowdIn，译者应把译文提交到该平台以便合入仓库。
+
+第五，签名是「可选但影响部署」的旁路，且分三类对象。`build.bat:53` 签六个 exe，`installer/build.bat:46` 签 MSI，`installer/build.bat:67` 签各架构的 `customactions.dll`；三者共用 `SigningProvider` 与 `TimestampServer`，但 `/d` 描述不同。`build.bat:50` 与 `build.bat:51` 只在变量都非空时才签名，缺一个就静默跳过，因此「构建成功但产物未签名」是配置问题而非编译问题。更重要的是不要把用户态 Authenticode 签名与内核驱动的微软签名混为一谈：`docs/buildrun.md` 说明驱动一般需要有效的 Microsoft 签名，官方建议先安装正式发行版以获得签名驱动，或用 `quickinstall.bat` 自制安装包。签名失败时的排错顺序应是：确认 `sign.bat` 在仓库根目录且被 `call`、确认 `signtool.exe` 在 PATH、确认证书未过期且时间戳服务可达、最后核对 `signtool` 汇总里的 errors 计数。
+
+第六，`GOFLAGS` 里的每个标志都有实际后果，别随意删减。去掉 `-tags load_wgnt_from_rsrc` 会切到 `dll_fromfile_windows.go`，产物退化为依赖磁盘 DLL；去掉 `-ldflags="-H windowsgui -s -w"` 会让程序变成控制台子系统且体积变大；去掉 `-trimpath` 或 `-buildvcs=false` 会破坏可复现性；`-v` 只是打印包名，删掉不影响产物但会丢失排障信息。`build.bat:76` 与 `Makefile:1` 逐字一致，说明两侧必须同步修改，`Makefile:76` 的 `remaster` 也只改下载项而非 GOFLAGS 本身。运行时的驱动 IOCTL 结构字段见 05-05，适配器与内存加载机制见 06-05，`driver/memmod` 模块见 07-04，`l18n` 模块见 07-12。
+
+### 7. 小结与延伸阅读
+
+本篇把四个黑盒拆成了四条可追踪的链：自举工具链让 `go build` 使用仓库内锁定的 `go1.27.1`；`windres` 把 `resources.rc` 里的清单、图标、多语言版本信息与 `wireguard.dll` RCDATA 编成 `resources_<GOARCH>.syso`，再由 `load_wgnt_from_rsrc` 标签选中 `dll_fromrsrc_windows.go` 与 `memmod` 完成运行期内存加载；`GoGenerate=yes` 经 `gotext.go` 生成 `zgotext.go` 把译文固化进二进制；`sign.bat` 的两个变量驱动 `signtool` 对六类文件做带时间戳的 Authenticode 签名。两张图分别固定了资源到运行期的回读链、以及生成与签名的时序，命令加输出的组合把「签名阶段应当看到什么」变成了可判读的清单。
+
+最需要带走的三条结论是：自举版本与 `go.mod` 语言版本要分开看；资源名、windres 的 `-I` 路径与 `GOARCH` 三者必须对齐，否则该架构产物静默缺资源；签名与本地化都是「有则做、无则跳过」的旁路，缺签名不会让 `build` 失败，却会让部署阶段卡在驱动装载。跨册引用按约定写作（字段见 05-xx ｜ 配置见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）；本篇涉及的 `driver.Adapter` 与 IOCTL 字段见 05-05 与 05-06，命令行开关见 04-04，驱动加载与适配器创建机制见 06-05，`driver/memmod` 与 `l18n` 模块见 07-04 与 07-12。延伸阅读建议接 02-05，看 WiX 如何把三个架构的 exe 与 `wg.exe` 收进 MSI、`customactions.c` 如何编排安装时序、以及 `quickinstall.bat` 如何把构建与安装串成一步。所有版本号、哈希、证书指纹与时间戳地址均为示例或当前快照值，需对照实际版本核验，定位路径已在正文逐处给出。
+
+---
+
+## 02-05 MSI 安装包、WiX、驱动签名与多架构产物
+
+### 1. 背景与动机
+
+到 02-04 为止，构建链已经能稳定产出三个架构的 `wireguard.exe` 与 `wg.exe`，但这些都还是「文件」，不是「产品」。Windows 上真正可分发、可被组策略批量部署、可被企业软件仓库管理的单元是 MSI。`docs/buildrun.md` 为此单独设了「Optional: Creating the Installer」一节：进入 `installer` 目录后执行 `build`，脚本会自己下载、校验并解压所需依赖。`README.md` 则进一步区分了两种面向用户的形态：`wireguard-installer.exe` 是一个引导安装器，负责按架构挑选最新版本、下载 MSI、检查签名与哈希后再安装；Standalone MSIs 则直接给系统管理员用于批量分发。理解这条从 exe 到 MSI 再到引导安装器的链，是 02 册的收尾，也是 03 册企业部署的前置。
+
+本篇之所以要把「WiX」「自定义动作」「驱动签名」「多架构」放在一篇里讲，是因为它们在 `installer/` 目录下是同一套构建的四个侧面。`installer/build.bat` 先为每个架构用 mingw gcc 编译 `customactions.c` 成 DLL，再用 WiX 的 `candle` 把 `wireguard.wxs` 编成 `.wixobj`、用 `light` 链接成 MSI；`wireguard.wxs` 里声明的八个自定义动作决定了安装、升级、卸载期间服务与适配器如何被处理；`UpgradeCode`、程序文件目录与 `-arch` 参数共同决定了三份 MSI 互不冲突；而签名环节既覆盖 MSI 与 `customactions.dll`，又牵涉到内核驱动能否装载这一外部前提。任何一面单独看都不完整。
+
+按去重铁律，本篇只讲打包与分发相关的构建事实。`.conf` 配置键、`wireguard.exe` 开关、`sc` / PowerShell 服务命令、`wg(8)` 子命令与注册表策略的完整清单写「完整配置见 04-xx」；`conf.Config`、`driver` IOCTL 结构等逐字段定义写「字段见 05-xx」；适配器创建、服务启停、更新校验等机制写「原理见 06-xx」；`updater`、`installer`、`manager` 等模块能力写「模块见 07-xx」。能力边界依旧要守住：本仓库是 Windows 官方客户端，内核数据面由外部项目 WireGuardNT 提供，MSI 里打包的是用户态程序而非内核协议实现，也不包含 Linux `wg-quick` 的任何语义。
+
+### 2. 核心概念
+
+第一个概念是「WiX 3.14 工具集是自带的」。`installer/build.bat:24` 下载 `wix314-binaries.zip`（来自 WiX 3.14 RTM 的 release），用 `installer/build.bat:56` 的 `CertUtil -hashfile` 校验 SHA256 后解压到 `.deps/wix/bin`；`installer/build.bat:36` 设 `WIX=%BUILDDIR%.deps\wix\`，`:msi` 子过程再调用 `%WIX%bin\candle` 与 `%WIX%bin\light`。这与主 `build.bat` 自举 Go、llvm-mingw、ImageMagick 是同一套思路：不依赖宿主机预装 WiX。哈希与压缩包名为时效性数值，需对照实际版本核验，定位路径为 `installer/build.bat:24`。
+
+第二个概念是「两份编译参数分离」。`installer/build.bat:37` 至 `installer/build.bat:39` 定义 `CFLAGS=-O3 -Wall -std=gnu11 -DWINVER=0x0A00 -D_WIN32_WINNT=0x0A00 -municode -DUNICODE -D_UNICODE -DNDEBUG`、`LDFLAGS=-shared -s -Wl,--kill-at ... --export-all-symbols`、`LDLIBS=-lmsi -lole32 -lshlwapi -lshell32 -luuid -lntdll`，用于把 `customactions.c` 编成各架构的 `customactions.dll`；`installer/build.bat:13` 至 `installer/build.bat:17` 定义 `WIX_CANDLE_FLAGS=-nologo -dWIREGUARD_VERSION=...` 与 `WIX_LIGHT_FLAGS=-nologo -spdb -sice:ICE39 -sice:ICE61 -sice:ICE03`，用于 WiX 编译与链接。`-spdb` 不生成 pdb，三个 `-sice:` 显式跳过 ICE39、ICE61、ICE03 三条内部一致性检查，属于该项目为消除特定误报而做的固定取舍。版本号同样从 `..\version\version.go` 提取（`installer/build.bat:10`），与主构建共用单一版本源。
+
+第三个概念是「一个 wxs 模板编出三份 MSI」。`installer/build.bat:40` 至 `installer/build.bat:42` 三次调用 `:msi`，参数依次是 `x86 i686 x86`、`amd64 x86_64 x64`、`arm64 aarch64 arm64`：第一个是产物目录名，第二个是 gcc/windres 前缀，第三个是传给 `candle -arch` 的 WiX 架构名。`wireguard.wxs:8` 至 `wireguard.wxs:23` 用 `<?if $(var.WIREGUARD_PLATFORM) = "amd64" Or ...?>` 预处理指令按平台选择 `PlatformProgramFilesFolder` 与 `UpgradeCode`：amd64/arm64 用 `ProgramFiles64Folder` 且各有独立 GUID，x86 用 `ProgramFilesFolder`，另保留一个 `arm` 分支。三份 MSI 因此拥有不同的 UpgradeCode，互不视为同一产品的升级候选，文件名形如 `dist\wireguard-%~1-%WIREGUARD_VERSION%.msi`（`installer/build.bat:71`），当前快照版本为 `1.1.1`，需对照实际版本核验。
+
+第四个概念是「三类签名各管一段」。`installer/build.bat:67` 对每个架构的 `customactions.dll` 签名，`installer/build.bat:46` 对三份 MSI 签名，`build.bat:53` 对六个 exe 签名，三者共用 `sign.bat` 提供的 `SigningProvider` 与 `TimestampServer`。但内核驱动是另一回事：`docs/buildrun.md` 明确写道，WireGuard 需要驱动，而驱动一般需要有效的 Microsoft 签名，因此建议先安装一份官方发行版（其中捆绑了微软签名的驱动），再运行自己编译的程序，或者用 `quickinstall.bat` 自制安装包。也就是说，本仓库能签的是用户态二进制与 MSI，内核驱动的微软签名属于 WireGuardNT 外部项目的发布环节，本仓库源码里没有对应实现，需对照实际版本核验。更新链的信任模型另在 `docs/attacksurface.md` 里：服务端用 `b2sum -l 256 *.msi > list` 加 `signify -S -e -s release.sec -m list` 产出 `list.sec`，客户端 TLS 下载并验 Ed25519 签名，再验 MSI 的 BLAKE2b-256，最后 `msiexec.exe /qb!- /i` 安装；这套签名与 Authenticode 不是同一层。
+
+### 3. 关键数据结构与源码位置
+
+本节固定 `wireguard.wxs` 的产品结构、组件与自定义动作。`wireguard.wxs:26` 至 `wireguard.wxs:38` 的 `Product` 用 `Id="*"`（每次构建自动生成新 ProductCode）、`Name="WireGuard"`、`Language="1033"`、`Version="$(var.WIREGUARD_VERSION)"`、`Manufacturer="WireGuard LLC"`；`Package` 用 `InstallerVersion="500"`、`Compressed="yes"`、`InstallScope="perMachine"`、`ReadOnly="yes"`，`MediaTemplate EmbedCab="yes"` 把 CAB 嵌进 MSI。`wireguard.wxs:45` 至 `wireguard.wxs:51` 的一组 Property 固定了 `ARPPRODUCTICON`、`ARPURLINFOABOUT`、`ARPNOMODIFY`、`DISABLEADVTSHORTCUTS`、`DISABLEROLLBACK`、`MSIDISABLERMRESTART`、`MSIRMSHUTDOWN`，其中 `DISABLEROLLBACK=yes` 与 03 册的卸载升级顺序直接相关。`wireguard.wxs:56` 至 `wireguard.wxs:61` 的 `MajorUpgrade` 设 `AllowDowngrades="no"`、`AllowSameVersionUpgrades="yes"`、`Schedule="afterInstallExecute"`、`IgnoreRemoveFailure="yes"`。
+
+组件方面，`wireguard.wxs:76` 至 `wireguard.wxs:87` 的 `ComponentGroup` 只有两个 Component：`WireGuardExecutable` 以 `..\$(var.WIREGUARD_PLATFORM)\wireguard.exe` 为 `KeyPath`，挂一个 `ProgramMenuFolder` 下的开始菜单快捷方式，并放了一个注释为「A dummy to make WiX create ServiceControl table for us」的空 `ServiceControl`；`WgExecutable` 放 `wg.exe` 并用 `<Environment Id="PATH" ... Part="last" Value="[WireGuardFolder]" />` 把安装目录追加到系统 PATH。真正要停用/删除哪些服务，由自定义动作在运行期动态填充 `ServiceControl` 表，这正是那个 dummy 存在的理由。目录结构为 `TARGETDIR` → `$(var.PlatformProgramFilesFolder)` → `WireGuardFolder`（`Name="WireGuard"`），另有 `ProgramMenuFolder`。
+
+八个自定义动作与其源码入口如下表所示，C 侧导出函数位于 `installer/customactions.c`，行号为当前快照值。
+
+| 动作 Id | DllEntry / 源码位置 | 执行时机与条件 | 作用 |
+|---|---|---|---|
+| `CheckWinVer` | `customactions.c:103` | After FindRelatedProducts，NOT REMOVE | 拒绝过旧 Windows |
+| `CheckWow64` | `customactions.c:119` | After FindRelatedProducts，NOT REMOVE | 拒绝 WOW64 场景 |
+| `EvaluateWireGuardServices` | `customactions.c:216` | After FindRelatedProducts | 评估服务并填充 ServiceControl 表 |
+| `LaunchApplicationAndAbort` | `customactions.c:289` | After CostFinalize，ProductState=5 且非 REMOVE 且非 DO_NOT_LAUNCH | 重配置时启动并中止安装 |
+| `EvaluateWireGuardComponents` | `customactions.c:318` | After ProcessComponents | 评估组件安装状态 |
+| `KillWireGuardProcesses` | `customactions.c:413` | After StopServices，deferred 且 Impersonate=no | 结束残留进程 |
+| `RemoveConfigFolder` | `customactions.c:565` | After DeleteServices，deferred | 卸载时清理配置目录 |
+| `RemoveAdapters` | `customactions.c:587` | Before RemoveFiles，deferred | 卸载时清理适配器 |
+| `LaunchApplication` | 无 DllEntry，FileKey=wireguard.exe | Before InstallFinalize，非 DO_NOT_LAUNCH | 安装后异步启动 UI |
+
+`DO_NOT_LAUNCH` 是 `wireguard.wxs:125` 与 `wireguard.wxs:165` 两处条件的共同开关，`docs/enterprise.md` 也把它列为批量分发时抑制安装后启动的属性；`wireguard /update` 可由计划任务每日触发，`wireguard /removedriver` 用于无适配器时的驱动移除，这些命令的完整清单写「配置见 04-04」「原理见 06-12」。`installer/fetcher/` 是另一套独立工程：其 `Makefile:17` 定义 `TARGET := wireguard-installer.exe`、`Makefile:18` 用 `CC := i686-w64-mingw32-clang`、`Makefile:16` 用一串 `-Wl,/delayload:` 参数（注释说明需要 llvm-mingw），`Makefile:36` 的 `sign` 目标先 `deploy` 再在远端用 `signtool` 签名并回传。它对应 `README.md` 里那个「按架构挑选并下载 MSI」的引导安装器，源码为 `fetcher.c`、`crypto.c`、`filelist.c`、`load_config.c`、`systeminfo.c` 等，模块能力写「模块见 07-12」。
+
+### 4. 关键流程与调用链
+
+`installer/build.bat` 的主链可以拆成六段。`installer/build.bat:19` 判断 `.deps\prepared` 是否存在，不存在则进入 `:installdeps` 下载并校验 `wix-binaries.zip`；`installer/build.bat:34` 若存在 `..\sign.bat` 就 `call` 它；`installer/build.bat:40` 至 `installer/build.bat:42` 三次调用 `:msi`；每次 `:msi` 在 `installer/build.bat:63` 用 `%CC% %CFLAGS% %LDFLAGS% -o "%~1\customactions.dll" customactions.c %LDLIBS%` 编译自定义动作 DLL，随后按 `SigningProvider`/`TimestampServer` 是否非空决定是否在 `installer/build.bat:67` 对它签名；接着 `installer/build.bat:69` 用 `candle %WIX_CANDLE_FLAGS% -dWIREGUARD_PLATFORM="%~1" -out "%~1\wireguard.wixobj" -arch %3 wireguard.wxs` 编译模板；`installer/build.bat:71` 用 `light %WIX_LIGHT_FLAGS% -out "dist\wireguard-%~1-%WIREGUARD_VERSION%.msi" "%~1\wireguard.wixobj"` 链接成 MSI；最后 `installer/build.bat:43` 至 `installer/build.bat:46` 若签名变量齐备，对 `dist\wireguard-*-%WIREGUARD_VERSION%.msi` 统一签名。
+
+安装期的动作顺序由 `wireguard.wxs:99` 至 `wireguard.wxs:166` 的 `InstallExecuteSequence` 决定：`FindRelatedProducts` 之后依次跑 `CheckWinVer`、`CheckWow64`、`EvaluateWireGuardServices`；`CostFinalize` 之后按 `ProductState=5 AND NOT REMOVE AND NOT DO_NOT_LAUNCH` 判断是否走 `LaunchApplicationAndAbort`；`ProcessComponents` 之后跑 `EvaluateWireGuardComponents`；`StopServices` 之后以 deferred、`Impersonate=no` 跑 `KillWireGuardProcesses`；卸载路径上 `DeleteServices` 之后跑 `RemoveConfigFolder`、`RemoveFiles` 之前跑 `RemoveAdapters`；`InstallFinalize` 之前按 `(&WireGuardFeature = 3) AND NOT DO_NOT_LAUNCH` 以 `Return="asyncNoWait"` 启动 `wireguard.exe`。这条顺序体现了两个设计要点：所有会动服务与适配器的动作都在 deferred 且非模拟上下文里执行（需要 LocalSystem 权限），而「装完是否弹 UI」统一受 `DO_NOT_LAUNCH` 控制。
+
+`quickinstall.bat` 把整条链串成一步：先 `call .\build.bat` 编出三架构 exe，再 `call .\installer\build.bat` 编出三份 MSI，然后用 `reg query ... /f WireGuard` 找出已安装项并 `msiexec /qb /x` 卸载旧版本，最后从 `version\version.go` 提取版本号并执行 `msiexec /qb /i installer\dist\wireguard-%PROCESSOR_ARCHITECTURE%-%WIREGUARD_VERSION%.msi` 安装当前架构的新 MSI。这是开发机上「编完立刻替换本机安装」的最快路径，也解释了为什么 `docs/buildrun.md` 把它作为自制安装包的推荐方式。整个构建与安装时序见图 02-05-01。
+
+MSI 构建期与安装期动作的衔接关系见图 02-05-01。
+
+:::figure id=02-05-01 | name=MSI 构建与安装时序 | dir=TD
+node n1 "installer/build.bat" blue
+node n2 "wix314-binaries.zip<br/>candle / light" teal
+node n3 "customactions.c<br/>编译 DLL" amber
+node n4 "wireguard.wxs" purple
+node n5 "candle -arch<br/>生成 wixobj" purple
+node n6 "light -spdb<br/>链接 MSI" green
+node n7 "dist/wireguard-<arch><br/>-<version>.msi" green
+node n8 "CheckWinVer /<br/>CheckWow64" red
+node n9 "EvaluateWireGuard<br/>Services" red
+node n10 "KillProcesses /<br/>RemoveAdapters" red
+edge n1 -> n2 "下载 WiX"
+edge n1 -> n3 "gcc 编译"
+edge n1 -> n4 "读取 wxs"
+edge n3 -> n5 "Binary 引用"
+edge n4 -> n5 "candle 输入"
+edge n5 -> n6 "wixobj 输入"
+edge n6 -> n7 "产物落盘"
+edge n7 -> n8 "安装时先校验"
+edge n8 -> n9 "顺序执行"
+edge n9 -> n10 "卸载/升级动作"
+edge n1 -> n7 dashed "三架构循环"
+:::
+
+图 02-05-01 中 `customactions.c` 到 `candle -arch` 的边对应 `wireguard.wxs:43` 的 `<Binary Id="customactions.dll" SourceFile="$(var.WIREGUARD_PLATFORM)\customactions.dll" />`，`wireguard.wxs` 到 `candle` 的边对应 `installer/build.bat:69`，而 `dist` 之后三条红色节点是安装期而非构建期的动作，用同一张图连起来是为了强调「构建期决定 DLL，安装期执行 DLL」。三架构循环用虚线表示 `:msi` 被调用三次，每次 `WIREGUARD_PLATFORM` 不同。
+
+### 5. 配置/命令/代码实例
+
+先看官方给出的安装包构建命令，来自 `docs/buildrun.md` 的「Optional: Creating the Installer」。本册只给构建与分发的最小必要命令，完整命令清单写「完整配置见 04-xx」。
+
+```bat
+cd installer
+build
+```
+
+下面是一次全新 `installer\build.bat` 的典型输出。示例输出，具体格式需对照实际版本核验。
+
+```text
+[+] Downloading wix-binaries.zip
+[+] Verifying wix-binaries.zip
+[+] Extracting wix-binaries.zip
+[+] Cleaning up wix-binaries.zip
+[+] Compiling x86
+[+] Linking x86
+[+] Compiling amd64
+[+] Linking amd64
+[+] Compiling arm64
+[+] Linking arm64
+[+] Signing
+[+] Success.
+```
+
+逐行判读如下。前四行是 `installer/build.bat:52` 至 `installer/build.bat:29` 的 `:download` 与解压清理流程在打印「下载、校验、解压、清理」，对应 `wix314-binaries.zip`；与根 `build.bat` 不同，这里只下载一个依赖包，因为 gcc、windres 等已由根构建的 `.deps` 提供（`installer/build.bat:35` 把 `%BUILDDIR%..\.deps\bin` 加进 PATH）。`[+] Compiling x86` 来自 `installer/build.bat:62`，表示正在用 `i686-w64-mingw32-gcc` 把 `customactions.c` 编成 `x86\customactions.dll`；紧随的 `[+] Linking x86` 来自 `installer/build.bat:70`，表示 `candle` 已生成 `x86\wireguard.wixobj`、`light` 正在链接 `dist\wireguard-x86-<version>.msi`。`Compiling`/`Linking` 必须按 x86、amd64、arm64 成对出现三组，缺任一组都说明 `:msi` 中途失败；只出现 `Compiling` 而没有 `Linking` 通常指向 `candle` 或 `light` 报错，例如 `-dWIREGUARD_PLATFORM` 传错导致 `wireguard.wxs:22` 的 `<?error Unknown platform ?>` 被触发。`[+] Signing` 来自 `installer/build.bat:45`，仅当 `SigningProvider` 与 `TimestampServer` 都非空时出现，此处签的是 `dist\wireguard-*-%WIREGUARD_VERSION%.msi`；注意每个架构的 `customactions.dll` 在 `:msi` 内部还有一次独立签名（`installer/build.bat:66` 的 `[+] Signing x86` 之类），不会打在这一行。最后 `[+] Success.` 是 `installer/build.bat:49` 的成功标志。异常特征是出现 `[-] Failed with error #`（`installer/build.bat:75`），此时应据上一阶段判断是 WiX 下载校验、gcc 编译、candle、light 还是 MSI 签名失败；`<version>` 为当前快照值 `1.1.1`，需对照实际版本核验。
+
+再看三份 MSI 的架构差异，理解为何它们不能互相替换。下表按架构列出编译前缀、UpgradeCode 前缀、程序文件目录与产物文件名，四列必须成套对应，错一列就会装到错误目录或无法升级。
+
+| 架构 | 编译前缀与 GOARCH | UpgradeCode 前缀 | 程序文件目录 | MSI 文件名 |
+|---|---|---|---|---|
+| `x86` | `i686` / `386` | `62754a0a` | `ProgramFilesFolder` | `wireguard-x86-<version>.msi` |
+| `amd64` | `x86_64` / `amd64` | `5e5a1da5` | `ProgramFiles64Folder` | `wireguard-amd64-<version>.msi` |
+| `arm64` | `aarch64` / `arm64` | `7ff76099` | `ProgramFiles64Folder` | `wireguard-arm64-<version>.msi` |
+
+三个 `UpgradeCode` 完整 GUID 分别为 `62754a0a-fee9-4412-b739-e8da2e7c9405`、`5e5a1da5-ba36-404d-92ec-41050d1c799c`、`7ff76099-8940-4d3e-99b9-50a3b3ca1ee9`（`wireguard.wxs:14` 至 `wireguard.wxs:20`），另有仅保留分支的 `arm` 用 `f90bca59-9627-431d-92b4-a5c2d9a529ff`。GUID 与版本号为当前快照值，需对照实际版本核验。
+
+最后给出 `quickinstall.bat` 的等价核心步骤与 `wireguard.wxs` 中 `DO_NOT_LAUNCH` 的两处条件，供定制安装流程时参考。
+
+```bat
+rem quickinstall.bat 的核心四步（节选）
+call .\build.bat
+call .\installer\build.bat
+msiexec /qb /x <已安装的 WireGuard 产品码>
+msiexec /qb /i installer\dist\wireguard-%PROCESSOR_ARCHITECTURE%-%WIREGUARD_VERSION%.msi
+```
+
+```xml
+<!-- wireguard.wxs:125 与 wireguard.wxs:165 的 DO_NOT_LAUNCH 条件 -->
+<!-- <Custom Action="LaunchApplicationAndAbort" After="CostFinalize">ProductState=5 AND NOT REMOVE AND NOT DO_NOT_LAUNCH</Custom> -->
+<!-- <Custom Action="LaunchApplication" Before="InstallFinalize">(&amp;WireGuardFeature = 3) AND NOT DO_NOT_LAUNCH</Custom> -->
+```
+
+`quickinstall.bat` 里卸载旧版本用的是 `reg query HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall /s /d /c /e /f WireGuard` 配合 `findstr` 找出产品码后逐个 `msiexec /qb /x`，上面的代码块用 `<已安装的 WireGuard 产品码>` 语义化表示该循环变量，实际脚本不依赖任何外部清单。企业批量分发时若不想让安装后弹出 UI，可在 `msiexec` 命令行传入 `DO_NOT_LAUNCH`，这正是 `docs/enterprise.md` 提到的用法；命令完整形式与属性取值写「配置见 04-04」「配置见 04-07」。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，先跑根 `build.bat` 再跑 `installer\build.bat`。`wireguard.wxs:78` 与 `wireguard.wxs:84` 的文件源是 `..\$(var.WIREGUARD_PLATFORM)\wireguard.exe` 与 `..\$(var.WIREGUARD_PLATFORM)\wg.exe`，也就是根目录三个架构目录下的产物；`installer/build.bat:35` 还把 `..\.deps\bin` 加进 PATH 以复用根构建自举的 gcc/windres。若跳过根构建直接进 `installer`，`light` 会因找不到源文件而失败，错误信息往往指向 `wireguard.wxs` 而非「请先编译主程序」。`quickinstall.bat:8` 至 `quickinstall.bat:10` 的固定顺序正是为规避这一点。
+
+第二，不要把 MSI 签名等同于驱动签名。`installer/build.bat:46` 与 `build.bat:53` 签的是用户态二进制与安装包，而 `docs/buildrun.md` 说明内核驱动一般需要有效的 Microsoft 签名，官方建议先安装捆绑了微软签名驱动的正式发行版，或用 `quickinstall.bat` 自制安装包。本仓库源码里没有内核驱动签名流程，WireGuardNT 驱动的签名属于外部项目的发布环节，具体方式需对照实际版本核验，定位路径为 `docs/buildrun.md` 的 Running 段与 `docs/attacksurface.md` 的 WireGuardNT 段。把「MSI 已签名」当成「隧道一定能起来」是部署期最典型的误判。
+
+第三，`UpdateCode` 与 `ProductCode` 的语义要分清。`wireguard.wxs:27` 的 `Id="*"` 让每次构建生成新的 ProductCode，而 `UpgradeCode` 按架构固定；`MajorUpgrade` 的 `AllowSameVersionUpgrades="yes"` 允许同版本重装、`AllowDowngrades="no"` 拒绝降级。因此跨架构迁移不是升级而是「卸载旧的、装新的」，`docs/enterprise.md` 与 03-06 会展开这一顺序；不要试图用 amd64 的 MSI 去覆盖 x86 安装。三个 `UpgradeCode` 互不相同正是为了让这在 Windows Installer 层面自然成立。
+
+第四，`DO_NOT_LAUNCH` 与 `DISABLEROLLBACK` 都会改变安装行为。`wireguard.wxs:125` 与 `wireguard.wxs:165` 表明该属性同时抑制「重配置时启动并中止」与「安装完成后启动 UI」两条动作，适合 GPO 静默分发；`wireguard.wxs:49` 的 `DISABLEROLLBACK=yes` 与 `wireguard.wxs:50` 至 `wireguard.wxs:51` 的 `MSIDISABLERMRESTART`、`MSIRMSHUTDOWN` 则影响失败回滚与重启管理器行为。定制 wxs 前应先理解这些 Property 的既有取值，避免为了「装完不弹窗」而误删 `MajorUpgrade` 或组件声明。服务停用与适配器清理由 deferred 自定义动作承担，改它们的执行顺序可能把卸载变成残留服务，机制细节写「原理见 06-10」，服务命令写「配置见 04-06」。
+
+第五，引导安装器与 Standalone MSI 是两条不同的分发路径。`README.md` 说明 `wireguard-installer.exe` 会挑选架构对应的最新版本、下载 MSI、检查签名与哈希后安装；它对应的源码在 `installer/fetcher/`，由独立的 `Makefile` 用 `i686-w64-mingw32-clang` 与一串 `-Wl,/delayload:` 参数编译，且 `sign` 目标先 `deploy` 到远端再由 `signtool` 签名回传（`installer/fetcher/Makefile:36` 至 `installer/fetcher/Makefile:38`）。而 `installer\build.bat` 产出的是三份 Standalone MSI，供管理员直接分发。两者不要混为一谈：`fetcher` 不在 `installer/build.bat` 的调用链上，也不随 `quickinstall.bat` 构建。更新器下载并校验后执行 `msiexec.exe /qb!- /i`（`docs/attacksurface.md`），其信任模型与 GPO 分发不同，机制写「原理见 06-12」，模块写「模块见 07-11」。
+
+第六，签名变量缺失是静默跳过。`installer/build.bat:43` 至 `installer/build.bat:44` 与 `build.bat:50` 至 `build.bat:51` 一样，只要 `SigningProvider` 或 `TimestampServer` 为空就跳到 `:success`，不报错；`installer/build.bat:64` 至 `installer/build.bat:65` 对 `customactions.dll` 也做同样判断。因此「构建成功但 MSI 与 DLL 未签名」是配置问题，排错顺序应是：确认 `sign.bat` 在仓库根目录且被两处 `call`、确认 `signtool.exe` 在 PATH、确认证书未过期且时间戳服务可达、核对 `signtool` 汇总的 errors 计数。所有证书指纹、时间戳 URL、WiX 压缩包哈希与版本号均为示例或当前快照值，需对照实际版本核验。
+
+### 7. 小结与延伸阅读
+
+本篇把 02 册的最后一环补齐：`installer/build.bat` 自举 WiX 3.14，用 mingw gcc 把 `customactions.c` 编成各架构 DLL，经 `candle` 与 `light` 把同一个 `wireguard.wxs` 模板编成三份带独立 `UpgradeCode` 的 MSI；`wireguard.wxs` 通过两个 Component、八个自定义动作、一组 Property 与 `MajorUpgrade` 决定了安装、升级、卸载的完整时序；`DO_NOT_LAUNCH` 统一控制装后是否启动 UI；`quickinstall.bat` 把根构建、安装包构建、卸载旧版、安装新版串成一步；`installer/fetcher/` 则是与 Standalone MSI 并列的引导安装器工程。图 02-05-01 把构建期与安装期放在一张图里，两张表格分别固定了自定义动作入口与三架构差异，命令加输出的组合让「一次安装包构建应当看到什么」可逐行判读。
+
+最需要带走的三条结论是：MSI 依赖根构建产出的 exe 与 `wg.exe`，顺序不能颠倒；MSI 签名、DLL 签名与内核驱动的微软签名分属三层，前者不影响后者能否装载；三份 MSI 因 `UpgradeCode` 与程序文件目录不同而互不覆盖，跨架构迁移必须走卸载再安装。跨册引用按约定写作（字段见 05-xx ｜ 配置见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）；本篇涉及的服务与配置结构字段见 05-08 与 05-09，MSI 属性与命令见 04-04、04-06、04-07，服务启停与更新校验机制见 06-10 与 06-12，`updater`、`installer`、`manager` 模块见 07-11、07-12 与 07-08。延伸阅读建议接 03-02（命令行静默安装与 `DO_NOT_LAUNCH`）、03-05（GPO 批量分发）与 03-06（卸载、升级、驱动移除与多架构迁移），把本篇的产物真正部署到 Windows 主机上。事实依据仍以 `upstream_src/` 为准：`installer/build.bat`、`installer/wireguard.wxs`、`installer/customactions.c`、`installer/fetcher/Makefile`、`quickinstall.bat`、`docs/buildrun.md`、`docs/enterprise.md`、`docs/attacksurface.md`、`README.md` 与 `version/version.go` 已逐处给出，凡时效性数值均标注需对照实际版本核验。
+
+

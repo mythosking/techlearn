@@ -1,0 +1,353 @@
+# wireguard-windows 技术资料 · 06 技术原理（分片 C）
+
+## 06-11 IPC 与环形日志
+
+### 1. 背景与动机
+
+wireguard-windows 的进程模型决定了它必须自带一套进程间通信。manager 服务以 LocalSystem 身份常驻，负责安装与卸载隧道服务、读写 DPAPI 加密的配置、枚举 WTS 会话；UI 则以每个已登录管理员的**高完整性提升令牌**运行，只负责画窗口与把用户操作翻译成请求。两者之间隔着会话边界与完整性级别，不能共享全局变量，也不适合让 UI 直接去操作 `%ProgramFiles%\WireGuard\Data` 下的密文与 SCM。上游给出的答案是「最小能力注入」：manager 在创建 UI 进程之前准备好三根匿名管道和一个只读的日志共享内存映射，把这四个句柄的数值直接写进命令行，再通过 `CreateProcessAsUser` 让 UI 继承。`docs/attacksurface.md` 用两句话概括了这条设计——manager 暴露 "Extensive IPC using unnamed pipes, inherited by the UI process"，以及 "a readable `CreateFileMapping` handle to a binary ringlog shared by all services, inherited by the UI process"。这两句话就是本篇的两条主线：控制通道与观测通道。
+
+第二个动机是可观测性。一个 manager 服务加 N 个隧道服务，是 N+1 个独立进程，如果各写各的文本日志，排障时要收集 N+1 个文件、各自滚动、各自编码，时间线还对不齐。ringlogger 的做法是让所有进程映射**同一个文件**的同一段视图，写者只推进一个 32 位原子游标，读者按游标遍历 2048 个槽位，于是一份 `log.bin` 就是全机的统一诊断视图，`wireguard /dumplog` 只是这段共享内存的另一个只读读者。
+
+第三个动机是权限降级后的可用性。UI 进程启动后立刻调用 `elevate.DropAllPrivileges(false)` 丢弃全部特权，此后它唯一还能做的事情就是往三根已经打开的管道里读写字节、以及读那段只读映射。即使 UI 被攻破，攻击者拿到的也只是「一个能发 RPC 的客户端」，而不是「一个能任意读写系统路径的高权限进程」。
+
+本篇的边界需要先说清：这里讲的是 manager 与 UI 之间的用户态 RPC，以及跨进程环形日志的格式与读写链；UI 如何被挑选、令牌如何复制属于 06-10，配置字段本身属于 05-02 与 05-09，`/ui` 开关的参数表属于 04-04。本文只点到为止，不重复字段全集。
+
+### 2. 核心概念
+
+**三根匿名管道，六个端点。** `manager/service.go` 里连续调用三次 `os.Pipe()`，每次返回「读端、写端」一对 `*os.File`。服务端保留 `ourReader`、`ourWriter`、`ourEvents`，把另外三个端点 `theirWriter`、`theirReader`、`theirEvents` 交给 UI。方向是刻意交叉的：UI 往 `theirWriter` 写请求，manager 从 `ourReader` 读；manager 往 `ourWriter` 写响应，UI 从 `theirReader` 读；manager 往 `ourEvents` 写通知，UI 从 `theirEvents` 读。之所以用匿名管道而不是命名管道，是因为匿名管道没有名字，因而不存在命名管道抢注（pipe squatting）、也不需要在 `\\.\pipe\` 命名空间里设计并审计一条 DACL；安全性完全等价于「谁手里有句柄」，而句柄的扩散被 `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` 精确限制为四个。代价是无法跨机器、无法被第三方工具直接连接，但对一个本机 UI 来说这恰好是优点。
+
+**gob 编码而不是文本行协议。** 请求的第一个字段永远是 `MethodType`（一个 `int`），服务端 `ServeConn` 先解出方法号，再按方法号决定后续解几个参数；响应则按「返回值 + 错误字符串」的固定顺序编码。选 gob 有三个实际理由：其一，两端都是同一份 Go 代码编译出来的，不存在跨语言兼容负担；其二，`conf.Config` 这种嵌套结构可以直接编码，不需要手写序列化；其三，gob 是自描述的类型流，新增一个方法只要两端同时升级即可。代价是它**不是**人类可读的文本协议，用十六进制编辑器看管道内容没有意义，调试必须靠日志。
+
+**请求与通知分离。** 13 个 `MethodType` 走「一问一答」的同步语义，客户端用一把全局 `rpcMutex` 串行化，保证请求与响应不会错配；5 个 `NotificationType` 走单向广播，服务端编码一次、写给所有连接，客户端在独立 goroutine 里解码后分发给注册的回调。错误不直接编码 `error` 接口，而是先用 `errToString` 转成字符串，空串代表成功——这是 gob 无法可靠传输任意 `error` 实现时的通用做法，客户端 `rpcDecodeError` 再把非空串还原成 `errors.New`。
+
+**关于 `IPC_CONNECT` 一类常量。** 读者可能在别的资料里见过 `IPC_CONNECT`、`IPC_GET_VERSION`、`IPC_SET_TUNNEL`、`IPC_RELOAD_CONFIGURATION`、`IPC_SET_STATE`、`IPC_QUIT` 这组名字。需要明确：在本次核对的 master 快照中，对整个仓库执行 `grep -rn "IPC_CONNECT" .` 返回空结果，`manager/ipc_server.go` 与 `manager/ipc_client.go` 里也不存在这些字符串常量；本仓库 manager 侧的 IPC 只有上文这套 gob 方法号。那组 `IPC_*` 命名属于 UAPI 风格的文本 IPC（`get=1`、`set=1` 之类的键值行协议），由 wireguard-go 与 `wg(8)` 使用，与这里的实现不是一回事，切勿混写。若手上的发行版确实出现这些常量，需对照实际版本核验其定义位置。
+
+**环形缓冲的发布协议。** `ringlogger/logMem` 只有一个头：`magic`、`nextIndex`，后面跟 2048 个 `logLine`，每行 8 字节时间戳加 512 字节定长文本。写者用 `atomic.AddUint32(&nextIndex, 1) - 1` 抢一个槽位，取模落到具体行，然后**先**把 `timeNs` 清零、把整行清零，**再**把 `[tag] 正文` 拷进去，**最后**才写回 `timeNs` 与行首的 `[`。读者只认 `timeNs != 0` 且行内能找到 NUL 的行，因此不会读到写了一半的内容。这是一套无锁的单生产者假设被放宽到「多写者、允许轻微乱序」的折中，源码注释里也直说了 Race 的存在：超过 2048 个写者会互相踩踏，行序也可能轻微错位。
+
+### 3. 关键数据结构与源码位置
+
+控制通道的核心是 `ManagerService`——每个 UI 连接对应一个实例，它持有事件管道、事件锁与调用者的提升令牌；令牌是否为零直接决定 `StoredConfig` 会不会调用 `conf.Redact()` 抹掉私钥、`Delete`/`Create` 会不会返回 `ERROR_ACCESS_DENIED`。枚举与方法号定义在 `manager/ipc_client.go`，服务端分派在 `manager/ipc_server.go` 的 `ServeConn`。观测通道的核心是 `Ringlogger` 与 `logMem`：前者是进程内的视图对象，后者是映射到共享内存的定长布局。两者字段都已在 05-09 逐项列出，此处只给定位与职责。
+
+下表把两条通道上的关键对象、源码位置与硬约束并排列出，便于对照阅读。
+
+| 对象 | 源码位置 | 职责 | 关键约束 |
+|---|---|---|---|
+| `ManagerService` | `manager/ipc_server.go` | 单连接的 RPC 服务与事件出口 | `events` 可被置空，令牌决定权限 |
+| `MethodType` | `manager/ipc_client.go` | 13 个同步方法编号 | 两端必须同版本，否则错位 |
+| `NotificationType` | `manager/ipc_client.go` | 5 类单向通知 | 只允许服务端到客户端 |
+| `Ringlogger` | `ringlogger/ringlogger.go` | 映射视图、读写游标、只读标志 | 行长 512，标签最长 5 |
+| `logMem` | `ringlogger/ringlogger.go` | 共享头与 2048 个槽位 | `magic=0xbadbabe`，不符即清零 |
+
+`NewRinglogger` 负责「文件 → 截断到 `sizeof(logMem)` → `CreateFileMapping` → `MapViewOfFile`」，并把 `magic` 不匹配的旧文件整体清零；`NewRingloggerFromInheritedMappingHandle` 则是 UI 侧的入口，它把命令行里的十进制句柄字符串还原成 `windows.Handle`，以 `FILE_MAP_READ` 映射，因此 UI 里的 `Ringlogger` 是**只读**的，`WriteWithTimestamp` 会直接返回 `io.ErrShortWrite`。`ExportInheritableMappingHandle` 是第三个入口：它用同一个文件再建一个 `PAGE_READONLY` 映射并设置 `HANDLE_FLAG_INHERIT`，专供子进程继承。
+
+### 4. 关键流程与调用链
+
+**建链。** manager 服务在 `startProcess(session)` 里完成全部准备工作：先 `os.Pipe()` 三次，任意一次失败都要把已建好的端点逐个关闭再返回；随后 `IPCServerListen(ourReader, ourWriter, ourEvents, elevatedToken)` 起一个 goroutine，把服务实例登记进全局 `managerServices` 表并进入 `ServeConn` 循环；接着 `ringlogger.Global.ExportInheritableMappingHandle()` 导出一个可继承的只读映射句柄；最后调用 `launchUIProcess`。父子进程之间的握手完全靠命令行参数传递句柄数值，没有额外的协商报文。四个句柄从 manager 到 UI 的流向与两侧的消费者见图 06-11-01。
+
+:::figure id=06-11-01 | name=manager 与 UI 之间的四句柄传递 | dir=TD
+node n1 "Manager 服务<br/>LocalSystem" blue
+node n2 "三根无名管道<br/>读/写/事件" teal
+node n3 "日志映射句柄<br/>只读继承" teal
+node n4 "CreateProcessAsUser<br/>句柄白名单" amber
+node n5 "UI 进程<br/>高完整性" purple
+node n6 "gob RPC<br/>请求与响应" green
+node n7 "事件广播<br/>单向通知" green
+node n8 "ringlogger<br/>共享环形日志" gray
+edge n1 -> n2 "os.Pipe 三次"
+edge n1 -> n3 "Export 映射"
+edge n2 -> n4 "三个端点"
+edge n3 -> n4 "第四个句柄"
+edge n4 -> n5 "仅继承四个"
+edge n5 -> n6 "读写管道"
+edge n5 -> n7 "解码事件"
+edge n6 -> n1 dashed "方法调用"
+edge n7 -> n5 dashed "回调分发"
+edge n8 -> n3 "映射视图"
+:::
+
+`launchUIProcess` 的细节值得展开：它先 `CreateEnvironmentBlock` 为目标令牌准备环境块，再 `NewProcThreadAttributeList(1)` 并 `Update(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, 句柄数组)` 把允许继承的句柄**列成白名单**，然后调用 `CreateProcessAsUser`，把 `bInheritHandles` 参数传为 `len(handles) != 0`。这里 `bInheritHandles` 的取值不是恒为真，而是「有没有句柄要传」；配合白名单，子进程拿到的可继承句柄恰好是 `theirReader`、`theirWriter`、`theirEvents` 与日志映射这四个，其余一概不继承。创建成功后父进程立刻 `Close` 自己那一份 `their*` 端点与映射句柄，避免句柄泄漏导致管道永远不出现 EOF。
+
+**接管。** UI 侧 `main.go` 的 `/ui` 分支先判断当前令牌是否具备管理员能力，是则 `elevate.DropAllPrivileges(false)` 丢弃全部特权，然后 `pipeFromHandleArgument` 把 `os.Args[2..4]` 三个十进制串还原成 `*os.File`，用 `os.Args[5]` 调 `NewRingloggerFromInheritedMappingHandle(os.Args[5], "GUI")` 接管只读日志视图，最后 `InitializeIPCClient(readPipe, writePipe, eventPipe)` 启动解码 goroutine 并 `ui.RunUI()`。注意参数个数被严格限定为 6（程序名加五个参数），多一个少一个都会打印用法并退出。
+
+**一次 RPC。** 以 UI 点「启动隧道」为例：`Tunnel.Start()` 先取 `rpcMutex`，编码 `StartMethodType`，再编码隧道名，然后等待响应；服务端 `ServeConn` 解码方法号、解码隧道名，调用 `ManagerService.Start`，后者做地址冲突检查、异步停掉相交隧道、最终 `InstallTunnel(path)`；返回值被 `errToString` 转成字符串编码回去；客户端 `rpcDecodeError` 读到空串即成功。整条链上没有任何超时，管道断开（对端进程退出）表现为 `Decode` 返回 `io.EOF`，`ServeConn` 直接 `return` 并在 defer 逻辑里把该连接从 `managerServices` 摘除。这条同步链与旁路的事件通道画在一起，见图 06-11-02。
+
+:::figure id=06-11-02 | name=一次 IPC 方法调用与事件旁路 | dir=TD
+node n1 "Tunnel.Start()" blue
+node n2 "rpcMutex 加锁" gray
+node n3 "编码 MethodType<br/>与隧道名" teal
+node n4 "ServeConn 解码<br/>分派方法" amber
+node n5 "业务执行<br/>InstallTunnel" purple
+node n6 "编码 errStr<br/>返回" teal
+node n7 "rpcDecodeError<br/>还原 error" green
+node n8 "事件通道<br/>notifyAll" red
+edge n1 -> n2 "进入临界区"
+edge n2 -> n3 "写请求"
+edge n3 -> n4 "管道传输"
+edge n4 -> n5 "switch 分派"
+edge n5 -> n6 "结果"
+edge n6 -> n7 "响应"
+edge n5 -> n8 dashed "状态变化"
+:::
+
+**通知广播。** `notifyAll`（参数为通知类型、是否仅管理员、若干附加字段） 先把类型与所有附加字段编码进一个 `bytes.Buffer`，然后持读锁遍历 `managerServices`：若某连接的 `elevatedToken == 0` 而本次通知是 `adminOnly`（更新进度就是），跳过；否则起一个 goroutine，持该连接的 `eventLock`，`SetWriteDeadline(now+1s)` 后一次 `Write`。这个 1 秒截止时间是**背压保护**：受限 UI 如果故意不读，写超时后这次通知被丢弃，manager 不会被拖住。`docs/attacksurface.md` 也承认受限操作员可能「draining notifications too slowly」造成 DoS，这里的 deadline 是把损害限制在「丢通知」而不是「堵死服务」的缓解手段。`Quit` 时会先把 `s.events` 置空再删除登记，正是为了规避「通知投递到即将退出的连接」的竞态。
+
+**日志写入。** 每个进程启动时调用 `ringlogger.InitGlobalLogger(logFile, tag)`：manager 用 `"MGR"`，隧道服务用 `"TUN"`，UI 用 `"GUI"`，`/dumplog` 的读者用 `"DMP"`。该函数把 `log.SetOutput(Global)`、`log.SetFlags(0)`，并通过 `//go:linkname overrideWrite runtime.overrideWrite` 挂上 `globalWrite`——这是直接拦截运行时写文件描述符的路径，连 `println` 与 panic 输出都能进环形缓冲。`globalWrite` 用一块栈外的 `globalBuffer` 按行聚合，遇到换行或缓冲区满就整行提交，避免一条日志被拆成多行碎片。
+
+**日志读出。** 非连续模式走 `WriteTo`：读一次 `nextIndex`，从该位置起遍历 2048 个槽，跳过 `timeNs==0` 的空槽，按 `2006-01-02 15:04:05.000000` 格式化输出，因此输出的是「从最旧到最新」的环形顺序，而不是槽位物理顺序。连续模式走 `FollowFromCursor`：`CursorAll` 表示从当前最新处开始，之后每次返回新增行并把游标推进到 `i % maxLines`，`DumpTo` 外层每 100 毫秒轮询一次，写端关闭（`io.EOF`）时退出。
+
+### 5. 配置/命令/代码实例
+
+下面的 Go 片段摘自 `manager/service.go` 的建链逻辑，去掉了错误处理以外的枝节，保留句柄的顺序关系；四行 `FormatUint` 的顺序必须与 `/ui` 的参数顺序、以及 `main.go` 里 `os.Args[2..5]` 的解读顺序完全一致，任何一处调换都会让 UI 读到错误的管道方向。
+
+```go
+ourReader, theirWriter, err := os.Pipe()
+theirReader, ourWriter, err := os.Pipe()
+theirEvents, ourEvents, err := os.Pipe()
+IPCServerListen(ourReader, ourWriter, ourEvents, elevatedToken)
+theirLogMapping, err := ringlogger.Global.ExportInheritableMappingHandle()
+proc, err := launchUIProcess(path, []string{
+    path,
+    "/ui",
+    strconv.FormatUint(uint64(theirReader.Fd()), 10),
+    strconv.FormatUint(uint64(theirWriter.Fd()), 10),
+    strconv.FormatUint(uint64(theirEvents.Fd()), 10),
+    strconv.FormatUint(uint64(theirLogMapping), 10),
+}, userProfileDirectory, []windows.Handle{
+    windows.Handle(theirReader.Fd()),
+    windows.Handle(theirWriter.Fd()),
+    windows.Handle(theirEvents.Fd()),
+    theirLogMapping,
+}, runToken)
+```
+
+服务端把 `ourReader` 当请求来源、`ourWriter` 当响应去向、`ourEvents` 当通知去向；UI 侧恰好相反。`ExportInheritableMappingHandle` 返回的句柄在 `launchUIProcess` 返回后立即 `windows.CloseHandle`，父进程不保留副本。
+
+排障时最常用的观测入口是 `/dumplog`。它把共享映射以只读方式打开，按环形顺序打印全部有效行，时间戳精确到微秒，标签固定为三字母进程类别。下面是一段示例输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+2026-11-11 09:12:03.184220: [MGR] Starting WireGuard/1.1.1 (Windows 10.0.26100, amd64)
+2026-11-11 09:12:03.201554: [MGR] Starting UI process for user 'alice@CORP' for session 2
+2026-11-11 09:12:04.775901: [TUN] [home] Watching network interfaces
+2026-11-11 09:12:04.812330: [TUN] [home] Resolving DNS names
+2026-11-11 09:12:04.930871: [TUN] [home] Creating network adapter
+2026-11-11 09:12:05.004512: [TUN] [home] Using WireGuardNT/1.1
+2026-11-11 09:12:05.118074: [TUN] [home] Dropping privileges
+2026-11-11 09:12:05.204998: [TUN] [home] Setting interface configuration
+2026-11-11 09:12:05.446120: [TUN] [home] Startup complete
+2026-11-11 09:13:41.002773: [TUN] [home] Shutting down
+```
+
+判读这段输出要抓住四件事。第一，**标签是进程类别而非隧道名**：`[MGR]` 只有 manager 会写，`[TUN]` 后面的 `[home]` 才来自 `log.SetPrefix(fmt.Sprintf("[%s] ", config.Name))`，所以同一条隧道重启后会以相同的 `[TUN] [home]` 前缀继续写，无法凭前缀区分两次启动，只能看时间戳断点。第二，**时间戳是本地时间且不带时区**，跨时区收集日志时必须先统一时区，否则会把不同机器的事件排错序；微秒位是 `UnixNano` 直接格式化，不是采样值，同一毫秒内的多行仍有稳定先后。第三，**正常的启动序列有固定顺序**：`Watching network interfaces` → `Resolving DNS names` → `Creating network adapter` → `Using WireGuardNT/x.y` → `Dropping privileges` → `Setting interface configuration` → `Startup complete`，任何一步缺失或反复重试都指向具体阶段，例如 `Creating network adapter` 之后长时间没有下一行，通常是驱动未加载或适配器创建被安全软件拦截。第四，**`Shutting down` 是隧道服务退出的第一行而不是最后一行**，其后若没有新的启动日志，说明服务确实停了；若隔几秒又出现 `Watching network interfaces`，说明服务被恢复策略拉起，形成了重启循环。需要提醒的是，环形缓冲只有 2048 行，上述输出是「当前仍在缓冲区内」的部分，早于最旧槽位的记录已经被覆盖，不能据此断言「之前没发生过某事件」。
+
+日常采集可以用一条 PowerShell 管道同时完成过滤与落盘，`:tail` 模式会持续跟随新行，适合挂到日志采集器上：
+
+```powershell
+& "$env:ProgramFiles\WireGuard\wireguard.exe" /dumplog /tail |
+    Select-String -Pattern '\[TUN\]|\[MGR\]' |
+    Tee-Object -FilePath "$env:TEMP\wg-live.log"
+```
+
+`/dumplog` 要求标准输出句柄存在，重定向到文件或管道时该条件成立；若在无控制台的会话里直接运行，`GetStdHandle` 可能返回 0 并以 "Stdout must be set" 退出。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**不要把 gob 通道当成可信输入。** `ServeConn` 对解码错误一律 `return`，这挡住了崩溃，但挡不住资源消耗：攻击者只要持有一个受限 UI 的管道句柄，就可以持续发送畸形 gob 流或只发方法号不发参数，让服务端反复分配。`docs/attacksurface.md` 明确把「sending garbage data that Go's gob decoder isn't expecting」列为已知风险。实践上应把 `LimitedOperatorUI` 视为「降低而非消除」攻击面，非必要不开启。
+
+**一次慢调用会阻塞整个 UI。** 客户端只有一把 `rpcMutex`，`Start`、`Stop`、`WaitForStop` 都持锁等待服务端完成。若某个隧道停止耗时很长（服务处于 `StopPending`），UI 上其他按钮会一起卡住，表现为「界面无响应但进程还在」。排障时不要误判为 UI 死锁，先看 `[MGR]` 日志里对应方法的调用时间。
+
+**事件可能丢，且丢了不会重试。** `notifyAll` 的写截止时间是 1 秒，超时后错误被忽略；客户端解码 goroutine 一旦因 `io.EOF` 退出也不会重连。因此 UI 不能把「收到某条通知」当作状态真相，正确做法是收到通知后重新调用 `State()` 或 `Tunnels()` 拉一次全量状态——这也是 UI 里回调通常只做「标记脏 + 触发刷新」的原因。
+
+**只读映射不可写。** UI 侧的 `Ringlogger` 以 `FILE_MAP_READ` 映射，`readOnly` 为真，任何 `log.Printf` 落到 UI 的全局 logger 上都会返回 `io.ErrShortWrite`。如果自研组件想在 UI 里写日志，必须自己开一个可写映射，而不能复用这个继承句柄；否则会得到「日志静默丢失」的假象。
+
+**行长与标签是硬限制。** 单行有效正文最多 `512 - 1 - 3 - len(tag)` 字节，超出部分被**截断丢弃**而不是折行，超长配置或超长错误串会在日志里断在半句；标签最长 5 字符，超过直接 `ERROR_LABEL_TOO_LONG`。写日志时不要把整个配置结构体打进去，关键字段足够。
+
+**环形缓冲会覆盖。** 2048 行看着不少，但隧道频繁重连时几分钟就能写满。需要长期留存的场景应使用 `/dumplog /tail` 持续外送，而不是事后一次性 dump；也不要指望 `/dumplog` 有「清空」语义，它只读不写。
+
+**不要尝试用命名管道客户端连接。** 这套 IPC 没有名字，`\\.\pipe\WireGuard` 之类的路径不存在；第三方集成只能通过 `wireguard.exe` 命令行或 UI，不能自建客户端复用 gob 协议——协议没有版本协商，字段顺序变化会静默错位。
+
+### 7. 小结与延伸阅读
+
+本篇把 manager 与 UI 之间的控制通道和全机共享的观测通道拆开讲清：控制通道是「三根匿名管道 + gob 方法号 + 一把客户端互斥锁 + 一组单向通知」，安全性来自句柄白名单继承与令牌判定；观测通道是「一个文件、一段 2048×520 字节的映射、一个原子游标、一套先清零后发布的写入顺序」，可用性来自多进程共享与 `/dumplog` 的只读视图。两者共同构成 manager 服务的对外能力边界：UI 能做的事，严格等于它能在这四个句柄上做的事。
+
+延伸阅读建议按以下顺序展开：字段与枚举定义见 05-09；UI 进程如何被挑选、令牌如何复制见 06-10；`/ui` 与 `/dumplog` 的参数表见 04-04；manager 模块的整体能力见 07-08，ringlogger 与 services 模块见 07-10；实战采集脚本与日志判读见 08-01。若要在源码里继续追，先读 `manager/service.go` 的 `startProcess`，再读 `manager/ipc_server.go` 的 `ServeConn` 与 `notifyAll`，最后读 `ringlogger/ringlogger.go` 的 `WriteWithTimestamp` 与 `FollowFromCursor`，这三段合起来就是本篇的全部机制。
+
+## 06-12 更新链与签名校验
+
+### 1. 背景与动机
+
+自更新是桌面客户端里权限最高、也最容易被忽视的一条代码路径：它要在 LocalSystem 上下文里下载一个可执行安装包，然后以系统权限运行它。一旦这条链被撕开一个口子，攻击者不需要再找内核漏洞，只要让客户端「自愿」安装一个恶意 MSI 就完成了本地提权与持久化。因此 wireguard-windows 的更新器没有采用「TLS 下载即信任」的简单模型，而是把信任拆成两层：**清单签名**决定「哪些文件、哪个版本可以装」，**内容哈希**决定「下载到的字节是不是清单里那一个」。前者用内嵌的 Ed25519 公钥验证，后者用 BLAKE2b-256 校验，两者都通过才允许调用 `msiexec`。
+
+第二层动机是防降级。TLS 只能保证「你连的是 download.wireguard.com」，不能保证「服务器给你的版本比你现在的新」。如果攻击者能控制 DNS 或企业代理，就可以返回一个旧版本 MSI，把已知漏洞重新装回去。更新器把版本比较放在**签名保护之内**：`latest.sig` 里是一份带哈希的完整清单，客户端验签后才解析文件名、提取版本号，只接受严格大于当前 `version.Number` 的同架构包。签名清单因此同时承担了「完整性」与「新鲜性」两个职责。
+
+第三层动机是供应链的现实约束。发布机上有多个架构的 MSI，发布动作是「对全部 MSI 算哈希、把哈希清单签名、只上传签名后的清单」。`updater/signify.go` 顶部的注释把这条流水线写得很直白：`b2sum -l 256 *.msi > list`、`signify -S -e -s release.sec -m list`、上传 `list.sec`。私钥保存在 HSM 上（`docs/attacksurface.md`），构建机即使被攻破，没有 HSM 也签不出可被客户端接受的新清单。
+
+需要先划定边界：本篇讲的是**更新链的机制与校验顺序**，不重复 `/update` 开关的参数表（配置见 04-04），不重复 `DownloadProgress` 的字段定义（字段见 05-09），也不展开 MSI 内部结构与 WiX 打包（模块见 07-11、02-05）。另外，本仓库只负责 Windows 客户端的更新，不涉及服务端分发系统或 Linux 仓库的包管理。
+
+### 2. 核心概念
+
+**清单文件的三段结构。** signify 的「embedded signature」格式固定为三部分：第一行是以 `untrusted comment: ` 开头的说明文字，第二行是 base64 编码的签名块，第三行起是原始清单正文，三部分之间用换行分隔。签名块解码后是 74 字节：前 10 字节是算法标识与 8 字节 keyid（`Ed` 加发行密钥的标识），后 64 字节是 Ed25519 签名。公钥同样是 42 字节：10 字节前缀加 32 字节公钥。`readFileList` 因此做了三重校验——公钥必须解出 42 字节且以 `Ed` 开头；签名必须解出 74 字节且前 10 字节与公钥前 10 字节**逐字节相等**；最后 `ed25519.Verify(pub[10:], 正文, sig[10:])` 必须为真。keyid 相等这一条把「用另一把密钥签的合法签名」也挡掉了。
+
+**清单正文的每一行。** `b2sum -l 256` 的输出是「128 位十六进制哈希 + 两个空格 + 文件名」，所以解析用 `strings.Cut(line, "  ")`，而不是按单个空格切分——文件名里允许有空格，两个空格是唯一可靠的分隔符。哈希必须是 64 个十六进制字符（32 字节），否则整份清单作废。解析结果是一个 `map[string][32]byte`，键是文件名，值是 BLAKE2b-256 摘要。注意这份 map 的遍历顺序在 Go 里是随机的，`findCandidate` 依赖的不是顺序而是「第一个满足条件的」这一语义，因此同一版本多架构并存时不会互相干扰。
+
+**版本比较的边界。** `versionNewerThanUs` 把候选版本与 `version.Number` 都按 `.` 切段，逐段 `strconv.ParseUint(段, 10, 16)`，也就是每段最大 65535；缺失的段按 0 处理，因此 `1.2` 与 `1.2.0` 被判为相等。任何一段为空、非数字或超过 16 位上限，都会返回错误并让整次更新中止。比较采用「从高位到低位，第一处不同即定胜负」，这是标准的点分版本语义，但不支持 `1.2-beta` 这类预发布后缀——带后缀的文件名会在 `ParseUint` 处失败。
+
+**为什么是 BLAKE2b-256 而不是 SHA-256。** 这是 WireGuard 生态的一贯选择：协议内部用 BLAKE2s，工具链用 BLAKE2b，`b2sum` 是现成的发布工具。256 位输出与 SHA-256 等长，抗碰撞强度同级，且在 x86-64 上有成熟的优化实现。对更新器而言，算法选择的意义在于「发布端与客户端必须用同一个算法」，`blake2b.New256(nil)` 与 `b2sum -l 256` 的输出必须逐字节一致。
+
+**信任链的四个环节。** 内嵌公钥是根，`latest.sig` 是根签发的清单，清单里的哈希指向具体 MSI，MSI 再由 `msiexec` 安装。四个环节里只有第一个是「编译进二进制的常量」`releasePublicKeyBase64`，其余三个都在网络上传输，因此任何一环被替换都会在下一环校验时暴露。这条链的走向与每段的校验点见图 06-12-01。
+
+:::figure id=06-12-01 | name=更新链的信任传递与校验点 | dir=TD
+node n1 "内嵌 Ed25519 公钥" blue
+node n2 "latest.sig<br/>三段结构" teal
+node n3 "readFileList<br/>验签" amber
+node n4 "list 哈希表<br/>文件名到摘要" teal
+node n5 "findCandidate<br/>同架构更高版本" purple
+node n6 "MSI 下载<br/>BLAKE2b-256" amber
+node n7 "临时文件<br/>随机名与 ACL" gray
+node n8 "msiexec /qb!- /i" green
+edge n1 -> n3 "公钥与 keyid"
+edge n2 -> n3 "正文与签名"
+edge n3 -> n4 "解出条目"
+edge n4 -> n5 "版本比较"
+edge n5 -> n6 "构造下载路径"
+edge n6 -> n7 "边下边算"
+edge n7 -> n8 "独占路径"
+edge n6 -> n8 dashed "哈希不符即中止"
+:::
+
+**临时文件的权限模型。** 下载落盘不是随便找个目录：`msiTempFile` 在 `%WINDIR%\Temp` 下用 32 字节随机数命名，创建时附带 SDDL `O:SYD:PAI(A;;FA;;;SY)(A;;FR;;;BA)`——所有者是 SYSTEM，SYSTEM 完全控制，管理员只读，其他用户无权限；打开方式是 `CREATE_NEW`（不覆盖已有文件）加 `FILE_ATTRIBUTE_TEMPORARY`，并立刻 `MoveFileEx(name16, nil, MOVEFILE_DELAY_UNTIL_REBOOT)` 登记「重启后删除」。这一段设计针对的是「同目录其他用户预置同名文件」与「安装包残留」两类问题：随机名让预置不可行，ACL 让替换不可行，延迟删除让失败路径也不会留下可执行文件。
+
+### 3. 关键数据结构与源码位置
+
+更新器的状态很小：`UpdateFound` 只有文件名与 32 字节哈希两个成员；`fileList` 就是上文的 map；`DownloadProgress` 是进度通道的元素，含活动描述、已下载字节、总字节、错误与完成标志，字段逐项见 05-09；`tempFile` 在 `*os.File` 之外多存一个原始句柄，用来在「需要独占路径」与「需要按句柄删除」两种模式间切换。常量集中在 `updater/constants.go`：主机 `download.wireguard.com`、端口 443、强制 HTTPS、清单路径 `/windows-client/latest.sig`、MSI 路径模板 `/windows-client/%s`、文件名前缀 `wireguard-%s-`、后缀 `.msi`。注意清单路径在代码里叫 `latest.sig`，而发布注释与官方文档说的是上传 `list.sec`，两者是「服务器上的文件名」与「客户端请求的路径」两个概念，实际部署是否做了重命名或重定向，需对照实际版本核验。
+
+下表按校验顺序列出每个环节的算法、输入、失败后果与源码位置，可作为审阅更新链时的检查清单。
+
+| 环节 | 算法或机制 | 输入 | 失败处理 | 源码位置 |
+|---|---|---|---|---|
+| 构建判定 | `IsRunningOfficialVersion` | 版本与构建标记 | 直接禁用更新 | `updater/downloader.go` |
+| 清单验签 | Ed25519 + keyid 比对 | `latest.sig` 三段 | 中止，不解析正文 | `updater/signify.go` |
+| 哈希解析 | 十六进制解码 32 字节 | 清单正文每行 | 整份清单作废 | `updater/signify.go` |
+| 版本筛选 | 点分段 16 位整数比较 | 文件名中的版本 | 无候选则报无更新 | `updater/versions.go` |
+| 内容校验 | BLAKE2b-256 + 常量时间比较 | 下载字节流 | 删除临时文件并报错 | `updater/downloader.go` |
+| 安装执行 | `msiexec /qb!- /i` | 临时文件基名 | 非零退出码即报错 | `updater/msirunner.go` |
+
+`version.Number` 目前是 `1.1.1`，`version.Arch()` 返回 `runtime.GOARCH` 对应的架构串，`version.UserAgent()` 会拼进 WinHTTP 会话，服务端可据此统计。`manager/updatestate.go` 另有一套三态枚举：未知、发现更新、因非官方构建而禁用，配合 `checkForUpdates` 的抖动循环向 UI 广播。
+
+### 4. 关键流程与调用链
+
+**入口有两条。** 命令行 `wireguard /update` 直接 `for progress := range updater.DownloadVerifyAndExecute(0)`，令牌参数为 0 表示「当前进程可能不是 SYSTEM」，函数内部会走 `elevate.DoAsSystem` 再执行真正的下载；UI 侧则是点「检查更新」后发 `UpdateMethodType`，`ManagerService.Update` 以 `uintptr(s.elevatedToken)` 调用同一函数，令牌非零就直接在 manager 服务进程里跑。UI 路径还会起一个 goroutine 把进度通道里的每一项转成 `IPCServerNotifyUpdateProgress`，而 CLI 路径只是把进度打到标准错误。`DownloadVerifyAndExecute` 用 `atomic.CompareAndSwapUint32(&updateInProgress, 0, 1)` 保证全局同时只有一次更新，第二个调用者会立刻收到「An update is already in progress」。
+
+**检查阶段。** `checkForUpdate(keepSession=true)` 先判 `version.IsRunningOfficialVersion()`，非官方构建直接返回错误——这是为了防止第三方重新打包的客户端去装官方 MSI，把自己的补丁冲掉。随后建立 WinHTTP 会话（而不是 Go 的 `net/http`），连接 `download.wireguard.com:443`，`Get(latestVersionPath)` 取清单，用 `io.LimitReader` 把响应限制在 512 KiB 内，读全后交给 `readFileList` 验签解析，再 `findCandidate` 选包。会话与连接在这里**不关闭**，因为紧接着要用同一个连接下载 MSI，这也是 `keepSession` 参数存在的原因。
+
+**下载与校验阶段。** 先 `msiTempFile()` 建临时文件，再把 `DownloadProgress` 的 `Activity` 依次推进为 `Creating temporary file`、`Msi destination is` 后跟完整路径、`Downloading update`。`connection.Get(fmt.Sprintf(msiPath, update.name), false)` 发起第二个请求，`response.Length()` 若可得就填 `BytesTotal`；随后 `blake2b.New256(nil)` 建哈希器，`io.Copy(file, io.TeeReader(io.LimitReader(response, 100 MiB), pm))` 把「限流、边下边算、边报进度」三件事合成一条流水线：`LimitReader` 防超大响应打爆磁盘，`TeeReader` 让每个字节同时进文件和哈希器，`progressHashWatcher.Write` 累加 `BytesDownloaded` 并往通道推一份快照。拷贝结束用 `subtle.ConstantTimeCompare` 比较摘要与清单值——这里用常量时间比较是习惯性防御，哈希不是秘密，但避免给侧信道留口子。
+
+**安装阶段。** 校验通过后 `runMsi(file, userToken)`：取 `GetSystemDirectory()` 下的 `msiexec.exe`，把 stdin/stdout/stderr 全部指向 `os.DevNull`，工作目录设为临时文件所在目录，进程令牌设为传入的 `userToken`，参数是 `/qb!-`、`/i`、`filepath.Base(msiPath)`。这里用基名而不是全路径，是因为工作目录已经切到同目录，短命令行也少一个被截断或注入的面。`proc.Wait()` 后若 `!state.Success()` 就返回 `*exec.ExitError`。安装完成后 `defer` 链会删除临时文件；若此前已 `ExclusivePath()` 关闭句柄，则走 `DeleteFile`（并带一个源码里自认的 TOCTOU 注释）。
+
+整条链的成功路径与三个主要失败出口画在一起（图 06-12-02），便于对照日志定位卡点。
+
+:::figure id=06-12-02 | name=更新流程的状态推进与失败分支 | dir=TD
+node n1 "CheckForUpdate" blue
+node n2 "官方构建判定" amber
+node n3 "TLS 取 latest.sig" teal
+node n4 "验签失败即中止" red
+node n5 "无更高版本则结束" gray
+node n6 "下载并计算哈希" purple
+node n7 "哈希不符即删除" red
+node n8 "runMsi 静默安装" green
+edge n1 -> n2 "入口"
+edge n2 -> n3 "是官方构建"
+edge n2 -> n5 dashed "否：禁用更新"
+edge n3 -> n4 dashed "签名错误"
+edge n3 -> n6 "验签通过"
+edge n6 -> n7 dashed "摘要不一致"
+edge n6 -> n8 "摘要一致"
+:::
+
+**进度与状态回传。** `DownloadProgress` 通道容量 128，`progressHashWatcher` 每写一块就 `pm.c <- *pm.dp`，若消费端（CLI 的 for 循环或 UI 的转发 goroutine）跟不上，写者会阻塞在通道上，从而天然形成背压——下载会变慢但不会丢进度。UI 侧收到 `UpdateProgressNotificationType` 后更新进度条，收到 `Complete` 就关闭对话框；`checkForUpdates` 的定时循环则在 manager 启动后先抖动 2–5 分钟（避免全机同时打服务器），之后每小时一次，发现更新只通知一次，失败后按 4–6 分钟、25–30 分钟、小时级三档退避。
+
+### 5. 配置/命令/代码实例
+
+发布端的三条命令是整条信任链的起点。第一行对当前目录下所有 MSI 计算 256 位 BLAKE2b 并写入 `list`，第二行用 signify 以 `release.sec` 对 `list` 做嵌入签名、输出 `list.sec`，第三行把签名结果上传。签名文件里同时含有明文清单，因此分发时只需要一个文件。
+
+```text
+b2sum -l 256 *.msi > list
+signify -S -e -s release.sec -m list
+```
+
+生成的 `list.sec` 结构固定为三段：第一行 `untrusted comment: ` 开头，第二行是 base64 签名（解码 74 字节，前 10 字节为 `Ed` 加 keyid），第三行起每行是「64 字节哈希的十六进制 + 两个空格 + `wireguard-<arch>-<version>.msi`」。客户端的 `readFileList` 要求行数至少为三，且正文至少有一条有效记录，否则报 "Signature input has too few lines" 或 "No file hashes found in signed input"。
+
+客户端在管理员命令提示符下执行更新，并把标准错误重定向到文件；`/update` 的所有进度都走 `log`，而 `main.go` 的 `setLogFile` 会把日志指向标准错误（不存在时退回标准输出），所以重定向 `2>` 才能完整收集。
+
+```powershell
+& "$env:ProgramFiles\WireGuard\wireguard.exe" /update 2> "$env:TEMP\wg-update.log"
+Start-Sleep -Seconds 2
+Get-Content "$env:TEMP\wg-update.log"
+```
+
+一次成功更新的日志形如下面这样（示例输出，具体格式需对照实际版本核验）：
+
+```text
+Checking for update
+Creating temporary file
+Msi destination is `C:\Windows\Temp\3f9a5c0d7b1e48a2c6f0d9b3a7e5c1f28d4b6a0e2c9f7d5b1a3e8c6f0d4b2a97`
+Downloading update: 524288/5242880 (10.00%)
+Downloading update: 2621440/5242880 (50.00%)
+Downloading update: 5242880/5242880 (100.00%)
+Installing update
+```
+
+判读这段输出要注意五点。第一，**第一条 `Checking for update` 之前没有任何输出是正常的**，因为 `DownloadVerifyAndExecute` 先往通道塞一条 `Initializing`，而 CLI 只在 `Activity` 非空时打印，真正的网络请求失败会以 `Error:` 开头的行出现而不是抛异常。第二，**`Msi destination` 是反引号包裹的完整路径**，文件名是 64 个十六进制字符（32 字节随机数），目录固定为 `C:\Windows\Temp`；如果这里的文件名不是 64 位十六进制，或目录变成用户临时目录，说明二进制被改过，应立即停止并核查来源。第三，**进度行只在 `BytesTotal` 或 `BytesDownloaded` 大于零时带分数**，服务端不返回 `Content-Length` 时 `BytesTotal` 保持 0，进度会退化成只打印活动名，此时无法从百分比判断是否卡住，只能看文件是否继续增长。第四，**`Installing update` 之后没有 "完成" 字样**，因为 `Complete` 为真的那条进度不带 `Activity`，CLI 不打印；因此判断成功的唯一可靠依据是进程退出码为 0，日志末尾停在 `Installing update` 恰恰是正常形态。第五，**任何 `Error:` 行都意味着本次更新未完成**，常见文本包括 "The downloaded update has the wrong hash"（内容被替换或下载截断）、"Signature is invalid"（清单被改）、"Build is not official, so updates are disabled"（非官方构建）。
+
+如果要在脚本里做机器判定，应显式检查退出码，而不是匹配日志文本：
+
+```powershell
+$p = Start-Process -FilePath "$env:ProgramFiles\WireGuard\wireguard.exe" -ArgumentList '/update' -Wait -PassThru -WindowStyle Hidden
+if ($p.ExitCode -ne 0) { Write-EventLog -LogName Application -Source 'WireGuard' -EventId 1001 -EntryType Error -Message "update failed: $($p.ExitCode)" }
+```
+
+校验逻辑本身可以用一小段 Go 还原出来，下面这段对应 `readFileList` 的核心分支，省略了错误文案的构造但保留了全部判断顺序：先看公钥长度与 `Ed` 前缀，再切三段，再校验注释行、签名长度与 keyid，最后才 `Verify` 并逐行解析哈希。
+
+```go
+publicKeyBytes, err := base64.StdEncoding.DecodeString(releasePublicKeyBase64)
+if err != nil || len(publicKeyBytes) != ed25519.PublicKeySize+10 || publicKeyBytes[0] != 'E' || publicKeyBytes[1] != 'd' {
+    return nil, errors.New("Invalid public key")
+}
+lines := bytes.SplitN(input, []byte{'\n'}, 3)
+if len(lines) != 3 || !bytes.HasPrefix(lines[0], []byte("untrusted comment: ")) {
+    return nil, errors.New("Signature input is malformed")
+}
+signatureBytes, err := base64.StdEncoding.DecodeString(string(lines[1]))
+if err != nil || len(signatureBytes) != ed25519.SignatureSize+10 || !bytes.Equal(signatureBytes[:10], publicKeyBytes[:10]) {
+    return nil, errors.New("Signature bytes are incorrect")
+}
+if !ed25519.Verify(publicKeyBytes[10:], lines[2], signatureBytes[10:]) {
+    return nil, errors.New("Signature is invalid")
+}
+```
+
+这段顺序不能调换：如果先解析正文再验签，攻击者就能用畸形清单触发解析器的边界分支；先验签则保证后续所有解析都发生在「已被根密钥认可的字节」上。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**非官方构建永远收不到更新，这是设计而非故障。** `IsRunningOfficialVersion` 为假时，manager 日志会写 "Build is not official, so updates are disabled"，`/update` 也会以同样的错误退出。自编译或二次打包的客户端必须自建分发通道，不能指望官方清单里出现自己的文件名。
+
+**TOCTOU 窗口客观存在。** `ExclusivePath()` 为了满足 `msiexec` 对文件独占的要求，会先 `Close` 句柄再返回路径；从关闭到 `msiexec` 打开之间有一个窗口，`docs/attacksurface.md` 对此的表述是「Hopefully the permissions of `C:\Windows\Temp` are good enough that an attacker can't replace the MSI from beneath us」。ACL 把写权限限制在 SYSTEM，普通用户无法替换，但如果攻击者已经是 SYSTEM，更新链本身就不再是边界。加固方向是收紧 `C:\Windows\Temp` 的继承权限、监控该目录下 64 位十六进制命名的新文件。
+
+**`/qb!-` 不是完全静默，也不保证不重启。** `/qb` 是基本进度界面，`!` 隐藏取消按钮，末尾 `-` 抑制部分提示；组合的确切语义需对照 `msiexec` 文档核验。由于三个标准句柄都指向 NUL，任何需要交互的对话框都会表现为「进程挂住直到超时」，这正是企业环境里应当用计划任务在维护窗口执行 `/update` 的原因。
+
+**退出码 3010 会被当成失败。** `runMsi` 用 `state.Success()` 判断，只有 0 算成功；MSI 返回 3010（安装成功但需重启）时会被包装成 `*exec.ExitError` 上报为错误。实际是否会出现 3010 取决于 MSI 的自定义动作与驱动安装结果，需对照实际版本核验；运维脚本若看到 3010，应按「已安装、待重启」处理，而不是立刻重试。
+
+**版本段上限 65535，且不接受预发布后缀。** 发布流水线如果生成了 `1.2.3-rc1` 这样的文件名，客户端会在 `ParseUint` 处报 "Invalid version integer part" 并中止整次更新；版本号里也不应出现前导 `v`。命名规范必须与 `msiArchPrefix`、`msiSuffix` 严格一致，否则文件会被 `findCandidate` 静默跳过，表现为「服务器有包但客户端说没有更新」。
+
+**架构匹配靠文件名，不靠 MSI 元数据。** `findCandidate` 用 `version.Arch()` 拼前缀，x86 客户端只会看到 `wireguard-x86-` 开头的条目，从源头上避免了 32 位进程去装 64 位包。至于「32 位进程调用 64 位 `msiexec`」这个经典坑，本仓库用更前面的手段规避：`main()` 一开始就 `checkForWow64()`，在 WOW64 下直接报 "You must use the native version of WireGuard on this computer." 并退出，因此更新器不会以 32 位进程的身份运行在 64 位系统上。仍需留意的是 `GetSystemDirectory()` 在 WOW64 下会重定向到 `SysWOW64`，若将来放宽 WOW64 限制，这里必须改成 `Sysnative` 或改用 `SHGetKnownFolderPath`，需对照实际版本核验。
+
+**不要试图用自建清单替换官方清单。** 公钥是编译进二进制的常量，改 `list.sec` 只会让验签失败；同样，给 `msiexec` 手工传一个下载好的 MSI 会绕过全部校验，这也是为什么企业分发应使用 GPO 推 MSI 并保留 Authenticode 校验，而不是让用户自行下载安装包。
+
+**更新会中断隧道。** MSI 安装过程会停止并重装服务，所有隧道短暂断开；计划任务应避开业务高峰，并在更新后验证 `sc query WireGuardManager` 与隧道服务状态，而不是只看安装器退出码。
+
+### 7. 小结与延伸阅读
+
+更新链的本质是一条「根的信任逐级下传」的流水线：Ed25519 公钥验证清单，清单里的 BLAKE2b-256 验证 MSI，版本比较在签名保护之内完成，最终由 `msiexec` 以调用者提供的令牌静默安装。每一层都只信任上一层已经验证过的字节，任何一层失败都立即中止且不留下可执行的残留文件。理解了这条链，就能解释三类常见现象：为什么自编译版本永远提示「更新已禁用」，为什么服务器上明明有新包客户端却说没有更新（文件名或版本段不合规），以及为什么日志停在 `Installing update` 却实际上安装成功（完成事件不带活动描述，需看退出码）。
+
+延伸阅读：`DownloadProgress`、`tempFile` 等结构与枚举见 05-09；`/update`、`/removedriver` 等开关的参数与退出码见 04-04；更新器模块的能力边界见 07-11；DPAPI 配置存储与更新后的配置迁移见 06-03；企业环境下的计划任务与 GPO 分发见 03-05 与 08-05；更新失败后的排障路径见 08-03。源码侧建议按 `main.go` 的 `/update` 分支 → `manager/ipc_server.go` 的 `Update` → `updater/downloader.go` 的 `DownloadVerifyAndExecute` → `updater/signify.go` 的 `readFileList` → `updater/msirunner.go` 的 `runMsi` 的顺序读一遍，再回头看 `docs/attacksurface.md` 的 Updates 一节，两者可以逐句对应。
+

@@ -1,0 +1,1943 @@
+# wireguard-windows 技术资料 · 07 模块与特性介绍（分片 A）
+
+## 07-01 `conf` 配置管理模块
+
+### 1. 背景与动机
+
+在 Linux 上，一份 WireGuard 配置的落地过程通常由 `wg-quick` 这层 shell 脚本承担：它读 INI、调 `wg setconf`、加地址、加路由、改 `resolv.conf`、挂 `iptables`。Windows 客户端没有这样一层脚本宿主，配置必须以**结构化内存对象**的形态在四个完全不同的执行体之间流转：UI 的语法高亮编辑器要把用户输入的文本读进来再写回去；manager 服务要通过 IPC 把配置交给 UI 展示、并在启动前判断两条隧道是否抢同一段路由；tunnel 服务要在 LocalSystem 会话里把配置翻译成驱动能接受的连续字节块；`wg showconf` 这类运行时查询又要把驱动里的当前状态反向投影成一份可读配置。`conf` 包就是这四者的公共语言，它的语义一旦漂移，表现出来就是「用户在 UI 里点保存，隧道行为却变了」这类极难定位的问题。因此本模块的第一职责不是「解析」，而是**保真**：凡是用户没改的东西，写回去必须还是原样。
+
+第二个动机来自配置文本本身的跨平台属性。`.conf` 是 WireGuard 生态的交换格式，用户会从 Linux 服务器、从 `wg genkey` 的输出、从同事发来的聊天记录里复制粘贴。这意味着解析器必须容忍一堆「不规整但合法」的写法：键名大小写混用、逗号后带空格、地址只写 IP 不写掩码、注释与键值同一行、文件是 UTF-16 而不是 UTF-8。同时它又必须硬性拒绝一批「看起来能跑但一定出事」的配置：没有私钥的接口、没有公钥的 peer、越界的 MTU、连续的逗号。这种「宽容读、严格判」的组合，决定了 `conf` 里必须有一个显式的解析状态机和一个统一的错误类型，而不是几百行正则。
+
+第三个动机是安全与展示的分离。配置里最敏感的字段是 `PrivateKey` 与 `PresharedKey`，而 UI 进程虽然以高完整性令牌运行，却并不总是持有可解密的凭据上下文；IPC 服务端在把配置对象交给调用方之前必须能把密钥抹掉。于是 `conf.Config` 上出现了一个 `Redact()` 方法，它把私钥、四个脚本、全部注释清零，把 peer 公钥替换成「序号填充的假值」，只留下结构供界面渲染。这个方法是「配置对象可以安全地离开服务进程」这一契约的实现，也解释了为什么 UI 永远不该把一个 redacted 对象再存回磁盘。
+
+本册是全集「模块功能唯一权威源」，本篇只讲 `conf` 模块**能做什么、边界在哪、怎么用**。字段的逐项定义交给 05 册（字段见 05-02、05-03、05-04），配置键的完整语义与取值交给 04 册（配置见 04-01、04-02、04-03），解析与规范化的机制细节交给 06 册（原理见 06-02）。需要提前明确的能力边界是：`conf` 不实现 `wg-quick` 的 `iptables`、`resolvconf`、`%i` 占位符与 `SaveConfig` 语义；`Table` 只被映射成「是否向系统路由表写 AllowedIPs」这一个布尔量，不接受 Linux 路由表编号的语义；四个脚本键在 `conf` 里只是四个字符串，是否执行由 tunnel 服务读取注册表开关后决定（模块见 07-05）。
+
+### 2. 核心概念
+
+**双表示与单一真源**。模块对外只有两种形态：`string`（WgQuick 文本）与 `*conf.Config`（内存模型）。所有入口都收敛到两个函数：`FromWgQuick(s, name)` 与 `(*Config).ToWgQuick()`。前者不接触磁盘，后者不接触加密，读写文件的事情由 `store.go` 负责。这种切分让「解析」可以单独测试（`conf/parser_test.go` 就是纯字符串进、结构出），也让 UI 的编辑器可以在不落盘的情况下反复往返。
+
+**三态解析机**。`parser.go` 里定义了 `parserState` 的三个取值：`notInASection`、`inInterfaceSection`、`inPeerSection`。整个解析是一个逐行循环，每行先按 `#` 切成「代码段 + 注释段」，再判断是否为空行、是否是段头、是否含 `=`。段头只认 `[interface]` 与 `[peer]` 两种（大小写不敏感，且不允许带值），其余任何键在 `notInASection` 状态下出现都直接报错「Line must occur in a section」。这个状态机刻意不支持嵌套、不支持 `[Peer]` 之前的全局键，因为 WireGuard 的配置语法本来就没有这些概念。
+
+**注释保真模型**。注释不是被丢弃后重新生成的，而是被挂到结构上的三个位置：段头之前的整段注释进 `SectionComments.Header.Before`，段头行尾的注释进 `Header.Suffix`，某个键之前的注释与行尾注释进 `SectionComments.Lines[key]`（key 统一转小写）。写回时 `writer.go` 的 `writeLine` 先吐 `Before` 的每一行，再吐「键 = 值」，再在行尾补一个空格加 `Suffix`。这套模型能覆盖 99% 的手写配置，但有两个已知的失真点：同一段里重复出现的同名键，其注释会被合并到同一个 map 槽位；键名的大小写会在写回时被规范成 `PrivateKey`、`AllowedIPs` 这类固定写法。
+
+**规范化而非原样回放**。`ToWgQuick()` 的输出顺序是硬编码的：先 `PrivateKey`，再 `ListenPort`、`Address`、`DNS`、`MTU`、四个脚本、`Table`，然后每个 peer 依次 `PublicKey`、`PresharedKey`、`AllowedIPs`、`Endpoint`、`PersistentKeepalive`，每个 `[Peer]` 之前强制空一行。列表统一用「逗号 + 空格」连接。这意味着「读进来再写出去」在字节层面并不等价，只在语义层面等价；`Table = main` 或 `Table = 1234` 会被归一化成 `Table = auto`，这是读者在比对文件差异时必须预期到的行为。
+
+**字面去重与语义判重是两件事**。`DeduplicateNetworkEntries()` 用 `netip.Prefix.String()` 作为 map 键，只去掉**文本完全相同**的重复项；`10.0.0.5/24` 与 `10.0.0.0/24` 会被当成两个不同条目同时保留，尽管它们描述的是同一段网络。真正带掩码语义的比较发生在两个地方：写路由时用 `allowedip.Masked()` 作为目的前缀（见 `tunnel/addressconfig.go`），以及 `IntersectsWith` 判断两条隧道是否冲突时同时比较「主机位前缀」与「掩码后前缀」。
+
+**冲突判定是模块级能力**。`(*Config).IntersectsWith(other)` 先把本方所有接口地址展开成「主机位前缀 + 掩码前缀」两类键，再把所有 peer 的 AllowedIPs 掩码后放入同一个集合，然后用对方的地址与 AllowedIPs 去命中。manager 的 `Start` 正是靠它实现「启动新隧道前先停掉抢同一段路由的旧隧道」：命中就异步 `Stop`，若对方还在 `TunnelStarting` 状态则直接拒绝并提示「请等待某隧道完成激活」。这条规则是 Windows 客户端特有的，因为 Windows 的路由表是全局的，两条隧道同时宣告 `0.0.0.0/0` 只会有一条真正生效。
+
+**运行态投影**。`FromDriverConfiguration(interfaze *driver.Interface, existingConfig *Config)` 是反向路径：它从驱动读回的当前配置里取私钥、监听端口、peer 公钥、endpoint、keepalive 与收发计数、最后握手时间，而把「驱动不保存的东西」——地址、DNS、MTU、脚本、`TableOff`——从磁盘上的 `existingConfig` 原样搬过来。这个方法的存在说明一个事实：驱动只持有数据面需要的最小子集，`conf` 才是完整语义的持有者。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与函数、给真实路径、给交叉引用，不展开任何字段表——这是 07 全册与 06 全册共同的去重铁律。顶层容器是 `conf.Config`（含名称、接口段、peer 切片、尾部注释），接口段是 `conf.Interface`，peer 是 `conf.Peer`，注释模型是 `conf.Comments` 与 `conf.SectionComments`，错误类型是 `conf.ParseError`（只带 `why` 与 `offender` 两个私有字段，`Error()` 输出「原因: "原文"」）。密钥类型 `conf.Key` 是 32 字节数组，`Public()` 走 `ecdh.X25519()` 派生，`NewPrivateKey()` 生成后按 Curve25519 的要求做钳位（首字节 `&248`，末字节 `&127|64`）。
+
+下表给出本模块的类型与函数分工，便于按「我要改什么」直接定位文件；字段细节请回查 05 册对应篇（字段见 05-02 ｜ 配置见 04-01 ｜ 原理见 06-02）。
+
+| 对象/函数 | 模块角色 | 源码位置 | 主要消费方 |
+|---|---|---|---|
+| `Config` | 一份配置的完整内存表示 | `conf/config.go` | UI、manager、tunnel |
+| `Interface` | 接口段语义（地址、MTU、DNS、脚本） | `conf/config.go` | `tunnel/service.go` |
+| `Peer` | peer 段语义与运行时计数 | `conf/config.go` | `writer.go`、UI 状态列 |
+| `FromWgQuick` | 文本到模型的唯一入口 | `conf/parser.go` | `store.go`、编辑器 |
+| `ToWgQuick` | 模型到文本的规范化输出 | `conf/writer.go` | `Save`、编辑器、导出 |
+| `ToDriverConfiguration` | 模型到 IOCTL 连续内存块 | `conf/writer.go` | `tunnel`、`interfaceWatcher` |
+| `FromDriverConfiguration` | 驱动状态反投影成模型 | `conf/parser.go` | manager 的运行时查询 |
+| `DeduplicateNetworkEntries` | 字面去重地址、DNS、AllowedIPs | `conf/config.go` | tunnel 启动、管理器 |
+| `IntersectsWith` | 两条隧道的地址/路由重叠判定 | `conf/config.go` | `manager.Start` |
+| `Redact` | 抹除密钥与注释后再出进程 | `conf/config.go` | IPC 服务端 |
+| `TunnelNameIsValid` | 隧道名合法性（含 Windows 保留名） | `conf/name.go` | 全模块与 `store.go` |
+
+真实源码清单（相对 `upstream_src/`）：`conf/config.go`（模型、类型、去重、冲突、抹除）、`conf/parser.go`（解析、校验、驱动反投影）、`conf/writer.go`（规范化输出、驱动载荷编组）、`conf/store.go`（按名加载/保存/列举/删除）、`conf/name.go`（隧道名与服务名派生）、`conf/storewatcher.go` 与 `conf/storewatcher_windows.go`（目录变更回调注册与等待循环）、`conf/path_windows.go`（根目录与日志路径）、`conf/migration_windows.go`（明文迁移）、`conf/dnsresolver_windows.go`（endpoint 域名预解析）、`conf/filewriter_windows.go`（原子写）、`conf/admin_windows.go`（`AdminBool` 读注册表策略）、`conf/dpapi/dpapi_windows.go`（加解密，模块见 07-02）。测试基线在 `conf/parser_test.go` 与 `conf/store_test.go`，改动解析器时应先跑这两个文件。
+
+### 4. 关键流程与调用链
+
+读取一份已存配置的链路是：`LoadFromName(name)` 先做 `TunnelNameIsValid`，拼出 `<Root>\Configurations\<name>.conf.dpapi`，交给 `LoadFromPath`；后者用 `NameFromPath` 从文件名反推隧道名（同时校验后缀必须是 `.conf.dpapi` 或 `.conf`），读全文件，若后缀是加密形态则调 `dpapi.Decrypt(bytes, name)`，最后交给 `FromWgQuickWithUnknownEncoding`。这个「未知编码」包装很有意思：它先用 UTF-8 直接解析，失败则遍历 `unicode.All` 里的全部编码（UTF-16LE/BE 及其带 BOM 变体）逐个解码重试，全部失败才把第一次的错误抛出来。这个设计的现实依据是 Windows 记事本长期默认保存 UTF-16LE，用户从服务器上抄下来的配置很可能带 BOM。
+
+解析循环的关键分支值得逐条记住。第一，空行不是被忽略，而是作为一个空字符串压入 `pendingComments`，以便保留段落之间的空行节奏；第二，`#` 之前的空白会被 `TrimSpace` 掉，`#` 之后的内容保留原样（只去掉行尾空格与制表符），所以行尾注释的对齐会被保留；第三，`preup`/`postup`/`predown`/`postdown` 四个键有特殊待遇——它们的值会从**原始行**重新按第一个 `=` 切出来，从而保留命令里的 `#` 字符（Windows 命令行里 `#` 不特殊，但在 wg-quick 里可能出现在 URL 片段中），同时丢弃该行的注释；第四，`address`、`dns`、`allowedips` 是追加语义，同一段里写多行会累加，而 `privatekey`、`listenport`、`mtu`、`table`、`endpoint`、`persistentkeepalive` 是赋值语义，重复出现时**后者覆盖前者**且不报错。
+
+解析结束后的收尾有三步。`maybeAddPeer` 把最后一个还在构造中的 peer 落盘；`pruneComments` 折叠连续空行并按位置丢弃首/尾空行，`pruneSectionComments` 把「既无前置注释又无行尾注释」的键从 map 里删除，避免写出空壳；最后是两条红线校验——`sawPrivateKey` 必须为真（错误文案「An interface must have a private key」），每个 peer 的 `PublicKey` 不能全零（错误文案「All peers must have public keys」）。注意这里没有校验的东西同样重要：不校验 AllowedIPs 是否为空、不校验 endpoint 是否存在、不校验 peer 公钥是否重复、不校验地址族是否匹配。这些「不校验」是刻意的，因为它们对应的是可用性问题而不是语法问题，交给运行期的日志与 UI 提示更合适。
+
+写入链路是读取的镜像：`Save(overwrite)` 校验名字、定位目录、`ToWgQuick()` 得到字节、`dpapi.Encrypt(bytes, config.Name)` 得到密文、`writeLockedDownFile(filename, overwrite, bytes)` 落盘（模块见 07-02，原理见 06-03）。`ToWgQuick` 内部用一个 `writeField` 闭包统一处理「该不该写这一行」：只要值「存在」（例如 `ListenPort > 0`、`TableOff` 为真、`PresharedKey` 非零）**或者**该键挂着任何注释，就写出这一行。后半个条件容易被误读成 bug，其实它是为了让「用户写了 `ListenPort = 0` 并在旁边写了注释」这种配置在往返后不丢注释；代价是值为零的键会被显式写出来。
+
+第三条链路是运行态读取，只出现在 manager 的 `RuntimeConfig` 里：先 `findDriverAdapter` 拿到适配器，`Configuration()` 读回驱动配置，再 `FromDriverConfiguration(runtimeConfig, storedConfig)` 合成一份「磁盘语义 + 驱动状态」的对象，最后按调用方令牌决定是否 `Redact()`。时间字段的换算在这里有个硬编码常量：驱动的 `LastHandshake` 是 FILETIME（自 1601-01-01 起的 100 纳秒数），减去 `116444736000000000` 再乘 100 才得到 Go 的纳秒时长。
+
+下图把「文本 → 模型 → 两种输出」的三条边压缩成一张图，节点与 `conf` 包里的真实函数一一对应。
+
+:::figure id=07-01-01 | name=conf 模块的文本与模型双向链路 | dir=TD
+node n1 "WgQuick 文本<br/>.conf 文件" blue
+node n2 "FromWgQuick<br/>逐行状态机" teal
+node n3 "conf.Config<br/>内存模型" amber
+node n4 "校验与去重" purple
+node n5 "ToWgQuick<br/>规范化输出" green
+node n6 "ToDriverConfiguration<br/>IOCTL 载荷" red
+node n7 "dpapi 加密<br/>.conf.dpapi" gray
+edge n1 -> n2 "按行解析"
+edge n2 -> n3 "填充结构"
+edge n3 -> n4 "红线校验"
+edge n4 -> n5 "编辑器保存"
+edge n3 -> n6 "隧道启动"
+edge n5 -> n7 "原子写入"
+edge n7 -> n1 dashed "下次读取"
+:::
+
+与图 07-01-01 对应地看，模块真正的「分水岭」在 `conf.Config` 这个节点：往左是文本世界的容错，往右是驱动世界的严格。理解了这条分界，就能解释为什么同一个字段在 UI 里可以是空字符串、在驱动载荷里必须变成某个标志位。
+
+注释的归属与写回是这套设计里最容易被忽视的一环，下图（图 07-01-02）单独画出它的数据流向，节点名对应 `parser.go` 与 `writer.go` 里的字段与闭包。
+
+:::figure id=07-01-02 | name=注释保真模型的数据流向 | dir=TD
+node a1 "输入行" blue
+node a2 "pendingComments<br/>空行与独立注释" teal
+node a3 "Comments.Before" amber
+node a4 "Comments.Suffix" amber
+node a5 "SectionComments.Lines<br/>按小写键索引" purple
+node a6 "writeLine<br/>先注释后键值" green
+node a7 "pruneComments<br/>折叠连续空行" gray
+edge a1 -> a2 "无键行"
+edge a1 -> a4 "行尾 #"
+edge a2 -> a3 "挂到下一个键"
+edge a3 -> a5 "键前注释"
+edge a4 -> a5 "键尾注释"
+edge a5 -> a6 "保存时写回"
+edge a7 -> a3 dashed "去重空行"
+:::
+
+### 5. 配置/命令/代码实例
+
+下面这份配置刻意写成「运维手写风格」：段头前有说明注释、`Table` 写成 `off`、endpoint 用域名而不是 IP。它只用了本模块最典型的五个键（`PrivateKey`、`Address`、`Table`、`AllowedIPs`、`Endpoint`），其余键的完整语义见 04-02 与 04-03。
+
+```conf
+# 办公室出口，2026-11 由运维统一下发
+[Interface]
+PrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=
+Address = 10.66.0.2/24, fd66::2/64
+Table = off
+
+[Peer]
+PublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=
+AllowedIPs = 10.66.0.0/24, fd66::/64
+Endpoint = vpn.example.com:51820
+```
+
+用一段最短的 Go 代码走完「加载 → 去重 → 判冲突 → 回写」四步，可以直接观察到规范化后的输出顺序与注释位置。
+
+```go
+cfg, err := conf.LoadFromName("office")
+if err != nil {
+    log.Fatal(err)
+}
+cfg.DeduplicateNetworkEntries()
+log.Printf("peers=%d table_off=%v", len(cfg.Peers), cfg.Interface.TableOff)
+if other, err := conf.LoadFromName("lab"); err == nil && cfg.IntersectsWith(other) {
+    log.Printf("office 与 lab 的地址或路由存在重叠，启动时会互相顶掉")
+}
+fmt.Print(cfg.ToWgQuick())
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+2026/11/12 09:41:07 peers=1 table_off=true
+# 办公室出口，2026-11 由运维统一下发
+[Interface]
+PrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=
+Address = 10.66.0.2/24, fd66::2/64
+Table = off
+
+[Peer]
+PublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=
+AllowedIPs = 10.66.0.0/24, fd66::/64
+Endpoint = vpn.example.com:51820
+```
+
+逐行判读这段输出：`peers=1` 说明只解析出一个 `[Peer]`，若期望两个而这里只有一个，通常意味着第二个 peer 缺少 `PublicKey` 而被红线拦下，或者段头被误写成 `[peer] =` 带值形式；`table_off=true` 说明 `Table = off` 被正确折算成布尔量，此时隧道仍会配地址、配 DNS、配 MTU，但**不会**把 `AllowedIPs` 写进系统路由表，流量不会自动被吸进隧道；输出里 `PrivateKey` 排第一、`Address` 紧随、`ListenPort`/`MTU`/四个脚本全部缺席，证明「零值不写」的规则生效；`Table = off` 原样保留而不是变成 `false`，说明写回用的是 wg-quick 的词汇表；`Endpoint` 仍是域名，因为 `ToWgQuick` 只做序列化，域名转 IP 发生在 tunnel 服务启动时的 `ResolveEndpoints`，而驱动载荷只能接收 IP（`writer.go` 里对 `Endpoint.Host` 做 `netip.ParseAddr`，解析失败就不置 `PeerHasEndpoint` 标志）。最后，注释出现在 `[Interface]` 之前且没有多余空行，说明 `pruneComments` 的首行裁剪与 `Header.Before` 的挂载都正常。若把这份文件改成 `Table = main` 再往返一次，输出会变成 `Table = auto`——这不是 bug，而是「语义等价、字节不等价」的直接证据。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**不要在运行中的隧道上期待热加载**。`Save` 只写磁盘，tunnel 服务在启动时把配置读进内存并下发驱动，之后不会监视单个文件的内容变化（目录监视只用于触发迁移与通知，见 07-02）。改了配置必须 `/uninstalltunnelservice` 再 `/installtunnelservice`，或者用 UI 的「重新启动」；否则你会看到 `wg show` 里还是旧 endpoint。
+
+**`SaveConfig` 与 `FwMark` 会被直接拒绝**。这两个键在 Linux 的 `wg-quick` 里合法，但 `parser.go` 的 `[Interface]` switch 没有对应分支，落到 `default` 就抛「Invalid key for [Interface] section」。同理 `[Peer]` 段里出现任何非五键的键都会报「Invalid key for [Peer] section」。从 Linux 迁配置时，正确做法是删掉这类键，而不是指望客户端忽略它们。
+
+**重复键静默覆盖**。同一个 `[Interface]` 里写两行 `PrivateKey`，只有最后一行生效，且不会有任何警告；`Address`、`DNS`、`AllowedIPs` 则是累加。这种不一致来自语义本身（单值 vs 列表），但在排障时极易误判，尤其是「我明明改了私钥却不生效」这类问题。审计配置时建议用 `wg show <name> public-key` 反查实际生效的公钥。
+
+**redacted 对象绝不能回存**。IPC 在调用方不是提升令牌时会返回 `Redact()` 过的配置，此时 `PrivateKey` 是全零、peer 公钥被序号填充、注释被清空。如果某个客户端把这份对象直接 `Save(true)`，磁盘上的配置就被彻底破坏，且因为 DPAPI 仍能解密，错误会以「握手永远失败」的形式延迟暴露。正确做法是：展示用 redacted，编辑用原始文本（UI 走的是 `ToWgQuick` 的文本通道），写回只接受用户显式提交的完整配置。
+
+**去重是字面级的**。`DeduplicateNetworkEntries` 不会把 `10.0.0.5/24` 合并进 `10.0.0.0/24`，也不会把 `::/0` 与 `0.0.0.0/0` 视作同类。真正的路由去重发生在 `tunnel/addressconfig.go`，那里用 `RouteData{Destination: allowedip.Masked(), Metric: 0}` 作为 map 键，因此主机位不同的同网段前缀会在那一层被合并。两份代码的差异是有意为之：`conf` 层保留用户输入的原貌，路由层才做网络语义归一。
+
+**隧道名是安全边界的一部分**。`TunnelNameIsValid` 要求名字匹配 `^[a-zA-Z0-9_=+.-]{1,32}$`，并额外拒绝三类东西：Windows 保留设备名（`CON`、`PRN`、`AUX`、`NUL`、`COM1`–`COM9`、`LPT1`–`LPT9`，比较时按第一个点截断且忽略大小写）、特殊字符集（含全部 0x00–0x1f 控制字符、`/ \ : * ? " < > |`、制表符）、以及 `$`。拒绝 `$` 的理由很直接：服务名是 `WireGuardTunnel$` 加隧道名，`$` 是分隔符；拒绝路径分隔符与点开头/结尾则是为了防止名字被当成相对路径或隐藏文件。导入配置时若文件名超长或含中文，`NameFromPath` 会直接失败并提示「Tunnel name is not valid」。
+
+**`IntersectsWith` 的杀伤面比想象大**。它把接口地址按「主机位前缀」和「掩码前缀」两条都放进集合，所以 `10.66.0.2/24` 会同时命中 `10.66.0.2/32` 与 `10.66.0.0/24`；peer 的 `AllowedIPs` 一律掩码后入集合，所以任何包含 `0.0.0.0/0` 的隧道会与所有使用 IPv4 的隧道冲突。manager 的行为是「停掉旧的、启动新的」，不做合并；如果你需要两条隧道共存，必须把其中一条的 AllowedIPs 收窄到具体网段，或用 `Table = off` 让其中一条不写路由。
+
+**实践建议**：把 `conf` 当只读 API 用，不要手写 `Config` 字面量再 `Save`——因为 `Name`、`TrailingComments`、`Comments` 三者必须自洽，手写几乎一定会丢注释；需要程序化生成配置时，先构造一份最小文本再走 `FromWgQuick` 解析，让解析器帮你补齐规范化。另外，修改 `parser.go` 的任何分支后，务必回归 `conf/parser_test.go`，那里覆盖了注释往返、未知编码、错误文案等容易破坏契约的用例。
+
+### 7. 小结与延伸阅读
+
+`conf` 模块是整套客户端里「语义的中央银行」：它把跨平台文本收敛成一个严格的内存模型，再把模型分发给编辑器、管理器与隧道服务，同时保证用户手写的注释、顺序与写法在往返中尽量不走样。它的设计取舍可以概括为三句话：读的时候尽量宽容（未知编码、大小写、缺掩码），判的时候只守两条红线（接口必须有私钥、peer 必须有公钥），写的时候完全规范化（固定顺序、固定键名、零值不写）。围绕这个核心，`DeduplicateNetworkEntries` 负责字面去重、`IntersectsWith` 负责跨隧道冲突、`Redact` 负责出进程前的脱敏、`FromDriverConfiguration` 负责把运行态投影回可读形态。
+
+延伸阅读建议按以下顺序推进：先看 05-02 与 05-04 建立字段与注释模型的地图；再看 06-02 理解逐行解析与规范化的完整机制；随后看 04-01 到 04-03 掌握每个键的合法取值与 Windows 语义差异；最后看 07-02 了解这些对象如何被加密落盘、07-05 了解它们如何在隧道服务里被翻译成驱动载荷。若只关心「我的配置为什么不生效」，直接跳到本篇第 6 节的六条陷阱，再配合 08-04 的故障案例库按现象反查即可。
+
+## 07-02 安全存储模块：`conf/dpapi` 与 `conf/path_windows`
+
+### 1. 背景与动机
+
+一份 WireGuard 配置的核心是接口私钥。拿到私钥的人可以完整冒充该接口：解密所有入站流量、以该身份向对端发起握手、在不改变任何服务端配置的情况下长期潜伏。而 Windows 客户端必须把这份私钥**以文件形式**保存在本机，才能让 LocalSystem 运行的隧道服务在开机时无人值守地拉起隧道。这就产生了一个矛盾：文件必须可被服务读取，但不能被同机的普通用户、漫游配置文件的备份、以及随手复制的目录拷贝带走。仅靠 NTFS ACL 解决不了这个问题——管理员可以取得所有权，备份操作员可以读取任意文件，把整个 `Program Files` 目录打包带走也是常见运维动作。
+
+WireGuard 官方客户端选择的答案是 **DPAPI**（Data Protection API）。`CryptProtectData` 用当前用户（或机器）的凭据派生密钥，把明文加密成一段自带完整性校验的二进制；`CryptUnprotectData` 只有在同一安全上下文里才能还原。对攻击者来说，拿到 `.conf.dpapi` 文件而没有该用户的登录会话与凭据，等于拿到一段随机字节。对本机服务来说，因为 tunnel 服务、manager 服务与 UI 进程最终都以 SYSTEM 身份运行（UI 通过继承的提升令牌），三者共享同一个 DPAPI 上下文，所以可以互相解密，不需要额外的密钥管理。
+
+第二个动机是**导入路径必须对用户友好**。用户在 Linux 服务器上用 `wg genkey` 生成配置，把 `.conf` 拖进 Windows 客户端的配置目录，这是官方文档明确支持的工作流。于是客户端必须监视 `Configurations` 目录，发现新的明文 `.conf` 就立刻解析、加密、删除明文。这个「监视 → 加密 → 删除」的窗口期是整个模块最脆弱的地方：窗口内明文仍在磁盘上，窗口外如果加密失败而删除成功就会丢配置，如果加密成功而删除失败就会留下明文副本。`migration_windows.go` 里的重试与错误处理，几乎全部是在为这个窗口期做防御。
+
+第三个动机是**路径本身是攻击面**。如果 `Data` 目录可以被普通用户替换成指向别处的 junction（目录重解析点），那么服务启动时读到的「配置」可能来自任意位置；如果目录的 DACL 继承自 `Program Files` 而被放宽，普通用户就能往里投放配置，进而让 LocalSystem 的隧道服务去解析任意文件。`RootDirectory` 因此做了四件事：用 `KnownFolderPath(FOLDERID_ProgramFiles)` 而不是环境变量取根、用显式的安全描述符创建 `Data` 目录、用 `GetFinalPathNameByHandle` 校验目录没有「跳走」、最后用 `SetKernelObjectSecurity` 把 DACL 设为受保护（`PROTECTED_DACL_SECURITY_INFORMATION`）以切断继承。
+
+本篇讲的是模块能力与使用边界，不重列机制细节：加解密的完整调用链见 06-03，结构体与函数签名见 05-02，目录与日志路径的管理命令见 04-06。能力边界要先说清：DPAPI 保护的是「文件离开本机/本用户后不可读」，它**不防**本机以同一账户运行的恶意进程，也**不防**已取得 SYSTEM 权限的攻击者；它不能替代磁盘加密（BitLocker），也不能替代对 `Program Files\WireGuard` 的 ACL 审计。把它当成「防拷贝、防备份泄露」的一层，而不是「防本机提权」的城墙，是正确的心智模型。
+
+### 2. 核心概念
+
+**两种后缀，一条生命周期**。明文配置文件叫 `<name>.conf`，加密后叫 `<name>.conf.dpapi`，二者由 `configFileSuffix` 与 `configFileUnencryptedSuffix` 两个常量定义。`NameFromPath` 同时接受两种后缀并反推出隧道名，`PathIsEncrypted` 只看 basename 是否以 `.conf.dpapi` 结尾。这个设计让「迁移」可以简单地实现为「读明文 → 存加密 → 删明文」，而不需要一张状态表；代价是目录里可能短暂并存两种形态，排障时必须用 `PathIsEncrypted` 而不是肉眼判断。
+
+**名称既是文件名也是加密描述串**。`Encrypt(data, name)` 把 `name` 传给 `CryptProtectData` 的 `szDataDescr` 参数（不是 entropy），`Decrypt(data, name)` 则从 `CryptUnprotectData` 取回描述串并逐字符比较，不一致就返回「input name does not match the stored name」。这个校验把「配置文件」与「隧道名」绑死：**直接重命名 `.conf.dpapi` 文件会导致解密失败**，因为描述串里还是旧名字。正确的改名方式是「在 UI 里导出 → 用新名字导入」，或者手工 `LoadFromName(旧名)` 后改 `Config.Name` 再 `Save`。
+
+**目录 ACL 与文件 ACL 是两套策略**。`Data` 目录的安全描述符是 `O:SYG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`：所有者与组都是 SYSTEM，DACL 受保护（`PAI` 表示不允许继承），SYSTEM 与 Builtin Administrators 各得完全控制，且带 `OICI` 让子对象继承。而单个加密文件的安全描述符是 `O:SYG:SYD:PAI(A;;FA;;;SY)(A;;SD;;;BA)`：SYSTEM 完全控制，管理员只有 `SD`（`STANDARD_RIGHTS_READ | DELETE`，即可读属性与删除，但**不可写内容**）。这套组合的意图是：管理员可以删除（便于卸载清理）但不能篡改（防止植入配置），普通用户连目录都进不去。
+
+**原子写**。`writeLockedDownFile` 从不在目标路径上直接 `CreateFile` 覆盖，而是：在**同一目录**生成一个 32 字节随机十六进制名加 `.tmp` 的临时文件 → 以目标文件的 ACL 创建并写入 → `FlushFileBuffers` → 用 `SetFileInformationByHandle(FileRenameInfo)` 把临时文件重命名到目标名，`replaceIfExists` 由调用方的 `overwrite` 参数决定。同目录保证重命名是同一卷内的原子操作；`GENERIC_WRITE | DELETE` 的句柄权限保证临时文件在失败时能被 `FileDispositionInfo` 标记删除；`FlushFileBuffers` 保证断电时不会留下半截配置。
+
+**共享冲突是正常现象**。迁移时用 `os.OpenFile(path, os.O_RDWR, 0)` 而不是 `os.ReadFile`，目的不是读，而是**利用 Windows 的共享模式**判断「文件是否还在被写」。若另一个进程（下载器、编辑器、同步盘）正持有独占句柄，打开会返回 `ERROR_SHARING_VIOLATION`；此时迁移不是简单跳过，而是用 `time.AfterFunc(time.Second/(base*base))` 安排最多三次退避重试（`sharingBase` 初值为 3），并在本轮把 `ignoreSharingViolations` 置真以免重复排队。这个细节直接决定了「把配置拖进目录」的体验：文件复制尚未完成时不会被误判成坏配置。
+
+**回调驱动的目录监视**。`RegisterStoreChangeCallback(cb)` 用 `sync.Once` 启动唯一的监视协程，立刻执行一次 `cb()`（保证「注册即拿到当前状态」），再把回调放入 map。监视协程用 `FindFirstChangeNotification` 打开目录，`WaitForSingleObject(INFINITE)` 等待，命中后在读锁下遍历回调，然后 `FindNextChangeNotification` 继续。任何一步失败都会关掉句柄、`Sleep(1s)` 并 `goto startover` 重建——这是一个近乎无限重试的循环，意图是「宁可暂时失明，也不要永久失明」。
+
+### 3. 关键数据结构与源码位置
+
+模块里没有复杂结构体，全部是函数与常量；下表按「职责 → 文件 → 依赖的 Win32 接口」组织，便于审计时逐项核对。字段层面的细节（如 `Config.Save` 的参数语义）请回查 05-02（字段见 05-02 ｜ 配置见 04-06 ｜ 原理见 06-03）。
+
+| 函数/常量 | 职责 | 源码位置 | 关键 Win32 接口 |
+|---|---|---|---|
+| `Encrypt` / `Decrypt` | 以隧道名为描述串的加解密 | `conf/dpapi/dpapi_windows.go` | `CryptProtectData` / `CryptUnprotectData` |
+| `RootDirectory` | 解析并硬化 `Data` 目录 | `conf/path_windows.go` | `KnownFolderPath`、`GetFinalPathNameByHandle` |
+| `LogFile` | 返回 `Data\log.bin` 路径 | `conf/path_windows.go` | 无（纯路径拼接） |
+| `writeLockedDownFile` | 临时文件 + 原子重命名 | `conf/filewriter_windows.go` | `CreateFile`、`FileRenameInfo` |
+| `MigrateUnencryptedConfigs` | 明文批量转加密并删除 | `conf/migration_windows.go` | 共享冲突退避、`os.Remove` |
+| `RegisterStoreChangeCallback` | 目录变更回调注册 | `conf/storewatcher.go` | 无（内存 map + 锁） |
+| `startWatchingConfigDir` | 变更通知等待循环 | `conf/storewatcher_windows.go` | `FindFirstChangeNotification` |
+| `ListConfigNames` | 列举可读配置名 | `conf/store.go` | `os.ReadDir` + 权限位过滤 |
+| `Save` / `LoadFromPath` | 加密落盘与按路径加载 | `conf/store.go` | 组合上述能力 |
+
+真实源码清单：`conf/dpapi/dpapi_windows.go`（加解密，仅 78 行，但每个参数都有讲究）、`conf/path_windows.go`（根目录、日志路径、`PresetRootDirectory`）、`conf/filewriter_windows.go`（原子写与随机临时名）、`conf/migration_windows.go`（明文迁移与退避）、`conf/storewatcher.go` 与 `conf/storewatcher_windows.go`（回调注册与等待循环）、`conf/store.go`（后缀常量、`ListConfigNames`、`LoadFromPath`、`Save`、`Path`、`DeleteName`）。测试参考 `conf/dpapi/dpapi_windows_test.go` 与 `conf/store_test.go`。
+
+### 4. 关键流程与调用链
+
+**保存**：`Config.Save(overwrite)` → 校验名字 → `tunnelConfigurationsDirectory()`（首次调用会触发 `RootDirectory(true)` 并把结果缓存到 `cachedConfigFileDir`）→ 拼 `<dir>\<name>.conf.dpapi` → `ToWgQuick()` → `dpapi.Encrypt(bytes, name)` → `writeLockedDownFile`。注意 `Encrypt` 里 `CRYPTPROTECT_UI_FORBIDDEN` 的作用：禁止 DPAPI 弹出任何 UI。这一条对服务进程是硬要求，否则在 Session 0 里弹框会直接挂死。
+
+**读取**：`LoadFromPath(path)` → `NameFromPath` → `os.ReadFile` → 若后缀是加密形态则 `dpapi.Decrypt` → `FromWgQuickWithUnknownEncoding`。这里没有「先判断文件是否存在」的额外分支，`os.ReadFile` 的错误原样上抛，调用方据此区分「配置不存在」与「配置损坏」。`ListConfigNames` 则更保守：它跳过非普通文件、跳过 `NameFromPath` 失败的名字、跳过权限位里连 `0o444` 都没有的条目（即「无任何读位」），这样即使目录里混进了符号链接或系统文件也不会污染隧道列表。
+
+**迁移**：`MigrateUnencryptedConfigs(cb)` 由 manager 服务在启动时通过 `RegisterStoreChangeCallback` 挂上，等于「服务启动即扫一遍，之后每次目录变动再扫一遍」。函数体先加 `migrating` 互斥锁（防止两次扫描并发处理同一文件），再遍历目录，对每个以 `.conf` 结尾的普通文件：以读写方式打开（触发共享冲突检测）→ 读全内容 → `FromWgQuickWithUnknownEncoding` → `config.Save(false)`（**不允许覆盖**，避免把同名加密配置冲掉）→ `os.Remove(明文)` → 取新路径 → 回调通知。任何一步失败都只记日志「Unable to ingest and encrypt %#q」，不中断整轮扫描。
+
+**路径硬化**：`RootDirectory(true)` 先取 `%ProgramFiles%\WireGuard`，用 `CreateDirectory` 创建（允许已存在，因为根目录继承 `Program Files` 的 ACL，这里刻意不改），再用带安全描述符的 `CreateDirectory` 创建 `Data`。随后进入一个循环：`CreateFile` 以 `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY` 打开目录句柄，若返回 `ERROR_FILE_NOT_FOUND` 就重试（创建与打开之间存在竞态）。拿到句柄后依次校验：属性必须是目录、不能带 `FILE_ATTRIBUTE_REPARSE_POINT`、`GetFinalPathNameByHandle` 的结果必须等于 `\\?\` 加预期路径（不区分大小写）。三项全过才用 `SetKernelObjectSecurity` 覆写 DACL 并缓存结果。
+
+下图把「明文投放 → 迁移 → 加密 → 读取」的完整生命周期画成一条主链，并标出「再次保存」这条回边；节点名与源码里的函数一一对应。
+
+:::figure id=07-02-01 | name=配置文件的加密生命周期 | dir=TD
+node n1 ".conf 明文投放" blue
+node n2 "目录变更通知" teal
+node n3 "Migrate<br/>解析并加密" amber
+node n4 "临时文件<br/>随机名 .tmp" gray
+node n5 "FileRenameInfo<br/>原子替换" purple
+node n6 ".conf.dpapi" green
+node n7 "LoadFromPath" blue
+node n8 "CryptUnprotectData<br/>校验描述串" amber
+node n9 "conf.Config" red
+edge n1 -> n2 "写入触发"
+edge n2 -> n3 "回调扫描"
+edge n3 -> n4 "写入内容"
+edge n4 -> n5 "重命名"
+edge n5 -> n6 "落地"
+edge n6 -> n7 "读取"
+edge n7 -> n8 "解密"
+edge n8 -> n9 "解析成模型"
+edge n9 -> n3 dashed "UI 再次保存"
+:::
+
+图 07-02-01 里唯一一条虚线回边值得注意：UI 保存走的是 `Config.Save(true)`，与迁移走的是同一个 `writeLockedDownFile`，区别只在 `overwrite` 参数。这意味着「覆盖已有配置」与「新建配置」在文件系统层面是同一套原子语义，不存在「先删后写」的空窗。
+
+### 5. 配置/命令/代码实例
+
+审计这套机制最快的方式不是读代码，而是看两件事：目录 ACL 与目录内容。下面用 `icacls` 与 `dir` 观察一台刚导入过配置的机器。注意 `Data` 目录本身与其中文件的安全描述符不同，这正是本节要验证的重点。
+
+```powershell
+icacls "$env:ProgramFiles\WireGuard\Data"
+Get-ChildItem "$env:ProgramFiles\WireGuard\Data" -Force | Select-Object Name, Length
+Get-ChildItem "$env:ProgramFiles\WireGuard\Data\Configurations" -Force | Select-Object Name, Length
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+C:\Program Files\WireGuard\Data BUILTIN\Administrators:(OI)(CI)(F)
+                            NT AUTHORITY\SYSTEM:(OI)(CI)(F)
+                            Mandatory Label\High Mandatory Level:(OI)(NP)(IO)(NW)
+
+Name       Length
+----       ------
+Configurations
+log.bin    1048576
+
+Name              Length
+----              ------
+office.conf.dpapi    612
+lab.conf.dpapi       588
+```
+
+逐行判读：`Data` 目录上只有 Administrators 与 SYSTEM 两个 ACE，且都带 `(OI)(CI)` 继承标志，说明新建的子文件会自动获得这两条 ACE；`(NW)` 那条是完整性标签（高完整性、无写上升），它解释了为什么中完整性进程即便能进目录也写不进去。`Configurations` 与 `log.bin` 并列出现，印证了「日志与配置同目录」这一事实——导出 `log.bin` 时请注意其中包含隧道名、endpoint、AllowedIPs 等元数据，虽然不含私钥，但仍属于拓扑信息。两个 `.conf.dpapi` 文件的长度都在 600 字节上下，而对应明文通常只有 300–400 字节，多出来的部分是 DPAPI 的头部、描述串与 HMAC；如果某个文件长度突然变成 0 或 16 字节的整数倍且极小，基本可以断定写入过程中断（临时文件残留或磁盘满）。文件名严格遵循 `<name>.conf.dpapi`，若看到 `.conf` 后缀说明迁移未完成，此时应立即检查 manager 服务是否在运行、日志里是否有「Unable to ingest and encrypt」。
+
+再看一眼单个文件的 ACL 差异，这一条决定了「管理员能否篡改配置」：
+
+```powershell
+icacls "$env:ProgramFiles\WireGuard\Data\Configurations\office.conf.dpapi"
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+office.conf.dpapi NT AUTHORITY\SYSTEM:(F)
+                   BUILTIN\Administrators:(R)
+                   BUILTIN\Administrators:(DE)
+```
+
+这里的 `(R)` 是读属性/读权限，`(DE)` 是删除，合起来正是安全描述符里的 `SD` 权限位；管理员**没有** `(W)` 或 `(F)`。若你在自己的机器上看到 `(F)`，说明目录 ACL 曾被手工改过（例如为了「方便编辑」而 `icacls /grant`），此时应立刻恢复默认，否则任何本地管理员都能替换配置文件，而隧道服务会以 LocalSystem 身份信任它。
+
+一段最小 Go 代码演示「不落盘地验证一份密文能否被当前上下文解开」，适合排障时确认「是文件坏了还是账户不对」：
+
+```go
+raw, err := os.ReadFile(`C:\Program Files\WireGuard\Data\Configurations\office.conf.dpapi`)
+if err != nil {
+    log.Fatal(err)
+}
+plain, err := dpapi.Decrypt(raw, "office")
+if err != nil {
+    log.Fatalf("解密失败，通常是账户上下文不同或文件被重命名: %v", err)
+}
+log.Printf("解密成功，明文 %d 字节", len(plain))
+```
+
+这段代码的价值在于把两类完全不同的故障分开：`Decrypt` 返回「unable to decrypt DPAPI protected data」意味着密钥上下文不匹配（换了用户、换了机器、或用非提升会话跑），返回「input name does not match the stored name」意味着文件被改名过而描述串没变。前者只能回到原账户或重新导入，后者只要把文件名改回原名即可。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**重命名 `.conf.dpapi` 会直接毁掉可读性**。这是本模块最容易踩的坑，也是与 Linux 习惯差异最大的一点：在 Linux 上 `mv a.conf b.conf` 之后改一下 `[Interface]` 里的注释就能用，而在 Windows 上文件名就是解密描述串的一部分。改名的唯一安全路径是「读出来 → 改 `Config.Name` → `Save(true)` → 删除旧文件」，而这需要能解密，也就是需要正确的账户上下文。
+
+**跨机器复制一定失败，且错误信息不直观**。DPAPI 的默认 scope 是「当前用户」，密钥材料存放在用户的 master key 目录里，受用户密码保护。把 `.conf.dpapi` 拷到另一台机器，哪怕用户名相同、密码相同，也解不开（SID 与 master key 都不同）。错误会表现为隧道启动失败、日志里出现 `Error loading configuration` 或解密错误。正确做法是把配置当「导入物料」：在源机器导出明文（UI 的导出功能会给出一份 `.conf`），在目标机器放进 `Configurations` 目录让迁移机制重新加密，或直接用 UI 导入。
+
+**计划任务与服务的账户必须一致**。manager 与 tunnel 服务都以 LocalSystem 运行，所以它们的 DPAPI 上下文是机器的 SYSTEM 账户；如果某个运维脚本用普通管理员账户去调 `conf.LoadFromName`，解密会失败。这也是为什么 `wireguard.exe /dumplog` 之类的诊断命令在非提升命令行里常常「看不到东西」——不是日志不存在，而是权限与上下文不对。
+
+**迁移窗口期的明文残留**。`MigrateUnencryptedConfigs` 的顺序是「加密成功 → 删除明文」，所以正常情况下不会丢配置；但如果 `os.Remove` 失败（文件被占用、ACL 只读），明文会留在目录里，而下一轮扫描会再次尝试。此时不要手工删掉 `.conf.dpapi` 去「重来」，因为 `Save(false)` 不允许覆盖，重跑只会一直失败。正确顺序是：先确认密文可解密（用上面的 Go 片段或 `wg show`），再删明文。
+
+**共享冲突不是错误，是节流信号**。看到日志里反复出现 `ERROR_SHARING_VIOLATION` 相关的重试，通常意味着同步盘（OneDrive、Synology Drive）正在扫描 `Configurations` 目录。这类软件会短暂持有独占句柄，导致迁移连续三轮都失败。解决办法不是改代码，而是把 `Data` 目录排除在同步范围之外——顺带也避免了把密文同步到云端（虽然 DPAPI 保证了云端不可读，但没必要）。
+
+**`PresetRootDirectory` 只给外部消费者用**。`path_windows.go` 里的这个函数允许调用方强制指定根目录，源码注释明确写「wireguard-windows 自己不用，但对使用我们库的外部消费者有用」。如果你在做嵌入式集成，注意它只是设置 `cachedRootDir`，不会创建目录、不会设 ACL，安全责任转移到调用方。
+
+**日志与配置同目录，导出前先想清楚**。`LogFile(true)` 返回 `<Data>\log.bin`，环形日志由所有隧道进程与 UI 共享。它不含私钥，但含隧道名、peer 公钥、endpoint、AllowedIPs、握手时间，足以还原拓扑。对外提交日志前，至少应确认是否有「把内网网段写进 AllowedIPs」这类信息。
+
+**最佳实践清单**：不要手工编辑 `Program Files` 下的配置（会被 ACL 拒绝，或被下一次保存覆盖）；不要为了「方便」给 `Data` 目录加 `Everyone:(F)`；不要把 `.conf.dpapi` 纳入版本管理或同步盘；迁移前先 `Stop-Service WireGuardManager` 再操作目录，避免监视器与手工操作打架；定期用 `icacls` 抽查目录与文件 ACL 是否仍为默认值。
+
+### 7. 小结与延伸阅读
+
+安全存储模块解决的是一个很具体的问题：私钥必须以文件形式存在于本机，但不能因文件泄露而泄露。它的答案是三层叠加——DPAPI 让密文离开账户上下文就不可读，目录与文件的差异化 ACL 让普通用户进不来、管理员改不了，原子写与迁移退避让「导入配置」这个高频动作不会产生半截文件。三个设计细节最值得记住：隧道名同时是文件名与加密描述串（所以不能改名）、`Data` 目录的 DACL 是受保护的（所以不受 `Program Files` 继承影响）、临时文件必须与目标同目录（所以重命名是原子的）。
+
+延伸阅读：机制细节见 06-03，字段与函数签名见 05-02，目录与日志相关的运维命令见 04-06，卸载时如何清理这些文件见 03-06，攻击面视角的完整分析见 08-05。若你在做企业分发，还应结合 03-04 的导入流程与 03-05 的批量下发一起看，因为「配置怎么到达终端」与「到达后怎么加密」是两段互补的链路。
+
+## 07-03 `driver` 驱动适配与 WireGuardNT IOCTL 模块
+
+### 1. 背景与动机
+
+Windows 没有 `/dev/net/tun`。要在 Windows 上实现一个三层隧道接口，必须写一个 NDIS 协议驱动或轻量筛选器驱动，由它向 TCP/IP 栈注册一个虚拟适配器，并在适配器与 UDP 套接字之间搬运加解密后的报文。这项工作的主体在外部项目 WireGuardNT 里，本仓库一行加密代码都没有。但「内核里有驱动」并不等于「用户态能用」：驱动需要有人创建适配器、派生网络 GUID、设置监听端口与私钥、逐 peer 写入公钥与 AllowedIPs、把适配器拉起或放下、在退出时销毁适配器，还要能把驱动日志接进 Go 的 `log`、能查询当前运行的驱动版本、在没有适配器时把驱动从系统里卸载。这些动作全部通过 `wireguard.dll` 的一组 C 导出函数完成，而 `driver` 包就是这组导出函数的 Go 绑定。
+
+为什么不让 Go 直接 `DeviceIoControl`？因为「创建一个 WireGuard 适配器」在 Windows 上远不止一次 IOCTL：它涉及设备对象创建、NDIS 适配器注册、网络位置感知（NLA）条目的生成、网络 GUID 的确定、以及驱动服务的按需安装。这些步骤的次序与错误处理被 WireGuardNT 收敛进了 `WireGuardCreateAdapter` 一个调用里；把这条边界画在 DLL 上，本仓库就只需要维护十来个函数原型与几个结构体布局，而不必跟着 NDIS 版本演进。代价是**强 ABI 耦合**：Go 侧的结构体字节布局必须与 DLL 侧完全一致，任何字段顺序、对齐、填充的偏差都会表现为 `ERROR_INVALID_PARAMETER` 甚至进程崩溃。这也解释了为什么 `driver/configuration_windows.go` 里到处是 `_ uint32`、`_ [4]byte` 这样的匿名填充字段——它们不是装饰，而是把 Go 的结构体强行对齐到 C 的布局。
+
+模块的第二个职责是**把「配置对象」翻译成「连续内存块」**。DLL 的 `WireGuardSetConfiguration` 接受一个指针加一个字节长度，指针指向的是一段自描述的变长结构：开头一个 `Interface`，后面紧跟 `PeerCount` 个 `Peer`，每个 `Peer` 后面紧跟它的 `AllowedIPsCount` 个 `AllowedIP`。这种「用计数而非指针串联」的布局在 C 里很常见，因为它可以一次性拷贝、一次 IOCTL 下发、没有跨进程指针的麻烦；但对 Go 来说，它意味着不能用 `[]Peer` 直接传，必须自己拼一段 `[]byte`。`ConfigBuilder` 就是为此存在的：`AppendInterface`、`AppendPeer`、`AppendAllowedIP` 依次把结构体按值追加进缓冲区，`Interface()` 返回首地址与总长度。
+
+第三个动机是**可观测性**。内核驱动出问题时，用户态唯一能拿到的线索是驱动自己打的日志。`wireguard.dll` 暴露了 `WireGuardSetLogger`，允许宿主注册一个回调，驱动在适配器生命周期、握手、路由变更时把 UTF-16 字符串回传。`driver/driver_windows.go` 的 `setupLogger` 用 `windows.NewCallback` 把 Go 函数变成 C 可调用的回调，并按 `runtime.GOARCH` 处理三种不同的调用约定：`amd64`/`arm64` 直接把 `logMessage` 注册进去；`386` 上 64 位时间戳被拆成两个 32 位参数；`arm` 上还多一个占位参数。这种「同一语义、三套签名」的写法是 Windows 多架构支持的典型成本。
+
+必须在本篇开头就把能力边界钉死：**本仓库不是数据面**。握手（Noise_IKpsk2）、密钥派生、ChaCha20-Poly1305 加解密、重放窗口、cookie 应答、AllowedIPs 的最长前缀匹配、`IP_PKTINFO` 出接口选择，全部在 WireGuardNT 内核驱动里完成。`driver` 包不解析一个字节的协议报文，它只做四件事：适配器生命周期、配置编组与下发、日志回调、版本与卸载。同样，`driver.Uninstall()` 删除的是驱动包，不是「关掉 WireGuard」；它在仍有适配器存在时会失败，这是设计而非缺陷。关于内核侧的实现细节，本仓库没有源码，任何具体行为都应写「需对照 WireGuardNT 版本核验」，不能凭 Linux 内核实现去推断。
+
+### 2. 核心概念
+
+**句柄即适配器**。`Adapter` 只有一个 `uintptr` 句柄和一个 `lastGetGuessSize` 缓存，没有任何字段镜像驱动状态。这意味着 Go 侧的对象是**薄句柄**：所有查询都要真的去问驱动（`AdapterState()`、`Configuration()`），本地没有可作弊的缓存。`CreateAdapter` 与 `OpenAdapter` 成功后都会 `runtime.SetFinalizer(wireguard, closeAdapter)`，给忘记 `Close` 的调用方留一条兜底路径；`Close()` 的第一件事是 `runtime.SetFinalizer(wireguard, nil)`，避免显式关闭后又被 finalizer 二次关闭。
+
+**存在性由标志位表达**。`driver.Interface` 与 `driver.Peer` 里没有一个字段是「指针」或「可选」，全部是定长值；「这个字段有没有意义」由 `Flags` 的位决定。`InterfaceHasPrivateKey`、`InterfaceHasListenPort`、`InterfaceHasPublicKey`、`PeerHasPublicKey`、`PeerHasPresharedKey`、`PeerHasPersistentKeepalive`、`PeerHasEndpoint` 这一组位，构成了「读回时哪些字段可信、下发时哪些字段要写」的契约。`conf/writer.go` 在编组时正是靠它决定要不要置 `PeerHasEndpoint`：只有 endpoint 的 host 能被 `netip.ParseAddr` 解析成 IP 时才置位，域名一律不置位。
+
+**全量与增量两套语义并存**。`PeerFlag` 里还有 `PeerReplaceAllowedIPs`、`PeerRemove`、`PeerUpdateOnly`，`AllowedIpFlag` 里有 `AllowedIpRemove`，`InterfaceFlag` 里有 `InterfaceReplacePeers`。这些位让 DLL 支持「只删一个 peer」「只加一段 AllowedIP」这类增量更新。但本仓库的 `ToDriverConfiguration` **没有使用任何增量位**：它下发的永远是一份完整的接口配置，且不带 `InterfaceReplacePeers`——因为调用场景只有两类，一是新适配器首次配置，二是适配器掉线后整体重配（`interfaceWatcher` 在检测到 `AdapterStateDown` 时重新 `SetConfiguration` 再拉起）。理解这一点能避免一个常见误解：以为客户端会「热更新单个 peer」，实际上任何配置变更都要重写整份配置。
+
+**状态机只有两态**。`AdapterStateDown`（0）与 `AdapterStateUp`（1）。顺序是硬约束：先 `SetConfiguration` 再 `SetAdapterState(Up)`；反过来在 `Up` 状态下改配置，驱动可能拒绝或只部分生效。关停时不需要显式 `Down`，`Close` 会销毁适配器，网络接口随之消失。
+
+**两个版本号不能混用**。`driver.Version()` 读的是 `wireguard.dll` 文件自身的 `RT_VERSION` 资源（资源 ID 1），解析 `VS_FIXEDFILEINFO` 拼成 `a.b.c.d`，它回答「我带的 DLL 是哪个版本」；`driver.RunningVersion()` 调 `WireGuardGetRunningDriverVersion`，返回一个 32 位整数，高 16 位是主版本、低 16 位是次版本，它回答「内核里正在跑的驱动是哪个版本」。两者可能不一致——例如系统里已经装了更新版本的驱动，而当前 exe 嵌的是旧 DLL。tunnel 服务启动时会把后者写进日志（`Using WireGuardNT/x.y`），排障时应以它为准。
+
+**日志回调是跨架构的**。`logMessage(level, timestamp, msg)` 的 `timestamp` 是 FILETIME 风格的 64 位值（自 1601 年起 100 纳秒），代码里减去 `116444736000000000` 再乘 100 转成 Unix 纳秒。如果 `log.Default().Writer()` 实现了 `TimestampedWriter` 接口（`WriteWithTimestamp(p []byte, ts int64)`），就用驱动给的时间戳写日志，否则退化成普通 `log.Println`。这个接口是 ringlogger 能与驱动日志对齐时间轴的关键（模块见 07-10）。
+
+### 3. 关键数据结构与源码位置
+
+本节只做「点名 + 定位 + 交叉引用」，不展开字段表。结构体逐字段（含每个填充字段的偏移）见 05-05 与 05-06；IOCTL 的下发时机与错误映射见 06-05（字段见 05-05 ｜ 配置见 04-04 ｜ 原理见 06-05）。
+
+| DLL 导出函数 | Go 包装 | 模块作用 | 源码位置 |
+|---|---|---|---|
+| `WireGuardCreateAdapter` | `CreateAdapter` | 创建适配器并派生网络 GUID | `driver/driver_windows.go` |
+| `WireGuardOpenAdapter` | `OpenAdapter` | 按名字打开已存在适配器 | `driver/driver_windows.go` |
+| `WireGuardCloseAdapter` | `Close` | 销毁适配器、移除网络接口 | `driver/driver_windows.go` |
+| `WireGuardDeleteDriver` | `Uninstall` | 无适配器时卸载驱动包 | `driver/driver_windows.go` |
+| `WireGuardGetAdapterLUID` | `LUID` | 取网络接口 LUID 供 winipcfg 使用 | `driver/driver_windows.go` |
+| `WireGuardGetRunningDriverVersion` | `RunningVersion` | 查询内核驱动版本 | `driver/driver_windows.go` |
+| `WireGuardSetAdapterLogging` | `SetLogging` | 开/关适配器日志（0/1/2） | `driver/driver_windows.go` |
+| `WireGuardSetLogger` | `setupLogger` | 注册跨架构日志回调 | `driver/driver_windows.go` |
+| `WireGuardSetConfiguration` | `SetConfiguration` | 下发整份配置内存块 | `driver/configuration_windows.go` |
+| `WireGuardGetConfiguration` | `Configuration` | 读回配置，缓冲不足时重试 | `driver/configuration_windows.go` |
+| `WireGuardSetAdapterState` | `SetAdapterState` | Down/Up 状态切换 | `driver/configuration_windows.go` |
+
+真实源码清单：`driver/driver_windows.go`（句柄、生命周期、日志、版本、LUID）、`driver/configuration_windows.go`（配置结构、标志位、`ConfigBuilder`、指针算术遍历）、`driver/dll_windows.go`（惰性符号解析与 `Version()`）、`driver/dll_fromrsrc_windows.go`（从资源内存加载，构建标记 `load_wgnt_from_rsrc`）、`driver/dll_fromfile_windows.go`（从磁盘加载，反向标记）、`driver/memmod/`（内存 PE 加载器，模块见 07-04）。测试与调用方参考 `tunnel/service.go`（生产路径）与 `manager/ipc_server.go`（运行态查询路径）。
+
+### 4. 关键流程与调用链
+
+**创建与上线**。`tunnelService.Execute` 在解析完配置、注册完接口监视器、解析完 endpoint 之后，进入一个最多 15 次的重试循环调用 `driver.CreateAdapter(config.Name, "WireGuard", deterministicGUID(config))`：首个参数是适配器显示名（等于隧道名），第二个是适配器类型字符串（固定 `"WireGuard"`，会影响 NLA 生成的网络配置文件），第三个是请求的网络 GUID（由配置确定性派生，模块见 07-05）。重试只在 `services.StartedAtBoot()` 为真时生效，因为开机早期 NDIS 栈可能尚未就绪，`CreateAdapter` 会返回「设备未就绪」类错误。创建成功后立刻 `adapter.LUID()` 拿到 LUID——这是后续所有 `winipcfg` 操作的钥匙（模块见 07-06）。
+
+**配置编组**。`config.ToDriverConfiguration()` 先做一次容量预估：`sizeof(Interface) + len(Peers)*sizeof(Peer) + 所有 AllowedIP 数量*sizeof(AllowedIP)`，然后 `ConfigBuilder.Preallocate` 一次性分配，避免追加过程中反复扩容导致指针失效（`Interface()` 返回的是缓冲区首地址，任何扩容都会让先前拿到的指针悬空，这是必须预分配的根本原因）。随后写 `Interface`：`Flags` 只置 `InterfaceHasPrivateKey | InterfaceHasListenPort`，`PeerCount` 填 peer 数；再逐个写 `Peer` 的 `Flags`、公钥、预共享密钥、keepalive、endpoint（`winipcfg.RawSockaddrInet`）与 `AllowedIPsCount`；最后为每段 AllowedIP 写 `Address[16]`、`AddressFamily`（`AF_INET`/`AF_INET6`）、`Cidr`。返回 `(*Interface, uint32)` 两个值，正好对应 `SetConfiguration(interfaze, size)` 的两个参数。
+
+**读取与重试**。`Configuration()` 是少数带内部循环的方法：它从 `lastGetGuessSize` 开始（首次 512 字节），调 `WireGuardGetConfiguration(handle, buf, &size)`；成功则把本次 `size` 记进缓存并返回；失败且错误是 `ERROR_MORE_DATA` 就按驱动回填的新 `size` 重新分配再来一次。这个「猜大小 → 不足则重试」的模式是 Windows 上所有变长 MIB/配置查询的标准写法。返回的 `*Interface` 直接指向 Go 堆上的 `[]byte`，因此调用方必须在同一 goroutine 内、在缓冲被回收前完成遍历，不能把指针存起来跨调用使用。
+
+**遍历**。驱动返回的是一段连续内存，Go 侧用指针算术还原成逻辑链表：`FirstPeer()` 返回 `Interface` 之后紧跟的第一个 `Peer`；`NextPeer()` 跳过当前 `Peer` 的固定大小**再加上** `AllowedIPsCount * sizeof(AllowedIP)`，落到下一个 `Peer`；`FirstAllowedIP()` 与 `NextAllowedIP()` 则是简单的定长偏移。这套算术的正确性完全依赖于「Go 结构体大小 == C 结构体大小」这一前提，任何一侧加字段都会让遍历错位——这也是为什么升级 wireguard.dll 时必须同步核对 `driver` 包。
+
+下图把「Go 侧调用 → DLL → 内核适配器 → 网络栈」的层次与关键顺序画在一起，节点名对应真实函数与真实对象。
+
+:::figure id=07-03-01 | name=driver 模块的适配器生命周期与 IOCTL 顺序 | dir=TD
+node n1 "tunnel.Service<br/>启动流程" blue
+node n2 "CreateAdapter<br/>名字/类型/GUID" teal
+node n3 "wireguard.dll<br/>C 导出函数" amber
+node n4 "WireGuardNT<br/>内核适配器" purple
+node n5 "SetConfiguration<br/>连续内存块" green
+node n6 "SetAdapterState<br/>AdapterStateUp" green
+node n7 "winipcfg<br/>地址与路由" amber
+node n8 "Close<br/>销毁适配器" red
+edge n1 -> n2 "创建"
+edge n2 -> n3 "导出调用"
+edge n3 -> n4 "装载并注册"
+edge n4 -> n1 dashed "返回句柄"
+edge n1 -> n5 "编组配置"
+edge n5 -> n4 "IOCTL 下发"
+edge n5 -> n6 "配置后上线"
+edge n6 -> n7 "LUID 配网"
+edge n1 -> n8 "退出清理"
+:::
+
+图 07-03-01 中「SetConfiguration 必须先于 SetAdapterState」这条边是硬约束，反过来不会报错但会让部分字段（尤其是 MTU 与 peer 端点）在第一次握手前不生效，表现为「隧道起来了但不通」。
+
+### 5. 配置/命令/代码实例
+
+下面这段 Go 代码复刻了 tunnel 服务里最关键的五步，可以直接放进一个 `main` 包里验证驱动是否可用。注意 `SetConfiguration` 接收的是 `conf` 编组出来的两个返回值，这是 Go 的多返回值直接作为实参的写法。
+
+```go
+adapter, err := driver.CreateAdapter("myconf", "WireGuard", nil)
+if err != nil {
+    log.Fatalf("CreateAdapter: %v", err)
+}
+defer adapter.Close()
+
+luid := adapter.LUID()
+if v, err := driver.RunningVersion(); err == nil {
+    log.Printf("WireGuardNT/%d.%d luid=%d", (v>>16)&0xffff, v&0xffff, uint64(luid))
+} else {
+    log.Printf("无法读取驱动版本: %v", err)
+}
+if err := adapter.SetLogging(driver.AdapterLogOn); err != nil {
+    log.Fatalf("SetLogging: %v", err)
+}
+cfg, err := conf.LoadFromName("myconf")
+if err != nil {
+    log.Fatalf("LoadFromName: %v", err)
+}
+if err := adapter.SetConfiguration(cfg.ToDriverConfiguration()); err != nil {
+    log.Fatalf("SetConfiguration: %v", err)
+}
+if err := adapter.SetAdapterState(driver.AdapterStateUp); err != nil {
+    log.Fatalf("SetAdapterState: %v", err)
+}
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+2026/11/12 10:21:03 WireGuardNT/1.1 luid=1689394872321
+2026/11/12 10:21:03 [myconf] Creating network adapter
+2026/11/12 10:21:03 [myconf] Using WireGuardNT/1.1
+2026/11/12 10:21:03 [myconf] Setting interface configuration
+2026/11/12 10:21:03 [myconf] Startup complete
+```
+
+逐行判读：第一行的 `luid` 是一个 64 位整数，高 32 位与低 32 位在 Windows 内部是分开的（低 32 位是索引类标识、高 32 位是实例计数），不要把它当数组下标或数据库主键，它**每次开机都会变**；`WireGuardNT/1.1` 来自 `RunningVersion()` 的高 16 位与低 16 位，若这里显示 `0.0` 而 `driver.Version()` 有值，说明 DLL 加载成功但内核驱动没有在跑（通常是驱动未安装或无权限打开设备）；`[myconf]` 前缀来自 `log.SetPrefix`，`Creating network adapter` 之后到 `Startup complete` 之间的耗时通常在 200–600 毫秒，若超过 3 秒且日志停在 `Creating network adapter`，多半是 NDIS 适配器注册被安全软件拦截或网络堆栈异常。若 `SetConfiguration` 失败，真实日志会给出 `Unable to set device configuration: 参数错误` 这类文案，此时应优先怀疑结构体布局与 DLL 版本不匹配，而不是配置内容本身——因为配置内容的问题早在解析阶段就被 `conf` 拦掉了。
+
+再看一眼「读回」的用法，它解释了 manager 的运行时查询为何总能反映真实状态：
+
+```go
+iface, err := adapter.Configuration()
+if err != nil {
+    log.Fatalf("Configuration: %v", err)
+}
+for p := iface.FirstPeer(); p != nil; p = p.NextPeer() {
+    log.Printf("peer tx=%d rx=%d handshake=%d", p.TxBytes, p.RxBytes, p.LastHandshake)
+    if p == iface.FirstPeer() && iface.PeerCount == 1 {
+        break
+    }
+}
+```
+
+这段代码有两个刻意的细节：`p.NextPeer()` 在最后一个 peer 之后会算出界外地址而不返回 `nil`，所以遍历必须用 `PeerCount` 计数，不能只靠指针判空；`LastHandshake` 是 FILETIME 而不是 Unix 时间，直接打印会得到一个十七位的天文数字，必须像 `conf.FromDriverConfiguration` 那样减去 `116444736000000000` 再乘 100。示例里用「只处理一个 peer 就 break」绕过了计数逻辑，生产代码必须按 `PeerCount` 循环。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**结构体布局是最硬的约束**。`driver.Interface`、`driver.Peer`、`driver.AllowedIP` 的字段顺序、类型宽度与填充都由 DLL 侧的头文件决定，Go 侧只是复刻。升级 `wireguard.dll` 时如果 C 结构体新增了字段而 Go 侧没跟上，`SetConfiguration` 会返回 `ERROR_INVALID_PARAMETER`，或者更糟——驱动按错位的偏移读到了垃圾数据，表现成「隧道能起、握手乱发、路由错乱」。因此本仓库把 `go.mod` 与 `.deps` 里的 WireGuardNT 版本绑定在一起，构建脚本会校验压缩包的 SHA256；读者若要替换 DLL，请把「结构体是否一致」当成第一检查项，并写「需对照实际版本核验」。
+
+**`size` 是整块字节数，不是 `sizeof(Interface)`**。`SetConfiguration(interfaze *Interface, size uint32)` 的第二个参数必须是「接口 + 全部 peer + 全部 allowed ip」的总长度。传 `unsafe.Sizeof(driver.Interface{})` 会得到一个「只有接口、零个 peer」的配置，隧道能起但没有任何 peer，`wg show` 里一片空白。这也是 `ConfigBuilder` 存在的意义：它替你维护长度。
+
+**不要在 `Up` 状态下改配置**。驱动的语义是「`Down` 时配置整份替换，`Up` 时只做有限增量」。本仓库的 `interfaceWatcher` 因此在重配前先 `AdapterState()`，只有确认是 `Down` 才 `SetConfiguration` 再 `SetAdapterState(Up)`。自己写脚本时若跳过这一步，可能遇到「配置下发返回成功但行为没变」。
+
+**`Adapter` 不能被值拷贝**。它持有一个句柄，拷贝出的副本会各自注册 finalizer，最终导致同一句柄被 `Close` 两次，第二次会作用在已被回收的内核对象上。所有函数都应传 `*driver.Adapter`；`manager` 里为了在多个 IPC 请求间共享适配器，用了显式的引用计数（`findDriverAdapter` / `releaseDriverAdapter` + 互斥锁），而不是拷贝结构体。
+
+**32 位进程不能操作 64 位驱动**。`main.go` 的 `checkForWow64()` 会在进程启动时直接拒绝架构不匹配的组合，因为 32 位进程加载 64 位 `wireguard.dll` 会失败，即便侥幸加载成功，结构体里的指针宽度也不一致。三种 MSI 分别对应 amd64 / x86 / arm64，不能混装。
+
+**卸载驱动前必须先停掉所有隧道**。`Uninstall()` 调 `WireGuardDeleteDriver`，驱动仍被适配器占用时该调用会失败（通常返回「设备正在使用」类错误）。正确顺序是：`/uninstalltunnelservice` 停掉每条隧道 → 确认 `Get-NetAdapter` 里已无 WireGuard 适配器 → 再 `/removedriver`。反过来做会留下「服务已删、适配器还在」的僵尸状态。
+
+**LUID 不是持久标识**。适配器的 LUID 每次创建都可能不同（尤其是重启后），任何把它写进配置文件或数据库的做法都会在下次启动时失效。需要稳定标识时用网络 GUID（`luid.GUID()`），它由 `deterministicGUID` 从配置派生，同名同配置的隧道会得到同一个 GUID，从而复用同一个 NLA 条目与防火墙配置文件。
+
+**日志开关的三种取值**。`AdapterLogOff`(0)、`AdapterLogOn`(1)、`AdapterLogOnWithPrefix`(2)。生产环境用 1；`2` 会在每条日志前加适配器名前缀，适合多隧道同机排障但会显著增加日志量。注意 `SetLogging` 必须在 `SetLogger` 之后调用——如果宿主没注册回调（例如一个只调 `CreateAdapter` 的最小程序），日志会被驱动丢弃，表现为「开了日志但 `log.bin` 里什么都没有」。
+
+### 7. 小结与延伸阅读
+
+`driver` 模块是「用户态与内核态之间的薄薄一层」：它不做协议，只做 ABI。它的全部复杂性来自三处——结构体的字节布局必须与 C 完全一致、配置必须以连续内存块的形式一次下发、日志回调必须覆盖三种 CPU 架构的调用约定。把这三处记住，剩下的就是一条清晰的顺序：`CreateAdapter` → `LUID` → `SetLogging` → `SetConfiguration` → `SetAdapterState(Up)` → 用 `winipcfg` 配地址与路由 → 退出时 `Close`。任何一步乱序，症状都不是「报错」，而是「隧道看起来起来了但不通」，这让它成为排障时最值得优先怀疑的模块。
+
+延伸阅读：结构体逐字段与填充见 05-05、适配器状态与句柄语义见 05-06；适配器创建与驱动加载的完整机制见 06-05；内存加载 DLL 的实现见 07-04；拿到 LUID 之后的网络配置见 07-06；隧道服务如何组织这条调用链见 07-05；驱动卸载与升级的运维步骤见 03-06。若想确认本机驱动版本，`wireguard /dumplog` 里的 `Using WireGuardNT/x.y` 与 `Get-NetAdapter -IncludeHidden` 的驱动版本信息可以互相印证。
+
+## 07-04 `driver/memmod` 内存加载模块
+
+### 1. 背景与动机
+
+官方 Windows 客户端对外只分发一个 `wireguard.exe`（外加 MSI 外壳）。如果 `wireguard.dll` 以独立文件的形式落在 `Program Files\WireGuard\` 下，就会引入三个问题。第一是**搜索路径劫持**：Windows 的 DLL 搜索顺序历史上包含当前目录与 `PATH`，任何能让进程从别处加载同名 DLL 的手段（投放、替换、旁加载）都能在 LocalSystem 上下文里执行代码。第二是**文件完整性**：多一个文件就多一个需要签名、需要 ACL 保护、需要防替换的对象；安装包要处理它的版本、升级、残留。第三是**可移植性**：绿色版、单文件分发、嵌入式集成（`embeddable-dll-service`）都希望「一个 exe 带走全部」。
+
+`driver/memmod` 给出的答案是：把 `wireguard.dll` 作为 **RCDATA 资源**编译进 exe，运行时把它当一段字节读出来，在进程堆上手动完成 PE 加载的全过程——分配镜像、拷贝节区、应用重定位、修复导入表、设置页保护、注册异常表、执行 TLS 回调、调用 `DllMain`——最后按名字解析导出函数地址。整个过程不产生磁盘文件，也不经过 Windows 的加载器，因此不存在「DLL 被替换」这一攻击面：要篡改这段代码，必须篡改 exe 本身，而 exe 有 Authenticode 签名，改动会导致签名失效。
+
+第二个动机是**构建形态的可切换**。仓库里有两个互斥的实现文件：`dll_fromrsrc_windows.go` 带 `//go:build load_wgnt_from_rsrc` 标记，走内存加载；`dll_fromfile_windows.go` 带 `//go:build !load_wgnt_from_rsrc`，走 `LoadLibraryEx`。`Makefile` 的 `GOFLAGS` 固定带 `-tags load_wgnt_from_rsrc`，所以官方产物永远是内嵌形态；而开发者想用新编译的 DLL 做快速验证时，去掉这个 tag 重新构建即可，无需重新跑 `windres`。这种「同一套上层代码、两种加载后端」的设计，让 `driver` 包完全不必知道自己用的是内存模块还是系统模块——它只依赖 `lazyDLL.Load()`、`lazyDLL.Base` 与 `lazyProc.nameToAddr()` 三个抽象。
+
+第三个动机是**架构分支必须显式**。内存加载 PE 时有两处与位宽强相关：其一，必须校验 PE 头里的 `Machine` 字段与当前进程架构一致，否则加载进去的代码一执行就崩；其二，在 64 位系统上，节区头里的 `PhysicalAddress` 字段只有 32 位，装不下 64 位地址，于是 `finalizeSections` 依赖 `imageOffset()` 把高 32 位补回来，并且必须在分配镜像时保证整个镜像不跨越 4GB 边界，否则「截断再拼回」的技巧会失效。`memmod_windows_64.go` 与 `memmod_windows_32.go` 就是为这两件事准备的两套实现，前者做 `check4GBBoundaries`，后者是空实现。
+
+最后要说清边界：`memmod` 加载的是**用户态 DLL**，不是内核驱动。它不能让一个未签名的 `.sys` 绕过 Windows 的驱动签名强制；内核驱动的安装、签名与加载由 WireGuardNT 侧完成，具体路径与策略需对照 WireGuardNT 版本核验。它也不是通用的「反病毒规避工具」——把任意 DLL 塞进内存加载，在现代 EDR 上同样是高危行为特征，官方客户端之所以不被拦，是因为整条链（签名 exe、签名驱动、固定资源名）都在白名单模型内。理解这一点，才不会把 `memmod` 误用成打包器。
+
+### 2. 核心概念
+
+**资源即文件**。`resources.rc` 里有一行 `wireguard.dll RCDATA wireguard.dll`：资源类型是 `RT_RCDATA`，资源名是 `wireguard.dll`，内容由 `windres` 从 `-I .deps/wireguard-nt/bin/<arch>` 目录里读入。运行时 `dll_fromrsrc_windows.go` 用 `windows.FindResource(0, d.Name, windows.RT_RCDATA)` 在当前模块（句柄 0 表示自身）里找到它，`LoadResourceData` 拿到 `[]byte`，交给 `memmod.LoadLibrary`。所以「DLL 的名字」在这个形态下不是文件名，而是资源名，两者必须完全一致。
+
+**手动映射与加载器的差别**。`LoadLibrary` 会做缓存（同一 DLL 只映射一次）、引用计数、依赖解析、TLS、异常表注册、`DllMain` 调用，还会把模块登记进 PE
+B 链表，让调试器、`GetModuleHandle`、栈回溯都能看见它。`memmod` 必须把这些一件件手工补上：`copySections` 拷贝节区、`performBaseRelocation` 修正绝对地址、`buildImportTable` 逐个 `LoadLibrary` 依赖并填 IAT、`finalizeSections` 按节区属性 `VirtualProtect`、`registerExceptionHandlers` 调 `RtlAddFunctionTable`、`executeTLS` 跑 TLS 回调、最后 `SyscallN(entry, codeBase, DLL_PROCESS_ATTACH, 0)` 调 `DllMain`。少任何一步，症状都很隐蔽：不注册异常表，x64 上的异常展开会失败，一次访问违例就变成「进程静默消失」。
+
+**4GB 边界技巧**。节区头结构是 PE 规范里固定的，`PhysicalAddress`/`VirtualSize` 只有一个 32 位字段。`memmod` 在拷贝节区时把 `dest & 0xffffffff` 存进去，在 `finalizeSections` 里再用 `| imageOffset()` 拼回高 32 位。这套技巧成立的前提是「同一镜像的所有节区高 32 位相同」，也就是镜像不能跨 4GB 边界。`check4GBBoundaries` 因此循环检查 `codeBase>>32` 与 `(codeBase+size)>>32` 是否相等，不等就释放、重新 `VirtualAlloc`、把旧地址挂到 `blockedMemory` 链表上（防止下次又分配到同一块），直到落在一段连续的 4GB 区域内。32 位进程天然满足，所以对应实现是空函数。
+
+**可见性补丁**。内存模块不在加载器链表里，Go 运行时的 `runtime.Caller`、`RtlLookupFunctionEntry` 之类的栈回溯会找不到它，日志里只能看到一串裸地址。`LoadLibrary` 末尾把 `[codeBase, codeBase+alignedImageSize)` 记进 `loadedAddressRanges`，并用 `sync.Once` 挂一次 `hookRtlPcToFileHeader`——这个 API 是 Windows 用来「由 PC 反查所属模块基址」的入口，钩住它就能让系统把内存模块的地址识别成合法模块，从而让异常处理与符号化正常工作。这是一个非常「脏」但必要的技巧，也是它与「简单粗暴的 shellcode 加载器」的分水岭。
+
+**导出解析两种方式**。`ProcAddressByName` 遍历导出表的名字表，用 `buildNameExports` 预先建立的 `map[string]uint16` 做名字到序号的映射，再按序号取 `AddressOfFunctions` 里的 RVA 加基址；`ProcAddressByOrdinal` 则直接用序号减 `Base` 得到下标。`driver` 包只按名字取函数，序号接口留给需要兼容旧 DLL 的场景。
+
+一个自然的替代方案值得讨论：既然最终目标只是「不落盘」，为什么不把资源写成临时文件、`LoadLibrary` 之后再删除？这条路被否决有三个理由。其一是 TOCTOU——从写入到加载之间，任何能访问临时目录的进程都可以替换文件内容，而这发生在 LocalSystem 进程里，等于把提权入口重新打开。其二是可诊断性——`LoadLibrary` 会把路径记进模块链表，崩溃报告、调试器、`GetModuleFileName` 都会指向一个已被删除的路径，事后分析几乎无法进行。其三是环境不可控——临时目录可能被组策略重定向到漫游配置文件、可能受磁盘配额限制、可能被安全软件实时扫描并短暂锁定，这些都会让「启动隧道」这种本该确定的行为变得依赖机器状态。相比之下，内存加载的输入是 exe 自身的一段只读资源，内容随签名一起被校验，没有中间态。
+
+代价也要说清：内存加载放弃了加载器的全部便利。没有引用计数，所以 `Free` 必须由调用方精确调用一次；没有依赖去重，同一个依赖被两个内存模块导入时会 `LoadLibrary` 两次（`Module.modules` 各自持有一份句柄）；没有自动的 CFG（控制流保护）登记，`finalizeSections` 只设页保护而不会把间接调用目标注册进 CFG 位图。`wireguard.dll` 恰好是一个依赖极简、导出极少的模块，这些代价可以接受；换成大型第三方库，这套加载器大概率跑不起来。
+
+### 3. 关键数据结构与源码位置
+
+下表把 `Module` 的成员按「在加载流程中的角色」归类，不给偏移与类型细节（字段见 05-06 ｜ 配置见 04-04 ｜ 原理见 06-05）。真正的逐字段说明与 PE 结构定义在 05-06 与 `driver/memmod/syscall_windows.go`。
+
+| 成员/函数 | 角色 | 源码位置 |
+|---|---|---|
+| `Module.headers` | 指向新镜像内的 NT 头，后续所有 RVA 计算的基准 | `memmod_windows.go` |
+| `Module.codeBase` | 镜像基址，`BaseAddr()` 的返回值 | `memmod_windows.go` |
+| `Module.modules` | 导入表中 `LoadLibrary` 打开的依赖句柄，`Free` 时逐个释放 | `memmod_windows.go` |
+| `Module.nameExports` | 导出名到序号的映射 | `memmod_windows.go` |
+| `Module.entry` | `AddressOfEntryPoint` 换算出的绝对地址 | `memmod_windows.go` |
+| `Module.blockedMemory` | 为避开 4GB 边界而保留的废弃分配 | `memmod_windows.go` |
+| `Module.runtimeFuncs` | 注册进系统的异常表，`Free` 时 `RtlDeleteFunctionTable` | `memmod_windows.go` |
+| `LoadLibrary` | 全部校验与映射流程 | `memmod_windows.go` |
+| `Free` | 逆序卸载：`DllMain` DETACH → 依赖 → 异常表 → 镜像 | `memmod_windows.go` |
+| `imageFileProcess` | 架构常量，按文件分片 | `memmod_windows_386/amd64/arm64.go` |
+| `check4GBBoundaries` | 64 位专用边界规避 | `memmod_windows_64.go` |
+
+真实源码清单：`driver/memmod/memmod_windows.go`（约 740 行，加载器主体）、`driver/memmod/memmod_windows_32.go` 与 `memmod_windows_64.go`（位宽分支）、`driver/memmod/memmod_windows_386.go`、`memmod_windows_amd64.go`、`memmod_windows_arm.go`、`memmod_windows_arm64.go`（四个 `imageFileProcess` 常量）、`driver/memmod/syscall_windows.go` 与 `syscall_windows_32.go`/`syscall_windows_64.go`（PE 结构与少量 syscall 封装）。上层入口是 `driver/dll_fromrsrc_windows.go`，资源定义在 `resources.rc`，构建规则在 `Makefile` 的 `resources_<arch>.syso` 目标。
+
+### 4. 关键流程与调用链
+
+`lazyDLL.Load()` 触发加载：先用原子读检查 `d.module` 是否已存在（快路径），加锁后再查一次（慢路径），然后 `FindResource` 找 RCDATA、`LoadResourceData` 取字节、`memmod.LoadLibrary(data)` 映射、把 `module.BaseAddr()` 存进 `d.Base`（供 `Version()` 用 `FindResource(d.Base, 1, RT_VERSION)` 读版本资源），最后若有 `onLoad` 回调就执行（`driver` 注册的是 `setupLogger`，它会调 `WireGuardSetLogger`）。
+
+`LoadLibrary` 内部是严格的「先校验、后分配、再修补」。校验阶段逐项检查：数据长度够不够放 `IMAGE_DOS_HEADER`、`E_magic` 是不是 `MZ`、`E_lfanew` 是否越界、NT 签名是不是 `PE\0\0`、`Machine` 是否等于 `imageFileProcess`、`SectionAlignment` 是否为 2 的幂、节区数是否为零、`SizeOfOptionalHeader` 是否够大、`NumberOfRvaAndSizes` 是否至少 16 项、节区头是否落在文件内、`SizeOfImage` 与最后一节末尾是否都按 `SectionAlignment` 对齐。任何一项不过都返回带具体期望值与实际值的错误，例如「Foreign platform (provided: 8664, expected: 14c)」——这类错误对排查「装错架构的 MSI」非常有用。
+
+分配阶段先尝试在 `OptionalHeader.ImageBase` 处 `VirtualAlloc(MEM_RESERVE|MEM_COMMIT)`，失败则退化为「任意地址」，随后 `check4GBBoundaries` 保证不跨界。头部单独 `VirtualAlloc` 一份并 `memcpy` 过去，然后改写 `module.headers.OptionalHeader.ImageBase` 为新基址——这一步是后续所有 RVA 计算的前提。`copySections` 对每个节区：`SizeOfRawData == 0` 的按 `SectionAlignment` 分配并清零（BSS 类节区），否则按 `PointerToRawData` 拷贝原始数据；两种情况都把「目标地址低 32 位」写回节区头。
+
+修补阶段按依赖顺序进行：`locationDelta = 新基址 - 旧基址`，非零则 `performBaseRelocation` 遍历重定位表逐项修正，若镜像没有重定位表且需要移动，直接报「Module could not be relocated」；`buildImportTable` 对每个导入 DLL 调 `LoadLibrary`、对每个导入函数调 `GetProcAddress` 并把地址写进 IAT；`finalizeSections` 按 `Characteristics` 把 `IMAGE_SCN_MEM_EXECUTE/READ/WRITE` 翻译成 `PAGE_EXECUTE_READ` 等保护常量，并处理「多个节区共享同一页」时的权限合并；`registerExceptionHandlers` 在有 `.pdata` 时调 `RtlAddFunctionTable`；`executeTLS` 按 TLS 目录里的回调数组逐个调用；最后若 `AddressOfEntryPoint != 0` 且是 DLL，就以 `DLL_PROCESS_ATTACH` 调入口，返回 0 则整体失败并回滚。
+
+下图把这条流水线按「校验 → 映射 → 修补 → 可用」四段画出，节点名对应 `memmod_windows.go` 里的真实函数。
+
+:::figure id=07-04-01 | name=memmod 的内存 PE 加载流水线 | dir=TD
+node n1 "RCDATA 资源<br/>wireguard.dll" blue
+node n2 "FindResource<br/>LoadResourceData" teal
+node n3 "PE 头与架构校验" amber
+node n4 "VirtualAlloc<br/>镜像基址" gray
+node n5 "copySections<br/>节区拷贝" purple
+node n6 "重定位与导入表" amber
+node n7 "页保护 异常表 TLS<br/>DllMain" green
+node n8 "ProcAddressByName<br/>导出解析" red
+edge n1 -> n2 "定位资源"
+edge n2 -> n3 "取出字节"
+edge n3 -> n4 "校验通过"
+edge n4 -> n5 "分配镜像"
+edge n5 -> n6 "修正地址"
+edge n6 -> n7 "补齐运行时"
+edge n7 -> n8 "可调用"
+:::
+
+图 07-04-01 里没有画 `Free`，因为它在正常路径上只出现一次（进程退出或适配器模块卸载时），但它的顺序与加载严格相反：先 `DllMain(DETACH)`，再 `FreeLibrary` 依赖，再 `RtlDeleteFunctionTable`，再 `VirtualFree` 镜像，最后释放 `blockedMemory` 链表。顺序错会导致「卸载后崩溃在别人的回调里」。
+
+### 5. 配置/命令/代码实例
+
+两个加载后端的差别只有一行构建标记，这组对照是理解模块切换成本的最佳示例。
+
+```go
+// dll_fromrsrc_windows.go
+//go:build load_wgnt_from_rsrc
+
+func (d *lazyDLL) Load() error {
+    resInfo, err := windows.FindResource(0, d.Name, windows.RT_RCDATA)
+    if err != nil {
+        return fmt.Errorf("Unable to find %q RCDATA resource: %w", d.Name, err)
+    }
+    data, err := windows.LoadResourceData(0, resInfo)
+    if err != nil {
+        return err
+    }
+    module, err := memmod.LoadLibrary(data)
+    if err != nil {
+        return err
+    }
+    d.Base = windows.Handle(module.BaseAddr())
+    return nil
+}
+```
+
+```go
+// dll_fromfile_windows.go
+//go:build !load_wgnt_from_rsrc
+
+func (d *lazyDLL) Load() error {
+    module, err := windows.LoadLibraryEx(d.Name, 0,
+        LOAD_LIBRARY_SEARCH_APPLICATION_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32)
+    if err != nil {
+        return fmt.Errorf("Unable to load library: %w", err)
+    }
+    d.Base = module
+    return nil
+}
+```
+
+构建内嵌形态时，`resources.rc` 里的那一行由 `windres` 在编译期解析，命令与产物如下。
+
+```bash
+x86_64-w64-mingw32-windres -I .deps/wireguard-nt/bin/amd64 -i resources.rc -o resources_amd64.syso
+make amd64/wireguard.exe
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+x86_64-w64-mingw32-windres -I .deps/wireguard-nt/bin/amd64 -i resources.rc -o resources_amd64.syso
+go build -overlay .overlay/overlay.json -tags load_wgnt_from_rsrc -ldflags="-H windowsgui -s -w" -trimpath -buildvcs=false -v -o amd64/wireguard.exe
+```
+
+逐行判读：第一行的 `-I` 指向 `.deps/wireguard-nt/bin/amd64`，`windres` 会在这个目录里找 `resources.rc` 中 `wireguard.dll RCDATA wireguard.dll` 右侧引用的文件——也就是说，**资源名与文件名在这里都叫 `wireguard.dll`，但来源是依赖包而不是仓库根目录**；如果这个目录里没有对应架构的 DLL，构建会失败并报「file not found」，而不是悄悄生成一个空资源。第二行的 `-tags load_wgnt_from_rsrc` 是选择内存加载后端的开关，去掉它就变成 `dll_fromfile` 形态，产物会在运行时去 `LOAD_LIBRARY_SEARCH_APPLICATION_DIR`（exe 所在目录）找 DLL；`-ldflags="-H windowsgui -s -w"` 去掉控制台窗口并剥掉符号，这让最终 exe 更小，但也意味着崩溃时拿不到 Go 的符号化栈——排障版应自行去掉 `-s -w` 重新构建；`-overlay .overlay/overlay.json` 把依赖目录里的生成文件映射进编译视图，具体映射内容随版本变化，需对照实际版本核验。产物落在 `amd64/wireguard.exe`，与 `x86/`、`arm64/` 并列，三个目录各自对应一次 `windres` 与一次 `go build`。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**资源名必须与 `d.Name` 完全一致**。`newLazyDLL` 的第一个参数（`"wireguard.dll"`）同时是「资源名」和「磁盘文件名」：内嵌形态下它去 `FindResource` 找 `RT_RCDATA` 里名为 `wireguard.dll` 的项，文件形态下它去 `LoadLibraryEx` 找磁盘上的 `wireguard.dll`。把资源改名成 `wg.dll` 而代码里仍写 `wireguard.dll`，会得到「Unable to find "wireguard.dll" RCDATA resource」，这个错误在运行时才出现，构建期毫无提示。
+
+**架构错了只会得到一句「Foreign platform」**。`Machine` 校验拿 `imageFileProcess` 比对，错误信息里给的是十六进制机器码（如 `8664` 对应 amd64、`14c` 对应 arm64），不熟悉 PE 的人很难一眼看出问题。遇到这个错误，先确认三件事：MSI 架构、`windres -I` 指向的依赖目录、以及 `GOARCH`。三者必须一致。
+
+**不可重定位的镜像是硬失败**。若 DLL 编译时去掉了重定位表（`/FIXED` 或某些裁剪工具会导致），而 `ImageBase` 又恰好被占用，`performBaseRelocation` 会返回 `relocated=false`，整体报「Module could not be relocated」。这类问题在开发机上往往复现不了（地址恰好空闲），一到客户机器上就必现。构建 DLL 时必须保留重定位信息。
+
+**内存加载会触发 EDR 告警**。`VirtualAlloc` + 手工拷贝 PE + `RtlAddFunctionTable` + 钩 `RtlPcToFileHeader`，这组行为与「反射式 DLL 注入」高度重合。官方产物之所以能过，是因为 exe 有有效签名、资源内容与签名版本一致、且行为模式被各大厂商加白。自行改造（例如把别的 DLL 塞进资源、或去掉签名）后出现「杀软拦截、进程启动即被杀」，属于预期结果而非 bug；企业环境应走 08-05 的白名单与签名策略，而不是试图对抗。
+
+**`Free` 之后不能再调任何导出函数**。`Module.Free()` 会 `VirtualFree` 整个镜像，之前通过 `ProcAddressByName` 拿到的函数指针全部失效。`driver` 包的 `lazyDLL` 在设计上不提供卸载路径，模块随进程存活；如果做嵌入式集成需要热替换 DLL，必须自己保证「没有正在执行的调用」再释放，这个同步责任在调用方。
+
+**不要把 `memmod` 当通用加载器**。它只处理「同架构、可重定位、导入表完整」的正常 PE，不支持延迟加载导入（delay-load）、不支持 API set 重定向的特殊处理、不支持 side-by-side 清单。`wireguard.dll` 恰好是一个依赖极简的 DLL（只依赖 `ntdll`、`kernel32` 等系统 DLL），所以能跑通；换成依赖一堆运行库的 DLL，很可能在 `buildImportTable` 阶段失败。
+
+**调试信息会丢**。内存模块不在加载器链表里，调试器默认看不到它的符号；`-s -w` 又剥掉了 Go 侧符号。排障时建议：用未剥离的构建、在 `setupLogger` 之后立刻打一条日志确认回调已注册、并用 `driver.Version()` 与 `RunningVersion()` 双向确认「加载的 DLL」与「运行的驱动」是否配套。
+
+### 7. 小结与延伸阅读
+
+`driver/memmod` 用 700 多行代码换来三个收益：单文件分发、无 DLL 替换攻击面、构建期可选后端。它的实现可以概括成一句话——「把加载器做的事按 PE 规范手工重做一遍，并把所有与位宽、页对齐、异常展开相关的坑显式处理」。四个关键点值得反复回看：`Machine` 校验决定能不能跑、`check4GBBoundaries` 决定 64 位下会不会崩、`registerExceptionHandlers` 决定异常时进程是「报错」还是「静默消失」、`hookRtlPcToFileHeader` 决定栈回溯能不能看见它。理解了这四点，就理解了为什么这不是一个「随便找个开源反射加载器就能替代」的模块。
+
+延伸阅读：`Module` 与 PE 结构的逐字段说明见 05-06；驱动加载与适配器创建的完整机制见 06-05；`driver` 包如何使用这些导出函数见 07-03；构建标记与 `windres` 资源编译的完整流程见 02-03 与 02-04；嵌入式 DLL 服务形态见 07-12；企业环境下的签名与白名单策略见 08-05。
+
+## 07-05 `tunnel` 服务模块
+
+### 1. 背景与动机
+
+在 Windows 上，「让一个隧道跑起来」不是一次函数调用，而是一段有严格先后顺序、且每一步都可能永久失败的启动剧本：先要有日志（否则失败无迹可查），再要有配置（否则不知道连哪里），再要有网络接口监视（否则适配器出现时无人接手），再要解析 endpoint 域名（否则驱动拿不到 IP），再要创建适配器（否则没有网卡），再要开防火墙（否则可能在隧道未就绪时泄漏流量），再要降权限（否则 LocalSystem 的完整令牌会一直暴露在解析外部配置的代码路径上），最后才是下发配置、拉起适配器、配地址路由。这段剧本由 `tunnel/service.go` 的 `tunnelService.Execute` 实现，它是整个客户端里**唯一**以 LocalSystem 身份、长期驻留、并且直接处理用户提供的配置文本的进程。
+
+为什么要把每条隧道做成独立的服务进程，而不是在 manager 里起 goroutine？三个理由。第一是**故障隔离**：一条隧道的驱动调用挂死、配置解析 panic、脚本卡住，不应该影响其他隧道与 UI。第二是**生命周期与 SCM 对齐**：服务可以被 `sc stop`、可以被组策略启动、可以设恢复策略、可以在开机时按依赖顺序拉起，这些都是 Windows 运维体系的原生能力，用进程内线程模拟不出来。第三是**权限边界**：隧道服务需要 `SeLoadDriverPrivilege` 来加载/操作驱动，但不需要其他任何特权；把「需要高权限的那一小段」关进一个独立进程，比让整个 manager 常驻高权限更容易审计。
+
+这也解释了为什么 `tunnel` 模块的代码里，**顺序本身就是安全属性**。防火墙规则必须在适配器拉起之前生效，否则从「适配器 Up」到「规则生效」之间会有一个流量明文外泄的窗口；权限降级必须发生在「解析完配置、创建完适配器」之后、「下发配置」之前，因为创建适配器需要驱动权限，而之后的运行期不应该再持有它；`PreUp` 脚本必须在防火墙之后、配置下发之前执行，`PostUp` 必须在适配器 Up 之后执行，否则用户脚本里 `netsh` 或 `wg` 命令看到的状态与预期不符。任何一次「为了省事把两步换个位置」的改动，都会破坏其中一条不变量。
+
+本册是模块功能唯一权威源，本篇讲 `tunnel` 服务**做什么、按什么顺序做、失败时怎么表现**。启动顺序里每一步调用的底层机制（如 `CreateAdapter` 的 IOCTL 细节、`winipcfg` 的地址写入、WFP 规则构造）分别属于 06-05、06-06、06-09 与 07-03、07-06、07-07；结构体字段见 05-08，服务安装命令与注册表策略见 04-06 与 04-07。能力边界要先讲清：本模块**不是** `wg-quick`，`PreUp`/`PostUp`/`PreDown`/`PostDown` 默认**不执行**，只有管理员显式把 `HKLM\Software\WireGuard\DangerousScriptExecution` 设为 1 才会以 LocalSystem 执行；脚本里拿不到 `%i`，只能用环境变量 `WIREGUARD_TUNNEL_NAME`；`Table = off` 只影响路由写入，不影响地址、DNS、MTU 与防火墙判定。
+
+### 2. 核心概念
+
+**一隧道一进程一服务**。服务名由 `conf.ServiceNameOfTunnel` 派生为 `WireGuardTunnel$<name>`，安装时 `manager.InstallTunnel` 把它注册成 `SERVICE_WIN32_OWN_PROCESS`、`StartAutomatic`、依赖 `Nsi` 与 `TcpIp`、`SidType` 为 `UNRESTRICTED`、显示名 `WireGuard Tunnel: <name>`。依赖 `Nsi` 是因为适配器与路由操作走的是网络存储接口（NSI），依赖 `TcpIp` 是因为没有 TCP/IP 栈就没有地址可配。`SidType` 非受限意味着服务进程里可以拿到自己的服务 SID，便于将来做更细的资源 ACL；当前代码没有用它做鉴权。
+
+**`svc.Execute` 契约与双通道退出码**。`Execute(args, r, changes)` 的返回值是 `(svcSpecificEC bool, exitCode uint32)`。这个二元组的含义是：若 `svcSpecificEC` 为真，`exitCode` 是「服务自定义错误码」，可以在事件日志里按 `services.Error` 的枚举解释；若为假，`exitCode` 是 Win32 错误码。`services.DetermineErrorCode` 的判断顺序是「先看 error 链里有没有 `windows.Errno`，有就直接透传 Win32 码；否则若 `serviceError` 非 `ErrorSuccess`，就用它」。这条规则很重要：同一个启动失败可能同时有「底层 Win32 错误」与「我们包装的语义错误」，最终报告给 SCM 的是前者，而写进日志的是两者拼接（`CombineErrors` 会输出 `语义错误: 底层错误`）。
+
+**日志锚点即阶段标记**。`tunnel` 的日志刻意写成一组可 grep 的短句：`Watching network interfaces`、`Resolving DNS names`、`Creating network adapter`、`Dropping privileges`、`Setting interface configuration`、`Startup complete`、`Shutting down`。排障时看最后一条锚点落在哪里，就能定位到失败阶段，比读堆栈快得多。日志前缀是 `[<隧道名>] `，由 `log.SetPrefix` 设置；环形日志的 tag 是 `TUN`，由 `ringlogger.InitGlobalLogger(logFile, "TUN")` 指定。
+
+**权限降级是一个精确的时刻**。`elevate.DropAllPrivileges(true)` 的参数 `true` 表示**保留 `SeLoadDriverPrivilege`**，其余全部丢弃。它发生在 `enableFirewall` 之后、`SetConfiguration` 之前。为什么保留驱动加载特权？因为运行期适配器可能被系统重置（驱动重装、网络栈重启），`interfaceWatcher` 需要能重新 `SetConfiguration` 并拉起适配器；而 `SetConfiguration` 走的是设备 IOCTL，不需要额外特权，真正需要的是「打开适配器句柄」这一步在极端情况下可能触发驱动加载。为什么不更早降权？因为创建适配器、注册 WFP 规则都需要更高权限。为什么不更晚？因为下发配置之后隧道就开始处理真实流量，此时不应该再持有可加载任意驱动的令牌。
+
+**脚本钩子是「默认关闭的高危能力」**。`runScriptCommand(command, interfaceName)` 的第一件事不是执行，而是 `conf.AdminBool("DangerousScriptExecution")`；为假就打一条「Skipping execution of script, because dangerous script execution is safely disabled」并返回 `nil`（注意：返回成功，不算失败）。为真时用 `GetSystemDirectory` 拼出 `cmd.exe` 的绝对路径，`os.StartProcess` 以 `cmd /c <command>` 启动，`Files` 把 stdin 接 `os.DevNull`、stdout/stderr 接同一根管道，环境变量追加 `WIREGUARD_TUNNEL_NAME=<name>`，窗口隐藏；随后起一个 goroutine 逐行读管道并以 `cmd> ` 前缀写日志，主流程 `process.Wait()` 等退出；退出码非 0 时记 `Command error exit status: N` 并返回 `ERROR_GENERIC_COMMAND_FAILED`。
+
+**看门狗是防死锁的最后手段**。`Execute` 的 `defer` 里会起一个 30 秒定时器：若清理流程在 30 秒内没有发出 `stopIt` 信号，它就 `runtime.Stack(buf, true)` 抓全量 goroutine 栈、逐行写日志、打印「Failed to shutdown after 30 seconds. Probably dead locked. Printing stack and killing.」，然后 `os.Exit(777)`。这个 777 不是随便选的：它不是任何 `services.Error` 的值，也不是常见 Win32 码，出现在事件日志或 `sc query` 的退出码里就是一个明确信号——「服务在关停时死锁了，去看日志里的栈」。
+
+**开机竞态被显式建模**。`services.StartedAtBoot()` 用 `svc.DynamicStartReason()` 判断本次启动是否由「自动/延迟自动」触发；为真时，多处行为会改变：DNS 解析重试次数从 10 次增加到 30 次（`maxTries *= 3`）且 `WSAHOST_NOT_FOUND` 也重试；适配器创建失败会重试最多 15 次、每次间隔 1 秒；`configureInterface` 遇到 `ERROR_NOT_FOUND` 会整体重来；甚至在 `Execute` 早期还要处理「SCM 被锁」——若 `mgr.LockStatus()` 显示 SCM 处于锁定状态，就先把自己标记成 `Running`，否则「安装网络适配器」会触发驱动服务启动，而驱动服务启动又要等 SCM 锁，形成死锁。
+
+### 3. 关键数据结构与源码位置
+
+本篇只点名对象与阶段，不展开字段（字段见 05-08 ｜ 配置见 04-06 ｜ 原理见 06-05）。`tunnelService` 只有一个配置路径字段，是 `svc.Run` 的宿主；`interfaceWatcher` 持有错误通道、启动通道、适配器、配置、LUID、变更回调与看门狗定时器；`interfaceWatcherError` 把「语义错误码 + 底层 error」成对传递，保证主循环能把失败原样翻译成退出码。下表按启动阶段组织，把「动作 → 失败错误码 → 日志锚点」对齐，便于按日志反查。
+
+| 阶段 | 主要动作 | 失败时 `services.Error` | 日志锚点 |
+|---|---|---|---|
+| 日志 | `conf.LogFile(true)` + `InitGlobalLogger` | `ErrorRingloggerOpen` | 无（此时还写不进日志） |
+| 配置 | `LoadFromPath` + `DeduplicateNetworkEntries` | `ErrorLoadConfiguration` | `Starting` |
+| 网络监视 | `watchInterface` 注册接口变更回调 | `ErrorSetNetConfig` | `Watching network interfaces` |
+| 域名解析 | `ResolveEndpoints` | `ErrorDNSLookup` | `Resolving DNS names` |
+| 适配器 | `CreateAdapter`（开机重试 15 次）+ `LUID` | `ErrorCreateNetworkAdapter` | `Creating network adapter` |
+| 驱动日志 | `RunningVersion` + `SetLogging` | `ErrorCreateNetworkAdapter` | `Using WireGuardNT/x.y` |
+| 前置脚本 | `runScriptCommand(PreUp)` | `ErrorRunScript` | `Executing:` |
+| 防火墙 | `enableFirewall`（单 peer 且含 /0 时收紧） | `ErrorFirewall` | `Enabling firewall rules` |
+| 降权 | `DropAllPrivileges(true)` | `ErrorDropPrivileges` | `Dropping privileges` |
+| 下发 | `SetConfiguration` + `SetAdapterState(Up)` | `ErrorDeviceSetConfig` / `ErrorDeviceBringUp` | `Setting interface configuration` |
+| 配网 | `watcher.Configure` → `configureInterface` | `ErrorSetNetConfig` | `Setting device v4/v6 addresses` |
+| 后置脚本 | `runScriptCommand(PostUp)` | `ErrorRunScript` | `Executing:` |
+| 上线 | 等 `watcher.started` 后置 `Running` | — | `Startup complete` |
+
+真实源码清单：`tunnel/service.go`（服务宿主、启动顺序、关停清理、错误码收口）、`tunnel/interfacewatcher.go`（接口变更回调、配置与重配、销毁时 flush）、`tunnel/addressconfig.go`（地址/路由/MTU/DNS 下发与防火墙触发条件）、`tunnel/mtumonitor.go`（未指定 MTU 时按默认路由推导）、`tunnel/deterministicguid.go`（网络 GUID 派生）、`tunnel/scriptrunner.go`（脚本钩子）、`tunnel/pitfalls.go`（dnscache 禁用、VirtIO 驱动过旧、WeakHostSend 三类环境陷阱探测）。服务安装与卸载在 `manager/install.go`，错误码枚举在 `services/errors.go`，启动原因判定在 `services/boot.go`。
+
+### 4. 关键流程与调用链
+
+`Run(confPath)` 只做三件事：`NameFromPath` 取隧道名、`ServiceNameOfTunnel` 拼服务名、`svc.Run(serviceName, &tunnelService{confPath})`。真正的剧本在 `Execute`。它先把状态置 `StartPending` 并通知 SCM，然后立刻打开 `log.bin` 初始化环形日志——这一步失败会以 `ErrorRingloggerOpen` 退出，此时用户几乎拿不到任何线索，只能用 `sc query` 看到退出码。
+
+接下来是配置加载与两个「环境体检」：`config.DeduplicateNetworkEntries()` 去掉字面重复；`log.SetPrefix("[name] ")` 让后续所有日志可辨识；`services.PrintStarting()` 打印版本与是否开机启动；`evaluateStaticPitfalls()` 起一个 goroutine 检查三件事——`dnscache` 服务是否被禁用（禁用会导致 DNS 解析全废）、`netkvm.sys`（VirtIO 网卡驱动）版本是否低于 `100.85.104.20800`（旧版有已知的校验和/分段问题）、以及稍后由 `evaluateDynamicPitfalls` 检查每个 endpoint 的出接口是否开了 `Forwarding`/`WeakHostSend`（会导致路由环路）。这些都是「只警告、不阻断」，因为它们是环境问题而非配置错误。
+
+随后 `watchInterface()` 注册全局接口变更回调并返回 `interfaceWatcher`；`config.ResolveEndpoints()` 把每个 peer 的 endpoint 域名解析成 IP（开机时最多 30 次、每次间隔 4 秒）；`CreateAdapter` 带着 `deterministicGUID(config)` 创建适配器，成功后取 LUID、读驱动版本写日志、`SetLogging(AdapterLogOn)` 打开驱动日志。此时 `PreUp` 脚本执行（若开关打开），随后 `enableFirewall(config, luid)`：它只在「恰好一个 peer、未设 `Table = off`、且该 peer 的 AllowedIPs 里有一段 `Bits()==0` 且等于其掩码形式」时才把 `doNotRestrict` 置假，也就是启用 kill-switch 式收紧；其余情况只做基础放行。
+
+最关键的一步是 `elevate.DropAllPrivileges(true)`，紧接着 `SetConfiguration(config.ToDriverConfiguration())` 与 `SetAdapterState(AdapterStateUp)`，然后 `watcher.Configure(adapter, config, luid)` 把三者交给监视器，由它触发 `configureInterface` 完成地址、路由、MTU、DNS 的下发。`PostUp` 执行完后，服务向 SCM 报告 `Running` 并声明接受 `Stop`/`Shutdown`，进入主循环：`r` 通道收 SCM 控制请求，`watcher.started` 通道表示「某个地址族配置完成」，`watcher.errors` 通道表示「监视器内部失败，请带我退出」。只有当 `started` 至少收到一次，才会真正置 `Running` 并打印 `Startup complete`——这意味着「服务已启动」这个状态是**由网络配置完成驱动的**，而不是由进程启动驱动的。
+
+关停走的是 `defer`：先算退出码并记日志，再报 `StopPending`，然后起 30 秒看门狗；若此前没有错误且适配器与配置都在，执行 `PreDown`；`watcher.Destroy()` 依次反注册接口回调、反注册 MTU/路由回调、`FlushRoutes`/`FlushIPAddresses`/`FlushDNS`（IPv4 与 IPv6 各一遍）、`firewall.DisableFirewall()`；随后 `adapter.Close()` 销毁适配器；再执行 `PostDown`；最后发 `stopIt` 停掉看门狗并打印 `Shutting down`。注意 `PreDown` 与 `PostDown` 的条件里都有 `logErr == nil`：**启动过程中一旦出错，关停时两个脚本都不会执行**，这是为了避免「隧道没建成就去跑清理脚本」造成误删。
+
+下图把启动与关停压成一条闭环，节点名对应 `Execute` 里的真实阶段，虚线表示「服务结束」这条回边。
+
+:::figure id=07-05-01 | name=tunnel 服务的启动顺序与关停逆序 | dir=TD
+node n1 "svc.Run<br/>Execute 入口" blue
+node n2 "日志与配置加载" teal
+node n3 "接口监视<br/>DNS 解析" teal
+node n4 "CreateAdapter<br/>取 LUID" amber
+node n5 "防火墙规则" red
+node n6 "DropAllPrivileges" purple
+node n7 "SetConfiguration<br/>SetAdapterState" green
+node n8 "配地址路由<br/>PostUp 上线" green
+node n9 "关停逆序清理" gray
+edge n1 -> n2 "第一步"
+edge n2 -> n3 "配置就绪"
+edge n3 -> n4 "endpoint 已解析"
+edge n4 -> n5 "适配器就绪"
+edge n5 -> n6 "规则先生效"
+edge n6 -> n7 "降权后下发"
+edge n7 -> n8 "适配器 Up"
+edge n8 -> n9 "Stop 请求"
+edge n9 -> n1 dashed "服务结束"
+:::
+
+对照图 07-05-01 可以看出两个「不可交换」的次序：`n5 → n6 → n7` 表示防火墙必须先于降权、降权必须先于下发；`n9` 的清理顺序与启动严格相反，先拆网络配置再关适配器，最后才跑 `PostDown`。
+
+### 5. 配置/命令/代码实例
+
+观察一个隧道服务的真实属性，最直接的方式是 `sc.exe qc`（查询配置）与 `sc.exe query`（查询状态）。注意 PowerShell 里 `$` 是变量前缀，服务名必须用单引号包住。
+
+```powershell
+sc.exe qc 'WireGuardTunnel$office'
+sc.exe query 'WireGuardTunnel$office'
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+SERVICE_NAME: WireGuardTunnel$office
+        TYPE               : 10  WIN32_OWN_PROCESS
+        START_TYPE         : 2   AUTO_START
+        ERROR_CONTROL      : 1   NORMAL
+        BINARY_PATH_NAME   : "C:\Program Files\WireGuard\wireguard.exe" /tunnelservice "C:\Program Files\WireGuard\Data\Configurations\office.conf.dpapi"
+        DISPLAY_NAME       : WireGuard Tunnel: office
+        DEPENDENCIES       : Nsi
+                             TcpIp
+        SERVICE_START_NAME : LocalSystem
+
+SERVICE_NAME: WireGuardTunnel$office
+        TYPE               : 10  WIN32_OWN_PROCESS
+        STATE              : 4  RUNNING
+        WIN32_EXIT_CODE    : 0  (0x0)
+        SERVICE_EXIT_CODE  : 0  (0x0)
+        CHECKPOINT         : 0x0
+        WAIT_HINT          : 0x0
+```
+
+逐行判读：`TYPE` 为 `WIN32_OWN_PROCESS` 说明每条隧道独占一个进程，这与「一隧道一服务」的设计一致，也是故障隔离的前提；`START_TYPE` 为 `AUTO_START` 表示随系统启动，若你希望手动拉起应改成 `DEMAND_START`，但注意这会影响开机时的网络可用性；`BINARY_PATH_NAME` 里同时出现 `/tunnelservice` 与 `.conf.dpapi` 的绝对路径，说明服务启动时**直接读加密配置**，不经过 manager，因此 manager 服务停掉不影响已安装隧道的启动——这也是为什么排障时不能只看 manager 日志；`DEPENDENCIES` 的 `Nsi` 与 `TcpIp` 对应安装时的依赖声明，若网络栈异常导致依赖服务未起，隧道服务会以 `ERROR_SERVICE_DEPENDENCY_FAIL` 失败而不是进入 `Execute`；`SERVICE_START_NAME` 为 `LocalSystem` 是全套权限模型的根，任何「用普通账户跑隧道」的想法都必须先改这里，而那会破坏 DPAPI 解密与驱动访问两件事。第二条输出里 `STATE` 为 `RUNNING`、两个 `EXIT_CODE` 都是 0，是健康状态；若 `WIN32_EXIT_CODE` 非 0，按 Win32 错误码查（例如 5 是拒绝访问、1053 是服务未及时响应）；若 `SERVICE_EXIT_CODE` 落在 1–16 区间，按 `services.Error` 的枚举解释（1 是日志文件打不开、3 是适配器创建失败、6 是配置下发失败、7 是适配器拉起失败、13 是降权失败）。特别地，`SERVICE_EXIT_CODE` 为 777 说明关停时 30 秒死锁被看门狗强杀，必须去 `log.bin` 里找「Probably dead locked」后的 goroutine 栈。
+
+再看一眼脚本钩子的日志形态，这能帮你确认「是没执行，还是执行失败」：
+
+```text
+2026-11-12 10:21:03.601: [office] Skipping execution of script, because dangerous script execution is safely disabled: "route add 10.0.0.0 mask 255.0.0.0 10.66.0.1"
+```
+
+这行日志说明配置里确实写了 `PostUp`，但 `DangerousScriptExecution` 未开启，所以**静默跳过且视为成功**——隧道会正常上线，只是脚本效果不存在。若看到的是 `Executing:` 后面紧跟 `cmd> ` 前缀的输出行，说明开关已打开、脚本已跑；若再跟一行 `Command error exit status: 1`，则整个服务会以 `ErrorRunScript` 失败退出，适配器被销毁。这个设计的意图是：脚本失败必须让隧道失败，否则会出现「隧道看起来在跑、但策略没生效」的隐蔽故障。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**脚本默认不执行，且这是正确默认**。大量从 Linux 迁过来的配置里带 `PostUp = iptables` 或 `PreUp = sysctl`，在 Windows 上这些命令要么不存在、要么语义完全不同。默认关闭既避免了误执行，也避免了「以 LocalSystem 跑一条来自配置文件的任意命令」这种显而易见的提权链。要开启必须同时满足：注册表 `HKLM\Software\WireGuard\DangerousScriptExecution` 为 DWORD 1、服务重启、脚本本身是 Windows 可执行语义。开启后请把配置目录的 ACL 收紧，因为「能改配置」等价于「能以 SYSTEM 执行命令」。
+
+**`%i` 不存在，只有 `WIREGUARD_TUNNEL_NAME`**。Linux 的 `wg-quick` 用 `%i` 展开接口名，Windows 客户端在 `os.StartProcess` 的 `Env` 里追加 `WIREGUARD_TUNNEL_NAME=<隧道名>`。脚本里应写 `%WIREGUARD_TUNNEL_NAME%`（cmd 语法）而不是 `%i`；写成 `%i` 会被 cmd 原样保留或展开成空，症状是「脚本执行了但什么都没做」。
+
+**启动失败时不要指望 `PreDown`/`PostDown` 清理**。条件里的 `logErr == nil` 是有意为之：如果 `PreUp` 失败，`PostDown` 就不该跑（它可能假设 `PreUp` 的副作用存在）；如果 `SetConfiguration` 失败，`PreDown` 也不该跑（隧道从未真正建立）。这意味着脚本作者必须自己保证幂等：`PreUp` 里做的每一步都应该能被重复执行而不报错。
+
+**降权之后无法回头**。`DropAllPrivileges` 一旦执行，进程令牌里的特权就被删除，后续任何需要特权的操作都会失败。这就是为什么 `interfaceWatcher` 在重配时只做 `SetConfiguration` 与 `SetAdapterState`（设备 IOCTL，不需要额外特权），而不是重新创建适配器。如果你在 `PostUp` 脚本里试图 `sc create` 或改防火墙，会发现「拒绝访问」——不是 bug，是设计。
+
+**30 秒看门狗会杀掉整个进程，包括未写完的日志**。`os.Exit(777)` 不执行任何 defer，环形日志的共享内存可能停在半写状态。遇到 777 时应先 `wireguard /dumplog` 导出日志再看栈，不要急着重启服务反复覆盖现场。常见死锁源是某个 WFP 或 winipcfg 回调在持锁状态下等待网络栈，而网络栈又在等这个进程。
+
+**开机启动的失败是「可重试的失败」**。开机时 NDIS 与 NSI 可能尚未就绪，`CreateAdapter` 返回的错误在 `StartedAtBoot()` 为真时会被重试 15 次；`configureInterface` 遇到 `ERROR_NOT_FOUND` 会整体重来（最多 15 次）。这意味着开机后 10–30 秒内隧道未就绪是正常的；但如果 60 秒后仍未 `RUNNING`，就不是竞态而是真故障。`interfaceWatcher` 的看门狗定时器（`time.Minute`）专门覆盖「适配器创建成功但 TCP/IP 接口一分钟内没出现」这种情况，会以 `ErrorCreateNetworkAdapter` 退出并附一条明确文案。
+
+**服务名里的 `$` 会让一堆工具出错**。`sc` 与 PowerShell 都要求引号；某些第三方监控脚本按空格切分命令行，会把 `WireGuardTunnel$office` 截断；注册表路径 `HKLM\SYSTEM\CurrentControlSet\Services\WireGuardTunnel$office` 在 cmd 里 `$` 不特殊但在 PowerShell 里特殊。写自动化脚本时统一用单引号，并避免用「前缀匹配」去枚举服务——`Get-Service 'WireGuardTunnel*'` 会把 manager 也匹配进来（名字里没有 `$`，但通配符会命中 `WireGuardManager` 之外的项），更稳妥的是 `Get-Service | Where-Object Name -like 'WireGuardTunnel$*'`。
+
+**`Table = off` 不会关掉防火墙收紧**。`enableFirewall` 的条件里显式要求 `!conf.Interface.TableOff`，所以 `Table = off` 时不会启用 kill-switch。但反过来要小心：一旦满足「单 peer + 含 /0 + 未 off」，防火墙会放行隧道服务自身 UDP、配置里指定的 53 端口 DNS、loopback、DHCP 与 NDP，其余全部阻断（原理见 06-09）。如果你在 `PostUp` 里加自定义放行规则，必须确认它们在正确的 WFP 子层，否则会被阻断规则覆盖。
+
+### 7. 小结与延伸阅读
+
+`tunnel` 服务模块的价值不在代码量，而在**顺序**。它把「一条隧道从配置文本变成可用网络接口」拆成十几个可观测、可失败、可回滚的阶段，并用一条 `defer` 把所有清理动作串成启动的严格逆序。四个不变量值得背下来：日志最先、配置其次；防火墙先于降权、降权先于下发；`PreUp` 在防火墙之后、`PostUp` 在 Up 之后；关停时先拆网络配置再关适配器。再加上一条「脚本默认关闭」的安全默认值，就构成了这个模块的全部设计哲学。
+
+延伸阅读：启动顺序里每一步的底层机制见 06-05（适配器）、06-06（地址路由）、06-07（MTU）、06-08（DNS）、06-09（防火墙）；`tunnelService` 与 `interfaceWatcher` 的字段见 05-08；服务安装、`sc` 控制与恢复策略见 04-06 与 03-03；脚本开关与受限 UI 的注册表语义见 04-07；关停死锁、开机竞态这类故障的完整案例见 08-04。
+
+## 07-06 `tunnel/winipcfg` 网络配置模块
+
+### 1. 背景与动机
+
+Go 标准库的 `net` 包能读接口列表、能拨号、能查地址，但它**不能配地址、不能加路由、不能改 MTU、不能设 DNS**。这些能力在 Windows 上属于 IP Helper API（`iphlpapi.dll`）与网络配置接口（`netioapi.h`）的范畴，全部以 MIB 表（Management Information Base）的形式暴露：你要先 `GetIpInterfaceTable` 拿到一张表，在表里找到目标行，改字段，再 `SetIpInterfaceEntry` 写回去。表的生命周期由系统管理，用完必须 `FreeMibTable`；行与行之间用 LUID（Locally Unique Identifier）关联；地址、路由、接口各有各的表与各有各的通知机制。
+
+`tunnel/winipcfg` 就是这层 API 的 Go 封装。它的存在意义不是「让调用更好看」，而是解决三个具体问题。第一是**内存布局**：这些 MIB 结构在 C 头文件里有几十个字段、有嵌套的 `SOCKADDR_INET` 联合体、有按位宽不同的对齐（`types_32.go` 与 `types_64.go` 就是为此存在），Go 侧必须逐字段复刻，否则 `SetIpInterfaceEntry` 会返回 `ERROR_INVALID_PARAMETER`。第二是**生命周期**：所有 `Get*Table` 返回的都是系统分配的内存，必须配对 `FreeMibTable`；`GetAdaptersAddresses` 则是「先问大小、再分配、再取」的两阶段调用。第三是**回调**：Windows 提供 `NotifyIpInterfaceChange`、`NotifyUnicastIpAddressChange`、`NotifyRouteChange2` 三个注册接口，回调是 C 调用约定、可能在任意线程触发，Go 侧必须把「一个系统句柄」映射成「多个 Go 回调」，并在反注册时等待在途回调结束。
+
+第二个动机是**语义封装**。裸 API 的用法非常啰嗦：加一个地址要 `InitializeUnicastIpAddressEntry`、填 `InterfaceLUID`、`SetAddr`、设 `DadState` 与两个 lifetime、设 `OnLinkPrefixLength`，再 `CreateUnicastIpAddressEntry`；加一条路由要填 `DestinationPrefix`、`NextHop`、`Metric`；设 DNS 要区分 Windows 版本走两条完全不同的路径。`winipcfg` 把这些收敛成 `luid.AddIPAddress(prefix)`、`luid.SetRoutesForFamily(family, routes)`、`luid.SetDNS(family, servers, domains)` 这样的方法，让 `tunnel/addressconfig.go` 能用十几行完成「配地址 + 配路由 + 配 MTU + 配 DNS」。
+
+第三个动机是**变更通知的可用性**。隧道的生命周期里，适配器可能被系统重建（驱动更新、网络栈重置），默认路由可能被 VPN 客户端或 Hyper-V 虚拟网卡抢走，MTU 可能因为底层链路变化而需要重算。没有通知机制，客户端只能轮询；有了通知，`interfaceWatcher` 才能在「适配器重新出现」的瞬间重配地址与路由，`mtumonitor` 才能在默认路由变化时重算 MTU。这三个通知在 Windows 上是三个不同的 API、三套回调签名，`winipcfg` 把它们统一成 `ChangeCallback` 接口（带 `Unregister()`），让上层可以一视同仁地持有与释放。
+
+必须说清能力边界：`winipcfg` 是**配置工具**，不是路由守护进程。它不做策略路由、不做 NAT、不做流量整形、不做 WFP 过滤（后者在 `tunnel/firewall`，模块见 07-07）；它写进去的路由是「直连（on-link）路由」，NextHop 是全零地址，实际转发由 WireGuardNT 适配器接管；它设置的 DNS 是「接口级 DNS」，不改变全局解析顺序，也不做 DNS 泄漏防护（那是防火墙模块的职责）。把它当成「Windows 网络配置的 syscall 层」，而不是「网络管理器」，是正确的心智模型。
+
+### 2. 核心概念
+
+**三种标识，各有各的稳定性**。`LUID` 是 64 位、只在本次开机内有效，是绝大多数 MIB API 的主键；`GUID` 是 128 位、跨重启稳定，由适配器创建时请求（`deterministicGUID`）或系统随机分配，是 DNS 设置与 NLA 的键；`InterfaceIndex` 是 32 位、也只在本次开机内有效，某些老 API 还在用。三者可以互转：`luid.GUID()`、`LUIDFromGUID(guid)`、`LUIDFromIndex(index)`。任何需要持久化的地方只能用 GUID——这就是 `deterministicGUID` 存在的理由：同名同配置的隧道每次都得到同一个 GUID，从而复用同一个网络配置文件与防火墙配置。
+
+**MIB 表是「取—改—写」而非「句柄」**。`IPInterface(family)` 返回一个 `*MibIPInterfaceRow`，它是「按 LUID + family 查出来的单行副本」；你改它的字段（`NLMTU`、`Metric`、`UseAutomaticMetric`、`DadTransmits`、`RouterDiscoveryBehavior`），然后 `Set()` 写回。它不是活对象，改了不会自动生效；也不是缓存，下次 `IPInterface` 会重新查。同理，`GetIPForwardTable2` 返回整张路由表的切片，每行都是副本，要删要改都得用行里的键重新定位。
+
+**family 是一等参数**。IPv4 与 IPv6 在 MIB 里是两张独立的表、两套独立的通知，所以几乎所有方法都带 `family AddressFamily`（`windows.AF_INET` / `windows.AF_INET6`）。`SetRoutesForFamily` 会先 `FlushRoutes(family)` 再逐条 `AddRoute`，并跳过不属于该 family 的条目；`SetIPAddressesForFamily` 同理。这个设计导致一个必须注意的行为：**同一个 LUID 的 v4 与 v6 配置是分两次调用完成的**，`configureInterface` 也因此被调用两次（一次 AF_INET、一次 AF_INET6），每次只处理自己那一族。
+
+**地址行的两个隐藏字段**。`AddIPAddress` 里把 `DadState` 设为 `DadStatePreferred`、`ValidLifetime` 与 `PreferredLifetime` 设为 `0xffffffff`（永不过期），并把 `OnLinkPrefixLength` 设为前缀长度。这三个值决定了「地址是否立刻可用」：默认情况下 Windows 会对新地址做重复地址检测（DAD），期间状态是 `Tentative`，不能收发；`configureInterface` 里把接口的 `DadTransmits` 设为 0，等于关掉 DAD，让地址立即进入 `Preferred`。这是一个刻意的取舍：隧道地址是虚拟的、不可能冲突，等 1–2 秒的 DAD 只会拖慢上线。
+
+**路由的 metric 是两级相加**。Windows 的实际选路度量是「路由 metric + 接口 metric」。`AddRoute` 只设路由 metric（`conf` 层固定传 0），接口 metric 由 `MibIPInterfaceRow.Metric` 与 `UseAutomaticMetric` 决定。`configureInterface` 在检测到「该 family 存在默认路由（`/0`）」时，会把 `UseAutomaticMetric` 设为 `false`、`Metric` 设为 0，目的是让隧道的默认路由压过物理网卡；没有 `/0` 时不动这两个字段，避免干扰用户已有的网络优先级。
+
+**DNS 有两条实现路径**。Windows 10 1809 及以上用 `SetInterfaceDnsSettings`（`iphlpapi` 的导出，通过 `DnsInterfaceSettings` 结构设置 `NameServer` 与 `SearchList`）；更早的系统没有这个导出，`SetDNS` 会捕获 `ERROR_PROC_NOT_FOUND`，退化为「直接写注册表 `Tcpip\Parameters\Interfaces\{GUID}` 的 `NameServer`/`SearchList`，再给 `dnscache` 服务发 `ParamChange` 控制码」。这条回退路径需要管理员权限（写 HKLM），也解释了为什么隧道服务必须以 LocalSystem 运行。
+
+**一个系统句柄，多个 Go 回调**。三个通知 API 各自只需要注册一次，但上层可能注册多个回调（例如 `interfaceWatcher` 与 `mtumonitor` 都要监听接口变化）。`winipcfg` 的做法是：包级维护一个 `map[*InterfaceChangeCallback]bool` 与一个 `windows.Handle`，第一个注册者触发 `notifyIPInterfaceChange`，最后一个反注册者触发 `cancelMibChangeNotify2`；C 回调 `interfaceChanged` 把行数据**按值拷贝**一份，然后在锁内为每个 Go 回调起一个 goroutine，并用 `WaitGroup` 记录在途数量；`Unregister` 里 `defer callback.wait.Wait()` 保证「返回后不会再有回调进来」。
+
+**架构相关的调用约定**。`SetInterfaceDnsSettings` 的第一个参数是 `GUID` **按值**传递，这在 x64 上是「传引用」，在 arm64 上是「两个 64 位字」，在 x86/arm 上是「四个 32 位字」。`winipcfg.go` 里因此有三套 syscall 声明（`setInterfaceDnsSettingsByPtr`、`ByQwords`、`ByDwords`），按 `runtime.GOARCH` 分派，默认分支直接 `panic("unknown calling convention")`。这是整个包里唯一一处「必须知道 ABI」的地方。
+
+### 3. 关键数据结构与源码位置
+
+下表按「能力」而不是「文件」组织，便于按需求定位方法；字段级说明（`MibIPInterfaceRow`、`MibUnicastIPAddressRow`、`MibIPforwardRow2`、`DnsInterfaceSettings` 的逐字段与位宽差异）见 05-07（字段见 05-07 ｜ 配置见 04-06 ｜ 原理见 06-06）。
+
+| 能力 | 主要方法/函数 | 源码位置 |
+|---|---|---|
+| 标识转换 | `LUID.GUID`、`LUIDFromGUID`、`LUIDFromIndex` | `winipcfg/luid.go` |
+| 接口查询与修改 | `LUID.Interface`、`LUID.IPInterface`、`MibIPInterfaceRow.Set` | `winipcfg/luid.go`、`winipcfg/types.go` |
+| 地址增删 | `AddIPAddress`、`DeleteIPAddress`、`SetIPAddressesForFamily` | `winipcfg/luid.go` |
+| 地址清空 | `FlushIPAddresses` | `winipcfg/luid.go` |
+| 路由增删 | `AddRoute`、`DeleteRoute`、`SetRoutesForFamily` | `winipcfg/luid.go` |
+| 路由清空 | `FlushRoutes`（失败继续，返回最后一个错误） | `winipcfg/luid.go` |
+| DNS 读写 | `SetDNS`、`DNS`、`FlushDNS` | `winipcfg/luid.go` |
+| 表枚举 | `GetAdaptersAddresses`、`GetIPInterfaceTable`、`GetIPForwardTable2` | `winipcfg/winipcfg.go` |
+| 变更通知 | `RegisterInterfaceChangeCallback` 等三组 | `winipcfg/*_change_handler.go` |
+| 原始套接字地址 | `RawSockaddrInet.SetAddrPort`、`.Addr()` | `winipcfg/types.go` |
+
+真实源码清单：`tunnel/winipcfg/winipcfg.go`（表枚举、二阶段缓冲、DNS 的架构分派）、`tunnel/winipcfg/luid.go`（LUID 上的全部操作方法）、`tunnel/winipcfg/types.go`（MIB 结构与 `SOCKADDR_INET` 联合体，约 1200 行）、`tunnel/winipcfg/types_32.go` 与 `types_64.go`（位宽相关布局）、`tunnel/winipcfg/interface_change_handler.go`、`route_change_handler.go`、`unicast_address_change_handler.go`（三组回调）、`tunnel/winipcfg/zwinipcfg_windows.go`（由 `mksyscall.go` 生成的 syscall 包装）、`tunnel/winipcfg/route_change_handler.go`。测试基线是 `winipcfg_test.go` 与 `types_test.go`，后者对结构体大小与偏移有断言，是升级 Windows SDK 时的第一道防线。
+
+### 4. 关键流程与调用链
+
+**枚举适配器**：`GetAdaptersAddresses(family, flags)` 先以 15000 字节为初始缓冲调一次 `windows.GetAdaptersAddresses`；若返回 `ERROR_BUFFER_OVERFLOW` 且系统回填的 `size` 大于当前缓冲，就按新 `size` 重新分配再来，直到成功。成功后把返回的链表（`IPAdapterAddresses.Next`）逐节点收集成切片。调用方随后用 `LUID` 字段匹配目标适配器，再遍历 `FirstUnicastAddress`、`FirstDNSServerAddress`、`FirstGatewayAddress` 等链。这条路径是 `cleanupAddressesOnDisconnectedInterfaces` 与 `DNS()` 的基础。
+
+**配置一个 family**（`configureInterface` 的核心）：先把所有 peer 的 AllowedIPs 折算成 `RouteData{Destination: masked, NextHop: 全零, Metric: 0}` 并放进 map 去重；若未设 `Table = off` 且该 family 有路由，则 `luid.SetRoutesForFamily(family, routes)`——内部先 `FlushRoutes(family)` 清掉该适配器该族的所有路由，再逐条 `AddRoute`。接着 `luid.SetIPAddressesForFamily(family, addresses)` 同样先清后加；若返回 `ERROR_OBJECT_ALREADY_EXISTS`，说明有残留地址挂在已断开的接口上，于是 `cleanupAddressesOnDisconnectedInterfaces` 遍历所有 `OperStatus != Up` 的接口，把匹配的地址删掉，再重试一次。随后 `luid.IPInterface(family)` 取行，改 `RouterDiscoveryBehavior = Disabled`、`DadTransmits = 0`、关掉 `ManagedAddressConfigurationSupported` 与 `OtherStatefulConfigurationSupported`；若配置指定了 MTU 且该 family 有地址或路由，就设 `NLMTU`；若有 `/0` 路由则关自动 metric 并置 0；最后 `Set()` 写回。收尾是 `luid.SetDNS(family, DNS, DNSSearch)`。
+
+**设置 DNS**：`SetDNS` 先按 family 过滤服务器（v4 只留 v4、v6 只留 v6），把服务器与搜索域分别拼成逗号分隔字符串并转 UTF-16；再 `luid.GUID()` 拿 GUID；构造 `DnsInterfaceSettings{Version: 1, Flags: Nameserver|SearchList}`，再填 `NameServer` 与 `SearchList` 两个字段，IPv6 时额外或上 `DnsInterfaceSettingsFlagIPv6`；调 `SetInterfaceDnsSettings`。若返回 `ERROR_PROC_NOT_FOUND`（老系统没有该导出），走注册表回退：按 family 选 `Tcpip` 或 `Tcpip6` 的 `Parameters\Interfaces\{GUID}` 键，写 `NameServer` 与 `SearchList`，再打开 `dnscache` 服务并 `Control(svc.ParamChange)` 让它重读配置。
+
+**注册回调**：以接口变更为例，`RegisterInterfaceChangeCallback(cb)` 在 `interfaceChangeAddRemoveMutex` 保护下把回调放进 map，若 `interfaceChangeHandle == 0` 就调 `notifyIPInterfaceChange(AF_UNSPEC, NewCallback(interfaceChanged), 0, false, &handle)`——注意 `initialNotification` 传 `false`，即注册时不补发当前状态，调用方必须自己先查一遍。C 回调 `interfaceChanged` 收到行指针后先 `rowCopy := *row` 做浅拷贝（结构是定长、无指针，浅拷贝即安全），加锁遍历 map，为每个回调 `wait.Add(1)` 并起 goroutine 执行，执行完 `Done()`。`Unregister` 先 `defer wait.Wait()`，再从 map 删除，若删空了就 `cancelMibChangeNotify2` 并把句柄清零。
+
+下图把「LUID 为中心的四类操作 + 通知回流」画成一张图，节点名对应 `luid.go` 的方法与三个 `*_change_handler.go`。
+
+:::figure id=07-06-01 | name=winipcfg 的 LUID 操作与变更通知 | dir=TD
+node n1 "winipcfg.LUID" blue
+node n2 "IPInterface<br/>MTU 与 metric" teal
+node n3 "单播地址表" amber
+node n4 "路由表<br/>MIB_IPFORWARD_ROW2" amber
+node n5 "DNS 设置" purple
+node n6 "Notify 回调<br/>三组注册" green
+node n7 "iphlpapi.dll" gray
+node n8 "tunnel 配网流程" red
+edge n1 -> n2 "取行并写回"
+edge n1 -> n3 "先清后加"
+edge n1 -> n4 "掩码后写入"
+edge n1 -> n5 "按 family 过滤"
+edge n6 -> n1 "变化后重配"
+edge n2 -> n7 "Set 调用"
+edge n3 -> n7 "Create 调用"
+edge n4 -> n7 "Create 调用"
+edge n5 -> n7 "SetDnsSettings"
+edge n8 -> n1 "传入 LUID"
+:::
+
+图 07-06-01 里 `n6 → n1` 这条边是「自愈」的关键：适配器被系统重建后，旧 LUID 失效，`interfaceWatcher` 会在通知里拿到新 LUID 并重新走一遍 `n1` 的全部配置；如果没有这条边，隧道只会在下次服务重启时才恢复。
+
+### 5. 配置/命令/代码实例
+
+验证 `winipcfg` 到底写了什么，最方便的工具是 PowerShell 的 `Get-NetIPAddress` 与 `Get-NetRoute`。下面只选关键列，避免输出过宽。
+
+```powershell
+Get-NetIPAddress -InterfaceAlias 'office' |
+    Select-Object IPAddress, PrefixLength, PrefixOrigin, AddressState, SkipAsSource
+Get-NetRoute -InterfaceAlias 'office' |
+    Select-Object DestinationPrefix, NextHop, RouteMetric, InterfaceMetric
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+IPAddress   PrefixLength PrefixOrigin AddressState SkipAsSource
+---------   ------------ ------------ ------------ ------------
+10.66.0.2             24 Manual       Preferred            False
+fd66::2               64 Manual       Preferred            False
+
+DestinationPrefix  NextHop  RouteMetric InterfaceMetric
+-----------------  -------  ----------- ---------------
+10.66.0.0/24       0.0.0.0            0               5
+fd66::/64          ::                 0               5
+0.0.0.0/0          0.0.0.0            0               5
+```
+
+逐行判读：`PrefixOrigin` 为 `Manual` 说明地址不是 DHCP 或路由器通告来的，而是 `CreateUnicastIpAddressEntry` 写进去的——这正是 `AddIPAddress` 的效果；若看到 `Dhcp` 或 `RouterAdvertisement`，说明该接口上还有别的配置源在起作用，通常意味着隧道适配器被误加入了某个网络策略。`AddressState` 为 `Preferred` 而不是 `Tentative`，印证了 `DadTransmits = 0` 关掉了重复地址检测；若出现 `Tentative` 并且持续数十秒，说明 DAD 没有被关掉（可能配置里显式设了 MTU 但没走 `IPInterface.Set` 这条路径）。`SkipAsSource` 为 `False` 是默认值，WireGuard 不使用源地址选择技巧。路由侧：`NextHop` 为 `0.0.0.0` 或 `::` 表示这是 on-link 路由，即「这段网段直接交给该接口」，符合 WireGuard 的「AllowedIPs 即路由」语义；`RouteMetric` 全为 0 且 `InterfaceMetric` 统一为 5，说明存在 `/0` 路由时 `UseAutomaticMetric` 被关掉、metric 被压到 0，从而优先于物理网卡；如果 `InterfaceMetric` 是一个很大的跳变值（如 9999），通常意味着该接口被判定为「无 Internet 连接」，此时隧道虽 Up 但流量不走它，需要检查底层物理网络。如果 `10.66.0.0/24` 缺失而 `0.0.0.0/0` 存在，说明 AllowedIPs 被 `Table = off` 抑制了路由写入——这是配置问题，不是 `winipcfg` 的问题。
+
+一段最小 Go 代码演示「读接口行 → 改 MTU → 写回」，这是 `mtumonitor` 每次重算后做的事：
+
+```go
+iface, err := luid.IPInterface(windows.AF_INET)
+if err != nil {
+    log.Fatalf("IPInterface: %v", err)
+}
+iface.NLMTU = 1420
+iface.UseAutomaticMetric = false
+iface.Metric = 0
+if err := iface.Set(); err != nil {
+    log.Fatalf("Set: %v", err)
+}
+```
+
+这段代码里 `IPInterface` 返回的是「副本」，`iface.Set()` 才真正下发；忘记调 `Set` 是最常见的错误——代码不报错，MTU 却永远是旧值。另外 `NLMTU` 的单位是字节，合法范围由驱动与链路决定，设成小于 576（IPv4 最小）或大于接口能力会被系统拒绝，返回 `ERROR_INVALID_PARAMETER`。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**LUID 不能持久化**。`LUID` 的低 32 位在本次开机内唯一，高 32 位是「开机次数/实例计数」类信息，重启后完全可能复用成别的适配器。把 LUID 写进配置文件、日志检索条件或数据库，下次启动就会指向错误对象。需要稳定标识时用 `luid.GUID()`，或者直接用隧道名反查适配器（`driver.OpenAdapter` + `LUID`）。
+
+**表必须释放，回调必须反注册**。`GetIPInterfaceTable`、`GetIfTable2Ex`、`GetIPForwardTable2`、`GetUnicastIPAddressTable` 内部都调了 `tab.free()`（对 `FreeMibTable` 的封装），但 `GetAdaptersAddresses` 用的是自己分配的 `[]byte`，不需要释放。回调则必须显式 `Unregister()`：`interfaceWatcher.Destroy()` 里对 `interfaceChangeCallback` 与两组 `changeCallbacks4/6` 逐个反注册，漏一个就会在服务退出后留下一个指向已释放内存的 C 回调，下一次网络变化时进程直接崩。
+
+**回调里不能做重活**。`interfaceChanged` 会为每个注册者起一个 goroutine，但 `interfaceWatcher` 的 `setup` 在回调里同步执行 `configureInterface`，而 `configureInterface` 会做多次 MIB 查询与写入。如果网络栈在同一时刻大量变更（例如插拔网卡、切换 Wi-Fi），回调会堆积成几十个 goroutine 同时抢同一个 `setupMutex`，表现为「CPU 飙高、配置反复被清空重写」。生产环境如果遇到这种情况，正确做法是加去抖（延迟合并），而不是加大锁粒度。
+
+**`Flush*` 是「删光该 LUID 的全部」**。`SetRoutesForFamily` 与 `SetIPAddressesForFamily` 都是「先 flush 再 add」，这意味着**任何并发写入都会被覆盖**。如果用户在同一接口上手工加了静态路由，隧道重配时会被删掉。这也是为什么 `interfaceWatcher` 用一个 `setupMutex` 把所有配置动作串行化——不是为了性能，而是为了防止两个 family 的配置互相踩。
+
+**`ERROR_NOT_FOUND` 在开机早期是常态**。适配器创建成功并不等于 TCP/IP 接口已就绪，`configureInterface` 因此在 `StartedAtBoot()` 为真时对 `SetRoutes`、`SetIPAddresses`、`IPInterface.Set`、`SetDNS` 四处的 `ERROR_NOT_FOUND` 都做了「整体重来」（`goto startOver`），最多 15 次、每次间隔 1 秒。自己写脚本时若在服务启动后立刻查地址，很可能查到空表，等 2–3 秒再查更可靠。
+
+**DNS 回退路径需要写 HKLM**。`SetInterfaceDnsSettings` 在 Windows 10 1809 之前不存在，回退实现会打开 `SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{GUID}` 并写值，再给 `dnscache` 发控制码。这意味着在旧系统上，`SetDNS` 的失败模式与新版完全不同（权限、注册表重定向、服务状态都可能出错），排障时要先确认系统版本。另外 `FlushDNS` 等价于 `SetDNS(family, nil, nil)`，它会把 `NameServer` 与 `SearchList` 都写成空字符串，而不是删掉整个键。
+
+**`SetDNS` 的 family 过滤是「静默丢弃」**。传给 `AF_INET` 的 v6 服务器会被直接跳过，不报错。如果配置里只写了一个 v6 DNS 而接口只配了 v4 地址，结果就是「DNS 设置成功但解析不了」；`configureInterface` 对每个 family 各调一次 `SetDNS`，正是为了让 v4 与 v6 的服务器各自落到正确的表里。
+
+**不要用 `winipcfg` 做它不该做的事**。它没有「设置默认网关」的方法（默认路由靠 `AddRoute` 加 `/0` 实现），没有「配 WINS」，没有「设代理」，也没有「绑定源地址」。需要这些能力时应直接调 `iphlpapi` 或 `netsh`，并把结果纳入 08-04 的排障流程，而不是在 `winipcfg` 上层层加码。
+
+### 7. 小结与延伸阅读
+
+`winipcfg` 是「Windows 网络配置的 syscall 层」：它把 `iphlpapi` 的 MIB 表、LUID 标识、三组变更通知包装成一组以 `LUID` 为接收者的方法，并把「取表—改行—写回」「先 flush 再 add」「按 family 分治」「DNS 双路径」这些 Windows 特有的模式固化下来。掌握它只需要记住四件事：LUID 是本次开机的键、GUID 才是稳定标识；`IPInterface` 返回副本，不 `Set` 不生效；`Flush` 会删光该接口该族的全部条目；回调是并发的，反注册要等在途回调结束。把这四点与 `tunnel/addressconfig.go` 的调用顺序对照看，就能完整解释「为什么我的路由被删了」「为什么地址是 Tentative」「为什么 DNS 设了却不生效」这三类高频问题。
+
+延伸阅读：MIB 结构与位宽差异见 05-07；地址与路由下发的完整机制（AllowedIPs 汇总、掩码、`IP_PKTINFO` 出接口选择）见 06-06；MTU 推导见 06-07；DNS 与搜索域语义见 06-08；WFP 规则见 06-09 与 07-07；隧道侧如何调用这些方法见 07-05；`netsh`、`Get-NetRoute` 等运维命令的完整清单见 04-06，故障判读案例见 08-04。
+
+## 07-07 `tunnel/firewall` WFP 模块
+
+### 1. 背景与动机
+
+在 Linux 上，WireGuard 的全隧道语义常由 `wg-quick` 生成的路由与 `iptables` 规则共同完成；Windows 既没有 Netfilter，也没有 `wg-quick` 的 `%i`、`PreUp`、`PostUp` 那一套脚本上下文。Windows 官方客户端因此选择了另一条路径：路由与地址交给 IP Helper API 和 WireGuardNT 适配器，泄漏防护交给 Windows Filtering Platform（WFP）。`tunnel/firewall` 包就是这条路径的用户态实现，它不参与任何数据包加解密，也不实现握手，只负责在系统过滤引擎里安装一组“放行什么、阻断什么”的过滤器。
+
+需要先理解它要解决的窗口期问题。全隧道配置把 `0.0.0.0/0` 与 `::/0` 写进某个 peer 的 `AllowedIPs` 后，隧道服务会把默认路由指向 WireGuard 适配器。但路由生效与隧道可用并不是同一时刻：适配器可能刚创建、WireGuardNT 可能尚未完成首次握手、DNS 查询可能比隧道更早发出、某些应用还会显式绑定物理网卡或使用自己的解析器。只要有一条路径绕开隧道，流量就会以明文离开主机。WFP 的价值在于它在 ALE（Application Layer Enforcement）层对“连接建立/接收许可”做授权判定，能在套接字真正发包之前拒绝，而不是事后补救。
+
+选择 WFP 而不是普通 Windows 防火墙规则，有三个直接原因。第一，WFP 过滤器可以按接口 LUID 匹配，而 WireGuard 适配器是每次启动隧道时动态创建、停止时销毁的，LUID 并不稳定，用名称或别名做规则容易在适配器重建后失效。第二，WFP 能同时拿到进程身份（应用 ID）、进程安全描述符、协议、端口、远端地址与 ICMP 类型，足以表达“只允许隧道服务自身的 UDP、只允许指定 DNS 服务器的 53 端口、允许 DHCP 与 NDP”这种组合条件。第三，WFP 支持事务与动态会话，安装失败可以整体回滚，进程退出后对象自动回收，不会留下跨重启的残留规则。
+
+触发条件被刻意设计得很窄：只有当配置里只有一个 peer，且该 peer 的 `AllowedIPs` 包含 `/0` 时，隧道服务才会进入限制模式。多 peer、部分路由、企业分流等场景不会启用这套 kill-switch，而是回退到 Windows 常规路由与 DNS 行为。这样做的好处是避免把“全隧道”的强约束误加到普通配置上；代价是用户必须理解 `/0` 的语义，否则会误以为“只要连上 VPN 就一定有泄漏防护”。`Table=off` 与触发条件的关系需要对照 `tunnel/service.go` 的实际判定核验，本仓库快照中该判定不在 `firewall` 包内。
+
+还必须写清能力边界：本仓库是 Windows 官方客户端，不是 Linux 内核实现，也不是 wireguard-go 用户态数据面。内核数据面由外部项目 WireGuardNT 提供，`driver/` 只做 IOCTL 配置下发；`tunnel/firewall` 只操作 WFP 对象，不碰 Noise 握手、不碰 ChaCha20-Poly1305、不碰路由表。把本模块当成“Windows 版的 iptables 封装”会高估它的职责，也会误读它的规则集合。
+
+### 2. 核心概念
+
+**WFP 对象模型**。一个过滤器不是孤立存在的，它挂在 provider、subLayer、layer 三层坐标上。provider 用 GUID 标识“这批对象属于 WireGuard”，便于排障时按来源筛选；subLayer 是同一引擎内的排序容器，`registerBaseObjects()` 把子层权重设为 `^uint16(0)`（即 65535），使它排在系统默认子层之前；layer 决定在协议栈的哪个点评估，本模块主要使用 `FWPM_LAYER_ALE_AUTH_CONNECT_V4`、`FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4` 及其 V6 对应层，Hyper-V 例外才使用 MAC 帧层。
+
+**过滤器（filter）的五个要素**。一是 `layerKey`，决定出站连接还是入站接收；二是条件数组 `filterCondition`，每个条件由字段键、匹配类型和值组成；三是动作 `action`，取 `FWP_ACTION_PERMIT` 或 `FWP_ACTION_BLOCK`；四是权重 `weight`，在同一子层内数值大者先评估；五是显示数据 `displayData`，即排障时看到的名称与描述。权重在本模块里不是装饰，而是规则语义的一部分：`blockAll` 必须排在所有放行规则之后，否则“先阻断后放行”会导致全断。
+
+**条件字段的用法**。接口条件用 `FWPM_CONDITION_IP_LOCAL_INTERFACE` 配 `FWP_UINT64`，值就是适配器 LUID；进程条件用 `FWPM_CONDITION_ALE_APP_ID` 配 `FWP_BYTE_BLOB_TYPE`，值由 `fwpmGetAppIdFromFileName0()` 从当前可执行文件取得；用户/安全上下文用 `FWPM_CONDITION_ALE_USER_ID` 配 `FWP_SECURITY_DESCRIPTOR_TYPE`，并带 `FWP_ACTION_FLAG_CLEAR_ACTION_RIGHT`，以避免“同一 exe 里托管的其他进程”命中服务放行规则。DNS 规则用 `IP_REMOTE_PORT = 53` 加两次 `IP_PROTOCOL`（UDP 与 TCP）表达“或”；DHCPv4 用本地端口 68、远端端口 67 与广播地址 `0xffffffff`；DHCPv6 用 `ff02::1:2`、`ff05::1:3`、端口 546/547 以及 `fe80::/10` 链路本地前缀；NDP 用 ICMPv6 类型 133 至 137 分别表达路由请求、路由通告、邻居请求、邻居通告与重定向。
+
+**动作与权重分层**。服务自身放行权重 15；DNS 的“允许指定服务器”权重 15、“阻断其余 53 端口”权重 14；环回放行 13；隧道接口、DHCPv4、DHCPv6、NDP 均为 12；兜底阻断为 0。`blockDNS()` 内部会先校验 `weightDeny < weightAllow`，否则直接返回错误，因为一旦deny 权重不低于 allow，允许规则永远不会命中。这个显式校验是阅读源码时最容易被忽略、但排障时最关键的一处。
+
+各规则组的权重与条件对照如下表所示，读表时应把“权重”理解为同一子层内的评估顺序，而不是优先级数值越大越安全。
+
+| 规则组 | 权重 | 主要条件 | 动作 |
+|---|---:|---|---|
+| WireGuard 服务自身 | 15 | 应用 ID + 服务安全描述符 | 放行 |
+| DNS 指定服务器 | 15 | 远端端口 53、UDP/TCP、远端地址 | 放行 |
+| DNS 其余流量 | 14 | 远端端口 53、UDP/TCP | 阻断 |
+| 环回 | 13 | `FWP_CONDITION_FLAG_IS_LOOPBACK` | 放行 |
+| 隧道接口 | 12 | 本地接口 LUID | 放行 |
+| DHCPv4 / DHCPv6 / NDP | 12 | 端口 67/68、546/547、ICMPv6 133-137 | 放行 |
+| 兜底 | 0 | 无附加条件 | 阻断 |
+
+**动态会话**。`createWfpSession()` 使用 `FWPM_SESSION_FLAG_DYNAMIC`，事务等待时间为 `INFINITE`。动态会话的含义是：引擎句柄关闭时，会话内创建的对象随之销毁。因此 `DisableFirewall()` 只需要 `fwpmEngineClose0(wfpSession)`，不需要逐条删除过滤器；即使隧道进程异常退出，系统也不会长期保留一套指向旧 LUID 的阻断规则。这与“持久化过滤器”是两种完全不同的运维模型，不能混用。
+
+**事务语义**。`runTransaction()` 依次执行 `fwpmTransactionBegin0`、安装回调、`fwpmTransactionCommit0`；任一步失败就 `fwpmTransactionAbort0`。这意味着读者不会看到“只装了一半”的状态：要么 provider、子层、全部过滤器都生效，要么全部不生效。对于 kill-switch 这种“部分生效反而危险”的场景，事务不是可选项。
+
+**“单 peer + `/0`”与 DNS 收紧**。`EnableFirewall()` 的第三个参数是 `restrictToDNSServers []netip.Addr`。当配置声明了 DNS 服务器时，`blockDNS()` 会为每个地址生成“允许该远端地址的 53 端口”的条件，同时保留一条“阻断所有 53 端口”的规则。其目的是压制 Windows 的多宿主 DNS 行为：系统可能同时向多个网卡的 DNS 服务器发查询，如果不收紧，查询会从物理网卡泄漏。没有配置 DNS 时，这个分支不会安装，用户需要自行确认系统解析器不会走物理链路。
+
+### 3. 关键数据结构与源码位置
+
+本模块的源码集中在 `tunnel/firewall/` 目录，阅读顺序建议从对象生命周期到规则细节：
+
+- `blocker.go`：模块入口。定义 `wfpObjectInstaller` 函数类型、`baseObjects`（provider 与 filters 两个 GUID）、包级变量 `wfpSession`，以及 `createWfpSession()`、`registerBaseObjects()`、`EnableFirewall()`、`DisableFirewall()`。
+- `rules.go`：规则集合。包含 `permitTunInterface()`、`permitWireGuardService()`、`permitLoopback()`、`permitDHCPIPv4()`、`permitDHCPIPv6()`、`permitNdp()`、`permitHyperV()`、`blockAll()`、`blockDNS()`。
+- `helpers.go`：事务与身份辅助。`runTransaction()`、`createWtFwpmDisplayData0()`、`filterWeight()`、`wrapErr()`、`getCurrentProcessSecurityDescriptor()`、`getCurrentProcessAppID()`。
+- `types_windows.go`：WFP 结构的手工镜像，包括 `wtFwpmFilter0`、`wtFwpmFilterCondition0`、`wtFwpConditionValue0`、`wtFwpValue0`、`wtFwpmSession0`、`wtFwpmSublayer0`、`wtFwpProvider0`、`wtFwpmDisplayData0`、`wtFwpByteArray16`、`wtFwpV6AddrAndMask` 等；`types_windows_32.go` 与 `types_windows_64.go` 处理指针宽度差异。
+- `syscall_windows.go`、`zsyscall_windows.go`、`mksyscall.go`：系统调用声明与生成入口；`fwpmEngineOpen0`、`fwpmFilterAdd0`、`fwpmSubLayerAdd0`、`fwpmProviderAdd0`、`fwpmTransactionBegin0/Commit0/Abort0`、`fwpmEngineClose0`、`fwpmGetAppIdFromFileName0`、`fwpmFreeMemory0` 都在这里。
+- `types_windows_test.go`：以 `unsafe.Sizeof` 与 `unsafe.Offsetof` 校验结构体大小和字段偏移。这类测试看似“形式主义”，实则是 WFP 调用正确性的底线：这些结构体会被直接传给内核，字段偏移错一个字节就可能得到 `FWP_E_INVALID_PARAMETER` 或更隐蔽的行为异常。
+
+字段的逐项含义、对齐与生命周期不在本篇展开（字段见 05-08）。本篇只强调三个“读源码时必须盯住”的点：`baseObjects.filters` 同时充当子层键与过滤器归属，二者是同一个 GUID；`wtFwpmFilter0.weight` 的类型是 `wtFwpValue0`，不是一个裸整数，赋值必须经过 `filterWeight()`；`permitWireGuardService()` 的条件数组里，安全描述符 blob 必须在调用期间保持存活，源码用 `runtime.KeepAlive(sdBlob)` 与 `runtime.KeepAlive(sd)` 保证这一点。
+
+（字段见 05-08 ｜ 配置见 04-03 ｜ 原理见 06-09 ｜ 模块见 07-07）
+
+### 4. 关键流程与调用链
+
+从触发判定到过滤器落地的整体关系见图 07-07-01，图中把“谁调用、安装哪些规则、按什么顺序提交”压缩成一条纵向链路。
+
+:::figure id=07-07-01 | name=tunnel/firewall 的规则安装链路 | dir=TD
+node n1 "单 peer 且含 /0" teal
+node n2 "EnableFirewall" blue
+node n3 "WFP 动态会话" purple
+node n4 "provider 与子层" gray
+node n5 "放行服务自身 15" green
+node n6 "DNS 与环回 15/13" amber
+node n7 "TUN / DHCP / NDP 12" teal
+node n8 "blockAll 兜底 0" red
+edge n1 -> n2 "触发"
+edge n2 -> n3 "打开引擎"
+edge n3 -> n4 "注册对象"
+edge n4 -> n5 "权重 15"
+edge n5 -> n6 "逐层收紧"
+edge n6 -> n7 "权重 12"
+edge n7 -> n8 "最后兜底"
+edge n8 -> n3 dashed "提交或回滚"
+:::
+
+`EnableFirewall()` 是唯一入口，调用链可以按“会话—对象—规则—事务”四段来读。第一段建立会话：`createWfpSession()` 填充 `wtFwpmSession0` 的显示名、`FWPM_SESSION_FLAG_DYNAMIC` 标志与无限事务超时，然后 `fwpmEngineOpen0()` 取得引擎句柄。若包级变量 `wfpSession` 已非零，函数立刻返回“防火墙已启用”错误，因此重复调用不是幂等的，调用方必须先判断状态或保证只调用一次。
+
+第二段注册基础对象：`runTransaction()` 开启事务后调用 `registerBaseObjects()`，生成两个 GUID，先 `fwpmProviderAdd0()` 注册 provider，再 `fwpmSubLayerAdd0()` 注册子层，子层权重为 `^uint16(0)`。provider 的作用是归属标识，子层的作用是排序容器；两者都成功后，后续过滤器才有合法的 `providerKey` 与 `subLayerKey`。
+
+第三段按权重安装规则，顺序写在 `EnableFirewall()` 的 `objectInstaller` 闭包里：
+
+1. `permitWireGuardService(session, baseObjects, 15)`：以当前进程的应用 ID 与服务安全描述符为条件，在四个 ALE 层各装一条放行规则，确保 WireGuard 自己的 UDP 报文能进出。
+2. 若 `doNotRestrict` 为假且 `restrictToDNSServers` 非空，调用 `blockDNS(restrictToDNSServers, session, baseObjects, 15, 14)`：先装四条阻断 53 端口的规则（V4/V6 出站与入站），再为每个 DNS 地址追加远端地址条件，装四条允许规则。IPv4 地址用 `FWP_UINT32` 承载 `binary.BigEndian.Uint32()` 的结果，IPv6 地址用 `FWP_BYTE_ARRAY16_TYPE` 承载 `wtFwpByteArray16`。
+3. `permitLoopback(..., 13)`：以 `FWPM_CONDITION_FLAGS` 匹配 `FWP_CONDITION_FLAG_IS_LOOPBACK`，四个层各一条。
+4. `permitTunInterface(..., 12, luid)`：以 `FWPM_CONDITION_IP_LOCAL_INTERFACE` 匹配 LUID，四个层各一条；这是“隧道内流量”被放行的关键。
+5. `permitDHCPIPv4(..., 12)`：两条规则，出站 UDP 68→67 到广播地址，入站 UDP 67→68。
+6. `permitDHCPIPv6(..., 12)`：两条规则，出站与入站，涉及 `ff02::1:2`、`ff05::1:3`、端口 546/547、`fe80::/10`。
+7. `permitNdp(..., 12)`：按 133、134、135、136、137 五类 ICMPv6 组装七条过滤器（135 与 136 是双向，各两条）。
+8. `blockAll(..., 0)`：四个层各一条无条件的阻断规则，作为兜底。
+
+第四段提交：全部安装成功后 `fwpmTransactionCommit0()`；任一失败则 `fwpmTransactionAbort0()` 并关闭引擎。`DisableFirewall()` 只做一件事：`fwpmEngineClose0(wfpSession)` 并把包级变量清零。由于会话是动态的，过滤器随句柄关闭而消失。
+
+需要特别指出，`permitHyperV()` 虽然完整实现，但在 `EnableFirewall()` 中被注释掉，源码注释说明它是二层规则、而其余规则是三层，作者选择“先不启用，遇到问题再打开”。这意味着在启用 Hyper-V 的主机上做全隧道时，虚拟机之间的二层流量是否受影响，需要按实际版本核验，不能仅凭函数存在就断定已生效。
+
+### 5. 配置/命令/代码实例
+
+触发这套规则的最小配置形态如下。这里只列与本模块直接相关的键，完整键集与语义见 04-02、04-03。
+
+```conf
+[Interface]
+PrivateKey = <客户端私钥，Base64，44 字符>
+Address = 10.7.0.2/32
+DNS = 10.7.0.1
+
+[Peer]
+PublicKey = <服务端公钥，Base64，44 字符>
+AllowedIPs = 0.0.0.0/0, ::/0
+# 其他键不在本篇展开，完整配置键见 04-02 与 04-03
+```
+
+`AllowedIPs` 中的 `0.0.0.0/0` 与 `::/0` 是进入限制模式的必要条件之一；`DNS` 决定是否安装 53 端口收紧规则；`Address` 决定适配器地址，但不改变过滤规则形状；`PrivateKey` 与 `PublicKey` 只影响密钥与握手。其余接口键的行为不在本篇展开，需要时按 04-02 核验。
+
+从代码角度，调用方的典型顺序是先拿到适配器 LUID，再启用防火墙，最后在退出路径关闭。下面的片段是示意性调用，参数来源与错误映射需对照 `tunnel/service.go` 的实际版本核验。
+
+```go
+luid, err := adapter.LUID()
+if err != nil {
+    return services.ErrorCreateNetworkAdapter
+}
+
+if err := firewall.EnableFirewall(uint64(luid), doNotRestrict, dnsServers); err != nil {
+    return services.ErrorFirewall
+}
+defer firewall.DisableFirewall()
+```
+
+排障时最直接的办法是把当前 WFP 状态导出为 XML，再按显示名过滤。命令与示例输出如下，输出格式与字段名需对照实际 Windows 版本核验。
+
+```powershell
+netsh wfp show filters file=C:\Temp\wfp-filters.xml
+Select-String -Path C:\Temp\wfp-filters.xml -Pattern 'WireGuard|Permit outbound DHCP|Block all outbound' |
+    Select-Object -First 6 |
+    ForEach-Object { $_.Line.Trim() }
+```
+
+```text
+正在收集筛选器信息
+已成功保存筛选器信息。
+
+<displayData name="Permit unrestricted outbound traffic for WireGuard service (IPv4)" description=""/>
+<displayData name="Permit outbound DHCP request (IPv4)" description=""/>
+<displayData name="Block all outbound (IPv4)" description=""/>
+<displayData name="Permit outbound IPv4 traffic on TUN" description=""/>
+```
+
+判读要点如下。第一，`netsh wfp show filters` 只负责把当前过滤器库导出为文件，控制台只会打印“正在收集/已成功保存”，真正的证据在 XML 里，因此必须用 `Select-String` 或解析器二次检索。第二，示例中的 `displayData name` 就是源码 `createWtFwpmDisplayData0()` 传入的字符串，属于稳定锚点：能看到 `Permit unrestricted outbound traffic for WireGuard service (IPv4)` 说明服务自身放行规则已安装；能看到 `Block all outbound (IPv4)` 说明兜底阻断已生效；若只有前者没有后者，通常意味着 `doNotRestrict` 为真或 `EnableFirewall()` 在中间步骤失败并被事务回滚。第三，`Permit outbound IPv4 traffic on TUN` 是否存在，直接反映 LUID 条件是否写入成功；若该条缺失而阻断存在，表现就是“隧道已连接但业务全断”，因为隧道接口本身没有被放行。第四，XML 中还会带 `weight`、`layerKey`、`action` 等字段，排查权重顺序时应优先核对 `Block all` 的权重是否为 0、各 Permit 是否大于 0；只看名称不看权重，容易得出错误结论。第五，导出文件可能包含大量系统过滤器，建议始终带 `WireGuard` 关键字过滤，避免把 Windows 自带规则误认为本模块产物。
+
+### 6. 注意事项、陷阱与最佳实践
+
+- **不要重复调用 `EnableFirewall()`**。包级 `wfpSession` 非零时函数直接报错，调用方若忽略错误继续启动，会得到“看起来启动了、实际没有防火墙”的假象。正确做法是把启用动作放在隧道启动的单一分支里，并在关停路径成对调用 `DisableFirewall()`。
+- **权重顺序就是语义**。`blockAll` 必须是 0，所有 Permit 必须大于 0；`blockDNS` 的 allow 必须大于 deny。修改权重前先想清楚“谁先匹配”，否则会出现 DNS 全断或全放行两种极端。
+- **DNS 收紧只覆盖 53 端口**。DoH（443）、DoT（853）、mDNS（5353）都不在放行/阻断条件内；如果组织依赖加密 DNS，kill-switch 不会替你把查询引到隧道内 DNS，需要额外的应用层策略。
+- **DHCP 与 NDP 例外不能删**。删掉 DHCPv4/v6 规则，全隧道下物理网卡的租约续期会失败；删掉 NDP 规则，IPv6 邻居发现与路由通告会中断，表现为“IPv6 时通时不通”。
+- **LUID 是动态的**。适配器每次启动都会重建，LUID 随之变化；任何缓存 LUID 的外部脚本或自定义规则都会在重启后失效。排障时应以“当前会话”的过滤器为准，而不是比对上一次的 XML。
+- **`0.0.0.0/1 + 128.0.0.0/1` 是逃生门**。如果希望获得近似默认路由但不想启用 kill-switch，可以用这两条前缀替代 `0.0.0.0/0`，IPv6 对应 `::/1 + 8000::/1`；UI 编辑器提供对应复选框，本质是改写 `AllowedIPs`，不是关闭防火墙。
+- **`Table=off` 要单独验证**。没有默认路由时，即使过滤器装上了，流量也未必走隧道；不要把“防火墙已启用”误当成“流量已受保护”，两者是不同层面的事实。
+- **Hyper-V 规则默认未启用**。源码中 `permitHyperV()` 被注释，若在 Hyper-V 主机上观察到虚拟机互通异常，应先确认该版本是否重新启用了这段逻辑，而不是直接改权重。
+- **错误信息带文件行号**。`wrapErr()` 会把 `syscall.Errno` 包装成 `Firewall error at <file>:<line>`，日志里看到这类字符串时应直接定位到对应 `fwpm*` 调用，而不是只看外层“无法启用防火墙规则”。
+- **不要把 WFP 当端点安全**。它只约束本机流量的出入口路径，不检测恶意内容、不替代杀毒、不防本地管理员篡改；本地管理员可以删除过滤器或停止隧道服务。
+
+### 7. 小结与延伸阅读
+
+`tunnel/firewall` 是一个“小而硬”的模块：代码量不大，但每一个条件、每一个权重都直接对应一条安全语义。它用 WFP 的 provider/subLayer/filter 三层模型表达“只放行 WireGuard 自身、指定 DNS、环回、隧道接口、DHCP 与 NDP，其余全断”，用事务保证安装的原子性，用动态会话保证退出后的清理。理解它的关键不是记住函数名，而是记住三条主线：触发条件是“单 peer + `/0`”，排序依据是权重，身份绑定是“应用 ID + 服务安全描述符”。
+
+延伸阅读建议按“配置—字段—原理—模块”四层展开：先看 04-03 弄清 `AllowedIPs` 与 `DNS` 的写法，再看 05-08 核对 WFP 结构字段，然后读 06-09 理解 kill-switch 的完整判定链，最后回到 `docs/netquirk.md` 的 “Firewall Considerations for `/0` Allowed IPs” 一节对照官方表述。若要在实验环境验证，建议先用 `0.0.0.0/1 + 128.0.0.0/1` 跑通流量，再切到 `/0` 观察过滤器差异，这样可以清晰区分“路由问题”与“防火墙问题”。
+
+## 07-08 `manager` 服务与隧道跟踪模块
+
+### 1. 背景与动机
+
+Windows 官方客户端由三块用户态组件加一个内核驱动组成：Tunnel Service、Manager Service、UI，以及 WireGuardNT。Tunnel Service 每条隧道一个实例，负责把配置下发到驱动、配置地址路由、启停防火墙；UI 是普通交互进程，负责列表、编辑、日志与托盘；Manager Service 则是唯一常驻的 LocalSystem 控制面，负责“谁来创建隧道服务、谁来跟踪隧道状态、谁来把 UI 拉起来、谁来在多个会话之间同步事件”。`manager` 包实现的正是这最后一层。
+
+为什么需要一个独立的管理服务，而不是让 UI 直接调 `sc create`？第一是权限。创建服务、写入 `%ProgramFiles%\WireGuard\Data\Configurations`、访问机器范围的 DPAPI 密文，都要求管理员甚至 SYSTEM 权限；让每个登录用户的 UI 都带高权限运行，既不符合最小权限，也会把攻击面铺到每个会话。第二是会话隔离。Windows 支持多用户同时登录、RDP 断线重连、快速用户切换；UI 必须运行在各自的交互会话里，而服务天然运行在会话 0，二者不能共享窗口句柄，只能通过 IPC 通信。第三是生命周期。隧道服务是“开机自启、按配置常驻”的对象，不能依赖某个用户的登录状态；Manager Service 以自动启动方式运行，才能在无人登录时继续跟踪隧道。
+
+这套设计也带来一个容易被误解的边界：Manager Service 不转发数据包，也不直接操作 WireGuardNT。它做的是服务编排与状态聚合：安装/卸载 `WireGuardTunnel$<name>`、订阅服务状态变化、把变更通过管道推给 UI、在需要时以提升令牌执行更新。数据面仍然在 WireGuardNT，隧道配置仍然由 Tunnel Service 下发。把 manager 当成“VPN 网关”或“流量代理”是典型误读。
+
+从运维视角看，manager 的价值是“单一事实来源”：UI 看到的隧道列表、托盘图标状态、日志页内容、更新进度，全部来自 manager 的 IPC 通知；`sc query` 看到的服务状态，则来自 Windows SCM，两者通过 `tunneltracker.go` 对齐。理解这一点，排障时就能快速判断问题出在“服务没起来”“跟踪没订阅上”还是“UI 没收到通知”，而不是在三个组件之间反复猜测。
+
+### 2. 核心概念
+
+**服务命名与配置**。管理服务名固定为 `WireGuardManager`，由 `svc.Run("WireGuardManager", &managerService{})` 注册；隧道服务名由 `conf.ServiceNameOfTunnel(name)` 生成，形如 `WireGuardTunnel$Office`。`InstallTunnel()` 创建服务时设置 `SERVICE_WIN32_OWN_PROCESS`、`StartAutomatic`、`ErrorNormal`、依赖 `Nsi` 与 `TcpIp`、显示名 `WireGuard Tunnel: <name>`，并显式要求 `SERVICE_SID_TYPE_UNRESTRICTED`。最后这一项不是可选项：没有不受限服务 SID，隧道进程在访问某些网络对象时会受限，行为与预期不符。
+
+**会话模型**。`Execute()` 先 `WTSEnumerateSessions()` 枚举当前会话，只处理 `WTSActive` 与 `WTSDisconnected` 两种状态；对每个会话调用 `WTSQueryUserToken()` 取得用户令牌，再判断“是否管理员或可提升”“是否是受限操作员”，通过后为每个会话启动一个 UI 进程。`procs` 保存会话 ID 到 `uiProcess` 的映射，`aliveSessions` 标记会话是否仍然有效。登录触发 `WTS_SESSION_LOGON` 时新增，注销触发 `WTS_SESSION_LOGOFF` 时删除并 `Kill()` 对应 UI。
+
+**令牌判定与受限 UI**。`elevate.TokenIsElevatedOrElevatable(userToken)` 判断当前令牌是否已提升或存在可提升的链接令牌；若不是管理员，则读取注册表 `LimitedOperatorUI`，再把令牌复制成 impersonation token，检查是否属于 `WinBuiltinNetworkConfigurationOperatorsSid`（Network Configuration Operators，S-1-5-32-556）。只有管理员或受限操作员才会被拉起 UI。受限操作员的权限被 IPC 层进一步收紧：`Delete()`、`Create()`、`Quit()`、`Update()` 在 `elevatedToken == 0` 时直接返回 `ERROR_ACCESS_DENIED`，因此他们能启停隧道，却不能删除配置或退出管理服务。
+
+**IPC 模型**。每个 UI 与 manager 之间有三根匿名管道：UI→manager 的请求、manager→UI 的响应、manager→UI 的事件；此外还有一个可继承的日志共享内存句柄。`IPCServerListen(reader, writer, events, elevatedToken)` 为每个连接创建一个 `ManagerService`，`ServeConn()` 用 `gob` 解码方法类型与参数，执行后把结果编码回去。事件方向不是“请求-响应”，而是 `notifyAll()` 主动广播：隧道状态变化、隧道列表变化、管理服务即将停止、发现更新、更新进度，各有独立通知类型。事件写入带 1 秒写超时，避免某个卡死的 UI 拖住整个服务。
+
+IPC 方法集合与权限边界如下表所示，表中“管理员令牌”指连接创建时传入了非零 `elevatedToken`；受限 UI 的连接该值为零。
+
+| 方法 | 用途 | 权限要求 |
+|---|---|---|
+| `StoredConfig` | 读取磁盘上的配置 | 任意已连接 UI |
+| `RuntimeConfig` | 读取驱动中的运行时配置 | 任意已连接 UI |
+| `Start` | 安装并启动隧道服务 | 任意已连接 UI |
+| `Stop` | 停止并卸载隧道服务 | 任意已连接 UI |
+| `WaitForStop` | 等待服务真正删除 | 任意已连接 UI |
+| `Delete` | 停止并删除配置文件 | 管理员令牌 |
+| `Create` | 保存新配置 | 管理员令牌 |
+| `State` | 查询单个隧道状态 | 任意已连接 UI |
+| `GlobalState` | 查询全局汇总状态 | 任意已连接 UI |
+| `Quit` | 退出管理服务 | 管理员令牌 |
+| `Update` | 触发下载与安装更新 | 管理员令牌 |
+
+**隧道跟踪**。`watchNewTunnelServices()` 通过 `SubscribeServiceChangeNotifications()` 订阅服务数据库变化（`SC_EVENT_DATABASE_CHANGE`），一旦有新服务创建就调用 `trackExistingTunnels()`；`trackTunnelService()` 再对单个服务订阅状态变化（`SC_EVENT_STATUS_CHANGE`）。状态被归一化为五个值：`TunnelUnknown`、`TunnelStarted`、`TunnelStopped`、`TunnelStarting`、`TunnelStopping`；`trackedTunnelsGlobalState()` 把所有隧道汇总成一个全局状态，供托盘与任务栏进度使用。这个“全局状态”不是简单取最后一个，而是按 Starting > Stopping > Started 的优先级合成。
+
+**配置冲突处理**。`ManagerService.Start()` 在安装新隧道前，会遍历 `trackedTunnels`，用 `conf.Config.IntersectsWith()` 判断地址/路由是否与目标配置相交；相交的隧道会被异步停止，若某个相交隧道正处于 `TunnelStarting` 或 `TunnelUnknown`，则直接返回“请等待该隧道完成激活”。这套逻辑解决的是 Windows 上“同一地址段不能同时挂在两个适配器”的现实约束，也解释了为什么有时启动一个隧道会看到另一个隧道被自动停掉。
+
+**退出码与错误**。`services.DetermineErrorCode()` 把错误分成两类：实现了 `windows.Errno` 的系统错误直接用 Win32 码，否则用服务自定义的 `services.Error` 枚举。`trackTunnelService()` 在隧道停止时读取 `ServiceSpecificExitCode`，若不是 `ErrorSuccess` 就删除服务并把错误通过 IPC 推给 UI。这样 UI 上看到的“隧道启动失败”往往对应一个具体的枚举值，而不是笼统的“服务已停止”。
+
+### 3. 关键数据结构与源码位置
+
+`manager/` 目录的文件分工如下：
+
+- `service.go`：`managerService` 与 `Execute()`，管理服务的启动、会话枚举、UI 孵化、控制请求循环与停止清理；`Run()` 是 `svc.Run` 的薄封装。
+- `install.go`：`InstallManager()`、`UninstallManager()`、`InstallTunnel()`、`UninstallTunnel()`、`changeTunnelServiceConfigFilePath()`，以及缓存的服务管理器 `serviceManager()`。
+- `tunneltracker.go`：`trackedTunnels`、`trackTunnelService()`、`trackExistingTunnels()`、`watchNewTunnelServices()`、`trackService()` 与状态映射函数。
+- `ipc_server.go`：`ManagerService` 的方法集合、`ServeConn()`、`IPCServerListen()`、`notifyAll()` 与各类 `IPCServerNotify*`。
+- `ipc_client.go`：UI 侧客户端，`InitializeIPCClient()`、方法类型枚举、回调注册表与各 `IPCClient*` 函数。
+- `uiprocess.go`：`uiProcess` 与 `launchUIProcess()`，负责 `CreateProcessAsUser`、句柄列表、环境块与进程等待。
+- `ipc_driver.go`、`updatestate.go`：驱动侧 IPC 辅助与更新状态枚举。
+
+需要说明的是，本仓库快照的 `manager/` 下没有独立的 `log.go`；管理服务的日志初始化直接调用 `ringlogger.InitGlobalLogger(logFile, "MGR")`，日志文件路径来自 `conf.LogFile(true)`。若读者手上的版本存在 `log.go`，应以实际文件为准，本篇不虚构其内容。
+
+结构体层面，`managerService` 是空结构，只用于挂载 `Execute()`；`ManagerService` 持有事件管道、事件锁与提升令牌；`uiProcess` 只包一个进程句柄；`serviceSubscriptionState` 保存服务对象、回调、`sync.WaitGroup` 与一次性标志。字段的完整定义、读写时机与并发约束见 05-09，本篇不重复列表。
+
+（字段见 05-09 ｜ 配置见 04-07 ｜ 原理见 06-10 ｜ 模块见 07-08）
+
+### 4. 关键流程与调用链
+
+管理服务的生命周期可以按“启动—孵化—跟踪—停止”四段阅读，整体关系见图 07-08-01。
+
+:::figure id=07-08-01 | name=Manager 服务的会话孵化与隧道跟踪 | dir=TD
+node n1 "Windows SCM" blue
+node n2 "WireGuardManager" teal
+node n3 "WTS 会话枚举" amber
+node n4 "每会话 UI 进程" purple
+node n5 "WireGuardTunnel$name" green
+node n6 "隧道服务跟踪器" gray
+node n7 "IPC 管道与日志映射" red
+edge n1 -> n2 "启动服务"
+edge n2 -> n3 "枚举会话"
+edge n3 -> n4 "创建进程"
+edge n2 -> n5 "安装或停止"
+edge n2 -> n6 "订阅变化"
+edge n6 -> n5 dashed "查询状态"
+edge n4 -> n7 "三管一并"
+edge n2 -> n7 "服务端监听"
+:::
+
+第一段是启动。`Run()` 调用 `svc.Run()` 后，`Execute()` 先发送 `StartPending`，随后打开日志文件并初始化全局环形日志；失败则把 `serviceError` 置为 `ErrorRingloggerOpen` 并退出。接着取当前可执行文件路径、调用 `watchNewTunnelServices()` 建立服务数据库订阅，再注册两个配置存储回调：一个在配置迁移时修改隧道服务的命令行参数，另一个在配置变化时通知所有 UI 刷新列表。之后枚举会话、为每个有效会话启动 UI 协程，最后把服务状态切到 `Running`，接受 `Stop` 与 `SessionChange`。
+
+第二段是 UI 孵化。`startProcess(session)` 先用 `WTSQueryUserToken()` 拿用户令牌，判断管理员/可提升/受限操作员；不满足就关闭令牌返回。通过后解析用户名、域、账户类型与用户配置文件目录，管理员走提升令牌，受限操作员走普通用户令牌。随后进入循环：创建三对管道，调用 `IPCServerListen()` 注册服务端，调用 `ringlogger.Global.ExportInheritableMappingHandle()` 导出可继承的日志映射句柄，再用 `launchUIProcess()` 以 `CreateProcessAsUser()` 启动 `wireguard.exe /ui <reader> <writer> <events> <mapping>`，并把四个句柄放入 `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`，确保只有这四个句柄被继承。进程启动后 `proc.Wait()` 阻塞；若退出码是 `STATUS_DLL_INIT_FAILED_LOGOFF`（0xC000026B），说明会话正在注销，协程直接结束；否则关闭本轮的管道与事件句柄，等待一秒后重新拉起 UI。
+
+第三段是隧道跟踪。`watchNewTunnelServices()` 先订阅服务数据库变化，再调用 `trackExistingTunnels()` 扫描配置目录中的每个名字，打开对应服务并 `go trackTunnelService()`。`trackTunnelService()` 先做 20 次、每次 200 毫秒的轮询，等待服务离开 `Stopped`；若超时仍停着，就检查服务是否被标记删除或启动类型是否为 `SERVICE_DISABLED`，是则删除服务、释放驱动适配器并广播 `TunnelStopped`。随后 `trackService()` 订阅状态变化，回调里把 SCM 状态映射为 `TunnelState`，状态变化时更新 `trackedTunnels`、在停止时 `releaseDriverAdapter()`、并 `IPCServerNotifyTunnelChange()` 广播。若服务停止且退出码表示错误，还会删除服务，避免“坏配置永远卡在列表里”。
+
+第四段是停止。收到 `svc.Stop` 或 `quitManagersChan` 后，服务发送 `StopPending`，把 `stoppingManager` 置真，调用 `IPCServerNotifyManagerStopping()` 通知 UI 退出，遍历 `procs` 逐个 `Kill()`，等待所有孵化协程结束；如果是通过 `Quit` 触发的，还会调用 `UninstallManager()` 删除服务。这里有一个容易忽略的顺序：先通知再 kill，给 UI 一个体面退出的窗口；如果先 kill，UI 可能来不及保存窗口状态。
+
+安装与卸载路径相对独立。`InstallManager()` 打开 `WireGuardManager`，若已存在且正在运行则返回 `ErrManagerAlreadyRunning`（`StartPending` 例外，视为他人正在启动）；若已停止则先删除再重建，并轮询等待 `ERROR_SERVICE_MARKED_FOR_DELETE` 消失。`InstallTunnel()` 的逻辑类似，但多了一步“已存在且非停止则报错”，并在创建后 `go trackTunnelService(name, service)` 把句柄交给跟踪器。`UninstallTunnel()` 先 `Control(svc.Stop)` 再 `Delete()`，对“已标记删除”做容错。
+
+### 5. 配置/命令/代码实例
+
+本模块最典型的“配置”不是 `.conf` 键，而是服务与注册表策略。下面只列四条常用命令/策略，完整开关与服务命令见 04-04、04-06、04-07。
+
+```powershell
+wireguard.exe /installmanagerservice
+wireguard.exe /installtunnelservice C:\ProgramData\WireGuard\Office.conf
+sc.exe query WireGuardManager
+sc.exe query "WireGuardTunnel$Office"
+```
+
+注册表侧的受限 UI 开关为 `HKLM\Software\WireGuard\LimitedOperatorUI`（DWORD 1），它决定非管理员但属于 Network Configuration Operators 的用户是否能看到并操作 UI。该键的完整语义、ACL 要求与卸载清理见 04-07。
+
+服务状态查询的示例输出如下，字段格式需对照实际 Windows 版本核验。
+
+```text
+SERVICE_NAME: WireGuardManager
+        TYPE               : 10  WIN32_OWN_PROCESS
+        STATE              : 4  RUNNING
+                                (STOPPABLE, NOT_PAUSABLE, ACCEPTS_SHUTDOWN)
+        WIN32_EXIT_CODE    : 0  (0x0)
+        SERVICE_EXIT_CODE  : 0  (0x0)
+        CHECKPOINT         : 0x0
+        WAIT_HINT          : 0x0
+
+SERVICE_NAME: WireGuardTunnel$Office
+        TYPE               : 10  WIN32_OWN_PROCESS
+        STATE              : 4  RUNNING
+                                (STOPPABLE, NOT_PAUSABLE, ACCEPTS_SHUTDOWN)
+        WIN32_EXIT_CODE    : 0  (0x0)
+        SERVICE_EXIT_CODE  : 0  (0x0)
+```
+
+判读要点如下。第一，`TYPE` 为 `10 WIN32_OWN_PROCESS` 表示服务在自己的进程里运行，而不是共享 `svchost`；这与 `InstallTunnel()` 设置的 `SERVICE_WIN32_OWN_PROCESS` 一致。第二，`STATE` 为 4 表示 `RUNNING`，但“服务在运行”不等于“隧道已握手”：握手状态要用 `wg show` 查，服务状态只说明进程没有退出。第三，`WIN32_EXIT_CODE` 与 `SERVICE_EXIT_CODE` 要分开看：前者是 Win32 错误码，后者是服务自定义错误码；`trackTunnelService()` 正是先看 `ERROR_SERVICE_SPECIFIC_ERROR`，再读 `ServiceSpecificExitCode` 并映射为 `services.Error`。第四，如果 `STATE` 是 1（`STOPPED`）而 `WIN32_EXIT_CODE` 非零，通常意味着启动阶段失败，例如配置解析失败、适配器创建失败或驱动加载失败，应结合 `wireguard /dumplog` 定位。第五，隧道服务名必须带 `$`，在 PowerShell 中要用引号包住，否则 `$Office` 会被当作变量展开，这是运维脚本里最常见的低级错误。
+
+从代码角度，UI 孵化阶段最关键的两步是“注册 IPC 服务端”和“导出日志映射句柄”，顺序不能颠倒：
+
+```go
+IPCServerListen(ourReader, ourWriter, ourEvents, elevatedToken)
+theirLogMapping, err := ringlogger.Global.ExportInheritableMappingHandle()
+if err != nil {
+    log.Printf("Unable to export inheritable mapping handle: %v", err)
+    return
+}
+```
+
+`IPCServerListen()` 必须在 UI 启动前完成，否则 UI 连上管道时服务端还没准备好，首帧状态可能丢失；`ExportInheritableMappingHandle()` 必须在 `CreateProcessAsUser()` 之前调用，否则子进程拿不到日志共享内存，日志页会一直为空。两者都依赖前面创建的管道与全局 `ringlogger.Global`，因此 `InitGlobalLogger()` 的失败必须被视为致命错误。
+
+### 6. 注意事项、陷阱与最佳实践
+
+- **不要手工 `sc create` 隧道服务**。`InstallTunnel()` 除了创建服务，还设置了依赖、服务 SID、启动类型，并在创建后把句柄交给跟踪器；手工创建容易漏掉 `SERVICE_SID_TYPE_UNRESTRICTED` 或依赖项，表现为隧道能启动但网络配置异常。
+- **受限 UI 不是“只读 UI”**。受限操作员可以启动、停止隧道，也可以查看配置（敏感字段会被 `Redact()`），但不能创建、删除、退出管理服务或触发更新。给运维账号授权时，要明确这是“可启停”而不是“可改配置”。
+- **配置相交会被自动停隧道**。`Start()` 用 `IntersectsWith()` 判断地址重叠，重叠的隧道会被异步停止；如果业务依赖两条隧道同时存在，应把地址段规划成不重叠，而不是反复重试启动。
+- **“僵尸隧道”来自状态竞态**。`trackTunnelService()` 会在停止后重试停止仍在 `Started/Starting` 的隧道，并删除启动失败的服务；如果看到隧道列表里反复出现又消失，应查日志中的 `Trying again to stop zombie tunnel` 与退出码。
+- **UI 被 kill 是设计行为**。管理服务停止或用户注销时，`procs` 中的 UI 会被 `TerminateProcess`；这不是崩溃，不要把它当成故障。真正需要关注的是 `STATUS_DLL_INIT_FAILED_LOGOFF` 之外的异常退出码。
+- **会话 0 没有 UI**。`WTSEnumerateSessions()` 只处理 `WTSActive` 与 `WTSDisconnected`，服务会话不会被孵化；在无人登录的服务器上，隧道仍由服务运行，但托盘与窗口不存在，这是正常的。
+- **gob 兼容性有版本边界**。IPC 的方法类型与结构体字段通过 `gob` 编码，跨版本混用（旧 UI 连新 manager）可能解码失败；升级时应整体替换 `wireguard.exe`，不要只替换其中一部分。
+- **事件管道可能阻塞**。`notifyAll()` 给每次写设置 1 秒 deadline，并用 `eventLock` 串行化；如果某个 UI 长时间不读，事件会被丢弃而不是无限堆积。排障时若发现 UI 状态“卡住”，先看 UI 是否还在响应，而不是怀疑 manager 没发通知。
+- **不要在隧道运行时改服务命令行**。`changeTunnelServiceConfigFilePath()` 只在配置迁移时改 `BinaryPathName`，并且会校验参数个数与可执行文件路径；手工改命令行会让跟踪器与配置名对不上，出现“服务在跑但列表里没有”的错位。
+
+### 7. 小结与延伸阅读
+
+`manager` 是整套客户端的中枢：它把“服务安装、会话枚举、UI 孵化、IPC、隧道跟踪、更新触发”收拢到一个 LocalSystem 进程里，用令牌判定区分管理员、受限操作员与普通用户，用服务通知而不是轮询来感知隧道状态，用 gob 管道把控制面与界面解耦。读这个模块时，建议抓住三条线：服务名与生命周期、令牌与权限、状态机与通知。只要这三条线清楚，看到任何“UI 不显示隧道”“服务在跑但连不上”“启动一个隧道另一个被停掉”的现象，都能快速定位到对应函数。
+
+延伸阅读建议：先看 04-04 与 04-06 熟悉 `/installmanagerservice`、`/installtunnelservice`、`sc` 的用法，再看 04-07 理解 `LimitedOperatorUI` 的边界，然后读 06-10 掌握会话枚举与 `CreateProcessAsUser` 的完整机制，最后对照 05-09 的 IPC 与错误码字段。若要动手实验，可以在测试机上有意创建一个地址相交的隧道，观察 `IntersectsWith()` 触发的自动停止，再结合 `wireguard /dumplog` 验证状态通知的顺序。
+
+## 07-09 `ui` 图形界面与配置编辑器模块
+
+### 1. 背景与动机
+
+`ui` 是 wireguard-windows 的门面，但它不是“必需组件”。隧道服务可以在无人登录的服务器上独立运行，`wg` 与 `wireguard.exe` 也能完成大部分运维动作；UI 的职责是把“隧道列表、状态、配置编辑、日志、更新”这些控制面操作做得可发现、可理解、可纠错。也正因为它不是数据面，UI 进程以普通用户权限运行，只有在需要写配置或管理服务时才通过 IPC 请求 manager 代劳；管理员登录时，manager 会用提升令牌启动 UI，普通用户则只能看到被 `Redact()` 过的只读视图。
+
+界面库选择的是 `github.com/lxn/walk`，一个对 Win32 公共控件做 Go 封装的库。它决定了代码的组织方式：窗口是 `walk.FormBase` 的嵌入，控件通过 `walk.New*` 创建，布局用 `GridLayout`/`VBoxLayout`，事件用 `Attach()` 挂回调。这套 API 不像 Web 前端那样有虚拟 DOM，控件就是真实的 HWND，因此跨线程更新必须走 `Synchronize()`，否则会触发 Win32 的线程亲和性错误。阅读 `ui` 包时，看到大量 `mtw.Synchronize(func(){...})` 不是冗余，而是必须。
+
+UI 的结构是“一个主窗口 + 三个标签页 + 一个托盘图标”。主窗口的关闭按钮默认不是退出，而是“关闭到托盘”；只有托盘菜单里的 Exit 才真正结束进程（并且在管理员场景下会顺带退出 manager）。这个行为对普通用户友好，对运维脚本却不友好：用 `Stop-Process` 强杀 UI 不会停止隧道，因为隧道活在服务里；反过来，停止 manager 会导致所有会话的 UI 被 kill。理解这个生命周期，才能正确判断“界面消失”到底意味着什么。
+
+本模块还要处理几类“非理想输入”：用户从网上复制来的 `.conf` 可能带 BOM、CRLF、未知编码；可能一次拖入多个 `.conf` 或一个 `.zip`；可能名字与已有隧道冲突；可能在编辑框里写错一个 Base64 字符。UI 不能替用户猜，但必须在不崩溃的前提下给出可定位的错误。配置编辑器因此不是简单的多行文本框，而是带语法高亮、字段校验、私钥联动与 kill-switch 复选框的专用控件。
+
+### 2. 核心概念
+
+**主窗口与会话**。`ManageTunnelsWindow` 嵌入 `walk.FormBase`，持有 `TabWidget`、`TunnelsPage`、`LogPage`、可选的 `UpdatePage`，以及一个 `manager.TunnelChangeCallback`。窗口类名是 `WireGuard UI - Manage Tunnels`，注册时同时注册 `TaskbarButtonCreated` 消息，用于在任务栏按钮创建后设置进度与叠加图标。`NewManageTunnelsWindow()` 里把 `Closing()` 事件改为“取消关闭 + 隐藏/最小化”，这是“关闭到托盘”的实现点。
+
+**隧道列表与详情**。`TunnelsPage` 由工具栏、`ListView` 与 `ConfView` 组成。`ListView` 的模型是 `ListModel`，列包括名称、状态、接收/发送流量等；`StyleCell()` 根据状态给行上色，`onTunnelChange()` 在状态变化时刷新对应行。`ConfView` 是右侧详情面板，内部把 `[Interface]` 与每个 `[Peer]` 映射成 `interfaceView`/`peerView`，每个字段是一行 `labelTextLine`，状态行是 `labelStatusLine`，底部还有一个 `toggleActiveLine` 用于启动/停止。`apply()` 负责把 `conf.Interface`/`conf.Peer` 的值填进控件，`SetTunnel()` 负责切换当前展示对象。
+
+**配置编辑器**。`EditDialog` 由名称输入框、只读公钥框、`syntax.SyntaxEdit`、kill-switch 复选框、保存/取消按钮组成。新建隧道时 `conf.NewPrivateKey()` 生成私钥并套默认模板；编辑已有隧道时从 `tunnel.StoredConfig()` 取配置。`syntaxEdit.SetText(dlg.config.ToWgQuick())` 把结构体序列化成 wg-quick 风格文本，保存时再解析回 `conf.Config` 并交给 manager。这个“结构体 → 文本 → 结构体”的往返是编辑器的核心契约，任何序列化/解析不一致都会表现为“保存后配置变了”。
+
+**语法高亮与校验**。`ui/syntax/highlighter.go` 是从 wireguard-tools 的 C 版 highlighter 直接翻译来的状态机。它逐字符扫描，识别段名、字段名、私钥/公钥/预共享密钥、IP、CIDR、主机名、端口、MTU、keepalive、注释、分隔符、`Table`、脚本命令与错误。每个值类型都有独立的校验函数：`isValidKey()` 检查 44 字符 Base64 与末字符集合，`isValidIPv4()`/`isValidIPv6()` 检查地址，`isValidEndpoint()` 处理 `[IPv6]:port` 与主机名，`isValidMTU()` 限定 576 至 65535，`isValidTable()` 接受 `off`/`auto`/`main`/整数。它只是“输入提示”，不是权威解析器；真正的合法性仍由 `conf` 包在保存时判定。
+
+**kill-switch 复选框**。`blockUntunneledTrafficCB` 的提示文本明确写了触发条件：恰好一个 peer、该 peer 的 `AllowedIPs` 至少包含 `0.0.0.0/0` 或 `::/0`、且接口没有 `Table=off`。复选框不是独立配置键，它通过改写 `AllowedIPs` 实现：勾选时把 `0.0.0.0/0` 与 `::/0` 写入，取消时改写成 `0.0.0.0/1 + 128.0.0.0/1` 与 `::/1 + 8000::/1`。`onBlockUntunneledTrafficCBCheckedChanged()` 与 `onBlockUntunneledTrafficStateChanged()` 负责双向同步，`syntaxedit.go` 里的 `evaluateUntunneledBlocking()` 根据当前文本推断复选框三态。
+
+**导入与导出**。`importFiles()` 支持 `.conf` 与 `.zip`：`.conf` 直接读文本，`.zip` 遍历条目并只取 `.conf`；随后按名称排序、检查重名、用 `conf.FromWgQuickWithUnknownEncoding()` 解析、再 `manager.IPCClientNewTunnel()` 保存。`exportTunnels()` 则把所有选中隧道的 `StoredConfig().ToWgQuick()` 写进一个 zip，每个条目名为 `<tunnel>.conf`。注意导出的是明文私钥，文件落盘位置与访问权限需要用户自己负责。
+
+**托盘**。`Tray` 包装 `walk.NotifyIcon`，菜单包含状态行、地址行、隧道切换项、管理窗口、导入、关于与退出。`onTunnelsChange()` 重建隧道动作，`onTunnelChange()` 更新状态与图标，`updateGlobalState()` 在“有隧道启动/停止中”时切换忙状态。托盘是 UI 的常驻入口，也是“关闭窗口后还能回来”的关键。
+
+**本地化与图标**。所有面向用户的字符串都走 `l18n.Sprintf()`，语言由 `GetUserPreferredUILanguages()` 与 `message.DefaultCatalog` 匹配；图标来自 `ui/icon/` 下的 SVG 源与编译进资源的 ico，`iconprovider.go` 提供 `iconForState()`、`iconWithOverlayForState()`、`textForState()`。状态文案与图标必须成对维护，否则会出现“图标是绿的、文字说已停止”的不一致。
+
+### 3. 关键数据结构与源码位置
+
+`ui/` 目录的主要文件与职责如下表所示。
+
+| 文件 | 关键类型/函数 | 职责 |
+|---|---|---|
+| `ui.go` | `RunUI()`、`onQuit()` | 进程入口、托盘与主窗口装配、退出 |
+| `managewindow.go` | `ManageTunnelsWindow`、`WndProc()` | 主窗口、标签页、任务栏状态 |
+| `tunnelspage.go` | `TunnelsPage`、`importFiles()`、`exportTunnels()` | 列表、工具栏、导入导出 |
+| `confview.go` | `ConfView`、`interfaceView`、`peerView` | 配置详情与启停按钮 |
+| `editdialog.go` | `EditDialog`、`runEditDialog()` | 新建/编辑对话框与保存 |
+| `listview.go` | `ListModel`、`ListView` | 隧道表格模型与状态着色 |
+| `logpage.go` | `LogPage`、`logModel` | 日志尾随、复制、另存 |
+| `tray.go` | `Tray` | 托盘菜单与隧道快捷操作 |
+| `syntax/highlighter.go` | `highlightConfig()` | 逐字符高亮与字段校验 |
+| `syntax/syntaxedit.go` | `SyntaxEdit` | 富文本编辑控件、事件、上下文菜单 |
+| `iconprovider.go` | `iconForState()`、`textForState()` | 状态图标与文案 |
+
+结构体字段的完整定义见 05-09；本篇只强调两个阅读要点。第一，`ConfView.peers` 是 `map[conf.Key]*peerView`，键是 peer 公钥，这意味着同一公钥在界面上只会有一份视图，配置里重复写同一个 peer 会在展示层被合并。第二，`EditDialog` 同时持有 `config conf.Config` 与 `lastPrivateKey string`，前者是“保存目标”，后者用于在私钥变化时联动更新公钥显示；两者不同步时会出现“公钥框还是旧值”的假象。
+
+（字段见 05-09 ｜ 配置见 04-02 ｜ 原理见 06-10 ｜ 模块见 07-09）
+
+### 4. 关键流程与调用链
+
+UI 的整体装配关系见图 07-09-01，图中把窗口、页面、托盘与 IPC 客户端放在同一张会话视图里。
+
+:::figure id=07-09-01 | name=UI 主窗口与页面装配关系 | dir=TD
+node n1 "RunUI" blue
+node n2 "ManageTunnelsWindow" teal
+node n3 "TunnelsPage 与列表" amber
+node n4 "ConfView 详情" purple
+node n5 "LogPage 日志" gray
+node n6 "Tray 托盘" green
+node n7 "manager IPC 客户端" red
+edge n1 -> n2 "创建窗口"
+edge n2 -> n3 "标签页一"
+edge n3 -> n4 "选中隧道"
+edge n2 -> n5 "标签页二"
+edge n1 -> n6 "创建托盘"
+edge n2 -> n7 "注册回调"
+edge n6 -> n7 dashed "状态同步"
+edge n7 -> n3 dashed "隧道变更"
+:::
+
+`RunUI()` 的启动顺序是“先窗口、后托盘、再订阅”。它先 `runtime.LockOSThread()` 把 goroutine 绑到主线程，降低进程优先级提升，然后循环调用 `NewManageTunnelsWindow()` 直到成功（失败间隔 400 毫秒），再循环创建 `Tray`；在 Windows Server Core 上没有托盘时，`version.OsIsCore()` 为真，托盘创建失败会被接受，`noTrayAvailable` 置真。接着注册 `manager.IPCClientRegisterManagerStopping()`，在 manager 停止时让 UI `walk.App().Exit(0)`；注册更新通知回调，并主动拉一次 `IPCClientUpdateState()` 以补齐启动前的状态。最后 `mtw.Run()` 进入消息循环，退出时销毁托盘与窗口。
+
+隧道列表的刷新由两条路径驱动。第一条是 `IPCClientRegisterTunnelChange(mtw.onTunnelChange)`：manager 每次广播 `TunnelChangeNotificationType`，客户端解码出隧道名、状态、全局状态与错误字符串，回调里 `Synchronize()` 到 UI 线程，更新任务栏进度、弹出隧道错误提示；`ListView` 与 `Tray` 也各自注册了回调，形成“一个事件、多处更新”。第二条是 `IPCClientRegisterTunnelsChange`：当配置增删导致列表结构变化时，`TunnelsPage.onTunnelsChanged()` 与 `Tray.onTunnelsChange()` 重新拉取 `IPCClientTunnels()` 并重建控件。
+
+编辑与保存的链路见图 07-09-02。
+
+:::figure id=07-09-02 | name=配置编辑器的保存链路 | dir=TD
+node n1 "EditDialog" blue
+node n2 "SyntaxEdit 文本" teal
+node n3 "高亮与字段校验" amber
+node n4 "kill-switch 复选框" purple
+node n5 "conf.Config" gray
+node n6 "IPCClientNewTunnel" green
+node n7 "manager 写入存储" red
+edge n1 -> n2 "嵌入"
+edge n2 -> n3 "逐字符扫描"
+edge n3 -> n4 "状态回调"
+edge n4 -> n2 "改写 AllowedIPs"
+edge n2 -> n5 "保存时解析"
+edge n5 -> n6 "提交配置"
+edge n6 -> n7 "DPAPI 落盘"
+:::
+
+`runEditDialog()` 是对话框的对外入口：`newEditDialog()` 创建控件并填充初始文本，`dlg.Run()` 进入模态循环，用户点保存时 `onSaveButtonClicked()` 解析文本、校验名称与字段、把结果写回 `dlg.config`，最后返回 `DlgCmdOK`。`TunnelsPage.onAddTunnel()` 与 `onEditTunnel()` 拿到返回的 `*conf.Config` 后，分别调用 `addTunnel()`（内部 `IPCClientNewTunnel`）或 `IPCClientSetTunnel` 一类的更新接口；具体方法名随版本可能不同，需对照 `manager/ipc_client.go` 与实际版本核验。若用户取消，返回 `nil`，调用方不做任何写入。
+
+导入流程值得单独看。`importFiles()` 在后台 goroutine 中执行，所有 UI 操作都通过 `tp.Synchronize()` 回到主线程；它先按扩展名分流，`.zip` 用 `zip.OpenReader()` 遍历，读取每个 `.conf` 的字节并保留文件名（去掉扩展名）作为候选隧道名。解析阶段用 `conf.FromWgQuickWithUnknownEncoding()`，这个函数会处理 BOM 与常见编码；保存阶段用 `manager.IPCClientNewTunnel()`，由 manager 决定最终路径与 DPAPI 加密。导入结束后根据成功数 `m` 与总数 `n` 给出四种提示：单个失败、单个成功、全部成功、部分成功，这比“导入失败”四个字有用得多。
+
+日志页与托盘是两条旁路。`LogPage` 使用 `logModel` 定时从 manager 的共享环形日志读取增量（原理见 06-11），`isAtBottom()` 决定是否自动滚动，`onCopy()`/`onSelectAll()`/`onSave()` 提供复制、全选、另存。`Tray` 则把 `IPCClientTunnels()` 的结果映射成菜单项，点击某一项时调用启动/停止，菜单文本与图标由 `textForState()`/`iconForState()` 统一生成。
+
+### 5. 配置/命令/代码实例
+
+UI 直接操作的配置键不多，最典型的是 `AllowedIPs`、`DNS`、`Table` 与 `Address`。下面的片段展示了“全隧道 + kill-switch 复选框生效”的形态，完整键集见 04-02、04-03。
+
+```conf
+[Interface]
+PrivateKey = <客户端私钥>
+Address = 10.7.0.2/32
+DNS = 10.7.0.1
+
+[Peer]
+PublicKey = <服务端公钥>
+AllowedIPs = 0.0.0.0/0, ::/0
+# 其他键不在本篇展开，完整配置键见 04-02 与 04-03
+```
+
+如果用户在编辑器里取消“Block untunneled traffic (kill-switch)”，UI 会把两条 `/0` 改写成四条半区前缀，路由效果接近默认路由，但不会触发 WFP 的强限制。这个改写发生在文本层，用户再次打开编辑器时能看到 `0.0.0.0/1, 128.0.0.0/1` 等值，而不是一个隐藏开关。
+
+UI 进程本身由 manager 以四个句柄启动，命令行形如 `/ui <reader> <writer> <events> <mapping>`。这四个参数不是给用户手工调用的，但排障时可以用进程命令行确认句柄是否成组出现：
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name = 'wireguard.exe'" |
+    Where-Object { $_.CommandLine -match '/ui' } |
+    Select-Object ProcessId, CommandLine
+```
+
+```text
+ProcessId CommandLine
+--------- -----------
+  6124    "C:\Program Files\WireGuard\wireguard.exe" /ui 548 552 556 560
+  7180    "C:\Program Files\WireGuard\wireguard.exe" /ui 620 624 628 632
+```
+
+判读要点如下。第一，每个交互会话应当有一个 `/ui` 进程；如果同一会话出现多个，可能是 UI 崩溃后被 manager 重新拉起，旧进程尚未完全退出。第二，四个数字是继承句柄的十进制表示，顺序固定为“读管道、写管道、事件管道、日志映射”；数值本身每次启动都会变化，不能用固定值判断。第三，若命令行只有 `/ui` 而没有四个参数，说明启动参数被截断或手工伪造，UI 会在初始化 IPC 时失败并退出。第四，`ProcessId` 与 `sc query WireGuardManager` 的进程号没有直接关系：manager 是服务进程，UI 是用户进程，二者通过管道通信而不是父子关系。第五，若在服务器上看到“没有 `/ui` 进程”，先确认是否有活动会话；会话 0 不会孵化 UI，这是设计行为而非故障。
+
+日志页的内容来自共享环形日志，典型行如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+2026-11-12 09:41:02.118: [MGR] Starting WireGuard/1.1.1 (Windows 10.0.19045; amd64)
+2026-11-12 09:41:02.204: [MGR] Starting UI process for user 'alice@WORKGROUP' for session 1
+2026-11-12 09:41:03.887: [TUN] [Office] Starting WireGuard/1.1.1 (Windows 10.0.19045; amd64)
+```
+
+这三行分别对应管理服务启动、UI 孵化、隧道服务启动；`[MGR]`、`[TUN]` 是 ringlogger 的 tag，方括号后是消息体。若 UI 日志页只有第一行而没有第二行，说明 manager 没有为当前会话拉起 UI；若第二行存在但界面仍空白，问题更可能在 IPC 连接或窗口初始化，而不是日志本身。
+
+### 6. 注意事项、陷阱与最佳实践
+
+- **关闭窗口不等于退出**。主窗口的 `Closing()` 被改写为隐藏或最小化，真正退出要走托盘 Exit；用任务管理器结束 UI 不会停止隧道，反而会让 manager 在一秒后重新拉起一个新的 UI。
+- **不要在非 UI 线程直接改控件**。Walk 控件有线程亲和性，所有来自 IPC 回调的更新都必须 `Synchronize()`；自己写扩展时若省略这一步，轻则界面不刷新，重则进程崩溃。
+- **高亮不是解析器**。`highlightConfig()` 会把非法值标红，但它不构建 `conf.Config`，也不做跨字段校验（例如同一 peer 是否重复、AllowedIPs 是否与接口地址冲突）。保存时的错误以 `conf` 包为准，不要因为“没红线”就认为一定能保存。
+- **导入的编码与重名**。`.conf` 可能带 BOM 或 UTF-16，`FromWgQuickWithUnknownEncoding()` 会尝试处理；重名检查是大小写不敏感的，`Office` 与 `office` 会被视为冲突。批量导入时部分成功是正常结果，提示会给出成功数与总数。
+- **导出包含私钥**。`exportTunnels()` 写出的是 `ToWgQuick()` 的明文，包含 `PrivateKey` 与 `PresharedKey`；导出的 zip 应放在受控目录，传输后及时删除，不要放进公共网盘。
+- **受限 UI 的能力差异**。非管理员且不属于 Network Configuration Operators 的用户看不到 UI；受限操作员能看到并启停，但保存、删除、退出等按钮会因 IPC 返回 `ERROR_ACCESS_DENIED` 而失败。这是权限设计，不是界面 bug。
+- **编辑运行中的隧道需要重启**。保存配置只写入存储，已运行的隧道服务不会自动重载；要让新配置生效，需要在界面上停止再启动，或由 manager 重新安装服务。
+- **Core 版本没有托盘**。`version.OsIsCore()` 为真时托盘创建失败会被接受，窗口以最小化方式存在；不要在没有托盘的机器上教用户“点右下角图标”。
+- **日志页不是无限历史**。它读的是固定容量的环形缓冲（容量与格式见 07-10），长时间运行后早期日志会被覆盖；需要长期留存时应在问题发生时及时“另存为”。
+
+### 7. 小结与延伸阅读
+
+`ui` 包把 Win32 控件、配置模型、IPC 通知与本地化粘在一起，形成一条“看得见”的控制面。它的设计重点不在视觉，而在契约：`conf.Config` 与 wg-quick 文本之间的往返必须稳定，kill-switch 复选框必须与 `AllowedIPs` 的改写严格对应，IPC 回调必须回到 UI 线程，导入导出必须对文件名、编码与重名有明确策略。掌握这四个契约，读代码时就不会被大量控件创建语句淹没。
+
+延伸阅读建议：先看 04-02、04-03 熟悉编辑器里出现的配置键，再看 05-09 核对 `ConfView`/`EditDialog` 涉及的字段，然后读 06-10 理解 UI 进程如何被 manager 孵化，最后对照 `ui/syntax/highlighter.go` 与 wireguard-tools 的 `highlighter.c` 看状态机差异。若要做二次开发，建议从 `LogPage` 或 `Tray` 这类边界清晰的组件入手，避免一上来就改 `ConfView` 的布局与字段映射。
+
+## 07-10 `ringlogger` 与 `services` 模块
+
+### 1. 背景与动机
+
+Windows 服务没有控制台。隧道服务与管理服务都以 LocalSystem 运行，既不能把日志写到某个用户的终端，也不适合为每条隧道维护一个无限增长的文本文件：全隧道长时间运行会产生大量握手、DNS、路由与错误日志，普通文件会持续膨胀，轮转又需要额外的文件锁与清理逻辑。wireguard-windows 的解法是一个固定容量的共享环形日志：所有进程把日志写进同一块内存映射区域，容量固定、写入 O(1)、旧日志自动被覆盖；需要查看时，用 `wireguard /dumplog` 把当前快照导出到标准输出，或用 `/tail` 持续跟随。
+
+这套设计的目标不是“长期审计”，而是“故障现场”。它假设最有价值的日志是最近发生的那一段：隧道为什么没起来、握手为什么失败、服务为什么退出。因此容量被刻意限制为 2048 行、每行最多 512 字节，超出就覆盖最旧的一行；进程崩溃不会留下半截文件，也不会因为磁盘满而写失败。代价是早期日志会丢失，长期留存必须由外部采集负责。
+
+`services` 包则是这套日志体系的“语义层”。它定义了一组稳定的错误码，把“打开日志失败、加载配置失败、创建适配器失败、启用防火墙失败、设置设备配置失败、绑定默认路由失败、监控 MTU 失败、设置网络配置失败、丢弃特权失败、执行脚本失败”等阶段映射为可枚举的 `Error`，并提供 `DetermineErrorCode()` 把 Go 错误转换成 Windows 服务的退出码。没有这一层，事件查看器里只会看到一个笼统的 `1066` 或一个 Win32 数字，排障无法定位到阶段。
+
+两个包经常一起出现：服务启动时先 `ringlogger.InitGlobalLogger()`，失败就返回 `services.ErrorRingloggerOpen`；随后每个阶段失败都设置对应的 `serviceError`，`Execute()` 的 defer 再统一计算退出码并写日志。理解这条“日志初始化 → 阶段错误 → 退出码”的链路，才能读懂 `sc query` 里的 `SERVICE_EXIT_CODE` 与 `/dumplog` 里的最后几行。
+
+### 2. 核心概念
+
+**环形缓冲的物理布局**。`logMem` 是映射文件的根结构：`magic` 是魔数 `0xbadbabe`，用于判断这块内存是否已初始化；`nextIndex` 是全局递增的写入序号；`lines` 是 2048 个 `logLine` 的数组。每个 `logLine` 由 `timeNs int64` 与 `line [512]byte` 组成。写入时用 `atomic.AddUint32(&nextIndex, 1) - 1` 取得序号，再对 2048 取模定位槽位；读取时从 `nextIndex` 往前推 2048 个槽位，按序号顺序输出。因为序号只增不减，读者可以判断“哪些行是新的、哪些已经被覆盖”。
+
+**单行的编码**。写入前会先 `bytes.TrimSpace()`，空行直接返回；然后计算 `textLen = 3 + len(p) + len(tag)`，其中 3 是 `[`、`]`、空格三个字节。若超长，就把正文截断到 `maxLogLineLength - 1 - 3 - len(tag)`，保证末尾仍有 NUL。写入顺序是“先清零、写 tag、写右括号与空格、写正文、最后写左括号与时间戳”，源码注释说明这是为了让读者在时间戳非零之前看不到半截行。这个细节决定了并发读到的要么是完整行，要么是“时间戳为 0 的空槽”，不会出现拼接错乱。
+
+**tag 与容量**。`maxTagLength` 为 5，管理服务用 `MGR`，隧道服务用 `TUN`，dump 进程用 `DMP`；超过 5 个字符会返回 `ERROR_LABEL_TOO_LONG`。`maxLines` 为 2048，意味着所有进程共享同一个 2048 行窗口，而不是每个进程 2048 行。多条隧道同时运行时，日志会交错出现，必须靠 tag 与隧道名区分。
+
+四个核心常量决定了这套日志的“分辨率”，如下表所示。
+
+| 常量 | 值 | 作用 |
+|---|---:|---|
+| `maxLogLineLength` | 512 | 单行字节上限，含 tag 与分隔符 |
+| `maxTagLength` | 5 | tag 最大长度，MGR/TUN/DMP |
+| `maxLines` | 2048 | 环形槽位总数，全局共享 |
+| `magic` | `0xbadbabe` | 映射初始化标记 |
+
+为什么要同时限制行数与行长？行数决定“能回看多久”，行长决定“单条消息能说清多少”。如果只限行数不限长度，一条超长错误栈就会挤掉几十条握手日志；如果只限长度不限行数，文件会随运行时间无限增长。512 与 2048 的组合是经验值：它足够容纳一次启动序列与若干次握手失败，又不会让共享内存大到影响映射成本。代价是长消息被截断、早期日志被覆盖，这两点在排障时必须主动补偿。
+
+**共享与继承**。`NewRinglogger()` 以 `os.O_RDWR|os.O_CREATE` 打开文件，权限 `0600`，把文件截断到 `unsafe.Sizeof(logMem{})`，再 `CreateFileMapping()` 建立映射；`NewRingloggerFromInheritedMappingHandle()` 则从十进制句柄字符串恢复一个只读视图，供 UI 进程使用。`ExportInheritableMappingHandle()` 重新以 `PAGE_READONLY` 打开同一文件映射，并设置 `HANDLE_FLAG_INHERIT`，这样 manager 可以把句柄放进 `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` 传给 UI，而不需要 UI 有权限打开日志文件。
+
+**读写 API**。`Write()` 取当前时间后调用 `WriteWithTimestamp()`；`WriteTo()` 按顺序输出全部有效行，格式为 `2006-01-02 15:04:05.000000: [TAG] message`；`FollowFromCursor()` 从游标开始增量读取，`CursorAll` 表示“从最旧的有效行开始”；`DumpTo()` 封装了“打开文件 → 映射 → 只读视图 → 全量或持续输出”的完整流程，持续模式每 100 毫秒轮询一次。
+
+**全局 logger 与运行时挂钩**。`InitGlobalLogger(file, tag)` 创建 `Global`，调用 `log.SetOutput(Global)` 与 `log.SetFlags(0)`，并通过 `//go:linkname overrideWrite runtime.overrideWrite` 把标准库的底层写函数替换为 `globalWrite`。这样即使某处直接调用了运行时或标准库的写日志路径，也会被汇入环形缓冲；`globalWrite` 用 `//go:nosplit` 保证在不可抢占的上下文中也能工作。
+
+**services 错误枚举**。`services.Error` 是 `uint32` 枚举，从 `ErrorSuccess` 开始，依次包括 `ErrorRingloggerOpen`、`ErrorLoadConfiguration`、`ErrorCreateNetworkAdapter`、`ErrorDNSLookup`、`ErrorFirewall`、`ErrorDeviceSetConfig`、`ErrorDeviceBringUp`、`ErrorBindSocketsToDefaultRoutes`、`ErrorMonitorMTUChanges`、`ErrorSetNetConfig`、`ErrorDetermineExecutablePath`、`ErrorTrackTunnels`、`ErrorEnumerateSessions`、`ErrorDropPrivileges`、`ErrorRunScript`、`ErrorWin32`。每个值都有对应的英文描述，`Error()` 方法把这些描述暴露给日志与 UI。
+
+**退出码计算**。`DetermineErrorCode(err, serviceError)` 先看 `err` 是否可转换为 `windows.Errno`：是则返回 `(false, uint32(syserr))`，表示“不是服务特定错误”；否则若 `serviceError` 非 `ErrorSuccess`，返回 `(true, uint32(serviceError))`；两者都没有则返回 `(false, NO_ERROR)`。`CombineErrors()` 则把阶段错误与底层错误合并成一条链式错误，供日志使用。`svc.Run` 会根据第一个返回值决定 `SERVICE_EXIT_CODE` 还是 `WIN32_EXIT_CODE`，这就是 `sc query` 中两个退出码字段的来源。
+
+**启动原因**。`services.StartedAtBoot()` 用 `svc.IsWindowsService()` 与 `svc.DynamicStartReason()` 判断本次启动是否由 `StartReasonAuto` 或 `StartReasonDelayedAuto` 触发，并把结果缓存；`PrintStarting()` 据此在日志里打印 “Starting at boot ...”。这不是装饰：开机自启与手动启动的失败模式不同，前者常与依赖服务未就绪有关。
+
+### 3. 关键数据结构与源码位置
+
+`ringlogger/` 只有三个文件，但每个都承担不同角色：
+
+- `ringlogger.go`：常量与结构体（`maxLogLineLength`、`maxTagLength`、`maxLines`、`magic`、`logLine`、`logMem`、`Ringlogger`）、构造与映射（`NewRinglogger()`、`NewRingloggerFromInheritedMappingHandle()`、`newRingloggerFromMappingHandle()`）、读写（`WriteWithTimestamp()`、`WriteTo()`、`FollowFromCursor()`）、关闭与句柄导出（`Close()`、`ExportInheritableMappingHandle()`）。
+- `dump.go`：`DumpTo(inPath, out, continuous)`，把“文件路径 + 输出流 + 是否持续”封装成一条命令可调用的路径。
+- `global.go`：`Global`、`InitGlobalLogger()`、`globalWrite()` 与 `runtime.overrideWrite` 挂钩。
+
+`services/` 只有两个文件：
+
+- `errors.go`：`Error` 枚举、`Error()` 文案、`DetermineErrorCode()`、`CombineErrors()`。
+- `boot.go`：`StartedAtBoot()`、`PrintStarting()`。
+
+需要澄清一个文件名问题：本仓库快照的 `ringlogger/` 下没有 `ringlogger_windows.go`，Windows 相关逻辑直接写在 `ringlogger.go` 里，通过 `golang.org/x/sys/windows` 调用；如果读者手上的版本存在该文件，应以实际版本为准。字段的完整定义、内存布局与读写时机见 05-09，本篇不重复字段表。
+
+（字段见 05-09 ｜ 配置见 04-06 ｜ 原理见 06-11 ｜ 模块见 07-10）
+
+### 4. 关键流程与调用链
+
+日志的写入与读取是两条独立路径，整体关系见图 07-10-01。
+
+:::figure id=07-10-01 | name=环形日志的写入与导出路径 | dir=TD
+node n1 "log.Printf" blue
+node n2 "globalWrite 缓冲" teal
+node n3 "WriteWithTimestamp" amber
+node n4 "logMem 2048 行" purple
+node n5 "WriteTo 全量" gray
+node n6 "FollowFromCursor" green
+node n7 "DumpTo 与 /dumplog" red
+edge n1 -> n2 "标准库输出"
+edge n2 -> n3 "按行提交"
+edge n3 -> n4 "原子序号定位"
+edge n4 -> n5 "顺序遍历"
+edge n4 -> n6 "游标增量"
+edge n5 -> n7 "一次性快照"
+edge n6 -> n7 "持续跟随"
+edge n7 -> n4 dashed "只读映射"
+:::
+
+写入路径从 `log.Printf()` 开始。标准库把格式化后的字节写到 `Global`，`Ringlogger.Write()` 取 `time.Now().UnixNano()` 作为时间戳，转交 `WriteWithTimestamp()`。后者先拒绝只读视图（返回 `io.ErrShortWrite`），再 `TrimSpace`、判空，然后用原子自增拿到序号，定位到 `lines[index%2048]`。接着把 `timeNs` 置零、清空整行，计算并截断正文，按 `[`、tag、`]`、空格、正文的顺序写入，最后用 `atomic.StoreInt64` 写入时间戳。读者看到时间戳非零，才认为这一行有效。
+
+读取路径分两种。`WriteTo()` 先读取 `nextIndex`，然后从 `(i+l)%maxLines` 遍历 2048 个槽位，跳过 `timeNs == 0` 的空槽，用 `bytes.IndexByte(line, 0)` 找到正文长度，按固定时间格式输出。`FollowFromCursor(cursor)` 则从调用方给的游标开始，最多遍历 2048 行；`CursorAll` 表示从最旧有效行开始，否则在遇到 `i%maxLines == nextIndex%maxLines` 时停止，避免把未写入的区域当成新日志。每读一行就更新 `nextCursor = i % maxLines`，调用方下次用它继续。
+
+`DumpTo()` 把读取路径封装成 CLI 行为：以只读方式打开日志文件，`CreateFileMapping(PAGE_READONLY)`，构造 `DMP` tag 的 `Ringlogger`；非持续模式调用 `WriteTo(out)`，持续模式从 `CursorAll` 开始循环调用 `FollowFromCursor()`，每 100 毫秒睡眠一次，遇到 `io.EOF` 正常返回。`wireguard.exe /dumplog` 与 `/dumplog /tail` 最终都落到这里，区别只是 `continuous` 参数。
+
+服务退出码路径与日志路径在 `Execute()` 的 defer 里汇合：`err` 是具体错误，`serviceError` 是阶段枚举，`DetermineErrorCode()` 决定 `svcSpecificEC` 与 `exitCode`，`CombineErrors()` 生成可读消息并 `log.Print`。如果 `err` 是 `windows.Errno`，退出码就是 Win32 码，`SERVICE_EXIT_CODE` 为 0；如果 `err` 不是系统错误而 `serviceError` 非零，则 `SERVICE_EXIT_CODE` 等于枚举值；两者都没有才是正常退出。这一区分对排障极其重要：看到 `SERVICE_EXIT_CODE: 5` 应查 `ErrorFirewall`，看到 `WIN32_EXIT_CODE: 5` 则应查 `ERROR_ACCESS_DENIED`。
+
+### 5. 配置/命令/代码实例
+
+`ringlogger` 没有用户可配的 `.conf` 键，日志路径由 `conf.LogFile()` 决定，通常位于 `%ProgramData%\WireGuard\Data\Logs\wireguard.log` 一类位置（具体路径需对照 `conf/path_windows.go` 与实际版本核验）。最典型的操作是三个命令，完整开关见 04-04、04-06。
+
+```powershell
+wireguard.exe /dumplog
+wireguard.exe /dumplog /tail
+sc.exe qc WireGuardManager
+```
+
+一次性导出的示例输出如下，时间格式与行内容需对照实际版本核验。
+
+```text
+2026-11-12 09:41:02.118: [MGR] Starting WireGuard/1.1.1 (Windows 10.0.19045; amd64)
+2026-11-12 09:41:02.204: [MGR] Starting UI process for user 'alice@WORKGROUP' for session 1
+2026-11-12 09:41:03.887: [TUN] [Office] Starting WireGuard/1.1.1 (Windows 10.0.19045; amd64)
+2026-11-12 09:41:04.012: [TUN] [Office] Creating network adapter
+2026-11-12 09:41:04.660: [TUN] [Office] Monitoring default routes
+```
+
+判读要点如下。第一，时间戳精确到微秒，格式固定为 `2006-01-02 15:04:05.000000`，便于按时间排序与对齐事件查看器。第二，`[MGR]` 与 `[TUN]` 是 tag，`[Office]` 是隧道名；同一秒内可能交错出现多条隧道，必须结合 tag 与隧道名阅读，不能只看行尾。第三，`Creating network adapter` 之后若没有 `Monitoring default routes`，说明适配器创建成功但后续网络配置失败，应结合 `SERVICE_EXIT_CODE` 判断是 `ErrorSetNetConfig` 还是 `ErrorMonitorMTUChanges`。第四，日志只有最近 2048 行，若隧道已运行很久，启动阶段的日志可能已被覆盖；要复现启动失败，应先停止再启动，然后立刻 dump。第五，`/tail` 是持续输出，适合在另一个窗口观察握手与路由变化，但它不会把历史行重新打印一遍（取决于游标策略），需要历史时先做一次全量 dump。
+
+从代码角度，服务的日志初始化通常只有三行，但顺序不能错：
+
+```go
+logFile, err := conf.LogFile(true)
+if err != nil {
+    serviceError = services.ErrorRingloggerOpen
+    return
+}
+if err := ringlogger.InitGlobalLogger(logFile, "TUN"); err != nil {
+    serviceError = services.ErrorRingloggerOpen
+    return
+}
+```
+
+`conf.LogFile(true)` 的布尔参数表示“是否需要写权限/是否创建目录”，具体语义需对照 `conf/path_windows.go`；`InitGlobalLogger()` 在 `Global` 已存在时直接返回 nil，因此同一进程内重复调用是安全的，但不同 tag 不会生效——第一个初始化的 tag 会一直沿用。这也是为什么管理服务与隧道服务必须各自在自己的进程里初始化，而不能共享一个进程。
+
+### 6. 注意事项、陷阱与最佳实践
+
+- **环形日志会覆盖**。2048 行是全局共享容量，不是每进程、每隧道独立；多条隧道 + 长时间运行会快速冲掉早期日志。排障前先停掉无关隧道，或尽快 dump。
+- **单行会被截断**。正文上限是 `512 - 1 - 3 - len(tag)`，超长消息会被截断而不是换行；打印大段配置或错误栈时，应分段输出，避免关键信息落在截断点之后。
+- **tag 最长 5 字符**。自定义 tag 超过 5 会直接失败；这不是可调参数，源码里是常量。
+- **时间戳是写入时间，不是事件发生时间**。高并发下 `time.Now()` 在取序号之前，可能出现“序号大但时间戳略小”的轻微乱序，源码注释已明确说明。对严格顺序有要求的场景，不要依赖时间戳排序。
+- **只读视图不能写**。UI 持有的是 `FILE_MAP_READ` 映射，`WriteWithTimestamp()` 会返回 `io.ErrShortWrite`；如果 UI 侧出现写日志失败，先确认句柄来源，而不是怀疑磁盘权限。
+- **日志文件权限是 0600**。`NewRinglogger()` 用 `os.OpenFile(..., 0o600)`，只有创建者可读写；共享靠继承句柄而不是放宽 ACL，不要为了“方便查看”把文件权限改成 Everyone。
+- **`/tail` 可能看起来“没输出”**。持续模式每 100 毫秒轮询，若期间没有新行就不会打印；另外它从当前游标开始，历史行需要先全量 dump。
+- **退出码要看两个字段**。`SERVICE_EXIT_CODE` 对应 `services.Error` 枚举，`WIN32_EXIT_CODE` 对应系统错误；把两者混为一谈会得到完全错误的排障方向。
+- **同 tag 的多实例会混在一起**。同一台机器上如果跑了两条隧道，二者都用 `TUN`，只能靠消息里的 `[隧道名]` 区分；自定义嵌入服务若也写同一文件，建议使用独立 tag 或独立日志路径，否则现场会被无关日志淹没。
+- **不要用日志判断服务是否“健康”**。日志只记录已发生的写操作，进程卡死、死锁或驱动阻塞时可能一条新日志都没有；健康检查应看 `sc query`、`wg show` 与实际的握手时间，而不是“最后一行日志离现在多久”。
+- **日志不是审计**。它没有防篡改、没有持久化保证、没有序列号完整性校验；安全事件应依赖 Windows 事件日志与外部 SIEM，而不是环形缓冲。
+
+### 7. 小结与延伸阅读
+
+`ringlogger` 用一块固定大小的共享内存解决了“服务无控制台、日志不能无限增长、多进程要看到同一份现场”三个问题；`services` 用一组稳定枚举把“失败在哪个阶段”编码进退出码。两者合起来，构成了 Windows 客户端可运维性的底座：日志告诉你发生了什么，退出码告诉你发生在哪一步。读源码时抓住三个数字即可：2048 行、512 字节、5 字符 tag；再抓住两个函数：`WriteWithTimestamp()` 的原子写入与 `DetermineErrorCode()` 的退出码映射。
+
+延伸阅读建议：先看 04-04 与 04-06 熟悉 `/dumplog`、`sc qc` 的用法，再看 05-09 核对 `logMem` 与 `Error` 枚举字段，然后读 06-11 理解共享内存与 IPC 的完整机制，最后结合 08-01 的日志采集实战，把 `/dumplog`、事件查看器与 `wg show` 组合成一套现场取证流程。
+
+## 07-11 `updater` 与 `version` 模块
+
+### 1. 背景与动机
+
+桌面客户端的更新链是最容易被低估的攻击面：它要在无人值守的情况下下载一个可执行安装包，并以高权限运行。wireguard-windows 的选择是“只信任签名清单，不信任传输通道”：服务端用 signify 对文件清单做 Ed25519 签名，客户端用内置公钥验证签名，再从清单里取出对应架构 MSI 的 BLAKE2b-256，下载后做一次常量时间比较，最后交给 `msiexec` 静默安装。整个链路不依赖证书链、不依赖 HTTPS 作为唯一信任根，也不接受“服务器说是什么就是什么”。
+
+`version` 包是这条链的“身份层”。它提供版本号 `Number`、架构名 `Arch()`、操作系统名 `OsName()`、User-Agent `UserAgent()`，以及两个“官方构建判定”：`IsRunningOfficialVersion()` 检查可执行文件的签名证书里是否包含 `WireGuard LLC`，`IsRunningEVSigned()` 检查证书策略里是否包含 EV 代码签名 OID。源码在 `official.go` 顶部用醒目注释说明：这些检查很容易被绕过，不承担安全职责，安全敏感逻辑不要放在这个文件里。理解这一点，才不会把“官方构建”误当成“可信执行环境”。
+
+更新器还承担一个现实约束：它必须以足够高的权限运行，才能让 `msiexec` 完成 per-machine 安装。UI 进程通常是普通权限或提升权限，但不一定是 SYSTEM；manager 服务是 LocalSystem，可以 impersonate 到 SYSTEM 后执行安装。`DownloadVerifyAndExecute(userToken)` 因此有两种模式：`userToken == 0` 时用 `elevate.DoAsSystem()` 包住整个流程，非零时直接在调用者令牌下执行。这个参数决定了“谁在装”，也决定了失败时的权限错误形态。
+
+对企业环境，更新器还提供了一个可编排的入口：`wireguard.exe /update` 可以由计划任务每日触发，配合 MSI 的 `DO_NOT_LAUNCH` 属性可以做到“只更新、不弹 UI”。这意味着更新链不仅要正确，还要能在没有交互、没有托盘、甚至没有登录会话的机器上跑通。`updater` 的很多设计（临时文件、静默参数、进度通道）都是为这个场景服务的。
+
+### 2. 核心概念
+
+**签名清单**。更新服务器上的 `latest.sig` 是一个 signify 格式的签名文件：第一行是 `untrusted comment: ...`，第二行是 Base64 签名，第三行是被签名的文件清单。`readFileList()` 先 Base64 解码内置公钥，检查长度等于 `ed25519.PublicKeySize + 10` 且前两字节是 `Ed`（signify 的公钥类型标识），再检查签名长度与 keyid 前缀，最后 `ed25519.Verify()`。清单每行形如 `<hex BLAKE2b-256>  <filename>`，用两个空格分隔；解析后得到 `fileList`，即文件名到 32 字节哈希的映射。
+
+**候选选择**。`findCandidate()` 用 `msiArchPrefix`（`wireguard-%s-`）与 `msiSuffix`（`.msi`）过滤，`%s` 来自 `version.Arch()`：`amd64`、`x86`、`arm64`（`386` 映射为 `x86`，`arm`/`arm64` 原样）。文件名去掉前后缀后就是版本字符串，长度超过 128 直接报错。`versionNewerThanUs()` 按点分段，每段用 `ParseUint(..., 10, 16)` 限制在 16 位内，逐段比较；候选段多于本地时，多出的段视为本地 0，反之亦然。这个比较是纯数字的，不处理 `-beta` 之类的后缀，遇到非数字段会返回“Invalid version integer part”。
+
+**下载与校验**。`checkForUpdate(true)` 建立 WinHTTP 会话，`Connect(download.wireguard.com, 443, true)`，`GET /windows-client/latest.sig`，用 `io.LimitReader` 限制清单最大 512 KiB。`DownloadVerifyAndExecute()` 再 `GET /windows-client/<name>` 下载 MSI，限制 100 MiB，用 `io.TeeReader` 同时写文件和算 BLAKE2b-256；下载完成后 `subtle.ConstantTimeCompare()` 与清单哈希比较，失败即报“wrong hash”。
+
+为什么用 `updater/winhttp` 而不是 Go 标准库的 `net/http`？源码给出的实现是一个围绕 WinHTTP 的薄封装：`NewSession(version.UserAgent())`、`Connect(host, port, useHttps)`、`Get(path, redirect)`、`Response.Length()`。从可观察行为看，它复用了系统的代理配置、证书存储与 HTTP 栈，这对企业环境很重要——很多公司的出站流量必须经过代理，而代理设置往往只配置在 WinHTTP/WinINet 层。代价是行为受系统策略影响，排障时不能只用 `curl` 验证，必须同时检查 WinHTTP 代理与 TLS 信任链。这一设计取舍的具体历史原因需对照上游提交与文档核验，本篇只描述可验证的调用面。
+
+**临时文件的安全属性**。`msiTempFile()` 生成 32 字节随机数，文件名是 `%WINDIR%\Temp\<hex>`，用 `windows.CreateFile()` 以 `CREATE_NEW` 创建，安全描述符为 `O:SYD:PAI(A;;FA;;;SY)(A;;FR;;;BA)`：SYSTEM 完全控制，Administrators 只读。创建后调用 `MoveFileEx(..., MOVEFILE_DELAY_UNTIL_REBOOT)` 注册重启删除，作为异常退出时的兜底。`tempFile.ExclusivePath()` 会在交给 `msiexec` 前关闭句柄，因为 MSI 需要一个不共享的文件；`Delete()` 则根据句柄是否已关闭选择 `DeleteFile` 或 `SetFileInformationByHandle(FileDispositionInfo)`。
+
+**执行**。`runMsi()` 取 `%SystemRoot%\System32\msiexec.exe`，参数固定为 `/qb!- /i <basename>`，工作目录设为临时文件所在目录，标准输入输出全部重定向到 `os.DevNull`，并通过 `syscall.SysProcAttr{Token: userToken}` 指定令牌。`/qb!-` 的含义是“基本 UI、无取消按钮”，既不是完全静默，也不给用户中途取消的机会；具体参数语义以 `msiexec` 文档与实际版本为准。
+
+**进度通道**。`DownloadVerifyAndExecute()` 返回 `chan DownloadProgress`，容量 128。每个阶段都会发一条 `Activity`：`Initializing`、`Checking for update`、`Creating temporary file`、`Msi destination is ...`、`Downloading update`、`Installing update`，完成时发 `Complete: true`，出错发 `Error`。`progressHashWatcher` 实现 `io.Writer`，每写一块就累加 `BytesDownloaded` 并投递进度，同时把字节喂给哈希。`updateInProgress` 是 `uint32` 的 CAS 锁，保证同一时刻只有一个更新在跑。
+
+**version 的身份信息**。`version.Number` 在快照中是 `1.1.1`；`Arch()` 把 Go 的 `GOARCH` 映射为 MSI 架构名；`OsName()` 通过 `RtlGetVersion()` 与 `ProductType` 拼出 `Windows Server 10.0.17763` 这类字符串，`OsIsCore()` 还会读 `ServerLevels` 判断 Server Core；`UserAgent()` 形如 `WireGuard/1.1.1 (Windows 10.0.19045; amd64)`，用于 WinHTTP 请求头与日志。`IsRunningOfficialVersion()` 与 `IsRunningEVSigned()` 只做证书枚举与策略 OID 匹配，属于“提示/分流”而非“准入控制”。
+
+### 3. 关键数据结构与源码位置
+
+`updater/` 的文件分工如下表所示。
+
+| 文件 | 关键函数/类型 | 职责 |
+|---|---|---|
+| `constants.go` | `releasePublicKeyBase64`、`updateServerHost` | 公钥、主机、路径、架构前后缀 |
+| `signify.go` | `fileList`、`readFileList()` | 解析并验证 signify 清单 |
+| `versions.go` | `versionNewerThanUs()`、`findCandidate()` | 版本比较与候选选择 |
+| `downloader.go` | `UpdateFound`、`DownloadProgress`、`DownloadVerifyAndExecute()` | 检查、下载、校验、执行、进度 |
+| `msirunner.go` | `tempFile`、`msiTempFile()`、`runMsi()` | 临时文件与 `msiexec` 调用 |
+| `winhttp/` | Session/Connection/Response | WinHTTP 封装 |
+
+`version/` 的文件分工：
+
+- `version.go`：`Number` 常量。
+- `os.go`：`OsIsCore()`、`OsName()` 与大量 `PRODUCT_*` 常量。
+- `official.go`：`IsRunningOfficialVersion()`、`IsRunningEVSigned()` 与证书枚举辅助。
+- `useragent.go`：`Arch()`、`UserAgent()`。
+- `certificate_test.go`：证书解析的测试。
+
+结构体层面，`UpdateFound` 只有文件名与 32 字节哈希；`DownloadProgress` 有活动描述、已下载字节、总字节、错误与完成标志；`progressHashWatcher` 持有进度指针、通道与哈希状态；`tempFile` 包装 `*os.File` 与原始句柄。字段的完整定义与读写时机见 05-09。
+
+（字段见 05-09 ｜ 配置见 04-04 ｜ 原理见 06-12 ｜ 模块见 07-11）
+
+### 4. 关键流程与调用链
+
+更新链的整体关系见图 07-11-01。
+
+:::figure id=07-11-01 | name=更新清单验证与 MSI 执行链路 | dir=TD
+node n1 "checkForUpdate" blue
+node n2 "latest.sig" teal
+node n3 "readFileList 验签" amber
+node n4 "findCandidate" purple
+node n5 "msiTempFile 临时文件" gray
+node n6 "BLAKE2b 常量比较" green
+node n7 "runMsi 静默安装" red
+edge n1 -> n2 "WinHTTP 获取"
+edge n2 -> n3 "Ed25519 验证"
+edge n3 -> n4 "按架构筛选"
+edge n4 -> n5 "下载到 Temp"
+edge n5 -> n6 "边下边算"
+edge n6 -> n7 "哈希一致"
+edge n7 -> n1 dashed "下次启动复查"
+:::
+
+第一步是资格检查。`checkForUpdate()` 首先调用 `version.IsRunningOfficialVersion()`，不是官方签名构建就直接返回“updates are disabled”。这不是安全边界，而是产品策略：非官方构建可能被重新打包，更新到官方 MSI 会覆盖用户改动，也可能破坏发行版约定。
+
+第二步是获取并验证清单。`winhttp.NewSession(version.UserAgent())` 建立会话，`Connect()` 连接 `download.wireguard.com:443`，`Get(latestVersionPath, true)` 取 `latest.sig`，`io.ReadAll(io.LimitReader(response, 512*1024))` 限制大小。`readFileList()` 验证通过后返回 `fileList`；任何一步失败都会关闭会话与连接，不会留下半开状态。
+
+第三步是选候选。`findCandidate()` 遍历 `fileList`，用 `strings.HasPrefix(name, prefix)` 与 `HasSuffix(name, suffix)` 过滤，取出中间版本串，做长度检查与 `versionNewerThanUs()` 比较，返回第一个更新的条目。若没有更新，`CheckForUpdate()` 返回 `(nil, nil)`，`DownloadVerifyAndExecute()` 会把它当成错误“No update was found”，但这不是异常，而是“已是最新”。
+
+第四步是准备临时文件。`DownloadVerifyAndExecute()` 先投递 `Initializing`，用 CAS 抢 `updateInProgress`；抢不到就投递“An update is already in progress”。然后 `msiTempFile()` 创建随机名文件，投递 `Msi destination is ...`，并注册 `defer file.Delete()`。这个 defer 只在进程正常返回时执行；异常退出由 `MOVEFILE_DELAY_UNTIL_REBOOT` 兜底。
+
+第五步是下载与校验。`connection.Get(fmt.Sprintf(msiPath, update.name), false)` 打开响应，`response.Length()` 取总长度（可能失败，失败就不显示总量），`blake2b.New256(nil)` 建哈希，`io.Copy(file, io.TeeReader(io.LimitReader(response, 100*1024*1024), pm))` 边下边写边算。完成后 `subtle.ConstantTimeCompare(hasher.Sum(nil), update.hash[:])`，不一致就报“The downloaded update has the wrong hash”并删除临时文件。
+
+第六步是执行。`runMsi(file, userToken)` 先 `ExclusivePath()` 关闭句柄，取 `System32` 与 `DevNull`，构造 `os.ProcAttr`，`os.StartProcess(msiexec, []string{msiexec, "/qb!-", "/i", filepath.Base(msiPath)}, attr)`，`proc.Wait()` 后检查 `state.Success()`。安装成功后投递 `Complete: true`；失败则把 `exec.ExitError` 投递出去。
+
+第七步是权限包装。若 `userToken == 0`，整个 `doIt()` 被放进 `elevate.DoAsSystem()`，通过 `SeDebugPrivilege` + `winlogon.exe` 令牌 impersonate 到 SYSTEM；否则直接在调用者令牌下运行。manager 的 `Update()` 传入的是 `s.elevatedToken`，所以 UI 触发的更新通常走“已提升令牌”路径；`wireguard.exe /update` 在无 UI 场景下可能走 SYSTEM 路径。两条路径的差异会影响临时文件 ACL 与 `msiexec` 的可见性，排障时要先确认是哪一条。
+
+### 5. 配置/命令/代码实例
+
+更新器没有 `.conf` 键，入口是命令行开关与计划任务。最典型的三条命令如下，完整开关见 04-04，服务与计划任务命令见 04-06。
+
+```powershell
+wireguard.exe /update
+schtasks /create /tn "WireGuard Update" /tr "\"C:\Program Files\WireGuard\wireguard.exe\" /update" /sc daily /st 03:00 /ru SYSTEM
+Get-Item "C:\Program Files\WireGuard\wireguard.exe" | Select-Object VersionInfo
+```
+
+一次成功更新的日志片段如下，活动名称与顺序需对照实际版本核验。
+
+```text
+2026-11-12 03:00:01.004: [MGR] Checking for update
+2026-11-12 03:00:01.512: [MGR] Creating temporary file
+2026-11-12 03:00:01.517: [MGR] Msi destination is "C:\\Windows\\Temp\\9f3c1a5d7b2e4c8a10f6d3b9e7a1c5d2"
+2026-11-12 03:00:01.520: [MGR] Downloading update
+2026-11-12 03:00:09.884: [MGR] Installing update
+2026-11-12 03:00:31.220: [MGR] Update completed
+```
+
+判读要点如下。第一，`Checking for update` 之后若立刻出现 “Build is not official, so updates are disabled”，说明当前 exe 的签名证书不含 `WireGuard LLC`，常见于自编译或第三方重打包；这不是网络问题。第二，`Msi destination is ...` 中的路径应位于 `%WINDIR%\Temp` 且文件名是 64 位十六进制随机串；如果出现可预测文件名或用户目录路径，说明不是本模块的标准行为。第三，`Downloading update` 与 `Installing update` 之间通常有几秒到几十秒的间隔，取决于 MSI 大小与网络；若长期停在 Downloading，应检查 WinHTTP 代理与 100 MiB 限制。第四，`Installing update` 之后若出现 `msiexec` 的退出码错误，常见原因是另一个安装正在进行、MSI 文件被占用或权限不足；`/qb!-` 不会弹交互窗口，错误只能从日志与事件查看器看。第五，`Update completed` 只代表 `msiexec` 返回成功，不代表新版本已生效；服务重启与 UI 重启由安装器/后续启动完成，必要时应复查 `version.Number` 或文件版本。
+
+从代码角度，更新器最关键的三个“不变量”是：清单必须先验签再解析、下载必须先哈希再执行、临时文件必须独占且随机命名。对应的代码片段如下：
+
+```go
+files, err := readFileList(fileList)
+if err != nil {
+    return nil, nil, nil, err
+}
+updateFound, err := findCandidate(files)
+if err != nil {
+    return nil, nil, nil, err
+}
+
+hasher, err := blake2b.New256(nil)
+if err != nil {
+    progress <- DownloadProgress{Error: err}
+    return
+}
+pm := &progressHashWatcher{&dp, progress, hasher}
+_, err = io.Copy(file, io.TeeReader(io.LimitReader(response, 1024*1024*100), pm))
+if err != nil {
+    progress <- DownloadProgress{Error: err}
+    return
+}
+if subtle.ConstantTimeCompare(hasher.Sum(nil), update.hash[:]) != 1 {
+    progress <- DownloadProgress{Error: errors.New("The downloaded update has the wrong hash")}
+    return
+}
+```
+
+这段代码没有“先落盘再校验”的中间态：哈希与写入是同一遍 `io.Copy`，校验失败时文件已被 `defer Delete()` 清理。`subtle.ConstantTimeCompare` 而非 `bytes.Equal`，是为了避免比较过程泄露哈希前缀信息；虽然这里的威胁模型主要是“服务器被攻破后投毒”，常量时间比较仍是良好习惯。
+
+### 6. 注意事项、陷阱与最佳实践
+
+- **官方构建判定不是安全边界**。`IsRunningOfficialVersion()` 只枚举证书简单名，注释明确说可绕过；不要用它做权限决策，也不要把“非官方构建不支持更新”理解为“官方构建绝对可信”。
+- **签名清单有大小上限**。512 KiB 的 `LimitReader` 是防御性限制，正常清单远小于此；若服务端返回异常大文件，读取会被截断并导致解析失败，这是预期行为。
+- **MSI 有 100 MiB 上限**。超过会被 `LimitReader` 截断，随后哈希不匹配；如果官方包体积增长，客户端必须同步调整上限，否则会出现“下载完成但哈希错误”的误判。
+- **临时文件必须先关闭再交给 MSI**。`ExclusivePath()` 的注释直言这是一个 TOCTOU 权衡，但 MSI 要求不共享文件；不要在调用 `runMsi()` 前重新打开该路径，否则安装会失败。
+- **`/qb!-` 不是完全静默**。它会显示基本进度但禁用取消；在无人值守场景仍可能因 UAC、重启提示或安装器对话框卡住。企业部署建议结合 `DO_NOT_LAUNCH` 与维护窗口。
+- **更新期间不要重复触发**。`updateInProgress` 的 CAS 会拒绝并发更新，但 UI 上仍可能看到“正在检查”与“已在更新”交错；应以日志中的 `An update is already in progress` 为准。
+- **版本比较只支持数字段**。`1.1.1-beta` 这类版本会在 `ParseUint` 处失败；官方发布使用纯数字版本，第三方构建不要指望更新器能正确比较预发布号。
+- **架构必须匹配**。`findCandidate()` 只找同架构的 MSI；在 x86 系统上不会下载 amd64 包，反之亦然。跨架构迁移需要手工卸载重装，不能靠 `/update`。
+- **降级被禁止**。MSI 的 `MajorUpgrade` 设置了 `AllowDowngrades="no"`，即使手工指定旧包也会被拒绝；需要回滚时应走卸载 + 安装旧版的受控流程。
+- **清单缺失与“已是最新”要区分**。服务器返回 404、返回空清单、清单里没有同架构条目，最终都可能表现为“没有可用更新”，但日志与错误文本不同：404 是传输层错误，空清单是“No file hashes found”，无候选是“No update was found”。排障时先看是哪一种，再决定查网络、查发布流程还是查架构匹配。
+- **代理与 TLS 检查**。WinHTTP 使用系统代理与系统证书存储；企业 TLS 拦截若未被系统信任，`Connect` 会失败，日志里表现为网络错误而不是签名错误。
+- **更新成功不等于新版本已运行**。`msiexec` 返回 0 只代表安装事务完成；正在运行的 manager、隧道服务与 UI 是否重启，取决于 MSI 的服务控制与后续启动逻辑。验证时应比较 `wireguard.exe` 的文件版本与 `version.Number`，并确认服务进程的启动时间晚于安装时间。
+- **文件版本与产品版本可能不同**。`version.Number` 是编译进二进制的字符串，MSI 的 `Version` 来自构建变量 `$(var.WIREGUARD_VERSION)`；两者在正常发布中一致，但自编译或改造构建中可能不一致。更新器只用 `version.Number` 做比较，MSI 升级规则只看产品版本，排查“为什么总提示有更新”时要同时核对这两处。
+
+### 7. 小结与延伸阅读
+
+`updater` 的核心不是“下载一个文件”，而是“用一条可验证的信任链把文件变成可执行的安装”。这条链由四段组成：Ed25519 验签保证清单来源，BLAKE2b-256 保证 MSI 完整，随机独占临时文件保证落盘安全，`msiexec /qb!-` 保证安装可控。`version` 则提供版本、架构、系统名与官方构建判定，是这条链的输入与旁路提示。把这两者分开看，就不会把“产品策略”误当成“安全机制”。
+
+延伸阅读建议：先看 04-04 的 `/update` 与 04-06 的计划任务命令，再看 05-09 的 `DownloadProgress`/`UpdateFound` 字段，然后读 06-12 理解完整更新链与 signify 的密钥管理，最后结合 `docs/attacksurface.md` 的更新章节与 `docs/enterprise.md` 的企业部署建议，设计自己的更新窗口与回滚预案。
+
+## 07-12 `elevate` / `l18n` / `installer` / `embeddable-dll-service` 扩展模块
+
+### 1. 背景与动机
+
+前面几篇讲的是“主链路”：配置、驱动、隧道、管理、界面、日志、更新。这一篇讲四个外围但不可缺的扩展模块，它们分别回答四个问题：进程如何获得、使用并放弃高权限；界面如何跟随用户语言；安装包如何把文件、服务、自定义动作编排成一个可回滚的 MSI；以及如何把 WireGuard 隧道能力嵌入到第三方程序里。四者看似无关，但共同构成了“可部署、可本地化、可集成”的外壳。
+
+`elevate` 的动机是权限最小化。Windows 客户端里至少有三类权限主体：LocalSystem 的管理服务与隧道服务、提升令牌下的 UI、普通用户令牌下的 UI。隧道服务启动后只需要保留加载驱动所需的一项特权，其余全部丢弃；UI 需要提升时不能在进程内“假装”提权，而要通过链接令牌或 COM 自动提升对象；更新器需要在 SYSTEM 上下文里运行 `msiexec`，但不能要求用户先开一个 SYSTEM 终端。`elevate` 把这些令牌操作封装成可复用函数，并明确哪些是“能力”、哪些是“边界”。
+
+`l18n` 的动机是可翻译性。WireGuard 的界面文字、错误消息、单位与枚举分隔符都面向最终用户；如果字符串散落在代码里、用 `fmt.Sprintf` 拼接，翻译工具无法提取，中文与日文的列举分隔符也无法正确处理。`l18n` 用 `golang.org/x/text/message` 的 printer 与 catalog，把“取用户首选 UI 语言、选择最可信翻译、按语言格式化”收敛到一处，再用 `gotext` 流水线生成 `zgotext.go`。
+
+`installer` 的动机是可运维性。MSI 不只是“复制文件”：它要在升级前停止并删除旧服务、在卸载时清理配置目录与适配器、在安装后按需启动 UI、在旧系统上提前失败、在多架构之间使用不同 `UpgradeCode`。这些动作有的适合用 WiX 声明式表达，有的必须写 C 自定义动作。`installer/` 里的 `wireguard.wxs`、`customactions.c` 与 `fetcher/` 就是这两类手段的分工。
+
+`embeddable-dll-service` 的动机是可集成。有些产品不希望用户安装完整的 WireGuard 客户端，而是希望在自己的进程里“顺带”提供一条隧道。上游提供的方案是编译一个 `tunnel.dll`，导出 `WireGuardTunnelService` 与 `WireGuardGenerateKeypair`，由宿主程序注册一个符合命名与 SID 要求的服务，再把配置路径传进来。它复用同一套隧道实现，但把“服务外壳”交给了集成方。
+
+### 2. 核心概念
+
+**特权丢弃**。`elevate.DropAllPrivileges(retainDriverLoading bool)` 打开当前进程令牌，取 `TokenPrivileges`，遍历每个 `LUIDAndAttributes`，把 `Attributes` 设为 `SE_PRIVILEGE_REMOVED`；若 `retainDriverLoading` 为真，则跳过 `SeLoadDriverPrivilege`。注意它用的是 `AdjustTokenPrivileges` 的“移除”语义，不是简单地禁用，移除后无法在同一令牌上重新启用。隧道服务在完成适配器创建后调用它，只留下加载驱动所需的能力，这对缩小攻击面有实际意义。
+
+**以 SYSTEM 执行**。`DoAsSystem(f func() error)` 先 `runtime.LockOSThread()`，启用 `SeDebugPrivilege`，`ImpersonateSelf()` 后打开线程令牌；如果当前已是 LocalSystem，直接执行回调。否则枚举 `winlogon.exe`，打开其令牌，确认用户 SID 是 `WinLocalSystemSid`，复制为 impersonation token，`SetThreadToken()`，切换环境变量，执行回调，最后恢复环境并 `RevertToSelf()`。这条路径依赖 `SeDebugPrivilege`，因此调用者必须先是管理员或 SYSTEM；它不是“任意用户提权”的工具。
+
+**以服务身份执行**。`DoAsService(serviceName, f)` 先通过 `mgr.Connect()` 打开服务，查 `ProcessId`，再在 `DoAsSystem()` 里打开该进程令牌、复制、`SetThreadToken()`、切换环境、执行回调。它适合“以某个已运行服务的身份做一件事”，例如让更新器借用管理服务的令牌。与 `DoAsSystem()` 的区别是：前者最终 impersonate 到目标服务进程的用户（通常是 SYSTEM），后者固定找 `winlogon.exe`。
+
+**UI 提权的两条路**。`ShellExecute(program, arguments, directory, show)` 先检查 `version.IsRunningEVSigned()`；不是 EV 签名就返回 `ERROR_INSUFFICIENT_LOGON_INFO`。然后看当前令牌是否已提升，未提升则检查是否可提升；再读 `ConsentPromptBehaviorAdmin`：为 0（无提示直接提升）则直接返回成功，为 5（提示同意）才继续，其他值返回 `ERROR_ACCESS_DENIED`。接着读 `COMAutoApprovalList` 中 `{3E5FC7F9-9A51-4367-9063-A120244FBEC7}` 的值，最后通过修改当前模块的 `LDR_DATA_TABLE_ENTRY.FullDllName` 指向 `explorer.exe`，用 `CoGetObject("Elevation:Administrator!new:{3E5FC7F9-9A51-4367-9063-A120244FBEC7}")` 拿到自动提升对象的接口指针，再按 vtable 偏移调用 `Release` 与 `ShellExecute`。这是一条“利用 COM 自动提升”的路径，失败时 defer 会回退到 `ShellExecute(0, "runas", ...)`，也就是普通 UAC 弹窗。
+
+**管理员判定**。`TokenIsElevatedOrElevatable(token)` 先看 `token.IsElevated() && isAdmin(token)`，否则取链接令牌再判断；`IsAdminDesktop()` 则通过 `GetShellWindow()` 找到桌面窗口、取进程、开令牌，判断“当前桌面是否由管理员拥有”。前者用于“这个用户能不能提权”，后者用于“当前桌面是不是管理员桌面”，两者不能混用。
+
+**本地化流水线**。`l18n.prn()` 惰性创建 `message.Printer`，语言由 `lang()` 决定：从 `GetUserPreferredUILanguages(MUI_LANGUAGE_NAME)` 取列表，逐个用 `message.DefaultCatalog.Matcher().Match()` 匹配，选置信度最高的；没有匹配就回退英语。`Sprintf()` 只是 `prn().Sprintf()` 的薄封装。`EnumerationSeparator()` 与 `UnitSeparator()` 通过翻译特殊的占位键来获得语言相关的分隔符（中文为 `、`，多数西方语言为 `, `），因为 `gotext` 会跳过没有字母的字符串，所以源码用带方括号的占位键绕过这一限制。
+
+**gotext 生成**。`gotext.go` 是 `//go:build generate` 的生成程序：读取 `locales/<lang>/messages.gotext.json`，把目录名规范化为语言标签，构建 `gotext` 命令，执行 `gotext -srclang=en update -out=zgotext.go -lang=<列表>`，再把 `out.gotext.json` 重命名为 `messages.gotext.json`。生成结果 `zgotext.go` 被编译进程序，`l18n` 在运行时通过 `message.DefaultCatalog` 使用它。换句话说，翻译不是运行时读文件，而是编译期固化。
+
+**WiX 安装包**。`wireguard.wxs` 的 `Product` 使用 `Version="$(var.WIREGUARD_VERSION)"`、`Manufacturer="WireGuard LLC"`、按架构选择 `UpgradeCode`（amd64、x86、arm、arm64 各一个），`Package` 设置 `InstallScope="perMachine"`、`InstallerVersion="500"`、`Compressed="yes"`。`MajorUpgrade` 设置 `AllowDowngrades="no"`、`AllowSameVersionUpgrades="yes"`、`Schedule="afterInstallExecute"`。组件里包含 `wireguard.exe`（带开始菜单快捷方式）、`wg.exe`（写系统 PATH），并用一个 `DummyService` 的 `ServiceControl` 强制 WiX 生成 ServiceControl 表，供自定义动作使用。
+
+**自定义动作**。`customactions.c` 导出多个 `__stdcall` 函数：`CheckWinVer` 提前拒绝旧系统，`CheckWow64` 检查架构匹配，`EvaluateWireGuardServices` 判断现有服务状态，`LaunchApplicationAndAbort` 在“首次安装且未设置 `DO_NOT_LAUNCH`”时启动 UI 并中止安装流程，`KillWireGuardProcesses` 结束占用文件的进程，`RemoveConfigFolder` 删除配置目录，`RemoveAdapters` 清理适配器。`wireguard.wxs` 用 `CustomAction` + `InstallExecuteSequence` 把它们插到 `CostFinalize`、`InstallValidate`、`InstallFinalize` 等时点；延迟动作标 `Execute="deferred" Impersonate="no"`，确保以 SYSTEM 运行。
+
+**可嵌入 DLL**。`embeddable-dll-service/main.go` 用 cgo 导出两个函数：`WireGuardTunnelService(confFile16 *uint16) bool` 设置配置根目录、强制 `tunnel.UseFixedGUIDInsteadOfDeterministic = true`，再调用 `tunnel.Run(confFile)`；`WireGuardGenerateKeypair(publicKey, privateKey *byte)` 用 `ecdh.X25519()` 生成密钥并做 clamp。README 要求宿主注册服务时使用 `WireGuardTunnel$SomeTunnelName`、`SERVICE_WIN32_OWN_PROCESS`、`StartAutomatic`、`ErrorNormal`、依赖 `Nsi` 与 `TcpIp`、`SERVICE_SID_TYPE_UNRESTRICTED`，可执行文件带 `/service configfile.conf` 参数，并在主函数里 `LoadLibrary("tunnel.dll")` + `GetProcAddress("WireGuardTunnelService")`。
+
+### 3. 关键数据结构与源码位置
+
+四个模块的源码位置与关键入口如下表所示。
+
+| 模块 | 源码 | 关键入口/类型 | 约束 |
+|---|---|---|---|
+| `elevate` | `elevate/privileges.go` | `DropAllPrivileges()` | 移除式降权，保留项可选 |
+| `elevate` | `elevate/doas.go` | `DoAsSystem()`、`DoAsService()` | 依赖 `SeDebugPrivilege` |
+| `elevate` | `elevate/membership.go` | `TokenIsElevatedOrElevatable()` | 管理员/可提升判定 |
+| `elevate` | `elevate/shellexecute.go` | `ShellExecute()` | EV 签名 + UAC 策略 + COM |
+| `l18n` | `l18n/l18n.go` | `Sprintf()`、`EnumerationSeparator()` | 编译期 catalog |
+| `l18n` | `gotext.go`、`zgotext.go` | 生成程序与生成结果 | `//go:build generate` |
+| `installer` | `installer/wireguard.wxs` | Product/Feature/CustomAction | 每架构独立 `UpgradeCode` |
+| `installer` | `installer/customactions.c` | 七个导出动作 | 延迟动作以 SYSTEM 运行 |
+| `installer` | `installer/fetcher/` | C 版下载器 | 构建期获取依赖 |
+| 嵌入服务 | `embeddable-dll-service/main.go` | 两个 cgo 导出 | 依赖 `wireguard.dll` |
+
+`elevate` 没有复杂的结构体，核心是 `windows.Token`、`windows.Tokenprivileges`、`windows.LUIDAndAttributes` 与 `windows.LDR_DATA_TABLE_ENTRY` 的直接操作；`l18n` 只有 `printer` 与 `printerLock` 两个包级变量；`installer` 的数据在 WiX XML 与 MSI 表中，不在 Go 代码里；嵌入服务只导出两个 C 函数。字段级细节见 05-09；本篇不重复。
+
+（字段见 05-09 ｜ 配置见 04-07 ｜ 原理见 06-05 ｜ 模块见 07-12）
+
+### 4. 关键流程与调用链
+
+四个扩展模块在整体系统中的位置见图 07-12-01。
+
+:::figure id=07-12-01 | name=扩展模块与主链路的关系 | dir=TD
+node n1 "elevate 令牌操作" blue
+node n2 "l18n 与 gotext" teal
+node n3 "installer WiX" amber
+node n4 "embeddable DLL" purple
+node n5 "tunnel 服务" gray
+node n6 "UI 进程" green
+node n7 "MSI 安装包" red
+edge n1 -> n5 "降权与提权"
+edge n1 -> n6 "提升启动"
+edge n2 -> n6 "界面文案"
+edge n3 -> n7 "打包编排"
+edge n7 -> n5 "注册服务"
+edge n4 -> n5 "复用隧道实现"
+edge n3 -> n4 dashed "构建产物"
+:::
+
+先看隧道服务的权限链。进程以 LocalSystem 启动，创建适配器、加载驱动、设置配置；在合适的时点调用 `elevate.DropAllPrivileges(true)`，只保留 `SeLoadDriverPrivilege`。此后即使进程被攻破，攻击者也无法直接获得调试、备份、改系统时间等特权。这个调用点不在 `elevate` 包内，而在 `tunnel/service.go` 的启动序列里；具体顺序与错误处理需对照实际版本核验。若降权失败，服务应把 `serviceError` 置为 `ErrorDropPrivileges` 并退出，而不是“带着全特权继续跑”。
+
+再看 UI 的提升链。普通用户启动 `wireguard.exe` 时，若当前不是管理员，程序可以调用 `elevate.ShellExecute()` 尝试自动提升；若 EV 签名、UAC 策略或 COM 自动批准任一条件不满足，就回退到 `runas`，由系统弹 UAC。提升成功后，UI 以高完整性运行，但仍然通过 IPC 让 manager 执行真正的服务操作；UI 自身不做 `CreateService`。这条“UI 提升但服务仍是唯一执行者”的分工，是权限模型的关键。
+
+安装链从 MSI 开始。`InstallExecuteSequence` 先跑 `CheckWinVer`（旧系统直接失败），再跑 `CheckWow64`（架构不匹配失败），然后 `EvaluateWireGuardServices` 判断现有服务，`LaunchApplicationAndAbort` 在首次安装且未设置 `DO_NOT_LAUNCH` 时启动 UI 并中止，`KillWireGuardProcesses` 结束占用文件的进程，文件复制完成后 `RemoveConfigFolder`/`RemoveAdapters` 在卸载路径清理，最后 `LaunchApplication` 按需启动。`DO_NOT_LAUNCH` 是一个 MSI 属性，企业分发时通过 `msiexec DO_NOT_LAUNCH=1` 设置，`wireguard.wxs` 里的条件写作 `NOT DO_NOT_LAUNCH`，因此“属性存在且非空”就会抑制启动。
+
+本地化链从源码到产物。开发者运行 `go generate`，`gotext.go` 扫描 `locales/` 下的 `messages.gotext.json`，调用 `gotext update` 生成 `zgotext.go`；编译时该文件进入二进制，运行时 `l18n.prn()` 按用户首选 UI 语言选择 catalog。翻译更新不需要改 Go 代码，但需要重新生成并重新编译；如果只替换 `locales/` 下的 JSON 而不重新生成，程序不会看到新翻译。
+
+嵌入链从构建到注册。`embeddable-dll-service/build.bat` 首次运行会调用上层 `build.bat` 下载依赖，随后产出 `amd64/tunnel.dll`、`x86/tunnel.dll`、`arm64/tunnel.dll`；`tunnel.dll` 依赖 `wireguard.dll`（WireGuardNT 的用户态 DLL）。宿主程序注册服务时必须使用 `WireGuardTunnel$` 前缀、正确的依赖与 `SERVICE_SID_TYPE_UNRESTRICTED`，并在 `/service` 分支里加载 DLL、取 `WireGuardTunnelService` 地址、把配置路径传进去。`WireGuardTunnelService` 内部强制固定 GUID，避免嵌入场景下确定性 GUID 与宿主网络策略冲突。
+
+### 5. 配置/命令/代码实例
+
+这一篇的“配置”主要是安装属性、注册表策略与构建命令。最典型的三条如下，完整命令与策略见 04-04、04-06、04-07。
+
+```powershell
+msiexec.exe /i wireguard-amd64-1.1.1.msi /qn DO_NOT_LAUNCH=1
+reg add "HKLM\Software\WireGuard" /v DangerousScriptExecution /t REG_DWORD /d 1 /f
+cd C:\src\wireguard-windows\embeddable-dll-service && build.bat
+```
+
+第一条用于企业静默安装并抑制安装后启动；第二条开启危险脚本执行（默认关闭，开启后 `PreUp`/`PostUp`/`PreDown`/`PostDown` 会以 LocalSystem 执行，环境变量是 `WIREGUARD_TUNNEL_NAME`）；第三条构建可嵌入 DLL。三条命令的风险等级完全不同，生产环境应把第二条视为高风险变更。
+
+安装后的验证输出如下，属性名与提示文本需对照实际 MSI 版本核验。
+
+```text
+PS> Get-WinEvent -LogName Application -MaxEvents 5 |
+>> Where-Object { $_.ProviderName -eq 'MsiInstaller' } |
+>> Select-Object TimeCreated, Id, Message
+
+TimeCreated            Id Message
+-----------            -- -------
+2026-11-12 10:02:11  11707 Product: WireGuard -- Installation completed successfully.
+2026-11-12 10:02:11  1033 Windows Installer installed the product.
+```
+
+判读要点如下。第一，`11707` 表示安装成功完成，`1033` 是更详细的“已安装产品”事件；两者同时出现通常说明主流程与自定义动作都走完了。第二，如果只看到 `1033` 而没有 `11707`，可能是安装被 `LaunchApplicationAndAbort` 中止，或某个延迟动作返回失败；应结合 `DO_NOT_LAUNCH` 是否设置来判断。第三，事件里不会直接告诉你“哪个自定义动作失败”，需要看 MSI 日志（`/l*v`）中的 `ActionStart`/`ActionEnd` 与返回值。第四，安装成功后仍要检查 `sc query WireGuardManager` 与 `Get-Service WireGuardTunnel$*`，因为 MSI 成功只代表文件与服务注册完成，不代表服务已启动。第五，卸载时若 `RemoveConfigFolder` 被跳过，配置目录可能残留；这是有意为之的保护，重装前应确认是否需要保留。
+
+从代码角度，嵌入服务的核心只有两个导出函数，宿主侧的关键是“服务参数必须完全匹配”：
+
+```go
+//export WireGuardTunnelService
+func WireGuardTunnelService(confFile16 *uint16) bool {
+    confFile := windows.UTF16PtrToString(confFile16)
+    conf.PresetRootDirectory(filepath.Dir(confFile))
+    tunnel.UseFixedGUIDInsteadOfDeterministic = true
+    err := tunnel.Run(confFile)
+    if err != nil {
+        log.Printf("Service run error: %v", err)
+    }
+    return err == nil
+}
+```
+
+这段代码做了三件事：把配置根目录设为配置文件所在目录，避免嵌入方与官方客户端的路径假设冲突；强制使用固定 GUID，避免确定性 GUID 在宿主环境中触发网络分类变化；直接调用 `tunnel.Run()`，复用完整的隧道启动、驱动下发、路由与防火墙逻辑。返回值是 `bool`，宿主应把它映射为服务退出码，否则 SCM 只能看到“进程退出”而不知道原因。
+
+### 6. 注意事项、陷阱与最佳实践
+
+- **降权是移除，不是禁用**。`DropAllPrivileges()` 把权限标记为 `SE_PRIVILEGE_REMOVED`，之后不能在同一令牌上重新启用；如果代码后续还需要某项权限，必须在调用前完成，或重新打开进程令牌。
+- **`DoAsSystem()` 不是通用提权**。它需要 `SeDebugPrivilege` 才能打开 `winlogon.exe`，普通用户调用会失败；把它包装成“任意用户可调用”的 API 是危险的，也会破坏权限模型。
+- **EV 签名检查只影响自动提升路径**。`ShellExecute()` 在非 EV 签名时直接返回错误，但 defer 会回退到 `runas`；这意味着“没有 EV 签名”不等于“不能提权”，只是不能走无弹窗的 COM 路径。
+- **修改 `FullDllName` 是敏感操作**。`shellexecute.go` 临时把当前模块的 `LDR_DATA_TABLE_ENTRY.FullDllName` 指向 `explorer.exe`，调用后必须恢复；任何 panic 或提前返回都可能留下不一致状态，扩展这段代码时要格外小心。
+- **`DO_NOT_LAUNCH` 只抑制启动**。它不会跳过服务注册、文件复制或自定义动作；企业静默安装仍需确保 `WireGuardManager` 被正确安装，否则 UI 启动后连不上服务。
+- **危险脚本默认关闭**。`DangerousScriptExecution` 未开启时四个脚本键不执行；开启后脚本以 LocalSystem 运行，等于把配置文件的写入权限提升为系统命令执行权限。不要把“能写配置”与“能执行脚本”混为一谈。
+- **翻译要重新生成**。`zgotext.go` 是生成文件，手工修改会在下次 `go generate` 时被覆盖；新增语言应同时更新 `locales/` 与生成结果，并确认 `l18n.lang()` 能匹配到该标签。
+- **MSI 的 `UpgradeCode` 按架构区分**。amd64、x86、arm、arm64 各有独立 GUID，跨架构升级不会被识别为同一产品；迁移架构时必须先卸载再安装，不能指望 `MajorUpgrade` 自动处理。
+- **嵌入服务的 SID 要求不可省**。README 明确说 `SERVICE_SID_TYPE_UNRESTRICTED` “absolutely essential”；漏掉它，隧道进程在访问某些网络对象时会受限，表现为路由或 DNS 行为异常。
+- **`tunnel.dll` 依赖 `wireguard.dll`**。只复制 `tunnel.dll` 而不部署 WireGuardNT 用户态 DLL，`LoadLibrary` 可能成功但运行期失败；分发时应把两个 DLL 与架构一起校验。
+
+### 7. 小结与延伸阅读
+
+这四个扩展模块分别守护四个边界：`elevate` 守护权限边界，`l18n` 守护语言边界，`installer` 守护部署边界，`embeddable-dll-service` 守护集成边界。它们的共同点是“不改变隧道数据面，但决定了客户端能否安全、正确地被安装、被理解、被复用”。读这些代码时，不要只看函数做了什么，更要看它拒绝做什么：拒绝保留多余特权、拒绝在非 EV 签名时静默提升、拒绝跨架构升级、拒绝在缺少服务 SID 时正常工作。
+
+延伸阅读建议：先看 04-07 理解 `DangerousScriptExecution` 与受限 UI 的策略，再看 06-05 理解适配器创建与驱动加载的权限前提，然后读 `installer/wireguard.wxs` 与 `customactions.c` 对照安装序列，最后按 `embeddable-dll-service/README.md` 的步骤在测试程序里注册一个 `WireGuardTunnel$` 服务，验证 `/service` 分支与 `WireGuardTunnelService` 的返回值映射。这样可以把“模块介绍”落到可复现的实验上，而不是停留在函数名层面。
