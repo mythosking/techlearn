@@ -45,6 +45,8 @@ VPP 的数据面不是内核协议栈的加速补丁，而是一套完全运行�
 
 **发包路径**。三层查表与 rewrite 完成后（详见 07-03），帧进入 `interface-output` 节点。该节点上挂有 `interface-output` feature arc（原理见 06-03），可在此插入 span、classify、QoS 等出向特性；最终 `vnet_hw_interface_t` 的 `output_node_index` / `tx_node_index` 决定把帧交给哪个驱动发送节点（如 `dpdk-output` / `dpdk-tx`），驱动回调 `vnet_device_class_t.tx_function` 完成真正的 DMA / sendmsg。对于子接口，`interface-output` 之前的 rewrite 阶段已按子接口封装 push/pop VLAN 标签（见 07-02），驱动看到的是已封装好的二层帧。
 
+图 07-01-01 按"驱动收发 → 输入分流 → 协议处理 → 出向汇聚 → 驱动发送"的顺序画出了接口层在整张转发图中的主干位置：`PMD/驱动层` 负责物理/虚拟收发；`device-input` 节点族把报文向量转成 `vlib_buffer_t` 帧并写入入接口索引；`ethernet-input` 按 ethertype 或桥域成员关系，把帧分发给 `l2-input`、`ip4-input`、`arp-input` 等典型下游入口；所有路径最终在挂有出向 feature arc 的 `interface-output` 汇聚，交给驱动的 tx 回调。读图时抓住一个分流点（`ethernet-input`）与一个汇聚点（`interface-output`），即可把后面各篇模块在图中的挂点定位出来。
+
 :::figure id=07-01-01 | name=VPP 接口层架构与收发路径 | dir=TD
 node pm "PMD/驱动层<br/>dpdk / af_packet / virtio / vhost" blue
 node din "device-input 节点族<br/>批量收包" teal
@@ -65,7 +67,7 @@ edge arp -> iout "应答/上送"
 edge iout -> tx "tx vector"
 :::
 
-> 表格兜底（图 07-01-01）：`PMD/驱动层` 负责物理/虚拟收发；`device-input` 把报文向量转成 `vlib_buffer_t` 帧并记入接口；`ethernet-input` 按 ethertype 或桥域成员关系分流；`l2-input`、`ip4-input`、`arp-input` 是三个典型下游入口；`interface-output` 是出向汇聚点，挂 feature arc；`device tx function` 是驱动回调终点。
+报文视角之外，还需要一张对象关系视角的图：图 07-01-02 从上到下展示了 `vnet_device_class_t` 与 `vnet_hw_interface_class_t` 两张能力表如何落到 `vnet_hw_interface_t` 上（前者给收发行为，后者给链路类型），硬件接口如何与主软件接口 1:1 关联、主接口又如何派生出 VLAN/QinQ 子接口，以及 `vnet_interface_main_t` 如何以 pool 统一管理这批对象。对照该图阅读第 3 节的注册函数与第 5 节的子接口配置，每条命令都能落到具体对象上。
 
 :::figure id=07-01-02 | name=hw/sw interface 与 device class 对象关系 | dir=LR
 node dc "vnet_device_class_t<br/>tx_function / admin_up_down" blue
@@ -98,6 +100,18 @@ set interface tag GigabitEthernet0/8/0.200 wan-edge
 show interface GigabitEthernet0/8/0.200
 ```
 
+上述配置执行后的典型回显如下（示例输出，具体格式需对照实际版本核验；不同版本的列名与统计口径可能不同）：
+
+```text
+GigabitEthernet0/8/0.200 is administratively up, link is up
+  address 00:1a:2b:3c:4d:5e, mtu 1500, tag wan-edge
+  RX: 1842113 packets, 1234567890 bytes, 12 dropped, 0 missed
+  TX: 1820034 packets, 1210000000 bytes, 3 dropped
+  IP4 address 10.20.0.1/24
+```
+
+逐行判读：首行 `administratively up, link is up` 对应第 2 节"管理 up + 链路 up"两层语义同时满足，缺其一会丢帧，这是接口排障的第一检查点；`address` 是父硬件接口的 MAC，子接口默认继承，与 07-04 的 ARP 应答行为直接相关——对端学到的就是这枚 MAC；`mtu` 是 L3 MTU，隧道叠加场景（07-06）若未与外层开销对齐会复现"小包通、大包不通"；`tag wan-edge` 确认 `set interface tag` 已写入 tag 哈希，编排系统可按 tag 反查 `sw_if_index`；RX/TX 的 `dropped` 非 0 时应到 `show errors`（命令见 04-06）定位是哪个节点的 error 计数在增长，`missed` 非 0 则通常是 rx ring 描述符不足或 CPU 轮询不及时（调优见 08-02）。
+
 驱动内部注册接口的代码骨架（示意，精确签名以 `src/vnet/interface.h` 为准，需对照实际版本核验）：
 
 ```c
@@ -117,6 +131,8 @@ vnet_hw_interface_t *hi = vnet_register_interface (
 
 真正写驱动时还应调用 `vnet_register_hw_interface_class()` 登记 `build_rewrite` / `link_up_down_function`，并用 `vnet_hw_interface_set_flags()` 上报 LINK_UP。接口与 `sw_if_index` 的换算、tag 哈希、MTU 设置均以 `src/vnet/interface_funcs.h` 的导出函数为准。
 
+**驱动形态选型判据**。同一台 VPP 上多种接口形态并存很常见，选择依据是"数据从哪来、交给谁"：DPDK 物理口吞吐最高、CPU 占用可预测，适合南北向大流量，但网卡必须独占；af_packet 便于快速实验与内核互通，但每包一次 socket 收发，性能低一个数量级，不宜承载生产大流量；vhost-user 是虚机场景的事实标准（共享内存零拷贝），配套 QEMU/KVM；virtio 适合把 VPP 本身跑在 VM 里的环境；memif 是 VPP 自有的共享内存接口，专为 VPP↔VPP 或 VPP↔容器（配合 VCL，见 07-12）设计，时延最低；TAP/TUN 用于与 Linux 协议栈互通路由。各形态均由本篇的 hw/sw 双层抽象统一收口，落地方法见 03-02（DPDK 绑定部署）与 03-04（容器化）的部署实战。
+
 ### 6. 注意事项、陷阱与最佳实践
 
 - **不要把 `hw_if_index` 当 `sw_if_index` 用**。绝大多数上层 API、FIB 绑定、ACL/NAT/QoS 接口绑定都吃 `sw_if_index`；只有驱动层与 `show hardware` 才关心 `hw_if_index`。子接口场景二者必然不等，混用会导致"配置显示成功但流量不生效"。
@@ -127,6 +143,8 @@ vnet_hw_interface_t *hi = vnet_register_interface (
 - **删除接口前先解绑**。接口被桥域、FIB 路由、ACL、NAT in/out、mirror 引用时直接删除会留下悬空索引；应遵循"先摘特性、再删子接口、最后删主接口"的顺序。
 - **tag 用于自动化而非寻址**。tag 便于编排系统按业务名反查 `sw_if_index`，但 VPP 内部转发完全不看 tag；不要试图用 tag 影响转发决策。
 - **命名与版本**：接口名由 `format_device_name` 生成，DPDK 端口的 `GigabitEthernet0/8/0` 风格在部分版本变为 `Ethernet0/8/0` 或由 `dpdk{}` 的 `name` 覆盖；升级时脚本里硬编码的接口名最易失效（版本差异见 08-05）。
+
+**失败模式与边界条件**。接口类问题集中表现为四类：其一，接口创建成功但收不到包——常见根因是驱动能力位（offload/RSS）与硬件实际不符、rx mode 配成 interrupt 但中断未注册、或大页不足导致 rx ring 分配失败，验证方法是 `show hardware`（命令见 04-03）核对能力位与队列状态，再看 `show errors` 与 `show buffers` 的计数；其二，admin up 后仍丢包——检查 hw 层 LINK_UP 标志与 vhost-user 对端连接状态（vhost 需要 QEMU 侧 socket 就绪），两层 up 缺一会静默丢包；其三，接口计数增长但业务无感——多半是 VLAN/VTR 或 BD 分流把帧送错了下游，用 packet trace（判读见 08-03）逐节点看帧走向；其四，删除接口报错或残留悬空索引——先解绑 BD/FIB/ACL/NAT/mirror 再删（上文陷阱已述）。各 error 计数器的具体口径随版本有差异，需对照 `src/vnet/interface.c` 的统计注册与 `src/vnet/devices/`、`src/plugins/` 各驱动的 error 定义核验。
 
 ### 7. 小结与延伸阅读
 
@@ -173,6 +191,8 @@ VPP 常被当作路由器使用，但它在云网融合、NFV、容器网络里�
 
 **泛洪与出口**。`l2-flood` 复制帧到 BD 的所有成员接口（排除入接口且排除同 SHG 成员），复制依赖 buffer 克隆/引用计数（原理见 06-09），每个副本分别设置自己的 TX 接口。`l2-output-vtr` 按出口配置 push/translate VLAN 标签；`l2-output` 再跑输出 feature arc，最终统一交给 `interface-output`。BVI 场景：`l2-fwd` 命中 BVI 的 MAC 时，帧改走 `ip4-input` 进入三层（见 07-03），实现桥接域到外部网络的网关转发。
 
+图 07-02-01 按帧的处理顺序串起这条 L2 主链：`ethernet-input` 先判定入接口是否属于 BD，随后经 `l2-input` feature arc（分类/ACL/policer 为可选特性）到 `l2-input-vtr` 做标签重写，`l2-learn` 学源 MAC，`l2-fwd` 按目的 MAC 查表，命中转发条目走 `l2-output`，未命中或广播交给 `l2-flood` 复制并做 SHG 过滤，命中 BVI MAC 则旁路上三层。读图时抓住两个分叉点：`l2-learn` 之后的"单播查表 vs 广播/未命中"，以及 `l2-fwd` 命中 BVI MAC 时进入 `ip4-input` 的旁路——前者决定泛洪量，后者决定桥接域有没有网关能力。
+
 :::figure id=07-02-01 | name=L2 桥接转发与 MAC 学习流程 | dir=TD
 node ein "ethernet-input<br/>判定接口属于 BD" blue
 node li "l2-input feature arc<br/>分类/ACL/policer" teal
@@ -194,6 +214,8 @@ edge flood -> lo "逐副本"
 edge lo -> iout
 edge flood -> learn dashed "SHG 防环/同组不转发"
 :::
+
+把上图各阶段按下表逐项核对，可以快速定位"帧在 L2 链的哪一站出了问题"：第一列是阶段，第二列是对应节点，第三列是该节点消费的输入，第四列是处理后的输出与副作用（学习、泛洪复制等）——排障时从"没有出现预期结果的那个阶段"往前查配置。
 
 | 阶段 | 节点 | 输入 | 输出/副作用 |
 |---|---|---|---|
@@ -219,6 +241,17 @@ l2fib add 00:11:22:33:44:55 10 vhost-user0
 show bridge-domain 10 detail
 ```
 
+上述 BD 配置与接口加入后的典型回显如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+BD 10, learn 1, forward 1, flood 1, uu-flood 1, arp-term 1, mac-age 300
+    vhost-user0                SHG 1
+    GigabitEthernet0/8/0.200   SHG 0
+    00:11:22:33:44:55 -> vhost-user0 (static)
+```
+
+逐行判读：第一行回显 BD 的开关位，`learn/flood` 等应与 `create bridge-domain` 的参数一致，`mac-age` 为 0 表示不老化，长期运行的网段建议启用老化防表膨胀；中间两行是成员接口及各自 SHG 编号——虚机口与上行口 SHG 不同是 Hub-Spoke 防环生效的前提（同 SHG 成员互不泛洪），若发现两接口 SHG 相同即该防环未配；静态 MAC 行以 `(static)` 标注且不会被老化覆盖，虚机迁移后流量仍钉在旧接口时优先检查这里是否残留旧静态条目。若成员列表缺失预期接口，说明 `set interface l2 bridge` 未生效，先确认该接口上没有残留 IP 地址或交叉连接绑定。
+
 查看学习表的调试骨架（示意，函数名需对照实际版本核验）：
 
 ```c
@@ -241,6 +274,14 @@ BD 与 `l2fib` 的初始化入口是 `l2_input_init()` / `l2fib_table_init()` �
 - **静态条目优先于动态学习**。`l2fib add` 的静态条目不会被老化覆盖，但会被 `filter` 标志的条目丢弃；变更虚机迁移时记得删除旧静态条目，否则流量被钉死在旧接口。
 - **隧道口进 BD 的 MTU**。VXLAN/Geneve 作为 BD 成员时（见 07-06），外层封装占 50+ 字节，BD 内虚机 MTU 应相应下调，否则大帧在隧道封装后被丢弃。
 - **交叉连接与 BD 二选一**。同一接口不能既 `l2-xc` 又属于 BD；配置前先 `show interface` 确认现有 L2 模式，重复绑定是常见配置错误。
+
+**失败模式与边界条件**。L2 功能"配了不生效"的三类典型原因：一是接口没真正进 BD——接口上还挂着三层地址或处于 L3 模式，`set interface l2 bridge` 失败或被忽略，验证方法是 `show bridge-domain <id>` 的成员列表里找不到该接口；二是开关被关——`learn 0` 时 `l2fib` 永远为空、`forward 0` 时未知单播直接丢弃，表现为"同 BD 内只有配了静态 MAC 的流量通"；三是 VTR 双向不对称——入向 pop 出向不 push，对端按 untagged 解析失败，用 `show l2fib` 与 `show bridge-domain ... detail`（命令见 04-06）核对成员与条目，再以 packet trace 逐跳看标签。边界条件：MAC 高频迁移会刷满 `l2fib` 并触发临时环路，`show errors` 里 `l2-learn` 相关丢弃计数上升是重要信号（判读见 08-03）；BD 数量与每 BD 成员数受内存与位图规模约束，超大规模部署需评估后规划（容器实现见 06-08）。
+
+**BVI 与三层互通的实现要点**。BVI 是 BD 与三层的唯一合法衔接点，有三个实现层行为需要理解：其一，BVI 的 MAC 就是 BD 内主机网关 ARP 应答所用的 MAC，`arp-term 1` 开启后由 VPP 在 BD 内代答该 MAC，关闭代答则泛洪真实 ARP 到成员；其二，从三层进 BD 的方向（`l2-output` 经 BVI 注入）同样要过输出 feature arc，出口 ACL/policer 对"三层下桥"的流量同样生效，这点经常被漏测；其三，一个 BD 只能有一个 BVI，BVI 所在接口不能同时加入其它 BD（否则成环）。BD 规划时按"网关归属"反推：每个需要网关的广播域一张 BD + 一个 BVI，与 VLAN 划分对齐即可，不要为省 BD 数把多个 VLAN 塞进同一 BD 再靠 VTR 区分——那会把学习表与泛洪域搅在一起。
+
+**验证与观测的命令组合**。L2 排障有一套固定的观测顺序：先 `show bridge-domain <id> detail` 确认成员与开关位齐全；再看 `show l2fib`（命令见 04-06）确认 MAC 学到了预期接口——动态条目带老化剩余时间，静态条目标 static；然后 `show errors` 看 `l2-learn`、`l2-fwd`、`l2-flood` 各节点的丢弃计数，判断帧停在哪一站；仍不明确时用 packet trace 逐节点看标签与出口。规模观测：BD 数量与每 BD 条目数直接影响 `l2fib` 哈希桶内存，`show l2fib` 输出的条目总数应纳入监控（容量与容器实现见 06-08）。老化行为边界：`mac-age` 到期删除是惰性+轮询混合机制（定时器原理见 06-15），表项被老化后若流量持续会立即重学，因此"老化时间过短"的代价是查表未命中率上升而非断流。
+
+**与相邻模块的边界与选型**。需要三层网关时用 BD + BVI（本篇），不要把二层流量硬塞进三层 FIB；点对点专线选 `l2-xc`（无学习、无泛洪，性能最好）；跨主机延伸二层则把 VXLAN/Geneve 隧道口作为 BD 成员（见 07-06），但要承担外层封装 MTU 与 underlay 可达性两项前置条件。与 MPLS VPLS 的取舍：VPP 的 VPLS 思路走 MPLS 标签交换（见 07-10），适合运营商域；云内大二层用 VXLAN 更轻量。另外 BD 的 `arp-term`（本篇）与三层 proxy-arp（见 07-04）代答范围不同：前者在 BD 内代答、不产生泛洪，后者跨网段代答，同一网段两者并存时必须明确谁优先，避免重复应答或应答出错误 MAC。
 
 ### 7. 小结与延伸阅读
 
@@ -288,6 +329,8 @@ BD 与 `l2fib` 的初始化入口是 `l2_input_init()` / `l2fib_table_init()` �
 
 **rewrite 与发送**。`ip4-rewrite` 从 `ip_adjacency_t` 取出预建的二层头，前移到报文数据区起点（调整 `current_data`），递减 TTL、用增量算法重算 IPv4 首部校验和，设置 TX `sw_if_index`，然后交 `ip4-output` → `interface-output` → 驱动 tx。隧道场景走 `ip4-midchain`：邻接的 rewrite 只是外层模板，发送前由 `adj_midchain_fixup` 回调补上真正的源/目的 IP、VNI、TEID 等（见 07-06/07-13）。glean 邻接不转发而是触发 ARP/ND（见 07-04）。
 
+图 07-03-01 把上述三段合成一条单播主线：`ip4-input` 完成合法性检查并选定 VRF，`ip4-lookup` 一次 FIB 命中拿到 `dpo_id_t`，ECMP 时 `ip4-load-balance` 用 5 元组流哈希选桶，随后按 DPO 类型分四路——`ip4-rewrite` 拷贝邻接 rewrite 并改 TTL/校验和、`ip4-midchain` 为隧道邻接补外层头、`ip4-local` 上送本机协议栈、`ip4-drop` 丢弃——最终经 `ip4-output` / `interface-output` 交给驱动。读图的要点是"分支由 DPO 类型决定"，与紧随其后的对象解析关系图（图 07-03-02）互为印证：上图是报文的视角，下图是控制面对象编译成这条链的过程。
+
 :::figure id=07-03-01 | name=IPv4 单播转发流程与 DPO 分支 | dir=TD
 node i "ip4-input<br/>校验 / TTL / VRF 选择" blue
 node lk "ip4-lookup<br/>FIB 最长前缀匹配" teal
@@ -307,7 +350,7 @@ edge rw -> out
 edge mid -> out
 :::
 
-> 表格兜底（图 07-03-01）：`ip4-input` 完成合法性检查并选定 VRF；`ip4-lookup` 一次 FIB 命中拿到 `dpo_id_t`；`ip4-load-balance` 在 ECMP 时用 5 元组哈希选桶；`ip4-rewrite` 拷贝邻接 rewrite 并改 TTL/校验和；`ip4-midchain` 为隧道邻接补外层头；`ip4-local` 上送本机协议栈；`ip4-drop` 丢弃；最终经 `ip4-output` / `interface-output` 交给驱动。
+数据面四路分支之外，控制面对象如何编译成这条链同样关键：图 07-03-02 从左到右展示了 `fib_table_t` 按前缀索引到 `fib_entry_t`，表项经 `fib_path_list_t` 解析出 `dpo_id_t`（ECMP 时进一步落到 `load_balance_t` 桶数组），桶内与直连路径最终指向预建好 rewrite 串的 `ip_adjacency_t`；虚线标注递归下一跳继续回查本表。对照该图读第 3 节的源码清单，从 CLI/API 入口到数据面查表，每个环节都能找到对应落点。
 
 :::figure id=07-03-02 | name=FIB 表项到 DPO 的解析关系 | dir=LR
 node ft "fib_table_t<br/>table_id / VRF" blue
@@ -342,6 +385,18 @@ ip route add 0.0.0.0/0 via 10.0.0.254 GigabitEthernet0/8/0
 show ip fib table 100
 ```
 
+以上配置执行后的典型回显如下（示例输出，具体格式需对照实际版本核验；`show ip fib` 的展开格式随版本差异较大）：
+
+```text
+ipv4-VRF:100, fib_index 1, flow hash: src dst sport dport proto
+ 0.0.0.0/0
+   via 10.0.0.254 GigabitEthernet0/8/0, weight 1, adjacency-IP4:3
+10.0.0.0/24
+   attached, GigabitEthernet0/8/0, glean
+```
+
+逐行判读：首行确认输出属于 VRF 100（`table_id` 与 `fib_index` 的换算见本节陷阱第一条），`flow hash` 行说明该表 ECMP 的哈希字段，默认含 5 元组；默认路由行 `via 10.0.0.254 ... adjacency-IP4:3` 表明下一跳邻接已解析为 rewrite 类型，索引 3 可在 `show ip adjacency`（命令见 04-06）里查到具体 MAC——若此处显示 `glean` 或 DPO 为 drop，即第 4 节"递归解析失败静默变 drop"的失败模式；直连网段行显示 `attached` + `glean` 属正常状态，命中后还要走 07-04 的邻居解析。`weight 1` 是 ECMP 权重，多路径时按权重分桶。
+
 控制面增删路由的代码骨架（示意，精确签名以 `src/vnet/fib/fib_table.h` 为准，需对照实际版本核验）：
 
 ```c
@@ -371,6 +426,14 @@ fib_table_entry_update_one_path (fib_index, &pfx, FIB_SOURCE_CLI /* 来源 */,
 - **VRF 泄漏要显式做**。不同 VRF 默认完全隔离，跨 VRF 需路由泄漏（route leak）、BVI 或把接口同时放进两个表；不要指望"配了默认路由就能跨表"。
 - **路由规模与 bihash 容量**。大规模 BGP 场景（数十万前缀）要关注 `clib_bihash` 的桶数与内存（原理见 06-08、字段见 05-09），控制面批量下发用 API 而非逐条 CLI（编程见 04-07）。
 - **feature arc 顺序影响语义**。NAT44 in2out、ACL、LB 都挂在 `ip4-unicast` 上，`runs_before/runs_after` 决定谁先看到原始报文（原理见 06-03）；插入新插件时务必核对它应在 `ip4-lookup` 之前还是之后。
+
+**失败模式与边界条件**。三层转发"路由 show 得到但不通"按概率排序排查：① 下一跳递归解析失败，DPO 退化为 `DPO_DROP`——查 `show ip fib <prefix>` 的 DPO 类型与依赖链；② 邻接是 glean 但 ARP 未解析（07-04）——`show ip neighbor` 看条目状态，`show errors` 里 glean/`ip4-arp` 相关丢弃计数上升是强信号；③ 走错 VRF——入接口的 `fib_index` 映射被改或报文入向没进预期表，packet trace 里 `ip4-lookup` 后紧跟 drop 即可确认（判读见 08-03）；④ TTL 归零或校验和坏——多见于自研 fixup 未刷新 offload 元数据（07-01）。边界条件：FIB 多来源并存时按 source 优先级取值，控制面删除了高优先级来源会"路由还在但不归你管"，`show ip fib` 的 source 列必须纳入变更核对；ECMP 桶内邻接失效由 `fib_walk` 收敛，收敛窗口内可能短时丢包，高可用设计应把这一窗口纳入容量规划。
+
+**路由来源（fib source）与运维语义**。同一前缀允许多个来源并存：CLI、Binary API、直连（attached）、各路由协议插件各占一个 source，各有固定优先级（完整优先级表需对照 `src/vnet/fib/fib_source.h` 核验）。运维上的关键推论有三条：删路由必须删对来源，`show ip fib` 里每条表项都会列出全部来源与当前生效者；协议插件（如 BGP 类代理）down 时其来源的路由可能被撤销，而 CLI 静态路由不受影响——变更演练要分别验证两类来源；同一前缀不同来源的 next-hop 冲突不报错，只按优先级静默取值，故排障时"看 show 的实际生效路径"比"看配置"更可靠。规模角度：直连与 glean 表项随接口/子接口数线性增长，万级子接口的网关型部署要先评估 FIB 内存与 `fib_walk` 批量更新耗时（依赖传播机制见 06 范畴、字段见 05-07）。
+
+**IPv6 侧的差异点**。IPv6 转发与 IPv4 共用同一套 FIB/DPO/邻接框架，但有四处行为差异需要单独留意：其一，链路本地地址（fe80::/10）不进全局 FIB，邻接解析走 ND 而非 ARP，`show ip6 fib` 默认看不到链路本地路由；其二，`ip6-input` 处理扩展头链（hop-by-hop、routing 等），扩展头存在时可能上送本机而非转发，行为与配置需对照 `src/vnet/ip/ip6_input.c` 核验；其三，IPv6 的 PMTUD 依赖 ICMPv6 Packet Too Big 上送，若出向 ACL（07-08）误丢 ICMPv6 会导致对端大包黑洞；其四，多表（VRF）语义一致但 `ip6 table` 命令族独立，混用 IPv4/IPv6 命令是高频配置错误（命令见 04-04）。改造现有 IPv4 方案迁移到双栈时，上述四点各占一次返工概率。
+
+**与相邻模块的选型判据**。三层出口是"直转发"还是"进隧道"由下一跳形态决定：普通 rewrite 邻接（本篇）适合物理互联；midchain 邻接（07-06）适合 VXLAN/GRE/SRv6 叠加；隧道口配 IP 走 IPIP/GRE 时路由直接指隧道 `sw_if_index`。VRF 场景里，租户隔离优先 `ip table` + `set interface ip table`（本篇），跨租户互通用 route leak 或 BVI（07-02）；MPLS VPN（07-10）复用同一套 FIB/DPO 框架，区别只在查 MPLS 表后压标签——没有标签交换需求就不必引入 MPLS，纯 IP 叠加走隧道即可。另外 PBR（按策略改 `fib_index`）依赖 classify/ACL 在 feature arc 上先行判定（07-08），它与目的查表的优先关系要在设计期定死，运行期随意改动极易造成转发不一致。批量大网部署时还应给每张表预留默认路由与黑洞路由（指向 `DPO_DROP` 的 null 路由，命令见 04-04），用于把未知流量显式收口而不是依赖隐式 drop——两者的 error 计数器不同，前者可在监控里单独告警。
 
 ### 7. 小结与延伸阅读
 
@@ -413,6 +476,8 @@ fib_table_entry_update_one_path (fib_index, &pfx, FIB_SOURCE_CLI /* 来源 */,
 
 **IPv4 主动解析链**：`ip4-lookup` 命中 glean 邻接 → `ip4-arp` 节点把报文入 pending 队列 → 构造 ARP Request（广播目的 MAC、目标 IP = 下一跳）→ `interface-output` 发出 → 对端 `arp-input` 收 Request → 本机 `arp-input` 收 Reply → `arp_learn` 写邻居表并调 `adj_nbr_add_or_lock` 填 rewrite → 把 pending 报文重新送 `ip4-lookup` 补发。**被动学习链**：收到任意 ARP 帧（Request/Reply）时，`arp-input` 都可从发送者硬件地址/协议地址学习并刷新邻接，因此"对端主动发 ARP"同样能让邻接就绪。
 
+图 07-04-01 把这条链画成闭环：`ip4-lookup` 命中 glean 后报文进入 pending 队列并发出 ARP Request，对端与本机的 `arp-input` 分头处理——非本机目标且启用了 proxy-arp 时由代理分支代答，Reply 或任何源学习机会都会经 `arp_learn` 写入邻居表并更新 rewrite 邻接，随后 pending 报文被重新送回 `ip4-lookup` 补发。读图重点在两个节点：`arp-input`（入向判定的四个分支）与 `arp_learn`（解析结果落库）——所有邻居类故障最终都可归约为"这两个节点有没有按预期被执行"。
+
 :::figure id=07-04-01 | name=ARP glean 解析与邻居表更新流程 | dir=TD
 node gle "ip4-lookup 命中 glean 邻接<br/>报文暂存 pending" blue
 node req "构造 ARP Request<br/>经 interface-output 发出" teal
@@ -431,6 +496,8 @@ edge lrn -> adj
 edge adj -> tx
 edge rep -> ai dashed "对端学习本机"
 :::
+
+上图的每个环节都有对应的失败形态，按下表逐环节核对可以快速归类故障：第一列是环节，第二列是该环节的关键动作，第三列是失败或超时时的外在表现——现场现象与第三列吻合时，沿第二列的动作回溯配置即可。
 
 | 环节 | 关键动作 | 失败/超时表现 |
 |---|---|---|
@@ -454,6 +521,16 @@ set proxy-arp GigabitEthernet0/8/0 10.0.1.0/24 enable
 set ip6 neighbor GigabitEthernet0/8/0 2001:db8::1 00:11:22:33:44:55
 show ip neighbor
 ```
+
+典型回显如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+    Time       IP4 Address        Flags      Interface              MAC
+  12.4s        10.0.0.254         static     GigabitEthernet0/8/0   00:11:22:33:44:55
+   3.2s        10.0.0.10          dynamic    GigabitEthernet0/8/0   00:1b:21:11:22:33
+```
+
+逐行判读：`Flags` 列区分 `static` 与 `dynamic`，静态条目不会被动态学习覆盖（本篇陷阱已述），虚机迁移后若仍显示旧接口的静态条目必须手工删除或更新；`Time` 是最近刷新的时间戳，长时间未刷新的 dynamic 条目可能对应已下线的对端，但转发会继续沿用旧 MAC 直到老化——这是"邻居还在、业务不通"的常见来源；把 MAC 与接口成对核验可发现"学错接口"——多见于双口接入同一 BD 或 LACP 两腿各自收到 ARP 的场景。若 `show ip neighbor` 里目标条目缺失，转 `show ip adjacency`（命令见 04-06）看对应邻接是否仍为 glean：是则说明解析请求已发出但无应答，再用 `show errors` 确认 ARP 相关丢弃计数是否增长。
 
 代码骨架（示意，精确签名以 `src/vnet/ethernet/arp.h` 与 `src/vnet/ip/adjacency.h` 为准，需对照实际版本核验）：
 
@@ -480,6 +557,14 @@ vnet_arp_set_ip4_over_ethernet (vm, sw_if_index,
 - **MTU / 分片不是邻居问题**。邻居解析成功后大包不通，优先查 07-01 的 MTU 与 07-06 的隧道封装开销，不要反复重配 ARP。
 - **计时单位易错**。BFD/ND/ARP 老化相关 CLI 的时间单位在不同版本可能是秒、毫秒或微秒（BFD 常用 usec，见 07-14），务必 `?` 看 help（命令见 04-02）并对照实际版本核验。
 
+**失败模式与边界条件**。邻居解析失败的典型链路：请求发出但无应答——对端禁用 ARP、VLAN 不通或 proxy-arp 作用域配错，验证方法是在对端/同链路设备抓包确认 Request 是否到达；pending 队列溢出——链路刚 UP 时大量流量同时命中 glean，首包被丢弃且 error 计数增长，规避手段是对关键下一跳配静态邻居（陷阱已述）；静态条目"钉死"旧 MAC——表现为链路切换或虚机迁移后单向通，删除或更新静态条目即恢复；IPv6 侧 DAD 失败会让地址无法启用，NUD 探测失败会让邻居进入不可达状态并触发重新解析，相关标志位需对照 `src/vnet/ip6-nd/` 实际头文件核验。所有"路由正确但邻居不通"的案例，先用 `show ip adjacency` 判断邻接类型（glean/rewrite/midchain），再决定查解析还是查隧道封装。
+
+**proxy-arp 的作用域实现**。proxy-arp 的配置粒度是"接口 + 网段列表"：先用 `set proxy-arp <intfc> <range> enable` 在接口上声明愿意代答的网段（可多条），只有目标地址落在某接口声明的网段内、且本机确有到该网段的路由，才会代答——"有路由"这一条是隐式约束，路由撤掉后代答自动失效，这类"代理随路由失效"的行为在网段调整时容易被忽略。观测用 `show proxy-arp`（命令见 04-05）核对声明列表，用 `show errors` 的 arp 相关计数判断代答是否触发。安全边界：proxy-arp 本质是"本机 MAC 为一段地址背书"，声明范围过宽会让本机对整段地址可达性负责，配合 ACL（07-08）限制可减少被扫描面；与 BD `arp-term`（07-02）的分工见下段选型。
+
+**报文处理细节与判定边界**。`arp-input` 的四分支判定有先后语义：先判"目标是不是本机接口地址"，再判 proxy-arp，最后才是学习——因此本机地址命中时不会走代理分支，这个顺序在两个分支都声明了重叠网段时决定应答内容，不能靠配置顺序调换。学习侧只接受发送者字段合法（协议地址与硬件地址长度正确、Sender MAC 非空且非广播）的报文，伪造/畸形的 ARP 会被丢弃并计 error。 gratuitous ARP（免费 ARP，sender 与 target 协议地址相同）默认也会触发学习，可用于虚机迁移后的邻接预热，但其安全性依赖链路可信，多租户场景建议关闭学习或配静态邻居（命令见 04-05）。IPv6 ND 的 NS/NA 携带 SLLA/TLLA 选项直接填邻接，DAD 只在地址启用阶段发生；ND 的组播地址映射（被请求节点组播）依赖 MLD snooping 之外的基本以太组播过滤，不需要额外配置，但 BD 场景（07-02）里 `arp-term` 对 ND 的代答行为需对照实际版本核验（`src/vnet/l2/l2_arp_term.c`）。
+
+**解析手段的选型判据**。（确定性最强、防欺骗）；普通动态场景靠 ARP/ND 自动解析；把一段地址揽到本机用 proxy-arp，但必须明确作用域；BD 内代答用 `arp-term`（07-02），它避免泛洪而 proxy-arp 不拦截泛洪，两者语义不同不要混用。跨链路借地址用 unnumbered，前提是借用接口与实际转发接口在同一二层域（陷阱已述）。与隧道的组合（07-06）：underlay 下一跳建议静态邻居，避免隧道起来后 underlay ARP 未解析导致 fixup 空转；与 NAT 的组合（07-05）：静态映射发布的公网地址要配 proxy-arp 让 VPP 应答对它的 ARP，否则服务器发布后外部仍不通。
+
 ### 7. 小结与延伸阅读
 
 ARP/ND 模块把"下一跳 IP → 目的 MAC"的解析结果固化进 `ip_adjacency_t` 的 rewrite 串，并用 glean 邻接 + pending 队列实现解析期间不丢包；IPv4 走 `arp-input`，IPv6 走 ICMPv6 ND 节点族，二者共享邻接抽象。源码主线 `src/vnet/ethernet/arp.c` → `src/vnet/ip/adjacency.c` → `src/vnet/ip6-nd/`。延伸：邻接如何被 FIB 引用见 07-03；proxy-arp 在 NAT 网关的用途见 07-05；静态邻居在隧道 underlay 的作用见 07-06；邻居表哈希容器（原理见 06-08）、定时器与 process 节点（原理见 06-15）、命令全集见 04-04/04-05、邻接字段见 05-07。
@@ -500,7 +585,7 @@ NAT 是 VPP 在运营商 CGN、云网关、边缘防火墙、5G UPF 里最常被
 
 **静态映射、hairpinning 与分片**。静态映射（`nat44 add static mapping`）把某个外部 `(addr, port)` 永久指向内部 `(addr, port)`，用于服务器发布；hairpinning 指"内网主机通过外部地址访问同内网服务器"——报文两次经过 NAT（in2out 再 out2in），由 `nat44-ei-hairpinning` 节点处理，避免把包又送回外网。分片报文需要先重组：IPv4 分片重组由 `ip4-sv-reass` / `ip4-full-reass`（`src/vnet/ip/reass/`，命名需核验）或 NAT 自带的 reass 节点完成，因为只有首片带端口，后续片必须靠 IP id + 5 元组关联到同一会话。
 
-**多 worker 与 handoff**。会话表是全局的，但为无锁转发，VPP 让每条会话"归属"一个 worker：按流哈希算出 worker index，若当前 worker 不是归属者，则经 `nat44-ei-handoff` 节点把帧 handoff 过去（机制见 06-07）。这保证同一会话的所有报文都在同一 worker 上更新计时器与状态，避免锁竞争；代价是跨 worker handoff 引入额外开销，因此 `nat44 ei set workers` / `snat_main_t.workers` 位图配置要与 CPU 拓扑匹配（调优见 08-02）。
+**多 worker 与 handoff**。会话表是全局的，但为无锁转发，VPP 让每条会话"归属"一个 worker：按流哈希算出 worker index，若当前 worker 不是归属者，则经 `nat44-ei-handoff` 节点把帧 handoff 过去（机制见 06-07）。这保证同一会话的所有报文都在同一 worker 上更新计时器与状态，避免锁竞争；代价是跨 worker handoff 引入额外开销，因此 `nat44 ei set workers` / `snat_main_t.workers` 位图配置要与 CPU 拓扑匹配（调优见 08-02），并保证哈希在 worker 间分布均匀——分布不均时单核会话热点会掩盖整体容量。
 
 **其它 NAT 形态**。NAT66（`src/plugins/nat/nat66/`）只做前缀替换、不动端口，是无状态、可硬件友好的 IPv6 前缀翻译；NAT64（`src/plugins/nat/nat64/`）配合 DNS64 做 IPv6↔IPv4 协议转换；CGN 场景还有 DS-Lite、lw4o6、MAP-E/MAP-T（`src/plugins/map/`、`src/plugins/nat/dslite/` 等，目录需核验）等把 IPv4 私网叠加到 IPv6 承载网的方案；5G UPF 的 N6 口 NAT 见 07-13。
 
@@ -526,6 +611,8 @@ NAT 是 VPP 在运营商 CGN、云网关、边缘防火墙、5G UPF 里最常被
 
 **out2in（外网→内网）**：`nat44-ei-out2in` 以 `(dst_ip, dst_port, proto, ...)` 反查会话或静态映射，命中则把目的 IP/端口还原成内部地址，重算校验和，再 `ip4-lookup` 转发到 inside 接口；未命中且无静态映射则丢弃（或按配置送 `ip4-punt`）。**hairpinning**：in2out 改写后发现目的就是本 NAT 的外部地址，报文不送外网，而是绕到 `nat44-ei-hairpinning` 再走一次 out2in，源/目的同时被正确还原，避免"内网访问公网映射地址"失败。**分片**：首片带端口可建会话，后续片经重组状态表关联到同一会话后再改写；ICMP error 内嵌的原报文也要一并翻译。
 
+图 07-05-01 把 in2out/out2in 两条链与三个查表分支（静态映射、会话命中、新建会话）合画在一起：`nat44-ei-in2out` 先判方向再查表，未命中即从地址池分配外部地址端口建会话，改写源 IP/端口并重算校验和；若改写后目的恰为本 NAT 的外部映射地址，则走 `hairpinning` 分支再进一次 `out2in`；回程 `out2in` 反查会话还原目的 IP/端口；两条链最终都回到 `ip4-lookup` → `interface-output`。读图时注意"静态映射优先于新建会话"这一分支次序——它决定了服务器发布地址与动态 NAT 抢占端口的先后关系。
+
 :::figure id=07-05-01 | name=NAT44 EI in2out/out2in 会话处理流程 | dir=TD
 node i2o "nat44-ei-in2out<br/>ip4-unicast feature" blue
 node hit "会话表命中<br/>bihash 5 元组键" teal
@@ -550,7 +637,7 @@ edge rt -> out
 edge out -> o2i dashed "回程入 outside 接口"
 :::
 
-> 表格兜底（图 07-05-01）：`in2out` 先判方向再查会话/静态映射，未命中即分配外部地址端口建会话；改写源 IP/端口并重算校验和；若目的恰为本 NAT 外部地址走 `hairpinning` 再进一次 `out2in`；回程 `out2in` 反查会话还原目的 IP/端口；最终都回到 `ip4-lookup` → `interface-output`。
+会话处理流程之外，控制面对象关系决定了"地址端口从哪来"：图 07-05-02 展示了主结构 `nat44_ei_main_t` 管理外部地址池、地址池细分出 per-user 端口池、端口分配结果写入会话 bihash，静态映射表独立于动态会话且优先命中；接口 in/out 标记决定方向判定，会话按流哈希绑定 worker，跨 worker 时经 handoff 归位。排查端口耗尽与地址分配问题时，按这张图的层级从地址池到端口池再到会话逐层核对最有效。
 
 :::figure id=07-05-02 | name=NAT 会话与地址池对象关系 | dir=LR
 node main "nat44_ei_main_t / snat_main_t" blue
@@ -586,6 +673,18 @@ nat44 ei add static mapping local 10.0.0.10 8080 external 203.0.113.10 80
 show nat44 ei sessions
 ```
 
+典型回显如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+NAT44 EI sessions:
+  i2o: 10.0.0.10:5000 -> 93.184.216.34:443
+  o2i: 203.0.113.10:1035 -> 93.184.216.34:443
+  proto tcp, index 17, worker 1
+NAT44 EI address pool: 203.0.113.10 - 203.0.113.20
+```
+
+逐行判读：每条会话同时给出 `i2o`（内部→外部改写后形态）与 `o2i`（回程匹配键）两个视角，两者不对称（例如只有 i2o 而回程 5 元组无法落到 o2i）意味着回程包将被丢弃——常见于路由不对称或中间设备二次改写；`worker` 列是多核排障的关键（见本篇多 worker 小节），同一 5 元组的所有报文应始终落在同一 worker，若分布跳跃说明归属哈希或 handoff 异常；`index` 是会话在 pool 中的索引，可用它关联日志与 API 查询；地址池行确认池范围已加载。会话数只增不减通常意味着超时配置过松或回程路由不可达导致会话滞留，结合 `show nat44 ei interfaces` 与 `show errors`（判读见 08-02）核对。
+
 代码骨架（示意，精确签名以 `src/plugins/nat/nat44-ei/nat44_ei.h` 为准，需对照实际版本核验）：
 
 ```c
@@ -613,6 +712,10 @@ if (!s) {
 - **ALG 与嵌入地址**。FTP/SIP/ICMP 等载荷内嵌 IP/端口的协议需要 ALG 支持，VPP 的支持范围有限（需对照实际版本核验）；不能假设"开了 NAT 所有协议都通"。
 - **日志与合规**。CGN 通常要求会话日志可溯源，需在部署时启用 syslog/IPFIX（07-14）并确认时间戳、端口块映射与 det44 算法一致，否则事后无法关联用户。
 - **与 ACL/IPsec 的顺序**。NAT 与 ACL（07-08）、IPsec（07-07）在 feature arc 上的先后顺序决定"ACL 看到的是转换前还是转换后地址"；插入插件时核对 `runs_before`（原理见 06-03）。
+
+**失败模式与边界条件**。NAT"配了不生效"按检查顺序：① 接口未标 in/out 或标反——`show nat44 ei interfaces` 核对，报文会原样转发且 error 计数里无 NAT 相关增长；② 方向对但查表不命中——检查会话键里的 `fib_index` 是否与接口 VRF 一致，VRF 错位是最隐蔽的一类失效；③ 只出不进——回程报文的目的地址/端口与 i2o 改写结果不一致（外部中间设备二次 NAT 或源端口保持策略冲突），抓包比对回程 5 元组即可定位；④ 端口耗尽——新流被丢弃且 error 计数上升，扩池或收紧超时；⑤ ICMP error 翻译失败——内嵌原报文未按会话翻译，表现为 ping 报错信息异常。所有丢弃最终都体现在 `show errors` 的 NAT 节点计数里（命令见 04-06、判读见 08-03），按计数器名回溯到节点即可定位代码路径。
+
+**与相邻模块的选型判据**。四种 NAT 形态的选择依据是"回连需求 + 溯源需求 + 规模"：EI 配静态映射适合云网关；ED 适合对外部主动回连严格管控的安全场景；det44 适合运营商 CGN 的溯源合规（固定端口块映射），代价是端口利用率低；NAT66/NAT64/MAP（本篇第 2 节）用于 IPv6 过渡，不与 NAT44 混用地址池。与 ACL（07-08）的组合：规则匹配的是转换前还是转换后地址取决于 feature arc 顺序（原理见 06-03），安全策略应按"NAT 之后形态"编写；与 IPsec（07-07）的组合要走 NAT-T（UDP 4500），并确认中间 NAT 不改写 IKE 端口。规模边界：单 worker 会话容量受内存与 bihash 桶数限制（原理见 06-08），扩容优先加地址池与 worker，而不是调大超时。
 
 ### 7. 小结与延伸阅读
 
@@ -662,6 +765,8 @@ NAT 模块把"地址池 + 会话表 + 静态映射 + 接口方向"编译成 in2o
 
 **解封装方向（underlay → overlay）**：物理口收包 → `ip4-input`（underlay VRF）→ `ip4-udp-lookup` 按目的端口 4789/6081/2152 分发到 `vxlan4-input` / `geneve4-input` / `upf-gtpu4-input`（07-13），或按 IP proto 47/115 分发到 `gre4-input` / `l2tpv3-input` → 节点校验外层、剥头、把 RX `sw_if_index` 换成隧道口、按内层类型重注入 `ethernet-input`（L2 overlay）或 `ip4-input`（L3 overlay）→ 之后完全走 07-02/07-03 的正常转发。**重注入**这一步是叠加网络的关键：它让内层报文享受与原生报文相同的 ACL/QoS/FIB 处理，而不是被隧道节点"私吞"。
 
+图 07-06-01 把封装与解封装两个方向画在同一张图里：上半部分是 overlay → underlay 的封装链，`ip4-lookup` 在 overlay VRF 命中隧道 DPO，`ip4-midchain` 的 fixup 填入运行时才确定的 VNI/TEID/SID list/外层源端口，经 encap 节点与 `ip4-rewrite` 交给 underlay；下半部分是 underlay → overlay 的解封装链，`ip4-udp-lookup`（或按 IP proto 分发）把报文交给对应隧道 input 节点剥头，重注入 `ethernet-input` 或 `ip4-input` 后完全复用 07-02/07-03 的原生转发。读图重点是两次 VRF 切换：封装前查 overlay 表、封装后查 underlay 表，解封装后反向回到 overlay。
+
 :::figure id=07-06-01 | name=叠加网络隧道封装与解封装流程 | dir=TD
 node lk "ip4-lookup (overlay VRF)<br/>命中隧道 DPO" blue
 node mid "ip4-midchain / fixup<br/>填 VNI/TEID/SID/源端口" teal
@@ -677,6 +782,8 @@ edge out -> udp "underlay 收包"
 edge udp -> dec
 edge dec -> reinj "按 inner ethertype 分流"
 :::
+
+两个方向的关键动作按下表归纳：第一列区分封装/解封装/重注入三个阶段，第二列是对应节点，第三列是该节点做的事，第四列是它的依赖（邻接、隧道表或端口注册）——隧道不通时按依赖列逐项核对即可。
 
 | 方向 | 关键节点 | 关键动作 | 依赖 |
 |---|---|---|---|
@@ -701,6 +808,15 @@ create gre tunnel src 10.0.0.1 dst 10.0.0.2 instance 1
 sr policy add bsid cafe::1 next-hop via encap cafe::100 cafe::200
 show vxlan tunnel
 ```
+
+建隧道后的典型回显如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+[0] src 10.0.0.1 dst 10.0.0.2 vni 100
+    encap-vrf 0 decap-next l2 sw_if_index 5
+```
+
+逐行判读：`src/dst/vni` 三项必须与对端配置逐字段对称，任一不对称即单向通（本篇陷阱与 08-04 案例均有呼应）；`encap-vrf 0` 确认外层查表用 underlay VRF——漏配时外层目的地址会在 overlay 表里查找而失败；`decap-next l2` 表明解封装后重注入 `ethernet-input`（进 BD），若组网是三层叠加却显示 `l2`，就是 `decap-next` 选反的失败模式；`sw_if_index 5` 是隧道口句柄，`show interface` 里应能找到 `vxlan_tunnel0`，它既可被 `set interface l2 bridge` 加进 BD（07-02），也可被 `ip route` 指作下一跳（07-03）。进一步用 `show ip fib` 核对去往对端 overlay 前缀的下一跳是否指向该隧道的 midchain 邻接，仍指向物理口即路由未引进隧道。
 
 代码骨架（示意，精确签名以 `src/vnet/vxlan/vxlan.h`、`src/vnet/gre/gre.h` 为准，需对照实际版本核验）：
 
@@ -735,6 +851,14 @@ vnet_vxlan_add_del_tunnel (&a, &sw_if_index);
 - **只在单端建隧道就判通**：本端 `show vxlan tunnel` 看到隧道便以为就绪，对端漏建或 VNI/`src`/`dst` 不对称即单向通（呼应 08-04 案例七）。规避：两端各跑一次逐字段对称核对，再双向打流。
 - **`decap-next` 与组网模式选反**：L2 VXLAN 进桥域（07-02）应选 `decap-next l2` 重注入 `ethernet-input`，配成 L3 会把内层以太帧当 IP 解析而丢弃。规避：先定隧道口进 BD 还是配 IP 走三层，再选 `decap-next`，用 `show trace` 看重注入节点。
 - **建完隧道没把流量引过去**：漏配指向隧道口的路由或没把隧道口加入 BD，`show ip fib` 里前缀仍走物理口，隧道「存在但不承载」。规避：建完立刻 `show ip fib` 核对下一跳是 midchain 邻接，完整命令族见 04-05。
+
+**失败模式与边界条件**。隧道类故障集中在四点：① 隧道口 UP 但零发包——underlay 下一跳未解析或 `encap-vrf` 错表，`show errors` 里 midchain/glean 相关计数上升是信号；② 单向通——两端 VNI/TEID/源目地址不对称或对端漏建，两端逐字段核对后双向打流验证；③ 大包不通——外层封装开销吃掉 MTU 且 PMTUD 无法穿越，表现为 ping 小包通、业务大包断，下调内层 MTU 或启用分片；④ 解封装后走错重注入点——`decap-next` 与组网模式不匹配（上文陷阱已述）。边界条件：UDP 端口 4789/6081/2152 被 VXLAN/Geneve/GTP-U 注册（机制见 06-02），自定义端口必须先确认未被占用；SRv6 的 SRH 长度随 SID 数线性增长，MTU 要单独核算；大规模 VNI/TEID 下隧道表用哈希容器（原理见 06-08），批量创建走 API（04-07）。用户面专用隧道 GTP-U 的会话语义见 07-13。
+
+**L3 VXLAN 与 decap-next 的三种形态**。除最常用的 `decap-next l2`（重注入 `ethernet-input`、隧道口进 BD）外，VXLAN 还有 L3 形态：隧道口不进 BD 而是按 L3 处理（具体参数名与行为随版本有差异，需对照实际版本核验，`src/vnet/vxlan/vxlan.h`），内层直接是 IP 报文时解封装后重注入 `ip4-input`/`ip6-input`，适合"路由型 VXLAN"（类似 EVPN IRB 的对称路由思路）。三种形态的选择逻辑：主机需要纯二层互访且网关在别处选 `l2`；网关就在本 VPP 且希望省一层 ARP 广播域时用 L3 形态；内层是 MPLS/其它协议时按 decap 支持范围核验。形态选择还决定 MTU 下调位置与 ACL 挂点（L2 形态走 07-02 的挂点，L3 形态走 07-08 的挂点），设计期必须定死，运行期改形态等于重建转发路径。
+
+**组播 VXLAN 与双向校验的边界**。VXLAN 支持组播承载模式：创建隧道时 `mcast_sw_if_index` 指向一个组播复制口，VNI 相同的隧道组以 underlay 组播实现泛洪——这简化了"每两两建隧道"的 O(N²) 问题，但依赖 underlay 组播路由可用，且泛洪复制成本被转移到 underlay（组网取舍见 07-02 的泛洪讨论）。双向对称校验应成为部署 SOP：两端各自 `show vxlan tunnel` 后比对 src/dst/vni/decap-next 四项，再双向各发一轮探测流量；只测单向是叠加网络故障的第一诱因。观测口径：`show interface vxlan_tunnel0` 的计数只统计隧道口本身的收发，underlay 物理口上看到的是封装后流量，两者数值差正好是外层开销换算，可用这个差值反推 MTU 是否预留充足。
+
+**封装协议的选型判据**。；要携带租户元数据/NSH 时选 Geneve（TLV 更灵活）；纯三层点对点互联选 GRE/IPIP（开销最小）；运营商域选 L2TPv3 伪线或 MPLS（07-10）；需要路径编程/TE 时选 SRv6，但要接受 SRH 开销与 IPv6 underlay 前置条件。与 IPsec 的组合（07-07）：站点加密优先 tunnel protect 包住 GRE/IPIP 整条隧道，而不是对每条 VXLAN 逐条装 SA——策略维护量差一个数量级。5G 用户面的 GTP-U（07-13）不是通用隧道，不要用 VXLAN 替代：TEID 的会话语义与 PFCP 管理面是 UPF 功能的一部分。
 
 ### 7. 小结与延伸阅读
 
@@ -780,6 +904,8 @@ IPsec 是 VPP 在站点互联、云上加密网关、5G 回传、以及"在用�
 
 **入向解封装链**：物理口收到 ESP（proto 50）→ `ipsec4-input-feature` 按 SPI 查 SAD 得 SA → 抗重放窗口检查（ESN/序列号）→ `esp4-decrypt` 验 ICV、解密、剥 ESP 头 → 内层 IP 报文重注入 `ip4-input` / `ip4-lookup`，之后按 07-03 正常转发。若 SPI 查不到 SA 或重放检查失败，报文丢弃并计 error 计数。tunnel protect 场景由 `ipsec4-tun-input` / `ipsec4-tun-output` 按 `ipsec_tun_protect_t` 的 in/out SA 数组处理，等价于"整条 GRE 隧道被加密"。
 
+图 07-07-01 同时画出三条链：左侧入向链从 `ipsec4-input-feature` 开始，按 SPI 查 SAD、过抗重放窗口后由 `esp4-decrypt` 完成验 ICV/解密/剥头并把内层报文重注入；右侧出向链从 `ipsec4-output-feature` 开始，经 SPD 策略匹配分成 protect（进 `esp4-encrypt` 加封装）、bypass（直接进 `ip4-lookup`）与 discard 三路；下方控制面是 `ikev2` process 节点经 UDP 500/4500 协商后，把 SA/SPD/tunnel protect 安装进数据面（虚线标注）。读图要点：出向分支由 SPD 决定、入向定位由 SPI 决定，两条数据链之间唯一的耦合是控制面写入的 SAD——这也解释了"SA 单向、需成对"这一最常见的误配点。
+
 :::figure id=07-07-01 | name=IPsec 入向/出向 ESP 链与 IKEv2 协商 | dir=TD
 node in "ipsec4-input-feature" blue
 node spid "按 SPI 查 SAD / 抗重放" teal
@@ -802,6 +928,8 @@ edge ike -> sad "IKE_AUTH / CREATE_CHILD_SA"
 edge sad -> in dashed "数据面 SAD 生效"
 edge sad -> outf dashed "SPD / protect 生效"
 :::
+
+三条链的分工按下表速查：前两行是出向（策略匹配与加密），中间两行是入向（SPI 定位与解密），最后一行是控制面协商——排障时先判断报文卡在哪条链，再深入对应节点的 error 计数。
 
 | 链 | 关键节点 | 输入 | 输出 |
 |---|---|---|---|
@@ -827,6 +955,16 @@ ikev2 profile set pr1 id local fqdn vpp-a.example
 ikev2 initiate sa-init pr1
 show ikev2 sa
 ```
+
+典型回显如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+p1  IKEv2 SA: init 1, resp 0, established 1
+    local id fqdn vpp-a.example, remote id fqdn vpp-b.example
+    CHILD-SA: spi-in 0x00000100, spi-out 0x00000200, encr aes-gcm-128
+```
+
+逐行判读：`established 1` 表示 IKE SA 完成认证进入稳定态；只有 `init/resp` 计数而无 established 时，卡点在 IKE_SA_INIT 或 IKE_AUTH——多半是身份（`id local/remote`）或 PSK 不一致，而非算法协商问题（陷阱已述）；`local/remote id` 两行必须与对端 profile 逐字一致，FQDN 大小写是否敏感需对照实际版本核验；CHILD-SA 的 `spi-in`/`spi-out` 是一对单向 SA 的两个 SPI，可拿 `spi-in` 到对端核对是否等于对端的 `spi-out`；随后用 `show ipsec sa`（命令见 04-06）按这两个 SPI 查已安装的 SA——查不到说明协商成功但安装失败，重点排查 Binary API 调用与 SAD 容量。`encr` 行回显最终协商出的算法套件，与 profile 期望不一致说明对端策略覆盖了本地偏好。
 
 代码骨架（示意，精确签名以 `src/vnet/ipsec/ipsec_sa.h`、`src/plugins/ikev2/ikev2.h` 为准，需对照实际版本核验）：
 
@@ -856,6 +994,14 @@ ipsec_sa_add_and_lock (&sa, &sa_index);
 - **重密钥黑洞**。rekey 期间新旧 SA 并存，若旧 SA 删除过早而数据面仍引用，会短时丢包；关注 `show ikev2 sa` 的 rekey 状态与 SA 过期时间。
 - **引擎可用性**。启用 async 前确认 cryptodev/ipsecmb/QAT 引擎已加载（插件机制见 06-11）并 `show crypto` 类命令能看到；引擎缺失时 IPsec 可能回退软件或报错。
 - **加密与校验和 offload**（07-01）叠加时，加密节点改了 IP 头，务必刷新 offload 元数据，否则对端收到坏校验和。
+
+**失败模式与边界条件**。IPsec 不生效或间歇断流的排查顺序：① SPD 未绑定接口或方向装反——`show ipsec spd` 核对绑定与方向；② SPD 顺序错误——宽 bypass 挡在 protect 前导致明文出门，或宽 protect 把 IKEv2/BFD（07-14）/路由协议报文也加密进隧道导致协商自锁；③ 单边 SA——手工装 SA 漏装反向一条，`show ipsec sa` 按方向成对核对；④ 抗重放丢包——高 PPS 下窗口过小，`show errors` 的 ESP 丢弃计数与序列号回退计数上升是特征；⑤ 加密引擎未加载——async 模式下引擎缺失会报错或回退软件，先确认引擎已注册再启用（插件加载机制见 06-11）。边界条件：MTU 要逐层核算（ESP + GRE + VXLAN 叠加最凶）；rekey 黑洞窗口（新旧 SA 交替期）建议把关键业务切换安排在低峰并监控 `show ikev2 sa` 的重协商状态；抗重放窗口与序列号全局一致性依赖 worker 间的同步（机制见 06-06/06-07）。
+
+**流量选择器（TS）与拆分隧道**。IKEv2 协商的 CHILD_SA 携带流量选择器（Traffic Selector，TSi/TSr）：它定义"哪些源/目的网段允许进这条 SA"。VPP 的 profile 里对应本地/远端子网参数（精确参数名需对照 `src/plugins/ikev2/` 核验），两端 TS 不一致时会出现"协商成功但业务不通"——对端认为你的网段不在 TS 内而拒绝。拆分隧道（split tunneling）就是用 TS 实现"只保护指定网段、其余明文走默认路由"，与 SPD 里写宽 protect + bypass 的效果等价，但语义在协商层保证，两端强一致，生产建议优先 TS 表达而非手工 SPD 补丁。TS 与 SPD 的关系：协商结果最终仍落到 SPD/SAD，`show ipsec spd` 里能看到协商产生的策略条目，核对它们与 profile 的子网是否一致是"协商成功但不加密"的标准检查步骤。
+
+**ESP 报文形态与算法组合**。ESP 头本身只有 SPI 与序列号两个字段，IV、密文、padding、pad length、next header 与 ICV 都算"载荷"：CBC 类算法 IV 显式放在 ESP 头后，AEAD 类算法（AES-GCM）把 IV 与一体化认证标签并入载荷，因此同一 SA 的开销字节数随算法不同（这也是 MTU 核算要按实际算法做的原因）。AES-GCM 一体化加密认证是 VPP 生产首选：单次遍历完成加密+ICV，性能优于"加密 + 分离 HMAC"组合，且 ipsecmb/cryptodev 引擎对其优化最充分（引擎选型见下段）。选择组合算法时要注意 ICV 长度与抗重放窗口独立配置，序列号溢出（32bit 满轮换）在长时高pps链路上需要 ESN 支持，是否启用需对照实际版本核验（`src/vnet/ipsec/ipsec_sa.h`）。
+
+**与相邻模块的选型判据**。加密承载方式三选一：对"接口对接口"的站点互联用 SPD + tunnel 模式 SA；对"隧道整体加密"优先 tunnel protect 包住 GRE/IPIP（07-06），策略维护最简单；transport 模式只保护端到端单层报文，适合云内主机对主机。手工 SA 与 IKEv2 的取舍：测试环境手工 SA 快速可控，生产一律 IKEv2（自动 rekey、DPD、NAT-T）。加速选型：Intel IPSec MB 插件用指令集加速、无额外硬件；有 cryptodev/QAT 时启用异步模式，吞吐更高但引入排队时延（实测方法见 08-01）。与 NAT 组合（07-05）必须走 NAT-T，并确认中间 NAT 不改写 UDP 500/4500；与 ACL 的顺序（07-08）由 feature arc 决定，策略要按报文在该挂点的实际形态编写。多 SA 并存的网关型部署还需监控 SAD 条目规模与 SPI 空间占用，重协商风暴（大量对端同时 rekey）会瞬时膨胀 SAD，容量余量按"峰值并发对端 × 每对端 2 条 SA"预估。
 
 ### 7. 小结与延伸阅读
 
@@ -900,6 +1046,8 @@ IPsec 模块把"策略"与"密钥"解耦成 SPD/SAD，把加解密做成 feature
 
 **classify 决策链**：`ip4-classify` 节点按表配置的 `skip` 定位到报文字节起点，取固定长度片段与 `mask` 相与，再查表 → 命中 `vnet_classify_entry_t` 则把 `hit-next`（如 `ip4-policer-classify`、drop、或指定 feature 节点）与 `opaque_index`/`advance` 写入 buffer 元数据（字段见 05-09 容器与实际头文件）→ 下游节点据此执行限速、重定向或继续按内层字节二次匹配（多级 classify 常用于 QinQ/GTP-U 内外层字段组合）。
 
+图 07-08-01 把两条决策链并排画出：左上是 ACL 链，报文经 feature arc 入口进入规则匹配，启用状态化时先过 `fa` 会话表（命中即按会话动作放行/丢弃并刷新超时），未命中再逐条匹配规则列表；右侧是 classify 链，按 mask/skip/match 做字节级匹配后产出动作，或把 `opaque_index` 交给下游节点。两链共用的终点是 permit（继续转发）与 deny（drop 并计 error）。读图要点：ACL 的会话表是"加速器"而非新语义，最终判定仍回溯到规则列表；classify 的 hit-next 可以指向 policer/重定向等非安全动作，这是它区别于 ACL 的本质。
+
 :::figure id=07-08-01 | name=ACL 与 classify 决策流程 | dir=TD
 node fi "feature arc 入口<br/>ip4-unicast / l2-input" blue
 node ac "ACL 规则匹配<br/>5 元组 + mask" teal
@@ -917,6 +1065,8 @@ edge cl -> act
 edge act -> drop "deny"
 edge act -> fwd "permit"
 :::
+
+两种机制的能力边界按下表对比：第二列说明各自匹配什么对象，第三列是可挂的 feature 位置，第四列是典型输出（permit/deny，或 hit-next + opaque_index）——选型时先确认要匹配的字段是否在 ACL 的 5 元组表达能力内，超出的（如 TEID、自定义 TLV）只能走 classify。
 
 | 机制 | 匹配对象 | 挂点 | 典型输出 |
 |---|---|---|---|
@@ -937,6 +1087,16 @@ set acl-plugin interface GigabitEthernet0/8/0 acl 0 input
 classify table buckets 4096 mask hex 000000000000000000000000ffff0000 skip 0 match l3 ip4
 classify session hit-next permit table-index 0 match hex 000000000a00000100000000
 ```
+
+典型回显如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+acl-index 0, tag 0, count 1
+  rule 0 permit tcp src 10.0.0.0/8 dst 0.0.0.0/0 sport 0-65535 dport 80
+acl-plugin sessions: 12 active, in 9, out 3
+```
+
+逐行判读：`acl-index 0` 与 `count 1` 确认规则列表已加载且规则数与配置一致——接口绑定后计数不符说明覆盖或加载失败；`rule 0` 行回显规则语义，端口范围与协议字段的写法随版本有差异，需对照实际版本核验；session 行是状态化模式的关键观测点：`active` 会话数持续增长且不下降，意味着超时配置过松或 reflect 会话泄漏，`in/out` 比例可用于识别单向流异常。规则"写了不生效"时，先确认接口绑定方向与挂点，再用 `show errors` 看 ACL 节点丢弃计数是否变化——计数不动说明报文根本没经过该挂点，回头查 feature arc 顺序（原理见 06-03）。classify 表的状态用 `show classify table` 核对桶数、已装 session 数与命中计数。
 
 代码骨架（示意，精确签名以 `src/plugins/acl/acl.h`、`src/vnet/classify/vnet_classify.h` 为准，需对照实际版本核验）：
 
@@ -963,6 +1123,14 @@ vnet_classify_add_del_table (&t, &table_index);
 - **permit+reflect 与单向流**。UDP/ICMP 的反向流识别依赖 5 元组反转与超时，非对称路由（来回走不同接口/VPP 实例）会导致反射会话不命中，表现"单通"。
 - **性能**：规则越多、越靠前匹配越好；把高频命中规则前置，避免每包遍历长列表；状态化会话命中路径远快于逐规则匹配。
 - **与 IPsec/NAT 的端口冲突**：IPsec SPD（07-07）、NAT 会话（07-05）都按 5 元组工作，组合部署时确认各模块看到的地址形态一致。
+
+**失败模式与边界条件**。ACL/classify 的四类典型失效：① 挂点不对——报文在该接口方向根本不经过 ACL/classify 节点（如接口工作在 L2 而 ACL 绑在三层 arc），`show errors` 计数纹丝不动是判据；② 规则顺序与默认动作冲突——首次匹配语义下宽 permit 挡住后面的 deny，上线前用 packet trace 验证实际命中的规则索引（判读见 08-03）；③ classify 的 skip/mask 算错——偏移差一个 VLAN 头就整表不命中，用 `show classify table` 与 trace 逐字节核对；④ 状态化会话异常——非对称路由导致 reflect 反向会话不命中而单通，超时过短导致长连接反复重建。边界条件：classify 的 buckets/memory-size 不足时添加 session 会失败并报错；ACL 规则规模上限与哈希内存相关（原理见 06-08），万级规则需先评估内存与每包 CPU 开销；L2 挂点（07-02）与三层挂点可同时生效，重叠策略要人为去重。
+
+**多级 classify 与链式匹配**。classify 支持多张表串联：表项的 `next_table_index` 指向下一张表、`advance` 决定跳过多少字节继续匹配，形成"先匹配外层、再匹配内层"的两级选择器——QinQ 场景第一级按外层 VLAN 选租户、第二级按内层五元组选流；GTP-U 场景（07-13）第一级按 TEID 选会话、第二级按内层 IP 选 QoS 类别。链式设计有两个容易踩的坑：`advance` 的字节数要把已匹配的头长度算准（含可选字段时尤其如此）；中间级没有命中项时会按 miss-next 处理（丢弃或继续，具体默认行为需对照实际版本核验，`src/vnet/classify/vnet_classify.h`），排障时"外层命中、内层静默丢弃"就查这一处。规划多级表时先把每级的 skip/match 字节段画成偏移表再写配置，比事后逐字节比对快得多。
+
+**L2 元组与 ether-type 匹配**。ACL plugin 的规则不只覆盖 IP 5 元组：L2 挂点上规则可按源/目的 MAC 与 ethertype 匹配，用于"只放行 ARP 与特定协议""封禁某源 MAC"这类二层策略；ether-type 匹配规则要挂在 `l2-input`/`l2-output` 方向才可见，绑到三层挂点等于空配。规则编排建议：把二层过滤与三层策略分成两张 ACL 分别绑定，而不是挤在一张列表里——两张表的命中计数独立，故障时可分别归因。deny 的实现细节：命中 deny 的报文多数实现是转交 error 节点丢弃并计特定 error 名（精确计数名需对照实际版本核验，`src/plugins/acl/`），监控告警应按 error 名而非接口计数配置，否则 deny 与正常丢弃无法区分。
+
+**与相邻模块的选型判据**。安全过滤选 ACL（5 元组语义、可状态化、面向人）；字段选择与限速选择器选 classify（字节级、面向程序、可配 `opaque_index` 传给 07-11 的 policer）；两者叠加的正确姿势是"classify 选流 → policer/ACL 执行"，不要在同一挂点对同一 5 元组重复配置。与 NAT/IPsec 的顺序（07-05/07-07）由 feature arc 决定，策略要按报文在该挂点的实际形态（转换前/后、加密前/后）编写，这是跨模块联调最容易返工的点。规则生命周期管理也建议走 Binary API（04-07）而非逐条 CLI：API 支持整表替换（`acl_add_replace` 一类语义，见第 3 节源码），可在不停流的情况下原子更新规则集，CLI 逐条增删的中间态会短暂暴露空策略窗口。与 06-14 的关系：classify/marking 的底层匹配原理在 06-14 展开，本篇不重复；QoS 的执行侧（限速、标记、队列调度）见 07-11。
 
 ### 7. 小结与延伸阅读
 
@@ -1003,7 +1171,7 @@ ACL plugin 提供面向人的有序 5 元组安全策略（可选状态化会话
 
 ### 4. 关键流程与调用链
 
-**查表转发链**：报文进入 `ip4-unicast` feature arc → `lb4-nat4`（或对应封装节点）按 VIP 前缀判定是否为本 LB 服务 → 计算 5 元组 `flow_hash` → `hash % bucket_count` 索引 Maglev 表 → 取得后端索引 → 按封装模式改写：NAT 模式把目的 IP 改成后端地址（并可能改端口、重算校验和）；GRE 模式把整个 IP 包塞进 GRE 头、外层目的为后端地址；L3DSR 模式改二层目的 MAC（或借用 DSCP 携带 VIP 索引）→ 交回 `ip4-lookup`（外层/改写后的目的）→ `ip4-rewrite` → `interface-output`。回程：NAT 模式由 `lb` 的反向节点把源地址改回 VIP；GRE 模式后端解封装后直接回客户端（或经 LB 反向解封装，视拓扑）；L3DSR 回程完全绕过 LB。
+**查表转发链**：报文进入 `ip4-unicast` feature arc → `lb4-nat4`（或对应封装节点）按 VIP 前缀判定是否为本 LB 服务 → 计算 5 元组 `flow_hash` → `hash % bucket_count` 索引 Maglev 表 → 取得后端索引 → 按封装模式改写：NAT 模式把目的 IP 改成后端地址（并可能改端口、重算校验和）；GRE 模式把整个 IP 包塞进 GRE 头、外层目的为后端地址；L3DSR 模式改二层目的 MAC（或借用 DSCP 携带 VIP 索引）→ 交回 `ip4-lookup`（外层/改写后的目的）→ `ip4-rewrite` → `interface-output`。回程：NAT 模式由 `lb` 的反向节点把源地址改回 VIP；GRE 模式后端解封装后直接回客户端（或经 LB 反向解封装，视拓扑）；L3DSR 回程完全绕过 LB。图 07-09-01 把这条链按「前缀匹配 → 5 元组哈希 → 查表取后端 → 按封装改写 → 出向」的顺序画了出来；对照它可以确认：整条主路径没有逐流会话表、没有锁，后端选择只由报文自身的 5 元组决定。
 
 :::figure id=07-09-01 | name=LB Maglev 一致性哈希选路流程 | dir=TD
 node rx "lb4-nat4 / lb4-gre4 / lb4-l3dsr<br/>ip4-unicast feature" blue
@@ -1019,7 +1187,7 @@ edge be -> enc
 edge enc -> out
 :::
 
-> 表格兜底（图 07-09-01）：`lb` feature 节点先按 VIP 前缀匹配服务；用 5 元组算 `flow_hash`；`hash % bucket_count` 直接索引 Maglev 表得到后端索引；按封装模式改写报文（GRE 隧道、NAT 目的转换、或 L3DSR 改二层）；最后回到 `ip4-lookup` 正常转发。整条主路径无逐流会话表、无锁。
+查表选路讲完数据面的每一步，还要回答「这张表是怎么来的、后端变化时会发生什么」：图 07-09-02 从左到右展示了 Maglev 表的构建与重算过程——每个后端由自身标识经两次哈希生成确定性的偏好列表（只依赖后端自身、与后端集合无关），填充阶段按轮转让各后端认领偏好列表里第一个空桶；后端增删触发整表重算时，只有约 1/N 的桶改变归属，绝大多数存量连接仍落到原后端，这是第 2 节所说「一致性」的可视化。
 
 :::figure id=07-09-02 | name=Maglev 表构建与后端变更一致性 | dir=LR
 node vip "lb_vip_t<br/>VIP 前缀 / encap 类型" blue
@@ -1037,8 +1205,6 @@ edge fill -> new "后端增删后重算"
 edge old -> remap
 edge new -> remap
 :::
-
-> 表格兜底（图 07-09-02）：每个后端由自身标识经两次哈希生成确定性的偏好列表（与后端集合无关）；填充阶段按轮转让各后端认领偏好列表里第一个空桶；后端增删触发整表重算，但由于偏好列表稳定、填充贪心，只有约 1/N 的桶改变归属，绝大多数存量连接仍落到原后端。
 
 **控制面变更链**：`lb as ... add/del` 或健康状态变更 → `lb_vip_t` 的 AS 集合变化 → 调 Maglev 构建函数重算该 VIP 的查找表（双缓冲/原子替换，避免数据面读到半更新状态，机制见 06-06/06-07）→ 数据面下一包即按新表选路。表重算是控制面行为，不在每包路径上，因此"加后端"对转发性能几乎无影响。
 
@@ -1070,6 +1236,20 @@ lb_as_add (/* VIP 前缀 */, /* 后端地址 */);
 /* 查表主路径：backend = vip->maglev[flow_hash % bucket_count]（字段见 05-12） */
 ```
 
+**示例输出与逐行判读**：配置完成后用 `show` 核对 VIP、后端与状态，输出形态如下（命令名随版本差异，`show lb vips` / `show lb vip` 两种拼写都见过，需对照 `src/plugins/lb/lb_cli.c` 核验）：
+
+```text
+# 示例输出，具体格式需对照实际版本核验（src/plugins/lb/lb_cli.c）
+vpp# show lb vips
+203.0.113.10/32  encap gre4  new_len 1024
+  application servers: 3
+    198.51.100.11  available
+    198.51.100.12  available
+    198.51.100.13  down
+```
+
+逐行判读：第一行的 `203.0.113.10/32` 应与 `lb vip` 下发的前缀逐字一致，长度多一位少一位都意味着命中范围变了；`encap gre4` 确认封装模式，`new_len 1024` 是新增头长度参数，与后端解封装假设必须一致。`application servers: 3` 说明三条 AS 都已挂上，若少于预期，检查 `lb as` 是否用了与 VIP 完全相同的前缀写法。三条后端逐行列出，`available` 才参与 Maglev 表，`down` 的后端不接流量——把 198.51.100.13 置 down 后应看到整表重算、落在它上面的连接迁到其余两台，这是验证一致性哈希最直接的方法；若状态长期停在 `inprogress` 之类的中间态（取值需核验），说明控制面状态变更没有完成收尾。
+
 ### 6. 注意事项、陷阱与最佳实践
 
 - **桶数取值**。Maglev 表长应为远大于后端数的素数（如 65537），太小则分布不均、一致性优势减弱；太大浪费内存且重算变慢。桶数在 `lb conf` 里设，运行中变更需重建所有 VIP 表。
@@ -1081,6 +1261,12 @@ lb_as_add (/* VIP 前缀 */, /* 后端地址 */);
 - **健康监测要外置**。不要假设插件会自动探测后端；把 BFD/编排系统的结果转成 `lb as` 状态变更并触发重算，否则故障后端会持续接流量。
 - **VIP 前缀长度**。`lb vip .../<len>` 的 len 决定匹配范围，配成 `/32` 只服务单 IP，配成网段会把不该分发的地址也纳入；与路由/ARP（07-04）配合确认 VIP 地址确实被路由到 LB。
 - **多 worker 与表替换**。重算 Maglev 表时要保证数据面读到的是完整表（原子替换/双缓冲，机制见 06-06/06-07）；自研修改时注意别在转发路径上逐包查锁。
+
+**失败模式与边界条件**：最常见的不生效形态是「配了 LB、流量却按普通转发走」——feature 节点只对命中 VIP 前缀的报文接管，前缀写法（`/32` 还是网段、ip4 还是 ip6）与实际流量不一致时，`lb4-*` 节点每包都直接跳过，此时 `show runtime` 里 LB 节点的 packets 计数不涨（判读见 08-02）。第二类是「表在、包到、没有后端」：VIP 命中但所有 AS 都被置 down、或 `lb as` 还没下发，报文在 LB 节点被丢弃并计入该节点的 error 计数（计数项名需对照 `src/plugins/lb/lb.c` 的节点注册处核验），`show errors` 能看到对应增长。第三类是封装成功但后端回不来：后端缺到客户端的路由、或 NAT4 模式下 `lb conf` 没配源地址，现象单向通，用 trace（命令见 04-06）确认出向改写正确后到后端查回程。边界上，Maglev 表按 VIP 独立构建、bucket_count 全局一份配置；`new_len` 只影响新增头场景，对 NAT 改写无效（语义需核验）。
+
+**与相邻模块的差异与选型判据**：与 07-05 的 NAT44 相比，`lb` 的 nat4 模式没有逐流会话表——每个包独立查 Maglev 表，换来无锁与向量化，但它不理解连接、做不了会话级行为；需要连接语义选 NAT44，只需要「把流量均匀分到后端」选 LB。与 07-08 的 ACL 组合时，先过滤后分发是常见顺序，但要确认两者在同一 arc 上的先后（原理见 06-03），否则会出现「ACL 按改写前地址匹配」或相反。封装模式选型：后端可控、追求回程不过 LB 选 L3DSR；后端不可控或要求对称路径选 NAT；跨三层把任意 IP 包送到后端选 GRE。上游是否有「扩缩容不迁移连接」的诉求，是选 lb 插件还是外部 LB 网关的分水岭。
+
+**分布验证与观测方法**：LB 上线验收的核心动作是分布验证——`show runtime`（命令见 04-06）里 `lb4-*` 节点的每 worker packets 计数反映整体分流是否在多 worker 上铺开；每后端的实际命中量可经 `show lb vips verbose` 一类子命令（命名需核验）或 Binary API 统计读到（编程见 04-07）。后端命中分布严重偏斜时，先检查来源 5 元组的多样性——NAT 设备后面的用户群会天然聚在少数源上——再考虑调整哈希输入或桶数，这是分布问题而不是表构建错误，把两者混为一谈会走错方向。验收建议按「单 VIP 单后端 → 多后端均匀流 → 故障摘除 → 恢复」四步打流，每步核对一次计数与分布，任何一步的偏差都能定位到明确环节。
 
 ### 7. 小结与延伸阅读
 
@@ -1129,6 +1315,8 @@ MPLS 在运营商骨干、流量工程（TE）、L2VPN/L3VPN、以及 5G 承载�
 - `DPO_MPLS_LABEL_DISPOSITION`（POP / PHP）：弹掉标签，若 EOS=1 则把内层按类型重注入 `ip4-input` / `ip6-input` / `ethernet-input`（L2VPN 伪线），之后完全走 07-03/07-02 的正常路径；若 EOS=0 则继续按下一层标签查表（多层标签栈递归）。
 - `DPO_DROP` / 无表项：丢弃并计 error 计数。
 
+把三条分支放在一起看：报文经 `mpls-input` 进入 `mpls-lookup` 后，去哪个分支由标签动作与 EOS 位共同决定——SWAP/PUSH 走标签域继续转发，POP/PHP 则把内层重新注入协议原生路径。图 07-10-01 按「`ethernet-input` → `mpls-input` → `mpls-lookup` → 分支 → rewrite → `interface-output`」的主线画出了这条查找与标签操作链，读者应先看中间的查表节点，再分别看左右两个分支各自的 DPO 类型与报文去向。
+
 :::figure id=07-10-01 | name=MPLS 标签查找与标签栈操作 | dir=TD
 node ei "ethernet-input<br/>ethertype 0x8847/0x8848" blue
 node mi "mpls-input<br/>解析标签栈 / TTL / EOS" teal
@@ -1147,6 +1335,8 @@ edge swap -> rw
 edge ip -> rw
 edge rw -> out
 :::
+
+栈顶 S 位与命中的 DPO 类型共同决定标签动作，三种典型组合按四列读下表：第一列是收包时读到的栈顶 S 位（含对端通告隐式空标签的情形），第二列是对应的 DPO 类型，第三列是数据面执行的动作，第四列是动作完成后报文的去向——排障时拿 trace 里的实际 S 位与 DPO 对照这张表即可定位分支走错的原因。
 
 | 栈顶 S 位 | DPO 类型 | 动作 | 后续 |
 |---|---|---|---|
@@ -1184,6 +1374,20 @@ fib_table_entry_update_one_path (fib_index, &pfx, FIB_SOURCE_CLI,
 
 生产还要配 `mpls interface enable`、LDP（`src/plugins/ldp/` 的 `ldp` 命令族，见 04-05）、以及 `show mpls fib` / `show mpls interface` 核对（判读见 08-03）。
 
+**示例输出与逐行判读**：第 5 节配置完成后，用两张 `show` 核对 LFIB 与接口使能状态（输出列名随版本略异，需对照 `src/vnet/mpls/` 的 CLI 注册处核验）：
+
+```text
+# 示例输出，具体格式需对照实际版本核验（src/vnet/mpls/mpls_cli.c）
+vpp# show mpls fib
+Table 0, fib_index 0
+ 100 eos 1  mpls-label-dpo
+   via 10.0.0.2  GigabitEthernet0/8/0  labels 200
+vpp# show mpls interface
+  GigabitEthernet0/8/0  MPLS enabled
+```
+
+逐行判读：`Table 0` 必须是 `mpls table add` 建的那张表，条目出现在别的 table 号下说明下发与查询用的 table-id 不一致。`100 eos <b>` 的键要与对端压栈后的实际栈顶完全对齐——单层标签报文栈顶 EOS=1，多层标签的中间层 EOS=0，键不齐则查表 miss、报文走 drop；`labels 200` 是改写后的出向栈顶（SWAP 语义），要压多层时会展开成标签列表（顺序需对照实际输出核验）。`via` 行给出下一跳与出接口，若这一行缺失，条目处于未解析状态，邻接（07-03）没建起来。`show mpls interface` 里接口必须 enabled，否则 0x8847 帧在 `ethernet-input` 就被当未知 ethertype 丢弃、LFIB 配得再对也收不到包。
+
 ### 6. 注意事项、陷阱与最佳实践
 
 - **接口必须显式使能 MPLS**。只建 MPLS 表不 `set interface mpls ... enable`，`mpls-input` 不会在该接口收包，标签帧被 `ethernet-input` 按未知 ethertype 丢弃；现象是"表配了但一个标签包都不进"。
@@ -1201,6 +1405,14 @@ fib_table_entry_update_one_path (fib_index, &pfx, FIB_SOURCE_CLI,
 - **只建表不使能接口**：`mpls table add 0` 后漏了 `set interface mpls ... enable`，标签帧被当未知 ethertype 丢弃，现象是「表配了、一个标签包都不进」。规避：配完 `show mpls interface` 逐口确认 enabled，并用 `show errors` 看 `ethernet-input` 的未知类型计数。
 - **EOS / S 位填反**：把中间节点还要继续 SWAP 的标签栈配成 S=1，egress 提前把 MPLS 当 IP 解析而丢弃。规避：按第 4 节表「S=0 继续查标签、S=1 才重注入内层」核对，`show trace` 看 `mpls-lookup` 之后走的是 `mpls-rewrite` 还是 `ip4-input`。
 - **MPLS table-id 与 IP VRF 混用**：L3VPN 内层标签按 VRF 隔离，把 MPLS 表号写成 IP VRF 编号会查到另一张表。规避：牢记 MPLS `fib_table_t` 与 IP VRF 是两张表（第 6 节），下发时显式指定表号核对（语法需对照实际版本核验）。
+
+**失败模式与边界条件**：补充三个容易忽略的失败形态。其一是标签空间视角：VPP 的 LFIB 按平台标签空间组织——同一个 in-label 全机只有一条表项，而不少教材按「每接口标签空间」讲 LDP；把不同邻居通告的相同标签值当成两条独立表项去配，后写的会覆盖先写的（实际语义需对照 `src/vnet/mpls/` 核验）。其二是显式空标签 0 与隐式空标签 3 的混淆：把 implicit-null 配成显式的 label 0，倒数第二跳会留下一个标签值为 0 的栈顶，egress 还要再处理一次，两端理解不一致时 traceroute 行为诡异。其三是 TTL propagation 开关：关闭后内层 IP TTL 不随 MPLS TTL 联动，traceroute 只能看到边界节点、中间 P 路由器全部隐身，排障时容易被误判为丢包。验证入口统一是：`show errors` 看 mpls 节点的 miss/drop 计数、`show trace` 看 `mpls-lookup` 之后走的是 `mpls-rewrite` 还是内层重注入（判读见 08-03）、以及 mpls-oam 的 LSP ping 验证端到端标签路径。
+
+**静态配置与动态协议的来源冲突**：`mpls route`（CLI 来源）与 LDP/控制器下发的条目写同一 (label, eos) 键时，按 FIB 的 source 优先级裁决（07-03），手工条目并不总是赢；表现为「CLI 配了、转发仍按协议条目走」，`show mpls fib` 的条目详情里能看到实际生效的来源与下一跳集合（输出需核验）。排障顺序上，先把「IP 可达 → LDP session up → LFIB 条目 → 端到端 LSP ping」四步各自验通再往下走，跳步会导致把 LDP 问题误判成转发问题。验收多标签栈（L3VPN 的两层标签）时还要逐层核对：外层查全局表、内层查 VRF 表，`show mpls fib` 与 `show ip fib` 两张表都要有对应条目，只核对外层会在 PE 落地时才暴露内层问题。
+
+**标签栈开销与 MTU 口径**：每层 MPLS 标签占 4 字节，两层标签叠加外层以太的开销比纯 IP 转发多 8 字节以上，PHP 未生效或多层 VPN 场景还要更多；出接口 MTU 与对端/后端的 MTU 假设必须一起核（07-01 的 MTU 核对方法），否则大包在 `mpls-rewrite` 后被丢或触发分片。`show hardware` 的 max packet 与接口 MTU（命令见 04-03）是核对依据，巨帧部署时把「IP MTU + 标签栈开销」与链路 MTU 三个数一起对齐。需要 explicit-null 的场景（LSP ping 类 OAM）还会多一层标签开销，验收时按最坏栈深测算，而不是按正常转发路径的栈深。
+
+**与相邻模块的差异与选型判据**：标签分发方式上，LDP 适合纯转发骨干——由 IGP 路由驱动自动分配标签（07-03），无流量工程能力；SR-MPLS 由控制器或头节点显式下发标签栈，支持 TE 与快速重路由，且不需要逐跳维护 LDP 会话，新建骨干优先考虑。承载协议上，SR-MPLS 与 SRv6（07-06）的取舍：MPLS 硬件生态成熟、标签栈开销小、中间设备无感；SRv6 用 IPv6 扩展头承载、可编程与业务链能力强，但头部开销大且要求端到端 IPv6。与云 overlay 对比：L3VPN/TE/承载网场景 MPLS 表达力更强，纯租户 overlay 与跨公网场景 VXLAN/GRE（07-06）更通用。判据归结为三问：骨干是否已 MPLS 化、是否需要显式路径、中间设备能否升级。收敛速度是第四问：LDP 联动 IGP 的收敛时间取决于 IGP 本身，SR-MPLS 可配合快速重路由一类机制（能力与命名需对照实际版本核验），对时延敏感业务是决定性差异。
 
 ### 7. 小结与延伸阅读
 
@@ -1241,7 +1453,7 @@ MPLS 模块把 20bit 标签当作 `fib_prefix_t` 的"地址"，复用 FIB/DPO/�
 
 **限速链**：报文入向 → `qos-record` 把 DSCP/TC 记进 buffer 元数据 → `ip4-classify`（或 `l2-classify`）按 mask/skip/match 命中，取出 `opaque_index` = policer index → `ip4-policer-classify` 调 `policer_police()` 跑令牌桶：比较当前时间与上次更新、按速率补充令牌、判定 conform/exceed/violate → 执行动作：conform 放行、exceed/violate 丢弃或降级 DSCP 后放行 → 放行的报文继续沿 arc 到 `ip4-lookup`。
 
-**出向标记与队列链**：`ip4-output` / `interface-output` 前，`qos-mark` 按 egress map 把内部 QoS 级别回写 DSCP/MPLS TC（07-10）→ HQoS 把报文按 DSCP/classify 结果映射到 `(subport, pipe, TC, queue)` → 若接口未拥塞则直接进 tx，拥塞时由 `rte_sched` 调度器按权重/优先级出队 → 驱动 tx（原理见 06-12）。
+**出向标记与队列链**：`ip4-output` / `interface-output` 前，`qos-mark` 按 egress map 把内部 QoS 级别回写 DSCP/MPLS TC（07-10）→ HQoS 把报文按 DSCP/classify 结果映射到 `(subport, pipe, TC, queue)` → 若接口未拥塞则直接进 tx，拥塞时由 `rte_sched` 调度器按权重/优先级出队 → 驱动 tx（原理见 06-12）。图 07-11-01 把「记录 → 分类 → 监管 → 出向标记 → 调度」五个环节按报文流向串成一条链，沿箭头顺序即可对应到本节各段，也对应下表的五行。
 
 :::figure id=07-11-01 | name=QoS 标记、限速与 HQoS 调度链 | dir=TD
 node qrec "qos-record<br/>DSCP/TC 记入 buffer" blue
@@ -1256,6 +1468,8 @@ edge pol -> mark "conform / 降级放行"
 edge mark -> hq
 edge hq -> tx
 :::
+
+五个环节各自的输入输出逐段核对可按表进行：第二列是承担该阶段的节点或机制，第三列是它消费的数据，第四列是它产出的结果——排查「没打上标、没限住速」时，从记录到调度逐行确认断在哪一环节。
 
 | 阶段 | 节点/机制 | 输入 | 输出 |
 |---|---|---|---|
@@ -1296,6 +1510,18 @@ vnet_policer_add (vm, &cfg, &policer_index);
 /* 再把 policer_index 作为 classify session 的 opaque_index（07-08） */
 ```
 
+**示例输出与逐行判读**：policer 建好并打流后，用 `show` 看配置回显与三色计数（输出项名随版本略异，需对照 `src/vnet/policer/` 的 CLI 注册处核验）：
+
+```text
+# 示例输出，具体格式需对照实际版本核验（src/vnet/policer/policer_cli.c）
+vpp# show policer p1
+  name p1, cir 1000000, cb 100000, rate pps, type 1r2c
+  conform: 12345678 packets
+  exceed:  89012 packets
+```
+
+逐行判读：第一行的 `rate pps` 与 CIR/CB 数值必须与 `configure policer` 的下发一致——单位解读错（pps 当 bps）是最常见事故，数值对了还要确认 `type 1r2c` 与设计一致，配三色时应显示 `1r3c`/`2r3c`。`conform` 与 `exceed` 两个计数的比例直接反映流量的超额形态：打流速率低于 CIR 时 exceed 应恒为 0，明显高于 CIR 时 exceed 持续增长；两者都恒 0 说明流量根本没进这个 policer（classify 未命中或没绑到接口），而不是限速没生效。`1r2c` 下不存在 violate 档，改三色后才会出现第三行计数。要在带宽口径上验证分界点，还需用流量发生器（方法学见 08-01）在 CIR 上下各打一档实测。
+
 ### 6. 注意事项、陷阱与最佳实践
 
 - **速率单位与 rounding**。policer 的 `rate pps/bps`、CIR/CBS/EBS 单位以及 round 策略（closest/up/down）不同版本默认值不同，配错会得到数量级错误的限速；上线用流量发生器（方法学见 08-01）实测核对。
@@ -1313,6 +1539,16 @@ vnet_policer_add (vm, &cfg, &policer_index);
 - **把 `rate pps` 当成 bps 用**：CIR 写 1000000 本意 1Mbps 却按 pps 解释，限速差数量级。规避：`show policer pools` 核对速率类型，用已知速率打流实测分界点，别只看配置回显。
 - **classify mask 偏移没算封装**：DSCP 在 IP 头 TOS 字节，QinQ/隧道封装（07-01/07-06）会改变 `mask`/`skip` 偏移，mask 配错则 classify 永不命中、`show policer` 计数恒 0、policer 形同虚设。规避：先在目标接口 `trace` 看实际字节布局再定 mask（命令见 04-06），并用 `show classify table` 核对命中数。
 - **三色模型漏配 violate 档**：只写 conform/exceed 就以为三色生效，violate 档可能默认 transmit，超额流量被放行而非丢弃/降级。规避：配 `1r3c`/`2r3c` 时显式写 `violate-action`，在 `show policer` 里确认三档计数都有意义。
+
+**失败模式与边界条件**：两个此前未展开的失败形态。一是多 worker 下的令牌桶状态分布：policer 的令牌桶状态是每 worker 一份还是全局共享，直接决定实际限速值——若每 worker 各持一份，N 个 worker 分摊流量时总限速会接近配置值的 N 倍（实现细节需对照 `src/vnet/policer/policer.c` 核验），上线前用「固定单流打满 + 多流分摊」两种形态各测一次分界点即可判明。二是 HQoS 树的重建成本：改 subport/pipe/TC 参数通常要重建整棵调度层次，运行中频繁变更不现实，按模板批量经 API 下发（04-07）而不是逐条改；l2 场景限速还有额外前提——桥接流量要挂 `l2-input` 侧的 classify（07-08），只配 ip4 表对 BD 内流量无效。验证入口：`show errors` 看相关节点 drop 计数、`show runtime` 看 policer/classify 节点在每 worker 上的占用（判读见 08-02），两者结合能区分「策略没命中」与「策略生效但算力不够」。
+
+**与相邻模块的差异与选型判据**：policer 与 HQoS 的分工是本篇第一判据——单级「超速就丢/降级」选 policer，配置简单、CPU 开销低；要保证多租户/多业务在拥塞下的相对时延选 HQoS，代价是 5 级树配置复杂度与专用调度资源。classify（07-08）在链路里只是「选择器」不做动作，策略值写进 classify session 还是写进 egress map，取决于匹配键是流（5 元组）还是报文头里的 QoS 位。与 07-13 的 QER 同源：UPF 的 QER 限速复用同一套 policer 机制，参数语义一致，两边经验可直接迁移。跨 MPLS 域（07-10）时 QoS 位载体从 DSCP 变为 TC，egress map 要按出向协议族分别建表，不能一张 map 通吃。
+
+**分类与索引的运维核对**：classify 表（07-08）的命中数是判断「策略有没有被流量触达」的最直接指标——`show classify table` 一类命令（命名需核验）能看到每张表的命中计数与活跃 session 数，命中恒 0 时按「接口绑定方向 → mask/skip 偏移 → 封装层次」三步回查。egress map 的核对同理：`show qos egress map` 一类命令（命名需核验）逐条列出映射，IP DSCP 与 MPLS TC（07-10）要分别建 map，共用一个 map id 会让另一族流量拿到错误标记。policer 索引由控制面分配，运维上避免删建循环：删除 policer 再重建会让 classify session 里记录的 opaque_index 悬空或指向新对象，表现为限速对象悄然改变（引用语义需对照 `src/vnet/classify/` 核验），策略变更用「新增索引 + 原子切换 session」的方式做。
+
+**HQoS 的资源预算**：HQoS 不是免费能力——调度树本身消耗 CPU 与内存，且通常要求把报文从普通 worker 递交给专门的 hqos 处理路径（线程模型需对照实际版本的 hqos 实现核验），相当于在转发路径上多一次 handoff（机制见 06-07）。规划时把「限速收益」与「handoff 开销」一起算：低 PPS 接口上 HQoS 是杀鸡用牛刀，高 PPS 多租户接口才值得。另一个边界是队列深度：pipe 队列满时 HQoS 主动丢包，这与 policer 的「超速即丢」语义不同——前者是拥塞管理、后者是监管，账面上两者的丢包原因要分开统计（判读见 08-02）。
+
+**突发口径与桶参数配合**：CBS/EBS 决定「多大的瞬时突发不丢」，但令牌补充速率由 CIR/PIR 决定——突发把桶打空后，后续流量要按承诺速率一点一点补回来，长时间平均速率不可能超过 CIR；把 CBS 配得极大去做「短时提速」是误解，它只是延迟丢弃点。桶容量单位与速率类型联动（pps 口径按包数、bps 口径按字节数换算报文长度），换算口径需对照 `src/vnet/policer/` 核验。验证突发行为用「短时高突发 + 长时均值限速」的组合打流（08-01），观察 exceed 计数在突发段尖峰、均值段平稳，两个特征同时出现才算桶参数按预期工作。
 
 ### 7. 小结与延伸阅读
 
@@ -1354,7 +1590,7 @@ VPP 首先是转发引擎，但很多场景需要它"自己也是一台主机"�
 
 ### 4. 关键流程与调用链
 
-**发方向**：应用调 `vppcom_session_write()`（或 LDP 劫持的 `write()`）→ 数据进 tx `svm_fifo_t` → 发 `SESSION_EVT_TX` 到 `svm_msg_q_t` → `session-queue` 节点消费事件，找到 `session_t` 与 `transport_connection_t` → TCP 分段/UDP 封包 → `tcp4-output` / `udp4-output` → `ip4-lookup` → rewrite → `interface-output`（07-03/07-01）。**收方向**：物理口 → `ip4-input` → `ip4-udp-lookup` / `tcp4-input`（按端口注册分发，原理见 06-02）→ 传输层处理 → 载荷进 rx `svm_fifo_t` → 发 `SESSION_EVT_RX` → 应用 `read()` 取走。整条数据通路绕过内核，控制面只走 Binary API（原理见 06-13）。
+**发方向**：应用调 `vppcom_session_write()`（或 LDP 劫持的 `write()`）→ 数据进 tx `svm_fifo_t` → 发 `SESSION_EVT_TX` 到 `svm_msg_q_t` → `session-queue` 节点消费事件，找到 `session_t` 与 `transport_connection_t` → TCP 分段/UDP 封包 → `tcp4-output` / `udp4-output` → `ip4-lookup` → rewrite → `interface-output`（07-03/07-01）。**收方向**：物理口 → `ip4-input` → `ip4-udp-lookup` / `tcp4-input`（按端口注册分发，原理见 06-02）→ 传输层处理 → 载荷进 rx `svm_fifo_t` → 发 `SESSION_EVT_RX` → 应用 `read()` 取走。整条数据通路绕过内核，控制面只走 Binary API（原理见 06-13）。图 07-12-01 把发、收两个方向与中间的 FIFO/事件层画在同一张图里：看图时先定位左上的「应用」与右下的「网络」，再沿 svm_fifo 数据通路与 SESSION_EVT 事件通路两条线，逐环对照上文箭头核验（图 07-12-01）。
 
 :::figure id=07-12-01 | name=主机协议栈 Session 层与 VCL 数据通路 | dir=TD
 node app "应用<br/>VCL / LDP / 原生 API" blue
@@ -1370,6 +1606,8 @@ edge tr -> ip "发方向"
 edge rx -> tr "收方向"
 edge tr -> svm dashed "载荷入 rx fifo"
 :::
+
+两个方向与控制通道的关键环节汇总如下：第二列按报文或事件实际流经的顺序列出环节，第三列标注支撑该环节的机制——排查「应用写得进、网络发不出」一类断链问题时，按行自上而下找第一个对不上的环节，就是断点所在。
 
 | 方向 | 关键环节 | 机制 |
 |---|---|---|
@@ -1407,6 +1645,20 @@ vppcom_session_close (s);
 /* 函数名与参数以 vcl.h 为准（需对照实际版本核验） */
 ```
 
+**示例输出与逐行判读**：会话建起来并收发一段时间后，用两张 `show` 核对会话状态与 FIFO 水位（输出列名随版本略异，需对照 `src/vnet/session/` 的 CLI 注册处核验）：
+
+```text
+# 示例输出，具体格式需对照实际版本核验（src/vnet/session/session_cli.c）
+vpp# show session verbose
+  thread 0: active sessions 2
+    [0:1] TCP: 10.0.0.1:1024 -> 203.0.113.10:80  ESTABLISHED
+          rx fifo: 0 of 4096 bytes, tx fifo: 2048 of 65536 bytes
+vpp# show app ns
+  app ns index 0 id 0 sw_if_index 1 ip4-fib-index 0
+```
+
+逐行判读：会话按 thread 分组列出，thread 号即处理该会话的 worker；一条 TCP 会话应看到四元组与状态，`ESTABLISHED` 之外长期停留在 `SYN_RCVD`/`CLOSED` 一类状态，说明握手或关闭流程卡住（常见于对端不可达或 FIFO 满触发背压）。rx/tx fifo 行给出已用/容量字节数：tx fifo 接近容量说明应用写得快、传输层发得慢，rx fifo 接近容量说明应用读得慢、已触发传输层背压——两者都是吞吐骤降的直接原因（容量规划见 08-02）。`show app ns` 里命名空间绑定的 sw_if_index 与 fib-index 决定会话查哪张表，多 VRF（07-03）下「监听成功但没有流量」的第一排查点就是这两个索引与预期表号是否一致。
+
 ### 6. 注意事项、陷阱与最佳实践
 
 - **session 层要显式启用**。`session enable` 之前本机终结流量不会进 VPP 主机栈；IKEv2、BFD、DHCP client 等依赖它的模块要先确认这一前提。
@@ -1418,6 +1670,18 @@ vppcom_session_close (s);
 - **控制面/数据面分离**。VCL 控制通道走 Binary API socket、数据通道走 svm 共享内存；只通控制不通数据时检查 svm 段权限/大页（原理见 06-10、部署见 03）。
 - **零拷贝的前提**。应用直接读写共享内存，跨 NUMA 或跨容器挂载 svm 段会削弱零拷贝收益并引入一致性问题（06-06/06-10）。
 - **调试入口**。`show session` / `show app ns`（04-06）看会话与命名空间，packet trace（判读见 08-03）确认本机终结流量是否被端口分发正确接管。
+
+**失败模式与边界条件**：先分清 startup.conf 与 CLI 两层开关——startup.conf 里的 `session { ... }` 段（use-app-socket-api、事件队列长度、fifo segment 大小一类关键字，具体名称需对照实际版本核验）管全局运行形态与 VCL 连接方式，CLI 的 `session enable` 管是否启用本机终结；只做后者不做前者，VCL 应用可能连不上 API socket。事件队列容量是第二类边界：应用与 worker 之间的事件队列长度有限（机制见 06-10），突发大量建连/读写时事件积压甚至丢弃，表现为「建连慢、数据断续」，调大队列与 fifo segment 是第一手段。VCL 的 worker 亲和是第三类：应用线程与 VPP worker 的会话分配影响跨核通知开销，绑错 NUMA 时零拷贝收益归零（06-06/06-10）。验证路径：`show session verbose` 的 FIFO 水位、`show app ns` 的表绑定、`show errors` 的会话相关计数逐层核对，必要时 trace 看 `tcp4-input` 是否真的收到报文（判读见 08-03）。
+
+**与相邻模块的差异与选型判据**：接入方式四选一——改造成本为零但语义受限（fork/epoll 支持有限）选 LDP 的 `LD_PRELOAD`；追求完整控制与确定性选 VCL 显式 API；应用与 VPP 同机且只需转发原始报文（不做协议终结）时，memif 直连（07-01）比整套 session 栈更轻；跨主机虚机走 vhost-user（07-01）。判据是对端可改造程度与终结流量占比：纯转发网关不需要启用本篇；IKEv2（07-07）、BFD（07-14）这类「本机终结少量控制流」的模块依赖这套栈，它们的会话建立失败要先查本篇前提（session enable、端口注册）再查协议本身；应用密集的宿主机才值得把大量流量放进 VPP 用户态 TCP。
+
+**多 worker 下的会话归属**：一条会话的生命周期事件必须由同一个执行体串行处理，否则 FIFO 状态会乱——session 层把会话与 worker 绑定（绑定粒度与迁移策略需对照 `src/vnet/session/` 核验），跨 worker 的报文经 handoff 递交到归属 worker（机制见 06-07）。观测上，`show session verbose` 里会话挂在哪个 thread 就说明归属哪个 worker；吞吐异常时对照该 worker 的 `show runtime` 占用，判断是会话分布不均（某 worker 堆了大量会话）还是单会话瓶颈。监听类会话与新连接的分配策略可在应用侧配置（VCL 的相关配置项需核验），长连接服务建议把连接摊开到全部 worker。
+
+**API 连接方式与排障**：VCL 与 VPP 的控制通道有 socket 与共享内存两种形态（use-app-socket-api 一类开关，需核验）：socket 形态隔离性好、调试直观，共享内存形态延迟更低但要求应用与 VPP 看到同一内存段。排障顺序是「API 通 → app 注册 → session 建立 → 数据通路」：`show app ns` 看不到应用时先查 API 连接，应用在而会话不在再查 listen/connect 参数与命名空间绑定。LDP 场景还有一层：被劫持程序的环境变量（LD_PRELOAD 路径、VCL 配置文件路径）任何一个没设对，程序会静默回退到内核 socket——表现为「能通但性能没变化」，用 ldd 与进程内存映射确认动态库确实加载。
+
+**与转发路径的相互影响**：本机终结流量与转发流量共享 worker 与 buffer 池，终结开销（TCP 状态机与事件处理，FIFO 本身零拷贝）在 `show runtime` 里表现为 session/tcp 节点的 CPU 占用；把控制流终结与高 PPS 转发放在同一 worker 会让两者互相抖动，部署上用 worker 划分（06-06）或独立接口终结来隔离。压力下还有一类隐蔽问题是大页耗尽：fifo segment 与 buffer 池同源于大页（06-10），session 段配得过大时 buffer 池缩水，表现为「启用 session 之后转发吞吐下降」，容量规划要把两类消费者一起算（08-02）。
+
+**阻塞语义的边界**：VCL 的 read/write 在 FIFO 满或空时的行为（阻塞、返回部分数据、返回错误码）与超时语义，和内核 socket 不完全一致（具体返回值与超时参数需对照 `src/vcl/vcl.h` 核验）；从内核栈迁移过来的代码若依赖「write 会完整写入」的假设，遇到 tx fifo 满会被静默截断，应用层要检查返回值并重试——这是把存量程序迁到 VCL 时最常见的正确性坑，性能问题之外先把它排除。
 
 ### 7. 小结与延伸阅读
 
@@ -1467,7 +1731,7 @@ vppcom_session_close (s);
 
 **上行数据面链**：N3 物理口收 GTP-U → `ip4-udp-lookup` 按 2152 分发到 `upf-gtpu4-input`（端口注册见 06-02）→ 校验 GTP-U 头、剥外层、按 TEID 找隧道/会话 → `upf-classify` 用内层 5 元组 + TEID 查 PDR bihash → 命中后依次执行：URR 累加流量/时长、QER 跑 policer 与 DSCP/QFI 标记、FAR 决定 forward/drop/buffer/duplicate → forward 则按 NWI 的 VRF 查 FIB（07-03）→ `ip4-rewrite` → N6 出接口。若 FAR 是 buffer（UE 空闲），报文进 BAR 缓冲并触发 PFCP 下行数据通知。
 
-**下行数据面链**：N6 收普通 IP（目的=UE IP）→ PDR 按 UE IP/5 元组匹配（可能在 `ip4-unicast` arc 上）→ URR/QER 执行 → FAR 的"外层头创建"给出 gNB 地址 + 下行 TEID + QFI → `upf-gtpu4-encap` 把原 IP 包封进 GTP-U + UDP 2152 → 按 NWI 的 RAN 表查路由到 gNB → N3 出接口发出。
+**下行数据面链**：N6 收普通 IP（目的=UE IP）→ PDR 按 UE IP/5 元组匹配（可能在 `ip4-unicast` arc 上）→ URR/QER 执行 → FAR 的"外层头创建"给出 gNB 地址 + 下行 TEID + QFI → `upf-gtpu4-encap` 把原 IP 包封进 GTP-U + UDP 2152 → 按 NWI 的 RAN 表查路由到 gNB → N3 出接口发出。图 07-13-01 把 PFCP 规则注入与上行数据面链画在同一张图里（下行方向是同一批规则的反向应用）：看图先左后右，左侧确认规则如何编译进数据面，右侧沿报文流经的节点逐个对应 PDR/QER/URR/FAR 的执行点。
 
 :::figure id=07-13-01 | name=UPF 用户面 PDR/FAR/QER/URR 处理流程 | dir=TD
 node pfcp "PFCP 控制面 (SMF)<br/>UDP 8805 会话建立/修改" blue
@@ -1487,6 +1751,8 @@ edge urr -> far
 edge far -> enc "forward"
 edge far -> enc "下行外层头创建"
 :::
+
+上下行两条链的差异集中体现在入口、PDR 匹配键、FAR 动作与出口四个维度，按列读下表即可对照排查；其中「上行靠 TEID 找会话、下行靠 UE IP 找会话」是两条链最本质的区别，也是两类断链问题的不同排查起点。
 
 | 方向 | 入口 | PDR 键 | FAR 动作 | 出口 |
 |---|---|---|---|---|
@@ -1524,6 +1790,22 @@ vnet_gtpu_add_del_tunnel (&a, &sw_if_index);
 /* UPF 侧 PDR/FAR/URR/QER 由 PFCP 会话建立消息安装，结构见 upf.h（字段见 05-01） */
 ```
 
+**示例输出与逐行判读**：SMF 下发会话后，核对会话、TEID 与 NWI 绑定（UPF 各实现的命令与输出差异极大，以下仅为形态示意，需对照实际部署版本核验）：
+
+```text
+# 示例输出，具体格式需对照实际版本核验（src/plugins/upf/ 各实现差异较大）
+vpp# show upf session
+  session seid 1001
+    uplink   teid 0x00000101  pdr 2  far 1
+    downlink teid 0x00000102  pdr 2  far 1
+    ue ip 10.10.0.15
+vpp# show upf nwi
+  n3  ip4-table-id 0
+  n6  ip4-table-id 100
+```
+
+逐行判读：SEID 是 SMF 分配的会话标识，一个 PFCP 会话对应一个 UE 上下文；上行/下行 TEID 必须不同且与对端登记一致——gNB 侧登记的是下行 TEID（示例里的 0x00000102），UPF 收上行用的是 0x00000101，两个值填反是「单向通」的经典根因。pdr/far 条数应与 Establishment 消息里的规则数一致，为 0 说明规则没有装进数据面，问题在 PFCP 侧而非转发侧。`ue ip` 是下行 PDR 的匹配键，与 UE 实际获取的地址不一致时下行 PDR 永远 miss。nwi 表必须与 `show ip fib table <id>` 能查到的 VRF（07-03）一一对应，表号指向不存在的 VRF 时上行解封装后直接丢弃。
+
 ### 6. 注意事项、陷阱与最佳实践
 
 - **NWI ↔ VRF 映射**。上行解封装后查 DN 表、下行封装后查 RAN 表；NWI 的 `ip4-table-id` 配错，报文进了不存在的 VRF 被丢弃。排障先 `show upf nwi` 与 `show ip fib`（命令见 04-04/04-06）。
@@ -1541,6 +1823,16 @@ vnet_gtpu_add_del_tunnel (&a, &sw_if_index);
 - **NWI 的 `ip4-table-id` 配错或没建对应 VRF**：n6 配了表 100 但 VPP 里没这张表，解封装后的上行包进不存在 VRF 被丢，表现为「隧道与会话都在、就是没流量」。规避：`show upf nwi` 后立刻 `show ip fib table 100` 确认表存在且有到 DN 的路由。
 - **上下行 TEID 混用**：FAR「外层头创建」里把下行 TEID 填成上行值，gNB 收包找不到承载。规避：`show upf session` 逐方向核对 TEID，双向各打一档流量，别只测上行。
 - **把基础 `gtpu` 隧道当 UPF 用**：只建 `gtpu` 隧道（无 PFCP）就期待 PDR/QER/URR 生效，结果只有透传、没有计费与 QoS。规避：明确 `src/plugins/gtpu/` 只做封装、`src/plugins/upf/` 才装规则（第 2 节），生产经 PFCP 下发，`show upf session` 有规则才算数，完整命令族见 04-05。
+
+**失败模式与边界条件**：三层递进的断点定位。第一层是 PFCP association 优先于会话——SMF 与 UPF 之间的 association/heartbeat 未建立时一切会话下发都失败，现象是 `show upf session` 恒为空；先验证 UDP 8805 双向可达，再谈规则。第二层是规则装配——TEID 在会话内应保持全局唯一，SMF 分配重复时后建会话可能被拒或互相覆盖（行为需核验）；FAR 为 buffer 时 BAR 缓冲占用 buffer 池，UE 大面积空闲遇突发下行会把池挤干、殃及普通转发（06-09），容量上限与超时要在部署层约束；URR 的阈值/周期配零或计量挂错 PDR，表现为「有流量、无话单」。第三层才是数据面——基础 `gtpu` 隧道的 decap-next 选错（L3 场景选了 ethernet-input）会让剥头后的 IP 包被当以太帧解析而丢弃。验证按分层走：PDR 命中计数、QER 限速计数、URR 累计值三个指标逐层递增即可定位断在哪一层（判读见 08-02/08-03）。
+
+**与相邻模块的差异与选型判据**：基础 `gtpu` 插件与 `upf` 插件的选型口径——只做 GTP-U 透传（互通测试、简单中继）用 `src/plugins/gtpu/`，一条隧道配置即完事；需要 PDR/FAR/计费/QoS 语义必须上 `src/plugins/upf/` 且经 PFCP 下发，两者不可混用。代际差异上，4G 的 S1-U/SGi 由 GTP-C（UDP 2123 一族）控制，5G 用 PFCP（8805）；开源 VPP 系 UPF 实现多面向 5G + PFCP，4G 场景需核验具体实现的协议支持面。与 07-06 的分工：gtpu 本质也是「端口注册 + 隧道」，但 UPF 的封装动作由 FAR 编译而来、携带 QFI 等移动专用字段，VXLAN/GRE 一类通用隧道不承载这些语义——不要试图用通用隧道替代 N3 接口。
+
+**联调验收的分步口径**：与 SMF 联调按「association → 会话建立 → 上行通路 → 下行通路 → 计量」五步验收，每步有独立判据：association 看 PFCP heartbeat 双向（抓包或实现自带的 show）；会话建立看 `show upf session` 的规则数；上行通路打 UE 流量看 N6 出口计数；下行通路反向打流看 N3 出口是否封装了正确的下行 TEID；计量看 URR 累计值与实际流量是否一致（方法学见 08-01）。五步中任何一步卡住都不要跳到下一步排障——用户面问题八成出在前两步的控制面装配上。验收环境建议在 N4 与 N3 各旁挂一台抓包机：前者看 PFCP 交互，后者看 GTP-U 封装格式，PFCP 报文里的 IE 错误只有抓包能定位。
+
+**URR 上报与话单核对**：URR 的上报消息由阈值（总量/时长/事件）触发，到达 SMF/计费网关后要能与本地流量记录对上账：上报周期内累计字节数应与打流总量在同一量级（考虑封装开销的口径差）；长期不上报时先核对阈值配置是否为零、上报地址与 NWI 路由是否可达。多 worker 下的计量累加是 per-PDR 还是全局聚合、精度损失多少（实现需核验），决定了计费口径是否需要在网关侧补偿，上线前用已知流量的对照测试确认。
+
+**会话重建与幂等口径**：SMF 重发 Establishment/Modification（相同 SEID）时，UPF 应按幂等替换处理旧规则集而不是叠加——重建后核对 `show upf session` 的规则数回到预期值、旧 TEID 已释放；PFCP 序列号乱序或重传时的去重行为需对照实现核验。另一个口径是会话老化：UE 去注册后 SMF 未发 Deletion 的残留会话会一直占着 TEID 与 PDR 表项，运维上要有对账手段——会话数与在线 UE 数定期比对（监控判读见 08-02），差异持续增大说明 Deletion 链路有丢。
 
 ### 7. 小结与延伸阅读
 
@@ -1582,7 +1874,7 @@ UPF 把 PFCP 下发的 PDR/FAR/URR/QER/BAR 规则编译进 VPP 数据面：上�
 
 ### 4. 关键流程与调用链
 
-**BFD 检测链**：控制面 `bfd udp session add ...` → `bfd_udp_add_session()` 建 `bfd_session_t`、注册 UDP 端口输入节点、把会话挂进定时器轮（原理见 06-15）→ 定时器到点，process 节点构造 BFD Control 报文（带本地/远端 discriminator、状态、间隔）经 `interface-output` 发出 → 对端 `bfd-udp4-input` 收包 → 校验鉴别符/认证、更新远端状态与 `last_rx`、推进状态机（Down→Init→Up 或超时 Up→Down）→ 状态变化时遍历监听者列表 / 通过 `want_bfd_events` 通知控制面 → 控制面据此撤销路由、摘除 LB 后端或触发切换。echo 模式额外发/收 echo 报文做单向快速检测。
+**BFD 检测链**：控制面 `bfd udp session add ...` → `bfd_udp_add_session()` 建 `bfd_session_t`、注册 UDP 端口输入节点、把会话挂进定时器轮（原理见 06-15）→ 定时器到点，process 节点构造 BFD Control 报文（带本地/远端 discriminator、状态、间隔）经 `interface-output` 发出 → 对端 `bfd-udp4-input` 收包 → 校验鉴别符/认证、更新远端状态与 `last_rx`、推进状态机（Down→Init→Up 或超时 Up→Down）→ 状态变化时遍历监听者列表 / 通过 `want_bfd_events` 通知控制面 → 控制面据此撤销路由、摘除 LB 后端或触发切换。echo 模式额外发/收 echo 报文做单向快速检测。图 07-14-01 把这条检测链与其下方的遥测链画成上下两段：上段沿「定时器 → 收发 → 状态机 → 事件 → 控制面联动」读，下段沿「flowprobe → IPFIX → collector」与 statseg 两条旁路读，两段互不阻塞。
 
 :::figure id=07-14-01 | name=BFD 状态机与遥测数据链 | dir=TD
 node tm "timer wheel / process 节点<br/>周期收发 BFD" blue
@@ -1601,6 +1893,8 @@ edge sm -> tm dashed "重置检测定时器"
 edge fp -> ipfix "流记录模板"
 edge ipfix -> ss dashed "统计聚合"
 :::
+
+四个环节的产出物各不相同，按行读下表可以快速回答「这个模块到底交付什么」：前两行是故障检测与联动的闭环，后两行是流量计量与运行时观测的旁路——监控体系里它们分别对应告警源与数据源。
 
 | 环节 | 模块 | 输出 |
 |---|---|---|
@@ -1642,6 +1936,19 @@ bfd_udp_add_session (&p, &bs_index);
 /* 状态迁移内部遍历 bfd_main.listeners 回调控制面（字段见实际 bfd.h） */
 ```
 
+**示例输出与逐行判读**：会话配置后用 `show` 核对协商结果与收发计数（输出列名随版本略异，需对照 `src/plugins/bfd/bfd_cli.c` 核验）：
+
+```text
+# 示例输出，具体格式需对照实际版本核验（src/plugins/bfd/bfd_cli.c）
+vpp# show bfd sessions
+  ... local discriminator 1, remote discriminator 2
+  state up, desired-min-tx 100000, required-min-rx 100000, detect-mult 3
+  transmission interval 100 ms, detection time 300 ms
+  tx/rx: 12345/12340 packets
+```
+
+逐行判读：local/remote discriminator 应两端互指成对，对不上说明报文被错误会话接收（同一接口多会话时常见）。`state up` 之外要重点核对两个派生时间：transmission interval 与 detection time，后者应等于「取大者 × detect-mult」（第 2 节公式），不满足说明两端参数协商未生效。tx/rx 计数持续同步增长才代表双向路径健康；tx 增长而 rx 停滞，意味着去程通、回程断——单通是链路故障最常见形态，BFD 将在一个 detection time 后翻转 Down 并触发事件。长期停在 `down`/`init` 时，按第 6 节先查参数对称性与认证 key，再查 UDP 3784/3785 是否被中间设备过滤。
+
 ### 6. 注意事项、陷阱与最佳实践
 
 - **时间单位与检测倍数**。BFD 的 min-tx/min-rx 常用微秒，`detect-mult` 决定检测时长；单位看错（当成毫秒/秒）会得到 1000 倍偏差的检测时间，要么过于敏感误报、要么故障几秒才发现。务必 `?` 看 help（04-02）并对照版本核验。
@@ -1660,6 +1967,12 @@ bfd_udp_add_session (&p, &bs_index);
 - **时间单位当成毫秒**：`desired-min-tx 100000` 按微秒是 100ms，误当成毫秒/秒会得到 1000 倍偏差，要么过于敏感误报、要么故障几秒才发现。规避：`?` 看 help（04-02）确认单位，用 `show bfd sessions` 回显的检测时间反算核对。
 - **只配 BFD 不做联动**：以为 Down 会自动切流量，实际没有控制面订阅 `want_bfd_events`/监听者回调就什么都不会发生。规避：上线前人为制造一次 Down，确认订阅方收到事件并撤销路由/摘除后端（07-03/07-09）。
 - **高 PPS 接口全量开 flowprobe**：active/passive timeout 过小又在所有接口启用 `flowprobe feature`，流表与 IPFIX 导出量暴涨，collector 不可达时反压数据面。规避：只在关键接口启用、按容量调 timeout（08-02），常态监控用 statseg 计数器而非逐流记录，完整命令族见 04-05/04-06。
+
+**失败模式与边界条件**：三个此前未展开的边界。其一，echo 模式的对端依赖：echo 报文按 RFC 5880 由对端回环处理，对端不支持或不转发 echo 时会话起不来，跨厂商部署先确认双方 echo 能力，不支持就退回普通模式并加大 detect-mult。其二，demand 模式：按需模式停止周期性交互、靠显式查询维持（RFC 5880），误开 demand 后表现为「看似安静、实则失去检测」，排查「BFD 静默但链路已断」先查模式与认证序列号（两端时钟或实现差异过大可能互判陈旧报文，细节需对照 `src/plugins/bfd/` 核验）。其三，会话规模：每条会话占用定时器与周期发包开销，数千会话时先压测（08-01）再上量。验证方法要做成演练而非只看回显：人为拔纤或加防火墙规则制造单通，确认 detection time 内翻转 Down、且订阅方（`want_bfd_events`/监听者）真的收到事件并执行了联动——`show bfd sessions` 的 tx/rx 计数与 `show errors` 的 bfd 节点计数是两个观测面。
+
+**与相邻模块的差异与选型判据**：故障检测手段按检测层级排序——接口 carrier 事件最快但只覆盖物理层；路由协议自身 Hello/dead timer 秒级且随协议走（07-03 的 IGP 场景）；BFD 毫秒级且与协议解耦，要求亚秒收敛的静态路由、ECMP、LB 后端（07-09）场景选 BFD，其余场景用已有机制即可，不必处处上 BFD。单跳与多跳的选型对应两种 UDP 端口：3784 用于直连下一跳，3785 用于跨多跳路径（如隧道对端，07-06/07-07），把多跳会话配成单跳端口会导致对端根本不监听。职责边界上，BFD 只产事件不执行策略（第 2 节），「检测」与「动作」分离是它与 FIB 联动（07-03）的设计原则，也是与内嵌 keepalive 方案的本质差别——这决定了部署时必须有订阅方，否则检测再快也不切流量。
+
+**statseg 的消费路径与变更窗口**：`show errors` / `show runtime` 只是统计段的两个入口，真正的常态消费方是外部采集——统计段是共享内存，采集进程直接映射读取即可（接口与路径见 06-10 与 04-07），轮询频率与字段选择决定采集开销（判读见 08-02）。IPFIX 侧还有模板机制：模板先于数据流注册到 collector，collector 重启后要等模板重新收到才能解码流记录，排障「collector 收到数据但解不出来」时先查模板会话。BFD 会话的运行参数（间隔、detect-mult）可在线修改并经协商生效（命令见 04-05），但变更会瞬时打断收发节拍、可能触发一次误判 Down，变更窗口要避开业务高峰。
 
 ### 7. 小结与延伸阅读
 
@@ -1701,7 +2014,7 @@ BFD 用会话状态机 + 定时器轮做毫秒级双向故障检测并通过事�
 
 **DHCP client 链**：接口标记 `dhcp` → process 节点发 DISCOVER（目的 255.255.255.255:67，源 0.0.0.0:68）→ UDP 68 端口分发（端口注册见 06-02/07-12）到 DHCP client 节点 → 收 OFFER → 发 REQUEST → 收 ACK → 把地址/掩码写进接口（07-01）、把默认路由写进 FIB（07-03）、把 DNS server 交给 `dns` 模块 → 租约定时器（原理见 06-15）到 T1/T2 续期，失败则重新 DISCOVER。**relay 链**：接入接口收广播 → `giaddr` 填接入接口地址、加 Option 82 → 单播转发到 server VRF → 收应答后按广播/单播回送客户端。
 
-**IGMP→mfib 链**：接口启用 IGMP → 收 Membership Report（或 Leave）→ `igmp` 更新该接口/组的状态 → 调 `mfib_table_entry_update()` 把接口加入 `(S,G)`/`(*,G)` 的出口列表 → 组播数据到达时 `ip4-mfib-forward-lookup` 查 mfib 得到出口集合 → `ip4-mfib-forward-rpf` 做 RPF 校验（防环，入接口必须指向源）→ `ip4-replicate` 逐出口复制（buffer 克隆见 06-09）→ 各出口 rewrite 后发出。若接口在 L2 BD（07-02），IGMP snooping 把组播只复制给有接收者的成员口而非全泛洪。
+**IGMP→mfib 链**：接口启用 IGMP → 收 Membership Report（或 Leave）→ `igmp` 更新该接口/组的状态 → 调 `mfib_table_entry_update()` 把接口加入 `(S,G)`/`(*,G)` 的出口列表 → 组播数据到达时 `ip4-mfib-forward-lookup` 查 mfib 得到出口集合 → `ip4-mfib-forward-rpf` 做 RPF 校验（防环，入接口必须指向源）→ `ip4-replicate` 逐出口复制（buffer 克隆见 06-09）→ 各出口 rewrite 后发出。若接口在 L2 BD（07-02），IGMP snooping 把组播只复制给有接收者的成员口而非全泛洪。图 07-15-01 把 DHCP/DNS/IGMP/SPAN/memif 五类模块各自挂到接口与转发图的位置画在一张总图里：看图按节点色调分组——控制面类（DHCP/DNS）、数据面类（IGMP/mfib、SPAN）、接口类（memif/tap/vhost），再对照下表确认每个模块的挂点与消费者。
 
 :::figure id=07-15-01 | name=辅助模块在接口与转发图中的挂载位置 | dir=TD
 node dhcp "DHCP client / relay<br/>地址获取与中继" blue
@@ -1718,6 +2031,8 @@ edge span -> fi "旁路复制"
 edge mem -> fi
 edge fi -> out
 :::
+
+这些模块体量小但挂点分散，下表把「模块 → 挂点 → 主要消费者」三列对齐：排查某类功能（拿不到地址、组播不通、抓不到包）时，先在第二列确认它挂在哪，再去第三列找谁消费它的输出，能省掉大半盲查时间。
 
 | 模块 | 挂点 | 主要消费者 |
 |---|---|---|
@@ -1756,6 +2071,19 @@ mfib_table_entry_update (fib_index, &pfx, MFIB_SOURCE_CLI /* 来源 */,
                          /* RPF + 出口 itf 列表，参数以 mfib.h 为准 */);
 ```
 
+**示例输出与逐行判读**：第 5 节配置完成后，按模块分别用 `show` 核对（各模块 CLI 命名随版本差异大，需对照各自目录的 `*_cli.c` 核验）：
+
+```text
+# 示例输出，具体格式需对照实际版本核验（src/vnet/dhcp/、src/vnet/mfib/ 各自的 *_cli.c）
+vpp# show dhcp clients
+  GigabitEthernet0/8/0  state bound  addr 192.0.2.15/24  router 192.0.2.1
+vpp# show mfib table
+  table 0, fib_index 0
+   (*, 239.1.1.1/32)  itf GigabitEthernet0/8/0
+```
+
+逐行判读：dhcp clients 行的 `state bound` 才代表 DISCOVER→OFFER→REQUEST→ACK 四步走完，停在 discover/request 阶段通常是广播域不通或 server 无响应；`addr` 与 `router` 两个字段要分别落到接口地址与 FIB 默认路由（07-03），有 addr 无 router 说明 server 侧过滤了路由选项。mfib 表里 `(*,G)` 条目的 itf 列表应与 IGMP 收到的成员口一致，出现「表有条目、包不复制」时先查 RPF 入接口是否指向源方向——RPF 失败在 mfib 转发节点的 error 计数里单独累计（计数项需对照 `src/vnet/mfib/` 核验），`show errors` 能看到增长。DNS 缓存可用 `show dns cache` 一类命令查看条目与 TTL（命名需核验），排障时先确认缓存内容再怀疑上游。
+
 ### 6. 注意事项、陷阱与最佳实践
 
 - **DHCP client 与静态地址互斥**。同一接口既 `set interface ip address` 又 `dhcp` 会互相覆盖；DHCP 拿到的默认路由可能与手工静态路由冲突，确认 FIB source 优先级（07-03）。
@@ -1768,6 +2096,14 @@ mfib_table_entry_update (fib_index, &pfx, MFIB_SOURCE_CLI /* 来源 */,
 - **memif 的共享内存与 NUMA**。memif 主/从两端要挂同一 svm 区域、CPU/NUMA 亲和一致（06-10/06-06），跨 NUMA 会显著削弱零拷贝收益；队列/ring 尺寸（字段见实际 `memif.h`）要按 PPS 规划。
 - **SPAN/pcap 是旁路但耗资源**。镜像/pcap 逐包复制并写盘，生产环境长时间全量开启会拖垮转发；按需短时开启，观察口带宽要足够（排障决策链见 08-03）。
 - **端口与特性叠加**。DHCP（67/68）、IGMP、DNS（53）等与控制面通道（07-12 的 UDP 端口注册）共存时确认无冲突；辅助接口加 ACL/NAT/QoS 时核对 feature arc 顺序（06-03）。
+
+**失败模式与边界条件**：五个此前未覆盖的边界。其一，DHCP 事件订阅：`want-dhcp-event` 一类参数决定拿到的地址是否主动通知控制面/写入编排系统，不订阅时地址只在 VPP 内生效、外部感知不到（API 机制见 06-13）。其二，relay 级联防环：giaddr 与 Option 82 叠加时，多台 relay 都再插一次 Option 82 会超长或被 server 拒绝，只在约定的那一级插入。其三，DNS 负缓存：上游返回 NXDOMAIN 的结果同样按 TTL 缓存，残留期间相关 FQDN 全部解析失败，排障先清缓存重查（命令见 04-06）再怀疑上游。其四，IGMP 与静态 mfib 的来源优先级：IGMP 动态加入与 CLI 下发的静态 (S,G)/(*,G) 条目来自不同 source，低优先级来源的出口可能被忽略（MFIB_SOURCE 语义需对照 `src/vnet/mfib/` 核验）。其五，pcap 落盘上限：文件按包数/大小截断（行为需核验），排障前先设上限避免写满磁盘。验证用一族 `show`（`show dhcp clients`、`show mfib table`、DNS 缓存查看，命名随版本，清单见 04-06）逐层核对，组播复制丢包时 `show errors` 看 replicate 节点计数（判读见 08-03）。
+
+**与相邻模块的差异与选型判据**：DHCP 三种形态按职责选——VPP 自己要地址选 client；仅为下游转发广播选 relay；需要代理认证/租约管理（BRAS 类）才考虑 proxy，混用形态是配置事故的主要来源。辅助接口按对端可改造程度选：同机进程间报文通道选 memif（零拷贝、需两侧协作，07-01）；通用虚拟网卡/容器场景选 tap；不动虚机镜像走 vhost-user。组播复制点要明确在 L3 还是 L2：三层复制走 mfib（本篇），BD 内压制泛洪靠 IGMP snooping（07-02），两者常同时启用但解决的问题不同。观测手段上，SPAN/pcap 看「原始字节」、packet trace（07-14）看「节点决策」，按排障阶段选用而不是二选一（决策链见 08-03）。
+
+**IPv6 侧的对应能力**：本篇模块大多有 IPv6 对应物——DHCPv6 与前缀委派（PD）在 `src/vnet/dhcp/` 的 dhcp6 一族实现（文件名需核验），用于下游 LAN 的地址与前缀分配；组播侧对应 MLD 而非 IGMP，`src/vnet/igmp/` 与 mfib 的 IPv6 路径负责（目录需核验）。选型上，IPv6 接入既可用 SLAAC（RA）也可用 DHCPv6-PD，网关类部署常两者并用：RA 给主机、PD 给下级路由器；这些控制面协议同样不进每包路径，排障先看控制面报文是否到达（端口注册见 06-02/07-12）。能力边界上，VPP 的 DHCP/DHCPv6 以 client、relay 与 PD client 为主，server 侧能力（地址池管理、租约数据库）是否提供需对照 `src/vnet/dhcp/` 核验，需要 server 功能时通常交给外部组件、VPP 只做接入与转发。
+
+**抓包链路的组合用法**：SPAN 与 pcap dispatch trace 可以叠加——SPAN 复制到观察口做长期低采样，pcap 短时全量落盘做精查，两者同时开时注意观察口带宽与磁盘写入互不影响转发。memif 作为抓包目标也可行：把镜像流量经 memif 送给同机分析进程，避免绕物理口一圈（接口能力见 07-01）。SPAN 与 pcap 的方向参数（rx/tx/both）要显式指定，默认方向随版本不同，只抓到单方向而误判为单向故障是常见乌龙（参数需核验）。
 
 ### 7. 小结与延伸阅读
 

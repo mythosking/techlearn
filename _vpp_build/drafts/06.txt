@@ -86,7 +86,7 @@ my_node_fn (vlib_main_t * vm, vlib_node_runtime_t * node,
 ```
 
 这段骨架浓缩了向量处理的全部要点：`from` 是本帧输入向量，`to_next[]` 是按处理结果分流的输出向量，`while` 内层是「对一批包执行同一操作」，节点末尾用 `vlib_put_next_frame` 把输出向量提交成下游的 pending frame。`PREDICT_TRUE` / `PREDICT_FALSE` 是 `src/vppinfra/compiler.h` 里基于 `__builtin_expect` 的分支提示宏，用来进一步巩固分支预测。
-5. **逐节点推进**。下游节点（如 `ethernet-input` → `ip4-lookup` → `ip4-rewrite` → `interface-output`）依次被 dispatch，每个都重复「拿一帧、批量处理、产出一帧」，直到出接口节点把包交给网卡发送、buffer 被释放回池（06-09）。整条链上报文本体零拷贝，流动的是索引向量。
+5. **逐节点推进**。下游节点（如 `ethernet-input` → `ip4-lookup` → `ip4-rewrite` → `interface-output`）依次被 dispatch，每个都重复「拿一帧、批量处理、产出一帧」，直到出接口节点把包交给网卡发送、buffer 被释放回池（06-09）。整条链上报文本体零拷贝，流动的是索引向量（图 06-01-01）。
 
 :::figure id=06-01-01 | name=标量逐包处理与向量批处理流程对比 | dir=TD
 node s1 "标量循环: 每次取一个包" gray
@@ -223,7 +223,7 @@ VLIB_REGISTER_NODE (my_mark_node) = {
 
 **阶段四：主循环 dispatch internal 节点**。主循环进入「消费 pending 队列」的循环：取出 `vlib_pending_frame_t`，据其 `node_index` / `next_index` 定位 `vlib_node_runtime_t` 与 `vlib_frame_t`，调用 `dispatch_node` → `node->function(vm, rt, frame)`。节点函数执行 06-01 的向量循环，把结果包按 `next_index` 分流，用 `vlib_put_next_frame` 提交下游帧，可能产生新的 pending 条目。如此反复，直到 pending 队列排空或达到本轮调度上限。
 
-**阶段五：出接口与释放**。当帧流到 `interface-output` 及其下游 tx 节点，包被交给设备发送；驱动回收 mbuf / buffer，buffer index 回到缓冲池空闲链表（06-09）。若某节点判定丢弃，则把包送 `error-drop` 类节点，累加错误计数并释放 buffer。
+**阶段五：出接口与释放**。当帧流到 `interface-output` 及其下游 tx 节点，包被交给设备发送；驱动回收 mbuf / buffer，buffer index 回到缓冲池空闲链表（06-09）。若某节点判定丢弃，则把包送 `error-drop` 类节点，累加错误计数并释放 buffer（图 06-02-01）。
 
 :::figure id=06-02-01 | name=数据包处理图与节点帧传递 | dir=TD
 node n1 "dpdk-input INPUT 收包成帧" blue
@@ -394,7 +394,7 @@ VNET_FEATURE_REGISTER (my_nat_feature) = {
 2. `vnet_get_config_data(config_index, &next, &n_cfg)` 取出链首 feature 项，把链游标暂存进 `vlib_buffer_t` 的 feature 相关 opaque 字段（字段见 05-04）；
 3. 把帧投递到链首 feature 节点的 `next_index`；
 4. 每个 feature 节点执行完自己的向量循环后，调用 `vnet_feature_next(sw_if_index, &next, b)`：它读取 buffer 里的当前链游标，推进到下一项，返回下一 feature 的 `next_index`；若已到链尾，返回弧的默认下游节点；
-5. 帧据此被导向下一 feature 或弧尾，直到走完整条动态子链，继续主转发流程。
+5. 帧据此被导向下一 feature 或弧尾，直到走完整条动态子链，继续主转发流程（图 06-03-01）。
 
 :::figure id=06-03-01 | name=Feature Arc 注册排序按接口启停与运行期子链 | dir=TD
 node r1 "VNET_FEATURE_ARC_REGISTER 注册弧" blue
@@ -405,8 +405,7 @@ node r5 "生成全序与默认config_chain" amber
 node e1 "enable_disable 按接口启停" purple
 node e2 "vnet_config_add_feature 重建链" purple
 node e3 "更新接口 config_index" purple
-node d1 "锚点节点读 config_index" green
-node d2 "vnet_get_config_data 取链首" green
+node d12 "锚点节点读 config_index<br/>vnet_get_config_data 取链首" green
 node d3 "vnet_feature_next 依次跳feature" green
 edge r1 -> r4 "弧定义"
 edge r2 -> r3 "依赖声明"
@@ -415,9 +414,8 @@ edge r4 -> r5 "排序结果"
 edge r5 -> e1 "默认链基准"
 edge e1 -> e2 "启停触发"
 edge e2 -> e3 "copy-on-write产出"
-edge e3 -> d1 "运行期读取"
-edge d1 -> d2
-edge d2 -> d3 "帧沿动态子链推进"
+edge e3 -> d12 "运行期读取"
+edge d12 -> d3 "帧沿动态子链推进"
 :::
 
 > **图 06-03-01 文字兜底**：上半部（蓝→琥珀）是启动期：弧与 feature 经 `VNET_FEATURE_*_REGISTER` 注册，`runs_before/runs_after` 构成 DAG，`vnet_feature_arc_init` 拓扑排序产出全序与默认链。中部（紫）是配置期：按接口 `enable_disable` 触发 `vnet_config_add_feature` 以 copy-on-write 重建 config chain，更新接口 `config_index`。下半部（绿）是数据面：锚点节点读 `config_index` → `vnet_get_config_data` 取链首 → `vnet_feature_next` 沿子链逐个跳转，帧批量推进，未启用的 feature 不进入路径。
@@ -543,7 +541,7 @@ while (n_left >= 4) {
 4. **查表路径的预取**。`ip4-lookup` 里，取到目的地址后要对 FIB / bihash 做查找：先对查表键所在的 bucket 发起预取，再做上一包的查表计算，使 bucket 加载与计算重叠。bihash 的「working copy / bucket」布局本身也按 cache line 对齐（06-08）。
 5. **写回报文头**。改写动作写入 buffer 数据区；因相关字段已在缓存（前面预取过），写命中率很高。产出帧用 `vlib_put_next_frame` 提交，帧索引数组本身连续，同样受益硬件预取。
 6. **统计无伪共享**。节点末尾把本帧 `vectors/clocks` 累加到**本线程**的 `vlib_node_runtime_t` 副本（对齐到独立 cache line），不与其他 worker 共享该行，避免核间失效。
-7. **跨节点传递**。帧在节点间流动时，报文本体不动、只搬索引（06-01），因此下游节点读到的 buffer 很可能仍在上游预热过的缓存层级里（尤其同 worker 同核时），局部性被延续。
+7. **跨节点传递**。帧在节点间流动时，报文本体不动、只搬索引（06-01），因此下游节点读到的 buffer 很可能仍在上游预热过的缓存层级里（尤其同 worker 同核时），局部性被延续（图 06-04-01）。
 
 :::figure id=06-04-01 | name=向量循环中的软件预取流水线 | dir=LR
 node t1 "时刻T 处理包i 计算" blue
@@ -709,7 +707,7 @@ vlib_main_loop (vlib_main_t * vm)
 
 **时间维护链**：主循环每轮 `clib_time_now`（读 CPU 周期源，如 TSC）→ 经 `clib_time_t` 的换算系数转成秒 → 更新 `vm` 的时间字段（字段见 05-02）→ `vlib_time_now(vm)` 供节点取用 → process 的 `wait_for_clock`、timer wheel（06-15）据此判断到期。这样把「读时钟」从每包降为每轮一次。
 
-**process / 控制面嵌入点**：process 节点不是每轮都跑，而是被事件或定时器唤醒后放进可运行集合，主循环第 4 步统一调度；主线程的 CLI、Binary API（04-07）、stat segment 等控制面请求，也在主循环的安全点/单独线程被处理。理解「数据面循环不被控制面阻塞、控制面也不饿死」这一平衡，是理解 VPP 运行时行为的关键。
+**process / 控制面嵌入点**：process 节点不是每轮都跑，而是被事件或定时器唤醒后放进可运行集合，主循环第 4 步统一调度；主线程的 CLI、Binary API（04-07）、stat segment 等控制面请求，也在主循环的安全点/单独线程被处理。理解「数据面循环不被控制面阻塞、控制面也不饿死」这一平衡，是理解 VPP 运行时行为的关键（图 06-05-01）。
 
 :::figure id=06-05-01 | name=vlib 主循环与 dispatch 调度流程 | dir=TD
 node m0 "vlib_main 初始化 进入循环" blue
@@ -857,7 +855,7 @@ barrier 期间的停顿会短暂影响吞吐与时延，因此配置变更应批
 
 **阶段五：RPC 方向**。worker 需要主线程代办控制面动作时，调用 `vlib_rpc_call_main_thread(callback, arg)` 把回调挂到主线程队列；主线程在 `vlib_main_loop` 安全点取出执行。worker 自身不直接改控制面共享状态。
 
-**阶段六：run-to-completion 数据流**。收包队列绑定到 worker → 该 worker 的 input 节点成帧 → 在同一 worker 的 pending 队列与图里一路 dispatch 到出接口（06-05）→ 全程写本线程 `vlib_node_runtime_t` 统计（无锁，06-04）。只有确需跨 worker 时才走 06-07 的 handoff。
+**阶段六：run-to-completion 数据流**。收包队列绑定到 worker → 该 worker 的 input 节点成帧 → 在同一 worker 的 pending 队列与图里一路 dispatch 到出接口（06-05）→ 全程写本线程 `vlib_node_runtime_t` 统计（无锁，06-04）。只有确需跨 worker 时才走 06-07 的 handoff（图 06-06-01）。
 
 :::figure id=06-06-01 | name=VPP 多线程模型 main 与 worker | dir=TD
 node mt "main thread 控制面 CLI/API 全局初始化" blue
@@ -935,6 +933,11 @@ vlib_worker_thread_barrier_release (vm);
 **陷阱七：帧跨线程传递破坏 run-to-completion**。过度使用 handoff / 按流分发会让包在核间来回跳，抵消扩展收益。跨线程递交的正确姿势与代价见 06-07。
 
 **最佳实践清单**：① 共享只读、写入本地；② 全局变更走 barrier 且批量低频；③ worker/网卡/buffer 三者 NUMA 对齐并绑核；④ 统计 per-thread 化；⑤ RPC 异步短小、避免死锁；⑥ 减少不必要的 handoff；⑦ 字段见 05-02/05-10、命令见 04-06、参数见 04-01。
+**失败分支分析：barrier 等不到全部 worker**。barrier sync 的完成条件是「每个 worker 都在帧边界确认」，任何一个 worker 到不了安全点，主线程就会长时间自旋等待，表现为：控制面命令卡死、`show threads` 里各 worker 的时钟差越拉越大。三类根因按序排查：① 某 worker 正在执行一个超长向量循环，尚未到达帧边界——属正常，等它跑完当前帧即可；若节点本身死循环（插件 bug）则永不返回；② 某 worker 的 process 节点长时间未让出（06-15 的协作式调度要求 process 主动让出，超时语义需对照实际版本核验）；③ worker 已崩溃或被 OOM 杀死，到齐计数永远差一。验证手段：gdb 挂主线程看 barrier 计数值与 worker 总数的差，再 `thread apply all bt` 找卡住的 worker 栈（确切计数变量需对照 `src/vlib/threads.c` 核验）。
+
+**失败分支分析：线程布局配置错误**。`corelist-workers` 写入主线程所在核、或两个 worker 绑到同一核、或核编号超过机器物理核数，行为分别是：主线程被 worker 抢占导致 CLI/API 周期性卡顿（无报错，只能从 `show threads` 的绑核列发现）；两 worker 争用同一物理核，吞吐减半且 `show cpu` 占用异常；越界则启动期报错退出（确切报错文案需对照实际版本核验）。NUMA 不对称同理：`corelist-workers` 跨两个 NUMA 节点而网卡只挂在一个节点上时，远离网卡的 worker 收包性能显著偏低，应把 `cpu{}` 与 `dpdk{}` 按 03-02/04-01 成对规划。
+
+**边界条件：worker 数为 0 与单 worker**。不配 `corelist-workers` 时 VPP 以单线程跑完数据面与控制面，功能完整但无并行；此时 barrier 退化为「自己等自己」的空操作路径（是否仍走完整 sync 流程需对照 `src/vlib/threads.c` 核验）。从单 worker 扩到多 worker 是纯配置变更；反向回退到 0 时，凡是「假设 worker > 0」的第三方脚本与监控要同步修改，避免误报。
 
 ### 7. 小结与延伸阅读
 
@@ -1003,7 +1006,7 @@ VPP 的多线程模型是「把单线程主循环复制到每个核」的 shared
 2. 主线程自旋等待；每个 worker 在 `vlib_worker_loop` 的帧边界安全点检查标志，发现请求后停止取新帧、原子把到齐计数 +1，随后自旋等待 release；
 3. 计数 == worker 总数 → 主线程确认「所有 worker 都停在帧边界、无节点函数在执行」，进入独占窗口，执行配置改写（改 FIB / feature config chain / node next 边 / 接口表），期间可安全使用 spinlock 保护非无锁结构；
 4. 主线程 `vlib_worker_thread_barrier_release`：清标志/推进 epoch、更新已发布的共享指针，唤醒 worker；
-5. worker 从安全点继续主循环，读到的是改完后的新状态（COW 下旧版本延迟回收）。
+5. worker 从安全点继续主循环，读到的是改完后的新状态（COW 下旧版本延迟回收）（图 06-07-01）。
 
 :::figure id=06-07-01 | name=线程间帧递交 handoff 与 barrier 同步 | dir=LR
 node w0 "worker0 处理帧 判定需转交" teal
@@ -1147,7 +1150,7 @@ vppinfra 的设计哲学可以概括成四条。第一，**内存布局可控且
 **clib_bihash 查找与 COW 更新**（读极多、写极少）：
 - 查找 `clib_bihash_search(BV, &kv, &result_kv)`：由 key 算 hash → 定位 bucket（常按 cache line 对齐并可预取，06-04）→ 在桶内/溢出页线性比对 KV → 命中则拷出 value。整条读路径**不加锁**，只读已发布的桶与页。
 - 更新 `clib_bihash_add_del(BV, &kv, is_add)`：定位目标桶/页 → 复制一份 **working copy**（COW）→ 在副本上插入/删除 KV → 原子发布新桶/页指针（配合内存屏障）→ 旧版本延迟回收（引用计数/epoch/在 barrier 或安全点后释放，呼应 06-07）。因此读永远看到一致版本，写之间才需要串行化。
-- 桶满时分配溢出页并链入，保持查找步数有界——这也是「bounded-index」名字的由来（确切层级与阈值需对照 `bihash_template.c` 核验）。
+- 桶满时分配溢出页并链入，保持查找步数有界——这也是「bounded-index」名字的由来（确切层级与阈值需对照 `bihash_template.c` 核验）（图 06-08-01）。
 
 :::figure id=06-08-01 | name=vec 与 pool 的内存布局与增长 | dir=TD
 node vh "vec_header_t len/alloc 在用户指针之前" blue
@@ -1230,6 +1233,11 @@ if (clib_bihash_search_8_8 (&table, &kv, &rv) == 0)
 **陷阱七：bitmap 越界与位宽假设**。`clib_bitmap_set` 会按需扩位图，但手动按 `uword` 位运算时若硬编码 64 位，在 32 位或不同字长平台会出错；一律用 `BITS(uword)` 之类宏（跨架构见 02-05）。
 
 **最佳实践清单**：① vec 存下标不存指针、复用容量用 `vec_reset_length`；② 需要稳定引用就选 pool，并管理索引代际；③ 「读多写极少」查表用 bihash，通用查找用 hash；④ 遍历 pool 用官方宏跳空洞；⑤ 位运算用 `BITS(uword)`；⑥ 容器字段/内存布局回查 05-09，timer wheel 见 06-15。
+**失败分支分析：容器操作失败时返回什么**。vppinfra 的薄接口大多**不返回错误码**，失败以「指针为 0 / 计数不足」表达，调用方必须显式检查：`vec_resize`/`vec_add` 系在内存耗尽时走分配失败路径，通常直接跳到错误处理或终止进程（确切行为需对照 `src/vppinfra/mem.c`、`vec.c` 核验），因此热路径一般不写「分配失败继续跑」的分支——VPP 的哲学是控制面内存失败 fail-fast，数据面靠预分配避免运行期分配。pool 扩容（`pool_get` 撞上数组末端）同理。把这一原则写进自定义节点：热路径只做「从池取、放回池」，任何可能失败的分配都挪到 init/config 路径。
+
+**失败分支分析：bihash 表满与冲突退化**。`clib_bihash_add_del` 在桶与溢出页都满时返回失败（确切返回值需对照 `bihash_template.c` 核验），常见错误是忽略返回值继续跑，结果「会话建不起来」却无任何告警——表现为 NAT/会话类业务新建流不通、已建流正常，而 `show errors` 无对应计数。另一类退化是哈希质量差导致所有 key 落同一桶：查找从 O(1) 退化为桶内线性扫描，`show runtime` 里对应查表节点的 clocks/packet 突增是判据。建表时按预期条目数匹配 `buckets`/`memory_size` 类参数（参数见 04-01 的会话类配置），并在表接近满时告警。
+
+**边界条件：字长与平台**。`uword` 在 x86_64 为 64 位、部分 32 位平台为 32 位（跨架构见 02-05），凡按 `sizeof(uword)` 推布局的容器（vec 头、bitmap）跨平台迁移时偏移全部重排，`pahole` 实测（方法见 05-09）是唯一可靠的核对手段。
 
 ### 7. 小结与延伸阅读
 
@@ -1293,7 +1301,7 @@ VPP 的做法是：启动时按配置预分配一大片物理内存（hugepage�
 - 克隆：`vlib_buffer_copy` 类函数生成新 buffer（新 index），数据区共享、`ref_count++`；两份逻辑包各自在图里走，释放时各减一次引用。
 - 链化：大包拆成多段，首 buffer 置 `NEXT_PRESENT` 标志、`next_buffer` 指向下一段 index；需要整包数据时沿链遍历（`vlib_buffer_chain_*`），不能只读首段。
 
-**阶段五：出接口发送与释放**。出接口/tx 节点（06-12）把 buffer 交给驱动（DPDK 侧把 buffer index 换回 `rte_mbuf`、`rte_eth_tx_burst`）；驱动发送完成后，mbuf 回到 mempool，VPP 侧 `vlib_buffer_free(vm, bi_array, n)` 把 index 批量归还本线程 free list。释放内部：先处理 `ref_count`（>1 则只减引用不归还数据）、沿 `next_buffer` 处理链上各段、最后把槽位标回空闲。丢弃路径（error-drop，06-02）同样要 `vlib_buffer_free`，否则就是 buffer 泄漏。
+**阶段五：出接口发送与释放**。出接口/tx 节点（06-12）把 buffer 交给驱动（DPDK 侧把 buffer index 换回 `rte_mbuf`、`rte_eth_tx_burst`）；驱动发送完成后，mbuf 回到 mempool，VPP 侧 `vlib_buffer_free(vm, bi_array, n)` 把 index 批量归还本线程 free list。释放内部：先处理 `ref_count`（>1 则只减引用不归还数据）、沿 `next_buffer` 处理链上各段、最后把槽位标回空闲。丢弃路径（error-drop，06-02）同样要 `vlib_buffer_free`，否则就是 buffer 泄漏（图 06-09-01）。
 
 :::figure id=06-09-01 | name=buffer 从分配到释放的生命周期 | dir=TD
 node p1 "缓冲池 per-thread free list" blue
@@ -1373,6 +1381,11 @@ for (i = 0; i < n; i++) {
 **陷阱七：把 template 初始化漏掉**。新 buffer 若不从模板 `memcpy` 而逐字段赋值，容易漏设 `ref_count=1`、flags、trace 关闭等，引发连锁问题。统一走分配辅助。
 
 **最佳实践清单**：① 分配/释放都按批（一帧）；② 每条出口（发送/丢弃/异常）都释放；③ clone/free 成对维护 ref_count；④ 整包操作遍历 chain；⑤ 谁分配谁释放、NUMA 对齐；⑥ 用 `show buffers`/`show errors` 监控泄漏与丢弃；⑦ 字段见 05-04、配置见 04-01、命令见 04-06。
+**失败分支分析：批量分配不满额**。`vlib_buffer_alloc` 类入口的返回值是「实际分配数」，可小于请求数：本线程 free list 与全局池都不足时返回部分甚至 0（确切语义需对照 `src/vlib/buffer_funcs.h` 核验）。正确的失败分支是「用多少取多少、剩下的正常处理」：input 节点只把已分配的 n 个 index 组帧投递，绝不把未初始化的 bi[] 槽位一起写进帧——写了就是「帧里带垃圾索引」，下游 `vlib_get_buffer` 解引用到未初始化 buffer，表现为随机的 malformed 与崩溃，极难定位。已分配但用不上的 buffer 必须立即 `vlib_buffer_free` 归还。分配持续不满额是 `buffers-per-numa` 偏小或泄漏的前兆，用 `show buffers` 的 free 基线确认（判读见 08-02/08-03）。
+
+**失败分支分析：双重释放与非法释放**。同一 index 被两次 `vlib_buffer_free`，第二次会把已复用的槽位标回空闲——受害的是之后分配这个槽位的无辜报文（错包/数据损坏），而非释放者本身，所以崩溃堆栈往往指向无关节点。克隆场景多减 `ref_count`、链化只释放首段不沿 `next_buffer` 走，都是同一类「释放语义不完整」。防御手段：给自定义节点的每个分支（发送/丢弃/转交）画一张 buffer 所有权转移图，保证「恰好一次释放」；经 handoff 转交（06-07）后源线程不得再释放。
+
+**边界条件：DPDK 与 vlib 双侧计数**。用 DPDK 后端时 mbuf 在 `rte_mempool` 与 VPP free list 两侧各有计数，`show buffers` 与 `show hardware-interfaces` 的可用数应长期一致；一侧正常一侧持续下降，说明 mbuf↔buffer 映射层（`src/plugins/dpdk/buffer.c`）存在未归还路径，属插件级问题，需对照实际版本核验。
 
 ### 7. 小结与延伸阅读
 
@@ -1430,7 +1443,7 @@ buffer 生命周期是「index 世界观」的落地：预分配的定长池 + p
 
 **阶段四：API 消息经共享队列传递**。外部客户端建立 API 连接（04-07）→ 在共享区里建立一对 `svm_queue_t`（请求队列/响应队列，或双向队列）→ 客户端把序列化消息写入请求队列、VPP 从队列取出分发（消息格式与 handler 机制见 **06-13**）→ 响应/事件写回队列或走 event 通道。队列用 head/tail + 内存屏障保证跨进程可见（呼应 06-07 的环形队列思想，但对象是 API 消息）。
 
-**阶段五：buffer 区独立**。数据面 buffer 池（06-09）经 `physmem`/DPDK mempool 建在 hugepage 上，与 svm 共享区并列存在；`show memory`（04-06）可看到这几类内存的占用分布。
+**阶段五：buffer 区独立**。数据面 buffer 池（06-09）经 `physmem`/DPDK mempool 建在 hugepage 上，与 svm 共享区并列存在；`show memory`（04-06）可看到这几类内存的占用分布（图 06-10-01）。
 
 :::figure id=06-10-01 | name=VPP 共享内存布局与消息队列 | dir=TD
 node base "svm_region_t 共享内存基址" blue
@@ -1513,6 +1526,11 @@ api clients: 2 (vppctl, stat-collector)
 **陷阱七：把数据面 handoff 与 svm_queue 混为一谈**。前者是进程内 worker 间传帧索引（06-07），后者是跨进程传 API 消息（06-13），对象/平面/可靠性都不同。
 
 **最佳实践清单**：① 共享结构一律用偏移/索引；② 数据面分配绝不用 mheap；③ 跨进程 ring 用 acquire/release 屏障 + 对齐；④ stat segment 客户端做版本兼容；⑤ 合理预估各共享区大小；⑥ 字段见 05-10、配置见 04-01、命令见 04-06、消息机制见 06-13。
+**失败分支分析：共享区映射失败**。`svm_map_region` 类入口失败的三种典型：① `/dev/shm` 或配置路径下残留同名旧区（上次异常退出未清理），大小/版本与新配置不一致——表现为启动报映射错误，清理残留文件后恢复（确切文件名需对照实际版本核验）；② `heapsize`/`statseg` 请求超过大页存量，`physmem` 预留失败，启动早期即退出，报错信息会指向大页数量（部署见 03-02）；③ 外部客户端与 VPP 的 svm 布局版本不兼容（跨版本混装，08-05），映射成功但字段错位，表现为统计读数离谱——采集器必须与 VPP 同版本。三类都可用 `show memory`（04-06）与 `/proc/<pid>/maps` 交叉核对实际映射区间。
+
+**失败分支分析：队列满的行为差异**。`svm_queue_add` 在队列满时的行为（阻塞等待、带超时、或立即失败）由队列创建参数与调用方决定（确切签名需对照 `src/svm/queue.c` 核验）。控制面侧要区分一种连锁：VPP 主线程消费 API 队列若被一条长命令阻塞，客户端写入会堆积直至队满——表现为「一条慢命令拖死全部控制面客户端」，治理靠把长操作挪到 process 节点（06-15）并给队列深度留合理余量（参数见 04-01）。事件推送路径同理：订阅者不读会导致其响应队列涨满，属 06-13 事件风暴的内存侧边界。
+
+**边界条件：偏移与指针的换算时机**。共享区基址在每个进程的映射地址不同，「写侧存偏移、读侧换算」的纪律只在跨进程边界生效；VPP 进程内部访问共享堆对象时可用本进程换算后的指针，但不得把该指针再写回共享区——等于把私有地址泄漏给别的进程，是陷阱一的常见变体。
 
 ### 7. 小结与延伸阅读
 
@@ -1592,7 +1610,7 @@ vlib_load_one_plugin (vlib_plugin_main_t * pm, char * path)
 
 **阶段四：加载后重建**。待加载列表处理完后，系统重新收集所有注册的静态节点（06-02）、解析 `next_nodes`、增量/全量重排 feature arc（06-03）、注册 CLI 命令树（04-02）、挂载 API handler（06-13）。至此插件节点可被 `vlib_main_loop` dispatch（06-05）。
 
-**阶段五：运行期热加载（可选）**。控制面收到加载命令（04-05/04-01）→ 主线程 `vlib_worker_thread_barrier_sync`（06-06/06-07）暂停 worker → `vlib_load_one_plugin` + 重建 → `vlib_worker_thread_barrier_release` 恢复。因为共享只读结构被改写，必须 barrier 保护。
+**阶段五：运行期热加载（可选）**。控制面收到加载命令（04-05/04-01）→ 主线程 `vlib_worker_thread_barrier_sync`（06-06/06-07）暂停 worker → `vlib_load_one_plugin` + 重建 → `vlib_worker_thread_barrier_release` 恢复。因为共享只读结构被改写，必须 barrier 保护（图 06-11-01）。
 
 :::figure id=06-11-01 | name=VPP 插件动态加载流程 | dir=TD
 node s1 "startup plugins 白黑名单与路径" blue
@@ -1672,6 +1690,11 @@ VLIB_PLUGIN_REGISTER = {
 **陷阱七：把插件注册放在非 constructor 路径**。若某段注册代码只在被显式调用的函数里执行，而该函数在 `dlopen` 时没被触发，注册就丢失。注册宏必须放在全局作用域/正确段，确保 constructor 阶段生效。
 
 **最佳实践清单**：① 注册全用官方宏放全局作用域；② 启动靠框架统一重建、运行期热加载走 barrier；③ 用 `.version` 做 ABI 校验；④ 明确插件依赖与加载顺序、保证符号可见；⑤ 加载后用 `show plugins`/`show vlib graph`/`show interface features` 验证；⑥ 字段见 05-11/05-12、配置见 04-01、命令见 04-05。
+**调用链分步走读（含源码定位）**。把第 4 节主线拆成可逐步核对的七步，每步给源码锚点：① `main`（`src/vpp/vpp.c`）解析 `plugins{}`（04-01）并初始化插件主结构（`src/vlib/plugin.c`/`plugin.h`）；② 扫描插件目录得到候选 `.so` 列表（扫描入口在 `src/vlib/plugin.c`，确切函数名需对照实际版本核验）；③ 白/黑名单过滤，记录每个候选的启用决策；④ `vlib_load_one_plugin` 读 `VLIB_PLUGIN_REGISTER` 的版本串做 ABI 检查（宏在 `src/vlib/plugin.h`，检查逻辑在 `src/vlib/plugin.c`）；⑤ `dlopen(path, RTLD_NOW | RTLD_GLOBAL)`（同文件），动态链接器执行插件内全部 constructor，注册宏把节点/feature/CLI/API 写入全局段（06-02/06-03/04-02/06-13）；⑥ 框架重新收集节点注册段并解析 `next_nodes`、重排 feature arc（注册收集入口在 `src/vlib/node.c` 一类、排序见 `src/vnet/feature/feature.h` 的 `vnet_feature_arc_init`）；⑦ CLI 命令树与 API 分发表挂载完成，`show plugins`/`show vlib graph` 可验证（04-05/04-06）。
+
+**失败分支分析：dlopen 失败与静默跳过**。dlopen 失败最常见于三类：依赖的 `.so` 不在（插件间依赖或第三方库缺失）；插件用不同版本 VPP 头编译导致符号缺失（`RTLD_NOW` 立即暴露）；路径配错。失败通常不终止进程——加载器记日志后跳过该插件继续启动（行为需对照 `src/vlib/plugin.c` 核验），因此「升级后某功能消失」的第一反应是看启动日志里 dlerror 的原文，而不是查转发配置。第二类失败是版本检查拒绝：`.version` 串与主程序不一致时插件被拒，日志有明确记录。第三类最隐蔽：dlopen 成功、注册也发生了，但加载后重建（第⑥步）失败或被跳过，插件节点「注册了却不在图里」——用 `show plugins`（已加载）与 `show vlib graph`（已接入）两步对照，即可把问题定位到第⑤⑥步之间，这是插件排障的固定分叉点。
+
+**边界条件：热加载与静态注册的差异**。运行期加载（04-05）走同一加载函数但处于 barrier 内（06-06/06-07），且只能「新增」难以安全「替换」：`dlclose` 卸载后其注册的节点/CLI/API 是否被对称移除、依赖它的 feature 链如何重排，属高漂移实现细节，使用前需对照实际版本核验。生产上更稳妥的做法是「启动期定版 + 版本升级走 08-05 的重启迁移」。
 
 ### 7. 小结与延伸阅读
 
@@ -1768,6 +1791,7 @@ dpdk_input (vlib_main_t * vm, vlib_node_runtime_t * rt, vlib_frame_t * f)
 }
 ```
 
+把上面的伪代码与图对照着读：左半是收包侧——`rte_eth_rx_burst` 无中断轮询取回一批 mbuf，经 mbuf↔buffer 映射换成一帧 index；右半是处理与发送侧——帧沿 vlib 图批量 dispatch 后由 tx 回调 `rte_eth_tx_burst` 批量发出，发送完成的回收经虚线回到下一轮轮询，形成图 06-12-01 的闭环。看图顺序按蓝→青→琥珀→绿→灰推进，与第 4 节收包/处理/发送三条链一一对应。
 :::figure id=06-12-01 | name=DPDK PMD 批处理收发调度 | dir=TD
 node rx "rte_eth_rx_burst 批量收包 无中断轮询" blue
 node cvt "rte_mbuf 转 vlib_buffer index 成帧" teal
@@ -1832,6 +1856,13 @@ cpu {
 **陷阱七：把 input 节点当 INTERNAL 用**。`dpdk-input` 是 `VLIB_NODE_TYPE_INPUT`、由主循环每轮主动调用（06-05/06-02），不是被 pending frame 触发的；搞错类型会导致收包不触发或重复轮询。
 
 **最佳实践清单**：① 队列/worker/NUMA/hugepage 四者对齐；② burst 尽量凑满、监控 `vectors/call`；③ 未入队/已发送 buffer 都正确释放；④ 经 device class 抽象收发；⑤ 用 `show hardware-interfaces`/`show node runtime`/`show errors` 监控；⑥ 字段见 05-11/05-05/05-04、参数见 04-01、命令见 04-03/04-06。
+**失败分支分析：rx burst 恒为 0**。流量在打、`dpdk-input` 的 vectors/call 却长期为 0，按固定顺序排查四层：① 队列归属——该 (port, queue) 没有分配给本 worker（设备到线程的分配发生在 `src/plugins/dpdk/` 的初始化代码，需对照实际版本核验），换到负责该队列的 worker 用 `show runtime` 验证；② 接口未 up 或设备未 start——`show interface` 的 state 与 `show hardware-interfaces` 的队列标志；③ RSS 把流全部分到了其它队列——用 `show hardware-interfaces` 的每队列收包计数定位包实际落在哪；④ VLAN/流量类型与网卡过滤配置不匹配。四层都排除后仍为 0，才怀疑驱动层。
+
+**失败分支分析：tx 发送不满额**。`rte_eth_tx_burst` 返回「成功入队数」，小于 n 表示 tx ring 满——失败分支必须把未入队的 mbuf/buffer 立即释放（06-09），否则泄漏；正确实现还会把残余留给下一轮重试（是否重试及策略需对照 `src/plugins/dpdk/device.c` 核验）。tx ring 持续打满的根因通常是「发送带宽 < 待发流量」（拥塞，查上游限速）或「描述符数量/free 阈值配置过低」（参数见 04-01），表现为驱动侧丢包计数同步上涨（`show hardware-interfaces`）。第三个分支是链路 down：`rte_eth_tx_burst` 仍可能「成功入队」但包被网卡丢弃，判据是接口收发计数不对等（`show interface`，判读见 08-03）。
+
+**失败分支分析：mbuf 耗尽**。突发流量叠加回收不及时会耗尽 mempool，此后 `rte_eth_rx_burst` 仍能取回 mbuf，但 VPP 侧换算/初始化失败，包在 input 阶段被丢弃并计错误（确切计数器需对照 `src/plugins/dpdk/` 核验）。判据是 mempool in-use 比例长期高位、且丢包与流量突发同步。治理按序：加大 `buffers-per-numa`（04-01）；检查是否有节点持有 buffer 过久（深队列/缓存类特性）；确认发送完成回收路径无泄漏（06-09 陷阱一）。
+
+**失败分支分析：多队列/多驱动兼容**。部分网卡 PMD 对 burst 上限、描述符数量、offload 组合有额外约束：多数在设备 start 阶段报错（启动日志可见），少数表现为性能异常而非报错（如描述符未按对齐要求配置导致每轮收不满帧）。遇到「配置了 N 个队列实际只起 M 个」，先看启动日志的 PMD 告警，再对照该 PMD 在 DPDK 文档中的约束；涉及具体网卡型号的行为需对照实际版本核验。
 
 ### 7. 小结与延伸阅读
 
@@ -1895,7 +1926,7 @@ PMD 是 VPP 数据面与物理网卡之间的桥梁：用户态、无中断、�
 **阶段四：事件推送**。
 1. 客户端发 `want_xxx_events(enable, client_index, context)` 订阅 → VPP 把该 `client_index` 加入对应事件类型的订阅者集合（字段见 05-12）；
 2. 数据面/控制面事件发生（接口状态变化、统计刷新、表项变化等）→ 构造 event 消息；
-3. 遍历订阅者，把 event 写入各自响应队列；客户端异步读取、无需请求上下文。
+3. 遍历订阅者，把 event 写入各自响应队列；客户端异步读取、无需请求上下文（图 06-13-01）。
 
 :::figure id=06-13-01 | name=Binary API 消息机制与分发 | dir=TD
 node api "*.api IDL 定义消息" blue
@@ -1982,6 +2013,13 @@ vl_api_my_feature_enable_t_handler (vl_api_my_feature_enable_t * mp)
 **陷阱七：把 Binary API 与 CLI、统计混为一谈**。CLI 是文本交互（04-02）、stat segment 是 mmap 共享统计（06-10/08-02）、Binary API 是二进制消息通道（本篇/04-07）；三者入口与用途不同，排障时先分清走哪条。
 
 **最佳实践清单**：① 用 IDL 生成绑定、不手写结构；② 严格校验消息长度与变长字段；③ reply 带回 `context`、写对 `client_index`；④ 配置 handler 走 barrier；⑤ 事件订阅对称注册/清理、节流；⑥ 用 `api-trace`/`show api clients` 排障；⑦ 字段见 05-12、传输见 06-10、编程见 04-07、命令见 04-06、参数见 04-01。
+**调用链分步走读（含源码定位）**。以一次「下发配置」为例把第 4 节拆成八步：① 客户端用 `.api` 生成的绑定填 `vl_api_xxx_t`（`client_index`/`context` 必填）；② 经 socksvr 建立的通道写入——共享内存时 `svm_queue_add`（`src/svm/queue.c`，06-10），socket 时走 `src/vlibmemory/` 的 socket 服务端读路径（确切文件需对照实际版本核验）；③ VPP 侧从队列取出消息，按消息头总长做边界校验；④ 取 `_vl_msg_id` 查分发表——注册在插件加载期由 `vl_msg_api_set_handlers` 类入口完成（头文件见 `src/vlibapi/`，加载时机见 06-11 第⑤步）；⑤ 调用 `vl_api_xxx_t_handler`（各模块 `*_api.c`，如 `src/vnet/interface_api.c`）；⑥ 配置类 handler 在 barrier（06-06/06-07）内调核心函数（如 `vnet_feature_enable_disable`）；⑦ 构造 reply：autoreply 由宏生成，普通 reply 显式填返回码与原 `context`，回写通道；⑧ 客户端按 `context` 匹配。把每步与 `api-trace`（04-01/04-06）记录逐条对照，是这类排障的标尺。
+
+**失败分支分析：unknown message id**。客户端与 VPP 版本不一致时，客户端发的 msg_id 在 VPP 分发表里不存在（或反之），消息被丢弃并计 API 错误（计数与日志行为需对照 `src/vlibapi/`、`src/vlibmemory/` 的分发函数核验）。常见变体是「dump 正常、detail 丢失」：旧版本 VPP 没有新版 `.api` 增补的消息。处理原则只有一条：客户端绑定必须与目标 VPP 同源生成（04-07），govpp 等库的消息集合同样按版本配套（08-05）。
+
+**失败分支分析：context 错配与订阅残留**。并发多请求时若客户端复用同一 `context`，reply 匹配错乱表现为「A 命令收到 B 的回包」；正确做法是每个在途请求分配唯一 context（成熟客户端库已封装，自研客户端要自己保证）。客户端异常退出时，VPP 依赖清理回调把该 `client_index` 从事件订阅集合移除（清理路径需对照 `src/vlibmemory/` 核验）；清理失效则 event 持续写向死连接的队列，最终把该队列写满——现象是「断开的客户端仍占用队列」与 API 错误计数上涨，重启对端或清理客户端表（04-06）恢复。
+
+**失败分支分析：控制面过载**。handler 全部跑在主线程，单个慢 handler（大表 dump、逐条 barrier 配置）会让所有客户端排队，`show api clients` 的队列积压与 `show runtime` 里主线程占用是判据。治理：dump 类查询分批分页、配置类合并下发（06-06 陷阱一）、大流量统计改走 stat segment（06-10）。
 
 ### 7. 小结与延伸阅读
 
@@ -2041,7 +2079,7 @@ VPP 把这套能力做成一组可插拔的图节点/feature（06-03），而不
 
 **阶段四：标记**。marking 节点依 color / class / 接口配置改写 IP DSCP/ECN 或二层 802.1p（在 rewrite/封装前的正确位置），写回报文头（06-09 的 `current_data` 改写，零拷贝）。
 
-**阶段五：排队与调度（HQoS）**。出接口前，按 class/队列映射把包放入相应队列；拥塞时由调度器按层级优先级/权重批量出队（DPDK `rte_sched` 或 sw queue）→ `interface-output` → tx（06-12）。多 worker 下需保证同一端口队列的驱动归属明确（06-06/06-07）。
+**阶段五：排队与调度（HQoS）**。出接口前，按 class/队列映射把包放入相应队列；拥塞时由调度器按层级优先级/权重批量出队（DPDK `rte_sched` 或 sw queue）→ `interface-output` → tx（06-12）。多 worker 下需保证同一端口队列的驱动归属明确（图 06-14-01，另见 06-06/06-07）。
 
 :::figure id=06-14-01 | name=QoS 流分类监管与队列调度流程 | dir=TD
 node in "收包进入 feature 子链" blue
@@ -2126,6 +2164,11 @@ Policer 0: cir 1000 kbps, cbs 100000
 **陷阱七：把 QoS 当孤立命令理解**。分类→监管→标记→排队是上下游链，只配 policer 不配分类映射、或只配 classify 不挂 feature 子链，都会「配了不生效」。用 `show interface features`（04-06）确认子链已挂。
 
 **最佳实践清单**：① 精确设 mask、监控命中率与冲突；② 令牌桶参数按单位精确、时间用 `vlib_time_now`；③ 标记放在封装/rewrite 前的正确位置；④ policer 状态 per-thread、HQoS 队列归属明确；⑤ opaque 按框架约定使用；⑥ 用 `show classify tables`/`show policer`/`show errors` 验证整条链；⑦ 命令见 04-05、show 见 04-06、功能见 07-11、字段见 05-04。
+**失败分支分析：classify 全 miss**。hits 长期为 0 的三个根因按序核验：① 表未挂到接口的 feature 子链——`show interface features`（04-06）确认 classify 节点在收包方向已启用（编排见 06-03）；② mask 偏移错——以太网头含 VLAN 时 IP 头起点逐层后移，mask 若按「无 VLAN」的偏移抽 key，抽到的是 VLAN 头字节，哈希恒不命中（偏移语义需对照 `src/vnet/classify/` 核验）；③ 流量字段与 mask 粒度不符（如按 /32 掩码配表而流量源地址不断变化）。三者的判据都来自 `show classify tables` 的 hits/misses 对比（04-06）。
+
+**失败分支分析：policer 三色失真**。conform 恒 0、全部 violate：令牌桶参数单位配错（把 pps 当 kbps、或把字节按包计），或桶深配 0（桶永远为空、任何包都超速）；conform/exceed 比例与打流速率明显不符：时间源异常（`vlib_time_now` 未随主循环正常更新，06-05）或桶状态被多 worker 竞争写（陷阱四）。验证方法：恒定速率打流，观察三色计数与理论值的偏差是否随速率线性放大（方法学见 08-01）；参数语义需对照实际版本核验（`src/vnet/policer/`）。
+
+**失败分支分析：HQoS 配了不生效**。特征是「分类与监管都正常，但出口看不到整形/调度效果」。三个常见缺口：① 调度节点未挂到出方向 feature（编排见 06-03）；② 使用 DPDK HQoS 时端口未启用 `rte_sched`（`src/plugins/dpdk/` 的 HQoS 初始化路径，需对照实际版本核验）；③ 队列归属与 worker 不一致，包走了旁路直接 tx（06-12）。判据：`show runtime` 里调度节点的 calls/vectors 是否非零，为零即包根本没经过它。
 
 ### 7. 小结与延伸阅读
 
@@ -2157,7 +2200,7 @@ VPP 的答案是把这类工作从图节点体系中剥离出来，交给一类�
 
 **事件（event）与信号（signal）**：这两个词在 VPP 代码里含义接近但不完全等同。event 通常指进程节点之间/从图节点到进程节点的异步通知，带类型与 opaque；signal 更多用于"一次性触发某个处理"的轻量标记，以及 `vlib_signal_timer` 这类定时回调。实践中可以理解为同一套"投递—就绪—唤醒"机制的不同封装层。
 
-**barrier（屏障）**：当控制面需要修改全局数据结构（增删接口、改 worker 数、重载配置）时，必须让所有 worker 暂时离开包处理循环，这就是 barrier。进程节点与 barrier 有微妙关系：进程节点一般只运行在 main 线程，但 barrier 期间主循环本身处于特殊状态，若进程节点此时挂起等待某个只有 worker 才能产生的事件，就会形成互相等待。因此涉及全局配置变更的代码要走 `vlib_worker_thread_barrier_sync` / `..._release` 配对，且不要在 barrier 持有期间做长耗时等待（详见 06-06 / 06-07）。
+**barrier（屏障）**：当控制面需要修改全局数据结构（增删接口、改 worker 数、重载配置）时，必须让所有 worker 暂时离开包处理循环，这就是 barrier。进程节点与 barrier 有微妙关系：进程节点一般只运行在 main 线程，但 barrier 期间主循环本身处于特殊状态，若进程节点此时挂起等待某个只有 worker 才能产生的事件，就会形成互相等待。因此涉及全局配置变更的代码要走 `vlib_worker_thread_barrier_sync` / `..._release` 配对，且不要在 barrier 持有期间做长耗时等待（详见 06-06 / 06-07，图 06-15-01）。
 
 :::figure id=06-15-01 | name=进程节点协作式调度与定时轮 | dir=TD
 node n1 "vlib_main_loop" blue
@@ -2173,6 +2216,8 @@ edge n5 -> n3 "唤醒"
 :::
 
 ### 3. 关键数据结构与源码位置
+
+本篇涉及的结构体按「执行流状态 → 节点框架 → 调度挂载 → 定时与观测」分层，下表按此顺序排列：排「进程节点不醒」问题时从 `vlib_process_t` 行查起，「字段见 05-xx」行回到字段权威源，源码位置列可直接用于 `rg` 定位。
 
 | 名称 | 作用 | 源码位置 |
 |---|---|---|
@@ -2207,7 +2252,7 @@ vlib_main_loop
 
 **定时器到期**：插件创建定时器时指定"多少滴答后到期"。定时轮按槽组织，主循环每次推进只扫描当前槽；到期项触发回调，回调里通常只做一件事——给对应进程节点发事件，把真正的业务处理留给进程节点。这样把"时间触发"与"事件驱动"统一到一条路径上，也避免了在定时器中断式上下文里做重活。
 
-**与 API/控制面的衔接**：控制面通过 Binary API（见 06-13 / 04-07）下发配置时，API handler 常需要"通知某模块重新扫描配置"。典型做法就是给该模块的进程节点发一个事件，进程节点醒后读取新配置并执行。这条链把 04 全册的配置命令、06-13 的消息机制与本篇的事件机制串成一条完整通路。
+**与 API/控制面的衔接**：控制面通过 Binary API（见 06-13 / 04-07）下发配置时，API handler 常需要"通知某模块重新扫描配置"。典型做法就是给该模块的进程节点发一个事件，进程节点醒后读取新配置并执行。这条链把 04 全册的配置命令、06-13 的消息机制与本篇的事件机制串成一条完整通路（图 06-15-02）。
 
 :::figure id=06-15-02 | name=事件投递到进程节点唤醒的调用链 | dir=TD
 node n1 "CLI / Binary API handler" blue
