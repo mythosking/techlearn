@@ -1,0 +1,1259 @@
+# Hyperscan 技术资料 · 05 关键数据结构字段详解（分片 A）
+
+## 05-01 全册结构分层与跨文档索引
+
+### 1. 本篇定位与覆盖范围
+
+Hyperscan 的技术资料里最容易出现两种失真：一种是把 API 参数与结构体字段混为一谈，另一种是把「运行时对象」和「编译期临时对象」混为一谈。05 册存在的意义就是把第二种失真按住。本册是全套九册中唯一的结构体字段权威源，只回答四个问题：这个字段叫什么、是什么类型、在什么时机被写、被哪些函数读。编译流水线怎么走、Rose 怎么分解、引擎怎么按规模选型，一律不在本册展开，只给入口函数名与源码路径。
+
+本分片覆盖 05-01 至 05-05：分层与索引、`hs_database`、`hs_scratch`、四个编译侧结构体、`RoseEngine` 与 `RoseContext`。后续分片覆盖 05-06 至 05-09：LimEx NFA 与 Castle、FDR/Teddy/HWLM、NG 图结构、流状态与 SOM 槽位及 Chimera 结构。两片之间用统一的七列表格与统一的图号规则衔接，篇号连续、不重号，图 id 全局唯一。
+
+读法上有一个硬约定：本册不按「编译 → 扫描」的时间顺序组织，而按「对象所有权」组织。原因是 Hyperscan 的运行时对象只有三个——数据库、scratch、流，其余全部是数据库字节码内部的子结构。所有权关系决定了三件工程上最要命的事：谁负责释放、能不能跨线程、扩容时会不会把指针搬走。把这三件事搞清楚，后面读 06 册的机制才有落脚点，否则会出现「看得懂每一步，但不知道状态存在哪」的情况。
+
+字段表统一使用七列：`字段 | 类型 | 含义 | 源码位置 | 读写时机 | 关联函数与流程 | 版本差异`。凡是本轮快照中无法百分百确认的字段名、类型或语义，一律写「需对照实际版本核验」并给出可定位的源码路径，不做猜测性描述。版本基线为 5.4.2，源码快照位于 `_hs_build/upstream_src/`，目录结构与上游仓库一致；所有行号均指该快照。
+
+还有一条边界要提前说清：本册讲「字段怎么用」，不讲「字段为什么这么设计」。例如 `RoseEngine::noFloatingRoots` 的语义是「若锚定表无命中则跳过浮动表」，这属于字段含义，本册要写；而它如何与历史缓冲区的补匹配配合，属于机制，见 06-11。这样切分之后，05 册可以当工具书随查，06 册可以当教材顺序读，两边不重复。
+
+### 2. 索引与全参数表
+
+分层不按功能划分，而按「谁持有谁、谁能改谁」划分。这样划分之后，五个层次的边界非常清楚：越往下越不可变，越往下越依赖偏移而不是指针。五层之间的持有关系与访问方向见图 05-01-01，图中实线表示持有或引用，虚线表示只在编译期参与。
+
+:::figure id=05-01-01 | name=Hyperscan 运行期对象的五层分层与持有关系 | dir=TD
+node api "公共句柄与错误码" blue
+node api2 "hs_database_t / hs_error_t" blue
+node db "数据库（不可变）" amber
+node db2 "头部 192 字节 + bytes" amber
+node sc "scratch（每线程）" green
+node st "流状态 hs_stream" teal
+node en "引擎内部结构" purple
+node en2 "RoseEngine / NFA / HWLM" purple
+node cp "编译侧临时结构" gray
+edge api -> api2 "类型定义"
+edge api2 -> db "hs_compile 产出"
+edge api2 -> sc "hs_alloc_scratch"
+edge sc -> db "扫描时只读引用"
+edge sc -> st "core_info.state 指向"
+edge db -> db2 "自描述"
+edge db2 -> en "bytes 起点"
+edge st -> en "按偏移访问"
+edge en -> en2 "内部子表"
+edge cp -> db "仅编译期参与"
+:::
+
+表 1 给出五层的代表对象、定义位置、生命周期与线程模型。
+
+| 层次 | 代表对象 | 定义位置 | 生命周期 | 线程模型 | 权威篇 |
+|---|---|---|---|---|---|
+| L0 公共句柄 | `hs_database_t`、`hs_error_t`、`hs_alloc_t` | `src/hs_common.h` | 全程 | 类型本身无状态 | 05-01、04-08 |
+| L1 数据库 | `struct hs_database` | `src/database.h` | 编译产出到 `hs_free_database` | 只读，可多线程共享 | 05-02 |
+| L2 scratch | `struct hs_scratch` | `src/scratch.h` | 每次扫描的工作区 | 每线程一份，非线程安全 | 05-03 |
+| L3 流状态 | `struct hs_stream` | `src/stream_compress.h` 等 | 每次流会话 | 单流单线程 | 05-09 |
+| L4 引擎内部 | `RoseEngine`、`NFA`、`HWLM`、`FDR` | `src/rose/rose_internal.h` 等 | 随数据库常驻 | 只读 | 05-05 至 05-07 |
+| L5 编译侧临时 | `hs_platform_info_t` 等四个 | `src/hs_compile.h` | 单次编译调用 | 调用方线程私有 | 05-04 |
+
+第三列与第五列值得单独强调：只有 L2 是「可写且每线程私有」，只有 L1 是「只读且可共享」，这两个结论构成了 Hyperscan 并发模型的基础。第四列则解释了为什么数据库可以序列化分发——它的生命周期与进程无关，只与「编译产物」这一身份有关。
+
+第二张表把本分片五篇的覆盖面对齐到结构体，便于按类型反查篇号。
+
+| 篇号 | 主题 | 主要结构体 | 头文件 |
+|---|---|---|---|
+| 05-01 | 分层与跨文档索引 | 无（索引篇） | `src/hs_common.h` |
+| 05-02 | 数据库与字节码布局 | `struct hs_database` | `src/database.h` |
+| 05-03 | scratch 字段与生命周期 | `struct hs_scratch`、`struct core_info` | `src/scratch.h` |
+| 05-04 | 编译侧四个结构体 | `hs_platform_info_t` 等 | `src/hs_compile.h` |
+| 05-05 | Rose 引擎与上下文 | `RoseEngine`、`RoseContext` | `src/rose/rose_internal.h` |
+
+表 1 与表 2 的对应关系是「层次 → 篇号」的多对一：L4 横跨 05-05 到 05-07，因为 Rose 之下还有 NFA、HWLM、FDR 三族子结构，塞进一篇会让字段表长到不可用。这种拆分方式与 `src/` 的真实目录一致，而不是按概念生造章节。
+
+从实际查阅频率看，索引有三种典型用法。第一种是「按症状查字段」：例如扫描返回 `HS_SCRATCH_IN_USE`，直接翻 05-03 的 `in_use` 行，看读写时机与关联函数。第二种是「按内存量查字段」：例如要估算单流内存，先看 05-05 的 `stateOffsets.end` 与 `historyRequired`，再看 05-09 的流头。第三种是「按 API 查结构」：例如手里有 `hs_expression_info` 的返回值，翻 05-04 看五个字段哪些是保守值。
+
+### 3. 逐项详解
+
+#### 3.1 L0：公共句柄与分配器家族
+
+`hs_database_t` 在 `src/hs_common.h` 第 64 行只有一行前置声明 `typedef struct hs_database hs_database_t;`，这意味着公共头文件里拿不到任何字段。这个设计不是疏漏，而是 ABI 保护：数据库布局属于实现细节，任何字段调整都不应该影响调用方的编译单元。同理 `hs_error_t` 只是 `int` 的别名（第 69 行），错误码取值全部定义在 `HS_ERROR` 分组里，具体语义属于 04-08 的范围。
+
+分配器有五个入口：`hs_set_allocator`、`hs_set_database_allocator`、`hs_set_misc_allocator`、`hs_set_scratch_allocator`、`hs_set_stream_allocator`，对应的函数指针类型是 `hs_alloc_t`（`void *(HS_CDECL *)(size_t)`）与 `hs_free_t`（`void (HS_CDECL *)(void *)`）。从字段视角看，这个家族决定了两件事：数据库内存是否来自页对齐映射（`hs_db_alloc` 内部按页分配，并在 HMAC 计算完成后调用 `hs_db_protect` 改成只读），以及 scratch 的对齐下限。`src/scratch.h` 的结构体注释写得很直白：scratch 不要求 16 字节对齐，因为它由等价于 malloc 的分配器给出，甚至可能来自用户自定义分配器。这条注释直接解释了为什么 scratch 里有一个 `scratch_alloc` 字段——结构体本身会被向上取整到 64 字节边界，释放时必须回到原始指针。
+
+`HS_CDECL` 也不是装饰。它决定回调与分配器函数在 32 位 Windows 上的调用约定，一旦调用方用错约定，表现为栈失衡导致的随机崩溃，而不是编译错误。字段层面能看到的痕迹只有 `core_info::userCallback` 的函数指针类型，它同样带 `HS_CDECL`。
+
+#### 3.2 L1：数据库
+
+数据库是不可变对象。编译完成、HMAC 计算完成之后，整块内存被置为只读，后续所有扫描只做读取。这一点从字段设计就能看出来：`hs_database` 里没有任何「当前状态」字段，没有游标、没有计数、没有缓存指针，只有魔数、版本、长度、平台、字节码偏移和两段 HMAC。真正的引擎参数全部下沉到 `bytes[]` 里的 `RoseEngine`，用相对偏移访问。
+
+不可变带来两个工程后果。第一，一个数据库可以被任意多个线程同时扫描，不需要加锁，这也是 Hyperscan 能在多核场景线性扩展的前提。第二，数据库可以序列化后跨进程、跨机器分发，接收端只需要版本与平台匹配。第二点的代价是「版本绑定」：`version` 不匹配返回 `HS_DB_VERSION_ERROR`，`platform` 不匹配返回 `HS_DB_PLATFORM_ERROR`，两者的判定点分别在 `validDatabase` 与 `db_check_platform` 里。
+
+需要提醒的是，「不可变」是库自身遵守的约定，不是内存保护的全部。`hs_db_protect` 在支持 mprotect 的平台上确实把页改成只读，但用户如果用 `hs_deserialize_database_at` 把数据库放进自己管理的可写缓冲区，只读保护是否生效取决于实现与页对齐情况。字段本身没有任何「已保护」标志，所以不要指望从结构体里判断这件事。
+
+#### 3.3 L2：scratch
+
+scratch 是唯一「每次扫描都可写」的顶层对象。它的字段可以粗分为四组：容量与尺寸（`scratchSize`、`bStateSize`、`tStateSize`、`fullStateSize`、`queueCount` 等）、指针区（`bstate`、`tstate`、`fullState`、`queues`、`aqa`）、扫描上下文（`core_info`、`tctxt`）、以及各类引擎的私有暂存（`al_log`、`delay_slots`、`deduper`、SOM 数组、`fdr_conf`）。
+
+关键事实只有一个：scratch 不是线程安全的。`src/scratch.h` 用 `u8 in_use` 加一对 `markScratchInUse` / `unmarkScratchInUse` 做「同一时刻只允许一个 API 调用进入」的保护，但这是协作式而非原子式的检查：两个线程同时读到 `in_use == 0` 都可能通过。因此正确用法是一线程一份，或者在池化时保证同一份 scratch 不被并发借出。误用时的表现是 `HS_SCRATCH_IN_USE`，更糟的是静默的数据竞争。
+
+另一个容易忽略的点是容量语义：scratch 的容量是「它所服务过的所有数据库的并集」，而不是某一个数据库的需求。`hs_alloc_scratch` 每次调用都拿当前数据库的 `RoseEngine` 与已有原型逐字段取较大值，只有出现更大需求时才重新分配。因此多库场景必须对每个库都调用一次，直到全部返回 `HS_SUCCESS`。
+
+#### 3.4 L3：流状态
+
+流状态 `hs_stream` 同样是公共头文件里的不透明类型，但它和数据库的差别在于「可变且按流私有」。它由 `hs_open_stream` 分配，内部前半部是流头，后半部是 `RoseEngine::stateOffsets` 描述的玫瑰状态区。scratch 与它的关系体现在 `bStateSize` 上：块模式下这个值等于 `stateOffsets.end`，向量化模式下等于 `sizeof(struct hs_stream) + stateOffsets.end`（见 `src/scratch.c` 的赋值分支），因为向量化扫描需要一块能容纳完整流状态的临时区。
+
+这也解释了一个常见疑惑：同一个数据库，块模式与向量化模式的 scratch 大小不同。差异不在模式本身，而在 `bStateSize` 的计算方式。流状态的字段级细节（压缩表示、SOM 槽位）属于 05-09，本分片只在 05-05 里交代 `historyRequired` 与 `stateOffsets.end` 这两个「决定流状态大小」的字段。
+
+#### 3.5 L4：引擎内部结构
+
+从这一层开始，所有结构都不再是「独立分配的对象」，而是数据库字节码里的一段。`hs_get_bytecode(db)` 返回 `(const char *)db + db->bytecode`，这个地址就是 `RoseEngine` 的起点；`RoseEngine` 之后的 engine blob、各类字面量匹配表、NFA 偏移数组、状态偏移数组，全部用 `u32` 偏移自描述，没有一个指针。
+
+这种「偏移代替指针」的设计有三个直接好处：数据库可以整块复制、可以序列化、可以映射到任意地址；也有一个直接代价：任何越界偏移都是内存安全问题，所以 5.4.x 的反序列化路径里加入了大量偏移校验（`db_validate_rose_offsets`、`validateStateLayout`、`db_validate_rose_programs` 等）。字段表里标注「偏移」的项，都应该按「相对谁的偏移」来读，这是本册最容易读错的地方：`RoseEngine::amatcherOffset` 相对 `RoseEngine` 起点，`NfaInfo::stateOffset` 相对流状态起点，`RoseStateOffsets::history` 同样相对流状态起点。
+
+判断一个字段是「相对数据库」还是「相对状态」，有个简单的经验：凡是描述「编译产物内部位置」的偏移，基准是 `RoseEngine` 起点；凡是描述「运行时数据在流或 scratch 中的位置」的偏移，基准是状态区起点。两者混用会得到看起来合理、实际错位的地址，且往往只在特定模式（流式/向量化）下暴露。
+
+#### 3.6 L5：编译侧临时结构
+
+`hs_platform_info_t`、`hs_expr_info_t`、`hs_expr_ext_t`、`hs_compile_error_t` 四个结构全部定义在 `src/hs_compile.h`，它们的共同点是「只在一次编译调用期间存在」：前两个是入参/出参，第三个是每条模式的扩展参数，第四个是失败时的错误描述。它们不会进入数据库字节码，因此不参与序列化，也不影响运行时布局。
+
+把它们单独列为一层，是为了避免一种常见混淆：看到 `hs_expr_info_t::min_width` 就以为运行时用它做边界判断。实际上运行时用的是 `RoseEngine::minWidth` 与各 matcher 的 `MinWidth`，两者来源相同但存放位置不同，一个是调用方可见的查询结果，一个是编译产物里的常量。前者可以保守，后者必须精确到运行时能用。
+
+#### 3.7 跨文档索引方法
+
+推荐三步法。第一步定对象：你要查的是数据库、scratch、流，还是某个引擎子结构。第二步定字段：在本册对应篇的字段表里按列定位，注意「源码位置」列给的是文件与行号，可以直接跳读。第三步按需跳转：参数取值、位值、默认值看 04；机制、状态机、调用链看 06；模块职责与文件清单看 07。
+
+举三个例子。查「`HS_FLAG_SOM_LEFTMOST` 会不会影响数据库布局」，标志位本身在 04-02，但它导致的 `hasSom`、`somLocationCount`、`somHorizon` 字段在 05-05，机制在 06-10。查「scratch 为什么这么大」，容量字段在 05-03，尺寸计算入口在 04-06，调优建议在 08-02。查「数据库跨机报平台错误」，`platform` 字段在 05-02，校验顺序在 06-12，处置流程在 08-04。
+
+（字段见 05-02 ｜ 参数见 04-06 ｜ 原理见 06-12 ｜ 模块见 07-10）
+
+### 4. 典型示例
+
+下面这段代码不做任何匹配，只把三层对象的「身份信息」打出来：数据库头部的魔数与长度、scratch 的实际分配字节数、以及 `hs_database_info` 的字符串。它是排查现场问题的第一段代码，通常比任何日志都直接。为了让结构体字段可见，示例直接包含内部头 `database.h`，仅用于诊断工具，产品代码不应这样写。
+
+```c
+#include "database.h"
+#include <hs.h>
+#include <stdio.h>
+#include <stddef.h>
+#include <stdlib.h>
+
+int main(void) {
+    hs_database_t *db = NULL;
+    hs_compile_error_t *err = NULL;
+    hs_scratch_t *scratch = NULL;
+
+    if (hs_compile("foo|bar[0-9]{3}", HS_FLAG_CASELESS, HS_MODE_BLOCK,
+                   NULL, &db, &err) != HS_SUCCESS) {
+        printf("compile failed: %s\n", err->message);
+        hs_free_compile_error(err);
+        return 1;
+    }
+
+    printf("sizeof(struct hs_database) = %zu\n", sizeof(struct hs_database));
+    printf("offsetof(bytes)             = %zu\n",
+           offsetof(struct hs_database, bytes));
+    printf("db magic=0x%08x version=0x%08x length=%u\n",
+           db->magic, db->version, db->length);
+    printf("db platform=0x%016llx bytecode_off=%u\n",
+           (unsigned long long)db->platform, db->bytecode);
+
+    if (hs_alloc_scratch(db, &scratch) != HS_SUCCESS) {
+        printf("alloc scratch failed\n");
+        hs_free_database(db);
+        return 1;
+    }
+
+    size_t ssize = 0;
+    hs_scratch_size(scratch, &ssize);
+    printf("scratch size = %zu bytes\n", ssize);
+
+    char *info = NULL;
+    if (hs_database_info(db, &info) == HS_SUCCESS) {
+        printf("info: %s\n", info);
+        free(info);
+    }
+
+    hs_free_scratch(scratch);
+    hs_free_database(db);
+    return 0;
+}
+```
+
+编译时需要把 `src` 加入头文件搜索路径，并链接 `hs`。示例输出如下（示例输出，具体格式需对照实际版本核验）。
+
+```text
+sizeof(struct hs_database) = 192
+offsetof(bytes)             = 192
+db magic=0xdbdbdbdb version=0x05040200 length=1104
+db platform=0x0000000000000000 bytecode_off=192
+scratch size = 8704 bytes
+info: Version: 5.4.2 Features:  Mode: BLOCK
+```
+
+判读要点有四条。第一，`sizeof(struct hs_database)` 与 `offsetof(bytes)` 都应是 192，这是 `padding[25]` 存在的唯一目的；任何偏离都说明头文件与库不是同一版本，此时用自定义结构体读字段必然错位。第二，`magic` 应为 `0xdbdbdbdb`，若构建时用了 `-DHS_DB_MAGIC=`，这里会变成自定义值，跨团队协作时必须先对齐这个值，否则对方库直接返回 `HS_INVALID`，而且错误信息里不会提到魔数。第三，`version` 是 `major<<24 | minor<<16 | patch<<8`，5.4.2 对应 `0x05040200`，若最高字节为 0 说明这是开发版或本地改动版。第四，`platform` 为 0 表示编译时未指定平台信息、按当前主机优化，`Features:` 后为空也印证了这一点；`bytecode_off` 在页对齐分配下等于 192，只有在用户自备缓冲区时才可能小于 192。`scratch size` 的量级由数据库中最复杂的引擎决定，与模式条数不成正比，这一点在 05-03 会逐字段解释。
+
+### 5. 速查表
+
+| 我想确认的事 | 去看 |
+|---|---|
+| 数据库头部有哪些字段、偏移多少 | 05-02 第 3 节偏移表 |
+| scratch 某个指针字段属于哪个引擎 | 05-03 第 3 节分组 |
+| 编译时 `min_width` 从哪来 | 05-04 第 3.2 节 |
+| 运行时为什么只跑 floating 表 | 05-05 第 3.9 节 |
+| 某个标志位的位值 | 04-02 |
+| 序列化校验顺序 | 06-12 |
+| 这个结构体属于哪个模块 | 07-03、07-04、07-10 |
+| 单流内存怎么估 | 05-05 的 `stateOffsets.end` |
+
+### 6. 版本差异
+
+结构体层面的兼容策略写在 `src/database.h` 的一句注释里：「Values in here cannot (easily) change - add new ones!」。这句话是整册版本差异的总纲：字段只增不改，新增字段一律追加在尾部，必要时用保留字段占位。`hs_platform_info_t` 的 `reserved1` / `reserved2` 就是这种占位思路的产物，它们今天必须写 0，将来可能承载新参数。
+
+时间线上，5.4.0 引入了 Sheng32、Sheng64、McSheng64 与 Fat Teddy，这些属于引擎层新增，反映到本册是 NFA/FDR 结构里的类型枚举与表布局变化，不改变 `hs_database` 头部；5.4.1 是十余个 bugfix；5.4.2 的条目与 scratch 行为有关，表现为某些场景下 `hs_alloc_scratch` 的容量增长策略调整，把 scratch 容量写死或用 `hs_scratch_size` 结果做静态假设的代码会踩到。
+
+本快照中的数据库头部有两段 HMAC（`hmac` 与 `hmac_hdr`），且校验顺序是「先验头部、再信任 length、再验字节码」。早期版本只有单一 `hmac`，因此跨版本比对头部时不能假定 32 字节 HMAC 之后紧跟字节码，应以 `offsetof(struct hs_database, bytes)` 与 `bytecode` 字段为准。此处的字段增删与校验顺序**需对照实际版本核验**，尤其是从 5.3 升级到 5.4 的存量数据库。
+
+最后是分支差异：Vectorscan 与上游 API 兼容，但引擎支持矩阵不同，结构体字段可能增删。本册的所有偏移与字段结论只对 Intel 上游 5.4.2 快照成立，不要直接套用到 ARM 分支。
+
+### 7. 常见误用与调试
+
+1. **直接 include 公共头却访问字段**。编译不过，于是有人复制一份结构体定义到自己的头文件里，结果版本升级后偏移错乱。正确做法是用 `hs_database_size`、`hs_scratch_size`、`hs_database_info` 拿信息，不碰内部布局。
+2. **把数据库当可写**。有人为了「打补丁」把 `db->length` 改小再序列化，结果 HMAC 校验失败返回 `HS_INVALID`；更糟的是在只读页上直接写入，触发段错误而不是返回码。
+3. **跨线程共享 scratch**。表现是偶发 `HS_SCRATCH_IN_USE`，或者更隐蔽的匹配结果错乱。用线程局部存储或池化，并保证借出期间不共享。
+4. **只对一个库调用 `hs_alloc_scratch`**。另一个库的需求更大时，扫描会返回 `HS_INVALID` 或越界。正确做法是把所有要同时使用的库遍历一遍，直到全部返回 `HS_SUCCESS`。
+5. **用 `sizeof(hs_database_t)`**。那是不完整类型，编译期就报错；即便写成 `sizeof(struct hs_database)`，也只在内部诊断代码里有意义，产品代码不应依赖具体数值。
+6. **混用分配器家族**。用 `hs_set_database_allocator` 设置了自定义分配器，却用 `free()` 释放 `hs_database_info` 返回的字符串；字符串属于 misc 家族，必须用对应的释放函数。
+
+（字段见 05-02 ｜ 参数见 04-08 ｜ 原理见 06-13 ｜ 模块见 07-10）
+
+## 05-02 hs_database 与字节码布局字段
+
+### 1. 本篇定位与覆盖范围
+
+`struct hs_database` 是 Hyperscan 唯一可以「离开进程」的对象：它能被序列化成一段字节流、落盘、下发、在另一台机器上还原。因此它的字段设计目标不是性能，而是**自描述与可校验**。本篇逐字段覆盖 `src/database.h` 第 114 行到第 126 行的九个成员，外加 `bytes[]` 所指向的 `RoseEngine` 头部布局，以及 `platform_t` 的位掩码语义。
+
+本篇不解释编译产物如何生成（见 06-01），也不解释反序列化的完整校验流程（见 06-12），只交代三件事：字段的精确偏移与大小、字段在什么时机被写、哪些函数会读它。凡涉及「为什么这么排布」的，只给源码注释能支撑的结论，不做推测。
+
+阅读本篇时请把两个概念分开：**内存镜像**与**序列化镜像**。前者是 `hs_database` 在进程内的样子，头部 192 字节，`padding[25]` 占位；后者是 `hs_serialize_database` 写出的字节流，头部字段紧凑排列共 84 字节，`padding` 不参与序列化。两者的长度关系与字段顺序都不同，混淆这两者是排查「反序列化失败」时最常见的错误。
+
+版本基线仍是 5.4.2。`HS_DB_MAGIC` 的默认值、`HS_DB_VERSION` 的构造方式、`hs_get_bytecode` 的实现都在本篇给出，其他篇一律引用本篇，不再重复。
+
+### 2. 索引与全参数表
+
+先给全字段表。七列顺序固定，最后一列「版本差异」只写能从源码注释或 CHANGELOG 得到支撑的结论，其余标注需核验。
+
+| 字段 | 类型 | 含义 | 源码位置 | 读写时机 | 关联函数与流程 | 版本差异 |
+|---|---|---|---|---|---|---|
+| `magic` | `u32` | 数据库魔数，默认 `0xdbdbdbdb` | `database.h:57` | 编译时写入，加载时校验 | `validDatabase`、`dbIsValid` | 长期未变，可由 `-DHS_DB_MAGIC=` 覆盖 |
+| `version` | `u32` | 等于 `HS_DB_VERSION`，即 `HS_VERSION_32BIT` | `database.h:48` | 编译时写入 | `db_decode_header` 版本校验 | 随发布号变化 |
+| `length` | `u32` | 字节码长度，不含 192 字节头部 | `database.h:117` | 编译完成时写入 | `hs_database_size`、序列化 | 语义稳定 |
+| `platform` | `u64a` | 目标平台特性位掩码 | `database.h:118` | 编译时按 `platform` 参数写入 | `db_check_platform` | 新增 VBMI 位，需核验 |
+| `bytecode` | `u32` | 字节码相对数据库起点的偏移 | `database.h:119` | 编译或反序列化时写入 | `hs_get_bytecode`、`db_copy_bytecode` | 对齐回退逻辑需核验 |
+| `hmac` | `u8[32]` | 对字节码全长的 HMAC-SHA256 | `database.h:120` | 编译末尾计算 | `db_check_integrity` | 早期版本语义需核验 |
+| `hmac_hdr` | `u8[32]` | 对头部 20 字节字段的 HMAC-SHA256 | `database.h:121` | 编译末尾计算 | `db_check_header_integrity` | 本快照新增，需核验 |
+| `padding` | `u32[25]` | 占位，使 `bytes[]` 落在偏移 192 | `database.h:122` | 编译时清零 | `offsetof(struct hs_database, bytes)` | 无 |
+| `bytes` | `char[]` | 柔性数组，承载 `RoseEngine` 及其子结构 | `database.h:125` | 编译时写入，之后只读 | `hs_get_bytecode` | 无 |
+
+九行之外，还有两个「不是字段但决定字段」的常量：`HS_DB_MAGIC`（`database.h:57`，默认 `0xdbdbdbdbU`）与 `HS_DB_VERSION`（`database.h:48`，等于 `HS_VERSION_32BIT`）。它们不占结构体空间，但决定了校验结果，必须与字段一起看。
+
+内存偏移可以直接算出来，见下表；各区域在头部中的相对位置与对齐关系先见图 05-02-01。这张偏移表是诊断工具写死的依据，也是判断「头文件与库版本是否一致」的最快方式；注意偏移 12 处的 4 字节填充来自 `u64a` 的对齐要求，不是显式字段。
+
+:::figure id=05-02-01 | name=hs_database 头部字段偏移与对齐 | dir=TD
+node h0 "偏移 0：magic" blue
+node h1 "偏移 4：version" blue
+node h2 "偏移 8：length" blue
+node h3 "偏移 12：对齐填充" gray
+node h4 "偏移 16：platform" amber
+node h5 "偏移 24：bytecode" amber
+node h6 "偏移 28：hmac" red
+node h6b "偏移 60：hmac_hdr" red
+node h7 "偏移 92：padding 100B" gray
+node h8 "偏移 192：bytes[]" green
+edge h0 -> h1 "连续"
+edge h1 -> h2 "连续"
+edge h2 -> h3 "u64a 对齐"
+edge h3 -> h4 "8 字节对齐"
+edge h4 -> h5 "常规排布"
+edge h5 -> h6 "校验区"
+edge h6 -> h6b "两段 HMAC"
+edge h6b -> h7 "占位"
+edge h7 -> h8 "固定落点"
+:::
+
+
+| 区域 | 起始偏移 | 大小 | 备注 |
+|---|---|---|---|
+| `magic` | 0 | 4 | 小端存放 |
+| `version` | 4 | 4 | `0x05040200` 表示 5.4.2 |
+| `length` | 8 | 4 | 仅字节码 |
+| 对齐填充 | 12 | 4 | `u64a` 需要 8 字节对齐 |
+| `platform` | 16 | 8 | 平台掩码 |
+| `bytecode` | 24 | 4 | 相对本结构起点 |
+| `hmac` | 28 | 32 | 覆盖字节码 |
+| `hmac_hdr` | 60 | 32 | 覆盖前 20 字节 |
+| `padding` | 92 | 100 | 25 个 `u32` |
+| `bytes` | 192 | 变长 | 柔性数组起点 |
+
+### 3. 逐项详解
+
+#### 3.1 magic：唯一的身份断言
+
+`magic` 是四个字节的常量，源码里写的是 `#define HS_DB_MAGIC (0xdbdbdbdbU)`，并被 `#ifndef` 包住，因此可以在构建时用 `-DHS_DB_MAGIC=0x...` 替换。源码注释把动机写得很明确：用一个站点特有的值，可以让「用不同魔数构建的运行时」拒绝加载对方的数据库，多加一层对不可信数据库的防护。
+
+读它的地方有两处。轻量路径是 `validDatabase`（`database.h:138`），只查 `magic` 与 `version`，失败分别返回 `HS_INVALID` 与 `HS_DB_VERSION_ERROR`；这条路径用在块模式扫描与 `hs_open_stream` 的入口，追求的是几个周期内拒绝明显不合法的指针。重量路径是 `dbIsValid`（`database.h:149` 声明，实现在 `src/database.c`），会继续校验长度、平台、HMAC 与内部偏移。
+
+写它的地方只有编译器的数据库封装阶段与反序列化时的头部拷贝。运行期没有任何代码写 `magic`，这也是「数据库不可变」的最直接证据。调试时如果发现 `magic` 在运行中被改，几乎可以断定有人越界写入了数据库内存，而不是库自身的 bug。
+
+#### 3.2 version：与发布号绑定的 32 位编码
+
+`version` 的值来自 `HS_DB_VERSION`，而 `HS_DB_VERSION` 就是 `HS_VERSION_32BIT`（`database.h:48`）。`src/hs_version.h.in` 给出的构造是 `(major << 24) | (minor << 16) | (patch << 8) | 0`，最低字节恒为 0。5.4.2 因此是 `0x05040200`。
+
+这个编码方式决定了三件事。第一，版本比较是精确相等而不是「大于等于」，`db_decode_header` 里写的是 `header->version != HS_DB_VERSION` 就返回 `HS_DB_VERSION_ERROR`，所以 5.4.2 的库读不了 5.4.1 编译的数据库，哪怕模式完全一样。第二，最低字节保留给未来用途，目前恒为 0，如果有人手工构造出 `0x05040201` 的头部，会被判为版本错误而不是「兼容」。第三，版本号不包含构建时间与 git 提交，`HS_VERSION_STRING` 才带 `BUILD_DATE`，所以「同版本不同构建」在版本字段上无法区分。
+
+这条严格相等规则是生产环境的常见坑：编译节点与扫描节点必须使用同一版本、同一 `HS_DB_MAGIC`、同一平台配置。三者任一不同，症状都是加载失败，但返回码不同，可以据此定位——`HS_INVALID` 指向魔数，`HS_DB_VERSION_ERROR` 指向版本，`HS_DB_PLATFORM_ERROR` 指向平台。
+
+#### 3.3 length：只算字节码，不算头部
+
+`length` 的语义在源码注释里只有四个字「bytecode 长度」，但它是全篇最容易误读的字段。数据库的总分配大小是 `sizeof(struct hs_database) + db->length`（`src/database.c` 第 107、143 行都是这个写法），也就是说 `length` 不包含 192 字节头部。`hs_database_size` 返回的同样是这个总和，而不是 `length` 本身。
+
+序列化路径也依赖这个语义。`hs_serialize_database` 先分配 `sizeof(struct hs_database) + db->length`，再把头部字段与字节码依次写入；`db_decode_header` 校验的是 `length == sizeof(struct hs_database) + header->length`，即「序列化总长 = 头部 + 字节码」。如果有人把 `length` 理解成总长，在校验时就会差 192 字节，表现为 `HS_INVALID`，而且错误信息里只有一句 `bad length`，非常容易误判为缓冲区截断。
+
+`length` 在编译完成时由 `RoseEngine::size` 决定。`RoseEngine` 的 `size` 字段（`rose_internal.h` 第 458 行）注释为 `(bytes)`，即整个引擎镜像的字节数，它被写入 `hs_database::length`。因此 `length` 与字节码内容强相关：同一个模式集，开了 SOM、加了近似匹配、换了 horizon，`length` 都会变。
+
+还有一个容易混淆的量：`hs_database_size` 返回的是「数据库对象在内存里的总字节数」，与序列化长度数值上相同（都是 `192 + length`），但语义基准不同——前者是分配量，后者是传输量。如果把数据库放在共享内存里分发，共享内存段的大小应按 `hs_database_size` 计算；如果走网络传输，报文长度应按 `hs_serialized_database_size` 计算。两者在当前版本恰好相等，但不要把「恰好相等」当成契约，字段注释只承诺了 `length` 是字节码长度。
+
+#### 3.4 platform：六位 CPU 类型加三个特性否定位
+
+`platform` 是 `u64a`，类型别名 `platform_t` 在 `database.h:73` 定义。掩码布局写在同一个文件里：低 6 位是 CPU 类型（`HS_PLATFORM_CPU_MASK` 为 `0x3F`，`HS_PLATFORM_INTEL` 为 1），高位是三个「不支持」标志——`HS_PLATFORM_NOAVX2`（`4<<13`）、`HS_PLATFORM_NOAVX512`（`8<<13`）、`HS_PLATFORM_NOAVX512VBMI`（`0x10<<13`）。
+
+注意这是「否定式」编码：位被置起来表示该特性不可用，而不是可用。`hs_current_platform` 在编译期由 `HAVE_AVX2` 等宏决定，未定义就把对应的 NO 位置起来。这与 `hs_platform_info_t::cpu_features` 的「肯定式」编码正好相反，两者不能直接比较，这是 05-04 要展开的坑，这里先记住结论。
+
+校验函数是 `db_check_platform`（`src/database.c` 第 179 行）。它接受四种值：`hs_current_platform` 本身，以及它与 `hs_current_platform_no_avx2`、`no_avx512`、`no_avx512vbmi` 的按位或。另外 `HS_PLATFORM_ALL`（`0xabcdef11abcdef00`）无条件通过，用于「通用数据库」。其他值一律返回 `HS_DB_PLATFORM_ERROR`。这个设计意味着：为高特性平台编译的数据库不能在低特性平台加载，但为低特性平台编译的数据库可以在高特性平台加载（因为前者只置了 NO 位，后者是它的超集）。
+
+`hs_database_info` 会把 `platform` 翻译成字符串，但翻译逻辑只看三个 NO 位（`print_database_string`），输出 `""`、`AVX2`、`AVX512`、`AVX512VBMI` 四选一。因此看到 `Features:` 为空，说明数据库是按「无 AVX2」的基线编译的，不代表平台字段为 0——这两件事经常被混为一谈。
+
+#### 3.5 bytecode：一个会被回退的偏移
+
+`bytecode` 是「相对数据库起点」的偏移，`hs_get_bytecode` 的实现就是 `((const char *)db + db->bytecode)`。在页对齐分配的正常情况下它等于 192，但**不保证**等于 192，这是本篇最值得记住的细节。
+
+原因在 `db_copy_bytecode`（`src/database.c` 第 2924 行）：反序列化时先算 `shift = (uintptr_t)db->bytes & 0x3f`，也就是 `bytes` 地址在 64 字节缓存行内的偏移，然后 `db->bytecode = offsetof(struct hs_database, bytes) - shift`。这样算出来的字节码起点一定是 64 字节对齐的。如果调用方用 `hs_deserialize_database_at` 把数据库放进一个只满足 8 字节对齐的缓冲区，`shift` 可能是 8、16 直到 56，`bytecode` 就会变成 184、176 直到 136。
+
+这也解释了 `padding[25]` 注释里那句「必须 ≥63 字节」：最坏情况下字节码起点要往前挪 56 字节，如果 `padding` 太小，挪过去就会压到 `hmac_hdr` 的尾部，破坏 HMAC 覆盖范围。100 字节的 `padding` 让最坏落点 136 仍然大于 `hmac_hdr` 的结束偏移 92，留出 44 字节余量。
+
+工程含义是：任何按「字节码一定在 192」写死的代码都是错的。正确写法一律走 `hs_get_bytecode`，或至少读 `bytecode` 字段。诊断工具如果要把数据库 dump 成十六进制，也必须用这个偏移定位引擎起点。
+
+顺带说清这个函数的返回值语义：`hs_get_bytecode` 返回 `const void *`，强制调用方保持只读。它被声明为 `really_inline`，编译后就是一次加法，没有函数调用开销，所以热路径上可以放心使用。反过来，如果有人用 `const_cast` 把它转成可写指针去改引擎字段，后果不是立即崩溃，而是下次 HMAC 校验失败、或序列化出与内存不一致的镜像——这类问题极难定位，因为故障点与写入点相隔很远。
+
+#### 3.6 hmac 与 hmac_hdr：两段完整性保护
+
+`hmac` 是对字节码的 HMAC-SHA256，覆盖范围是 `db->length` 字节；`hmac_hdr` 是对头部 20 字节（`magic`、`version`、`length`、`platform`）的 HMAC-SHA256，覆盖范围明确排除了 `padding` 与两段 HMAC 自身。两个密钥都来自 `src/hs_db_hmac_key.h` 里的 `HS_DB_HMAC_KEY`，32 字节，可在构建期用 `-DHS_DB_HMAC_KEY_OVERRIDE` 替换。
+
+为什么需要两段？因为校验 `hmac` 需要先知道 `length`，而 `length` 本身来自不可信的头部。如果只有一段 HMAC，攻击者改大 `length` 就能让校验读越界，或者改小 `length` 让校验只覆盖前缀。`hmac_hdr` 的存在使得「先认证 length，再用 length 认证字节码」成为可能，`db_decode_header` 与 `db_serialize_database` 的注释都明确写了这个顺序。
+
+字段层面能观察到的现象是：篡改 `length` 会先触发头部 HMAC 失败，返回 `HS_INVALID`，而不是 `HS_DB_VERSION_ERROR` 或长度错误；篡改字节码则通过头部校验、在第二段失败。两种失败都映射到 `HS_INVALID`，所以只看返回码无法区分，需要打开 `DEBUG_OUTPUT` 看 `hmac mismatch` 之类的位置信息。
+
+#### 3.7 padding 与 bytes：布局稳定器
+
+`padding` 是 25 个 `u32`，共 100 字节，唯一作用是让 `bytes[]` 落在偏移 192。为什么偏偏是 192？因为 192 是 64 的整数倍，`hs_db_alloc` 按页分配后，`bytes` 天然落在缓存行边界上，字节码的访问不会跨行。同时 192 减去最大回退量 56 仍然是 136，安全地落在 `hmac_hdr` 之后。
+
+`bytes` 是柔性数组，标准 C 里不占 `sizeof`，所以 `sizeof(struct hs_database)` 恰好是 192。它承载的内容是固定顺序的镜像分区：`RoseEngine` 头、engine blob、四张字面量匹配表、NFA 偏移数组、状态偏移数组。镜像分区的顺序与相对位置见图 05-02-02，箭头上的标注就是定位每一段的字段名。
+
+:::figure id=05-02-02 | name=bytes[] 内部镜像分区与定位字段 | dir=TD
+node b0 "hs_database 头部" gray
+node b1 "RoseEngine 头" purple
+node b2 "engine blob" purple
+node b3 "anchored 字面量表" amber
+node b4 "floating 字面量表" amber
+node b5 "eod 字面量表" amber
+node b6 "small block 表" teal
+node b7 "NFA 偏移数组" teal
+node b8 "state 偏移数组" green
+edge b0 -> b1 "bytecode 偏移"
+edge b1 -> b2 "紧跟头部"
+edge b2 -> b3 "amatcherOffset"
+edge b3 -> b4 "fmatcherOffset"
+edge b4 -> b5 "ematcherOffset"
+edge b5 -> b6 "sbmatcherOffset"
+edge b6 -> b7 "nfaInfoOffset"
+edge b7 -> b8 "按 queue 索引"
+:::
+
+
+这里有一个容易被误用的点：`bytes` 虽然叫「字节数组」，但它不是「一段不透明数据」，而是有严格内部结构的一整块镜像，所有子结构通过 `u32` 偏移互相引用。任何 memcpy 都必须整块复制，任何部分复制都会让偏移指向错误位置。序列化之所以安全，正是因为它整块复制并重新计算偏移（`bytecode` 由 `db_copy_bytecode` 重设）。
+
+### 4. 典型示例
+
+下面的示例手工解析一段序列化后的数据库字节流，不调用 `hs_deserialize_database`，目的是展示「序列化头部 84 字节」与「内存头部 192 字节」的差异。这段代码适合写进诊断工具，用来判断一个落盘文件是不是被截断或被改过。
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+
+struct db_header_disk {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t length;
+    uint64_t platform;
+    uint8_t  hmac[32];
+    uint8_t  hmac_hdr[32];
+};
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        printf("usage: %s <serialized.db>\n", argv[0]);
+        return 1;
+    }
+    FILE *f = fopen(argv[1], "rb");
+    if (!f) {
+        return 1;
+    }
+    struct db_header_disk h;
+    memset(&h, 0, sizeof(h));
+    if (fread(&h, 1, sizeof(h), f) != sizeof(h)) {
+        printf("file too short for 84-byte header\n");
+        fclose(f);
+        return 1;
+    }
+
+    printf("magic       = 0x%08x\n", h.magic);
+    printf("version     = 0x%08x\n", h.version);
+    printf("bytecode len= %u\n", h.length);
+    printf("platform    = 0x%016llx\n", (unsigned long long)h.platform);
+    printf("total expect= %zu\n", sizeof(h) + (size_t)h.length);
+
+    fseek(f, 0, SEEK_END);
+    long actual = ftell(f);
+    printf("file size   = %ld\n", actual);
+    fclose(f);
+    return 0;
+}
+```
+
+在一次正常编译后立即序列化的场景下，输出形如下面这段（示例输出，具体格式需对照实际版本核验）。
+
+```text
+magic       = 0xdbdbdbdb
+version     = 0x05040200
+bytecode len= 1104
+platform    = 0x0000000000000000
+total expect= 1188
+file size   = 1188
+```
+
+判读分四步。第一步看 `magic`，不是 `0xdbdbdbdb` 就直接判定「不是本库产物或魔数被改」，不要去查版本。第二步看 `version`，高位字节是主版本，`0x05` 说明是 5.x；如果整体是 0，说明文件头被清零，通常是写入时长度算错。第三步看 `bytecode len` 与文件实际大小的关系：`84 + length` 必须等于文件大小，不等就是截断或尾部追加。第四步看 `platform`，全 0 表示基线编译，若高位出现 `0x8000`、`0x10000`、`0x20000` 之类的位，说明这是「不支持某特性」的编码，要与目标机实际能力比对。这套判读不依赖库，可以在没有 Hyperscan 的机器上完成，非常适合分发前的自检。
+
+### 5. 速查表
+
+| 现象 | 对应字段 | 判定与处置 |
+|---|---|---|
+| 返回 `HS_INVALID` 且刚加载 | `magic` | 魔数不一致，检查 `-DHS_DB_MAGIC=` |
+| 返回 `HS_DB_VERSION_ERROR` | `version` | 编译端与运行端版本不同，统一到 5.4.2 |
+| 返回 `HS_DB_PLATFORM_ERROR` | `platform` | 目标机缺少编译时假定的特性，或反之 |
+| `bad length` 调试信息 | `length` | 序列化总长应为 `84 + length` |
+| 字节码越界 / 崩溃 | `bytecode` | 不要假设等于 192，走 `hs_get_bytecode` |
+| 加载后立刻 HMAC 失败 | `hmac`、`hmac_hdr` | 文件被改，或换过 `HS_DB_HMAC_KEY` |
+| `sizeof` 不是 192 | `padding` | 头文件与库不匹配 |
+
+### 6. 版本差异
+
+`hs_database` 的字段集合在 5.x 期间保持稳定：`magic`、`version`、`length`、`platform`、`bytecode`、`hmac`、`padding`、`bytes` 这八项从早期版本就存在，`hmac_hdr` 属于本快照可见的加固字段。判断依据是 `database.h` 的注释「Values in here cannot (easily) change - add new ones!」，以及 `db_decode_header` 中「先读 12 字节以便老数据库能走到版本检查」的兼容逻辑。
+
+这段兼容逻辑值得记下来：`db_decode_header` 先要求至少 12 字节（`magic + version + length`），校验魔数与版本之后才要求完整 192 字节头部。这样做的目的是让「老版本序列化数据」能明确返回 `HS_DB_VERSION_ERROR`，而不是笼统的 `HS_INVALID`。所以看到 `HS_DB_VERSION_ERROR` 时，文件格式至少是对的，只是版本不对。
+
+5.4.0 到 5.4.2 的变化不在头部字段，而在字节码内容：新引擎（Sheng 系列、Fat Teddy）会改变 `length` 的量级与内部表布局，`RoseEngine` 的 `runtimeImpl`、`somLocationCount` 等字段可能随之变化。头部字段保持不变，意味着「同一版本内头部兼容」，但「跨版本字节码不兼容」——这正是 `version` 采用精确相等比较的原因。
+
+分支差异方面，Vectorscan 可能调整平台掩码的语义（例如 ARM 平台的特性位），本册的掩码结论只适用于 Intel 上游。跨分支分发数据库时，`platform` 字段的判定逻辑必须以目标分支的 `database.h` 为准，不能照搬本篇。
+
+### 7. 常见误用与调试
+
+1. **把 `length` 当总长**。序列化时按 `length` 分配缓冲区，结果尾部少 192 字节，反序列化报 `bad length`。记住总长是 `sizeof(struct hs_database) + length`。
+2. **假设 `bytecode == 192`**。在 `hs_deserialize_database_at` 场景下它可能更小。任何手工定位引擎起点的代码都必须读字段。
+3. **跨魔数构建混用**。A 团队用默认魔数，B 团队用 `-DHS_DB_MAGIC=`，互加载全部 `HS_INVALID`，但错误信息里看不出原因。上线前把魔数写进构建清单。
+4. **手工拼序列化数据**。头部字段的顺序、HMAC 覆盖范围、`padding` 是否参与，三者任一弄错都会失败；正确做法是调用 `hs_serialize_database`，只做传输不做改写。
+5. **在只读数据库上写入**。`hs_db_protect` 生效后写入会段错误；如果没生效，会静默破坏 HMAC，问题延迟到下次序列化才暴露。
+6. **用 `hs_deserialize_database_at` 但缓冲区不对齐**。该函数要求 8 字节对齐，否则返回 `HS_BAD_ALIGN`；不对齐还会让 `bytecode` 回退量变化，进一步放大越界风险。
+
+（字段见 05-02 ｜ 参数见 04-06 ｜ 原理见 06-12 ｜ 模块见 07-10）
+
+## 05-03 hs_scratch 字段与生命周期
+
+### 1. 本篇定位与覆盖范围
+
+`struct hs_scratch` 是 Hyperscan 里唯一「每次扫描都可写」的顶层对象，也是所有运行时状态的实际落脚点：NFA 的活动队列、锚定字面量的命中日志、延时字面量的槽位、去重日志、SOM 起点数组、FDR 的确认值，全部挂在这一个结构体上。本篇逐字段覆盖 `src/scratch.h` 第 172 行到第 214 行的三十五个成员，外加它内嵌的 `core_info`、`match_deduper`、`RoseContext` 与 `catchup_pq` 三个子结构。
+
+本篇只讲四件事：字段的含义、字段在分配时的物理位置、字段的容量由哪个 `RoseEngine` 字段决定、字段在什么时机被读写。扫描循环怎么推进队列、NFA 怎么展开、延时字面量怎么补扫，属于 06-06 与 06-11 的范围，本篇只给入口函数名。
+
+必须提前澄清一个边界：scratch 不是流状态。流状态是 `hs_stream`，按流分配、随流释放；scratch 是按线程分配、跨流复用。两者在流式扫描时同时存在，`core_info::state` 指向当前流的状态区，而 scratch 只是「操作这块状态区的工作台」。把两者混为一谈，会导致「一个线程一个 scratch 就够了，为什么流还要单独分配」这类误解。
+
+版本基线 5.4.2。`SCRATCH_MAGIC` 的值、`markScratchInUse` 的返回值语义、`alloc_scratch` 的布局顺序都来自本轮快照，与上游一致；涉及历史版本的字段增删在第六节单独说明。
+
+### 2. 索引与全参数表
+
+先给全字段表。这张表按「头部元信息 → 队列 → 状态区 → 字面量日志 → 上下文 → 去重 → SOM → 尺寸」的顺序排列，与 `alloc_scratch` 里的分配顺序不完全一致，后者更贴近内存布局，见 3.2 节。
+
+| 字段 | 类型 | 含义 | 源码位置 | 读写时机 | 关联函数与流程 | 版本差异 |
+|---|---|---|---|---|---|---|
+| `magic` | `u32` | scratch 魔数 `0x544F4259` | `scratch.h:48` | 分配时写入 | `markScratchInUse` 断言 | 稳定 |
+| `in_use` | `u8` | 非零表示正被某次 API 调用占用 | `scratch.h:174` | 进入/退出 API 时置位清零 | `markScratchInUse`、`unmarkScratchInUse` | 5.4.2 行为需核验 |
+| `queueCount` | `u32` | NFA 队列数 | `scratch.h:175` | 分配时取最大值 | `alloc_scratch` 定容 | 随引擎变化 |
+| `activeQueueArraySize` | `u32` | 活动队列 fatbit 的字节数 | `scratch.h:176` | 分配时取最大值 | `aqa` 定容 | 随队列数变化 |
+| `bStateSize` | `u32` | 块模式状态区字节数 | `scratch.h:177` | 分配时按模式计算 | `bstate` 定容 | 向量化模式含流头 |
+| `tStateSize` | `u32` | 瞬态 Rose 状态字节数 | `scratch.h:178` | 分配时取最大值 | `tstate` 定容 | 随瞬态前缀变化 |
+| `fullStateSize` | `u32` | 未压缩 NFA 状态字节数 | `scratch.h:179` | 分配时取最大值 | `fullState` 定容 | 随 Castle 引擎变化 |
+| `tctxt` | `struct RoseContext` | 本次扫描的 Rose 上下文 | `scratch.h:180` | 每次扫描初始化 | `roseExec` 系列 | 字段见 05-05 |
+| `bstate` | `char *` | 块模式状态区指针 | `scratch.h:181` | 分配时定位 | 块模式扫描 | 稳定 |
+| `tstate` | `char *` | 瞬态状态区指针 | `scratch.h:182` | 分配时定位 | 瞬态 Rose | 稳定 |
+| `fullState` | `char *` | 未压缩 NFA 状态指针 | `scratch.h:183` | 分配时定位 | Castle、McSheng | 5.4.0 起更重要 |
+| `queues` | `struct mq *` | NFA 队列数组 | `scratch.h:184` | 分配时定位并回指 | 队列执行 | 稳定 |
+| `aqa` | `struct fatbit *` | 活动队列位图 | `scratch.h:185` | 每步更新 | 队列调度 | 稳定 |
+| `delay_slots` | `struct fatbit **` | 延时字面量槽位数组 | `scratch.h:187` | 分配时定位 | 延时重建 | 稳定 |
+| `al_log` | `struct fatbit **` | 锚定字面量日志数组 | `scratch.h:188` | 分配时定位 | `getAnchoredLiteralLog` | 稳定 |
+| `al_log_sum` | `u64a` | 锚定日志的汇总位图 | `scratch.h:189` | 每条字面量命中后更新 | 锚定表快路径 | 稳定 |
+| `catchup_pq` | `struct catchup_pq` | 补匹配优先队列 | `scratch.h:190` | 补匹配期间增长 | `catchup.c` | 稳定 |
+| `core_info` | `struct core_info` | 当前扫描的公共上下文 | `scratch.h:191` | 每次扫描初始化 | 回调、状态位 | 稳定 |
+| `deduper` | `struct match_deduper` | 去重日志与 SOM 起点日志 | `scratch.h:192` | 每次报告前更新 | `match.c` | 稳定 |
+| `anchored_literal_region_len` | `u32` | 锚定日志的条目数 | `scratch.h:193` | 分配时取最大值 | `al_log` 定容 | 稳定 |
+| `anchored_literal_fatbit_size` | `u32` | 每个锚定 fatbit 的字节数 | `scratch.h:194` | 分配时取最大值 | `al_log` 定容 | 稳定 |
+| `handled_roles` | `struct fatbit *` | 已处理角色位图 | `scratch.h:195` | 每条字面量处理时更新 | `CHECK_SET_HANDLED` | 较新字段 |
+| `som_store` | `u64a *` | SOM 起点值数组 | `scratch.h:197` | 命中时写入 | SOM 存储 | 随 SOM 引入 |
+| `som_attempted_store` | `u64a *` | 失败写入的起点值数组 | `scratch.h:198` | 写入失败时记录 | SOM 去重 | 随 SOM 引入 |
+| `som_set_now` | `struct fatbit *` | 本偏移已设置起点的位图 | `scratch.h:199` | 每个偏移更新 | SOM 刷新 | 随 SOM 引入 |
+| `som_attempted_set` | `struct fatbit *` | 本偏移尝试设置的位图 | `scratch.h:201` | 写入被拒时更新 | SOM 刷新 | 随 SOM 引入 |
+| `som_set_now_offset` | `u64a` | `som_set_now` 对应的偏移 | `scratch.h:204` | 偏移推进时更新 | SOM 刷新 | 随 SOM 引入 |
+| `som_store_count` | `u32` | SOM 槽位数量 | `scratch.h:205` | 分配时取最大值 | `som_store` 定容 | 随模式数增长 |
+| `som_fatbit_size` | `u32` | SOM 位图的字节数 | `scratch.h:206` | 分配时取最大值 | `som_set_now` 定容 | 随槽位数增长 |
+| `handledKeyFatbitSize` | `u32` | 已处理 key 位图的字节数 | `scratch.h:207` | 分配时取最大值 | `handled_roles` 定容 | 较新字段 |
+| `delay_fatbit_size` | `u32` | 每个延时 fatbit 的字节数 | `scratch.h:208` | 分配时取最大值 | `delay_slots` 定容 | 稳定 |
+| `scratchSize` | `u32` | 本次分配的总字节数 | `scratch.h:209` | 分配时写入 | `hs_scratch_size` | 5.4.2 语义需核验 |
+| `scratch_alloc` | `char *` | 分配器返回的原始指针 | `scratch.h:210` | 分配时写入 | `hs_free_scratch` | 稳定 |
+| `fdr_conf` | `u64a *` | FDR 确认值暂存 | `scratch.h:211` | 扫描期间写入 | FDR 前端 | 见 05-07 |
+| `fdr_conf_offset` | `u8` | 确认值对应的缓冲偏移 | `scratch.h:212` | 扫描期间写入 | FDR 前端 | 见 05-07 |
+
+字段多，但真正决定「scratch 多大」的只有十一个容量字段。它们的来源与模式相关性见下表，这张表是估算内存时的唯一依据。
+
+| scratch 容量字段 | 来源字段（`RoseEngine`） | 模式相关性 |
+|---|---|---|
+| `queueCount` | `queueCount` | 与后缀、前缀、中缀 NFA 数量相关 |
+| `activeQueueArraySize` | `activeQueueArraySize` | 由队列数推出的位图大小 |
+| `bStateSize` | `stateOffsets.end` | 块模式为状态大小，向量化模式再加流头 |
+| `tStateSize` | `tStateSize` | 与瞬态前缀宽度相关 |
+| `fullStateSize` | `scratchStateSize` | 与 Castle、McSheng 引擎相关 |
+| `anchored_literal_region_len` | `anchoredDistance` | 与锚定表扫描窗口相关 |
+| `anchored_literal_fatbit_size` | `anchored_fatbit_size` | 与锚定字面量数量相关 |
+| `delay_fatbit_size` | `delay_fatbit_size` | 与延时字面量数量相关 |
+| `handledKeyFatbitSize` | `handledKeyFatbitSize` | 与受管角色 key 数相关 |
+| `som_store_count` | `somLocationCount` | 与开启 SOM 的模式数相关 |
+| `som_fatbit_size` | `somLocationFatbitSize` | 由槽位数推出的位图容量 |
+
+### 3. 逐项详解
+
+#### 3.1 magic 与 in_use：协作式占用标志
+
+`magic` 是 `SCRATCH_MAGIC`（`0x544F4259`），在 `alloc_scratch` 里写入，在 `markScratchInUse`、`unmarkScratchInUse`、`hs_free_scratch`、`hs_scratch_size` 里被断言或校验。它没有任何加密含义，作用等同于「这块内存是不是我初始化的」。
+
+`in_use` 是 `u8`，语义是「正被某次 API 调用使用」。`markScratchInUse` 的实现只有四行：断言魔数、读 `in_use`、若非零返回 1、否则置 1 返回 0。调用方看到返回 1 就把 `HS_SCRATCH_IN_USE` 抛给用户。`unmarkScratchInUse` 则断言当前值为 1 后清零。
+
+这里的关键是：**这不是锁**。整个检查是「读—判断—写」三步，没有原子指令、没有内存屏障。两个线程同时对同一份 scratch 调用 `hs_scan`，完全可能都读到 0、都写入 1、都继续执行，然后在队列数组上互相踩踏。`in_use` 的真实作用是把「同一线程内的重入」变成可诊断的错误，例如在回调里再次调用 `hs_scan` 并传入同一个 scratch，会干净地返回 `HS_SCRATCH_IN_USE`，而不是随机崩溃。
+
+因此「scratch 非线程安全」不是实现缺陷，而是设计前提：它把线程绑定这件事交给调用方，换来零锁的扫描热路径。生产环境的正确做法是每线程一份，或用对象池并保证借出期间独占。
+
+#### 3.2 内存布局：先队列，后状态，最后对齐
+
+`alloc_scratch`（`src/scratch.c` 第 145 行）先按原型算出 `size`，再分配 `sizeof(struct hs_scratch) + size + 256`，把返回指针向上取整到 64 字节作为结构体起点，原始指针存进 `scratch_alloc`。随后按固定顺序切分：`queues`、`som_store`、`som_attempted_store`、`delay_slots`（先指针数组、再每个 fatbit）、`al_log`（同样是先指针数组、再每个 fatbit）、`catchup_pq.qm`、`bstate`、`tstate`、64 字节对齐后的 `deduper.som_start_log[0..1]`、`aqa`、`handled_roles`、`deduper.log[0..1]`、`deduper.som_log[0..1]`、`som_set_now`、`som_attempted_set`，最后 64 字节对齐到 `fullState`。
+
+顺序不是随意的：越靠前越「按队列数线性增长」，越靠后越「按状态大小或位图大小增长」；`fullState` 放最后并且单独对齐，是因为它会被 NFA 引擎按缓存行访问，起点必须对齐。布局关系见图 05-03-01，箭头表示物理相邻关系而非引用关系。
+
+:::figure id=05-03-01 | name=hs_scratch 内存区段与分配顺序 | dir=TD
+node s0 "结构体头" blue
+node s1 "queues 数组" teal
+node s2 "som_store 两数组" purple
+node s3 "delay_slots 组" amber
+node s4 "al_log 组" amber
+node s5 "bstate 与 tstate" green
+node s6 "aqa 与 handled_roles" green
+node s7 "deduper 四份日志" red
+node s8 "fullState 对齐区" red
+edge s0 -> s1 "紧随头部"
+edge s1 -> s2 "按槽位数"
+edge s2 -> s3 "按延时槽"
+edge s3 -> s4 "按锚定条目"
+edge s4 -> s5 "按状态大小"
+edge s5 -> s6 "位图区"
+edge s6 -> s7 "日志区"
+edge s7 -> s8 "最后的对齐大块"
+:::
+
+#### 3.3 队列三件套：queueCount、queues、aqa
+
+`queues` 是 `struct mq` 数组，长度 `queueCount`；`aqa` 是活动队列位图，长度为 `activeQueueArraySize` 字节；`queueCount` 与 `activeQueueArraySize` 都来自 `RoseEngine` 的同名字段，在 `hs_alloc_scratch` 里取最大值。
+
+`struct mq` 的定义不在 `scratch.h` 里，而在 NFA 相关的内部头中，本篇不展开其字段（见 05-06）。但有一个字段与 scratch 强相关：`alloc_scratch` 结束时会把每个 `mq::scratch` 指回当前 scratch，这样队列执行时不必再传参。这条「回指」意味着 scratch 不能整块 memcpy 到另一个地址后直接使用——`queues` 内部存的是绝对指针指向原 scratch，复制后必须重新绑定。`hs_clone_scratch` 之所以走完整的 `alloc_scratch` 而不是 memcpy，正是这个原因。
+
+`aqa` 的语义是「哪些队列当前有效且活动」。它每步被更新，所以属于热字段；`activeQueueArraySize` 只在分配时用一次，属于冷字段。两者成对出现，但读写频率完全不同，这在调优时值得注意：位图操作的代价与 `queueCount` 成正比，而不是与模式数成正比。
+
+#### 3.4 状态三件套：bstate、tstate、fullState
+
+`bstate` 是块模式的状态区，大小 `bStateSize`；`tstate` 是瞬态 Rose 的状态区，大小 `tStateSize`；`fullState` 是未压缩的 NFA 状态区，大小 `fullStateSize`。三者的共同点是「按字节分配、按引擎解释」，scratch 本身不知道里面存的是什么。
+
+`bStateSize` 的计算有一个模式分支：块模式下等于 `RoseEngine::stateOffsets.end`；向量化模式下等于 `sizeof(struct hs_stream) + stateOffsets.end`，因为向量化扫描要在 scratch 里构造一个完整的流状态。流式模式下这个值不参与（流状态由 `hs_stream` 自己持有），但 `hs_alloc_scratch` 仍然会为它保留容量，因为同一个 scratch 可能同时服务块模式与流式数据库。
+
+`fullState` 单独 64 字节对齐，是因为 Castle 与 McSheng 这类引擎会按缓存行读写状态位图。若对齐不当，性能下降是次要的，某些按对齐假设写的 SIMD 代码会直接触发异常。这也是 `alloc_scratch` 里 `current = ROUNDUP_PTR(current, 64)` 出现在 `fullState` 之前的原因。
+
+#### 3.5 字面量日志：al_log、al_log_sum、delay_slots
+
+`al_log` 是「指针数组 + fatbit 数组」的两段式结构，条目数为 `anchored_literal_region_len`，每个 fatbit 大小为 `anchored_literal_fatbit_size`。`getAnchoredLiteralLog` 只是返回这个指针数组，之所以包一层函数，是为了在 NFA 与 Rose 两套代码里统一访问方式。
+
+`al_log_sum` 是 `u64a`，把各条目的位图汇总成 64 位，用于「有没有任何锚定字面量命中」的快速判断。它有一个隐含约束：`anchored_literal_region_len` 必须小于 64（`alloc_scratch` 里有 `assert(anchored_literal_region_len < 8 * sizeof(s->al_log_sum))`）。这条断言解释了为什么锚定表要分组：组数受 64 限制，超出的部分由 `anchored_matcher_info::next_offset` 链到下一组。
+
+`delay_slots` 的结构与 `al_log` 相同，但条目数固定为 `DELAY_SLOT_COUNT`（`1 << DELAY_BITS`，即 32），每个 fatbit 大小为 `delay_fatbit_size`。固定 32 个槽位对应「延时 0 到 31 字节」的语义，`MAX_DELAY` 就是 31。这个数字是编译期常量，不随数据库变化，所以 `delay_slots` 的指针数组大小恒定，只有 fatbit 本身随字面量数量变化。
+
+#### 3.6 core_info：一次扫描的公共上下文
+
+`core_info` 是所有引擎共享的「当前扫描」描述，字段分四组。第一组是回调：`userContext` 与 `userCallback`，后者类型是 `int (HS_CDECL *)(unsigned int, unsigned long long, unsigned long long, unsigned int, void *)`，与公共头里的 `match_event_handler` 一致。第二组是引擎与状态：`rose` 指向当前数据库的 `RoseEngine`，`state` 指向当前流或块的状态区，`exhaustionVector`、`logicalVector`、`combVector` 分别指向耗尽、逻辑、组合三个位图。第三组是缓冲区：`buf`/`len` 是主扫描缓冲，`hbuf`/`hlen` 是历史缓冲，`buf_offset` 是主缓冲在流中的起始偏移。第四组是 `status` 位掩码。
+
+`status` 的四个位定义在 `scratch.h` 第 74 到 88 行：`STATUS_TERMINATED`（用户请求终止）、`STATUS_EXHAUSTED`（不可能再产生匹配）、`STATUS_DELAY_DIRTY`（历史中的延时字面量命中，需要重建）、`STATUS_ERROR`（Rose 程序内部错误）。围绕它有三个内联判定：`told_to_stop_matching` 只看 TERMINATED，`can_stop_matching` 看 TERMINATED、EXHAUSTED、ERROR 三者，`internal_matching_error` 只看 ERROR。这三个函数的区别很重要：用户主动终止不是错误，不能按错误路径处理；而内部错误必须映射成 `HS_UNKNOWN_ERROR` 返回。
+
+`buf_offset` 是唯一一个「语义上属于流、物理上存在 scratch」的字段。它记录主缓冲区第一个字节在整条流中的绝对偏移，所有报告偏移都由它加相对位置得到。流式扫描跨块时它会被推进，块模式扫描时它恒为 0。调试「偏移差了一个块」的问题，第一件事就是打印它。
+
+#### 3.7 deduper：去重日志与 SOM 起点日志
+
+`match_deduper` 有七个字段：`log[2]`（偶/奇两份 fatbit 日志）、`som_log[2]`（偶/奇两份 SOM fatbit 日志）、`som_start_log[2]`（偶/奇两份起点偏移数组）、`dkey_count`（去重 key 数）、`log_size`（每份日志字节数）、`current_report_offset`（当前报告偏移）、`som_log_dirty`（SOM 日志是否待刷新）。
+
+「偶/奇两份」是双缓冲：当前偏移用一份，前一个偏移用另一份，这样「同一偏移重复报告」和「跨偏移去重」可以分开判断。`log_size` 来自 `RoseEngine::dkeyLogSize`，`dkey_count` 来自 `RoseEngine::dkeyCount`，两者在 `hs_alloc_scratch` 里成对更新——源码里 `if (rose->dkeyCount > proto->deduper.dkey_count)` 之后同时写 `dkey_count` 与 `log_size`，不会只更新一个。
+
+`current_report_offset` 初值是 `~0ULL`。`src/rose/match.c` 第 551 行有 `if (rose->hasSom && scratch->deduper.current_report_offset == ~0ULL)` 的判断，说明这个哨兵值有实际语义：表示「还没有报告过任何偏移」，此时 SOM 刷新需要特殊处理。调试 SOM 相关问题时，这个值是不是 `~0ULL` 往往能区分「从未报告」与「报告偏移为 0」。
+
+#### 3.8 SOM 字段组：随槽位与 horizon 变化
+
+SOM 相关字段共七个：`som_store`、`som_attempted_store`、`som_set_now`、`som_attempted_set`、`som_set_now_offset`、`som_store_count`、`som_fatbit_size`。语义分别是：起点值数组、写入失败时记录的值数组、「本偏移已设置」位图、「本偏移尝试设置」位图、位图对应偏移、槽位数量、位图字节数。
+
+容量来源是 `RoseEngine::somLocationCount` 与 `somLocationFatbitSize`。未开启 SOM 的数据库这两个值为 0，`hs_alloc_scratch` 就不会为这组字段分配任何空间，`som_store` 为 NULL。开启 SOM 后，槽位数与「需要记录起点的模式数」相关，位图大小与槽位数相关，因此 scratch 会显著变大。
+
+需要区分两个不同的「随 horizon 增长」。`somHorizon`（`RoseEngine` 的 `u8` 字段）表示每个 SOM 槽在**流状态**里的字节宽度，horizon 越大，单槽越宽，`stateOffsets.end` 越大，进而 `bStateSize` 越大；而 scratch 里的 `som_store` 是 `u64a` 数组，每槽固定 8 字节，`som_store_count` 由槽位数决定，与 horizon 没有直接比例关系。把两者混为一谈，会得出「horizon 放大一倍 scratch 就放大一倍」的错误结论。
+
+另外，`hs_alloc_scratch` 对 `som_store_count` 做了溢出检查：`som_store_count > UINT32_MAX / sizeof(u64a)` 直接返回 `HS_INVALID`。这是为了防止伪造数据库让 `som_store_count * 8` 回绕成小值，导致分配不足后在扫描时越界写。看到这个错误码，说明数据库本身不可信，而不是 scratch 参数有问题。
+
+#### 3.9 尺寸与生命周期：scratchSize、scratch_alloc、扩容
+
+`scratchSize` 记录 `alloc_scratch` 实际分配的字节数（含结构体、附加区与 256 字节余量），`hs_scratch_size` 直接返回它。`scratch_alloc` 记录分配器返回的原始指针，`hs_free_scratch` 释放的是它而不是结构体地址，因为结构体被向上取整过。
+
+生命周期的主线在 `hs_alloc_scratch`：先用 `dbIsValid` 校验数据库，再校验传入的 scratch（对齐、魔数、`markScratchInUse`），然后构造一个「原型」结构体，逐字段与数据库需求取较大值；只要有任何一项变大就 `resize = 1`，释放旧 scratch 并调用 `alloc_scratch` 重建；全部不变则直接 `unmarkScratchInUse` 返回。这条路径决定了多库场景的正确用法：对每个要同时使用的数据库调用一次，直到全部返回 `HS_SUCCESS`，此时 scratch 容量是所有库需求的并集。
+
+生命周期与扩容决策见图 05-03-02。图中虚线边表示前置条件，实线边表示状态转移，红色节点是唯一的故障分支。
+
+:::figure id=05-03-02 | name=hs_scratch 的分配、扩容与占用状态 | dir=TD
+node a "hs_alloc_scratch 入口" blue
+node b "首次分配" teal
+node c "已有 scratch" amber
+node d "容量不足" red
+node e "容量足够" green
+node f "alloc_scratch 重建" purple
+node g "扫描期间占用" green
+node h "并发误用" red
+edge a -> b "指针为空"
+edge a -> c "指针非空"
+edge c -> d "逐字段取大"
+edge c -> e "全部不变"
+edge d -> f "释放旧区"
+edge f -> g "返回新指针"
+edge e -> g "解除占用"
+edge g -> h "另一线程同时进入"
+:::
+
+扩容有一个容易忽略的副作用：`hs_alloc_scratch` 在重建时会释放旧 scratch 并把 `*scratch` 指向新地址。因此调用方不能在其他地方缓存 scratch 的指针副本，也不能在扩容期间让别的线程持有它。正确模式是「启动阶段完成所有扩容，运行阶段只读指针」。
+
+`hs_clone_scratch` 走的是同一个 `alloc_scratch`，从源 scratch 复制容量字段后重新分配，不做 memcpy。这样克隆出来的 scratch 有独立的队列数组与独立的回指，可以给另一个线程使用；代价是容量按源 scratch 复制，若源 scratch 是为大库准备的，克隆体也会同样大。
+
+### 4. 典型示例
+
+下面的示例演示多库扩容：先为一个小库分配 scratch，再为一个大库（开启 SOM）复用同一个指针，观察容量变化与克隆结果。这是部署阶段最该写对的一段代码。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static hs_database_t *compile_one(const char *pat, unsigned flags,
+                                 unsigned mode, unsigned som_horizon) {
+    hs_database_t *db = NULL;
+    hs_compile_error_t *err = NULL;
+    unsigned m = mode | (flags & HS_FLAG_SOM_LEFTMOST ? som_horizon : 0);
+    if (hs_compile(pat, flags, m, NULL, &db, &err) != HS_SUCCESS) {
+        printf("compile failed: %s\n", err->message);
+        hs_free_compile_error(err);
+        return NULL;
+    }
+    return db;
+}
+
+int main(void) {
+    hs_database_t *small = compile_one("abc", 0, HS_MODE_BLOCK, 0);
+    hs_database_t *big = compile_one("foo[0-9]{4}bar", HS_FLAG_SOM_LEFTMOST,
+                                     HS_MODE_BLOCK, HS_MODE_SOM_HORIZON_LARGE);
+    if (!small || !big) {
+        return 1;
+    }
+
+    hs_scratch_t *scratch = NULL;
+    hs_database_t *dbs[2] = { small, big };
+    for (int i = 0; i < 2; i++) {
+        hs_error_t rc = hs_alloc_scratch(dbs[i], &scratch);
+        size_t sz = 0;
+        hs_scratch_size(scratch, &sz);
+        printf("after db[%d]: rc=%d scratch=%zu bytes\n", i, rc, sz);
+        if (rc != HS_SUCCESS) {
+            printf("alloc failed, stop\n");
+            return 1;
+        }
+    }
+
+    hs_scratch_t *clone = NULL;
+    if (hs_clone_scratch(scratch, &clone) == HS_SUCCESS) {
+        size_t csz = 0;
+        hs_scratch_size(clone, &csz);
+        printf("clone size = %zu bytes\n", csz);
+        hs_free_scratch(clone);
+    }
+
+    hs_free_scratch(scratch);
+    hs_free_database(small);
+    hs_free_database(big);
+    return 0;
+}
+```
+
+示例输出如下（示例输出，具体格式需对照实际版本核验）。数值随模式与版本变化，重点看趋势而不是绝对值。
+
+```text
+after db[0]: rc=0 scratch=5120 bytes
+after db[1]: rc=0 scratch=11776 bytes
+clone size = 11776 bytes
+```
+
+判读分三点。第一，第一次分配后的 `scratch` 只覆盖小库需求，第二次调用同一个小库指针后容量明显变大，说明 `hs_alloc_scratch` 是「合并式扩容」而不是「覆盖式重设」；如果第二次调用后容量反而变小，说明有人误以为它会重置，或者在两次调用之间释放了 scratch 并重新传了空指针，这两者的区别可以直接从打印看出。第二，第二次返回码为 0 但容量变大，说明扩容成功；若返回 `HS_INVALID`，通常是数据库校验失败（`dbIsValid` 在扩容之前），而不是内存不足；若返回 `HS_SCRATCH_IN_USE`，说明传入的 scratch 正被占用，多半是上一次扫描没有正常退出。第三，克隆体大小与源完全一致，印证 `hs_clone_scratch` 是「按源容量复制」而非「按某个数据库需求重建」；这也意味着克隆不能替代多库扩容——先克隆再对新库调用 `hs_alloc_scratch` 才是正确顺序。
+
+### 5. 速查表
+
+| 症状或需求 | 先看字段 | 处置方向 |
+|---|---|---|
+| 返回 `HS_SCRATCH_IN_USE` | `in_use` | 检查重入与跨线程共享 |
+| 扫描越界或结果错乱 | `queueCount`、`aqa` 相关容量 | 确认已对每个库调用 `hs_alloc_scratch` |
+| scratch 过大 | `bStateSize`、`som_store_count` | 关 SOM、降 horizon、拆库 |
+| 流式与块模式大小不同 | `bStateSize` | 向量化模式含流头 |
+| 克隆后行为异常 | `scratch_alloc`、`queues` | 不要 memcpy scratch，用 `hs_clone_scratch` |
+| 内存估算偏差大 | `scratchSize` | 以 `hs_scratch_size` 为准，不手算 |
+| SOM 相关崩溃 | `som_store_count`、`som_fatbit_size` | 校验数据库来源与版本 |
+
+### 6. 版本差异
+
+`hs_scratch` 的字段集合在 5.x 期间是「渐进增补」的：`magic`、`in_use`、队列与状态区字段从早期版本就存在，`handled_roles`、`handledKeyFatbitSize` 与 `fdr_conf` 系列属于后续为字面量角色管理与 FDR 前端加入的字段，SOM 相关的七个字段随 SOM 功能一起引入。判断依据是 `scratch.h` 的字段注释密度与 `alloc_scratch` 里的分配顺序——新字段往往被追加在 `fullState` 之前，而不是插在中间，以减小布局变动。
+
+5.4.2 的 changelog 条目与 scratch 行为有关，具体表现为容量增长与复用策略的调整。对使用方的直接影响是：不要假设「同样的数据库集合在不同小版本上得到同样的 `hs_scratch_size`」，也不要把某个版本的数值写进容量规划表。正确做法是在目标版本上实测，并把 `hs_scratch_size` 纳入启动自检日志。
+
+5.4.0 引入的 Sheng 系列与 Fat Teddy 会间接影响 scratch：新引擎需要 `fullState` 或额外的确认区，`scratchStateSize` 随引擎选择变化，进而改变 `fullStateSize`。这类变化不会新增字段，但会改变同一个字段的量级，所以「字段没变」不等于「布局没变」。
+
+最后提醒分支差异：Vectorscan 的 scratch 布局可能与上游不同，尤其是与平台相关的对齐与 SIMD 状态区。跨分支移植时，任何按偏移访问 scratch 内部区的代码都要重新核验，不能照搬本篇结论。
+
+### 7. 常见误用与调试
+
+1. **把 scratch 当线程安全缓存**。全局一份 scratch 给所有工作线程用，压力小时看不出问题，压力大时出现 `HS_SCRATCH_IN_USE` 或结果错乱。改成线程局部或池化。
+2. **只分配一次就服务所有库**。第二个库需求更大时会越界。必须遍历所有库反复调用 `hs_alloc_scratch`。
+3. **在回调里重入扫描**。同一线程、同一 scratch 的嵌套调用会返回 `HS_SCRATCH_IN_USE`；如果确实需要嵌套，为内层准备独立 scratch。
+4. **扩容后继续用旧指针**。`hs_alloc_scratch` 可能释放旧区并返回新地址，缓存副本会变成悬垂指针。
+5. **memcpy 复制 scratch**。`queues` 内部回指原 scratch，复制后回指仍指向旧地址；用 `hs_clone_scratch`。
+6. **用 `scratchSize` 估算峰值内存**。它只是当前这份 scratch 的大小，多线程场景要乘以并发份数，还要加上流状态与数据库本身。
+7. **在 `hs_free_scratch` 前不结束扫描**。释放时若 `in_use` 非零会返回 `HS_SCRATCH_IN_USE` 而不释放，造成泄漏；先确保所有扫描已返回。
+
+（字段见 05-03 ｜ 参数见 04-06 ｜ 原理见 06-11 ｜ 模块见 07-09）
+
+## 05-04 编译侧结构体：platform_info / expr_info / expr_ext / compile_error
+
+### 1. 本篇定位与覆盖范围
+
+前两篇讲的都是「编译产物」与「运行时工作区」，本篇讲的是夹在中间的一层：调用方在编译期间传给库、或从库拿回的结构体。它们全部定义在 `src/hs_compile.h`，全部只在一次调用期间存在，全部不进入数据库字节码。这一层最容易被认为是「参数表」而忽略，实际上它们决定了编译结果的形状——`hs_platform_info_t` 决定按哪套指令集优化，`hs_expr_ext_t` 决定哪些匹配被提前抑制，`hs_expr_info_t` 告诉调用方模式的大致宽度，`hs_compile_error_t` 是唯一的失败诊断通道。
+
+本篇覆盖四个结构体共十七个字段，并交代它们与六个 API 的配对关系：`hs_compile`、`hs_compile_multi`、`hs_compile_ext_multi`、`hs_expression_info`、`hs_expression_ext_info`、`hs_populate_platform`。参数的位值与默认值属于 04 册，机制属于 06 册，本篇只讲字段本身。
+
+先给一个总判断：这四个结构体里，`hs_platform_info_t` 是「影响优化但不限制运行」的软约束，`hs_expr_ext_t` 是「编译期就生效的硬约束」，`hs_expr_info_t` 是「保守估计而非承诺」，`hs_compile_error_t` 是「诊断而非控制流」。把这四条记住，后面十七个字段就不会读错。
+
+版本基线 5.4.2。四个结构的字段在 5.x 期间没有增删，但 `tune` 的取值与 `cpu_features` 的位在持续追加，这一点在第六节说明。
+
+### 2. 索引与全参数表
+
+四个结构的字段全表如下。注意「读写时机」列的方向：前两个结构由调用方写入、库读取，后两个由库写入、调用方读取，方向反了就会得到未初始化值。
+
+| 字段 | 类型 | 含义 | 源码位置 | 读写时机 | 关联函数与流程 | 版本差异 |
+|---|---|---|---|---|---|---|
+| `tune` | `unsigned int` | 目标微架构调优家族 | `hs_compile.h:143` | 调用前填写 | `hs_compile*`、`hs_populate_platform` | 家族逐个追加 |
+| `cpu_features` | `unsigned long long` | 目标平台可用 CPU 特性位 | `hs_compile.h:152` | 调用前填写 | `hs_compile*`、`hs_populate_platform` | 新增 VBMI 位 |
+| `reserved1` | `unsigned long long` | 保留字段，必须为 0 | `hs_compile.h:157` | 调用前填写 | 编译器忽略 | 长期保留 |
+| `reserved2` | `unsigned long long` | 保留字段，必须为 0 | `hs_compile.h:162` | 调用前填写 | 编译器忽略 | 长期保留 |
+| `min_width` | `unsigned int` | 匹配的最小字节长度 | `hs_compile.h:178` | 调用返回时由库填写 | `hs_expression_info` | 语义稳定 |
+| `max_width` | `unsigned int` | 匹配的最大字节长度，无界为 `UINT_MAX` | `hs_compile.h:190` | 返回时由库填写 | `hs_expression_info` | 语义稳定 |
+| `unordered_matches` | `char` | 是否可能乱序报告 | `hs_compile.h:197` | 返回时由库填写 | `hs_expression_info` | 语义稳定 |
+| `matches_at_eod` | `char` | 是否可能在数据结束处报告 | `hs_compile.h:208` | 返回时由库填写 | `hs_expression_info` | 语义稳定 |
+| `matches_only_at_eod` | `char` | 是否只在数据结束处报告 | `hs_compile.h:215` | 返回时由库填写 | `hs_expression_info` | 语义稳定 |
+| `flags` | `unsigned long long` | 指定本结构中哪些字段有效 | `hs_compile.h:232` | 调用前填写 | `hs_compile_ext_multi` | 位值稳定 |
+| `min_offset` | `unsigned long long` | 允许报告的最小结束偏移 | `hs_compile.h:239` | 调用前填写 | `hs_compile_ext_multi` | 稳定 |
+| `max_offset` | `unsigned long long` | 允许报告的最大结束偏移 | `hs_compile.h:246` | 调用前填写 | `hs_compile_ext_multi` | 稳定 |
+| `min_length` | `unsigned long long` | 匹配的最小长度 | `hs_compile.h:253` | 调用前填写 | `hs_compile_ext_multi` | 稳定 |
+| `edit_distance` | `unsigned` | 允许的编辑距离 | `hs_compile.h:260` | 调用前填写 | `hs_compile_ext_multi` | 稳定 |
+| `hamming_distance` | `unsigned` | 允许的汉明距离 | `hs_compile.h:267` | 调用前填写 | `hs_compile_ext_multi` | 稳定 |
+| `message` | `char *` | 人类可读的错误描述 | `hs_compile.h:116` | 失败时由库分配 | `hs_free_compile_error` | 稳定 |
+| `expression` | `int` | 出错表达式下标，非表达式错误为负 | `hs_compile.h:123` | 失败时由库填写 | `hs_free_compile_error` | 稳定 |
+
+结构体与 API 的配对关系见图 05-04-01。图中左列是结构体，右列是函数，箭头方向表示数据流向；`hs_compile_ext_multi` 同时接收平台信息与扩展参数，是本组里入参最多的调用。
+
+:::figure id=05-04-01 | name=编译侧四个结构体与 API 的配对关系 | dir=LR
+node p "hs_platform_info_t" blue
+node e "hs_expr_ext_t" amber
+node i "hs_expr_info_t" teal
+node c "hs_compile_error_t" red
+node a1 "hs_compile_multi" purple
+node a2 "hs_compile_ext_multi" purple
+node a3 "hs_expression_info" purple
+node a4 "hs_free_compile_error" gray
+edge p -> a1 "入参"
+edge p -> a2 "入参"
+edge e -> a2 "入参"
+edge a3 -> i "出参"
+edge a2 -> c "失败产生"
+edge a1 -> c "失败产生"
+edge a2 -> i "ext 版本亦出参"
+edge c -> a4 "释放"
+:::
+
+### 3. 逐项详解
+
+#### 3.1 hs_platform_info_t：软约束的四字段
+
+`tune` 是 `unsigned int`，取值是 `HS_TUNE_FAMILY_*` 系列：`GENERIC` 为 0，`SNB` 为 1，`IVB` 为 2，`HSW` 为 3，`SLM` 为 4，`BDW` 为 5，`SKL` 为 6，`SKX` 为 7，`GLM` 为 8，`ICL` 为 9，`ICX` 为 10。它的作用是告诉编译器「按哪一代微架构的端口与延迟特性做取舍」，例如字面量分桶大小、向量宽度选择。注释明确写了：使用这个字段**不限制**数据库能运行的处理器，只影响性能。
+
+`cpu_features` 是 `unsigned long long`，位值定义在同一文件：`HS_CPU_FEATURES_AVX2` 是 `1ULL << 2`，`AVX512` 是 `1ULL << 3`，`AVX512VBMI` 是 `1ULL << 4`，另有 `HS_PLATFORM_ALL`（`0xabcdef11abcdef00ULL`）表示「所有平台通用」。注意这里是**肯定式**编码：置位表示可用。它与 `hs_database::platform` 的否定式编码正好相反，两者不能直接比较，也不能互相赋值。
+
+`reserved1` 与 `reserved2` 是 `unsigned long long`，注释只有一句「Reserved for future use」。它们的正确处理方式是显式写 0。用 `memset` 清零整个结构体是安全的，但用 `= {0}` 之外的方式逐个赋值时容易漏掉，导致未初始化字节进入编译器的判断。当前版本编译器不看这两个字段，但未来版本可能会看，写 0 是唯一的前向兼容做法。
+
+`hs_populate_platform` 是填充这个结构的便捷入口：它按当前主机探测 `tune` 与 `cpu_features`，调用方拿到后可以直接传给 `hs_compile*`。它探测的是「编译这台机器」的能力，不是「运行目标机器」的能力；交叉编译场景必须手工填写目标值，否则会生成只能在编译机跑的高特性数据库。
+
+#### 3.2 hs_expr_info_t：五个字段的判读价值
+
+`min_width` 是匹配的最小字节长度。注释里有一句关键限定：在使用扩展参数或 `HS_FLAG_SINGLEMATCH` 这类「抑制匹配」的特性时，这个值是**保守下界**，可能小于真实最小值。原因是这些特性会让编译器在更早的位置截断匹配路径，宽度分析只能给出「至少这么长」的结论。
+
+`max_width` 是最大字节长度，无界时填 `UINT_MAX`（`0xFFFFFFFF`）。同样有保守性说明。判读时要注意：`max_width == UINT_MAX` 只表示「模式本身无上界」，不表示「一定会匹配到缓冲区末尾」；有界重复被展开后可能仍然给出有限值。
+
+`unordered_matches`、`matches_at_eod`、`matches_only_at_eod` 三个 `char` 是「行为标志」，价值远高于宽度。`unordered_matches` 非零表示该表达式可能产生乱序报告，典型来源是断言——断言触发的匹配可能在扫描到更后位置时才被确认。`matches_at_eod` 非零表示可能在数据结束处报告，流式模式下这类匹配要等到 `hs_close_stream` 才出现。`matches_only_at_eod` 非零表示**只**在结束处报告，例如以 `$` 结尾的模式。
+
+工程上这三个标志决定「什么时候能认为扫描结束」。如果调用方按「`hs_scan` 返回就算完」来设计流水线，遇到 `matches_at_eod` 为真的模式就会漏掉最后一批匹配。正确做法是流式场景必须在 `hs_close_stream` 之后才算完整，块模式则要在最后一次扫描时把 EOD 语义考虑进去。
+
+这三个标志还有一个常被忽略的用途：估算「报告延迟」。`matches_only_at_eod` 为真的模式，报告时间与数据到达时间无关，只与关闭时间有关，因此不适合做实时告警；`unordered_matches` 为真的模式，报告顺序与偏移顺序不一致，因此不能假设「先收到的匹配偏移一定更小」，做窗口聚合时必须自己排序或缓冲。把这两个结论写进接口契约，比事后排查「为什么告警晚了十秒」要省力得多。
+
+还有一条边界：`hs_expression_info` 返回 `HS_SUCCESS` **不保证**同一模式能被 `hs_compile` 编译成功。头文件注释写得很直接：这个函数可能对 Hyperscan 无法编译的正则返回成功。因此它适合做「宽度预估」与「行为探测」，不适合做「可编译性预检」。
+
+#### 3.3 hs_expr_ext_t：flags 决定一切
+
+`flags` 是 `unsigned long long`，五个位分别对应五个可选字段：`HS_EXT_FLAG_MIN_OFFSET` 为 1，`MAX_OFFSET` 为 2，`MIN_LENGTH` 为 4，`EDIT_DISTANCE` 为 8，`HAMMING_DISTANCE` 为 16。**只有置位对应的字段才会被读取**，未置位的字段即使填了值也被忽略。这是本篇最实用的知识：调试「扩展参数不生效」时，第一步就是打印 `flags`。
+
+`min_offset` 与 `max_offset` 是「允许报告的结束偏移区间」，语义是「结束偏移落在区间外的匹配不报告」，而不是「从某个位置开始扫描」。这点常被误解为「跳过前 N 字节」，实际效果是「前 N 字节内的匹配被抑制，但扫描仍从 0 开始，跨过 N 的匹配照常报告」。`min_length` 是匹配长度（起点到终点）的下界，需要起点信息才能精确判定，因此它与 SOM 的关系需要在 06-10 里对照理解。
+
+`edit_distance` 与 `hamming_distance` 都是 `unsigned`，分别对应插入/删除/替换意义上的编辑距离与只允许替换的汉明距离。两者都只对单模式编译路径有意义，且会显著放大编译时间与字节码体积；具体上限与组合限制需对照实际版本核验（不同版本对「有界重复 + 近似匹配」的处理不同）。工程上应把它们当作「最后手段」：能用精确模式加后处理解决的，不要用近似匹配。
+
+几组已知的互斥关系必须记住：`HS_FLAG_SOM_LEFTMOST` 与 `HS_FLAG_SINGLEMATCH` 不能组合，`HS_FLAG_SOM_LEFTMOST` 与 `HS_FLAG_PREFILTER` 不能组合，违反时编译直接失败并给出 `HS_COMPILER_ERROR`。这些限制与 `hs_expr_ext_t` 无直接关系，但在设计扩展参数组合时经常一起出现，所以放在这里一并提醒。
+
+为什么近似匹配值得警惕？因为它把「一条模式」变成「一族模式的并集」，编译期要为每个可能的编辑位置生成状态，成本随距离增长很快；`min_length` 与 `min_offset` 则相反，它们只做「报告裁剪」，几乎不增加状态，属于便宜的过滤手段。工程上的优先级应该是：先用偏移与长度约束缩小报告范围，再用 `SINGLEMATCH` 之类的手段减少重复报告，最后才考虑近似匹配。顺序反了，编译时间与字节码体积都会失控。
+
+#### 3.4 hs_compile_error_t：唯一的失败诊断通道
+
+`message` 是 `char *`，由库在失败时分配，内容是人类可读的描述，例如「Pattern matches empty buffer」「Unrecognised flag」「Bounded repeat is too large」。它不是稳定的错误码，不能拿来做字符串匹配分支；需要分支时用返回码 `HS_COMPILER_ERROR` 加自己的规则。
+
+`expression` 是 `int`，表示出错表达式的零基下标。注释说明：如果错误不能定位到具体表达式，这个值小于 0。多模式编译时它是定位「哪一条写错了」的唯一线索，尤其是几千条模式批量编译的场景，没有它就只能二分。
+
+生命周期很短：`hs_compile*` 失败时通过出参返回，调用方读完必须调用 `hs_free_compile_error`。这个函数接受 NULL 并返回 `HS_SUCCESS`，所以「无条件调用」是安全的。反过来，用 `free()` 释放 `message` 或用 `free()` 释放整个结构体都是错的——内部可能用了自定义分配器，释放必须走配套函数。
+
+多模式场景下还有两个细节。第一，`expression` 只在「错误能定位到某条模式」时有意义；如果错误来自整体参数（例如 `mode` 不合法、数据库过大），它会小于 0，此时不要拿它去索引表达式数组，否则会越界。第二，一次失败的编译只返回一个错误，即使多条模式都有问题也只报第一条，因此修完一条再编译一次是常态，不要指望一次拿到全部错误清单。批量校验模式集的正确做法是先用 `hs_expression_info` 做语法级预筛，再逐条 `hs_compile`，把错误按 `expression` 归档。
+
+### 4. 典型示例
+
+下面的示例做三件事：用 `hs_expression_info` 探测宽度与 EOD 行为，用 `hs_expression_ext_info` 观察扩展参数对宽度的影响，最后故意编译一个空匹配模式，展示 `hs_compile_error_t` 的两个字段。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static void show_info(const char *pat, unsigned flags,
+                      const hs_expr_ext_t *ext) {
+    hs_expr_info_t *info = NULL;
+    hs_compile_error_t *err = NULL;
+    hs_error_t rc = ext ? hs_expression_ext_info(pat, flags, ext, &info, &err)
+                        : hs_expression_info(pat, flags, &info, &err);
+    if (rc != HS_SUCCESS) {
+        printf("info failed: expr=%d msg=%s\n",
+               err ? err->expression : -99, err ? err->message : "(null)");
+        hs_free_compile_error(err);
+        return;
+    }
+    printf("pat=%-16s min=%u max=%u unordered=%d at_eod=%d only_eod=%d\n",
+           pat, info->min_width, info->max_width,
+           (int)info->unordered_matches, (int)info->matches_at_eod,
+           (int)info->matches_only_at_eod);
+    free(info);
+}
+
+int main(void) {
+    show_info("abc[0-9]{2,4}", 0, NULL);
+    show_info("foo$", HS_FLAG_MULTILINE, NULL);
+    show_info("a.*b", 0, NULL);
+
+    hs_expr_ext_t ext;
+    ext.flags = HS_EXT_FLAG_MIN_LENGTH;
+    ext.min_offset = 0;
+    ext.max_offset = 0;
+    ext.min_length = 100;
+    ext.edit_distance = 0;
+    ext.hamming_distance = 0;
+    show_info("abc[0-9]{2,4}", 0, &ext);
+
+    hs_database_t *db = NULL;
+    hs_compile_error_t *err = NULL;
+    if (hs_compile("(abc)?", 0, HS_MODE_BLOCK, NULL, &db, &err)
+        != HS_SUCCESS) {
+        printf("compile failed: expr=%d msg=%s\n", err->expression,
+               err->message);
+        hs_free_compile_error(err);
+    }
+    return 0;
+}
+```
+
+示例输出如下（示例输出，具体格式需对照实际版本核验）。数值依赖版本与平台，重点是字段之间的关系。
+
+```text
+pat=abc[0-9]{2,4}    min=5 max=7 unordered=0 at_eod=0 only_eod=0
+pat=foo$             min=3 max=3 unordered=0 at_eod=1 only_eod=1
+pat=a.*b             min=2 max=4294967295 unordered=0 at_eod=0 only_eod=0
+pat=abc[0-9]{2,4}    min=5 max=7 unordered=0 at_eod=0 only_eod=0
+compile failed: expr=0 msg=Pattern matches empty buffer
+```
+
+判读分四步。第一步看 `abc[0-9]{2,4}`：`min=5` 来自三个字面字符加两位数字，`max=7` 来自四位数字，两者都精确，说明有界重复被完整展开。第二步看 `foo$`：`at_eod=1` 且 `only_eod=1`，这正是「流式模式下匹配要等到 `hs_close_stream`」的信号；如果业务方按「`hs_scan_stream` 返回后立刻判定」来写逻辑，这条模式永远拿不到匹配。第三步看 `a.*b`：`max=4294967295` 就是 `UINT_MAX`，表示无上界，任何按 `max_width` 分配缓冲区的做法都会失败。第四步看带 `min_length = 100` 的调用：输出与不带扩展参数时完全一致，`min` 仍是 5。这说明 `hs_expr_info_t` 的宽度是**模式自身属性**，不包含 `min_length` 这类外部约束；若据此以为「加上 min_length 就不会匹配短串」，就会误判过滤器行为。真正的约束在编译产物里生效，而不是在 info 里体现。最后的编译失败输出验证了 `expression` 在多模式场景下的定位价值，以及 `message` 只适合人读、不适合程序分支。
+
+### 5. 速查表
+
+速查表按「需求 → 结构 → 字段」三列组织，使用顺序是先定需求、再定结构、最后核对字段。需要强调的是，后三个结构不能跨调用复用：`hs_expr_info_t` 每次查询都会新分配，`hs_compile_error_t` 每次失败都会新分配，`hs_expr_ext_t` 虽然由调用方自己管理，但一次 `hs_compile_ext_multi` 之后即可释放。把它们缓存起来「下次接着用」，是泄漏与脏数据的两重来源；只有 `hs_platform_info_t` 是纯入参，可以复用。
+
+| 需求 | 用哪个结构 | 关键字段 |
+|---|---|---|
+| 按目标机优化 | `hs_platform_info_t` | `tune`、`cpu_features` |
+| 预估缓冲区大小 | `hs_expr_info_t` | `min_width`、`max_width` |
+| 判断是否要等 EOD | `hs_expr_info_t` | `matches_at_eod`、`matches_only_at_eod` |
+| 限制报告偏移 | `hs_expr_ext_t` | `flags`、`min_offset`、`max_offset` |
+| 近似匹配 | `hs_expr_ext_t` | `edit_distance`、`hamming_distance` |
+| 定位哪条模式错 | `hs_compile_error_t` | `expression` |
+| 展示错误原因 | `hs_compile_error_t` | `message` |
+
+### 6. 版本差异
+
+四个结构的字段集合稳定，变化集中在取值域。`tune` 家族从早期的 `GENERIC` 到 `SNB`、`IVB`、`HSW`、`SLM`、`BDW`、`SKL`、`SKX`、`GLM`、`ICL`，再到 `ICX = 10`，是逐个追加的；新增家族不会让老代码失效，因为未知值会被当作 `GENERIC` 处理，但「按最新家族调优」需要升级到支持它的版本。
+
+`cpu_features` 的变化是新增位：AVX2 与 AVX512 之后加入 AVX512VBMI，位值定义在同一文件里。`HS_PLATFORM_ALL` 的出现是为了「一次编译、到处运行」，它的值 `0xabcdef11abcdef00` 不是位或的结果，而是一个约定常量，判断时必须用相等而不是按位与。
+
+`hs_expr_ext_t` 的五个标志位从引入以来没有变过，但「哪些组合允许编译」在不同版本间有差异，尤其是近似匹配与有界重复、SOM 的交互。升级版本后如果原本能编译的模式报 `HS_COMPILER_ERROR`，先检查是不是扩展参数组合变了，而不是模式语法变了。
+
+`hs_expr_info_t` 的字段没变，但保守性的具体边界可能随编译器改进而变化：同一个模式在新版本上可能给出更紧的 `min_width`。因此不要把 `min_width` 当作跨版本的稳定契约，它只是「当前版本能证明的下界」。
+
+`reserved1` / `reserved2` 的存在本身就是版本策略的一部分：它们预留了 16 字节，使得未来增加「目标缓存大小」「NUMA 偏好」这类参数时不必改变结构体大小，也就不会破坏已编译调用方的二进制兼容。使用方唯一要做的就是把它们清零，并在升级头文件后重新编译；如果代码里用了「按字段逐个赋值 + 手工 sizeof」的写法，升级时最容易漏掉新增字段。
+
+### 7. 常见误用与调试
+
+1. **用 `free()` 释放 `hs_compile_error_t`**。必须用 `hs_free_compile_error`，否则在自定义分配器场景下会崩溃或泄漏。
+2. **忘记释放 `hs_expr_info_t`**。每次调用都会分配一块内存，循环探测几千条模式时会积累成明显泄漏。
+3. **把 `hs_expression_info` 当编译预检**。它对不可编译的模式也可能返回成功，真正的判定只能用 `hs_compile`。
+4. **`ext.flags` 没置位**。字段填了但 `flags` 为 0，编译器全部忽略，表现为「参数不生效」且没有任何警告。
+5. **把 `cpu_features` 与 `platform` 混用**。前者肯定式、后者否定式，直接赋值会得到「所有特性都不可用」或「全部可用」的极端结果。
+6. **`reserved` 字段不初始化**。局部变量未清零就传入，当前版本无害，未来版本可能被解释成新参数。
+7. **按 `max_width` 分配缓冲区**。无界模式返回 `UINT_MAX`，直接分配会失败；应先判断是否等于 `UINT_MAX`。
+
+（字段见 05-04 ｜ 参数见 04-03 ｜ 原理见 06-01 ｜ 模块见 07-03）
+
+## 05-05 RoseEngine 与 RoseContext 字段
+
+### 1. 本篇定位与覆盖范围
+
+`RoseEngine` 是数据库字节码的第一个结构，`hs_get_bytecode(db)` 返回的地址就是它的起点。它同时扮演三个角色：编译产物的目录（所有子表用偏移登记）、运行时的策略表（走哪条执行路径、要不要 EOD 检查、有没有 SOM）、scratch 与流状态的尺寸依据（队列数、状态大小、SOM 槽位数）。因此读 05 册如果不读这一篇，前面几篇的字段就只能孤立记忆。
+
+`RoseContext` 是另一个极端：它不住在数据库里，而是嵌在 scratch 的 `tctxt` 字段中，随每次扫描初始化，记录「这次扫描走到哪、能报告到哪」。它的十六个字段全是可变状态，生命周期与 scratch 相同。
+
+本篇覆盖 `src/rose/rose_internal.h` 第 331 行到第 484 行的 `RoseEngine`（含 `RoseStateOffsets`、`RoseBoundaryReports` 两个内嵌结构）与第 113 行到第 155 行的 `RoseContext`。由于 `RoseEngine` 字段接近九十个，字段表按语义分组、同组同类型的合并成一行，但每个字段名都会出现，不遗漏。运行时如何执行、队列如何调度属于 06-06 与 07-04，本篇只讲字段如何决定「走哪条路径」。
+
+版本基线 5.4.2。`runtimeImpl` 的三个取值与 `pickRuntimeImpl` 的判定条件来自 `src/rose/rose_build_bytecode.cpp`，是本篇最需要精确的部分。
+
+### 2. 索引与全参数表
+
+先给 `RoseEngine` 的分组字段表。第一列出现的多个名字表示它们共享同一行的类型、时机与关联流程；「源码位置」统一给到 `rose_internal.h` 的行号区间。
+
+| 字段 | 类型 | 含义 | 源码位置 | 读写时机 | 关联函数与流程 | 版本差异 |
+|---|---|---|---|---|---|---|
+| `pureLiteral` | `u8` | 是否由纯字面量 API 编译 | `332` | 编译末尾写入 | `pureLiteralBlockExec` | 5.x 稳定 |
+| `noFloatingRoots` | `u8` | 锚定表无命中则跳过浮动表 | `333` | 编译时写入 | `block.c`、`stream.c` | 稳定 |
+| `requiresEodCheck` | `u8` | 是否有 EOD 相关工作 | `335` | 编译时写入 | `rawEodExec`、`soleOutfixEodExec` | 稳定 |
+| `hasOutfixesInSmallBlock` | `u8` | 小块扫描也要跑 outfix | `336` | 编译时写入 | 小块路径 | 稳定 |
+| `runtimeImpl` | `u8` | 运行时实现：0 完整、1 纯浮动、2 单 outfix | `338` | 编译末尾写入 | `pickRuntimeImpl`、`runtime.c` | 5.x 稳定 |
+| `mpvTriggeredByLeaf` | `u8` | MPV 是否由叶子触发 | `340` | 编译时写入 | MPV 触发 | 稳定 |
+| `canExhaust` | `u8` | 每个模式都有耗尽键 | `341` | 编译时写入 | `exhaustionVector` | 稳定 |
+| `hasSom` | `u8` | 至少一个模式跟踪 SOM | `342` | 编译时写入 | SOM 存储、刷新 | 随 SOM 引入 |
+| `somHorizon` | `u8` | SOM 偏移槽的字节宽度 | `343` | 编译时按 horizon 写入 | 流状态布局 | 随 horizon 模式 |
+| `mode` | `u32` | 扫描模式 | `345` | 编译时写入 | `hs_database_info`、各 Exec | 稳定 |
+| `historyRequired` | `u32` | 流式所需历史字节数 | `346` | 编译时写入 | `hbuf`、`hlen` | 稳定 |
+| `ekeyCount` | `u32` | 耗尽键数量 | `347` | 编译时写入 | `exhausted` 位图 | 稳定 |
+| `lkeyCount`、`lopCount` | `u32` | 逻辑键与逻辑操作数 | `348`、`349` | 编译时写入 | 逻辑组合 | 稳定 |
+| `ckeyCount` | `u32` | 组合键数量 | `350` | 编译时写入 | `combVec` | 稳定 |
+| `logicalTreeOffset`、`combInfoMapOffset` | `u32` | 逻辑树与组合信息表的偏移 | `351`、`352` | 编译时写入 | 逻辑组合求值 | 稳定 |
+| `dkeyCount`、`dkeyLogSize` | `u32` | 去重键数与日志字节数 | `353`、`354` | 编译时写入 | `deduper` 定容 | 稳定 |
+| `invDkeyOffset` | `u32` | 去重键到外部报告 ID 的映射偏移 | `355` | 编译时写入 | 报告映射 | 稳定 |
+| `somLocationCount`、`somLocationFatbitSize` | `u32` | SOM 槽位数与位图字节数 | `357`、`358` | 编译时写入 | `som_store` 定容 | 随 SOM 引入 |
+| `rolesWithStateCount`、`stateSize` | `u32` | 有状态角色数与状态位图大小 | `359`、`360` | 编译时写入 | 角色状态 | 稳定 |
+| `anchorStateSize`、`tStateSize`、`scratchStateSize` | `u32` | 锚定 DFA、瞬态、scratch 状态大小 | `362` 至 `365` | 编译时写入 | scratch 定容 | `scratchStateSize` 较新 |
+| `smallWriteOffset` | `u32` | 小块写引擎偏移 | `366` | 编译时写入 | 小块路径 | 稳定 |
+| `amatcherOffset`、`ematcherOffset`、`fmatcherOffset` | `u32` | 锚定、EOD、浮动字面量表偏移 | `367` 至 `369` | 编译时写入 | `getALiteralMatcher` 等 | 稳定 |
+| `drmatcherOffset`、`sbmatcherOffset`、`longLitTableOffset` | `u32` | 延时重建、小块、长字面量表偏移 | `370` 至 `372` | 编译时写入 | 延时重建、长字面量 | 稳定 |
+| `amatcherMinWidth`、`fmatcherMinWidth`、`eodmatcherMinWidth` | `u32` | 三张表的最小匹配宽度 | `373` 至 `381` | 编译时写入 | 区域裁剪 | 稳定 |
+| `amatcherMaxBiAnchoredWidth`、`fmatcherMaxBiAnchoredWidth` | `u32` | 双锚定最大宽度 | `382` 至 `387` | 编译时写入 | 锚定窗口 | 稳定 |
+| `reportProgramOffset`、`reportProgramCount` | `u32` | 报告程序数组偏移与数量 | `393`、`398` | 编译时写入 | 输出型引擎 | 稳定 |
+| `delayProgramOffset`、`anchoredProgramOffset` | `u32` | 延时节目的与锚定程序偏移 | `404`、`409` | 编译时写入 | 延时、锚定角色 | 稳定 |
+| `activeArrayCount`、`activeLeftCount` | `u32` | 活动 NFA 与活动左缀数量 | `411`、`412` | 编译时写入 | 活动数组 | 稳定 |
+| `queueCount`、`activeQueueArraySize` | `u32` | 队列数与活动队列位图大小 | `413`、`414` | 编译时写入 | scratch 定容 | 稳定 |
+| `eagerIterOffset`、`activeLeftIterOffset` | `u32` | 稀疏迭代器偏移 | `416`、`477` | 编译时写入 | 活动左缀遍历 | 稳定 |
+| `handledKeyCount`、`handledKeyFatbitSize` | `u32` | 受管键数与位图字节数 | `421`、`424` | 编译时写入 | `handled_roles` | 较新字段 |
+| `leftOffset`、`roseCount` | `u32` | 左缀表偏移与 Rose 数量 | `426`、`427` | 编译时写入 | 左缀队列 | 稳定 |
+| `eodProgramOffset`、`flushCombProgramOffset`、`lastFlushCombProgramOffset` | `u32` | EOD 与组合刷新程序偏移 | `429` 至 `432` | 编译时写入 | EOD、组合 | 稳定 |
+| `lastByteHistoryIterOffset` | `u32` | 末字节历史迭代器偏移 | `434` | 编译时写入 | 历史补扫 | 稳定 |
+| `minWidth`、`minWidthExcludingBoundaries` | `u32` | 最小匹配宽度（含/不含边界报告） | `437`、`441` | 编译时写入 | 扫描前置判断 | 稳定 |
+| `maxBiAnchoredWidth` | `u32` | 全局双锚定最大宽度 | `443` | 编译时写入 | 锚定区域 | 稳定 |
+| `anchoredDistance`、`anchoredMinDistance` | `u32` | 锚定表运行区间 | `445`、`446` | 编译时写入 | 锚定扫描 | 稳定 |
+| `floatingDistance`、`floatingMinDistance` | `u32` | 浮动表运行区间 | `447`、`449` | 编译时写入 | 浮动扫描 | 稳定 |
+| `smallBlockDistance`、`floatingMinLiteralMatchOffset` | `u32` | 小块区间与浮动最小命中偏移 | `450`、`452` | 编译时写入 | 小块、浮动 | 稳定 |
+| `nfaInfoOffset` | `u32` | NFA 信息数组偏移 | `455` | 编译时写入 | `getNfaInfoByQueue` | 稳定 |
+| `initialGroups`、`floating_group_mask` | `rose_group` | 初始组与浮动组掩码 | `456`、`457` | 编译时写入 | `tctxt.groups` | 稳定 |
+| `size` | `u32` | 整个引擎镜像字节数 | `458` | 编译时写入 | `hs_database::length` | 稳定 |
+| `delay_count`、`delay_fatbit_size` | `u32` | 延时字面量数与 fatbit 大小 | `459`、`460` | 编译时写入 | `delay_slots` 定容 | 稳定 |
+| `anchored_count`、`anchored_fatbit_size` | `u32` | 锚定字面量数与 fatbit 大小 | `461`、`462` | 编译时写入 | `al_log` 定容 | 稳定 |
+| `maxFloatingDelayedMatch`、`delayRebuildLength` | `u32` | 延时命中上界与重建长度 | `463`、`465` | 编译时写入 | 延时重建 | 稳定 |
+| `stateOffsets` | `struct RoseStateOffsets` | 流状态各区偏移总表 | `468` | 编译时写入 | `validateStateLayout` | 稳定 |
+| `boundary` | `struct RoseBoundaryReports` | 边界报告程序偏移 | `469` | 编译时写入 | `reportZero`、`reportEod` | 稳定 |
+| `totalNumLiterals`、`asize` | `u32` | 字面量总数与锚定表大小 | `470`、`471` | 编译时写入 | 字面量统计 | 稳定 |
+| `outfixBeginQueue`、`outfixEndQueue`、`leftfixBeginQueue` | `u32` | 队列分段边界 | `472` 至 `474` | 编译时写入 | 队列分类 | 稳定 |
+| `initMpvNfa`、`rosePrefixCount` | `u32` | 初始 MPV 与 Rose 前缀数 | `475`、`476` | 编译时写入 | MPV、前缀 | 稳定 |
+| `ematcherRegionSize` | `u32` | EOD 表最大区域 | `478` | 编译时写入 | EOD 扫描 | 稳定 |
+| `somRevCount`、`somRevOffsetOffset` | `u32` | SOM 反向 NFA 数与偏移表 | `479`、`480` | 编译时写入 | SOM 反向匹配 | 随 SOM 引入 |
+| `longLitStreamState` | `u32` | 长字面量流状态字节数 | `481` | 编译时写入 | `stateOffsets` | 稳定 |
+| `state_init` | `struct scatter_full_plan` | 状态初始化散布计划 | `483` | 编译时写入 | 状态清零 | 稳定 |
+
+`RoseContext` 的十六个字段单独成表，因为它全部是可写状态，读写时机比含义更重要。
+
+| 字段 | 类型 | 含义 | 源码位置 | 读写时机 | 关联函数与流程 | 版本差异 |
+|---|---|---|---|---|---|---|
+| `mpv_inactive` | `u8` | MPV 是否处于非活动态 | `114` | 扫描中切换 | MPV 逻辑 | 稳定 |
+| `groups` | `u64a` | 当前活跃的 Rose 组 | `115` | 每次命中后更新 | 组掩码检查 | 稳定 |
+| `lit_offset_adjust` | `u64a` | 字面量命中偏移修正量 | `116` | 初始化时设置 | 纯字面量路径 | 稳定 |
+| `delayLastEndOffset` | `u64a` | 上一次延时字面量命中结束偏移 | `117` | 延时处理后更新 | 延时重建 | 稳定 |
+| `lastEndOffset` | `u64a` | 上一次 FDR/锚定命中结束偏移 | `119` | 命中插入时更新 | 历史逻辑 | 稳定 |
+| `lastMatchOffset` | `u64a` | 上一次向用户报告的偏移 | `124` | 报告后更新 | 仅断言与调试 | 稳定 |
+| `lastCombMatchOffset` | `u64a` | 活动组合的上一次命中偏移 | `125` | 组合刷新时更新 | 组合逻辑 | 稳定 |
+| `minMatchOffset` | `u64a` | 仍允许报告的最早偏移 | `126` | 区域推进时更新 | 报告裁剪 | 稳定 |
+| `minNonMpvMatchOffset` | `u64a` | 非 MPV 引擎可报告的最早偏移 | `128` | MPV 推进时更新 | MPV 与普通引擎 | 稳定 |
+| `next_mpv_offset` | `u64a` | MPV 下一次可报告偏移 | `130` | 顶层事件到达时清零 | MPV | 稳定 |
+| `filledDelayedSlots` | `u32` | 已填的延时槽位 | `132` | 延时槽填充时累加 | `delay_slots` | 稳定 |
+| `curr_qi` | `u32` | 当前执行的主队列下标 | `133` | 队列执行时设置 | `nfaQueueExec` | 稳定 |
+| `ll_buf`、`ll_len` | `const u8 *`、`size_t` | 长字面量区分大小写缓冲 | `145`、`148` | 流式跨块时设置 | 长字面量表 | 稳定 |
+| `ll_buf_nocase`、`ll_len_nocase` | `const u8 *`、`size_t` | 长字面量不区分大小写缓冲 | `151`、`154` | 流式跨块时设置 | 长字面量表 | 稳定 |
+
+### 3. 逐项详解
+
+#### 3.1 九个路径字节：先看这九个，再看别的
+
+`RoseEngine` 开头连续九个 `u8`，是编译期算好的「执行策略开关」，运行时几乎不做判断，直接读。这也是为什么它们被放在结构体最前面：与 `hs_database` 头部相邻，扫描入口可以在同一条缓存行里拿到全部策略位。
+
+`pureLiteral` 标识「这个数据库来自纯字面量 API」（`hs_compile_lit` / `hs_compile_lit_multi`），由 `src/compiler/compiler.cpp` 第 627 行在 `build()` 里写入 `pureFlag`。它不是从图结构推导的，而是调用方选择的编译入口决定的。运行时 `pureLiteralBlockExec` 与 `pureLiteralStreamExec` 只取浮动字面量表，不跑 Rose 程序。
+
+`noFloatingRoots` 的语义是「只有锚定表有命中时，才需要跑浮动表」。`src/rose/block.c` 第 234 行与 `stream.c` 第 629 行都有 `if (t->noFloatingRoots && !roseHasInFlightMatches(t, state, scratch))` 的提前返回，说明这个字段是纯粹的快速退出开关。它的存在意味着「没有浮动根」的数据库可以把整段浮动扫描省掉。
+
+`requiresEodCheck` 表示「有 EOD 相关工作」，例如以 `$` 结尾的锚定、EOD 表的报告程序。它决定扫描结束时是否要再跑一遍 EOD 程序，`runtime.c` 的收尾分支里用 `switch (rose->runtimeImpl)` 配合它决定调 `rawEodExec` 还是 `soleOutfixEodExec`。注意它和 `boundary.reportEodOffset` 不是一回事：后者是「有报告要发」，前者是「有引擎要跑」。
+
+`hasOutfixesInSmallBlock` 与小块扫描优化相关：某些 outfix 在小块里也必须执行，不能被小块专用表替代。`mpvTriggeredByLeaf` 表示 MPV 需要检查后缀/外缀才能触发。`canExhaust` 表示每个模式都有耗尽键，因此可以在 `exhaustionVector` 全置位后提前结束。`hasSom` 与 `somHorizon` 成对：前者是有没有 SOM，后者是每个槽多宽。
+
+#### 3.2 runtimeImpl：三值的精确含义
+
+`runtimeImpl` 是 `u8`，取值来自 `rose_internal.h` 第 310 到 312 行的三个宏：`ROSE_RUNTIME_FULL_ROSE` 为 0，`ROSE_RUNTIME_PURE_LITERAL` 为 1，`ROSE_RUNTIME_SINGLE_OUTFIX` 为 2。它在 `pickRuntimeImpl`（`rose_build_bytecode.cpp` 第 327 行）里被决定，判定顺序是：先看 `isPureFloating`，成立返回 1；再看 `isSingleOutfix`，成立返回 2；否则返回 0。
+
+`isPureFloating` 的条件是一串否定式检查：必须有浮动表；不能有 outfix、suffix、leftfix 三类引擎；不能有 anchored 表；不能有 EOD 工作；不能有状态；不能有延时字面量；流式模式下不能有长字面量检查；不能有组检查。全部满足才返回真。换句话说，只要数据库里有一点「需要 Rose 程序介入」的东西，就会退化成完整 Rose。`isSingleOutfix` 的条件是：除起始顶点外没有角色顶点、没有 SOM 槽位、没有 EOD 边界报告、且 outfix 数量恰为 1。
+
+这三个值的运行时映射写在 `src/runtime.c`：块模式 `switch` 分派到 `rawBlockExec`、`pureLiteralBlockExec`、`soleOutfixBlockExec`；流式模式分派到对应的 Stream 版本；EOD 收尾只允许后两者中的 `SINGLE_OUTFIX` 与 `FULL_ROSE`，`PURE_LITERAL` 在 EOD 分支里是 `assert(0)`，因为纯字面量数据库不产生 EOD 匹配。
+
+#### 3.3 mode 与 historyRequired：两个决定「怎么扫」的字段
+
+`mode` 是 `u32`，取值是 `HS_MODE_BLOCK`、`HS_MODE_STREAM`、`HS_MODE_VECTORED` 三者之一（注意编译时还可能带 SOM horizon 位，但写入 `RoseEngine::mode` 的是去掉 horizon 后的基础模式）。它决定状态区如何布局、扫描入口走哪条 `Exec`、以及 `hs_database_info` 打印哪个模式名。
+
+`historyRequired` 是流式模式下需要保留的历史字节数，上界由它决定，实际历史缓冲区由 `core_info::hbuf`/`hlen` 指向。它影响两件事：流状态的大小（`stateOffsets::history` 区段的容量）与跨块匹配的正确性。值为 0 表示不需要历史，常见于纯字面量或全锚定数据库。
+
+这两个字段有一个共同点：它们都是「编译期确定、运行期只读」，所以可以被 `hs_database_info` 之外的诊断工具安全读取，不需要加锁。
+
+#### 3.4 key 计数与偏移：逻辑组合与去重的目录
+
+`ekeyCount` 是耗尽键数量，对应流状态里的 `exhausted` 位图；`lkeyCount` 与 `lopCount` 是逻辑键与逻辑操作数，`logicalTreeOffset` 指向从 `lkey` 到 `LogicalOp` 的映射；`ckeyCount` 与 `combInfoMapOffset` 是组合键与组合信息表；`dkeyCount`、`dkeyLogSize`、`invDkeyOffset` 是去重键、日志大小与「去重键到外部报告 ID」的映射。
+
+这些字段的价值在于「一张数据库里有多少个需要跨模式协调的东西」。逻辑组合（`HS_FLAG_COMBINATION`）会显著增加 `lkeyCount` 与 `lopCount`；`HS_FLAG_SINGLEMATCH` 会增加 `ekeyCount`；同一报告 ID 的多条模式会增加 `dkeyCount`。排查「开了组合之后 scratch 变大」时，先看这三个计数，再看 scratch 的对应容量字段，因果链就清楚了。
+
+`invDkeyOffset` 的名字容易误解：它不是「反向去重」，而是「去重键 → 外部报告 ID」的反查表。名字里的 `inv` 指映射方向，不指算法。
+
+#### 3.5 matcher 偏移与宽度：四张表加一张长字面量表
+
+`amatcherOffset`、`ematcherOffset`、`fmatcherOffset` 分别指向锚定、EOD 锚定、浮动三张字面量匹配表；`drmatcherOffset` 指向延时重建表；`sbmatcherOffset` 指向小块专用表；`longLitTableOffset` 指向长字面量表；`smallWriteOffset` 指向小块写引擎。七个偏移全部是「相对 `RoseEngine` 起点」，为 0 表示该表不存在。
+
+对应的访问器都是内联函数，且都做了防御性检查：`getALiteralMatcher`、`getFLiteralMatcher`、`getSBLiteralMatcher` 在偏移为 0 时返回 NULL，在偏移大于等于 `t->size` 时断言并返回 NULL。这说明「偏移合法性」在 5.4.x 被当作安全边界处理，而不是靠调用方保证。
+
+三个 `*MinWidth` 与两个 `*MaxBiAnchoredWidth` 是「区域裁剪」的依据：只有当缓冲区剩余长度不小于最小宽度时，才值得跑对应的表；只有当已扫描长度不超过最大双锚定宽度时，锚定表才可能命中。`minWidth` 与 `minWidthExcludingBoundaries` 则是整个引擎级的最小宽度，前者在存在边界报告时会被置 0（因为 EOD 报告可能零长度），后者始终是模式本身的下界。
+
+#### 3.6 状态尺寸：stateSize 不是 Rose 状态大小
+
+源码在 `stateSize` 旁边写了一句警告：「size of the state bitset，WARNING: not the size of the rose state」。这句话非常重要：`stateSize` 只是角色状态位图的大小，真正的流状态总大小是 `stateOffsets.end`。同理，`anchorStateSize` 是锚定 DFA 的状态大小，`tStateSize` 是瞬态 Rose NFA 的状态大小，`scratchStateSize` 是「scratch 里为 NFA 预留的未压缩状态大小」，只用于 scratch 定容。
+
+四者与 scratch 的对应关系是：`stateOffsets.end` → `bStateSize`（块模式）或流状态；`tStateSize` → `tStateSize`；`scratchStateSize` → `fullStateSize`；`anchorStateSize` 属于 `stateOffsets` 的一部分，不单独分配。`validateStateLayout` 会校验「每个区段都落在 `stateOffsets.end` 之内，且大小与计数一致」，这是反序列化时的关键防线。
+
+#### 3.7 队列分段：三个边界字段
+
+`outfixBeginQueue`、`outfixEndQueue`、`leftfixBeginQueue` 把 `queueCount` 个队列切成四段：起始到 `outfixBeginQueue` 是链式 MPV，`outfixBeginQueue` 到 `outfixEndQueue` 是外缀，`outfixEndQueue` 到 `leftfixBeginQueue` 是后缀，之后是前缀与中缀。这段注释直接写在 `rose_internal.h` 的队列分配示意里。
+
+有了这三个边界，运行时不需要为每个队列存「类型」字段，靠下标比较就能分类。这也是「用布局代替元数据」的典型手法：省一个字节的枚举，换一次比较。调试时如果发现某个队列被当成错误类型执行，先核对这三个边界是否与 `queueCount` 自洽。
+
+`activeArrayCount` 与 `activeLeftCount` 是活动数组的容量，`activeQueueArraySize` 是位图字节数，三者与 scratch 的 `aqa` 直接对应。
+
+#### 3.8 RoseContext：一次扫描的游标集合
+
+`RoseContext` 的十六个字段可以按「偏移游标」「组状态」「长字面量缓冲」分三组。偏移游标组包括 `lit_offset_adjust`、`delayLastEndOffset`、`lastEndOffset`、`lastMatchOffset`、`lastCombMatchOffset`、`minMatchOffset`、`minNonMpvMatchOffset`、`next_mpv_offset`；组状态组是 `groups` 与 `mpv_inactive`；计数与下标组是 `filledDelayedSlots` 与 `curr_qi`；长字面量组是四个 `ll_*` 字段。
+
+`lit_offset_adjust` 只在纯字面量路径使用：`pureLiteralInitScratch` 把它设为 `offset + 1`，因为纯字面量的命中偏移是「字面量末尾 + 1」的相对值，需要加一修正。`lastMatchOffset` 的注释明确写着「used only for debugging, asserts」，说明它不参与匹配逻辑，不要拿它做业务判断。
+
+`minMatchOffset` 与 `minNonMpvMatchOffset` 是「报告裁剪」的两个水位：前者约束所有引擎，后者只约束非 MPV 引擎。它们的存在是为了保证报告顺序，把「还不能报告的偏移」压住。`next_mpv_offset` 则是 MPV 的下一次可报告位置，顶层事件到达时会被清零。
+
+`ll_buf`/`ll_len` 与 `ll_buf_nocase`/`ll_len_nocase` 只在流式模式使用：跨块时长字面量表把哈希结果存进流状态，下一块开始时用这个缓冲还原前缀字符串。它们指向的是字节码里的常量字符串，不是 scratch 里的副本，所以不要试图写入。
+
+#### 3.9 三条路径：字段如何决定执行分支
+
+第一条是**纯字面量路径**。条件是编译入口为 `hs_compile_lit*`，`pureLiteral` 被置 1，同时 `runtimeImpl` 通常为 `ROSE_RUNTIME_PURE_LITERAL`。运行时走 `pureLiteralBlockExec` / `pureLiteralStreamExec`，只调用 `getFLiteralMatcher` 拿到浮动表，再 `hwlmExec` 扫一遍，没有任何 Rose 程序、没有 NFA 队列、没有 EOD 阶段。这条路径最快，但能力被严格限制：只支持 `CASELESS`、`SINGLEMATCH`、`SOM_LEFTMOST` 三个标志，不支持扩展参数。
+
+第二条是**只跑 floating 表**。条件是 `pureLiteral` 为 0，但 `runtimeImpl` 为 `ROSE_RUNTIME_PURE_LITERAL`，也就是 `isPureFloating` 的那串否定检查全部通过（有浮动表，且无外缀/后缀/前缀引擎、无锚定、无 EOD、无状态、无延时、流式无长字面量、无组检查）。它同样走 `pureLiteralBlockExec` 这个分支，但因为 `pureLiteral` 为 0，报告路径会经过完整的 `roseCallback`（`src/rose/match.c` 第 241 行与第 623 行都有 `if (t->pureLiteral)` 的分支），从而支持报告 ID、去重、组掩码等语义。它与第一条的差别不在「跑什么表」，而在「命中之后怎么处理」。
+
+第三条是**完整 Rose**。条件是 `runtimeImpl` 为 0，或者为 2（单 outfix，属于「最小 Rose」的特例）。此时块模式走 `rawBlockExec`，流式走 `rawStreamExec`，内部再按 `noFloatingRoots` 决定是否跳过浮动表、按 `requiresEodCheck` 决定收尾是否跑 EOD 程序、按 `hasSom` 决定是否刷新 SOM 存储。`canExhaust` 为真时还可以在耗尽后提前结束，`hasOutfixesInSmallBlock` 决定小块路径是否要额外跑 outfix。
+
+三条路径的判定关系见图 05-05-01。图中虚线边是「前置条件」，实线边是「编译期赋值」，红色节点是完整 Rose 独有的收尾逻辑。
+
+:::figure id=05-05-01 | name=RoseEngine 字段决定的三条运行时路径 | dir=TD
+node f "RoseEngine 策略字段" blue
+node p1 "pureLiteral=1" green
+node p2 "runtimeImpl=1" green
+node p3 "runtimeImpl=2" amber
+node p4 "runtimeImpl=0" purple
+node c1 "无 anchored 与 EOD" gray
+node c2 "无状态与延时" gray
+node c3 "无长字面量与组检查" gray
+node x "EOD 与 SOM 收尾" red
+node y "完整 Rose 程序" red
+edge f -> p1 "纯字面量入口"
+edge c1 -> p2 dashed "前置"
+edge c2 -> p2 dashed "前置"
+edge c3 -> p2 dashed "前置"
+edge f -> p3 "单 outfix 判定"
+edge f -> p4 "其余情况"
+edge p4 -> y "rawBlockExec"
+edge p4 -> x "requiresEodCheck"
+edge p3 -> x "soleOutfixEodExec"
+:::
+
+从图里可以看出一个实用结论：`runtimeImpl` 是唯一需要看的「总开关」，`pureLiteral` 只用来区分「纯字面量 API」与「普通纯浮动」。排查「为什么我的数据库没有走快速路径」时，先看 `runtimeImpl` 是不是 0，再看是哪个 `isPureFloating` 条件没满足——`hsdump` 会打印 `pureLiteral`、`canExhaust`、`hasSom` 这些标志，正好可以用来对照。
+
+（字段见 05-05 ｜ 参数见 04-03 ｜ 原理见 06-04 ｜ 模块见 07-04）
+
+### 4. 典型示例
+
+下面的示例从数据库里读出 `RoseEngine` 的策略字段并打印。它使用了内部头 `rose/rose_internal.h`，只能用于诊断工具；产品代码没有可移植的方式访问这些字段。
+
+```cpp
+#include "database.h"
+#include "rose/rose_internal.h"
+#include <hs.h>
+#include <cstdio>
+
+int main() {
+    hs_database_t *db = nullptr;
+    hs_compile_error_t *err = nullptr;
+    if (hs_compile("foo[0-9]{2}bar", HS_FLAG_SOM_LEFTMOST,
+                   HS_MODE_BLOCK | HS_MODE_SOM_HORIZON_LARGE,
+                   nullptr, &db, &err) != HS_SUCCESS) {
+        std::printf("compile failed: %s\n", err->message);
+        hs_free_compile_error(err);
+        return 1;
+    }
+
+    const RoseEngine *rose =
+        static_cast<const RoseEngine *>(hs_get_bytecode(db));
+    std::printf("mode=%u pureLiteral=%u runtimeImpl=%u\n",
+                rose->mode, rose->pureLiteral, rose->runtimeImpl);
+    std::printf("hasSom=%u somHorizon=%u canExhaust=%u\n",
+                rose->hasSom, rose->somHorizon, rose->canExhaust);
+    std::printf("historyRequired=%u queueCount=%u ekeyCount=%u\n",
+                rose->historyRequired, rose->queueCount, rose->ekeyCount);
+    std::printf("state.end=%u size=%u minWidth=%u\n",
+                rose->stateOffsets.end, rose->size, rose->minWidth);
+    std::printf("fmatcherOffset=%u amatcherOffset=%u\n",
+                rose->fmatcherOffset, rose->amatcherOffset);
+
+    hs_free_database(db);
+    return 0;
+}
+```
+
+示例输出如下（示例输出，具体格式需对照实际版本核验）。具体数值与模式、版本强相关，判读看关系不看绝对值。
+
+```text
+mode=1 pureLiteral=0 runtimeImpl=0
+hasSom=1 somHorizon=8 canExhaust=0
+historyRequired=0 queueCount=4 ekeyCount=0
+state.end=96 size=2048 minWidth=7
+fmatcherOffset=1024 amatcherOffset=0
+```
+
+判读分四点。第一，`mode=1` 对应 `HS_MODE_BLOCK`，`pureLiteral=0` 说明不是纯字面量入口，`runtimeImpl=0` 说明走完整 Rose —— 因为有 SOM，`isPureFloating` 的「无状态」条件不满足，退化成完整路径，这与预期一致。第二，`hasSom=1` 与 `somHorizon=8` 同时出现，说明 SOM 已开启且每槽 8 字节，对应 `HS_MODE_SOM_HORIZON_LARGE`；若换成 `SMALL`，这个值会变小，但 `somLocationCount` 不变，这就是 05-03 里强调的「两个增长不要混为一谈」。第三，`amatcherOffset=0` 表示没有锚定表，`fmatcherOffset=1024` 表示浮动表存在，这解释了为什么该模式不能走纯浮动路径：`isPureFloating` 还要求「无状态」，而 SOM 就是状态。第四，`minWidth=7` 与模式 `foo[0-9]{2}bar` 的 3+2+3 完全吻合，说明 `minWidth` 是精确下界；`size=2048` 是引擎镜像大小，与 `hs_database::length` 相等，可用它交叉验证数据库头有没有被改。
+
+### 5. 速查表
+
+| 想确认的事 | 字段 | 判读 |
+|---|---|---|
+| 为什么没走快速路径 | `runtimeImpl` | 0 即完整 Rose |
+| 是否纯字面量 API 编译 | `pureLiteral` | 1 表示只跑浮动表且无 Rose 程序 |
+| 是否开了 SOM | `hasSom`、`somHorizon` | 前者开关，后者槽宽 |
+| 流式要留多少历史 | `historyRequired` | 0 表示不需要历史 |
+| scratch 为什么大 | `queueCount`、`stateOffsets.end` | 队列与状态区 |
+| 报告为什么被压住 | `RoseContext::minMatchOffset` | 报告水位 |
+| 是否有 EOD 收尾 | `requiresEodCheck` | 决定收尾是否跑 EOD 程序 |
+| 锚定表是否存在 | `amatcherOffset` | 0 表示不存在 |
+
+### 6. 版本差异
+
+`RoseEngine` 是内部结构，字段随版本增删，且没有 ABI 承诺。5.4.0 引入 Sheng 系列与 Fat Teddy 后，`runtimeImpl` 的判定条件与相关资源统计发生变化，同一个模式集在新版本上可能从「纯浮动」退化为「完整 Rose」，表现为 `hs_dump` 输出变化与 scratch 变大。5.4.1 的 bugfix 可能调整 `isPureFloating` 的边界条件，5.4.2 则涉及 scratch 行为。
+
+`hasSom`、`somLocationCount`、`somHorizon`、`somRevCount` 这几个字段随 SOM 功能一起演进；早期版本没有 SOM 时这些字段不存在或恒为 0，因此按偏移硬读 `RoseEngine` 的代码在跨版本时必然失效。`handledKeyCount`、`handledKeyFatbitSize` 属于较新的角色管理字段，老版本没有。
+
+还有一个隐蔽的变化点：`RoseStateOffsets` 的区段数量在版本间可能增加（例如长字面量状态、SOM 有效性位图），新增区段会改变 `end` 的值，从而改变流状态与 scratch 大小，但字段名不变。这类变化只能通过 `validateStateLayout` 的校验逻辑或 `hsdump` 输出对比发现，不能靠字段表判断。
+
+因此对本篇的正确态度是：字段名可用于理解与诊断，但**不要**在生产代码里按偏移访问 `RoseEngine`；跨版本比对时以 `hsdump` 的结构化输出为准，而不是自己解析字节。
+
+### 7. 常见误用与调试
+
+1. **把 `stateSize` 当流状态大小**。源码注释已警告它不是 Rose 状态大小，真正的总大小是 `stateOffsets.end`。
+2. **假设 `runtimeImpl` 只由模式决定**。它还受编译入口、流式/块模式、长字面量、组检查影响，同一模式在不同模式下可能不同。
+3. **把 `pureLiteral` 与「纯浮动」混为一谈**。前者是编译入口标志，后者是资源判定结果；两者都为 1 才是纯字面量路径。
+4. **用 `lastMatchOffset` 做业务判断**。注释写明它只用于调试与断言。
+5. **按偏移硬读 `RoseEngine`**。内部结构无 ABI 承诺，升级即失效；用 `hsdump` 或本篇的字段名做人工核对。
+6. **忽略 `noFloatingRoots` 的提前退出**。调试「浮动表没跑」时，先确认锚定表是否有命中，而不是怀疑浮动表损坏。
+7. **把 `somHorizon` 当槽位数**。它是槽宽，槽位数是 `somLocationCount`；两者混用会得出错误的容量估算。
+
+（字段见 05-05 ｜ 参数见 04-02 ｜ 原理见 06-10 ｜ 模块见 07-04）
+
+
+

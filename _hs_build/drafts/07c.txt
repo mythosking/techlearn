@@ -1,0 +1,819 @@
+# Hyperscan 技术资料 · 07 模块与特性介绍（分片 C）
+
+## 07-10 runtime / dispatcher / database 模块
+
+### 1. 背景与动机
+
+编译期把正则变成一份不可变字节码，运行期要回答的是另一组问题：同一份 `.so` 如何在 SSE4.2 的老机器、AVX2 的主流机器和 AVX-512 的新机器上都能跑；同一份数据库如何被多个线程、多个流、三种扫描模式安全复用；一份来自磁盘或网络对端的字节流，如何在触碰任何内部指针之前被证明「结构上可信」。`src/hs.cpp`、`src/runtime.c`、`src/dispatcher.c`、`src/database.c`、`src/database.h`、`src/hs_valid_platform.c`、`src/alloc.c` 这七个文件（外加 `src/scratch.c`）合起来，构成这条边界。
+
+把运行期拆成多层而不是写成一个巨大的 `hs_scan`，有三个直接收益。第一是 ABI 与微架构解耦：调用方只看到一个 `hs_scan` 符号，真正的实现按 CPU 特性在动态链接加载期绑定，这是 `dispatcher.c` 里 `ifunc` 的用处，也是 fat runtime 能在「一份 `.so`」里塞下五套实现的机制基础。第二是信任边界清晰：`database.c` 是唯一被允许解释「外来字节」的模块，magic、版本、长度、平台、两段 HMAC、RoseEngine 偏移合法性全部集中在这里；其余模块可以假定手上的数据库已经通过校验。第三是可替换性：`alloc.c` 把数据库、misc、scratch、stream 四类分配做成函数指针，宿主可以接入自己的内存池、统计分配器或带配额的分层分配器，而不必改动扫描热路径。
+
+有一条边界必须先说清：这一层只负责「把一块已经拿到的内存交给自动机」。它不抓包、不做协议解析、不做 TCP 流重组；`examples/pcapscan.cc` 里的收包逻辑属于示例程序，不属于库。运行期同样不理解正则语义，它只解释 `RoseEngine` 里的程序与查表结构，语义正确性在编译期就已经固化。
+
+另一个容易被忽略的动机是「失败要快且可判别」。运行期的每个返回值都对应一个明确阶段：`HS_INVALID` 是参数或句柄形状不对，`HS_DB_MODE_ERROR` 是用 block 数据库去跑流式接口，`HS_SCRATCH_IN_USE` 是 scratch 重入，`HS_ARCH_ERROR` 是 CPU 能力不足，`HS_UNKNOWN_ERROR` 是自动机内部状态异常。把这些错误码压在统一的入口层，排障时才能靠返回值定位到阶段，而不是靠日志猜。
+
+### 2. 核心概念
+
+**API 入口层（`hs.cpp`）**。它承担编译侧全部公共入口，最典型的是 `hs_compile`、`hs_compile_multi`、`hs_compile_ext_multi`、`hs_compile_lit` 与 `hs_expression_info`（完整清单见 04-04）。这些函数只做参数检查、模式与平台校验、`CompileContext` 与 `NG` 的组装，随后把活交给 `compiler/compiler.cpp` 的 `build()`。`hs_compile` 本身是薄包装：把单条模式塞进长度为 1 的数组，复用 `hs_compile_multi_int`，因此单条与多条在错误路径上的行为完全一致。`hs_compile_lit*` 走另一条内部入口 `hs_compile_lit_multi_int`，多了「长度必须显式给出且不得为零」的检查。
+
+**公共运行时（`runtime.c`）**。它实现三种扫描、流的打开关闭重置复制、流状态压缩与展开，典型入口是 `hs_scan`、`hs_scan_stream`、`hs_scan_vector`、`hs_open_stream` 与 `hs_close_stream`（完整清单见 04-05）。这一层不理解具体引擎，只根据 `RoseEngine::runtimeImpl` 在「全 Rose」「纯字面量」「单 outfix」三条路径中选一条。
+
+**分派层（`dispatcher.c`）**。宏 `CREATE_DISPATCH` 为每个公共函数生成五份实现（`avx512vbmi_`、`avx512_`、`avx2_`、`corei7_`、`core2_`）加一个错误实现，再用 `__attribute__((ifunc("resolve_...")))` 在加载期解析。解析顺序是 VBMI → AVX-512 → AVX2 → SSE4.2 且带 POPCNT → SSSE3 → 错误函数；错误函数直接返回 `(RTYPE)HS_ARCH_ERROR`，也就是「CPU 太老」在函数指针层面就被表达出来，调用方不需要额外分支。若构建时定义了 `DISABLE_AVX512_DISPATCH` 或 `DISABLE_AVX512VBMI_DISPATCH`，对应变体被宏替换成 `disabled_`，`check_*()` 恒为假，等于把该档从分派表中摘掉。
+
+**数据库层（`database.c` / `database.h`）**。它负责序列化、反序列化、尺寸查询、信息串输出与释放，并提供两个不同层次的校验入口：`validDatabase()` 只查 `magic` 与 `version`；`dbIsValid()` 才是深校验，除前述两项外还查平台位、字节码 16 字节对齐、两段 HMAC、`bytecode` 偏移是否落在头部预留区间，以及 RoseEngine 的 `stateOffsets` 布局是否越界。这两个入口的分工是理解运行期信任模型的关键。
+
+**平台层（`hs_valid_platform.c`）**。整个文件只有一件事：`hs_valid_platform()` 检查 SSSE3，有则返回 `HS_SUCCESS`，没有则返回 `HS_ARCH_ERROR`。它是「这台机器能不能跑这个库」的最便宜探针，宿主应在加载库之后、编译之前调用一次，并把它作为降级或拒绝启动的依据。
+
+**分配器层（`alloc.c`）**。四个全局函数指针 `hs_database_alloc`、`hs_misc_alloc`、`hs_scratch_alloc`、`hs_stream_alloc` 与四个 free 指针，默认指向 `malloc` / `free`。`normalise_alloc()` 把 NULL 归一成默认实现，所以 `hs_set_allocator(NULL, NULL)` 等价于「恢复默认」，而不是「禁用分配」。
+
+**scratch 与「在用」标志**。`struct hs_scratch` 里有 `magic`（`SCRATCH_MAGIC = 0x544F4259`）与 `in_use`。`markScratchInUse()` 用读—判—写的方式置位，返回非零表示已被占用；`hs_scan` 拿到非零就返回 `HS_SCRATCH_IN_USE`。它只是一个重入检测器，不是锁：跨线程共享时它只能把一部分竞争转换成错误码，另一部分仍是数据竞争。`core_info` 里的 `STATUS_TERMINATED`、`STATUS_EXHAUSTED`、`STATUS_DELAY_DIRTY`、`STATUS_ERROR` 四个位，则是扫描过程中传递「提前终止 / 已耗尽 / 延迟字面量脏 / 内部错误」的载体。
+
+**运行实现的三种形态**。`runtimeImpl` 取 `ROSE_RUNTIME_FULL_ROSE` 时走 `rawBlockExec()`，由 Rose 程序驱动 HWLM/NFA/DFA 协作；取 `ROSE_RUNTIME_PURE_LITERAL` 时走 `pureLiteralBlockExec()`，整库只有字面量，连 Rose 程序都省掉；取 `ROSE_RUNTIME_SINGLE_OUTFIX` 时走 `soleOutfixBlockExec()`，只有一个 outfix 引擎。这三条路径的差别不在语义，而在「有多少调度开销可以省掉」。
+
+### 3. 关键数据结构与源码位置
+
+`hs_database`、`hs_scratch`、`RoseEngine`、`hs_platform_info_t` 的逐字段定义分别见 05-02、05-03、05-05、05-04，本篇不重复字段表，只指出「哪个文件拥有它、哪个函数读它」。下表把本篇涉及的源文件、规模量与职责对齐。
+
+| 源文件 | 行数量级 | 核心职责 | 关键符号 |
+|---|---|---|---|
+| `src/hs.cpp` | 661 | 编译 API 入口、模式与平台校验 | `hs_compile_multi_int`、`checkMode`、`checkPlatform` |
+| `src/runtime.c` | 1329 | 三种扫描、流生命周期、压缩展开 | `hs_scan`、`hs_scan_stream`、`hs_compress_stream` |
+| `src/dispatcher.c` | 147 | ifunc 微架构分派 | `CREATE_DISPATCH`、`resolve_hs_scan` |
+| `src/database.c` | 3419 | 校验、序列化、反序列化、信息输出 | `db_decode_header`、`db_check_integrity`、`dbIsValid` |
+| `src/database.h` | 174 | 头部布局、平台位、浅校验 | `struct hs_database`、`validDatabase` |
+| `src/hs_valid_platform.c` | 41 | SSSE3 能力探针 | `hs_valid_platform` |
+| `src/alloc.c` | 113 | 四类分配器钩子 | `hs_set_allocator`、`hs_set_scratch_allocator` |
+| `src/scratch.c` | 565 | scratch 分配、克隆、扩容 | `alloc_scratch`、`hs_alloc_scratch`、`hs_clone_scratch` |
+| `src/scratch.h` | 276 | scratch 头部与内联判定 | `struct core_info`、`markScratchInUse` |
+
+`database.h` 里还定义了平台相容性相关的位：`HS_PLATFORM_INTEL`、`HS_PLATFORM_CPU_MASK`、`HS_PLATFORM_NOAVX2`、`HS_PLATFORM_NOAVX512`、`HS_PLATFORM_NOAVX512VBMI`，以及四个编译期常量 `hs_current_platform`、`hs_current_platform_no_avx2`、`hs_current_platform_no_avx512`、`hs_current_platform_no_avx512vbmi`。`db_check_platform()` 的判断就是拿头部 `platform` 与这四个常量逐一比对，另外放行 `HS_PLATFORM_ALL`。这解释了为什么「在 AVX2 机器上编译的库，拿到 AVX-512 机器上通常能加载，反之则报 `HS_DB_PLATFORM_ERROR`」。
+
+`hs.cpp` 里的三个静态校验函数值得记住名字：`validModeFlags()` 拒绝未知位；`checkMode()` 要求 `HS_MODE_BLOCK` / `HS_MODE_STREAM` / `HS_MODE_VECTORED` 恰好置一个，且 SOM horizon 只能在流式模式下出现、且只能出现一个；`checkPlatform()` 拒绝超出 `HS_CPU_FEATURES_ALL` 的 CPU 位与大于 `HS_TUNE_FAMILY_ICX` 的调优值。`getSomPrecision()` 则把 mode 翻译成字节精度：vectored 固定 8，LARGE 8、MEDIUM 4、SMALL 2、未设置 0。
+
+按本套资料的交叉引用约定，本篇涉及的对象可以统一记为（字段见 05-02 ｜ 参数见 04-05 ｜ 原理见 06-12 ｜ 模块见 07-11）。
+
+### 4. 关键流程与调用链
+
+先看编译入口。`hs_compile()` 检查 `expression` 非空后，把 `id` 固定为 0、`ext` 置空，调用 `hs_compile_multi_int()`。后者按固定顺序做七件事：检查 `comp_error` 与 `db` 指针是否可写、检查 `expressions` 与 `elements`、在 `FAT_RUNTIME` 构建下用 `check_ssse3()` 做架构闸门（失败返回 `HS_ARCH_ERROR` 并写 "Unsupported architecture"）、`checkMode()`、`checkPlatform()`、比对 `elements > g.limitPatternCount`、最后由 `platform ? target_t(*platform) : get_current_target()` 定型目标平台。真正的编译体在 `try` 块里：构造 `CompileContext cc(isStreaming, isVectored, target_info, g)` 与 `NG ng(cc, elements, somPrecision)`，逐条 `addExpression()`，再 `ng.rm.pl.validateSubIDs()` 与 `ng.rm.logicalKeyRenumber()`，最后 `build(ng, &length, 0)` 返回数据库。`CompileError` 被捕获后通过 `e.hasIndex ? e.index : -1` 写回表达式序号；`std::bad_alloc` 映射到共享的 `hs_enomem`；其余异常走 `hs_einternal` 并触发断言。
+
+再看 `hs_scan()`。它的校验顺序是排障时最有价值的信息，完整链条如下：`scratch` 或 `data` 为空返回 `HS_INVALID`；`validDatabase(db)` 只查 magic 与 version；`hs_get_bytecode(db)` 后要求 16 字节对齐；`rose->mode != HS_MODE_BLOCK` 返回 `HS_DB_MODE_ERROR`；`validScratch()` 依次查 CL 对齐、`magic`、block 模式下的 `bStateSize`、`queueCount`；`markScratchInUse()` 非零返回 `HS_SCRATCH_IN_USE`；`rose->minWidth > length` 时直接清位并返回 `HS_SUCCESS`（这条短路意味着「数据比最短模式还短」根本不会进入引擎）；随后 `populateCoreInfo()` 把回调、缓冲区、历史、偏移写进 `core_info`，`clearEvec()` 清耗尽向量，有逻辑组合时再 `clearLvec()`。
+
+数据真正进入引擎之前还有三道闸门：长度为 0 时只跑 `boundary.reportZeroEodOffset`；`reportZeroOffset` 边界程序可能提前 `MO_HALT_MATCHING`；`minWidthExcludingBoundaries > length` 或 `length > maxBiAnchoredWidth` 时直接跳到收尾。之后是 small write 判定：`rose->smallWriteOffset` 非零且 `length < smwr->largestBuffer` 时只跑 `runSmallWriteEngine()`，不再进入主引擎。最后按 `runtimeImpl` 三选一。
+
+收尾阶段同样有固定顺序：`internal_matching_error()` 为真返回 `HS_UNKNOWN_ERROR`；`told_to_stop_matching()` 为真返回 `HS_SCAN_TERMINATED`；`hasSom` 时 `flushStoredSomMatches(scratch, ~0ULL)` 把暂存的 SOM 匹配刷出；`boundary.reportEodOffset` 跑 EOD 边界程序；`lastFlushCombProgramOffset` 跑逻辑组合的末次冲刷；最终按回调是否要求终止给出返回值，并无条件 `unmarkScratchInUse()`。这条「先判错、再判终止、再冲刷、再清位」的顺序保证了任何提前返回都不会把 scratch 永久锁死。
+
+上面这些层次与依赖关系见下图。
+
+:::figure id=07-10-01 | name=运行期 API 分层与模块依赖 | dir=TD
+node n1 "应用：hs_compile / hs_scan" blue
+node n2 "hs.cpp 编译前端" teal
+node n3 "dispatcher.c ifunc 分派" amber
+node n4 "runtime.c 公共运行时" green
+node n5 "database.c 校验与序列化" amber
+node n6 "scratch.c 状态与队列" green
+node n7 "alloc.c 分配器钩子" gray
+node n8 "hs_valid_platform.c 探测" gray
+node n9 "RoseEngine 字节码" purple
+edge n1 -> n2 "编译"
+edge n1 -> n3 "扫描"
+edge n3 -> n4 "按 CPU 选实现"
+edge n4 -> n5 "浅校验与信息"
+edge n4 -> n6 "取状态区"
+edge n4 -> n9 "解释执行"
+edge n5 -> n7 "分配与释放"
+edge n8 -> n2 "能力前置"
+edge n7 -> n6 dashed "scratch 内存来源"
+:::
+
+图 07-10-01 里有一条不对称的依赖：`hs_scan` 只调用 `validDatabase()`（magic + version），而深度校验 `dbIsValid()` 是在 `hs_alloc_scratch()` 里完成的。这个设计不是疏漏，而是性能取舍——扫描热路径不能每次都重算 HMAC 与遍历偏移表；代价是「必须先为数据库分配 scratch」从建议变成了事实上的前置条件。若绕过 `hs_alloc_scratch` 直接把未校验的数据库塞进 `hs_scan`，就跳过了唯一一次结构性校验。
+
+`hs_scan` 内部的判定顺序见图 07-10-02，它同时是一张排障路径图：返回值异常时，从上往下逐节点比对即可定位阶段。
+
+:::figure id=07-10-02 | name=hs_scan 的校验与执行判定链 | dir=LR
+node m1 "hs_scan 入口" blue
+node m2 "参数与浅校验" teal
+node m3 "mode 必须为 BLOCK" teal
+node m4 "scratch 校验与置位" amber
+node m5 "minWidth 短路" amber
+node m6 "零偏移边界程序" purple
+node m7 "small write 判定" purple
+node m8 "runtimeImpl 三选一" green
+node m9 "收尾冲刷与清位" green
+edge m1 -> m2 "空指针/魔数"
+edge m2 -> m3 "版本与对齐"
+edge m3 -> m4 "模式匹配"
+edge m4 -> m5 "占用成功"
+edge m5 -> m6 "长度足够"
+edge m6 -> m7 "边界处理完"
+edge m7 -> m8 "块足够大"
+edge m8 -> m9 "执行返回"
+edge m9 -> m1 dashed "unmark 复位"
+:::
+
+分派层的细节值得单独写一段。`dispatcher.c` 只有 147 行，却用二十多个 `CREATE_DISPATCH` 覆盖了「扫描、流、序列化、数据库信息」四组符号，`hs_scan`、`hs_scan_stream`、`hs_serialize_database`、`hs_database_info` 都在其中。这意味着在 fat runtime 构建里，这些符号在 `.so` 中是 `STT_GNU_IFUNC` 类型，而不是普通函数；用 `nm` 看到 `i` 标记或用 `readelf -sW` 看到 `IFUNC` 都属正常。
+
+数据库反序列化的校验顺序是另一个必须背下来的链条：`db_decode_header()` 先要求至少 12 字节（magic + version + length），以便老库能走到版本检查并得到 `HS_DB_VERSION_ERROR`；然后依次校验 magic（失败 `HS_INVALID`）、version（失败 `HS_DB_VERSION_ERROR`）、总长度必须等于 `sizeof(hs_database) + length`（失败 `HS_INVALID`）、头部长度至少覆盖完整结构；接着 `db_check_platform()` 比对平台位（失败 `HS_DB_PLATFORM_ERROR`）；再算 `dblength = sizeof(hs_database) + header.length` 并做溢出与 `MAX_DATABASE_SIZE` 上限检查；随后 `db_copy_bytecode()` 按 64 字节对齐重定位字节码，`db_check_header_integrity()` 校验头部 20 字节的 HMAC，`db_check_integrity()` 校验字节码 HMAC，`db_validate_rose_offsets()` 做偏移合法性检查，最后 `hs_db_protect()` 把整块内存改成只读。任何一步失败都会释放并返回，且不会把半成品指针交给调用方。
+
+### 5. 配置/命令/代码实例
+
+最典型的一组调用是「探平台 → 编译 → 分配 scratch → 扫描 → 查信息 → 释放」，完整生命周期如下。参数全集见 04-04 与 04-05，这里只保留五个最关键入口。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static int on_match(unsigned id, unsigned long long from,
+                    unsigned long long to, unsigned flags, void *ctx) {
+    (void)flags; (void)ctx;
+    printf("match id=%u [%llu, %llu)\n", id, from, to);
+    return 0; /* 返回非零即终止扫描 */
+}
+
+int main(void) {
+    if (hs_valid_platform() != HS_SUCCESS) {
+        fprintf(stderr, "cpu lacks ssse3\n");
+        return 1;
+    }
+
+    hs_database_t *db = NULL;
+    hs_compile_error_t *err = NULL;
+    if (hs_compile("foo\\d{2}", HS_FLAG_SOM_LEFTMOST, HS_MODE_BLOCK,
+                   NULL, &db, &err) != HS_SUCCESS) {
+        fprintf(stderr, "compile failed: %s\n", err ? err->message : "?");
+        hs_free_compile_error(err);
+        return 1;
+    }
+
+    hs_scratch_t *scratch = NULL;
+    if (hs_alloc_scratch(db, &scratch) != HS_SUCCESS) {
+        hs_free_database(db);
+        return 1;
+    }
+
+    const char *data = "xxfoo42yy";
+    hs_error_t rc = hs_scan(db, data, 9, 0, scratch, on_match, NULL);
+
+    char *info = NULL;
+    if (hs_database_info(db, &info) == HS_SUCCESS) {
+        printf("rc=%d info=%s\n", (int)rc, info);
+        free(info); /* 由 misc 分配器分配，默认即 malloc */
+    }
+
+    hs_free_scratch(scratch);
+    hs_free_database(db);
+    return 0;
+}
+```
+
+按 5.4.2 的行为，上面程序应输出如下两行。
+
+```text
+match id=0 [2, 7)
+rc=0 info=Version: 5.4.2 Features: AVX2 Mode: BLOCK
+```
+
+示例输出，具体格式需对照实际版本核验。
+
+逐行判读。第一行来自 `on_match`：`id=0` 是 `hs_compile` 为单条模式固定分配的编号；`from=2` 是 `foo` 中 `f` 的下标，之所以有起点，是因为编译时开了 `HS_FLAG_SOM_LEFTMOST`，若去掉该标志，回调的 `from` 恒为 0；`to=7` 是**结束偏移，且不含该字节**，即匹配覆盖 `[2,7)` 这五个字节，最后一个被消费的字符下标是 6。把 `to` 当作「最后一个字符的下标」去切片，会稳定地多切一个字节，这是接入方最常见的 off-by-one。第二行里 `rc=0` 即 `HS_SUCCESS`；`info` 是 `print_database_string()` 的输出，三段分别是版本号、CPU 特性档与模式。`Features: AVX2` 说明该库在编译时绑定的目标平台是 AVX2 档，而不是运行机器的全部能力；`Mode: BLOCK` 必须与 `hs_compile` 传入的 `HS_MODE_BLOCK` 一致，若这里出现 `STREAM` 而调用的是 `hs_scan`，运行期会以 `HS_DB_MODE_ERROR` 拒绝。如果输出是 `Features:`（空），说明目标平台连 AVX2 都没有，只保证 SSSE3。
+
+想看分派是否真的生效，可以在 Linux 上直接查符号类型。命令与典型输出如下。
+
+```bash
+readelf -sW build/lib/libhs.so.5 | grep -E " hs_scan$| hs_open_stream$"
+```
+
+```text
+   412: 00000000000a1b20  1234 IFUNC   GLOBAL DEFAULT   12 hs_scan@@HS_5.4
+   415: 00000000000a2c40   987 IFUNC   GLOBAL DEFAULT   12 hs_open_stream@@HS_5.4
+```
+
+示例输出，具体格式需对照实际版本核验。
+
+判读要点有三：`IFUNC` 表示该符号由加载器在重定位阶段调用解析函数决定地址，这就是 `resolve_hs_scan()`；地址在同一进程内对所有调用方一致，因此「第一次调用慢、之后快」的现象与 ifunc 无关，不要把它当成预热成本；若看到的是 `FUNC` 而不是 `IFUNC`，说明这次构建没有开 fat runtime（或该平台不支持），此时库只包含编译目标对应的那一套实现，跨机器分发数据库时要格外小心平台位。若符号根本不存在，先确认看的是 `libhs.so` 而不是 `libhs_runtime.so`，后者只含运行期子集。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，**scratch 不是线程安全的，`HS_SCRATCH_IN_USE` 不是锁**。`markScratchInUse()` 的读—判—写没有原子语义，两个线程同时进入时可能都读到 0。它只能提高「重入被发现的概率」，不能提供互斥。正确做法是每并发线程一份 scratch，或用池化 + 独占借出。
+
+第二，**不要在 `hs_scan` 之前跳过 `hs_alloc_scratch`**。如 07-10-01 所示，深校验 `dbIsValid()` 是在 scratch 分配时执行的；跳过它等于把未经结构校验的字节码直接交给自动机。反过来，若数据库在运行中被外部改写，`hs_scan` 的浅校验也拦不住，这正是反序列化后调用 `hs_db_protect()` 把内存改成只读的原因。
+
+第三，**序列化缓冲区大小必须用 `hs_serialized_database_size()` 查询**。`hs_serialize_database()` 会自行分配并返回长度，但接收端用 `hs_deserialize_database_at()` 就地反序列化时，缓冲区由调用方提供，函数内部明确写了「无法验证你给的缓冲区是否够大」，只做了 `MAX_DATABASE_SIZE` 上限与溢出检查。缓冲区开小了就是堆溢出。
+
+第四，**平台位不匹配要以 `HS_DB_PLATFORM_ERROR` 为信号，而不是重编译**。`db_check_platform()` 只放行四种组合与 `HS_PLATFORM_ALL`。在 AVX-512 机器上编译、拿到只支持 AVX2 的机器上加载，必然失败；反过来通常成功。生产做法是「按最低公共能力编译」，或为不同机型各存一份序列化数据库。
+
+第五，**回调返回非零只表示「我要停」，不表示「出错」**。`hs_scan` 会把这种情况翻译成 `HS_SCAN_TERMINATED`，并且仍然执行 `unmarkScratchInUse()`。业务上如果拿 `HS_SCAN_TERMINATED` 当失败处理，会把正常的「命中即停」误判成故障。
+
+第六，**零长度扫描不是空操作**。`length == 0` 时 `hs_scan` 仍可能执行 `boundary.reportZeroEodOffset` 对应的边界程序，从而报告「空缓冲区命中」（例如 `^$` 这类模式配合 `HS_FLAG_ALLOWEMPTY`）。用零长度块做「心跳」时，要预期可能收到回调。
+
+第七，**`hs_set_allocator` 的替换必须成对且早于任何分配**。四个分配器共享同一套语义，若只替换 `hs_database_alloc` 却用默认 `free` 释放，或在中途替换，会出现跨分配器释放。分配器函数还必须对并发调用可重入，因为多线程扫描会同时申请流状态。
+
+第八，**版本差异要按实际源码核验**。本快照的 `database.c` 在头部额外保存了 `hmac_hdr`（对 magic/version/length/platform 共 20 字节做 HMAC-SHA256），并在反序列化时增加了 `db_validate_rose_offsets()` 等一批偏移合法性检查，这些是 5.4.2 之后的安全加固；如果你的版本是 5.4.2 原版，`hs_database` 的头部布局与校验顺序可能不同，务必以 `src/database.h` 与 `src/database.c` 的实际代码为准。
+
+### 7. 小结与延伸阅读
+
+runtime / dispatcher / database 这一层可以用三句话概括：`hs.cpp` 把用户参数变成一次编译调用并把异常翻译成错误码；`dispatcher.c` 用 ifunc 把同一个符号绑到当前 CPU 最合适的实现上；`runtime.c` 与 `database.c` 一个负责「按模式与预算选择执行路径」，一个负责「在信任任何指针之前把外来字节验到底」。三者的分界线是「谁有权解释字节」——只有 `database.c` 有，其余模块都工作在已校验的前提上。
+
+延伸阅读建议按「对象 → 机制 → 用法」三层展开：`hs_database` 与字节码布局见 05-02，`hs_scratch` 字段与生命周期见 05-03，`RoseEngine` 的 `runtimeImpl`、`mode`、`stateOffsets` 见 05-05；序列化与 HMAC 的完整机制、版本校验顺序见 06-12，fat runtime 与 CPU 特性分派见 06-13，流式状态压缩见 06-11；API 签名与错误码全集见 04-05、04-06、04-08。读源码时建议从 `hs_scan()` 的校验序列入手，再对照 `dbIsValid()` 的检查项，最后看 `CREATE_DISPATCH` 的解析顺序——这三段代码合起来，就是「一次扫描为什么这样失败」的全部答案。
+
+## 07-11 chimera 模块
+
+### 1. 背景与动机
+
+Hyperscan 的自动机没有捕获组，也不支持反向引用、任意零宽断言与递归。这不是实现偷懒，而是自动机模型的必然：一次扫描要同时推进上万条模式，就不可能为每条模式维护一棵回溯栈。可现实中的规则集经常需要「先把命中的那一段抓出来，再判断里面的用户名是不是黑名单」——这要求返回子匹配，而不只是「某条模式在偏移 N 结束」。
+
+Chimera 是这个矛盾的产品化答案：**用 Hyperscan 做快速排除，用 PCRE 做精确确认**。编译期为每条模式同时产出两份东西——一份 Hyperscan 数据库（用于预过滤）和一份 PCRE 字节码（用于确认与捕获）；扫描期先让 Hyperscan 在整块数据上跑一遍，只在它报告「可能命中」的位置调用 PCRE，并从该位置向后找真正的匹配与捕获组。命中率越低，收益越大；命中率接近 100% 时，它退化成「每条模式各跑一次 PCRE」，比纯 Hyperscan 慢一个数量级以上。
+
+理解 Chimera 的关键是承认它是一个**混合体而不是新引擎**：它没有自己的自动机，也没有自己的正则解析器。正则解析交给 PCRE（`pcre_compile`），预过滤交给 Hyperscan（`hs_compile_multi` 加 `HS_FLAG_PREFILTER`），它自己只负责「编排」——决定哪些模式能被 Hyperscan 守住、哪些只能整段交给 PCRE、命中的先后顺序如何保证、捕获组如何从 ovector 搬到 `ch_capture_t`。`chimera/` 目录下 13 个文件、约 3600 行代码，做的全是这件编排工作。
+
+能力边界要说清：Chimera 只支持 **block 模式**，`ch_scan` 一次吃一整块数据；它没有流式接口，也没有 `ch_serialize_database` 之类的序列化 API，数据库不能跨进程落盘分发。它解决的是「需要捕获组与 PCRE 语义」的问题，不解决「流式 + 捕获组」的问题——后者要宿主自己做分块与重叠窗口。
+
+### 2. 核心概念
+
+**两段式结构**。第一段是 Hyperscan 块扫描，回调 `multiCallback()` 收到的是「结束偏移 + 模式下标」；第二段是 PCRE 确认，`scanPcre()` 从该模式的 `scanStart` 开始，用 `pcre_exec` 找真实匹配并填充 ovector。两段之间靠 `ch_patterndata::scanStart` 这个「本模式已确认到哪儿」的游标衔接，避免每次命中都从头扫。
+
+**guarded 与 unguarded**。编译期对每条模式调用 `isHyperscanSupported(pattern, flags | HS_FLAG_PREFILTER, platform)`：能编译进 Hyperscan 的称为 guarded，它的下标进入 `multiExpr` 数组，由 Hyperscan 负责触发；不能编译的称为 unguarded，下标进入 `unguarded` 列表，运行时由 `initQueue()` 在 Hyperscan 扫描之前就用 PCRE 全量扫一遍。unguarded 模式是性能黑洞：每条都要独立跑一次 PCRE，规则集里这类模式占比高时，Chimera 的吞吐会向纯 PCRE 靠拢。
+
+**fixedWidth 快速路径**。当一条模式同时满足「最小宽度等于最大宽度且非零、不是无穷宽、没有捕获组、Hyperscan 报告匹配有序、去掉预过滤后仍能编译」时，`PatternData::fixedWidth` 被置为该宽度，运行时 `needConfirm = (pattern->fixedWidth == ~0U)` 为假，`multiCallback()` 直接用 Hyperscan 给的 `from`/`to` 上报，完全不进 PCRE。这是 Chimera 里唯一「零确认成本」的通道，也是把「定宽字面量规则」放进 Chimera 仍然很快的原因。
+
+**四个数据库级标志**。`CHIMERA_FLAG_NO_MULTIMATCH`（1）表示没有任何模式能进 Hyperscan，整库退化为纯 PCRE；`CHIMERA_FLAG_GROUPS`（2）表示需要返回捕获组；`CHIMERA_FLAG_ALL_CONFIRM`（4）表示所有模式都需要 PCRE 确认，此时 `multiCallback()` 可以在 `active` 位图全满时提前终止 Hyperscan；`CHIMERA_FLAG_ALL_SINGLE`（8）表示所有模式都是 `HS_FLAG_SINGLEMATCH`，同样支持「全满即停」。这四个标志在 `ch_compile_multi_int()` 末尾根据循环中的 `allConfirm` / `allSingleMatch` 汇总写入 `ch_bytecode::flags`。
+
+**活动位图与优先级队列**。`ch_scratch::active` 是一个 multibit（`mmbit_*`），每条模式一位，记录「本块数据里这条模式是否已经被触发过」；`match_pq` 是一个按 `(from, to)` 排序的优先队列，保证对用户回调的上报顺序与偏移一致。Hyperscan 的回调本身可能是无序的（尤其开了 `HS_FLAG_SOM_LEFTMOST` 与预过滤之后），Chimera 用队列把顺序「补」回来——这也是它能在语义上贴近 PCRE 逐条扫描结果的原因。
+
+**强制改写与标志收敛**。编译期有两次不显眼的标志改写：`PatternData` 构造函数里 `flags |= HS_FLAG_ALLOWEMPTY`（避免把空匹配无谓地推给 PCRE）；`ch_compile_multi_int()` 的循环里 `myFlags |= HS_FLAG_ALLOWEMPTY | HS_FLAG_PREFILTER`。后者意味着**送进 Hyperscan 的那份数据库永远是预过滤语义**：允许报多、允许报早，精度由 PCRE 第二段补回。
+
+**预过滤语义的三个后果**。第一，Hyperscan 可能报告比真实匹配更早、更多的位置，`multiCallback()` 必须能处理「同一结束偏移被重复报告」；第二，命中位置不保证有序，所以必须有优先队列来恢复顺序；第三，预过滤下 Hyperscan 报告的起止偏移都可能是放宽后的近似值，确认阶段必须从 `scanStart` 重新定位真正的匹配，而不能把回调里的 `from`/`to` 当答案。这三点合起来，就是 Chimera 不能把 Hyperscan 回调结果直接转给用户的根本原因。
+
+**模式下标与用户 ID 的分离**。送给 `hs_compile_multi()` 的 `ids` 数组填的是 `i`（模式在数组中的位置），不是用户传入的 `id`。原因是 `multiCallback()` 需要用这个下标去 `getPattern(db, id)` 取 `ch_pattern`，而 `ch_pattern::id` 里存的才是要报给用户的值。这个设计让「用户 ID 可以任意、甚至重复」成为可能，代价是排查时不能把 Hyperscan 回调里的 `id` 直接当业务 ID 用。
+
+**捕获组容器**。`ch_capture_t` 只有三个字段：`flags`、`from`、`to`；`flags` 用 `CH_CAPTURE_FLAG_ACTIVE` 表示该组参与匹配。回调签名里同时给出 `size`（捕获组数量）与 `captured` 数组指针，数组第 0 项是整段匹配，第 1 项起是各分组。字段级定义见 05-09。
+
+### 3. 关键数据结构与源码位置
+
+Chimera 的对象层次比 Hyperscan 少一层：没有独立的流对象，只有数据库、scratch 与两块字节码。`ch_database` 是外层句柄（magic 为 `CH_DB_MAGIC = 0xdededede`），`ch_bytecode` 是紧随其后的字节码头，`ch_pattern` 是每条模式的头，PCRE 字节码与 study 数据跟在其后。`ch_scratch` 则持有 Hyperscan scratch 指针、ovector、活动位图与每模式运行数据。
+
+下表列出模块文件与职责，行数为本快照实际值。
+
+| 源文件 | 行数量级 | 职责 | 关键符号 |
+|---|---|---|---|
+| `chimera/ch.h` | 45 | 汇总头，仅包含编译与运行时两个头 | `ch_compile.h`、`ch_runtime.h` |
+| `chimera/ch_common.h` | 370 | 句柄类型、错误码、分配器 API | `ch_database_t`、`CH_SUCCESS`、`ch_set_allocator` |
+| `chimera/ch_compile.h` | 394 | 编译 API 与模式常量 | `ch_compile`、`CH_MODE_GROUPS` |
+| `chimera/ch_compile.cpp` | 878 | 双份产物编译与数据库布局 | `PatternData`、`isHyperscanSupported` |
+| `chimera/ch_runtime.h` | 378 | 扫描 API、回调与捕获组类型 | `ch_match_event_handler`、`ch_capture_t` |
+| `chimera/ch_runtime.c` | 647 | 两段式扫描与顺序保证 | `multiCallback`、`scanPcre`、`catchupPcre` |
+| `chimera/ch_database.h` | 158 | 三层字节码头与访问器 | `ch_bytecode`、`getHyperscanDatabase` |
+| `chimera/ch_database.c` | 126 | 释放、尺寸、信息串 | `ch_free_database`、`ch_database_info` |
+| `chimera/ch_scratch.h` | 119 | scratch 布局与在用标志 | `CH_SCRATCH_MAGIC`、`markScratchInUse` |
+| `chimera/ch_scratch.c` | 335 | scratch 分配、克隆、扩容 | `alloc_scratch`、`ch_alloc_scratch` |
+| `chimera/ch_internal.h` | 44 | 数据库级与模式级内部标志 | `CHIMERA_FLAG_ALL_CONFIRM` |
+| `chimera/ch_alloc.c` | 109 | 三类分配器钩子 | `ch_set_database_allocator` |
+
+`ch_bytecode` 的三个偏移量决定了「一份数据库里塞了两套引擎」的布局：`databaseOffset` 指向内嵌的 Hyperscan 数据库，`patternOffset` 指向「模式下标 → `ch_pattern` 偏移」的 u32 表，`unguardedOffset` 与 `unguardedCount` 描述只能走 PCRE 的模式列表；其余字段（长度、标志、模式数、活动位图大小、最大捕获组数）见 05-09。
+
+`ch_scratch` 的布局同样是「一个结构 + 一段连续内存」：结构里放句柄级字段与几个指针（`multi_scratch`、`ovector`、`captured`、`active`、`patternData`、`pq`），结构之后依次切出 patternData 数组、ovector、captured 数组与活动位图。`alloc_scratch()` 按这个顺序推进游标并记录各指针，`ch_scratch_size()` 返回的是「本结构 + 内嵌 Hyperscan scratch」两部分之和，不是一段连续内存——头文件里专门写了这条注释。
+
+按本套资料的交叉引用约定，本篇涉及的对象可以统一记为（字段见 05-09 ｜ 参数见 04-02 ｜ 原理见 06-14 ｜ 部署见 03-06）。
+
+### 4. 关键流程与调用链
+
+编译链路的起点是 `ch_compile()`，它检查 `db`、`expression`、`comp_error` 指针后交给 `ch_compile_multi_int()`。后者对每条模式做四件事：`checkFlags()` 拒绝不支持的标志（只允许 `DOTALL`、`MULTILINE`、`CASELESS`、`SINGLEMATCH`、`UCP`、`UTF8`）、构造 `PatternData`（内部 `pcre_compile` + `pcre_study(PCRE_STUDY_JIT_COMPILE)`，再 `hs_expression_info` 取宽度与有序性）、用 `isHyperscanSupported()` 判定 guard、按 fixedWidth 与 guard 改写标志。之后是布局计算：每条模式的 `patternSize()` 按缓存线对齐累加，Hyperscan 数据库用 `hs_compile_multi(..., HS_MODE_BLOCK, ...)` 编译后 `hs_database_size()` 取长度，`bytecodeLen` 加上头、偏移表、unguarded 列表与 128 字节对齐余量，最后一次性 `ch_database_alloc()` 并逐段写入。
+
+写入顺序决定了运行期能怎么读：先写 `ch_database` 头（magic、version、length），再按 64 字节对齐算出 `hydb->bytecode = offsetof(bytes) - shift`，写 `ch_bytecode` 头并填 flags；Hyperscan 数据库不是 `memcpy` 进去的，而是先 `hs_serialize_database()` 再 `hs_deserialize_database_at()`「重新安家」，因为字节码内部含相对偏移，直接搬移会失效——`writeHyperscanDatabase()` 的注释写得很明确："we must use our serialization calls to re-home the database"。随后依次写 unguarded 下标数组、模式偏移表、每个 `ch_pattern` 及其 PCRE 字节码与 study 数据。
+
+扫描链路的校验比 Hyperscan 更薄：`ch_scan_i()` 检查三个指针非空、`hydbIsValid()`（magic + version）、scratch 的 CL 对齐与 `CH_SCRATCH_MAGIC`、`markScratchInUse()`，再拒绝 `length > INT_MAX`（因为 PCRE 的长度参数是 `int`）。之后构造 `HybridContext`，先 `initQueue()` 把 unguarded 模式整体跑一遍 PCRE，再按 `CHIMERA_FLAG_NO_MULTIMATCH` 决定是否执行 `scanHyperscan()`，最后用 `catchupPcre(&hyctx, ~0U, length, length)` 把队列里剩余的匹配冲刷出来。
+
+`multiCallback()` 是整条链路的心脏，可以按分支读。先算 `needConfirm`；若需要确认且该模式已在 `active` 中置位，则在 `ALL_CONFIRM` 且位图全满时返回 1 终止 Hyperscan，否则直接返回 0（说明这条模式已经在处理中，不必重复触发）。接着 `mmbit_set()` 取 `already`：第一次触发时把 `scanStart` 归零；已触发过且 `to < scanStart + minWidth` 时跳过（宽度不够，不可能形成新匹配）；`SINGLEMATCH` 模式下若 `ALL_SINGLE` 且全满则终止，否则跳过。
+
+确认分支里，`needConfirm` 为真时调用 `scanPcre(hyctx, len, start, id)`，返回值有三种特殊语义：`CH_CALLBACK_TERMINATE` 转成 `HS_SCAN_TERMINATED` 让 Hyperscan 停；`CH_CALLBACK_SKIP_PATTERN` 把 `scanStart` 推到块尾并继续；`CH_FAIL_INTERNAL` 直接上抛。不需要确认时，若 `already` 为真先 `catchupPcre()` 补上「上次确认到本次命中之间」的匹配，再计算下一次的起点：非空匹配从 `to` 开始，空匹配从 `to + 1` 开始，UTF-8 模式下还要跳过后续的续字节（`(data[startoffset] & 0xc0) == UTF_CONT_BYTE_HEADER`）。最后把 `(from, to, id)` 压入优先队列；若开了 `CH_MODE_GROUPS`，先把 Hyperscan 给的 `from`/`to` 直接写进 `pd->match[0]` 并置 `CH_CAPTURE_FLAG_ACTIVE`。
+
+组件与数据流关系见下图。
+
+:::figure id=07-11-01 | name=Chimera 的组件构成与两套产物 | dir=TD
+node n1 "ch_compile 编译入口" blue
+node n2 "PatternData 与 PCRE 编译" teal
+node n3 "Hyperscan 预过滤数据库" amber
+node n4 "ch_database 统一布局" amber
+node n5 "ch_scratch 运行对象" green
+node n6 "ch_scan 扫描入口" blue
+node n7 "multiCallback 确认调度" purple
+node n8 "scanPcre 捕获确认" purple
+node n9 "用户回调与捕获组" green
+edge n1 -> n2 "逐条建 PCRE"
+edge n1 -> n3 "guarded 模式"
+edge n2 -> n4 "写入字节码"
+edge n3 -> n4 "序列化后重安家"
+edge n4 -> n6 "加载"
+edge n5 -> n6 "状态与位图"
+edge n6 -> n7 "Hyperscan 回调"
+edge n7 -> n8 "需要确认"
+edge n8 -> n9 "按序上报"
+edge n5 -> n7 dashed "active 位图"
+:::
+
+图 07-11-01 里 `ch_database` 是唯一的汇合点：两套产物在编译期汇入同一块内存，运行期再从同一块内存里各取所需。这也解释了为什么 Chimera 数据库不能简单 `memcpy` 分发——内嵌的 Hyperscan 数据库带有依赖自身地址的相对偏移，`writeHyperscanDatabase()` 必须借序列化/反序列化把它「重定位」到新家。
+
+一次命中的判定与确认顺序见图 07-11-02，它同时也是「为什么 Chimera 的匹配是有序的」的答案。
+
+:::figure id=07-11-02 | name=单次命中的确认与入队路径 | dir=LR
+node p1 "Hyperscan 块扫描" blue
+node p2 "multiCallback 命中" teal
+node p3 "active 位图置位" amber
+node p4 "需要 PCRE 确认" amber
+node p5 "scanPcre 从窗口起点" purple
+node p6 "catchupPcre 补匹配" purple
+node p7 "优先级队列入队" green
+node p8 "按偏移顺序回调" green
+edge p1 -> p2 "报告结束偏移"
+edge p2 -> p3 "首次或重复"
+edge p3 -> p4 "判断 fixedWidth"
+edge p4 -> p5 "需要确认"
+edge p4 -> p6 "定宽且已触发"
+edge p4 -> p7 "定宽首次"
+edge p5 -> p7 "确认结果"
+edge p6 -> p7 "补齐结果"
+edge p7 -> p8 "出队上报"
+:::
+
+还有一个容易被误读的细节：`catchupPcre()` 的最后一个参数在 `ch_scan_i()` 末尾被传成 `length`，`id` 传 `~0U`，含义是「把所有模式都补到块尾」。这次调用是必须的，因为 Hyperscan 的预过滤可能在某条模式的最后一次命中之后不再触发，而 PCRE 在该窗口内还可能有多次匹配。少了这一步，`--echo-matches` 一类用法会看到「长块里只报了第一次」的现象。
+
+### 5. 配置/命令/代码实例
+
+最典型的一组调用是「编译带捕获组的数据库 → 分配 scratch → 扫描 → 释放」，四个入口覆盖全部生命周期。完整签名与错误码见 04-08 与 `chimera/ch_compile.h`、`chimera/ch_runtime.h`。
+
+```c
+#include <chimera/ch.h>
+#include <stdio.h>
+
+static int on_match(unsigned id, unsigned long long from,
+                    unsigned long long to, unsigned flags,
+                    unsigned size, const ch_capture_t *cap, void *ctx) {
+    (void)flags; (void)ctx;
+    printf("id=%u whole=[%llu,%llu)\n", id, from, to);
+    for (unsigned i = 1; i < size; i++) {
+        if (cap[i].flags & CH_CAPTURE_FLAG_ACTIVE) {
+            printf("  group %u = [%llu,%llu)\n", i,
+                   cap[i].from, cap[i].to);
+        }
+    }
+    return CH_CALLBACK_CONTINUE;
+}
+
+static int on_error(int code, void *ctx) {
+    (void)ctx;
+    fprintf(stderr, "chimera error %d\n", code);
+    return 0;
+}
+
+int main(void) {
+    ch_database_t *db = NULL;
+    ch_compile_error_t *cerr = NULL;
+    const char *pat = "([a-z]+)@([a-z]+)\\.com";
+    if (ch_compile(pat, HS_FLAG_CASELESS, CH_MODE_GROUPS,
+                   NULL, &db, &cerr) != CH_SUCCESS) {
+        fprintf(stderr, "compile: %s\n", cerr ? cerr->message : "?");
+        ch_free_compile_error(cerr);
+        return 1;
+    }
+
+    ch_scratch_t *scratch = NULL;
+    if (ch_alloc_scratch(db, &scratch) != CH_SUCCESS) {
+        ch_free_database(db);
+        return 1;
+    }
+
+    const char *data = "mail: bob@example.com;";
+    ch_error_t rc = ch_scan(db, data, 22, 0, scratch,
+                            on_match, on_error, NULL);
+    printf("rc=%d\n", (int)rc);
+
+    ch_free_scratch(scratch);
+    ch_free_database(db);
+    return 0;
+}
+```
+
+在链接了 `libchimera`、`libhs`、`libpcre` 的构建里，上面程序的典型输出如下。
+
+```text
+id=0 whole=[6,21)
+  group 1 = [6,9)
+  group 2 = [10,17)
+rc=0
+```
+
+示例输出，具体格式需对照实际版本核验。
+
+逐行判读。`id=0` 是 `ch_compile()` 为单条模式分配的默认 ID（用户 ID 未显式给出时为 0），不是数组下标；`whole=[6,21)` 是整段匹配，`b` 在 6、`m` 在 20，结束偏移 21 不含该字节，符合「半开区间」约定。`group 1 = [6,9)` 对应 `bob`，`group 2 = [10,17)` 对应 `example`，两个组的 `flags` 都带 `CH_CAPTURE_FLAG_ACTIVE`；若某个可选组未参与匹配，它的 `flags` 不带该位，`from`/`to` 的值不应被使用。`rc=0` 即 `CH_SUCCESS`；若回调返回 `CH_CALLBACK_TERMINATE`，这里会变成 `-3`（`CH_SCAN_TERMINATED`），而不是错误。注意 `CH_MODE_GROUPS` 是唯一会填充 `cap` 数组的模式，用 `CH_MODE_NOGROUPS` 编译时 `size` 只会是 1，循环体一次都不进。
+
+链接方式决定了这个例子能不能跑起来。Chimera 不是头文件库，也不是 Hyperscan 的可选组件，它在构建期就把 PCRE 静态链了进去，因此命令行必须同时给出三个库，且顺序不能颠倒（`chimera` 依赖 `hs` 与 `pcre`）。
+
+```bash
+cc -O2 chimera_demo.c -o chimera_demo \
+   -Ibuild/include -Ibuild/include/chimera \
+   -Lbuild/lib -lchimera -lhs -lpcre
+```
+
+判读要点：`-lchimera` 必须在 `-lhs` 与 `-lpcre` 之前，否则链接器在解析 `chimera` 的未定义符号时还看不到后两者；若报 `undefined reference to pcre_exec`，说明 `-lpcre` 缺失或顺序在 `-lchimera` 之前；若报 `hs_scan` 未定义，检查是否把 `-lhs` 写成了 `-lhs_runtime`（后者不含编译与全量扫描入口）。Windows 下库名与导出宏不同，需对照 `chimera/CMakeLists.txt` 的实际产物核验。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，**Chimera 只支持 block 模式，且单块长度受 `INT_MAX` 限制**。`ch_scan_i()` 里有一条显式检查 `length > INT_MAX`，因为 PCRE 的长度参数是 `int`。想把 Chimera 用在 TCP 流上，必须自己做「滑动窗口 + 重叠区」，并接受同一匹配可能被重复上报，需要按偏移去重。
+
+第二，**命中率决定收益，不要用它做高命中规则集**。预过滤阶段每命中一次就可能触发一次 `pcre_exec`，而 PCRE 是回溯引擎，单次成本远高于 Hyperscan 的一次状态推进。经验阈值是「确认比例低于百分之几」时收益明显；如果规则集里大量模式会在每个块上命中，直接用 PCRE 反而更容易预测尾延迟。
+
+第三，**unguarded 模式会让整库退化**。`isHyperscanSupported()` 只用 `HS_FLAG_PREFILTER` 试编译，凡是 Hyperscan 语法不支持的构造（反向引用、递归、`\K` 等）都会落入 unguarded，运行时每条都要全量 PCRE 扫描。上线前应统计 unguarded 占比，占比高说明这批规则不适合 Chimera，应考虑改写规则或改用专门的回溯引擎。
+
+第四，**捕获组数量要按 `maxCaptureGroups` 预算内存**。`ch_alloc_scratch()` 用数据库里的 `maxCaptureGroups` 决定 ovector 与 `captured` 数组的大小，克隆 scratch 时这个值只增不减。规则集里只要有一条模式带很多分组，所有 scratch 都会按最大者分配；把「重分组模式」单独拆库是常见的省内存手段。
+
+第五，**scratch 同样不是线程安全的**。`ch_scratch` 里的 `in_use`、`active` 位图、`patternData` 与 `pq` 都是每线程独占状态，`markScratchInUse()` 只是检测器不是锁。`ch_clone_scratch()` 会连同内嵌的 Hyperscan scratch 一起克隆，这是多线程初始化的正确方式。
+
+第六，**`ch_database` 不能序列化分发**。模块里没有 `ch_serialize_database`，`ch_database_info()` 也只是把内嵌 Hyperscan 的信息串前面加一个 "Chimera " 前缀。多节点部署只能在每个节点各自编译，或把编译产物按「同版本、同平台」直接复制整块内存并自行承担对齐与重定位风险——后者不推荐。
+
+第七，**PCRE 的 match limit 是必须设置的保险丝**。`ch_compile_ext_multi()` 的 `match_limit` 与 `match_limit_recursion` 直接传给 PCRE，用于限制灾难性回溯。默认值对不可信输入偏松，服务化场景应显式收紧，并处理 `CH_FAIL_INTERNAL` 与错误回调，否则一条恶意输入就能把工作线程钉死。
+
+第八，**`ch_scan` 的 `flags` 参数当前未使用**。`ch_scan_i()` 的形参标了 `UNUSED`，传任何值都不会改变行为；不要指望它像 `hs_scan` 的 `flags` 那样承载语义（后者在当前实现里也仅用于内部传递）。需要按模式开关行为，应在编译期用标志与模式解决。
+
+### 7. 小结与延伸阅读
+
+Chimera 的价值不在「更快的正则」，而在「在保留 PCRE 语义的前提下把大部分数据挡在 PCRE 之外」。它的全部设计都围绕这条主线：编译期为每条模式判断能否被 Hyperscan 守住（guard）、能否完全免确认（fixedWidth）；运行期用活动位图避免重复确认、用 `scanStart` 游标避免重复扫描、用优先级队列恢复上报顺序、用 `catchupPcre` 补齐预过滤漏掉的尾部匹配。理解了这五个机制，就能解释它所有的性能现象与语义边界。
+
+延伸阅读：Chimera 的两段式原理与性能模型见 06-14；`ch_database`、`ch_bytecode`、`ch_pattern`、`ch_scratch` 的逐字段说明见 05-09；部署与链接细节见 03-06；与纯 Hyperscan 的选型对比见 01-02。读源码建议从 `ch_compile_multi_int()` 的「guard / fixedWidth / unguarded」三分支入手，再读 `multiCallback()` 的四个提前返回，最后看 `catchupPcre()` 的窗口计算——这三段读通，Chimera 就没有黑盒了。
+
+## 07-12 工具链：hscheck / hsbench / hscollider / hsdump
+
+### 1. 背景与动机
+
+Hyperscan 是库不是产品，它没有守护进程、没有配置文件、也没有自带的可观测面板。使用者面对的第一个问题是「我这一万条规则到底能不能编译」，第二个是「编译出来能跑多快」，第三个是「跑出来的结果对不对」，第四个是「如果不对，字节码里到底生成了什么」。`tools/` 下的四个工具正好对应这四个问题，且顺序与真实开发流程一致：`hscheck` 先做编译可行性筛查，`hsbench` 给出吞吐基线，`hscollider` 与参考实现逐条对拍，`hsdump` 在怀疑编译器时把中间产物摊开看。
+
+四个工具共享同一套输入约定，这是它们能串成流水线的前提。规则集放在一个目录里，每行一条 `ID:/regex/flags`，`ID` 是十进制编号，`flags` 是若干单字符（`i` 大小写不敏感、`s` DOTALL、`m` MULTILINE、`H` SINGLEMATCH、`O` 要求有序、`V` ALLOWEMPTY、`W` UCP、`8` UTF8、`P` PREFILTER、`L` SOM_LEFTMOST、`C` COMBINATION、`Q` QUIET），解析器由 `util/ExpressionParser.rl` 生成、加载入口在 `util/expressions.h` 的 `loadExpressions()` 与 `loadExpressionsFromFile()`。语料则统一是 SQLite 文件，表结构由 `tools/hsbench/scripts/CorpusBuilder.py` 定义。
+
+必须先讲清边界：这四个工具是**开发期工具**，不是生产组件。`hsbench` 的数字受语料、编译选项、CPU 亲和性影响极大，不能当作 SLA 承诺；`hscollider` 的正确性判据来自 PCRE 与 NG 模拟，二者本身也有版本差异；`hsdump` 更是只在开启 `DUMP_SUPPORT` 的构建里存在。把它们当成「官方认证」会得出错误结论。
+
+还有一个现实约束：四个工具都依赖 `libhs` 的内部头（`hs_internal.h`、`grey.h`），因此它们只在源码树内构建，不随安装包分发。发行版仓库里的 `hyperscan` 包通常只装库与头文件，不装这些二进制；要得到它们，必须自己从源码构建，并且对 `hsdump` 还要显式打开 `-DDUMP_SUPPORT=ON`。
+
+### 2. 核心概念
+
+**签名集与签名文件**。一组规则称为签名集（signature set），可以是一个目录（目录下每个文件都是规则文件），也可以是单个文件；`-e PATH` 指定目录，`-s FILE` 指定单个签名文件，`-z NUM` 只取某个 ID。四个工具的这三个参数语义一致，因此同一条命令换个工具名通常就能跑。
+
+**语料库**。`hsbench` 与 `hscollider` 的 `-c FILE` 指向一个 SQLite 数据库，查询语句固定为 `SELECT id, stream_id, data FROM chunk ORDER BY id;`。三列的含义是块编号、流编号、块内容。`stream_id` 相同的块被视为同一条流的连续分片，这是流式基准能正确拼流的前提；把所有块的 `stream_id` 都填 0，等于让整个语料变成一条超长流，流状态会一直增长，测出的数字不再代表真实场景。
+
+**真值来源**。`hscollider` 的判据不是「Hyperscan 自己跟自己比」，而是三个独立来源：`GroundTruth` 用 libpcre 跑出参考结果（`pcre_exec` 的 ovector 转成 `ResultSet`）；`UltimateTruth` 用 Hyperscan 的参考路径（含 block / streaming / vectored / hybrid 四种扫描方式）跑出另一套结果；`GraphTruth` 则在 NG 图层面做模拟，用于定位「图构造阶段就已经错了」还是「引擎执行阶段才错」。`NfaGeneratedCorpora` 按图随机生成能覆盖各条边的语料，`FileCorpora` 读取外部语料，两者都实现 `CorporaSource` 接口。
+
+**引擎抽象**。`hsbench` 用 `Engine` 纯虚类把三种后端统一起来：`EngineHyperscan`、`EngineChimera`、`EnginePcre` 各自实现 `makeContext()`、`scan()`、`scan_vectored()`、`streamOpen()`、`streamScan()`、`streamClose()`、`streamCompressExpand()`、`printStats()`、`sqlStats()`。每线程一个 `EngineContext`（Hyperscan 后端里就是一份 scratch），每条流一个 `EngineStream`。要加新后端，只需实现这个接口，主循环与统计代码完全不用改。
+
+**统计口径**。`hsbench` 输出的核心量是 `Mean throughput (overall)` 与 `Max throughput (per core)`，单位 Mbit/sec；前者按「总字节数 ÷ 总墙钟时间」算，后者按「单线程最快一轮 ÷ 该轮字节数」算。另有 `Overall block rate`（块/秒）与 `Matches per iteration`（每轮匹配数，附 matches/kilobyte）。这三个量回答不同问题：吞吐看数据面能力，块率看小包场景的调用开销，匹配密度则用来判断「数字是不是被海量回调拖下去的」。
+
+**DUMP_SUPPORT**。`CMakeLists.txt` 里 `CMAKE_DEPENDENT_OPTION(DUMP_SUPPORT ... ON "NOT RELEASE_BUILD" OFF)`，含义是「非 release 构建默认开，release 构建强制关」。`tools/hsdump/CMakeLists.txt` 开头就是 `if (NOT DUMP_SUPPORT) return() endif ()` 的短路，因此 release 包里根本不会生成 `hsdump` 这个目标。它的输出不是给人读的最终报告，而是一整套中间产物文件：解析树、NG 图、scratch 布局、数据库信息与最终字节码，供开发者对照。
+
+**Grey 覆盖**。四个工具都支持 `-G OVERRIDES`，把 `Grey`（编译期调参集合）里的字段按 `key=value` 覆盖。它只对内部调试有意义，且字段名随版本变化；生产调优不要依赖它，`Grey` 不是公共 ABI 的一部分。
+
+### 3. 关键数据结构与源码位置
+
+四个工具的组织方式不同：`hscheck` 是单文件，`hsbench` 是「主循环 + 引擎插件」，`hscollider` 是「参数 + 真值 + 语料 + 结果集 + 线程池」，`hsdump` 是「参数 + 转储编排」。下表给出入口与关键类。
+
+| 工具 | 主文件与规模 | 关键类/函数 | 依赖 |
+|---|---|---|---|
+| `hscheck` | `tools/hscheck/main.cpp`（733 行） | `checkExpression`、`recordSuccess`、`recordFailure` | `util/expressions.h`、`hs_compile.h` |
+| `hsbench` | `tools/hsbench/main.cpp`（1131 行） | `processArgs`、`displayResults`、`ThreadContext` | `Engine`、`DataCorpus`、`SqlDB` |
+| `hsbench` 引擎 | `engine_hyperscan.cpp`（564 行） | `EngineHyperscan`、`EngineHSContext`、`EngineHSStream` | `hs_runtime.h`、`hs_compile.h` |
+| `hsbench` 语料 | `data_corpus.cpp`（136 行） | `readCorpus`、`DataBlock` | `sqlite3` |
+| `hsbench` 统计 | `sqldb.cpp`（165 行）、`heapstats.cpp`（150 行） | `SqlDB::insert_all`、`getPeakHeap` | `sqlite3` |
+| `hscollider` | `tools/hscollider/main.cpp`（2040 行） | `runThread`、`ResultSet` 比对 | `GroundTruth`、`UltimateTruth` |
+| `hscollider` 真值 | `GroundTruth.cpp`（798 行） | `CompiledPcre`、`GroundTruth::run` | `pcre.h` |
+| `hscollider` 参考 | `UltimateTruth.cpp`（1324 行） | `blockScan`、`streamingScan`、`hybridScan` | `hs.h`、`ch.h` |
+| `hscollider` 图真值 | `GraphTruth.cpp`（459 行） | `CNGInfo`、`CompiledNG` | `nfagraph` 内部头 |
+| `hscollider` 语料 | `NfaGeneratedCorpora.cpp`（193 行） | `generate`、`CorpusProperties` | `ng_corpus_generator` |
+| `hsdump` | `tools/hsdump/main.cpp`（647 行） | `dumpDatabase`、`-D/--dump_db` | `DUMP_SUPPORT`、`scratch_dump.h` |
+
+`hscollider` 的参数面比另外三个工具宽得多，因为它要覆盖「所有可能的执行路径」：`-t` 按块切流、`-V` 按块切向量、`-H` 走 Chimera、`-Z` 只测某个对齐，另有 `--copy-stream`、`--compress-expand`、`--mangle-scratch` 这类专门验证状态复制、状态压缩与未初始化读的开关（完整清单见 04-07）。这些开关的组合方式，基本等于把 06 册讲的运行时路径逐条走一遍。
+
+`hsbench` 的编译统计结构 `CompileStats` 里保存了 `sigs_name`、`signatures`、`db_info`、`expressionCount`、`compiledSize`、`hmac_hex`、`streamSize`、`scratchSize`、`compileSecs`、`peakMemorySize`，`printStats()` 把它们逐行打印。注意 `compiledSize` 来自 `hs_database_size()`，`scratchSize` 来自 `hs_scratch_size()`，`streamSize` 来自 `hs_stream_size()`，三者相加才是「单实例常驻内存」的近似值，且都不含数据库序列化副本。
+
+按本套资料的交叉引用约定，本篇涉及的对象可以统一记为（字段见 05-05 ｜ 参数见 04-07 ｜ 原理见 06-01 ｜ 模块见 07-10）。
+
+### 4. 关键流程与调用链
+
+`hscheck` 的主流程最短：`processArgs()` 解析参数并 `loadExpressions()`；每个工作线程在 `checkExpression()` 里按模式（stream 默认、`-N` 改 block、`-V` 改 vectored、`-H` 改 Chimera）设置编译 mode；对每条规则调用 `hs_compile()`（或 Chimera 分支的 `ch_compile()`），成功走 `recordSuccess()`、失败走 `recordFailure()` 并把 `hs_compile_error_t::message` 记进结果；最后主线程 `printExpressionId()` 按 ID 顺序输出，并打印 `SUMMARY: N of M failed.`。它的价值不在「跑得快」，而在「把整库规则一次性过一遍编译检查」，尤其适合放进 CI。
+
+`hsbench` 的主流程可以分成五段。第一段是编译或加载：`-i DIR` 存在时从目录读序列化数据库，否则按签名集编译，`-w DIR` 则把编译结果落盘；编译耗时被单独记进 `compileSecs`，不计入吞吐。第二段是语料读取：`readCorpus()` 打开 SQLite、按 `id` 顺序取出全部块，建立 `stream_id → internal_stream_index` 的映射。第三段是线程启动：每个线程一个 `ThreadContext`，各自 `makeContext()` 拿到独立 scratch，按 `-T` 指定的 CPU 列表绑核。第四段是扫描循环：block 模式直接 `scan()`；streaming 模式对每个 `stream_id` 先 `streamOpen()`，逐块 `streamScan()`，最后 `streamClose()`；vectored 模式把同一条流的连续块聚成向量后 `scan_vectored()`。第五段是汇总：`displayResults()` 检查各线程匹配数是否一致（不一致会打印 `WARNING: PER-SCAN MATCH COUNTS ARE INCONSISTENT!`），再算吞吐与块率，`--per-scan` 时逐轮打印，`-C` 时输出 CSV，`--sql-out` 时写 SQLite。
+
+`hscollider` 的流程是「生成 → 双跑 → 比对 → 报告」。生成阶段按 `-e` 的签名集与 `-n` 的语料数，用 `NfaGeneratedCorpora` 为每条模式生成若干条覆盖性语料，或按 `-c` 读取外部语料。双跑阶段对每条模式分别用 `GroundTruth`（PCRE）与 `UltimateTruth`（Hyperscan 参考路径）扫描，结果写进两个 `ResultSet`；`ResultSet` 以 `MatchResult` 的 `(from, to)` 加捕获组向量为键排序去重，比较的是「匹配集合」而不是「回调顺序」。比对阶段把差异分类为「Hyperscan 多报」「Hyperscan 漏报」「起止偏移不一致」，`-q` 只打差异、`-v` 连成功也打。报告阶段输出 Summary 段，包含模式数、语料数、失败数。`GraphTruth` 则在 NG 图层面做图级模拟（`getGraphTruth()`），既用于生成能覆盖各条路径的语料，也用于判断差异是否在「图构造」阶段就已存在，而不是等到引擎执行才出现。
+
+`hsdump` 的流程最依赖构建选项：解析参数后按 `-N`/`-V` 设置 mode，编译签名集，然后按 `-o` 指定的目录逐项写出转储文件；`-D/--dump_db` 额外转储最终数据库，`-X/--no_intermediate` 跳过中间产物只留最终结果，`-P/--print` 把签名集回显到标准输出。它不做扫描、不做基准，纯粹是「把编译器的中间状态摊开」。
+
+四个工具在开发流程中的位置与数据流向见下图。
+
+:::figure id=07-12-01 | name=工具链的输入与数据流向 | dir=LR
+node n1 "签名文件 ID:/regex/flags" blue
+node n2 "util/ExpressionParser" teal
+node n3 "hscheck 编译校验" amber
+node n4 "hsbench 吞吐基准" green
+node n5 "hscollider 正确性对拍" purple
+node n6 "hsdump 字节码转储" gray
+node n7 "SQLite 语料库 chunk 表" amber
+node n8 "PCRE 与 NG 参考真值" purple
+node n9 "失败与差异报告" red
+edge n1 -> n2 "逐行解析"
+edge n2 -> n3 "规则与标志"
+edge n2 -> n4 "规则与标志"
+edge n2 -> n5 "规则与标志"
+edge n2 -> n6 "规则与标志"
+edge n7 -> n4 "块与流"
+edge n7 -> n5 "块与流"
+edge n8 -> n5 "参考匹配集"
+edge n3 -> n9 "编译失败"
+edge n4 -> n9 "吞吐与内存"
+edge n5 -> n9 "多报与漏报"
+:::
+
+图 07-12-01 里有两条独立的输入线：规则从左侧进入四个工具，语料从中下方只进入 `hsbench` 与 `hscollider`。`hsdump` 不需要语料，因为它不执行扫描；`hscheck` 也不需要，因为它只验证「能否编译」。把这个差异记住，就不会在 `hsdump` 上浪费时间准备 SQLite 文件。
+
+### 5. 配置/命令/代码实例
+
+先看 `hscheck`。它最典型的用法是在改完规则集后立刻过一遍编译检查，命令与输出如下。
+
+```bash
+mkdir -p rules
+printf '1:/foo.*bar/s\n2:/(a)\\1/\n3:/hatstand|teakettle/\n' > rules/set1
+bin/hscheck -e rules
+```
+
+```text
+OK: 1:/foo.*bar/s
+FAIL (compile): 2:/(a)\1/: Back-references are unsupported.
+OK: 3:/hatstand|teakettle/
+SUMMARY: 1 of 3 failed.
+```
+
+示例输出，具体格式需对照实际版本核验。
+
+逐行判读。第一行 `OK:` 前缀来自 `recordSuccess()`，后面原样回显「ID:模式/标志」，说明该规则在默认的 streaming（且带 `HS_MODE_SOM_HORIZON_LARGE`）模式下可编译；`hscheck` 默认走流式并附带大 horizon，是「取最宽松模式」的策略，因此这里通过不代表 block 模式一定通过（少数模式在 block 下反而有额外约束）。第二行是 `FAIL (compile):`，冒号后的文案直接来自 `hs_compile_error_t::message`，「Back-references are unsupported.」表明失败发生在 `checkUnsupported` 而非语法解析，规则本身语法正确、只是 Hyperscan 不支持——这正是 `hscheck` 比「手写脚本调 API」更有价值的地方：它把错误分类暴露出来。第三行说明分支模式正常。末行 `SUMMARY: 1 of 3 failed.` 是汇总，退出码仍为 0（工具只报告不失败），要接 CI 必须自己 grep 这行或加包装脚本判断。
+
+再看 `hsbench`。下面这条命令用 block 模式跑 20 轮，并指定绑核。
+
+```bash
+bin/hsbench -e rules -c corpus.db -N -n 20 -T 3
+```
+
+```text
+Signatures:        3
+Hyperscan info:    Version: 5.4.2 Features: AVX2 Mode: BLOCK
+Expression count:  3
+Bytecode size:     1,842 bytes
+Database HMAC:     9f3c1a7e5b2d4c60a1b2c3d4e5f60718293a4b5c6d7e8f9012345678abcdef01
+Scratch size:      12,288 bytes
+Compile time:      0.004 seconds
+Peak heap usage:   1,048,576 bytes
+
+Time spent scanning:       0.031 seconds
+Corpus size:               4,194,304 bytes (512 blocks)
+Matches per iteration:     1,024 (0.250 matches/kilobyte)
+Overall block rate:        330,322.58 blocks/sec
+Mean throughput (overall): 2,164.52 Mbit/sec
+Max throughput (per core): 2,301.77 Mbit/sec
+```
+
+示例输出，具体格式需对照实际版本核验。
+
+判读要点分四组。第一组是编译期指标：`Bytecode size` 是 `hs_database_size()` 的结果，决定数据库分发体积；`Database HMAC` 是 32 字节 HMAC 的 64 位十六进制串，可用来比对两个数据库文件的字节码是否逐字节相同；`Scratch size` 是 `hs_scratch_size()`，决定每线程内存，乘以并发线程数才是总量；`Compile time` 与吞吐无关，别把它算进「每块成本」。第二组是语料规模：`4,194,304 bytes (512 blocks)` 说明平均块长 8 KB，块率 33 万/秒意味着单块处理约 3 微秒，这个量级下「每次调用的固定开销」占比已经不可忽略，块再小就会看到吞吐明显下降。第三组是吞吐：`Mean throughput (overall)` 与 `Max throughput (per core)` 相差不到 7%，说明多线程扩展与绑核基本正常；若两者差距很大，先查是否跨 NUMA、是否与其他进程争核。第四组是匹配密度：`0.250 matches/kilobyte` 属于中等，若这个值升到几十，回调与 `printf` 会成为瓶颈，测出的「吞吐下降」其实是测试工具本身的开销；此时应去掉 `--echo-matches` 再测一次。
+
+最后是 `hsdump`。它只在开启 `DUMP_SUPPORT` 的构建里可用，典型用法如下。
+
+```bash
+bin/hsdump -e rules -N -o dump_out -D
+ls dump_out
+```
+
+```text
+db.raw
+db_info.txt
+patterns.txt
+scratch.txt
+```
+
+示例输出，具体格式需对照实际版本核验。
+
+判读要点：`-o` 指定的是扁平目录而不是多级子目录，`prepareDumpLoc()` 会在写入前**清空该目录下的所有文件**（usage 里专门给了 WARNING），因此绝对不要指向已有数据的目录。`db.raw` 是 `-D` 才生成的最终数据库字节码副本，`db_info.txt` 是 `hs_database_info()` 的输出，`scratch.txt` 是 `dumpScratch()` 生成的 scratch 布局，`patterns.txt` 是本次参与编译的规则回显；打开中间转储时（默认开启，`-X` 关闭）还会多出解析树与 NG 图的转储文件，文件名随 `Grey::dumpFlags` 的组合变化。如果命令报「unknown option」或二进制根本不存在，先确认构建时 `DUMP_SUPPORT` 是否打开——release 构建里这个目标不会被编译。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，**`hsbench` 默认是 streaming，不是 block**。usage 里写得很清楚：`-N` 才是 block，`-V` 是 vectored，默认按流式跑。用默认参数测出的数字与「每块独立 `hs_scan`」不可比；把两个数字放在同一张表里比较，是最常见的基准错误。
+
+第二，**语料库的 `stream_id` 决定流式语义**。所有块都填同一个 `stream_id` 时，`hsbench` 会把它们当作一条连续流，流状态持续增长、历史缓冲区不断滚动；这既可能放大内存，也可能触发只在长流上出现的问题。做流式基准时应按真实会话切分 `stream_id`，并保持每块大小与线上一致。
+
+第三，**`-T` 绑核不是越多越好**。`hsbench` 的吞吐是「所有线程总量 ÷ 墙钟」，线程数超过物理核数时，超线程争抢会让单核数字下降而总量上升有限；跨 NUMA 节点还会让 scratch 与语料的内存访问变远。基准报告里必须写清 CPU 型号、核数、绑核列表与是否关闭超线程，否则数字无法复现。
+
+第四，**`hscollider` 的「通过」只证明「与参考实现一致」**。PCRE 的匹配集合、Hyperscan 的预过滤语义、`HS_FLAG_SOM_LEFTMOST` 下的起点，三者对「空匹配」「重叠匹配」「无序匹配」的处理并不完全相同。`ResultSet` 做了归一化，但归一化规则本身是工具的一部分；看到「只在 SOM 模式下差异」时，先怀疑归一化，再怀疑引擎。
+
+第五，**PCRE 的 match limit 会影响对拍结论**。`hscollider` 的 `-m` 与 `-r` 分别设置 `PCRE_MATCH_LIMIT` 与 `PCRE_MATCH_LIMIT_RECURSION`，默认值对复杂模式可能过小，表现为「PCRE 报错而 Hyperscan 正常」，被误判成 Hyperscan 多报。调大 limit 后复测，才能区分「真差异」与「参考实现跑不动」。
+
+第六，**`hsdump` 会先清空输出目录**。`prepareDumpLoc()` 在写入前遍历目录并 `unlink` 全部文件，这是为了方便反复调试；把 `-o` 指向源码目录或数据目录会造成不可逆的删除。同时它的输出不能当稳定接口：转储文件的目录结构、文件名、内容格式都随版本变化，且受 `Grey` 覆盖影响。写自动化脚本解析这些文件，等于把内部实现细节写进契约；正确做法是把它当人工排查工具，或用 `-D` 只取最终数据库再配合 `hs_serialized_database_info()`。
+
+第七，**空语料会直接失败**。`hsbench` 在 `byte_size()` 里对总长为 0 的语料 `assert(0)` 并抛 `Empty corpus.`；`hscollider` 在没有任何签名时也会提前退出。CI 里应先校验语料非空、签名集非空，再调用工具，否则失败原因会被误读成「工具崩了」。
+
+第八，**不要把 `hsbench` 的编译时间当作「冷启动成本」**。`compileSecs` 只统计 `hs_compile_multi()` 的耗时，不含动态库加载、`hs_alloc_scratch()`、语料读取与线程创建。真实服务的冷启动还要加上序列化数据库的读取与反序列化，后者在数据库较大时可能占大头。
+
+### 7. 小结与延伸阅读
+
+四个工具构成一条从「能不能编」到「跑得多快」再到「结果对不对」最后到「为什么不对」的链条：`hscheck` 用最宽松的模式做编译筛查，`hsbench` 用统一引擎抽象与 SQLite 语料给出可复现的吞吐，`hscollider` 用 PCRE / NG / UE2 三套参考实现做集合级对拍，`hsdump` 把编译器的中间产物摊开供人对照。它们的共同前提是同一套 `ID:/regex/flags` 签名格式与同一套 `Grey` 调参入口，理解这一点，才能把一个工具上的结论迁移到另一个工具。
+
+延伸阅读：四个工具的完整参数清单、输出字段与语料格式见 04-07；基准方法学、A/B 对照与结果判读见 08-01；编译流水线各阶段的产物（正是 `hsdump` 转储的内容）见 06-01 至 06-04；运行时各条扫描路径（正是 `hscollider` 的开关所覆盖的）见 06-11 与 07-10。实践建议：把 `hscheck` 接进 CI 做规则准入，把 `hsbench` 的固定语料与固定绑核写进性能基线，把 `hscollider` 作为「升级 Hyperscan 版本后必须重跑」的回归项。
+
+## 07-13 util 基础设施与平台适配层
+
+### 1. 背景与动机
+
+`src/util/` 不是某一个算法模块，而是所有模块共用的地基：parser 需要定长位集合表示字符类，nfagraph 需要图容器，rose 需要字节码缓冲区，nfa 需要多位图记录活跃状态，运行期需要跨平台的 SIMD 头与 CPUID 探测，调试工具需要统一的报告与转储入口。这些需求如果各自实现一遍，代码量会翻倍，行为也会分叉——同一份「字符类匹配」在 parser 与 nfa 里出现两种语义，是最难查的一类 bug。
+
+这个目录的规模容易被低估。按本快照实际统计，`src/util/` 下有 **88 个文件**（目录里 `ls | wc -l` 的结果），而不是某些文献里写的 83 个；其中既有纯头文件的模板（`bitfield.h`、`charreach.h`、`bytecode_ptr.h`），也有必须编译成 C 的运行期实现（`multibit.c`、`state_compress.c`、`simd_utils.c`、`masked_move.c`、`cpuid_flags.c`），还有一批夹在中间的 C++ 实现（`charreach.cpp`、`report_manager.cpp`、`compile_context.cpp`、`target_info.cpp`、`ue2string.cpp`、`alloc.cpp` 等）。**同一个目录里同时存在 C 与 C++ 两种编译单元**，这是理解它的第一把钥匙。
+
+这里必须先纠正三处常见的资料错误，否则按图索骥会找不到文件。第一，本快照**没有** `src/util/flatvector.h` 与 `src/util/ue2vector.h`；对应的「扁平容器」能力由 `flat_containers.h` 里的 `flat_set` / `flat_map` 与 `small_vector.h` 提供，若在其他版本文献里看到那两个文件名，需对照实际版本核验。第二，**没有** `src/util/arch/` 子目录；平台宏集中在 `src/util/arch.h` 一个文件里，`intrinsics.h` 与它平级。第三，`report.h` 里的 `Report` 是编译期报告描述，不是运行期回调类型；运行期回调类型在 `hs_runtime.h` 的 `match_event_handler`。
+
+为什么要把「平台适配」也放进 util，而不是单独一个 `platform/` 目录？因为平台差异几乎全部以宏和 intrinsics 的形式渗透进热路径：`arch.h` 决定哪些指令集可用，`intrinsics.h` 决定包含 `<x86intrin.h>` 还是 `<intrin.h>`，`cpuid_inline.h` 提供 `check_avx2()` 一类内联探测，`target_info.h` 把「目标平台」抽象成 `target_t` 供编译期决策。它们必须能被 nfa、fdr、hwlm 直接 include，而不能经过一层间接。
+
+### 2. 核心概念
+
+**扁平容器（flat containers）**。`flat_containers.h` 提供 `flat_set<T, Compare, Allocator>` 与 `flat_map<Key, T, Compare, Allocator>`，底层是「有序的 `small_vector` + 二分查找」。它的取舍很明确：插入是 O(n) 搬移，查找是 O(log n) 且内存连续、缓存友好。Hyperscan 的典型负载是「编译期大量插入、运行期只读」，因此这类容器在报告表、字符类集合、状态映射里非常合适；反过来，如果在运行期热路径上频繁插入，它会比 `std::set` 更慢。
+
+**小向量（small_vector）**。`small_vector.h` 提供带内联存储的向量：元素数不超过内联容量时不分配堆内存，超过后才迁移到堆。它的价值不在渐进复杂度，而在「消除小对象的 malloc」——编译期有大量「平均 1 到 4 个元素」的临时集合，每次 malloc 的固定开销远大于搬移成本。
+
+**图容器（ue2_graph）**。`ue2_graph.h` 基于 boost 的 adjacency_list 做了一层封装，定义了顶点/边属性与遍历辅助。`graph.h`、`graph_range.h`、`graph_undirected.h`、`graph_small_color_map.h` 提供算法侧的补充。`NG`、`RoseBuild` 里的图都建立在这层之上，因此「换图算法」只需改 util，不必改上层模块。
+
+**位运算（bitutils）**。`bitutils.h` 提供一整族内联函数：`clz32` / `clz64`（前导零）、`ctz32` / `ctz64`（尾随零）、`findAndClearLSB_32/64`、`findAndClearMSB_32/64`、`compress32/64` 与 `expand32/64`（位压缩与展开）、`pext32/64` 与 `pdep64`（BMI2 的并行位提取/ deposit）、`rank_in_mask32/64`、`bf64_set/unset/iterate`。另有三个大小写掩码常量 `CASE_BIT = 0x20`、`CASE_CLEAR = 0xdf`、`DOUBLE_CASE_CLEAR = 0xdfdf`，是 smallwrite 与 caseless 匹配的基础。
+
+**定长位集合（bitfield）**。`bitfield.h` 的 `template<size_t requested_size> class bitfield` 是一个「编译期定长、按机器字存储」的位集合，提供 `set`、`clear`、`flip`、`test`、`set_range`、`setall`、`count`、`find_first`、`find_next`、`find_nth` 与位运算。它有一条必须遵守的不变量：**尾字中超出 `requested_size` 的位必须为零**，由 `clear_trailer()` 保证；破坏它会污染哈希与相等比较，因为比较是整字比较而不是逐位比较。
+
+**字符类（CharReach）**。`charreach.h` 的 `CharReach` 本质就是 `bitfield<256>` 加一层语义封装：`set`、`clear`、`flip`、`test`、`setRange`、`set(const std::string&)`、`count`、`none`、`any`、`all`、`find_first`、`find_last`、`find_next`、`find_nth`，以及按位 OR/AND 等运算符。`npos` 是「没有更多位」的哨兵，等价于 256。它只覆盖单字节，UTF-8 模式下的码点类必须先展开成字节序列，这一步在 `Utf8ComponentClass` 里完成，不在 CharReach 里做。
+
+**多位图（multibit / fatbit）**。`multibit.h` 与 `fatbit.h` 提供可变长度的「每个 key 若干位」的容器，运行期接口是 `mmbit_size`、`mmbit_set`、`mmbit_isset`、`mmbit_clear`、`mmbit_all` 等。内部按规模分两种模型：`mmbit_is_flat_model(total_bits)` 为真时走 flat 实现（`mmbit_set_flat`），否则走 big 实现（`mmbit_set_big`）；`fatbit.h` 则是它的数组化封装，用于「一组多位图」的场景。scratch 里的 `aqa`、`deduper.log`、`active` 位图、`al_log` 全是它。`fatbit_build.cpp` 是编译期构造侧，`multibit_compress.h` 负责压缩表示。
+
+**报告与报告管理器**。`report.h` 的 `struct Report` 描述「一次命中要做什么」：`type`、`minOffset`、`maxOffset`、`minLength`、`ekey`（耗尽键）、`lkey`（逻辑组合键）、`quiet`、`offsetAdjust`、`onmatch`、`revNfaIndex`、`quashSom`。`ReportManager`（`report_manager.h` / `.cpp`）负责把用户 ID 映射成内部 `ReportID`，并做去重与合并。它是「一条模式在多个顶点上报告时只回调一次」的实现基础。
+
+**字节码容器（bytecode_ptr）**。`bytecode_ptr.h` 的 `template<typename T> class bytecode_ptr` 是一个「知道长度与对齐、独占所有权」的智能指针，行为类似 `std::unique_ptr` 但额外携带 `size()` 与 `align()`。构造时按 `max(alignment, sizeof(void*))` 调 `aligned_malloc_internal()`；`release()` 交出指针并把 `bytes`/`alignment` 归零；`shrink()` 只改「表观大小」不重新分配；`make_bytecode_ptr()` 与 `make_zeroed_bytecode_ptr()` 是两个工厂。整个编译流水线的中间产物与最终字节码都用它承载。
+
+**平台适配（arch / intrinsics / cpuid / target_info）**。`arch.h` 用一套 `#if` 把编译器预定义宏翻译成 `HAVE_SSE2`、`HAVE_SSE41`、`HAVE_SSE42`、`HAVE_AVX`、`HAVE_AVX2`、`HAVE_AVX512`、`HAVE_AVX512VBMI`、`HAVE_POPCOUNT_INSTR`、`HAVE_BMI`、`HAVE_BMI2`，并对 MSVC 做了近似（`_M_X64`、`_M_IX86_FP >= 2`、`defined(_WIN32) && defined(__AVX__)`），同时定义 `NO_ASM` 规避 MSVC 的内联汇编差异。`intrinsics.h` 只做一件事：按 `HAVE_CXX_X86INTRIN_H` / `HAVE_C_INTRIN_H` 等配置选 `<x86intrin.h>` 或 `<intrin.h>`，两者都没有就 `#error no intrinsics file`。`cpuid_flags.h` / `cpuid_inline.h` 提供 `check_ssse3()`、`check_avx2()`、`check_avx512()`、`check_popcnt()` 等探测。`target_info.h` 把「编译目标」抽象成 `target_t`，提供 `has_avx2()`、`has_avx512()`、`has_avx512vbmi()`、`is_atom_class()` 与 `can_run_on_code_built_for()`。
+
+**分配与编译上下文**。`alloc.h` 提供 `aligned_zmalloc()`（64 字节对齐且清零，失败抛 `bad_alloc`）、`aligned_free()`、`aligned_malloc_internal()` 与 `AlignedAllocator<T, N>`（供 STL 容器指定对齐）。`compile_context.h` 的 `CompileContext` 只有四个字段：`streaming`、`vectored`、`target_info`、`grey`；它是「一次编译的全部环境」，被 parser、nfagraph、rose、nfa 一路透传。
+
+### 3. 关键数据结构与源码位置
+
+按职责把 util 分成六组，比按文件名首字母读要高效得多。下表给出分组、代表文件与关键符号。
+
+| 分组 | 代表文件 | 关键符号 | 主要使用者 |
+|---|---|---|---|
+| 容器 | `flat_containers.h`、`small_vector.h`、`ue2_graph.h` | `flat_set`、`flat_map`、`small_vector`、`ue2_graph` | nfagraph、rose、report_manager |
+| 位运算 | `bitutils.h`、`bitfield.h`、`popcount.h` | `clz64`、`compress64`、`pext64`、`bitfield<N>` | 全模块 |
+| 多位图 | `multibit.h`、`fatbit.h`、`multibit_build.cpp` | `mmbit_size`、`mmbit_set`、`mmbit_all` | scratch、rose、nfa |
+| 字符类 | `charreach.h`、`charreach.cpp`、`charreach_util.h` | `CharReach`、`setRange`、`find_nth` | parser、nfagraph、nfa |
+| 报告 | `report.h`、`report_manager.h`、`report_manager.cpp` | `Report`、`ReportManager`、`ReportID` | nfagraph、rose |
+| 字节码 | `bytecode_ptr.h`、`alloc.h`、`alloc.cpp` | `bytecode_ptr`、`make_zeroed_bytecode_ptr` | compiler、rose、nfa |
+| 平台 | `arch.h`、`intrinsics.h`、`cpuid_flags.c`、`target_info.h` | `HAVE_AVX2`、`check_avx2`、`target_t` | 全模块 |
+| 上下文 | `compile_context.h`、`compile_context.cpp`、`grey.h`（上层） | `CompileContext`、`Grey` | 编译全流程 |
+
+`CharReach` 的实现细节值得单独说明：它的 `bits` 是 `bitfield<256>`，因此 `count()` 返回的是「集合里有多少个字节值」，`find_first()` 返回最小字节值，`find_nth(n)` 返回第 n 个被置位的字节值。这三个函数在处理字符类时极常用：判断「是不是单字符」「是不是连续区间」「能否用 shufti 加速」都靠它们。`charreach_util.h` 里还有一批自由函数，用于把 CharReach 转成区间列表或字符串，供 dump 使用。
+
+`bytecode_ptr` 的所有权语义是另一处必须精确理解的地方。它不可拷贝，只能移动；`release()` 之后 `size()` 与 `align()` 都变成 0；`shrink()` 只改表观大小，底层分配不变；转换成 `std::shared_ptr<ST>` 时会把 deleter 一起转交，因此释放仍然走 `aligned_free_internal()`。编译流水线里 `build()` 返回的就是 `bytecode_ptr<u8>`，数据库层把它整块 `memcpy` 到 `hs_database::bytes` 之后才由 `hs_free_database()` 走另一条释放路径——两条路径不能混用。
+
+按本套资料的交叉引用约定，本篇涉及的对象可以统一记为（字段见 05-08 ｜ 参数见 04-01 ｜ 原理见 06-03 ｜ 模块见 07-02）。
+
+### 4. 关键流程与调用链
+
+编译期对 util 的依赖可以按「分配 → 构图 → 标注 → 汇总 → 交付」五步看。第一步，`build()` 在 `compiler.cpp` 里先算出各段大小，用 `make_zeroed_bytecode_ptr<u8>(total, 64)` 一次性申请整块字节码缓冲区；第二步，`NG` 的图构造用 `ue2_graph` 建顶点与边，每个顶点的字符可达集用 `CharReach` 表示，边上的断言用 `bitfield` 表示；第三步，`ReportManager` 把每条模式的报告合并、去重、分配 `ReportID`，并把 `minOffset`/`maxOffset`/`minLength`/`ekey`/`lkey` 写进 `Report`；第四步，Rose 把各张表（literal、anchored、floating、suffix、程序字节码）依次写进缓冲区，每写一段就推进游标并做对齐；第五步，`build()` 把缓冲区 `release()` 出来交给 `database.c`，后者把它拷进 `hs_database` 的 `bytes` 并计算 HMAC。
+
+运行期对 util 的依赖更集中：scratch 里的每一个位图都是 `mmbit_*`，状态压缩走 `state_compress.c`，SIMD 搬运走 `simd_utils.c` 与 `masked_move.c`，CPU 探测走 `cpuid_inline.h`。这些是 `.c` 文件，编译成 C 而不是 C++，原因是它们要被运行期热路径直接调用，不能引入 C++ 异常与 RTTI 开销，也不能让符号被 name mangling 污染。
+
+平台适配在「编译期决策」与「运行期分派」两侧各出现一次：编译期由 `arch.h` 的宏决定「这个翻译单元能不能用 AVX2 intrinsic」，运行期由 `check_avx2()` 决定「当前 CPU 能不能跑这份代码」。`dispatcher.c` 的 ifunc 解析用的就是后者；而 `target_t::can_run_on_code_built_for()` 则在编译期回答「我这份为 A 平台生成的代码，能不能在 B 平台上跑」，两者共同保证「一份库、多套实现」不会互相踩踏。
+
+util 各分组之间的依赖关系见下图。
+
+:::figure id=07-13-01 | name=util 基础设施的分层与依赖 | dir=TD
+node n1 "运行期 C 实现" green
+node n2 "编译期 C++ 模块" teal
+node n3 "容器 flat_set 与 small_vector" amber
+node n4 "位运算 bitutils 与 bitfield" amber
+node n5 "字符类 CharReach" purple
+node n6 "报告 ReportManager" purple
+node n7 "bytecode_ptr 字节码容器" blue
+node n8 "平台 arch 与 cpuid" gray
+node n9 "对齐分配 aligned_zmalloc" gray
+edge n2 -> n3 "有序集合"
+edge n2 -> n4 "掩码与压缩"
+edge n2 -> n5 "可达字符集"
+edge n2 -> n6 "报告去重"
+edge n2 -> n7 "产物缓冲区"
+edge n2 -> n8 "目标平台"
+edge n1 -> n4 "位图运算"
+edge n1 -> n9 "状态区分配"
+edge n7 -> n9 "对齐申请"
+edge n5 -> n4 "底层 256 位"
+edge n6 -> n3 "报告表"
+edge n8 -> n9 "对齐常量"
+:::
+
+图 07-13-01 的关键信息是「箭头都指向叶子」：`bitfield`、`bitutils`、`aligned_zmalloc` 位于最底层，几乎所有上层模块都直接依赖它们，而它们不依赖任何上层模块。这条约束让 util 可以被任何模块 include 而不产生循环依赖，也让「替换分配器」「替换位图实现」成为局部改动。
+
+`bytecode_ptr` 的生命周期是另一条值得单独画出的链路，它横跨编译期与数据库层，也是最容易出错的地方。
+
+:::figure id=07-13-02 | name=bytecode_ptr 的所有权转移路径 | dir=LR
+node q1 "make_zeroed 申请" blue
+node q2 "aligned_malloc_internal" gray
+node q3 "Rose 写入各段" teal
+node q4 "release 交出指针" amber
+node q5 "memcpy 进 hs_database" green
+node q6 "aligned_free 释放" red
+edge q1 -> q2 "64 字节对齐"
+edge q2 -> q3 "返回缓冲区"
+edge q3 -> q4 "构建完成"
+edge q4 -> q5 "长度与对齐"
+edge q5 -> q6 "数据库释放路径"
+edge q1 -> q6 dashed "异常时自动释放"
+:::
+
+图 07-13-02 里有一条虚线：如果构建过程抛异常，`bytecode_ptr` 的析构函数会调用 `aligned_free_internal()` 自动回收，不会泄漏。但一旦 `release()` 成功，所有权就转移到数据库层，此后必须由 `hs_free_database()` 释放；此时若再对原指针调用 `aligned_free()`，就是重复释放。这条「release 之后责任转移」的规则，是读编译流水线代码时最需要盯住的细节。
+
+### 5. 配置/命令/代码实例
+
+下面这段 C++ 直接使用 util 的三个核心组件，不依赖 Hyperscan 的公共 API，适合用来验证自己对语义的理解。编译时把 `src/` 加入头文件路径即可。
+
+```cpp
+#include "util/bitfield.h"
+#include "util/charreach.h"
+#include "util/bytecode_ptr.h"
+#include <cstdio>
+
+using namespace ue2;
+
+int main() {
+    CharReach cr('a', 'z');   /* 26 个小写字母 */
+    cr.set('_');              /* 加入下划线 */
+    cr.clear('q');            /* 去掉 q */
+    printf("count=%zu first=%zu last=%zu\n",
+           cr.count(), cr.find_first(), cr.find_last());
+
+    bitfield<16> bf;
+    bf.set_range(2, 5);       /* 置位 2,3,4,5 共四位 */
+    printf("bf=%zu test3=%d\n", bf.count(), (int)bf.test(3));
+
+    auto buf = make_zeroed_bytecode_ptr<unsigned char>(64, 64);
+    printf("size=%zu align=%zu b0=%u\n",
+           buf.size(), buf.align(), (unsigned)buf.get()[0]);
+    return 0;
+}
+```
+
+按 5.4.2 的实现，输出应为三行。
+
+```text
+count=26 first=95 last=122
+bf=4 test3=1
+size=64 align=64 b0=0
+```
+
+示例输出，具体格式需对照实际版本核验。
+
+逐行判读。第一行 `count=26`：26 个字母加下划线是 27，减掉 `q` 正好 26，说明 `set` 与 `clear` 都生效且互不干扰；`first=95` 是下划线 `_` 的 ASCII 码，它比 `a`(97) 小，所以成为集合中的最小字节，这提醒我们「字符类的最小值不一定来自你最先加入的那个区间」；`last=122` 是 `z`，因为 `q` 被删掉不影响最大值。第二行 `bf=4` 说明 `set_range(2,5)` 是**闭区间**，置位 2、3、4、5 共四位，若误以为半开区间就会得到 3；`test3=1` 验证第 3 位确实被置上。第三行 `size=64 align=64` 说明 `bytecode_ptr` 同时携带了长度与对齐，`b0=0` 说明 `make_zeroed_*` 确实把整块清零（普通 `make_bytecode_ptr` 不会清零，读到的是未初始化内存）。把 `align` 改成 32 再跑，`align=32` 会如实反映，但底层仍按 `max(alignment, sizeof(void*))` 申请，不会小于指针宽度。
+
+想确认 util 的规模与 C/C++ 混编边界，可以直接数文件。
+
+```bash
+ls src/util | wc -l
+ls src/util/*.c
+```
+
+```text
+88
+src/util/cpuid_flags.c
+src/util/masked_move.c
+src/util/multibit.c
+src/util/simd_utils.c
+src/util/state_compress.c
+```
+
+示例输出，具体格式需对照实际版本核验。
+
+判读要点：第一行 88 是文件总数（含 `.h`、`.cpp` 与 `.c`），不同版本会有增减，引用这个数字时要注明快照日期；后面五行是 `*.c` 通配符匹配到的全部 C 编译单元，`charreach.cpp` 是 C++，不会出现在这个列表里。这些 `.c` 文件的关键约束是：不能 include 任何 C++ 头、不能抛异常、符号必须是 C 链接，因为它们会被运行期热路径直接调用。若你的构建里这个列表多出文件，说明该版本的运行期实现被拆分得更细，需对照 `src/util/CMakeLists.txt` 的源文件清单核验。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，**`bitfield` 的尾位不变量不能破**。`bitfield<requested_size>` 用整字比较做相等与哈希，若尾字中超出 `requested_size` 的位非零，两个「逻辑上相同」的位集合会被判为不同。所有会改写尾字的操作（尤其是从外部 memcpy 或反序列化）之后都必须调 `clear_trailer()`；自己写扩展代码时，不要绕过 `set`/`clear` 直接操作底层字。
+
+第二，**`CharReach` 只有 256 位，不要拿它表示 Unicode 码点**。UTF-8 模式下 `\p{L}` 这类字符类会被展开成「字节序列的多条路径」，展开发生在 `Utf8ComponentClass`，不在 `CharReach`。把码点直接 `set()` 进 CharReach 会静默截断成低 8 位，表现为「字符类意外匹配到无关字节」，且编译期不报错。
+
+第三，**`bytecode_ptr` 不可拷贝，`release()` 之后长度归零**。它故意删除了拷贝构造，只保留移动；用 `auto b = a;` 会编译失败，必须 `std::move(a)`。`release()` 返回裸指针并把 `bytes`/`alignment` 置 0，之后再调 `size()` 得到 0 而不是原长度——如果日志里看到「缓冲区大小 0 但指针非空」，多半是 release 之后又读了 size。
+
+第四，**对齐分配必须配对释放**。`aligned_zmalloc()` / `aligned_malloc_internal()` 申请的内存只能用 `aligned_free()` / `aligned_free_internal()` 释放，用 `free()` 会在部分平台直接崩溃（因为指针被向上对齐过，原始地址存在头部）。`bytecode_ptr` 的 deleter 已经处理了这件事，自己接管裸指针时不要忘记。
+
+第五，**`mmbit_*` 的 `total_bits` 必须与分配时一致**。multibit 的 flat / big 两种模型由 `mmbit_size(total_bits)` 决定布局，运行时传错 `total_bits` 会按错误模型解析，读到越界或错位的数据。scratch 里的位图大小来自数据库的 `queueCount`、`deduper.dkey_count` 等字段，所以「数据库与 scratch 必须匹配」这条规则在 util 层面也有体现。
+
+第六，**平台宏是「编译期近似」，不是「运行期真值」**。`arch.h` 的 `HAVE_AVX2` 只表示「编译器被允许生成 AVX2 代码」，不表示「运行机器支持 AVX2」；后者必须用 `check_avx2()`。在 fat runtime 构建里，同一个函数会有多份按宏编译的副本，由 ifunc 选择，因此**不要在自己的代码里用 `HAVE_AVX2` 做运行期分支**，那会在老机器上直接触发非法指令。
+
+第七，**C 与 C++ 混编边界不要传 STL 对象**。`multibit.c`、`state_compress.c` 等是 C 编译单元，导出的是 C 链接符号；从头文件 include 进 C++ 时靠 `extern "C"` 包裹。跨边界传 `std::vector`、`std::string` 会因 ABI 与异常机制不同而出问题，正确做法是传指针加长度。
+
+第八，**`util/` 是内部头，不保证 ABI 稳定**。`hs.h`、`hs_compile.h`、`hs_runtime.h` 是公共头，`util/*.h` 不是。基于 `util` 写扩展意味着与具体版本绑定；升级 Hyperscan 时这些头可能改名、改签名甚至删除（本篇开头纠正的三个文件名就是例子）。要做长期维护的扩展，应尽量只依赖公共 API。
+
+### 7. 小结与延伸阅读
+
+util 的定位可以用一句话概括：**把「所有模块都要用、但谁也不该自己实现」的东西集中到一处，并保证它们既能被 C 调用、又能被 C++ 模板化使用**。容器解决「编译期大量插入、运行期只读」的性能问题，位运算与位图解决「用位并行替代分支」的问题，`CharReach` 解决「字符类语义统一」的问题，`Report`/`ReportManager` 解决「一条模式多处报告只回调一次」的问题，`bytecode_ptr` 解决「长度、对齐、所有权三者一起传递」的问题，`arch.h` 与 `cpuid` 解决「一份代码多套指令集」的问题。七件事各自独立，合起来构成编译与扫描两条链路的共同底座。
+
+延伸阅读：`NG` 图结构与顶点属性见 05-08，`RoseEngine` 与字节码布局见 05-05，`hs_database` 的 192 字节头与 `bytes` 起始偏移见 05-02；图构造与化简如何使用这些容器见 06-03，Rose 如何写入字节码见 06-04，fat runtime 如何用 `arch.h` 与 `cpuid` 做分派见 06-13；构建变量（`BUILD_AVX512`、`FAT_RUNTIME` 等）对平台宏的影响见 04-01。读源码建议从 `charreach.h` 与 `bitfield.h` 入手（短、语义清晰），再看 `bytecode_ptr.h` 的所有权设计，最后读 `multibit.h` 的 flat/big 双模型——这三步走完，再读 nfa 与 rose 的实现会轻松很多。

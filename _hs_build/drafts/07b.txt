@@ -1,0 +1,801 @@
+# Hyperscan 技术资料 · 07 模块与特性介绍（分片 B）
+
+## 07-06 hwlm 模块
+
+### 1. 背景与动机
+
+Hyperscan 的编译期把一条正则拆成「能被字面量触发的部分」和「只能由自动机推进的部分」（原理见 06-04）。拆出来的字面量不是一条两条，而是成千上万条：一个典型的 IDS 规则集里，几乎每条规则都带有至少一个可锚定的协议关键字，HTTP 方法、URI 前缀、TLS 握手特征各自成群。如果每条字面量都单独做一次 `memmem`，扫描成本与规则条数成正比，多正则匹配「一次扫描命中上万条模式」的意义就消失了。HWLM 正是为这一步准备的多字面量匹配层：它把一组字面量编译成一张表，用一次线性推进同时跟踪所有候选。
+
+名字需要先纠正一处流传很广的误写。`src/hwlm/hwlm.h` 的文件注释写的是 `Hamster Wheel Literal Matcher`，不是 `hardware literal matcher`。它不依赖任何专用硬件，走的是 SSE、AVX2、AVX-512 的通用 SIMD 指令；「仓鼠轮」形容的是「数据不停送入、轮子不停转动」的扫描循环。把 HWLM 展开成 hardware 的二手资料很多，但以上游源码注释为准更稳妥，也避免让人误以为它需要某种加速卡。
+
+HWLM 的第二重价值是「稳定外壳」。它向下遮蔽了三种差异极大的实现：单字面量的 Noodle、面向中等规模字面量集合的 Teddy、面向更大集合的 FDR。Rose 在生成字节码时只认 `struct HWLM` 与 `hwlmExec` / `hwlmExecStreaming` 两个入口，不需要知道背后是谁；引擎选择在编译期就固化成 `HWLM::type`。这种「一个定长头 + 一段引擎体」的布局还有一个附加好处：序列化数据库时只需原样搬运字节，不必为不同引擎分别写序列化代码。
+
+第三重价值是组掩码。逻辑组合（`HS_FLAG_COMBINATION`）需要「某些模式组被关闭时不要上报」，HWLM 把这件事做进了回调返回值：回调返回一个 64 位掩码，引擎把它当作「后续只关心这些组」的提示。组开关因此不必逐条字面量判断，而变成扫描循环里的一个滤波器；这也是为什么 `hwlmcb_rv_t` 不是 `bool` 而是 `hwlm_group_t`。
+
+从能力边界上说，HWLM 只解决「短字面量集合的快速定位」，不解决「匹配从哪开始」。回调参数只有结束偏移 `end`、字面量 `id` 和 `scratch`，没有起始偏移。需要起点就必须在更上层开启 `HS_FLAG_SOM_LEFTMOST`，由 SOM 模块补上（模块见 07-09）。把 HWLM 当成「能返回完整匹配区间的匹配器」是阅读源码时最常见的误解之一。
+
+### 2. 核心概念
+
+**字面量（hwlmLiteral）**。这是编译期表示，字段包括字符串本体 `s`、回调用的 `id`、是否大小写不敏感 `nocase`、是否允许压缩连续命中 `noruns`、所属组掩码 `groups`，以及一对可选的补充比较向量 `msk` / `cmp`。构造函数会把 `nocase` 的字符串统一转成大写，之后引擎只按大写形态比较；`msk` / `cmp` 的作用是对字符串末尾 8 字节再加一层 `(v & msk) == cmp` 的约束，用于表达「整体不区分大小写、但某几位必须区分」这类细节。`HWLM_MASKLEN` 与 `HWLM_LITERAL_MAX_LEN` 都是 8，说明交给 HWLM 的是长度不超过 8 字节的短片段。
+
+**原型（HWLMProto）与成品（HWLM）**。`HWLMProto` 是「还没布局」的中间产物：它记录引擎类型 `engType`、引擎描述（`fdrEng` 或 `teddyEng` 二选一）、字面量数组、桶到字面量的映射 `bucketToLits`，以及 `make_small` 这个「按小体积优化」的开关。`HWLM` 才是可以落进数据库的字节码头，只有三个字段：`type`、`accel1_groups` 和两个加速器描述 `accel1` / `accel0`；真正的引擎体紧跟其后，通过 `HWLM_C_DATA` 宏按 `ROUNDUP_CL(sizeof(struct HWLM))` 跳过头部取得。分成两段的原因是编译期需要反复重排、打分、合并，运行期则要求一次分配、只读、缓存行对齐。
+
+**三种底层引擎**。`HWLM_ENGINE_NOOD` 的值为 16，`HWLM_ENGINE_FDR` 的值为 12。Noodle 只处理「恰好一条字面量」且编译选项允许的情况；它的运行时结构 `noodTable` 记录一个 8 字节掩码、一个 8 字节比较值、掩码长度、键偏移和两个键字节，本质上是「先用一两个字节做粗筛，再对 8 字节窗口做一次掩码比较」。FDR 这一支其实包含两个引擎：Teddy 与 FDR。二者共用同一个类型标记，因为 `struct Teddy` 的前六个 `u32` 与 `struct FDR` 完全兼容，`fdrSize()` 直接读 `fdr->size` 就能得到长度。判断到底是哪一个，要看 `engineID` 能否在 FDR 引擎描述表里查到；`fdr_dump.cpp` 里的 `fdrIsTeddy()` 就是 `!getFdrDescription(engineID)`。
+
+**组掩码与提前终止**。`HWLM_ALL_GROUPS` 是全 1，`HWLM_CONTINUE_MATCHING` 也是全 1；`HWLM_TERMINATE_MATCHING` 是 0。这里有一个容易写错的地方：返回 0 不是「没有组」，而是「立刻停止」。如果调用方想表达「这些组我都不关心」，应当返回一个非零但不包含它们的掩码，而不是返回 0。回调文档还明确写了：引擎「可能选择不上报」某些匹配，只要在到达结束位置时没有属于当前掩码的组处于活跃状态。因此 HWLM 的输出是「在给定组掩码下的上报流」，不是「全部匹配的全集」。
+
+**块模式与流式模式**。块模式的入口是 `hwlmExec(tab, buf, len, start, cb, scratch, groups)`，`start` 是「最早可能开始匹配的偏移」，允许加速器从更早的位置起扫。流式入口是 `hwlmExecStreaming(tab, len, start, cb, scratch, groups)`，它不接收缓冲区指针，而是从 `scratch->core_info` 里取 `hbuf` / `hlen` / `buf`——这是它与 Rose 运行时约定好的数据放置方式。流式接口的注释特别说明：完全落在历史缓冲区里的匹配不会上报；跨块的匹配，起点可能以「负值」形式表达，具体编码由上层处理。
+
+**加速器（accel）**。`HWLM` 头里保存两套加速方案。`accel1` 只在「当前组掩码是 `accel1_groups` 的子集」时使用，`accel0` 是兜底。加速器的作用是快速跳过「不可能出现任何候选」的前缀，常见实现是 `vermicelli`（单字节或双字节）、`shufti`（字符类）、`truffle`（通用字符类）。块模式下还有 16 字节的最小长度门槛，低于门槛就直接进主引擎，避免加速器的固定开销超过收益。
+
+**洪泛（flood）**。当输入是同一字符的长跑（例如一整片 `aaaa...`），大量字面量会在每个位置同时成为候选，确认阶段被反复触发，吞吐骤降。HWLM 通过 `hwlmFloodProneSuffixLen()` 在编译期估计「多长的重复后缀会让这套字面量变得洪泛敏感」：Noodle 单条不限制；Teddy 在 48 条以内、或 AVX2 下 96 条以内，返回 3；其余情况也返回 3。这个「3」是源码里明确标注的经验值，不是可以由用户配置的参数。
+
+### 3. 关键数据结构与源码位置
+
+`src/hwlm/` 在本快照下共 17 个文件，按职责可以分成四组，见表 07-06-A。表中「角色」一列是阅读顺序建议：先看头文件确认契约，再看构建代码确认输入，最后看运行时确认热路径。本册不重复字段定义与参数清单，遇到结构体一律写「字段见 05-07 ｜ 参数见 04-04 ｜ 原理见 06-05 ｜ 模块见 07-07」，按这四路交叉查阅即可。
+
+| 文件 | 角色 |
+|---|---|
+| `hwlm.h` | 运行时 API：回调类型、组掩码常量、`hwlmExec`、`hwlmExecStreaming` |
+| `hwlm_internal.h` | `struct HWLM`、`HWLM_C_DATA`、两个引擎类型常量 |
+| `hwlm_build.h` | `HWLMProto`、`hwlmBuild`、`hwlmBuildProto`、`hwlmSize` |
+| `hwlm_build.cpp` | 原型构建、限额检查、Noodle 判定、最终布局 |
+| `hwlm_literal.h` | `hwlmLiteral` 编译期表示与 `maskIsConsistent` |
+| `hwlm_literal.cpp` | 大小写归一、掩码一致性校验 |
+| `hwlm.c` | 运行时分派、两套加速器的选择与调用 |
+| `hwlm_dump.cpp` | `hwlmGenerateDumpFiles` 与文本转储 |
+| `hwlm_dump.h` | 转储入口声明 |
+| `noodle_build.cpp` | `noodBuildTable`、键偏移选择、掩码合成 |
+| `noodle_engine.c` | 单/双字节扫描、三阶段对齐扫描 |
+| `noodle_engine.h` | `noodExec`、`noodExecStreaming` 声明 |
+| `noodle_engine_sse.c` | SSE 分块扫描模板（`CHUNKSIZE` 16） |
+| `noodle_engine_avx2.c` | AVX2 分块扫描模板（`CHUNKSIZE` 32） |
+| `noodle_engine_avx512.c` | AVX-512 分块扫描模板（`CHUNKSIZE` 64） |
+| `noodle_internal.h` | `noodTable` 布局 |
+| `noodle_build.h` | `noodBuildTable`、`noodSize`、`noodPrintStats` |
+
+`struct HWLM` 的定义在 `src/hwlm/hwlm_internal.h:48`，只有 `type`、`accel1_groups`、`accel1`、`accel0` 四项。它刻意保持极小：任何与具体引擎相关的信息都不放在头里，这样 Rose 侧只需要一个不透明指针。`HWLM_C_DATA` 与 `HWLM_DATA` 两个宏在 `hwlm_internal.h:56` 与 `:60`，前者返回 `const void *`、后者返回 `void *`，都用 `ROUNDUP_CL` 对齐到缓存行，这就是「头部之后才是引擎体」这一约定的全部实现。
+
+`hwlmLiteral` 在 `src/hwlm/hwlm_literal.h:51`，字段的逐项语义与读写时机见 05-07。这里只强调两点：其一，`nocase` 为真时构造器会调用 `upperString(s)`，因此后续所有比较都按大写形态进行，引擎里不需要再逐字节转换；其二，`msk` 全零时构造器会把它和 `cmp` 一起清空，避免无意义的补充比较拖慢主路径。`maskIsConsistent()` 在 `hwlm_literal.cpp:53`，它从字符串尾部和掩码尾部同时反向遍历，逐字节验证 `(c & m) == v`，不满足就直接在调试构建里断言失败。
+
+`noodTable` 在 `src/hwlm/noodle_internal.h:38`，字段依次是 `id`、`msk`、`cmp`、`msk_len`、`key_offset`、`nocase`、`single`、`key0`、`key1`。`key_offset` 的语义容易看反：它记录的是「键字节距离字符串末尾还有多远」，`noodBuildTable()` 里写作 `n->key_offset = s.length() - key_offset`，而 `final()` 里用 `pos + n->key_offset - n->msk_len` 回推比较窗口的起点。`single` 表示字面量只有一个字节，此时可以直接上报，不必再做 8 字节窗口比较。
+
+编译侧的三个入口都在 `src/hwlm/hwlm_build.cpp`：`hwlmBuildProto()` 在 `:164`，`hwlmBuild()` 在 `:121`，`hwlmSize()` 在 `:217`，`hwlmFloodProneSuffixLen()` 在 `:236`。运行侧的两个入口在 `src/hwlm/hwlm.c`：`hwlmExec()` 在 `:172`，`hwlmExecStreaming()` 在 `:201`；加速器的块模式包装 `do_accel_block()` 在 `:79`，流式包装 `do_accel_streaming()` 在 `:108`。Noodle 的运行时在 `src/hwlm/noodle_engine.c`：`final()` 在 `:113`，`scanSingleMain()` 在 `:154`，`noodExec()` 在 `:374`，`noodExecStreaming()` 在 `:387`。
+
+### 4. 关键流程与调用链
+
+先看编译期。Rose 把一批字面量交给 `hwlmBuildProto()`，第一步不是选引擎，而是做限额与安全检查：字面量条数超过 `grey.limitLiteralCount`、单条长度超过 `grey.limitLiteralLength`、总字符数超过 `grey.limitLiteralMatcherChars`，任一越界都抛 `ResourceLimitError`；`id` 等于 `0xffffffff` 也直接拒绝，因为这个值被引擎内部保留。这些检查都在分配任何大块内存之前完成，目的是让「不可信模式集」在编译期就失败，而不是把内存打爆（安全侧讨论见 08-05）。
+
+第二步是判定 Noodle。`isNoodleable()` 的条件只有两个：`grey.allowNoodle` 为真，且字面量恰好一条。满足就构造 `HWLM_ENGINE_NOOD` 原型；否则一律走 `fdrBuildProto(HWLM_ENGINE_FDR, ...)`。注意这里传入的类型是 FDR，但 `fdrBuildProtoInternal()` 会先尝试 Teddy：只要 `grey.fdrAllowTeddy` 为真且 `teddyBuildProtoHinted()` 返回非空，原型里装的就是 `teddyEng`；Teddy 构建失败才回退到 `chooseEngine()` 选出的 FDR 描述。这条「Teddy 优先、FDR 兜底」的顺序是编译期行为，用户无法直接指定，只能通过字面量长度分布间接影响。
+
+第三步是布局。`hwlmBuild()` 按 `proto.engType` 分两路：Noodle 走 `noodBuildTable(lits.front())`，返回一个固定大小的 `noodTable`；其余走 `fdrBuildTable(proto, grey)`，内部再根据 `proto.teddyEng` 是否为空决定 `teddyBuildTable()` 还是 `FDRCompiler::build()`。拿到引擎体后先检查 `engSize > grey.limitLiteralMatcherSize`，超限同样抛 `ResourceLimitError`；然后一次性分配 `ROUNDUP_CL(sizeof(HWLM)) + engSize` 字节、64 字节对齐、全零初始化的块，写入 `type`，把引擎体 `memcpy` 到头部之后。整个 HWLM 从这一刻起就是不可变的只读字节码。
+
+运行期的块模式链路见图 07-06-01 之后的图 07-06-02。`hwlmExec()` 先看 `groups`，为 0 立即返回 `HWLM_SUCCESS`——这是一个纯粹的快速路径，连缓冲区都不碰。Noodle 直接 `noodExec()`；FDR 分支先选加速器：若 `(groups & ~t->accel1_groups) == 0`，说明当前关心的组都在「高质量加速器」覆盖范围内，用 `accel1`，否则用 `accel0`。随后 `do_accel_block()` 在剩余长度不足 16 字节时直接放弃加速，否则调用 `run_hwlm_accel()` 按 `accel_type` 分派到 `vermicelliExec`、`vermicelliDoubleExec`、`shuftiExec` 或 `truffleExec`，再把返回指针按 `aux->generic.offset` 回退若干字节（因为加速器命中的位置可能位于真正候选之后），最后交给 `fdrExec()`。
+
+流式链路多一层历史处理。`hwlmExecStreaming()` 从 `scratch->core_info` 取 `hbuf`、`hlen`、`buf`，先做同样的组掩码短路，然后 Noodle 分两种情况：`start` 非零时直接用 `noodExec()` 从该偏移扫主缓冲区，`start` 为零时才用 `noodExecStreaming()` 把历史与主缓冲区拼起来看。FDR 分支调 `do_accel_streaming()`，它有三个细节：只有 `*start == 0` 时才扫描历史；历史长度不足 16 字节时直接用 `run_hwlm_accel()`，否则先扫一遍，再判断剩余尾巴是否小于 16 字节；为了处理「双字节加速器需要看下一个字节」的情况，它把尾巴拷进一个 17 字节的栈上临时数组，末字节填 0，并在有主缓冲区时把主缓冲区首字节接上。`inaccurate_accel()` 专门标记 `ACCEL_DVERM` 与 `ACCEL_DVERM_NOCASE`，因为这两个加速器「不总能追到边界」，需要额外补扫。
+
+最后是上报。无论 Noodle 还是 FDR，最终都会调用 `HWLMCallback`，参数是 `end`、`id`、`scratch`。Noodle 的 `final()` 在掩码比较通过后调用 `cbi->cb(pos + n->key_offset - 1, cbi->id, cbi->scratch)`，其中 `pos` 已经减去了 `cbi->offsetAdj`，这是块模式与流式模式共用同一段扫描代码时用来对齐偏移的修正量。回调返回 `HWLM_TERMINATE_MATCHING` 时，`final()` 返回 `HWLM_TERMINATED`，这个值一路上传，最终让 `hs_scan` 返回 `HS_SCAN_TERMINATED`。
+
+构建期的两级结构见图 07-06-01：上半部分是「原型」阶段，做限额、判型、分桶；下半部分是「成品」阶段，按引擎类型生成引擎体，再拼成一个连续块。
+
+:::figure id=07-06-01 | name=HWLM 从字面量列表到只读字节码的两级构建 | dir=TD
+node n1 "Rose 交来的 hwlmLiteral 列表" blue
+node n2 "hwlmBuildProto：限额与去重检查" teal
+node n3 "仅一条字面量且允许 Noodle" amber
+node n4 "fdrBuildProto：Teddy 优先" amber
+node n5 "HWLMProto：引擎类型 + 字面量" purple
+node n6 "noodBuildTable：单表布局" purple
+node n7 "fdrBuildTable / teddyBuildTable" purple
+node n8 "HWLM 头 + 引擎体（64B 对齐）" green
+edge n1 -> n2 "进入编译"
+edge n2 -> n3 "条数为 1"
+edge n2 -> n4 "其余情况"
+edge n3 -> n5 "封装原型"
+edge n4 -> n5 "封装原型"
+edge n5 -> n6 "NOOD 分支"
+edge n5 -> n7 "FDR 分支"
+edge n6 -> n8 "拼接"
+edge n7 -> n8 "拼接"
+:::
+
+运行期的分派见图 07-06-02。图中把「组掩码短路」「加速器选择」「引擎分派」画成三条并列判断，它们的顺序不能交换：先短路最便宜，再选加速器，最后才进主引擎。
+
+:::figure id=07-06-02 | name=HWLM 运行时的组掩码、加速器与引擎分派 | dir=TD
+node n1 "hwlmExec：块模式入口" blue
+node n2 "hwlmExecStreaming：带历史" blue
+node n3 "groups 为 0：直接返回成功" gray
+node n4 "按掩码选 accel1 或 accel0" amber
+node n5 "noodExec / noodExecStreaming" purple
+node n6 "fdrExec / fdrExecStreaming" purple
+node n7 "HWLMCallback 上报 end 与 id" green
+edge n1 -> n3 "空掩码短路"
+edge n1 -> n4 "FDR 分支"
+edge n1 -> n5 "NOOD 分支"
+edge n4 -> n6 "加速后进主表"
+edge n2 -> n5 "Noodle 流式"
+edge n2 -> n6 "FDR 流式"
+edge n5 -> n7 "命中"
+edge n6 -> n7 "命中"
+:::
+
+### 5. 配置/命令/代码实例
+
+HWLM 没有公开的 C API，用户侧的「配置」全部体现为编译标志与模式写法，完整参数见 04-02 与 04-04。下面这段代码展示的是模块内部的典型调用序列：先建原型，再建成品，最后取尺寸。它适合在阅读源码或写单元测试时使用，不适合直接嵌进产品——内部结构没有 ABI 稳定性承诺。
+
+```cpp
+#include "hwlm/hwlm_build.h"
+#include "util/compile_context.h"
+
+using namespace ue2;
+
+bytecode_ptr<HWLM> build_keyword_table(const CompileContext &cc) {
+    std::vector<hwlmLiteral> lits;
+    // 参数顺序：字符串、nocase、noruns、id、groups、msk、cmp
+    lits.emplace_back("GET", true, false, 1, HWLM_ALL_GROUPS,
+                      std::vector<u8>{}, std::vector<u8>{});
+    lits.emplace_back("POST", true, false, 2, HWLM_ALL_GROUPS,
+                      std::vector<u8>{}, std::vector<u8>{});
+
+    auto proto = hwlmBuildProto(lits, false, cc);
+    if (!proto) {
+        return nullptr; // 引擎构建失败，通常意味着字面量集合不可用
+    }
+    auto table = hwlmBuild(*proto, cc);
+    if (!table) {
+        return nullptr;
+    }
+    printf("hwlm bytes = %zu\n", hwlmSize(table.get()));
+    return table;
+}
+```
+
+这段代码有三处值得注意。第一，`hwlmBuildProto()` 的第二个参数是 `make_small`，它会影响 FDR/Teddy 的打分与确认表规模；第三个参数是 `CompileContext`，限额、目标 CPU 特性、Grey 开关都从这里取。第二，`hwlmBuildProto()` 返回空指针表示「无法为这组字面量选出一个引擎」，调用方应当把它当作编译失败向上传播，而不是继续用空原型。第三，`hwlmSize()` 内部按 `h->type` 分别调用 `noodSize()` 或 `fdrSize()`，再加头部的对齐长度；Teddy 也走 `fdrSize()`，因为它的头部与 FDR 兼容。
+
+把上面的表用 `hwlmGenerateDumpFiles()` 转储，会得到一个 `.txt` 文件。下面是与「单条 GET、nocase」相对应的示例输出，具体格式需对照实际版本核验：
+
+```text
+Noodle table
+Key Offset: 2
+Msk: dfdfdf Cmp: 544547 MskLen 3
+String: GET
+accel1_groups: ffffffffffffffff
+```
+
+逐行判读如下。`Noodle table` 说明这个 HWLM 的底层引擎是 Noodle，也就是「只有一条字面量」的情形，与 `isNoodleable()` 的两个条件吻合。`Key Offset: 2` 表示键字节距离字符串末尾两个字节，`noodBuildTable()` 里用 `s.length() - key_offset` 算出这个值；本例字面量长度为 3，粗筛键落在首字节 `G` 上。`Msk: dfdfdf` 是三个字节的掩码，`0xdf` 等于 `0xff` 清掉第 5 位，正是 ASCII 大小写不敏感的掩码；如果这里是 `ffffff`，说明该字面量区分大小写，`nocase` 没有生效。`Cmp: 544547` 按内存序读出来是 `G`、`E`、`T` 三个字节，与 `String: GET` 一致；两者不一致就说明掩码与比较值在构建期被错误改写，属于严重 bug。`MskLen 3` 必须等于字符串长度，否则 `final()` 里的 `partial_load_u64a` 会读错窗口。最后一行 `accel1_groups` 是全 1，表示高质量加速器对所有组都可用；真实输出后面还会跟 `accel1:` 与 `accel0:` 两行，由 `dumpAccelInfo()` 按加速器类型展开，格式随类型变化，需对照实际版本核验。
+
+用户侧真正能控制的只有编译标志。下面三个调用足以覆盖「让一批关键字走 HWLM」的最小场景；`hs_compile_multi` 之后，字面量如何分组、走 Noodle 还是 Teddy 完全由库决定，用户看不到也不能指定。
+
+```c
+hs_database_t *db = NULL;
+hs_scratch_t *scratch = NULL;
+hs_compile_error_t *err = NULL;
+unsigned flags[2] = {HS_FLAG_CASELESS, HS_FLAG_CASELESS};
+unsigned ids[2] = {1, 2};
+
+if (hs_compile_multi(exprs, flags, ids, 2, HS_MODE_BLOCK, NULL, &db, &err)
+    != HS_SUCCESS) {
+    fprintf(stderr, "compile failed: %s\n", err->message);
+    hs_free_compile_error(err);
+    return 1;
+}
+if (hs_alloc_scratch(db, &scratch) != HS_SUCCESS) {
+    hs_free_database(db);
+    return 1;
+}
+hs_scan(db, "GET / HTTP/1.1\r\n", 16, 0, scratch, NULL, NULL);
+```
+
+`HS_FLAG_CASELESS` 对应 `hwlmLiteral::nocase`，最终表现为掩码里的 `0xdf`；`HS_FLAG_SINGLEMATCH` 对应 `noruns`，会让引擎在首次命中后压缩后续连续命中；`HS_FLAG_PREFILTER` 则会放宽部分约束，让更多模式落入字面量前端。这三者的完整语义与互斥关系见 04-02，此处不重复。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**不要调用内部接口**。`hwlmExec()` 与 `hwlmExecStreaming()` 是 Rose 运行时与 HWLM 之间的契约，不是给应用调用的。尤其 `hwlmExecStreaming()` 直接从 `scratch->core_info` 取缓冲区，调用方必须先把 `buf`、`len`、`hbuf`、`hlen` 填好；填错不会报错，只会读到错误内存。产品代码只应使用 `hs_scan` / `hs_scan_stream` 系列。
+
+**长度为 0 不能进 HWLM**。`hwlmExec()` 与 `hwlmExecStreaming()` 都有 `assert(start < len)`，空缓冲区在调试构建下会直接断言。运行时层在调用前会做长度判断，自己写测试时不要跳过这一步。
+
+**`HWLM_ENGINE_FDR` 不等于 FDR**。Teddy 也用这个类型标记，因为二者头部兼容。看到 `type == 12` 就断言「这是 FDR 引擎」会误判；正确做法是查 `engineID` 是否在 FDR 描述表里，或者直接看 dump 文件里的 `TEDDY:` / `FDR:` 标记。
+
+**回调返回 0 是终止，不是「无组」**。这是最容易造成「扫描提前结束、后续全漏」的写法。若想表达「不关心任何组」，应返回一个非零掩码；若确实要停止，返回 0 并准备接收 `HS_SCAN_TERMINATED`。
+
+**不要假设「所有匹配都会上报」**。`noruns` 会压缩连续命中，`included_id` / `squash` 会让被长字面量包含的短字面量走短路，组掩码不活跃时引擎可以不上报。这些行为在 `hwlm.h` 的回调注释与 `hwlm_literal.h` 的字段注释里都写明了。需要「每条模式每次出现都报」时，应关闭 `SINGLEMATCH` 并避免依赖包含关系优化。
+
+**洪泛敏感度无法直接配置**。`hwlmFloodProneSuffixLen()` 的返回值是编译期启发式，用户能做的只有改写模式：避免大量以同一字符长跑结尾的字面量（例如一整组 `.*aaa` 的后缀），或者把长字面量拆成更有区分度的片段。`grey.fdrAllowTeddy` 可以把 Teddy 关掉强制走 FDR，但这是调试手段，不是性能开关。
+
+**长度上限 8 是硬约束**。`hwlmLiteral` 构造器断言 `s.size() <= HWLM_LITERAL_MAX_LEN`，说明交给 HWLM 的只是短片段；更长的字面量由 Rose 的长字面量路径处理（原理见 06-05）。试图把 20 字节的关键字直接塞进 `hwlmLiteral` 会在调试构建里断言，在发布构建里则是未定义行为。具体的切分策略需对照实际版本核验。
+
+**dump 只在 `DUMP_SUPPORT` 下可用**。`hwlm_dump.cpp` 开头就是 `#ifndef DUMP_SUPPORT #error No dump support!`，发布构建默认关闭该选项（见 04-01）。需要看 `Noodle table` 这类输出，必须用带 `-DDUMP_SUPPORT=ON` 的调试构建。
+
+### 7. 小结与延伸阅读
+
+HWLM 是「字面量前端」的统一外壳：编译期把一组短字面量收敛成 Noodle、Teddy 或 FDR 之一，运行期用 `type` 分派、用组掩码过滤、用加速器跳过无关前缀。它的接口极小，但语义上有三个必须记住的约束：只报结束偏移、回调返回 0 即终止、不承诺上报全部匹配。把这三条记住，再去看 Rose 如何消费 HWLM 的上报，整条字面量触发链路就通了。
+
+延伸阅读建议按「原理—字段—参数—相邻模块」的顺序：字面量前端的整体设计与 Teddy/FDR 的取舍见 06-05；`HWLM`、`hwlmLiteral`、`noodTable`、`FDR` 的字段逐项说明见 05-07；`HS_FLAG_CASELESS` / `SINGLEMATCH` / `PREFILTER` 的完整语义见 04-02；FDR 的桶划分与确认表细节见 07-07；NFA 侧如何接住 HWLM 的上报见 07-05。需要强调的是，`src/hwlm/` 在本快照下没有独立的公共头文件导出，任何 `hwlm*` 符号都属于内部 ABI，升级版本时必须重新编译，不能跨版本混用。
+
+## 07-07 fdr 模块
+
+### 1. 背景与动机
+
+当字面量集合从几十条涨到几千条，Teddy 的位并行模型开始吃力：它的掩码位宽有限，桶数最多 16，装载率一高就必须靠 `packed` 变体硬塞，误报率随之上升。FDR 是为更大规模准备的两段式匹配器：第一段用一张按字节索引的表做「位并行粗筛」，把「这个位置可能有某条字面量结束」压缩成 64 位状态里的若干位；第二段只对置位的位置做精确确认。两段式的好处是，第一段的成本与字面量条数基本无关，只与输入长度和表大小有关；第二段只在候选处发生，成本与候选密度成正比。
+
+这个设计决定了 FDR 的调优空间集中在两个量上：`domain`（用多少位输入做表索引）和 `stride`（每隔多少字节查一次表）。`domain` 越大，表越大、区分度越高、误报越少；`stride` 越大，查表次数越少、吞吐越高，但会跳过一些位置，必须靠「状态随字节推进而移位」来补回，短字面量因此更容易漏。`chooseEngine()` 的核心工作就是在「表大小可接受」的前提下，为给定的字面量长度分布挑一组 `domain` / `stride`。
+
+FDR 还承担了 Teddy 的运行时装载体角色。`struct Teddy` 的前六个 `u32` 与 `struct FDR` 完全一致，`fdrExec()` 里有一张 `funcs[]` 分派表，按 `engineID` 选择 `fdr_engine_exec`、`fdr_exec_teddy_msks1..4` 或 AVX2 下的 `fdr_exec_fat_teddy_*`。这意味着「FDR 模块」在源码目录意义上是一个引擎族容器，而不只是单一引擎；阅读时要把 `teddy*.c` 与 `fdr.c` 放在一起看。
+
+最后是洪泛。FDR 的状态是「过去若干字节的候选累积」，一旦输入是同一字符的长跑，几乎每个位置都会置位，确认阶段被反复触发。`FDRFlood` 结构就是为这种情况准备的：它记录「某个字符长跑时最多会产生哪些 id」，以及需要回看多少字节的 `suffix`，让扫描循环能在检测到长跑后走一条廉价路径，而不是逐位确认。
+
+### 2. 核心概念
+
+**domain 与表**。`domain` 是「用输入的低若干位作为表索引」的位数，源码断言它落在 9 到 15 之间。表项不是「命中集合」，而是「反掩码」：默认全 `0xff`，构建期把「这个索引下某个桶的某个位置不可能匹配」的位清掉。运行期把查到的掩码左移、或进状态，状态里为 1 的位表示「该桶在该位置仍有候选」。这种「用 0 表示可能命中」的编码让主循环只需移位与或，不需要分支。
+
+**stride**。`stride` 只能是 1、2、4。它表示主循环每隔多少字节查一次表。取 2 或 4 时，中间字节不查表，状态靠移位推进；这要求字面量足够长，否则候选会在「没查表的位置」上被跳过。`findDesiredStride()` 的策略是：字面量少于 250 条且最短长度大于 1 时，直接用最短长度；250 到 800 条用「最短长度减一」；800 到 5000 条最多用 2；并且对「最短长度等于 4 且这样的字面量超过 2 条」的情况强制降到 2，因为长度为 4 的字面量在 stride 4 下极其脆弱。
+
+**bucket**。每个桶是一组字面量，桶内字面量共享状态中的一段位。桶的划分不是按哈希，而是按「长度」：先按长度排序，再把长度相近、数量合适的一段连续字面量切成一个 chunk，最后用动态规划把 chunk 合并成 `numBuckets` 个桶。打分函数是 `count^1.05 * len^-3`，含义是「桶内条数越多越差、长度越长越好」，指数是源码里的经验值。桶的数量由引擎描述决定，本快照的 `getFdrDescriptions()` 只返回一个描述：`id=0`、`schemeWidth=64`、`numBuckets=8`。
+
+**确认（confirm）**。主表只告诉你「可能有候选」，不告诉你是哪条。确认表以 `FDRConfirm` 为头，后面跟一张 `u32` 的 lit index 映射表和一组 `LitInfo`。`FDRConfirm` 里 `andmsk`、`mult`、`nBits` 组成一个乘法哈希：取候选位置附近的 8 字节，与 `andmsk` 相与、乘 `mult`、右移取高 `nBits` 位，得到哈希桶号；桶里再逐个 `LitInfo` 比较 `v` / `msk`，通过才回调。`LitInfo` 的注释说明它后面可以跟变长字符串前缀，用于超过 8 字节的字面量做补充比较。
+
+**初始状态**。`createInitialState()` 把每个桶「最小长度减一」个位预置为 1，意思是「扫描开始前，这些位置已经在等待候选」。这样 offset 0 附近的短字面量不需要特殊处理，主循环可以从第一个字节就跑统一逻辑。预置位数过多会制造无谓确认，过少会漏掉开头匹配，所以它按桶内最小长度逐个计算。
+
+**zone**。FDR 主循环一次处理 16 字节（`ITER_BYTES`），并且需要向前读 3 字节、向后读若干字节做哈希。为了既不越界又不做逐字节边界判断，`prepareZones()` 把输入切成至多 3 段（`ZONE_MAX`）：起始段、若干整段组成的主段、结束段。边界段会把历史或后续数据拷进一个 64 字节的 `zone::buf`，保证主循环可以无脑读写。
+
+**flood**。`struct FDRFlood` 记录 `allGroups`、`suffix`、`idCount` 以及最多 16 个 `ids` / `groups`。`FDR_FLOOD_MAX_IDS` 是 16，超过这个数的字面量集合不会被洪泛路径处理，而是退回逐位确认。`suffix` 的默认值来自 `getDefaultFloodSuffixLength()`，算法是 `ceil(schemeWidth / numBuckets) + 1`，对本快照的 64 位宽、8 桶就是 9。
+
+### 3. 关键数据结构与源码位置
+
+`src/fdr/` 在本快照下共 28 个文件，比大纲记的 25 个多三个，属于版本差异，需对照实际版本核验。按职责分组见表 07-07-A；阅读顺序建议先看 `fdr_internal.h` 与 `fdr_confirm.h` 建立内存布局，再看 `fdr_compile.cpp` 的桶划分，最后看 `fdr.c` 的主循环。本节只讲布局关系，字段与参数一律按「字段见 05-07 ｜ 参数见 04-07 ｜ 原理见 06-05 ｜ 模块见 07-06」查阅。
+
+| 文件 | 角色 |
+|---|---|
+| `fdr.h` | 运行时入口 `fdrExec`、`fdrExecStreaming`，`FDR_ENGINE_COUNT` |
+| `fdr_internal.h` | `struct FDR`、`FDR_Runtime_Args`、`FDRFlood` |
+| `fdr.c` | zone 准备、主循环、确认与洪泛分派 |
+| `fdr_confirm.h` | `FDRConfirm`、`LitInfo`、哈希函数 |
+| `fdr_confirm_runtime.h` | 确认阶段的内联比较 |
+| `fdr_confirm_compile.cpp` | `setupFullConfs`、`getFDRConfirm` |
+| `fdr_compile.cpp` / `fdr_compile.h` | 桶划分、表生成、整体布局 |
+| `fdr_compile_internal.h` | 编译期类型别名与 `setupFullConfs` 声明 |
+| `fdr_compile_util.cpp` | `maxLen`、`minLenCount`、`absdiff` |
+| `fdr_engine_description.cpp` / `.h` | `chooseEngine`、`findDesiredStride` |
+| `engine_description.cpp` / `.h` | 引擎描述基类与目标校验 |
+| `fdr_loadval.h` | 主循环的掩码装载原语 |
+| `flood_compile.cpp` | `setupFDRFloodControl` |
+| `flood_runtime.h` | `floodDetect` 与洪泛状态 |
+| `teddy.h` / `teddy.c` / `teddy_avx2.c` | Teddy 与 Fat Teddy 的扫描实现 |
+| `teddy_compile.cpp` / `teddy_compile.h` | Teddy 表构建与桶分配 |
+| `teddy_engine_description.cpp` / `.h` | Teddy 引擎选择与打分 |
+| `teddy_internal.h` | 与 FDR 兼容的 `struct Teddy` 头 |
+| `teddy_runtime_common.h` | Teddy 运行时共用的掩码原语 |
+| `fdr_dump.cpp` / `fdr_dump.h` | `fdrPrintStats`、Teddy/FDR 文本转储 |
+
+`struct FDR` 在 `src/fdr/fdr_internal.h:69`，字段的完整语义见 05-07。这里只点出三个与运行期性能直接相关的：`stride` 决定主循环步长；`domain` / `domainMask` 决定表索引宽度；`start` 是 128 位的初始状态，`createInitialState()` 按桶最小长度预置。`confOffset` 与 `floodOffset` 是相对 FDR 基址的字节偏移，`setupFDR()` 按「头部 → 表 → 确认 → 洪泛」的顺序布局，每一段都 `ROUNDUP_CL` 到缓存行，最后一段不补齐。
+
+`FDR_Runtime_Args` 在 `fdr_internal.h:93`，是运行期只读参数的打包：`buf`、`len`、`buf_history`、`len_history`、`start_offset`、`cb`、`scratch`、`firstFloodDetect`、`histBytes`。它按值传进 `fdr_engine_exec()`，之后以指针形式传给确认与洪泛子函数，避免在每个子调用里重复解引用 `scratch`。`struct zone` 在 `fdr.c:59`，包含一个 64 字节的 `buf`、`start` / `end` 指针、`shift`、`floodPtr` 与 `zone_pointer_adjust`；`zone_pointer_adjust` 用来把「拷贝缓冲区里的指针」换算回原缓冲区偏移。
+
+确认侧的两个结构都在 `src/fdr/fdr_confirm.h`：`FDRConfirm` 在 `:78`，四个字段 `andmsk`、`mult`、`nBits`、`groups`；`LitInfo` 在 `:57`，字段 `v`、`msk`、`groups`、`id`、`size`、`flags`、`next`。`getConfirmLitIndex()` 在 `:86`，它按 `ROUNDUP_N(sizeof(*fdrc), alignof(u32))` 跳过头部取 lit index 数组，这个「头部之后紧跟变长数据」的布局与 `FDR` 本身的手法一致。
+
+`FDRFlood` 在 `fdr_internal.h:50`，`allGroups` 是所有组掩码的并集，`suffix` 是需要回看的字节数，`idCount` 与 `ids[]` / `groups[]` 描述「这个字符长跑时会产生哪些上报」。`FDR_FLOOD_MAX_IDS` 为 16，超过就放弃洪泛优化。运行期的洪泛检测在 `flood_runtime.h` 的 `floodDetect()`，它由主循环每隔一段距离调用一次，返回新的 `tryFloodDetect` 指针，并通过 `floodBackoff` 控制检测频率。
+
+### 4. 关键流程与调用链
+
+编译期从 `fdrBuildProtoInternal()` 开始。它先尝试 Teddy（若 `grey.fdrAllowTeddy`），失败后调用 `chooseEngine(target, lits, make_small)`。`chooseEngine()` 枚举 `domain` 9 到 15、`stride` 1/2/4（`domain > 13` 时只允许 stride 1），对每组参数用「表大小 + 桶装载 + 最短长度」算一个启发式分数，选最优的一组写回 `FDREngineDescription::bits` 与 `stride`。随后 `assignStringsToBuckets()` 做真正的分桶：先按「长度升序、同长度按反转字符串字典序」稳定排序，保证相同后缀的字面量聚在一起；再用 `assignChunks()` 按长度切块，块总数上限 512（`CHUNK_MAX`），单块条数由 `maxPerChunk` 控制，且「只在大小写不敏感属性不同」的等价字面量不会被拆开；最后用二维动态规划把块合并成 8 个桶，代价函数就是前面说的 `count^1.05 * len^-3`。分桶完成后 `addIncludedInfo()` 计算「短字面量被长字面量包含」的关系，写入 `included_id` 与 `squash`。
+
+接下来是 `FDRCompiler::build()`，它只做两件事：`setupTab()` 与 `setupFDR()`。`setupTab()` 先把整张表填成 `0xff`，然后对每个桶、每个「后缀位置」计算该位置可能出现的字节组合：`getMultiEntriesAtPosition()` 取出该位置上所有字面量的字节，把「不关心」的位收集进 `dontCares`，再把所有具体值收集进集合；随后枚举 `dontCares` 的所有自由组合，把对应表项里的那一桶位清 0。换句话说，**表项里为 0 的位表示「这个输入可能让该桶在该位置命中」**。这个「反掩码」约定是读懂 `FDR_MAIN_LOOP` 的关键。
+
+`setupFDR()` 先调 `setupFDRFloodControl()` 与 `setupFullConfs()` 生成两张子表，再算总大小：头部、表、确认、洪泛四段各自 `ROUNDUP_CL`，最后一段不补。分配后依次写头部（`engineID`、`maxStringLen`、`numStrings`、`domain`、`domainMask`、`tabSize`、`stride`）、调 `createInitialState()`、拷贝表、写 `confOffset` 与确认表、写 `floodOffset` 与洪泛表。整个布局是「一次分配、内部指针用偏移表达」，因此可以原样序列化。
+
+运行期从 `fdrExec()` 进入。它把参数打包成 `FDR_Runtime_Args`，然后按 `fdr->engineID` 查 `funcs[]`：0 是通用 `fdr_engine_exec`，3 到 10 是 AVX2 的 Fat Teddy 变体，11 到 18 是普通 Teddy 的 1 到 4 掩码变体（带不带 `_pck` 后缀表示 packed）。若查不到或该目标不支持，返回 `HWLM_ERROR_UNKNOWN`。`fdr_engine_exec()` 先 `prepareZones()` 切段、`getInitState()` 取初始状态，然后逐段执行：按 `z->shift` 把状态左移、或上 `zone_or_mask[shift]`（把「重扫区域」的位屏蔽掉），再按 `stride` 选 `FDR_MAIN_LOOP` 的三个变体之一。
+
+主循环每 16 字节做一次：先检查是否到了洪泛检测点，是就调 `floodDetect()`；然后 `get_conf_stride_k()` 用 4 个（stride 1）或更少的表项拼出 128 位状态，取出低 64 位与高 64 位两个候选字；分别 `do_confirm_fdr()`。`do_confirm_fdr()` 对每个置位的桶计算哈希、取 `FDRConfirm`、遍历 `LitInfo` 比较 `v` / `msk`，命中就回调；对带 `FDR_LIT_FLAG_NOREPEAT` 标记（来自字面量的 `noruns`）的条目，`last_match_id` 会抑制同一 `id` 的连续命中，避免重复上报。回调返回终止时，`control` 变为 `HWLM_TERMINATE_MATCHING`，主循环立刻返回 `HWLM_TERMINATED`。
+
+流式入口 `fdrExecStreaming()` 与块模式的差别只在参数准备：它把 `hbuf` / `hlen` 放进 `FDR_Runtime_Args`，把 `start_offset` 设为 `start`，并令 `firstFloodDetect` 指向历史与主缓冲区的交界。zone 准备阶段会把历史尾部拼进起始段，保证跨块的字面量能完整比较；确认阶段读到「历史里的字节」时，通过 `zone_pointer_adjust` 把偏移折回主缓冲区坐标系。这也是 FDR 流式状态只保存固定的状态向量、而不是整段历史的原因：它只需要记住「哪些桶的候选还没闭合」，不需要保存历史字节本身（具体状态字节数需对照实际版本核验）。
+
+桶划分与确认链路见图 07-07-01。图中左侧是「按长度聚簇」，右侧是「主表给候选、确认表定 id」，中间的 `included` 虚线表示短字面量可以被长字面量短路，从而跳过确认。
+
+:::figure id=07-07-01 | name=FDR 的桶划分、主表与确认表三段结构 | dir=LR
+node n1 "hwlmLiteral 按长度排序" blue
+node n2 "assignChunks：按长度切块" teal
+node n3 "动态规划分配到 8 个 bucket" teal
+node n4 "bucket 0：最长字面量" amber
+node n5 "bucket 7：最短字面量" amber
+node n6 "主表：domain 位反掩码" purple
+node n7 "FDRConfirm + LitInfo 确认链" purple
+node n8 "FDRFlood：洪泛控制" gray
+edge n1 -> n2 "稳定排序"
+edge n2 -> n3 "合并打分"
+edge n3 -> n4 "长字面量优先"
+edge n3 -> n5 "短字面量兜底"
+edge n4 -> n6 "写入桶位"
+edge n5 -> n6 "写入桶位"
+edge n6 -> n7 "候选确认"
+edge n7 -> n8 "长跑退化"
+edge n4 -> n7 dashed "included 短路"
+:::
+
+扫描主循环的 zone 切分与状态推进见图 07-07-02。图中「重扫区屏蔽」是保证「同一位置不重复上报」的关键步骤，去掉它会出现重复命中。
+
+:::figure id=07-07-02 | name=FDR 主循环的 zone 切分与状态推进 | dir=TD
+node n1 "prepareZones：切成至多 3 段" blue
+node n2 "getInitState：按桶最小长度" teal
+node n3 "variable_byte_shift 对齐状态" teal
+node n4 "FDR_MAIN_LOOP：每次 16 字节" purple
+node n5 "get_conf_stride_k 取候选位" purple
+node n6 "do_confirm_fdr 哈希查表" amber
+node n7 "floodDetect：长跑退化处理" gray
+edge n1 -> n2 "起始段"
+edge n2 -> n3 "进入 zone"
+edge n3 -> n4 "屏蔽重扫位"
+edge n4 -> n5 "查表并移位"
+edge n5 -> n6 "逐桶确认"
+edge n6 -> n7 "候选过密"
+edge n7 -> n4 dashed "回退后继续"
+:::
+
+### 5. 配置/命令/代码实例
+
+FDR 没有用户可调的开关，`domain` / `stride` / 桶数全部由编译期根据字面量集合决定。要观察它选了哪组参数，最直接的办法是用 `hsdump` 生成转储，再读 `fdr.txt` / `teddy.txt`。下面这条命令在调试构建（`DUMP_SUPPORT=ON`）下使用；若该版本要求 `-s` 指定签名文件，需要补上，具体参数见 04-07。
+
+```bash
+hsdump -e patterns.txt -N -o dump
+cat dump/fdr.txt
+```
+
+对应的示例输出如下，具体格式需对照实际版本核验：
+
+```text
+FDR:           0
+    domain     13
+    stride     1
+    strings    512
+    size       53248 bytes
+    max length 8
+    floodoff   49152 (c000)
+    confirm 0
+      andmsk  0xffffffffffffffff
+      mult    0x9e3779b97f4a7c15
+      nbits   7
+      groups  0x0000000000000001
+      load    96/128 (75.00%)
+```
+
+逐行判读。`FDR: 0` 是 `engineID`，0 对应 `funcs[]` 里的通用 `fdr_engine_exec`；如果是 11 到 18，说明这个「FDR 模块」实际装的是 Teddy，后续字段含义会换成 `masks` / `buckets` / `packed`。`domain 13` 表示表索引用 13 位，表项数 8192，每项 8 字节，所以表大小是 64 KB 量级；`size 53248 bytes` 是头部、表、确认、洪泛四段对齐后的总和，可以据此估算数据库体积。`stride 1` 表示逐字节查表，是最保守也最不容易漏的设置；如果这里是 2 或 4，说明最短字面量足够长，编译期选择了跳字节，短模式集的召回要特别验证。`strings 512` 与 `max length 8` 一起说明这组字面量的规模与长度上界；`max length` 超过 8 时，确认阶段的 `LitInfo` 尾部会带变长前缀，确认成本上升。`floodoff 49152` 是洪泛表的起始偏移，落在 `size` 之内说明布局合法；若它大于 `size`，数据库已经损坏，加载阶段应当被 `validDatabase()` 拦住。`load 96/128 (75.00%)` 是确认表哈希桶的装载率，75% 属于正常范围；接近 100% 意味着哈希冲突严重，编译期应当增加 `nBits` 或减少桶内字面量，否则运行期会出现大量「哈希命中但 `LitInfo` 比较失败」的空转。
+
+如果要在代码里检查编译期的选择，可以调用内部 API。下面的片段展示从字面量到 `FDR` 结构的最小路径；它同样只适合调试与单元测试。
+
+```cpp
+#include "fdr/fdr_compile.h"
+#include "fdr/fdr_engine_description.h"
+
+using namespace ue2;
+
+bytecode_ptr<FDR> build_fdr(std::vector<hwlmLiteral> lits,
+                            const CompileContext &cc) {
+    auto desc = chooseEngine(cc.target_info, lits, false);
+    if (!desc) {
+        return nullptr;
+    }
+    u32 domain = desc->bits;
+    u32 stride = desc->stride;
+    auto buckets = assignStringsToBuckets(lits, *desc);
+    HWLMProto proto(HWLM_ENGINE_FDR, std::move(desc), lits, buckets, false);
+    auto fdr = fdrBuildTable(proto, cc.grey);
+    if (fdr) {
+        printf("domain=%u stride=%u size=%u\n", domain, stride, fdr->size);
+    }
+    return fdr;
+}
+```
+
+这段代码的关键点在顺序：`assignStringsToBuckets()` 会就地重排 `lits`，所以必须在把 `lits` 拷进 `HWLMProto` 之前调用；`std::move(desc)` 之后不能再解引用 `desc`，因此 `domain` / `stride` 要提前取出来；`fdrBuildTable()` 内部会再判一次 `proto.teddyEng`，如果 Teddy 构建成功，返回的其实是 Teddy 表，`fdr->engineID` 不会是 0。这三处顺序错误在调试时都不会崩溃，只会得到「参数看起来对、dump 出来却是另一个引擎」的困惑。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**不要用 `type` 判断引擎**。`HWLM_ENGINE_FDR` 是「非 Noodle」的统称，Teddy 也用它。正确判断方式是 `getFdrDescription(fdr->engineID)` 是否为空，或者直接读 dump 里的 `TEDDY:` / `FDR:` 标题。
+
+**`domain` 不是越大越好**。每增加一位，表项数翻倍，`tabSize` 翻倍，编译期内存与缓存压力同步上升。`chooseEngine()` 在 `domain > 13` 时强制 `stride = 1`，就是因为大表已经不适合再跳字节。手工调参时若把 `domain` 推到 15，表会到 256 KB 量级，L2 缓存开始吃紧，吞吐可能反而下降。
+
+**`stride > 1` 对短字面量不友好**。主循环跳过的字节只靠状态移位补偿，长度小于 `stride` 的字面量可能整段落在「没查表」的区间。`findDesiredStride()` 对「最短长度为 4 且数量超过 2」的情况强制降到 2，就是这个原因。混合长短字面量时，最短的那几条决定了 stride 的上限。
+
+**确认表装载率要留余量**。`load` 接近 100% 时，哈希冲突会让大量候选进入 `LitInfo` 链表逐条比较，表现为「主表很快、确认很慢」。这不是运行期能修的，只能回到编译期调整字面量分组或改模式写法。
+
+**洪泛是吞吐悬崖，不是正确性问题**。`floodDetect()` 只在候选过密时切换路径，匹配结果不变。看到某段输入吞吐掉一个数量级，先看是不是「同一字符长跑 + 大量同后缀字面量」；`FDR_FLOOD_MAX_IDS` 为 16，超过这个数的集合根本不会走洪泛优化，退化会更明显。
+
+**zone 的边界读是设计的一部分**。`prepareZones()` 允许主循环在 zone 末尾多读 3 字节（`domain > 8` 时哈希需要），边界段用拷贝缓冲区兜住。自己改主循环或复用 `fdr.c` 的代码时，必须保留这个前提；否则会读到缓冲区之外，表现为偶发崩溃或错误命中。
+
+**流式历史长度必须够**。`fdrExecStreaming()` 依赖 `buf_history` 与 `len_history` 把跨块字面量拼完整；历史长度由 Rose 的 `historyRequired` 决定。手工调用时若把 `hlen` 传 0，跨块匹配会静默丢失，而且不会返回错误。
+
+**数据库跨版本不可复用**。`engineID` 的取值范围受 `FDR_ENGINE_COUNT`（19）约束，序列化数据库里存的是这个 ID；不同版本的引擎编号可能变化，`HS_DB_VERSION_ERROR` 就是为此准备的。分发数据库时必须保证编译端与运行端版本一致（见 03-03）。
+
+### 7. 小结与延伸阅读
+
+FDR 的核心是「反掩码主表 + 哈希确认表」两段式：主表用 `domain` 位输入索引、用 64 位状态累积候选，成本与字面量条数弱相关；确认表只在候选处做精确比较，成本与候选密度成正比。`stride` 是吞吐与召回的折中，`bucket` 是按长度聚簇的结果，`flood` 是长跑输入的逃生通道。把这三件事分开理解，就不会把「stride 变大后短模式漏报」误判成库的 bug。
+
+延伸阅读：桶划分与确认表的内存布局见 05-07；Teddy 与 FDR 的取舍、以及 5.4.0 对 Fat Teddy 的 VBMI 优化见 06-05；`HS_MODE_*` 与数据库平台校验见 04-03 与 06-12；HWLM 如何把字面量交给 FDR 见 07-06；NFA 侧如何消费 FDR 的上报见 07-05。需要提醒的是，本快照 `src/fdr/` 的文件数与大纲记的 25 个不一致，`vermicelli.c` 一类「按印象存在」的文件也未必真的存在，写代码前一律以 `upstream_src/` 为准。
+
+## 07-08 smallwrite 与字符类加速模块
+
+### 1. 背景与动机
+
+这一篇要先把一个流传很广的误解纠正掉：`smallwrite` 不是「小写化」（lowercase / case folding），而是「small write」——直译「小块写入」，指的是「一次性写入的一小段数据」，也就是短缓冲区。`src/smallwrite/smallwrite_internal.h:36` 的注释写得很清楚：`largestBuffer` 是「largest buffer that can be considered small write」；`src/runtime.c:414` 的注释是「Is this a small write case?」，判断条件就是 `length < smwr->largestBuffer`。模块里没有任何大小写转换表，也没有「把输入统一转小写再比」的逻辑。把 smallwrite 讲成小写化，会连带把整条短包优化路径解释错。
+
+真实的动机是这样的：网络设备上大量数据包只有几十字节，DNS 查询、TCP 握手、HTTP 首行都在这个量级。对这么大的块，走完整的 Rose 流水线（字面量前端 + NFA + anchored 表 + 各种边界处理）固定开销太高，而短块又有一个天然优势——所有匹配都必须落在这一小段里，可以用一台很小的 DFA 一次判定完。`smallwrite` 就是这台「专门服务短块的外缀（outfix）DFA」：它在编译期把能覆盖短块的模式确定化、合并、裁剪，运行时只要块长小于阈值，就整块交给它，跑完直接结束，不再进 Rose 主体。
+
+第二块内容是字符类加速。正则里的 `[0-9A-F]`、`\w`、`[^,]` 这类字符类，在编译期被表示为 `CharReach`——一个 256 位的位图。运行期如果逐字节判断「这个字节在不在集合里」，成本与扫描长度成正比；`shufti`、`truffle`、`vermicelli` 的做法是用 SIMD 一次看 16 或 32 字节，直接把「第一个属于该字符类的位置」找出来，让主引擎从那里开始尝试。这三者不是「匹配器」，而是「跳跃器」：它们只负责跳过不可能匹配的前缀，返回一个候选指针，真正的匹配仍由 NFA 或字面量引擎完成。
+
+第三块是大小写的真实归属。本快照的 `src/util/` 下没有 `caseless.cpp`，大小写处理分散在三处：`hwlmLiteral` 构造器里的 `upperString(s)`（字面量统一转大写，再用 `0xdf` 掩码做不敏感比较）、`CharReach::make_caseless()`（把字符类扩成大小写闭包）、以及各处直接使用 `CASE_CLEAR`（`0xdf`）清第 5 位。`CharReach::isBit5Insensitive()` 专门判断「这个集合是否对第 5 位不敏感」，也就是「每个字符异或 `0x20` 之后仍在集合里」。这套做法只对 ASCII 字母成立，UTF-8 / UCP 下不能等价替换，这是阅读相关代码时必须记住的边界。
+
+### 2. 核心概念
+
+**SmallWriteEngine**。运行时结构只有三个字段：`largestBuffer`（可用该引擎的最大块长）、`start_offset`（从块内哪个偏移开始扫）、`size`（含内嵌 NFA 的总字节数）。内嵌的 NFA 紧跟在结构体之后，`getSmwrNfa()` 用 `(const char *)smwr + sizeof(*smwr)` 取得，并断言缓存行对齐。它没有独立的 scratch、没有队列，`prepEngine()` 里明确把 `nfa->queueIndex` 设为 0，注释是「dummy, small write API does not use queue」。
+
+**outfix 语义**。`raw_dfa` 的构造参数是 `NFA_OUTFIX`，`start_anchored` 与 `start_floating` 指向同一个根状态。这意味着它不区分「锚定」与「浮动」：任何位置都可以是起点，只要在块内完成匹配即可。也正因为「不区分起点」，它天然不支持 SOM——`add(const NGHolder &, const ExpressionInfo &)` 里第一件事就是检查 `expr.som`，为真则把整个 builder 标记为 `poisoned`，后续任何模式都不再尝试构建。同一个 `poisoned` 标记还覆盖「空匹配图（vacuous）」与「带 `min_length` 扩展参数」两种情况，因为这两者都需要超出「短块内一次判定」的表达能力。
+
+**LitTrie 与 AC 自动机**。字面量走另一条路：先插进两棵 Trie，一棵区分大小写、一棵不区分（`literal.any_nocase()` 决定去哪棵）。Trie 的每个节点记录「到达该节点时应该上报哪些 ReportID」。构建时 `buildAutomaton()` 计算失败链，`buildDfa()` 按 BFS 序给状态编号，把失败链写成 `daddy` 状态，再补齐字母表映射——这就是标准的 Aho-Corasick 自动机。`MAX_TRIE_VERTICES` 是 8000，超过就放弃继续插入；`mergeDfas()` 的 `DFA_MERGE_MAX_STATES` 也是 8000，合并后状态数超限就整体放弃。
+
+**largestBuffer 与 bad 阈值**。`Grey` 里 `smallWriteLargestBuffer` 默认 70，`smallWriteLargestBufferBad` 默认 35。前者是「正常情况下的短块上限」，后者是「Rose 质量不高时的保守上限」。`prepEngine()` 先按 `is_slow()` 判断这台 DFA 在热路径上是否够快；如果不够快，就把可用块长压到 `smallWriteLargestBufferBad`，并调用 `clear_deeper_reports()` 把超过该深度的上报清掉，再重新确定化。这是一次「用召回换速度」的裁剪，只影响短块路径，长块仍然走 Rose。
+
+**字符类加速三件套**。`shufti` 用 SSSE3 的 `pshufb` 做「双 nibble 查表」：低 4 位查一张 16 字节表，高 4 位查另一张，两张结果相与，非零表示命中；它适合「若干个不连续区间」的字符类。`truffle` 是通用化的版本，用两张 16 字节表分别处理「高位清零」与「高位置位」两种情形，能表达任意 256 位集合，代价是每条向量多做一次比较。`vermicelli` 只处理单字节或双字节，用广播比较 + 位掩码找第一个相等的位置，是最轻量的一种；`nocase` 版本先对输入清第 5 位再比。
+
+**AccelAux 与 offset**。三种加速器在 `union AccelAux` 里各有自己的字段：`verm.c`、`dverm.c1/c2`、`shufti.lo/hi`、`truffle.mask1/mask2`，公共前缀是 `accel_type` 与 `offset`。`offset` 的含义是「加速器命中的位置可能比真正候选晚若干字节」，所以调用方拿到返回指针后要回退 `offset`，并夹到缓冲区起点。`ACCEL_MIN_LEN` 是 16：短于这个长度就不加速，因为固定开销划不来。
+
+**CharReach 的构造与判定**。`CharReach` 内部是一个 `bitfield<256>`，提供 `set`、`setRange`、`flip`、`count`、`find_first` / `find_next` 等操作；`dot()` 是全 0 到 255。`make_caseless()` 遍历 `A` 到 `Z`，只要集合里出现大写或小写之一，就把两者都置位。`make_and_cmp_mask()` 是给「用一条 and/cmp 指令近似判断字符类」用的：它对集合内所有字节求「按位与的公共 1」与「按位或的公共 1」，得到 `and_mask = ~(lo ^ hi)`、`cmp_mask = lo`。这个近似会放过一些不属于集合的字节（注释明确写了「characters not in cr may also pass」），所以调用方必须再做一次精确确认。
+
+### 3. 关键数据结构与源码位置
+
+`src/smallwrite/` 只有 5 个文件，规模不大，但每一层都对应一个明确的编译阶段，见表 07-08-A。字符类与加速器的实现不在这个目录里，而在 `src/util/charreach.*` 与 `src/nfa/{shufti,truffle,vermicelli*}`，表中一并列出，便于按调用关系跳转。本节不展开字段与参数，统一按「字段见 05-01 ｜ 参数见 04-07 ｜ 原理见 06-09 ｜ 模块见 07-13」交叉查阅。
+
+| 文件 | 角色 |
+|---|---|
+| `smallwrite_internal.h` | `SmallWriteEngine`、`getSmwrNfa` |
+| `smallwrite_build.h` | `SmallWriteBuild` 抽象接口与工厂 |
+| `smallwrite_build.cpp` | Trie、DFA 构建、合并、裁剪、引擎准备 |
+| `smallwrite_dump.cpp` | `smwrDumpText` 文本转储 |
+| `smallwrite_dump.h` | 转储入口声明 |
+| `util/charreach.h` | `CharReach` 位图类与集合运算 |
+| `util/charreach.cpp` | `make_caseless`、`make_and_cmp_mask`、`fill_bitvector` |
+| `util/charreach_util.h` | 上述自由函数的声明 |
+| `nfa/shufti.c` / `shufti.h` | 双 nibble 字符类加速 |
+| `nfa/truffle.c` / `truffle.h` | 通用字符类加速 |
+| `nfa/vermicelli.h` | 单/双字节加速（实现为头文件内联） |
+| `nfa/vermicelli_sse.h` | SSE 版本的向量原语 |
+| `nfa/vermicelli_run.h` | 重复前缀的辅助扫描 |
+
+这里有一处必须按实际版本核验的事实：任务清单里提到的 `src/nfa/vermicelli.c` 在本快照中并不存在，只有 `vermicelli.h`、`vermicelli_sse.h`、`vermicelli_run.h` 三个头文件，`vermicelliExec` 等函数是 `static really_inline` 定义在头文件里的。同样，`src/util/caseless.cpp` 也不存在。写文件清单时照抄「印象中的文件名」很容易出错，一律以 `upstream_src/` 下的实际目录为准。
+
+`SmallWriteEngine` 在 `src/smallwrite/smallwrite_internal.h:35`，三个字段的语义见上节；它属于引擎内部布局，05 册没有单列字段表，阅读时以 05-01 的分层索引定位即可。`SmallWriteBuild` 在 `smallwrite_build.h:60`，四个纯虚函数就是全部契约：`build(roseQuality)`、两个 `add()` 重载、`all_reports()`。真正的实现类 `SmallWriteBuildImpl` 在 `smallwrite_build.cpp:126`，成员包括 `dfas`（未合并的 `raw_dfa` 列表）、`lit_trie` / `lit_trie_nocase`、`poisoned`、`num_literals`。
+
+构建侧的三个关键函数都在 `smallwrite_build.cpp`：`add(const NGHolder &, const ExpressionInfo &)` 在 `:261`，负责「图模式」的确定化；`add(const ue2_literal &, ReportID)` 在 `:354`，负责「字面量」入 Trie；`build(u32 roseQuality)` 在 `:868`，负责合并、裁剪、生成最终引擎。辅助函数里，`add_to_trie()` 在 `:330`，`mergeDfas()` 在 `:231` 附近，`buildDfa()` 在 `:673`，`prepEngine()` 在 `:811`，`getDfa()` 在 `:785`。`getDfa()` 的引擎选择顺序是 `shengCompile` → `sheng32Compile` → `sheng64Compile` → `mcclellanCompile`，前三个受 `grey.allowSmallWriteSheng` 控制，本快照该开关默认 `false`（`grey.cpp:135`），所以实际走的是 McClellan。
+
+Rose 侧的落库入口在 `src/rose/rose_build_bytecode.cpp:3489` 的 `addSmallWriteEngine()`。它先判断 `roseIsPureLiteral()`，纯字面量数据库不添加（因为纯字面量路径已经足够快）；然后 `build.smwr.build(qual)`，成功就把引擎体追加到 `RoseEngine` 之后，写入 `smallWriteOffset`，并更新 `size`。运行时通过 `src/rose/rose_internal.h:720` 的 `getSmallWrite()` 取指针，该函数带越界检查：`smallWriteOffset >= t->size` 时断言并返回 `NULL`。
+
+字符类侧，`CharReach` 在 `src/util/charreach.h:44`，`make_caseless()` 在 `charreach.cpp:111`，`make_and_cmp_mask()` 在 `:136`，`fill_bitvector()` 在 `:128`。`shuftiExec()` 在 `src/nfa/shufti.c:150`（SSE）与 `:446`（AVX2）等处有多个编译变体，`rshuftiExec()` 是反向版本，`shuftiDoubleExec()` 同时处理两个字符类。`truffleExec()` 在 `truffle.c`，`vermicelliExec()` / `vermicelliDoubleExec()` 在 `vermicelli.h`。
+
+### 4. 关键流程与调用链
+
+编译期从 `NGBuilder` 的构造开始。`src/nfagraph/ng.cpp:88` 在初始化列表里创建 `smwr(makeSmallWriteBuilder(num_patterns, rm, cc))`，随后把它交给 `RoseBuildImpl` 共享。之后每加入一条模式，`NGBuilder` 会在 `:437` 调 `smwr->add(g, expr)`（图模式）、在 `:621` 调 `smwr->add(literal, id)`（纯字面量），两条路并行喂给同一个 builder。
+
+图模式这一路先做「毒化检查」：`expr.som` 为真、图为 vacuous、任一上报的 `minLength > 0`，三者任一命中就把 `poisoned` 置真并直接返回。这个设计是「全有或全无」：只要有一条模式不适合短块引擎，整个 smallwrite 就不构建，而不是部分构建后漏报。通过检查后 `cloneHolder()` 复制图、`pruneOverlong()` 按 `smallWriteLargestBuffer` 深度裁掉够不到的路径、`reduceGraph()` 化简，再 `buildMcClellan()` 确定化。若本次 DFA 让「累计待合并数」达到 `smallWriteMergeBatchSize`（默认 20），立即调 `mergeDfas()` 合并；合并失败就清空 `dfas` 并毒化。
+
+字面量这一路更简单：长度超过 `smallWriteLargestBuffer` 的直接跳过（不算毒化，只是这条不参与），累计条数超过 `smallWriteMaxLiterals` 才毒化；然后按 `any_nocase()` 选 Trie 插入，Trie 节点超过 8000 也毒化。注意「跳过」与「毒化」的区别：前者只影响这一条模式的短块优化，后者会让整个引擎不生成。
+
+`build()` 先处理「什么都没有」与「已毒化」两种早退，再根据 `roseQuality` 决定是否进一步裁剪 Trie。之后把两棵 Trie 分别 `buildDfa()` 成 `raw_dfa`，与图模式产生的 DFA 一起合并；`prepEngine()` 对合并结果做三件事：`remove_leading_dots()` 算出 `start_offset`（前导「任意字符」可以直接跳过）、`getDfa()` 选 DFA 实现、`is_slow()` 判断是否需要压到 `smallWriteLargestBufferBad`。最后检查 `nfa->length` 是否超过 `limitSmallWriteOutfixSize` 与 `limitDFASize`，超限是「软失败」——返回空，不毒化，Rose 照常工作。
+
+运行期只有一处判断，在 `src/runtime.c:414`：`if (rose->smallWriteOffset)` 且 `length < smwr->largestBuffer`，就 `runSmallWriteEngine(smwr, scratch)` 然后 `goto done_scan`。这里有三个细节：比较是严格小于，70 字节的块不会走短块引擎；跑完直接结束，不再执行 `rawBlockExec` / `pureLiteralBlockExec` / `soleOutfixBlockExec`；`start_offset` 会在引擎内部作为扫描起点，所以前导可跳过字节不会被重复处理。流式模式没有这条路径——`smallwrite` 只服务块模式，流式块再短也走 Rose。
+
+字符类加速的调用发生在更下层。以 HWLM 为例，`src/hwlm/hwlm.c:47` 的 `run_hwlm_accel()` 按 `aux->accel_type` 分派：`ACCEL_VERM` / `ACCEL_VERM_NOCASE` 调 `vermicelliExec`，`ACCEL_DVERM` / `ACCEL_DVERM_NOCASE` 调 `vermicelliDoubleExec`，`ACCEL_SHUFTI` 调 `shuftiExec`，`ACCEL_TRUFFLE` 调 `truffleExec`，`ACCEL_NONE` 原样返回。NFA 侧的 `accelScan()` 走的是同一组原语，只是参数来自 `AccelAux` 的不同字段。加速器返回的是「第一个可能命中的位置」，不是「匹配位置」；主引擎必须从该位置重新尝试，这也是 `offset` 回退存在的原因。
+
+短块引擎的编译链路见图 07-08-01。图中上半部分是图模式（确定化 → 合并），下半部分是字面量（Trie → AC 自动机），两条路最后汇入同一个 `SmallWriteEngine`，再由 Rose 决定是否在运行时启用。
+
+:::figure id=07-08-01 | name=smallwrite 的两条构建路径与运行时启用条件 | dir=TD
+node n1 "NG outfix 图与字面量" blue
+node n2 "pruneOverlong 限制深度" teal
+node n3 "buildMcClellan 确定化" teal
+node n4 "mergeDfas：8000 态上限" amber
+node n5 "LitTrie：区分大小写" teal
+node n6 "LitTrie：nocase 版本" teal
+node n7 "buildDfa：AC 式自动机" amber
+node n8 "SmallWriteEngine + 内嵌 NFA" green
+edge n1 -> n2 "图模式"
+edge n2 -> n3 "化简后"
+edge n3 -> n4 "批量合并"
+edge n1 -> n5 "字面量"
+edge n1 -> n6 "nocase 字面量"
+edge n5 -> n7 "失败链"
+edge n6 -> n7 "失败链"
+edge n4 -> n8 "写入引擎体"
+edge n7 -> n8 "写入引擎体"
+:::
+
+### 5. 配置/命令/代码实例
+
+短块引擎没有独立开关，`allowSmallWrite` 默认就是 `true`（`grey.cpp:134`），用户能观察到它的只有 dump 与性能曲线。下面这条命令生成转储并查看 `smallwrite.txt`，具体参数见 04-07，若版本要求 `-s` 需补上签名文件。
+
+```bash
+hsdump -e patterns.txt -N -o dump
+cat dump/smallwrite.txt
+```
+
+示例输出如下，具体格式需对照实际版本核验：
+
+```text
+SmallWrite:
+
+States: 37
+Length: 1180
+Largest Short Buffer: 70
+Start Offset: 0
+```
+
+逐行判读。`SmallWrite:` 之后原本还有一行 `describe(*n)` 的输出，内容取决于内嵌 DFA 的类型（McClellan、Sheng32、Sheng64 的描述不同），本示例省略了这行不确定内容，实际以工具输出为准。`States: 37` 是 DFA 状态数，对应 `nfa->nPositions`；37 个状态说明这套模式在短块上确实很小，如果这里是几千，说明短块里塞进了过多模式，`mergeDfas` 已经接近 8000 上限，编译期可能随时回退。`Length: 1180` 是引擎体字节数，直接决定数据库体积增量；它应当远小于 Rose 主体，否则短块优化的收益会被缓存压力抵消。`Largest Short Buffer: 70` 就是 `smallWriteLargestBuffer`，运行时判断是 `length < 70`，所以 69 字节走短块、70 字节走 Rose，这个边界值在压测时会被反复踩到。`Start Offset: 0` 表示没有可跳过的前导「任意字符」；如果模式都以 `.*` 开头，这里会是正数，引擎从该偏移开始扫，前面的字节直接略过。
+
+用户侧能写的代码只有普通扫描。下面这段代码把同一批模式分别喂给 32 字节和 4096 字节的块，用来验证「短块路径与长块路径给出一致的上报」；这也是排查短块漏报的最小复现框架。
+
+```c
+#include <string.h>
+
+static int on_match(unsigned int id, unsigned long long from,
+                    unsigned long long to, unsigned int flags, void *ctx) {
+    (void)from; (void)flags; (void)ctx;
+    printf("id=%u end=%llu\n", id, to);
+    return 0;
+}
+
+int scan_two_blocks(const hs_database_t *db, hs_scratch_t *scratch) {
+    const char *small = "GET /index.html HTTP/1.1\r\n";
+    char large[4096];
+    hs_error_t rv;
+
+    memcpy(large, small, strlen(small));
+    memset(large + strlen(small), 'x', sizeof(large) - strlen(small));
+
+    rv = hs_scan(db, small, (unsigned)strlen(small), 0, scratch, on_match, NULL);
+    if (rv != HS_SUCCESS) { return rv; }
+
+    rv = hs_scan(db, large, (unsigned)sizeof(large), 0, scratch, on_match, NULL);
+    return rv;
+}
+```
+
+这段代码的关键是「同一数据库、同一 scratch、两种块长」。32 字节的块会命中 `length < 70` 分支，走 `runSmallWriteEngine()`；4096 字节的块不会，走 `rawBlockExec()`。两次输出必须完全一致，如果不一致，优先怀疑短块引擎的裁剪逻辑（`clear_deeper_reports` 把本该上报的深度清掉了），而不是怀疑模式写错。`from` 参数在未开 SOM 时是未定义的，示例里显式忽略它，这是正确用法；把它打印出来当作起点是常见错误。
+
+字符类加速是内部原语，下面的片段展示它的典型调用形态。`mask_lo` / `mask_hi` 是编译期由字符类生成的两张 16 字节表，运行期只做查表与比较。
+
+```c
+#include "nfa/shufti.h"
+
+const u8 *skip_to_hex(const u8 *buf, const u8 *buf_end,
+                      m128 mask_lo, m128 mask_hi) {
+    const u8 *p = shuftiExec(mask_lo, mask_hi, buf, buf_end);
+    if (p == buf_end) {
+        return NULL; // 整段没有十六进制字符
+    }
+    return p; // 第一个候选位置，仍需精确匹配
+}
+```
+
+`shuftiExec()` 返回的是「第一个可能属于该字符类的位置」，不是「匹配起点」；返回 `buf_end` 表示没找到。调用方拿到指针后必须从该位置重新跑匹配逻辑，不能直接当成命中上报。反向版本 `rshuftiExec()` 在没找到时返回 `buf - 1` 而不是 `NULL`，这是它和正向版本最容易混淆的地方。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**不要把 smallwrite 说成小写化**。这是本篇最需要强调的一条。模块名来自「small write」（短块），与大小写无关；真正的 case folding 在 `hwlmLiteral::upperString`、`CharReach::make_caseless` 与 `CASE_CLEAR` 掩码里。把两者混为一谈，会导致在排查「大小写不敏感为什么没生效」时去翻 `smallwrite`，方向完全错。
+
+**70 字节是严格小于的边界**。`runtime.c` 的判断是 `length < smwr->largestBuffer`，不是 `<=`。压测时如果语料刚好是 70 字节，会看到「短包优化没生效」的假象；把语料改成 69 或 71 各测一遍，才能确认拐点位置。`largestBuffer` 还可能被 `is_slow()` 压到 35，实际拐点要以 dump 里的 `Largest Short Buffer` 为准。
+
+**短块与长块的路径不同，结果必须一致**。短块走 DFA，长块走 Rose，两条路径的实现完全不同。上线前应当用同一批模式在两种块长下对拍（`hscollider` 可以做这件事），否则短块漏报会非常隐蔽——它只在特定长度以下出现。
+
+**SOM 与 short block 互斥**。`add()` 里 `expr.som` 为真就毒化整个 builder，意味着「开了 `HS_FLAG_SOM_LEFTMOST` 的数据库不会有 smallwrite 引擎」。这不是缺陷，而是 outfix DFA 无法表达「起点」的必然结果。需要 SOM 又想要短包性能，只能接受走 Rose，或者把模式拆成「短块用无 SOM 库粗筛 + 长块用 SOM 库确认」的两级结构。
+
+**`min_length` 扩展参数会禁用短块引擎**。`rm.getReport(id).minLength > 0` 同样触发毒化。使用 `hs_expr_ext_t` 的 `HS_EXT_FLAG_MIN_LENGTH` 时要有心理准备：短包优化消失，吞吐曲线会变。
+
+**字符类近似的假阳性必须二次确认**。`make_and_cmp_mask()` 生成的 and/cmp 只能保证「集合内的字节一定通过」，不能保证「通过的字节一定在集合内」。任何用它做预筛的代码都必须保留精确判断，否则会把 `[0-9]` 判成包含 `:` 之类。
+
+**第 5 位技巧只适用于 ASCII**。`0xdf` 掩码、`isBit5Insensitive()`、`CASE_CLEAR` 都建立在「大小写字母只差第 5 位」这个 ASCII 事实上。UTF-8 模式（`HS_FLAG_UTF8`）与 UCP 语义下，非 ASCII 字母不能用这套办法；相关代码路径会用完整的 `CharReach` 展开，成本更高但正确。
+
+**Trie 与 DFA 的上限是硬编码**。`MAX_TRIE_VERTICES` 与 `DFA_MERGE_MAX_STATES` 都是 8000，不是 `Grey` 参数。模式集接近这个量级时，构建会静默失败（返回空引擎），表现为「短包突然变慢」，而不会有任何编译错误。用 dump 里有没有 `SmallWrite:` 段来确认。
+
+### 7. 小结与延伸阅读
+
+`smallwrite` 是「短块专用 outfix DFA」：编译期把图模式确定化、把字面量做成 AC 自动机、合并后裁剪到 8000 态以内；运行时只要块长小于 `largestBuffer`（默认 70）就整块交给它，跑完不再进 Rose。它不支持 SOM、vacuous、`min_length`，任一不满足就整体不构建。字符类加速则是另一层：`CharReach` 负责编译期集合表示，`shufti` / `truffle` / `vermicelli` 负责运行期跳过不可能的前缀，三者都只返回候选位置，不负责确认。
+
+延伸阅读：加速器的整体设计与 `accelScan` 的回退路径见 06-09；`CharReach` 与位运算基础设施见 07-13；`HS_FLAG_SOM_LEFTMOST` 为何与短块引擎冲突见 06-10 与 07-09；短包性能的实测方法见 08-01。最后再提醒一次事实核验：本快照没有 `src/nfa/vermicelli.c` 与 `src/util/caseless.cpp`，遇到这两个文件名应当直接标注「需对照实际版本核验」，不要凭印象写进文件清单。
+
+## 07-09 som 模块
+
+### 1. 背景与动机
+
+Hyperscan 默认只上报匹配的结束偏移。这是流式匹配的自然结果：自动机在读到某个字节时知道「有一条模式在这里闭合」，但它并没有保留「这条模式是从哪个字节开始的」。要拿到起点，必须额外记录「每个前缀是从哪里开始的」，这就是 SOM（Start of Match）。`src/som/som.h` 把这件事压缩成一个枚举：`SOM_NONE` 表示不需要，`SOM_LEFT` 表示需要「精确最左起点」。
+
+SOM 为什么难？因为一条模式在自动机里可能同时存在多条活跃路径，每条路径的起点不同；要报「最左」，就必须在合并状态时保留最小的那个起点，而不能简单丢弃。更麻烦的是流式：一个匹配可能从上一块的某个字节开始，这一块才闭合，起点信息必须跨块保存。保存绝对偏移会随流长度无限增长，所以只能保存「相对当前流偏移的距离」，并且给这个距离设一个上限——这就是 horizon。
+
+SOM 的成本体现在三处。第一是状态：每个需要起点的「槽位」要在 scratch 里占 8 字节，流状态里占 2、4 或 8 字节，槽位数量由模式结构决定，可能远多于模式数。第二是编译：需要为部分模式构建反向 NFA（从 end 往回找起点），还要在字节码里插入一整套「SOM 操作」。第三是能力：SOM 与 `HS_FLAG_SINGLEMATCH`、`HS_FLAG_PREFILTER`、`HS_FLAG_QUIET` 都不能组合，编译期直接报错。
+
+`src/som/` 这个模块的职责，就是把这套机制拆成四个可独立阅读的部分：编译期分配槽位（`slot_manager.cpp`）、运行期读写槽位（`som_runtime.c`）、流式搬运（`som_stream.c`）、操作编码（`som_operation.h`）。理解了这四者的分工，再看 Rose 字节码里那些 `SOM_*` 操作就不会迷路。
+
+### 2. 核心概念
+
+**槽位（slot）**。槽位是「一个起点值的存储单元」，不是「一条模式的存储单元」。多条模式如果共享同一个前缀，可以共享同一个槽位；带 reset 语义的前缀（例如 `^` 或某个哨兵）还可以进一步合并。`SomSlotManager::getSomSlot(prefix, escapes, is_reset, parent_slot)` 做的就是「给这个前缀找一个槽，能找到就复用，找不到就新分配」。`parent_slot` 表达「这个槽的起点继承自哪个父槽」，`escapes` 是一组「会打断继承」的字符类。
+
+**槽位缓存**。`SlotCache` 用 `unordered_set<SlotCacheEntry>` 保存「前缀图 + escapes + parent + is_reset」到槽号的映射，键的哈希与相等由 `SlotEntryHasher` / `SlotEntryEqual` 定义，比较的是图结构而不是指针。`getInitialResetSomSlot()` 还有一套更复杂的共享逻辑：它把「初始 reset 前缀」与「body 图 + 区域映射」一起缓存，只有当新前缀与已有条目的「哨兵清尾」关系兼容时才共享，否则新开一个槽。`rollbackSomTo(num)` 用于编译期回退：某个候选方案最终没被采用时，把槽号计数器退回，避免浪费。
+
+**反向 NFA**。有些模式的起点无法从正向状态直接得到（例如带复杂前缀的浮动匹配），这时编译期会构造一台反向 NFA：从 end 位置往回扫，找到「最短的、能构成合法起点的位置」。`addRevNfa(nfa, maxWidth)` 把它登记进 `rev_nfas`，同时把 `historyRequired` 更新为 `max(historyRequired, maxWidth)`——因为反向扫描最多要回看 `maxWidth` 字节，流式状态下必须保证历史窗口够长。这个 `historyRequired` 最终会进 `RoseEngine`，决定流状态大小。
+
+**SOM 操作**。`som_operation.h` 定义了 15 种操作码，从 `SOM_EXTERNAL_CALLBACK_REL`（按「end 减固定距离」上报）到 `SOM_INTERNAL_LOC_SET_FROM_IF_WRITABLE`（有条件地从另一个槽复制）。每个操作有 `type`、`onmatch`（要修改的槽号）和 `aux`（距离、反向 NFA 索引或源槽号）。这些操作不是运行期解释的脚本，而是编译期生成、运行期由 `handleSomInternal()` / `handleSomExternal()` 用 `switch` 分派的紧凑指令。
+
+**valid / writable / set_now 三组位图**。`somValid` 表示「这个槽已经有值」，`somWritable` 表示「这个槽还允许被写」，`som_set_now` 是「本轮（同一个 `to_offset`）已经写过的槽」。第三个位图是为了处理同一位置上多条路径竞争：同一轮里先写的赢，后续写要比较大小或直接忽略。写失败时不是丢弃，而是把「尝试写的起点」暂存到 `som_attempted_store`，并置位 `som_attempted_set`，等反向 NFA 或后续轮次确认后再补写。这个「暂存 + 补写」机制是 SOM 正确性的核心，也是最容易被误读的部分。
+
+**相对偏移与哨兵**。`som_store` 在 scratch 里是 `u64a` 绝对偏移，写进流状态时 `storeSomValue()` 把它转成 `stream_offset - som_value`，按 `somHorizon`（2/4/8 字节）截断。全 1 是哨兵：8 字节时是 `~0ull`，4 字节时是 `~0u`，2 字节时是 `(u16)~0u`。读回时 `loadSomValue()` 做减法还原绝对偏移；如果读到哨兵，直接返回 `SOM_SENTINEL_LARGE`（即 `~0ull`），上层据此上报 `HS_OFFSET_PAST_HORIZON`。所以「起点太远」不是错误码，而是一个特殊偏移值。
+
+**precision 与 horizon**。`HS_MODE_SOM_HORIZON_LARGE`（`1U << 24`）对应 8 字节槽，`MEDIUM`（`1U << 25`）对应 4 字节，`SMALL`（`1U << 26`）对应 2 字节；`HS_MODE_VECTORED` 强制 8 字节。`getSomPrecision()` 在 `src/hs.cpp:149` 做这个映射。horizon 的语义要精确理解：它不是「流状态窗口大小」，而是「起点相对当前流偏移允许的最大回溯距离」。超过这个距离，起点仍然存在，但已经无法用固定宽度表示，于是上报 `HS_OFFSET_PAST_HORIZON`。
+
+**SOM log**。块模式下，同一个 `to_offset` 可能产生多条「起点待定」的上报，`flushStoredSomMatches()` 负责在合适时机把它们吐给用户回调。它先看 `scratch->deduper.som_log_dirty`，只有脏了才走 `flushStoredSomMatches_i()`。这个「先记账、后 flush」的设计是为了保证同一位置上多条模式的上报顺序稳定，也为了避免在扫描热路径里反复调用用户回调。
+
+### 3. 关键数据结构与源码位置
+
+`src/som/` 共 11 个文件，规模不大但分工很细，见表 07-09-A。阅读顺序建议：先 `som.h` 与 `som_operation.h` 建立语义，再 `slot_manager.h` 看编译期，最后 `som_runtime.c` / `som_stream.c` 看运行期。字段与参数不在本册展开，统一按「字段见 05-09 ｜ 参数见 04-03 ｜ 原理见 06-10 ｜ 模块见 07-08」查阅。
+
+| 文件 | 角色 |
+|---|---|
+| `som.h` | `som_type` 枚举：`SOM_NONE` / `SOM_LEFT` |
+| `som_operation.h` | 15 种操作码与 `som_operation` 结构 |
+| `som_runtime.h` | 运行期入口声明 |
+| `som_runtime.c` | `handleSomInternal`、`handleSomExternal`、flush |
+| `som_stream.h` | 流式存取声明 |
+| `som_stream.c` | `storeSomToStream`、`loadSomFromStream` |
+| `slot_manager.h` | `SomSlotManager` 公共接口 |
+| `slot_manager.cpp` | 槽位分配、缓存、反向 NFA 登记 |
+| `slot_manager_internal.h` | `SlotCache`、`SlotCacheEntry`、初始 reset 条目 |
+| `slot_manager_dump.cpp` | 槽位表文本转储 |
+| `slot_manager_dump.h` | 转储入口声明 |
+
+`som_operation` 在 `src/som/som_operation.h:57`，三个字段：`type`、`onmatch`、`aux`。字段的逐项含义与读写时机见 05-09；这里只强调 `aux` 是联合体，`somDistance` 与 `revNfaIndex` 共用同一块存储，具体读哪个由 `type` 决定。`handleSomInternal()` 在 `som_runtime.c:229`，`handleSomExternal()` 在 `:420`，`setSomFromSomAware()` 在 `:492`，`flushStoredSomMatches_i()` 在 `:586`。`storeSomToStream()` 在 `som_stream.c:95`，`loadSomFromStream()` 在 `:152`，`storeSomValue()` / `loadSomValue()` 分别是 `:50` 与 `:120`。
+
+`SomSlotManager` 在 `slot_manager.h:58`，公共方法有 `getSomSlot`、`getInitialResetSomSlot`、`getPrivateSomSlot`、`rollbackSomTo`、`numSomSlots`、`addRevNfa`、`somHistoryRequired`、`somPrecision`。私有成员是 `nextSomSlot`、`cache`、`rev_nfas`、`historyRequired`、`precision`。`NO_PARENT` 是 `~0`，表示「没有父槽」。`getSomSlot()` 在 `slot_manager.cpp:113`，`getInitialResetSomSlot()` 在 `:138`，`addRevNfa()` 在 `:244`。
+
+`SlotCacheEntry` 在 `slot_manager_internal.h:66`，保存 `prefix` 的独占副本、`escapes`、`parent_slot`、`is_reset`、`slot`；`SlotCache` 在 `:88`，除了 `store` 还有 `initial_prefixes` 与 `initial_resets` 两个容器。这些容器只在编译期存在，不进数据库；落库的是「槽位总数、每个槽的宽度、SOM 操作表」。
+
+运行期与槽位相关的字段分布在两个对象里：`RoseEngine` 侧的 `somLocationCount`、`somHorizon`、`stateOffsets.somValid` / `somWritable` / `somLocation`（字段见 05-05）；`hs_scratch` 侧的 `som_store`、`som_set_now`、`som_attempted_set`、`som_attempted_store`、`som_set_now_offset`（字段见 05-03）。`rose_internal.h:343` 对 `somHorizon` 的注释是「width in bytes of SOM offset storage」，这正是 2/4/8 的来源。
+
+### 4. 关键流程与调用链
+
+编译期从 `NG` 的构造开始。`src/hs.cpp:227` 调 `getSomPrecision(mode)` 得到 0/2/4/8，传给 `NG`；`NG` 内部创建 `SomSlotManager(precision)`。之后每遇到一个「需要记住起点」的前缀，就调 `getSomSlot(prefix, escapes, is_reset, parent_slot)`：先查 `SlotCache`，命中直接复用槽号；未命中则 `cache->insert(...)` 并返回 `nextSomSlot++`。`getSomSlot()` 开头有 `assert(parent_slot == NO_PARENT || parent_slot < nextSomSlot)`，保证父槽一定先于子槽分配，这个顺序是后续「复制父槽」操作的前提。
+
+复杂情形走 `getInitialResetSomSlot()`。它先把前缀克隆成 `shared_ptr` 并查 `initial_prefixes`，命中就复用同一份图；然后克隆 body 图与区域映射，调 `sentClearsTail()` 判断「新哨兵是否能清掉尾部」，得到一个 `first_bad_region`。接着遍历已有的 `initial_resets`，对每个条目的哨兵与 body 都做一次 `sentClearsTail()` 检查；全部兼容才共享，否则 `try_next`。共享时如果前缀已经在这个槽里实现过，会把 `prefix_already_implemented` 置真，调用方据此避免重复生成字节码。
+
+需要反向 NFA 时，编译期构造好 `NFA` 后调 `addRevNfa(nfa, maxWidth)`：槽号就是 `rev_nfas.size()`，push 后更新 `historyRequired`。注意这个 `historyRequired` 是「所有反向 NFA 的最大宽度」，不是求和；流状态只需要能回看最远的那一个。它最终与 Rose 自身的 `historyRequired` 取较大值，决定 `hs_stream_size()` 的一部分。
+
+运行期块模式的入口是 `handleSomInternal(scratch, ri, to_offset)`。它先做两件事：如果 `to_offset` 与 `scratch->som_set_now_offset` 不同，清空 `som_set_now` 与 `som_attempted_set`，更新偏移——这保证「同一轮」的判定以 `to_offset` 为准；然后检查 `ri->onmatch` 是否落在 `somLocationCount` 内，越界直接返回。这个越界检查是防御性的：`onmatch` 来自序列化数据库，可能被伪造，不能直接拿去索引数组。
+
+随后按 `type` 分派。`SOM_INTERNAL_LOC_SET` 无条件写：置 `somValid` 位，调 `setSomLoc()` 把 `to_offset - somDistance` 写进 `som_store[onmatch]`。`SET_IF_UNSET` 先看 `ok_and_mark_if_unset()`：写入条件是「该槽尚未写过」或「本轮已经写过、需要就地裁决」——`mmbit_set()` 返回旧位，`fatbit_isset()` 判断本轮是否已写，两者取或，所以它既能写下第一个值，也能在同一轮里把更早的起点替换进去。`SET_IF_WRITABLE` 最复杂：`ok_and_mark_if_write()` 的条件在上一组之上再加一条「`somWritable` 位仍为 1」，写成功后把 writable 清掉（表示「这个槽已经定型」）；如果三条都不满足，就把「本来想写的起点」存进 `som_attempted_store`，并用 `LIMIT_TO_AT_MOST` 保留更小的值——因为同一轮可能有多次竞争，最终要的是最左。`SET_REV_NFA` 系列则先跑反向 NFA 求出 `from_offset`，再走同样的写入或暂存逻辑。
+
+`handleSomExternal()` 是「上报时取起点」的入口。它按 `type` 分四种：`SOM_EXTERNAL_CALLBACK_REL` 直接算 `to_offset - somDistance`；`ABS` 用固定值；`STORED` 从 `som_store[onmatch]` 读；`REV_NFA` 现场跑反向 NFA。返回值就是回调的 `from`。如果读到的值是哨兵或超出 horizon，返回 `HS_OFFSET_PAST_HORIZON`（`~0ULL`），由上层原样传给用户。
+
+流式的存取发生在扫描边界。`hs_scan_stream()` 在扫描前调 `loadSomFromStream(scratch, offset)`：遍历 `somValid` 中置位的槽，用 `loadSomValue()` 把流状态里的相对偏移还原成绝对偏移，填进 `scratch->som_store`。扫描成功后调 `storeSomToStream(scratch, offset)`：同样遍历有效槽，用 `storeSomValue()` 转回相对偏移写进流状态。两个函数都只处理 `somValid` 为 1 的槽，无效槽不占搬运成本，这也是「SOM 流状态大小与已见起点数相关」的原因。
+
+槽位分配与共享的决策路径见图 07-09-01。图中「缓存命中」与「新分配」是两条并列分支，最后都要经过 `addRevNfa()` 才能形成完整可用的 SOM 支持。
+
+:::figure id=07-09-01 | name=SOM 槽位分配、缓存复用与反向 NFA 登记 | dir=TD
+node n1 "前缀 NGHolder + escapes" blue
+node n2 "SlotCache::find 查缓存" teal
+node n3 "命中：复用已有槽位" amber
+node n4 "未命中：nextSomSlot 自增" amber
+node n5 "addRevNfa 登记反向 NFA" purple
+node n6 "historyRequired 取最大值" green
+edge n1 -> n2 "查键"
+edge n2 -> n3 "结构相同"
+edge n2 -> n4 "结构不同"
+edge n4 -> n5 "需要回找起点"
+edge n3 -> n5 dashed "共享槽的反向 NFA"
+edge n5 -> n6 "决定历史窗口"
+:::
+
+流式 SOM 的往返见图 07-09-02。图中「绝对偏移」只在 scratch 内存在，「相对偏移」才进流状态；这条分界线是理解 `HS_OFFSET_PAST_HORIZON` 的关键。
+
+:::figure id=07-09-02 | name=SOM 在 scratch 与流状态之间的相对偏移往返 | dir=LR
+node n1 "scratch 中的 som_store" blue
+node n2 "storeSomValue 转相对偏移" teal
+node n3 "流状态：2/4/8 字节槽" amber
+node n4 "loadSomValue 还原绝对偏移" teal
+node n5 "handleSomInternal 写槽" purple
+node n6 "handleSomExternal 取 from" purple
+node n7 "report 上报 from 与 to" green
+edge n1 -> n2 "扫描结束"
+edge n2 -> n3 "写流状态"
+edge n3 -> n4 "下一块开始"
+edge n4 -> n5 "载入 scratch"
+edge n5 -> n6 "匹配闭合"
+edge n6 -> n7 "回调"
+edge n1 -> n5 dashed "块内直接读写"
+:::
+
+### 5. 配置/命令/代码实例
+
+SOM 的「配置」只有两个开关：编译标志 `HS_FLAG_SOM_LEFTMOST`，以及模式里的 `HS_MODE_SOM_HORIZON_*`。完整参数见 04-02 与 04-03，这里只给最小可用组合。下面的代码编译一个流式 SOM 数据库，扫描两块数据，并在回调里打印 `from` 与 `to`。
+
+```c
+static int on_som_match(unsigned int id, unsigned long long from,
+                        unsigned long long to, unsigned int flags, void *ctx) {
+    (void)flags; (void)ctx;
+    if (from == HS_OFFSET_PAST_HORIZON) {
+        printf("id=%u from=PAST_HORIZON to=%llu\n", id, to);
+    } else {
+        printf("id=%u from=%llu to=%llu\n", id, from, to);
+    }
+    return 0;
+}
+
+int run_som_stream(const char *pat) {
+    hs_database_t *db = NULL;
+    hs_scratch_t *scratch = NULL;
+    hs_stream_t *stream = NULL;
+    unsigned flags = HS_FLAG_SOM_LEFTMOST;
+    unsigned mode = HS_MODE_STREAM | HS_MODE_SOM_HORIZON_MEDIUM;
+
+    if (hs_compile(pat, flags, mode, NULL, &db, NULL) != HS_SUCCESS) {
+        return 1;
+    }
+    if (hs_alloc_scratch(db, &scratch) != HS_SUCCESS) { return 1; }
+    if (hs_open_stream(db, 0, &stream) != HS_SUCCESS) { return 1; }
+
+    hs_scan_stream(stream, "abcXY", 5, 0, scratch, on_som_match, NULL);
+    hs_scan_stream(stream, "ZWabc", 5, 0, scratch, on_som_match, NULL);
+    hs_close_stream(stream, scratch, on_som_match, NULL);
+
+    /* 生产代码此处还须 hs_free_scratch(scratch) 与
+       hs_free_database(db)，示例聚焦扫描流程，故从略。 */
+    return 0;
+}
+```
+
+这段代码里有五个必须理解的调用。`hs_compile` 的 `flags` 只开 `HS_FLAG_SOM_LEFTMOST`，不能再加 `SINGLEMATCH` / `PREFILTER` / `QUIET`，否则编译期直接抛出 `CompileError`；源码里的错误文本是 `HS_FLAG_SINGLEMATCH is not supported in combination with HS_FLAG_SOM_LEFTMOST.`（`compiler.cpp:193`），`PREFILTER` 与 `QUIET` 各有一条同构的文本。`mode` 用 `HS_MODE_STREAM` 加 `HS_MODE_SOM_HORIZON_MEDIUM`，对应 4 字节槽；`hs_compile` 内部由 `getSomPrecision()` 映射成 4。`hs_alloc_scratch` 必须针对这个数据库分配，不能拿别的库的 scratch 复用。`hs_open_stream` 的第二个参数是 `flags`，示例传 0；`hs_scan_stream` 的第四个参数同样是 `flags`，不是超时或长度。`hs_close_stream` 会补跑 EOD 上报，所以最后一条跨块匹配可能在这里才吐出来。
+
+以模式 `abc` 为例，示例输出如下，具体匹配位置取决于模式，格式需对照实际版本核验：
+
+```text
+id=0 from=0 to=3
+id=0 from=7 to=10
+```
+
+逐行判读。第一行 `from=0 to=3`：`abc` 在第一块的 0、1、2 三个字节上闭合，`to` 是「最后一个匹配字节之后的偏移」，所以是 3 而不是 2；`from=0` 是「最左起点」，如果模式能匹配多种长度，库一定取能构成匹配的最小起点。第二行 `from=7 to=10`：匹配跨块，`abc` 落在第二块的前三个字节，但 `from` / `to` 都是「整个流」的累计偏移，不是块内偏移 0 到 3——这是流式 SOM 最容易读错的地方，也是很多「偏移错位」工单的根因。`id=0` 是因为这条模式用 `hs_compile()` 单条编译，单表达式数据库的 id 固定为 0；用 `hs_compile_multi()` 才会是传入的 id。
+
+这段输出里没有 `PAST_HORIZON`，因为流总长只有 10 字节，远小于 `MEDIUM` 的 2^32 字节精度范围。当流很长、起点落在精度范围之外时，`from` 会变成 `HS_OFFSET_PAST_HORIZON`（`~0ULL`，`hs_runtime.h:615`），`to` 仍然有效——「结束位置总是可信，起点可能不可信」。业务代码必须能处理这种「只有 end」的上报，既不能把 `~0ULL` 当成 0（会误判为从流开头开始），也不能把它当错误码丢弃整条流。`SMALL` 的精度范围是 2^16 字节，长连接场景下更容易触发，选型时要按最坏回溯距离估算。
+
+要看编译期分配了哪些槽，可以用 `hsdump` 的 `-L`（对所有模式加 `HS_FLAG_SOM_LEFTMOST`）与 `-d`（指定 precision）选项，然后读 `slot_manager` 的转储。命令与示例输出如下，具体格式需对照实际版本核验：
+
+```bash
+hsdump -e patterns.txt -N -L -d 4 -o dump
+cat dump/som.txt
+```
+
+```text
+slot width 4 bytes
+
+0	 shared reset (users = 3)
+1	parent:0	reset
+2	<private>
+```
+
+判读：`slot width 4 bytes` 与 `-d 4` 一致，说明 precision 映射正确；如果这里是 8 而命令传了 4，说明该版本忽略了 `-d` 或模式强制了更高精度，需要核验。`0  shared reset (users = 3)` 表示 0 号槽被三个初始 reset 前缀共享，这是编译期缓存命中的结果，不是错误。`1  parent:0  reset` 表示 1 号槽继承 0 号槽的起点，并带 reset 语义；这种父子关系在运行期表现为 `SOM_INTERNAL_LOC_COPY` 或 `SET_FROM` 系列操作。`2  <private>` 表示私有槽，不共享；私有槽通常来自无法证明等价的前缀，数量过多会让 `somLocationCount` 膨胀，进而推高 scratch 与流状态。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**默认没有 `from`**。不开 `HS_FLAG_SOM_LEFTMOST` 时，回调的 `from` 是未定义的，不要读。很多「起点总是 0」的现场，其实是没有开 SOM，而 `from` 恰好是栈上的 0。
+
+**SOM 与三个标志互斥**。`SINGLEMATCH`、`PREFILTER`、`QUIET` 都不能与 `SOM_LEFTMOST` 组合，编译期会返回 `HS_COMPILER_ERROR`，错误信息在 `compiler.cpp:193`、`:249`、`:216` 三处。不要试图用「先编译再改标志」绕过，标志参与字节码生成，改了就必须重编译。
+
+**`HS_OFFSET_PAST_HORIZON` 不是 0，也不是错误码**。它的值是 `~0ULL`。把它当 0 会让业务逻辑认为「匹配从流开头开始」；把它当错误会让整条流被丢弃。正确做法是「保留 `to`，起点标记为未知」，并在监控里单独统计这种上报的比例，比例过高说明 horizon 选小了。
+
+**horizon 选大要用内存换**。`LARGE` 是 8 字节槽、`MEDIUM` 4 字节、`SMALL` 2 字节，槽宽直接乘进流状态大小。十万条并发流、每条流一千个槽，2 字节与 8 字节的差别就是 `1e8 × 6` 字节，约 600 MB。选 `SMALL` 之前要确认「最坏回溯距离」确实小于 65534 字节，否则会出现大量 `PAST_HORIZON`。
+
+**槽位不等于模式**。`somLocationCount` 可能大于、也可能小于模式数：共享前缀会减少槽位，一条模式内部的多个分支可能增加槽位。用「槽位数 × 槽宽」估算流状态时，要以 dump 或 `hs_database_info` 的实际值为准，不要按模式数拍脑袋。
+
+**流式不能重放历史**。`storeSomToStream()` 只保存「当前有效槽」的相对偏移，历史缓冲区之外的数据不会被保留。`hs_scan_stream` 要求数据按序到达；乱序或回退会让 `loadSomValue()` 算出错误的绝对偏移，表现为 `from > to`。`report.h:370` 有一条断言 `from_offset <= to_offset`，发布构建里断言被编译掉，但同一文件里还有一段防御性 clamp，会把「起点大于终点」的上报强行改成 `from = to`——看到这种「起点等于终点」的怪结果，先查数据是否乱序。
+
+**`som_set_now` 的清空条件是 `to_offset` 变化**。同一 `to_offset` 下多次写同一槽，只有第一次有效（`SET_IF_UNSET`）或最小者有效（`SET_IF_WRITABLE` 的暂存比较）。自己写测试直接调 `handleSomInternal()` 时，如果反复用同一个 `to_offset`，会看到「第二次写不进去」的现象，这不是 bug。
+
+**SOM 与有界重复**。部分带大型有界重复的模式在开启 SOM 后无法编译，具体边界见 04-03 与 06-10；这不是 `src/som/` 的限制，而是上层图构造阶段就拒绝了。遇到「同样的模式不开 SOM 能编、开了就失败」，先查有界重复，不要先怀疑槽位管理。
+
+**scratch 仍然不是线程安全的**。`som_store`、`som_set_now`、`som_attempted_store` 都在 scratch 里，多个线程共享同一 scratch 会互相覆盖槽位，产生「起点随机跳变」的诡异结果。每个并发扫描线程必须有独立 scratch，这条规则在 SOM 场景下比普通场景更容易被违反，因为症状不是崩溃而是错值。
+
+### 7. 小结与延伸阅读
+
+SOM 模块把「记住起点」拆成四件事：编译期用 `SomSlotManager` 分配可共享的槽位、必要时登记反向 NFA 并抬高 `historyRequired`；运行期用 `handleSomInternal()` 按 15 种操作码读写槽位，用 `handleSomExternal()` 在命中时取出 `from`；流式场景用 `storeSomToStream()` / `loadSomFromStream()` 在「绝对偏移」与「相对偏移」之间往返；槽宽由 `HS_MODE_SOM_HORIZON_*` 决定，超出范围统一返回 `HS_OFFSET_PAST_HORIZON`。四条线索合起来，就是「起点可见但有代价」这句话的全部含义。
+
+延伸阅读：SOM 的语义、horizon 与状态膨胀的整体分析见 06-10；`hs_scratch` 中 SOM 字段与 `RoseEngine` 中 `somHorizon` / `somLocationCount` 的逐字段说明见 05-03 与 05-05；`HS_FLAG_SOM_LEFTMOST` 与三个互斥标志的完整语义见 04-02；流状态压缩如何处理 SOM 槽见 06-11；短块引擎为何不支持 SOM 见 07-08。最后提醒：`src/som/` 的 11 个文件里，运行期代码是 C，编译期的槽位管理与转储是 C++（`slot_manager.cpp`、`slot_manager_dump.cpp`），混编边界在 `extern "C"` 上，自己写扩展时不要跨边界传 STL 容器。

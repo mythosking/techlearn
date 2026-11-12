@@ -1,0 +1,983 @@
+# Hyperscan 技术资料 · 06 技术原理（分片 A）
+
+## 06-01 编译流水线总览：从正则文本到 RoseEngine 字节码
+
+### 1. 背景与动机
+
+Hyperscan 的设计哲学可以浓缩成一句话：把尽可能多的工作从「每个字节都要走一遍」的路径挪到「只走一次」的路径上。正则文本进入库的那一刻，Hyperscan 并不保留它，也不打算在扫描时解释它；它把模式集合翻译成一份自包含的、不可变的字节码，之后每一次 `hs_scan` 都只是让数据流过这张已经排布好的表。这个「编译一次、扫描无数次」的不对称，既是 Hyperscan 吞吐的来源，也是它全部使用约束的来源。
+
+把这条流水线讲清楚有三个现实收益。第一是定位编译失败。用户看到的往往只是一句 `HS_COMPILER_ERROR` 和一段错误文本，但错误究竟来自词法、语法、语义检查、图规模限制还是 Rose 的资源上限，决定了应该改模式、改标志还是改编译选项。第二是解释吞吐差异。两条看起来相似的正则，可能一条被整体折叠成字面量、走 Teddy 或 FDR，另一条却退化成大 NFA 甚至 Castle，吞吐差一个数量级；差异不是运行时随机产生的，而是在流水线的某个判定点上已经注定。第三是判断能力边界。SOM、近似匹配、流式历史、逻辑组合这些特性并不是运行时的开关，而是编译期就要写进字节码的结构；不理解这一点，就会反复尝试「先编译再想办法打开 SOM」这类不可能的操作。
+
+本册把机制与调用链集中在这里，正是因为后续每一篇都在展开本篇文章中的某一格。06-02 展开解析器与组件树，06-03 展开 Glushkov 图构造与化简，06-04 展开 Rose 的角色划分，06-05 展开字面量前端；06-06 之后进入 NFA、Castle、Sheng、加速器与 SOM、流状态、序列化、fat runtime 与 Chimera。读完本篇，应当能在脑中维持一条从 `hs_compile` 到 `hs_database` 的完整路径，并且知道每一步的输入、输出与典型失败方式。
+
+需要强调，Hyperscan 是编译加扫描的库，不是 DPI 产品。它不抓包、不做协议解析、不做流重组；`examples/pcapscan.cc` 只是演示如何把包载荷喂给扫描接口。流水线的终点是一份数据库，而不是一个可执行服务，这也是本套资料把「集成与部署」单独放在 03 册的原因。
+
+### 2. 核心概念
+
+整条流水线可以概括为「四次表示转换 + 一次落库」。四次转换分别是组件树、NG 图、Rose 图和 RoseEngine 字节码；落库则是把字节码包进带头部与完整性校验的 `hs_database`。每一次转换都在丢失信息，同时也在固化决策。理解「丢了什么」比记住「经过哪些函数」更重要，因为丢失的信息在运行期无法恢复。
+
+组件树是语法结构的直接映射。`ComponentSequence` 表示串联，`ComponentAlternation` 表示分支，`ComponentRepeat` 表示量词，`ComponentClass` 表示字符类，`ComponentBoundary` 与 `ComponentWordBoundary` 表示行首行尾与词边界。组件树保留的是「子表达式之间的组合关系」，它还带有 `first()`、`last()`、`empty()` 这三个用于 Glushkov 构造的语义查询。此时模式仍然是可以被打印、被改写的结构，尚未涉及任何状态编号。
+
+NG 图是 Glushkov 位置自动机。它把每个「字符位置」变成一个顶点，把「某个位置之后可以接某个位置」变成边。与 Thompson 构造不同，Glushkov 图没有 epsilon 边，状态数等于位置数，因此状态编号紧凑、运行期推进直接；代价是边数可能较多，且大重复会复制子图。`NGHolder` 里还保留 `start`、`startDs`、`accept`、`acceptEod` 四个特殊顶点，分别对应「锚定起点」「任意起点」「普通接受」「仅在数据末尾接受」。这四个顶点是后面 Rose 判断角色时的重要依据。
+
+Rose 图是「触发关系图」。它不再关心自动机的每个状态，而是把模式拆成两类东西：能被字面量匹配器快速触发的部分，以及只能由 NFA 逐字节推进的部分。字面量按照起点是否固定进入 anchored 表或 floating 表，靠近数据末尾的进入 EOD 表；无法用字面量表达的后缀、前缀、中缀、外缀则变成不同类型的 NFA 角色。Rose 图上的边带有 lag 与边界，表示「触发之后还需要确认多远」。这一步是 Hyperscan 性能的核心，也是 06-04 的主题。
+
+RoseEngine 是最终的扁平字节码。它由一个头部、若干偏移量、若干表（anchored 表、floating 表、EOD 表、小块表、NFA 信息表、左信息表、逻辑组合表）以及若干程序段组成。头部里的 `runtimeImpl`、`pureLiteral`、`noFloatingRoots`、`mode`、`historyRequired`、`hasSom` 等字段，决定了运行期走哪条快速路径。到了这一步，原始正则已经不存在，剩下的只是偏移与指令；因此 `hs_database_info` 只能报告版本、特性与模式，无法反查模式文本。
+
+还有两条旁路必须记住。其一是纯字面量 API：`hs_compile_lit` 与 `hs_compile_lit_multi` 不经过解析器和图构造，直接把字节串变成 `ue2_literal` 交给 Rose，因此只支持大小写不敏感、单次匹配与 SOM 这几个标志，扩展参数一律拒绝。其二是 `shortcutLiteral`：普通编译路径下，如果组件树被判定为纯字面量且不涉及混合大小写，也会跳过建图直接进 Rose。这两条旁路解释了为什么同一个模式用不同 API 编译，得到的字节码规模与运行路径可能不同。
+
+### 3. 关键数据结构与源码位置
+
+本册只点名结构体与入口，逐字段定义统一放在 05 册，避免与字段表重复。公共句柄 `hs_database` 的布局见 05-02；编译上下文 `CompileContext` 与表达式信息见 05-04；`NG`、`NGHolder` 与 `NFAVertex` 见 05-08；`RoseEngine` 与 `RoseContext` 见 05-05；字节码容器 `bytecode_ptr` 见 05-01 的分层索引。
+
+从源码角度看，装配中心是 `src/compiler/compiler.cpp`。`build()` 位于 `compiler.cpp:622`，它调用 `generateRoseEngine()`（`compiler.cpp:523`）拿到 `bytecode_ptr<RoseEngine>`，设置 `pureLiteral` 标志，再交给 `dbCreate()`（`compiler.cpp:561`）做对齐、填头与 HMAC。真正的图构造入口是 `buildGraph()`（`compiler.cpp:713`），它按 Glushkov 构造顺序把组件树变成 `NGHolder`，并在返回前调用 `removeAssertVertices()`。
+
+Rose 侧的抽象接口在 `src/rose/rose_build.h:82`，类名是 `RoseBuild`；具体实现是 `RoseBuildImpl`，声明在 `src/rose/rose_build_impl.h`。`buildRose()` 的实现位于 `src/rose/rose_build_compile.cpp:1682`，它先做一系列图变换，最后调用 `buildFinalEngine()`（`src/rose/rose_build_bytecode.cpp:3609`）分配并填充 `RoseEngine`。`RoseEngine` 的定义在 `src/rose/rose_internal.h:331`，字段含义见 05-05。
+
+`NG` 类在 `src/nfagraph/ng.h:63`，构造函数 `NG::NG` 在 `src/nfagraph/ng.cpp:81`，它一次性创建 `ReportManager`、`SomSlotManager`、`SmallWriteBuild` 与 `RoseBuild`。`NG::addGraph()` 在 `ng.cpp:326`，`NG::addLiteral()` 在 `ng.cpp:579`，`reduceGraph()` 在 `ng.cpp:156`。这三处是理解「图如何进入 Rose」的关键锚点。
+
+分配器与所有权由 `src/util/bytecode_ptr.h` 承担。`bytecode_ptr<T>` 在 `bytecode_ptr.h:56`，它同时记录指针与字节数，`size()` 返回字节数（`bytecode_ptr.h:119`）；`make_zeroed_bytecode_ptr()` 在 `bytecode_ptr.h:152`，先分配再清零。`RoseEngine` 与内部的表都放在同一块连续内存里，因此可以整体序列化、整体释放，这也是数据库能做到零拷贝分发的前提。
+
+下表把五个阶段的输入输出与入口放在一起，便于建立索引；参数与标志的完整语义见 04 册，不在本表重复。
+
+| 阶段 | 主要输入 | 主要输出 | 源码入口 |
+|---|---|---|---|
+| 解析 | 模式文本、编译标志 | 组件树 `Component` | `src/parser/Parser.rl` 的 `parse()` |
+| 建图 | 组件树、`ReportManager` | `NGHolder` | `compiler.cpp` 的 `buildGraph()` |
+| 归约 | `NGHolder` | 化简后的图与组件切分 | `ng.cpp` 的 `reduceGraph()`、`calcComponents()` |
+| 分解 | 若干 `NGHolder` | Rose 图与字面量表 | `ng.cpp` 的 `addGraph()` |
+| 落库 | Rose 图 | `RoseEngine` 与 `hs_database` | `rose_build_compile.cpp` 的 `buildRose()` |
+
+本篇只负责把调用链讲通，具体字段、参数与模块边界分别以对应分册为准（字段见 05-05 ｜ 参数见 04-02 ｜ 模块见 07-03）。
+
+### 4. 关键流程与调用链
+
+第一步在公共 API 层。`hs_compile()`（`src/hs.cpp:436`）先把单模式包装成单元素数组，直接调用 `hs_compile_multi_int()`（`src/hs.cpp:167`）；`hs_compile_multi()` 与 `hs_compile_ext_multi()` 也走同一个内部函数，只是传入的数组长度与扩展参数不同。这个函数先做参数校验：`db`、`expressions` 不能为空，`elements` 不能为零；随后在 `FAT_RUNTIME` 构建下检查 SSSE3 是否可用，不可用直接返回 `HS_ARCH_ERROR`；接着 `checkMode()` 校验扫描模式，`checkPlatform()` 校验目标平台描述，最后用 `limitPatternCount` 限制模式总数。
+
+第二步建立编译上下文。`CompileContext cc(isStreaming, isVectored, target_info, g)` 把「是否流式」「是否向量模式」「目标平台」「灰盒配置」四件事固定下来，这些值在整次编译中不再变化。随后 `NG ng(cc, elements, somPrecision)` 构造全局图容器；`NG` 的构造函数会创建报告管理器、SOM 槽位管理器、SmallWrite 构建器和 Rose 构建器。注意 `somPrecision` 来自模式位，如果流式模式下使用了 SOM 标志却没有指定 horizon，后面的 `addExpression` 会直接抛错。
+
+第三步逐条处理表达式。`addExpression()`（`compiler.cpp:336`）先判断是否为逻辑组合：组合表达式不走常规解析，而是交给 `ng.rm.pl.parseLogicalCombination()`，并且只允许 `QUIET`、`SINGLEMATCH` 与少量扩展参数。普通表达式则构造 `ParsedExpression`，其构造函数内部调用 `parse(expression, mode)` 得到组件树；解析失败会抛 `ParseError`，`hs_compile_multi_int` 捕获后设置表达式下标再原样抛出，保证错误能定位到具体模式。
+
+解析之后是一串语义检查。若开了 `HS_FLAG_PREFILTER`，先跑 `prefilterTree()` 做预过滤改写；随后 `checkUnsupported()` 遍历组件树，拒绝零宽断言、原子组、反向引用、条件引用、`\X`、占有量词以及 UCP 模式下的 `\b`；再调用 `checkEmbeddedStartAnchor()` 与 `checkEmbeddedEndAnchor()` 检查嵌入锚点是否合法；若灰盒开启组件树优化，`optimise()` 会在没有 `min_length` 与 SOM 的前提下做简化。之后才轮到 `shortcutLiteral()`：如果组件树能折叠成一个确定字面量（单字符类、固定次数重复、无分支与断言），直接走 `ng.addLiteral()`，跳过建图。
+
+第四步建图。`buildGraph()` 先 `makeNFABuilder()` 创建位置构造器，再 `makeGlushkovBuildState()` 创建构造状态；`notePositions()` 为组件树的每个位置分配顶点；`connectInitialStates()` 把 `start` 与 `startDs` 接到所有首位置；`buildFollowSet()` 递归计算后继关系；`connectFinalStates()` 把尾位置接到接受顶点；`buildEdges()` 一次性落边；`getGraph()` 取出 `NGHolder`；最后 `removeAssertVertices()` 处理断言顶点。这里任何一步发现图不可能匹配、或图过大，都会抛出 `CompileError`。
+
+第五步归约与分解。`NG::addGraph()` 先清理无效报告、确保 UTF-8 起点对齐、检查 `can_never_match()`；然后 `resolveAsserts()` 解析断言、`make_fuzzy()` 处理近似匹配、`pruneUseless()` 与 `pruneEmptyVertices()` 删无用顶点；接着传播并归约扩展参数、拆分 vacuous 模式、把图交给 SmallWrite 构建器、尝试 `splitOffLiterals()` 把贯穿整图的字面量摘走；再用 `calcComponents()` 把图拆成若干连通分量，逐分量调用 `addComponent()`，依次尝试 SEP、SOM、anchored acyclic、小字面量集、固定宽度、装饰字面量、Violet、puff、outfix 等处理路径。全部失败则抛 `Pattern is too large.`。
+
+第六步落库。`build()` 调 `generateRoseEngine()`，后者用 `ng.minWidth` 计算最小宽度（无限宽用 `ROSE_BOUND_INF`），再调 `ng.rose->buildRose(minWidth)`。`buildRose()` 内部完成角色合并、后缀转换、Castle 原型生成、历史分配、别名化与分组，最后 `buildFinalEngine()` 按「原型 `RoseEngine` → 分配 → 拷贝 → 写状态初始化表 → 写引擎 blob」的顺序落地。`dbCreate()` 再把这串字节码复制进 `hs_database`，按 64 字节对齐调整 `bytecode` 偏移，写入 `magic`、`version`、`length`、`platform`，并对字节码与头部各算一次 HMAC-SHA256。
+
+整条链路的阶段划分与数据流见图 06-01-01。
+
+:::figure id=06-01-01 | name=从正则文本到 hs_database 的五个阶段 | dir=TD
+node n1 "正则文本与标志" blue
+node n2 "Parser：组件树" teal
+node n3 "NG：Glushkov 图" teal
+node n4 "Reduction：化简" teal
+node n5 "RoseBuild：角色分解" amber
+node n6 "RoseEngine 字节码" amber
+node n7 "hs_database 与 HMAC" green
+node n8 "hs_compile 返回" blue
+edge n1 -> n2 "parse()"
+edge n2 -> n3 "buildGraph()"
+edge n3 -> n4 "reduceGraph()"
+edge n4 -> n5 "addGraph()"
+edge n5 -> n6 "buildRose()"
+edge n6 -> n7 "dbCreate()"
+edge n7 -> n8 "HS_SUCCESS"
+:::
+
+失败并不只发生在解析阶段。图 06-01-02 把四类异常出口与它们最终落到的返回码画在一起：解析错误、语义与标志冲突、资源上限、内存不足，最后都被 `hs_compile_multi_int` 收敛为 `HS_COMPILER_ERROR`，只是错误文本与 `expression` 下标不同。
+
+:::figure id=06-01-02 | name=编译失败的四个出口与统一返回 | dir=LR
+node e1 "addExpression" blue
+node e2 "ParseError：语法" red
+node e3 "CompileError：语义" red
+node e4 "ResourceLimitError" red
+node e5 "hs_compile_error_t" amber
+node e6 "HS_COMPILER_ERROR" gray
+edge e1 -> e2 "词法或语法"
+edge e1 -> e3 "标志或构造"
+edge e1 -> e4 "图或角色超限"
+edge e2 -> e5 "带下标"
+edge e3 -> e5 "带下标"
+edge e4 -> e5 "无下标"
+edge e5 -> e6 "统一出口"
+:::
+
+### 5. 配置/命令/代码实例
+
+下面的 C 程序走完整生命周期：编译一条带 SOM 的模式、打印数据库信息、分配 scratch、扫描一段数据、释放全部对象。它刻意只用一个模式，便于把回调里的 `id` 与 `from`、`to` 对上号。完整标志表见 04-02，模式常量见 04-03，这里不重复参数清单。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int on_match(unsigned int id, unsigned long long from,
+                    unsigned long long to, unsigned int flags, void *ctx) {
+    (void)flags;
+    (void)ctx;
+    printf("match id=%u [%llu, %llu)\n", id, from, to);
+    return 0; /* 返回 0 表示继续扫描 */
+}
+
+int main(void) {
+    const char *pattern = "GET /[a-z]+ HTTP/1\\.[01]";
+    const char *data = "x GET /index HTTP/1.1 y";
+    hs_database_t *db = NULL;
+    hs_scratch_t *scratch = NULL;
+    hs_compile_error_t *err = NULL;
+
+    if (hs_compile(pattern, HS_FLAG_CASELESS | HS_FLAG_SOM_LEFTMOST,
+                   HS_MODE_BLOCK, NULL, &db, &err) != HS_SUCCESS) {
+        fprintf(stderr, "compile failed: %s (expr %d)\n",
+                err->message, err->expression);
+        hs_free_compile_error(err);
+        return 1;
+    }
+
+    char *info = NULL;
+    if (hs_database_info(db, &info) == HS_SUCCESS) {
+        printf("%s\n", info);
+        free(info); /* 由默认 misc 分配器分配，需由调用方释放 */
+    }
+
+    if (hs_alloc_scratch(db, &scratch) != HS_SUCCESS) {
+        hs_free_database(db);
+        return 1;
+    }
+
+    if (hs_scan(db, data, (unsigned)strlen(data), 0, scratch,
+                on_match, NULL) != HS_SUCCESS) {
+        fprintf(stderr, "scan failed\n");
+    }
+
+    hs_free_scratch(scratch);
+    hs_free_database(db);
+    return 0;
+}
+```
+
+在一台支持 AVX2 的机器上以 5.4.2 编译运行，输出形如下面的文本。示例输出，具体格式需对照实际版本核验。
+
+```text
+Version: 5.4.2 Features: AVX2 Mode: BLOCK
+match id=0 [2, 21)
+```
+
+逐行判读。第一行来自 `hs_database_info()`，格式串在 `src/database.c:3357` 固定为「Version: 主.次.修订 Features: 特性 Mode: 模式」。`5.4.2` 对应 `HS_MAJOR/MINOR/PATCH`；`AVX2` 说明数据库的目标平台允许 AVX2，若目标机不支持任何向量特性，这一段会是空串；`BLOCK` 说明编译时用了 `HS_MODE_BLOCK`，同一份数据库不能拿到流式接口上使用，否则会得到 `HS_DB_MODE_ERROR`。第二行来自回调：`id=0` 是单模式编译时默认的外部报告号，`from=2` 是 `GET` 的起始偏移，`to=21` 是结束偏移且为开区间，即最后一个匹配字节的下标是 20；若没有开 `HS_FLAG_SOM_LEFTMOST`，`from` 不具语义，只有 `to` 可信。偏移都相对于本次扫描缓冲区起点，block 模式下不存在跨块换算问题。
+
+命令行侧可以用 `hscheck` 做「能不能编译」的快速判定。`-N` 表示 block 模式，`-s` 指定签名文件，具体选项全集见 04-07。
+
+```bash
+hscheck -N -s patterns.txt
+```
+
+`hscheck` 的价值不在吞吐，而在把「编译期拒绝」与「运行期不命中」分开：如果这里就失败，后面的扫描结果没有解释意义。反过来，如果 `hscheck` 通过而业务侧仍然不命中，问题通常落在模式语义、标志组合或数据边界上，应转到 08 册的诊断树。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，不要把编译当成廉价操作。流水线里有多次全图遍历与多轮化简，`buildRose()` 还要做角色合并与状态排布；模式集合越大、重复越多、分支越复杂，编译时间与峰值内存增长得比线性更快。生产环境的正确姿势是编译一次、序列化分发、`hs_deserialize_database()` 加载，而不是每次进程启动都重新编译。数据库是不可变对象，这也意味着运行期没有任何「热更新单条模式」的接口，更新只能换库。
+
+第二，要理解「编译成功」与「按预期匹配」是两件事。`hs_compile` 只保证模式被接受并且字节码自洽，不保证它符合你的业务语义。典型偏差来自 `HS_FLAG_PREFILTER`：预过滤模式允许漏报，换来更小的图和更高的吞吐；如果误把它当成精确匹配开关，就会出现「明明有却报不出」的现场。另一个偏差来自 `HS_FLAG_SINGLEMATCH`：它只保证每条流最多报一次，不保证报的是最早或最左的那一次。
+
+第三，注意模式长度与图规模的双重限制。`limitPatternLength` 在 `addExpression()` 入口就会拦下过长的模式；`ComponentRepeat` 还有 `MAX_REPEAT`（32767）与 `MAX_POSITIONS_EXPANDED`（500000）两道闸门，超过就抛「Bounded repeat is too large.」。这两类错误都发生在图构造前后，错误文本不同，处理方式也不同：前者应缩短模式或拆分，后者应把大重复改写成等价但更紧凑的形式，或依赖 `ng_lbr.cpp` 的大重复路径。
+
+第四，SOM 不是随便加的。流式模式下使用 `HS_FLAG_SOM_LEFTMOST` 必须同时指定 SOM horizon（`HS_MODE_SOM_HORIZON_LARGE/MEDIUM/SMALL`），否则 `addExpression()` 会抛「an SOM precision mode must be specified」。SOM 还会与 `SINGLEMATCH`、`PREFILTER` 互斥，组合会直接编译失败；部分有界重复在开 SOM 后也无法编译。这些都不是运行期能补救的，必须在写模式时决定。
+
+第五，留意平台绑定。`dbCreate()` 把 `target_to_platform()` 的结果写进 `platform` 字段；数据库跨机器分发时，如果目标机缺少编译时假定的指令集，加载会返回 `HS_DB_PLATFORM_ERROR`。fat runtime 构建下，一份库可以在多代 CPU 上分派，但数据库里的平台位仍然是对编译目标的承诺，不能用「库能跑」推断「库一定能加载这份数据库」。
+
+第六，谨慎对待纯字面量旁路。`shortcutLiteral()` 只处理不涉及混合大小写的字面量；`NG::addLiteral()` 里的 `mixed_sensitivity()` 检查会把混合大小写退回完整图处理。`hs_compile_lit` 更是完全绕过解析器，扩展参数一律拒绝，空串也拒绝。若你的模式本来是字面量，却因为大小写混写而没有走快速路径，不要误判为「Hyperscan 对字面量不优化」，应先检查字面量形态。
+
+第七，错误处理要看出口。`hs_compile_multi_int()` 对 `CompileError`、`std::bad_alloc` 与未知异常分别处理：前者生成带 `expression` 下标的错误对象，中者返回预置的「Unable to allocate memory.」，后者返回内部错误。`hs_free_compile_error()` 对三个静态错误对象做了特判，不会重复释放；但调用方仍然必须在每次失败后释放，否则会泄漏错误文本。
+
+### 7. 小结与延伸阅读
+
+本篇建立了整册的骨架：`hs_compile` 把模式交给 `hs_compile_multi_int`，在那里建立 `CompileContext` 与 `NG`，逐条 `addExpression` 完成解析、检查、建图与分解，最后由 `build()` 生成 `RoseEngine` 并包进带 HMAC 的 `hs_database`。五个阶段的产物分别是组件树、`NGHolder`、Rose 图、`RoseEngine` 与数据库；每往后一步，信息更少、决策更硬、运行期更不可改。
+
+如果只记住三件事：第一，编译期的判定点决定了运行期的路径，吞吐差异通常不是调参能解决的；第二，能力边界（SOM、近似、流式）在编译期就以字段和表的形式固化；第三，编译昂贵且数据库不可变，生产部署应以序列化分发为主。
+
+延伸阅读建议按顺序进行：06-02 看解析器如何把 PCRE 子集变成组件树，并理解哪些构造在解析期就被拒绝；06-03 看 Glushkov 构造与化简如何控制图规模；06-04 看 Rose 如何把图切成字面量与 NFA 两类角色；06-05 看字面量前端如何在 Teddy、Fat Teddy 与 FDR 之间选择。结构体字段随时查 05-05 与 05-08，API 与标志查 04-02、04-03、04-04，模块边界查 07-03 与 07-04。
+
+## 06-02 PCRE 语法解析与组件树构造
+
+### 1. 背景与动机
+
+Hyperscan 的语法跟随 PCRE，但它不是 PCRE 的实现。它需要在解析阶段就判断「这个构造能不能被自动机表达」，并且要把「不能」尽早变成一条可读的编译错误，而不是等到建图时才发现状态爆炸。组件树就是为此设计的中间层：它比原始文本更结构化，比自动机更接近语法，既能承载 `first()`、`last()` 这类图构造查询，也能被 `checkUnsupported()` 这样的访问器整体扫描。
+
+理解解析层有三个直接用处。第一，解释错误文本。`Zero-width assertions are not supported.`、`Back-references are unsupported.`、`Possessive quantifiers are not supported.` 这些话都来自解析后的组件树检查，而不是图构造；知道来源就能判断「换写法」是否有意义。第二，解释语义差异。`\b` 在普通模式下可用，在 UCP 模式下被拒绝；`^`、`$` 是边界组件，不是零宽断言；UTF-8 与大小写不敏感同时开启时，字面量会被提升为字符类。这些都不是文档随口一提，而是解析器的具体分支。第三，解释性能。组件树的形状直接影响 Glushkov 图的位置数：一个 `{0,1000}` 的重复会复制上千份子图，而一个字符类只占一个位置。
+
+需要先纠正一个常见说法。很多资料把 `src/parser/` 描述为「递归下降解析器」，但在这个 5.4.2 快照里，真正的解析器是由 Ragel 从 `src/parser/Parser.rl` 生成的状态机，配合一个显式的 `sequences` 栈来管理嵌套分组，而不是一组互相递归的 `parseAtom`、`parseRepeat` 函数。源码中能看到 `%% write init;` 与 `%% write exec;`（`Parser.rl:1983`、`Parser.rl:1984`），以及 `PUSH_SEQUENCE`、`POP_SEQUENCE` 宏（`Parser.rl:79`、`Parser.rl:84`）。说它「按递归结构组织语义」可以，说它「用递归下降实现」不准确；涉及实现细节时应以 `Parser.rl` 为准。
+
+### 2. 核心概念
+
+解析的输入是「以 NUL 结尾的模式文本 + `ParseMode`」，输出是一棵 `Component` 树。`ParseMode` 是一个很小的结构，保存 `caseless`、`dotall`、`multiline`、`ucp`、`utf8` 等布尔量（`src/parser/Parser.h:56` 起）。它不是全局常量，而是会随分组内联选项变化：`(?i)`、`(?s)`、`(?m)` 这类内联标志会在进入分组时压栈、离开时恢复，所以解析器用 `ExprState` 保存「当前序列 + 进入偏移 + 当时的模式」（`Parser.rl:88`）。
+
+组件树的节点类型可以按「组合」与「原子」两类理解。组合节点有 `ComponentSequence`（串联）、`ComponentAlternation`（分支）、`ComponentRepeat`（量词）；原子节点有 `ComponentClass`（ASCII 与 UTF-8 两个派生）、`ComponentByte`（单字节）、`ComponentEmpty`（空）、`ComponentBoundary`（`^`、`$`）、`ComponentWordBoundary`（`\b`、`\B`）。此外还有一批「解析得出、但检查时拒绝」的节点：`ComponentAssertion`（前后向断言）、`ComponentAtomicGroup`、`ComponentBackReference`、`ComponentCondReference`、`ComponentEUS`（`\X`）。它们存在的意义不是被实现，而是让错误信息能精确到构造类型与位置。
+
+`Component` 基类定义了图构造所需的三个语义查询：`first()` 返回「可能作为起点的位置集合」，`last()` 返回「可能作为终点的位置集合」，`empty()` 表示「是否可以匹配空串」。这三个查询是 Glushkov 构造的接口，组件树不需要知道状态编号，只需要回答「我的首位置、尾位置、是否可空」。`notePositions()` 与 `buildFollowSet()` 则把「分配位置」和「连接后继」分开，前者只数位置，后者才落边；这种两阶段设计让重复展开可以先算总量、再决定是否超限。
+
+分支的表示值得单独说明。`ComponentSequence` 并不在每次遇到 `|` 时立刻建一个 `ComponentAlternation`，而是先把「左分支」的 children 换进一个子序列、追加到 `alternation`，等到 `finalize()` 时再把整个 alternation 作为唯一孩子放回。`addAlternation()` 与 `finalize()` 的实现见 `src/parser/ComponentSequence.cpp:141` 与 `:151`。这意味着解析过程中树的形状是「边解析边折叠」的，最终每个分组都收敛为一个 sequence 或 alternation，便于后续统一处理。
+
+`empty()` 的语义值得单独说明。它回答的是「这个组件能否在不消耗字符的情况下完成」，而不是「这个组件是不是空串」；一个带 `*` 的组件通常 `empty()` 为真，因为它可以选择零次。这个查询直接影响 Glushkov 的首尾集合：如果前一个孩子可空，后一个孩子的 `first` 也要并入当前序列的 `first`。整棵树都可空时，`addExpression()` 会在建图后用 `matches_everywhere()` 检查，未开 `HS_FLAG_ALLOWEMPTY` 就抛「Pattern matches empty buffer; use HS_FLAG_ALLOWEMPTY to enable support.」。
+
+量词由 `ComponentRepeat` 表示，构造时带最小、最大与贪心类型。`RepeatType` 有三个值：`REPEAT_NONGREEDY`、`REPEAT_GREEDY`、`REPEAT_POSSESSIVE`（`ComponentRepeat.h:83`）。对 Hyperscan 而言，贪婪与非贪婪在「是否报告匹配」上没有区别，因为自动机不接受回溯语义；占有量词只在预过滤模式下被容忍，普通模式下会被 `checkUnsupported()` 拒绝。`ComponentSequence::addRepeat()` 还要求最后一个孩子 `repeatable()`，因此不能对断言、边界这类零宽节点直接加量词（`ComponentSequence.cpp:123`）。
+
+解析后的 `optimise()` 也会改写量词。它只在没有 `min_length` 与 SOM 时运行；`ComponentRepeat::optimise()` 在「根连接到 startDs」时会把 `m_max` 压成 `m_min`（`src/parser/ComponentRepeat.cpp:226`），理由是末尾多出的重复不会改变「是否匹配」的结论。这个改写能显著缩小图，但也意味着 `hsdump` 的 `orig` 与 `opt` 两个阶段看到的组件树形状可能不同；对比时要以阶段名为准。
+
+UTF-8 与 UCP 是解析层最容易被低估的部分。开启 `HS_FLAG_UTF8` 后，解析器必须把多字节字符当成一个位置，而不是逐字节；`addLiteral()` 在 `utf8 && caseless` 时会「借助字符类生成顶点」，因为一个 Unicode 字符的大小写折叠可能对应多个码点（`Parser.rl:172` 起）。`ComponentClass` 有 ASCII 与 UTF-8 两个实现，`getComponentClass(mode)` 按模式选择。开启 `HS_FLAG_UCP` 后，`\b` 的词边界语义依赖 Unicode 属性，当前实现不支持，除非同时开预过滤；这就是 `ComponentWordBoundary` 检查里 `c.ucp && !c.prefilter` 的来源（`src/parser/unsupported.cpp:71`）。
+
+最后要理解「检查发生在什么时候」。词法与语法错误在 Ragel 状态机执行时抛出 `LocatedParseError`，由 `parse()` 的 catch 块补上偏移；构造性拒绝（断言、反向引用、占有量词、UCP 词边界）发生在 `parse()` 返回之后的 `checkUnsupported()`；标志冲突（SOM 与 SINGLEMATCH、SOM 与 PREFILTER、未知标志）发生在 `ParsedExpression` 构造函数里；图规模限制发生在 `notePositions()` 的重复展开处。四类错误都在 `hs_compile` 返回之前发生，运行期不会再有「这个构造不支持」的异常。
+
+### 3. 关键数据结构与源码位置
+
+解析器的源文件是 `src/parser/Parser.rl`，构建时由 Ragel 生成 `Parser.cpp`；仓库快照里只有 `.rl` 源文件，生成的 `.cpp` 在构建目录中。入口函数 `parse()` 在 `Parser.rl:1915`，它先调用 `read_control_verbs()` 处理 `(*UTF8)`、`(*UCP)` 这类控制动词，再初始化状态机并执行。机器定义从 `Parser.rl:274` 的 `machine regex;` 开始，字符类、转义、量词、分组、内联选项都在同一个状态机里。
+
+组件基类在 `src/parser/Component.h:58`，纯虚接口包括 `clone()`、`accept()`、`first()`、`last()`、`empty()`、`notePositions()`、`buildFollowSet()`。派生类的头文件与实现一一对应：`ComponentSequence`、`ComponentAlternation`、`ComponentRepeat`、`ComponentClass`、`AsciiComponentClass`、`Utf8ComponentClass`、`ComponentBoundary`、`ComponentWordBoundary`、`ComponentAssertion`、`ComponentBackReference`、`ComponentCondReference`、`ComponentAtomicGroup`、`ComponentEUS`、`ComponentByte`、`ComponentEmpty`。
+
+错误类型在 `src/parser/parse_error.h`。`ParseError` 继承自 `CompileError`（`parse_error.h:43`），`LocatedParseError` 额外记录偏移并在 `locate()` 时把偏移拼进错误文本（`parse_error.h:52`）。`CompileError` 定义在 `src/util/compile_error.h`，带 `reason`、`hasIndex`、`index` 三个关键信息，最终由 `generateCompileError()` 转成 `hs_compile_error_t`。
+
+不支持构造的检查在 `src/parser/unsupported.cpp`，访问器是 `UnsupportedVisitor`，继承 `DefaultConstComponentVisitor`，对每类节点重载 `pre()` 并抛错。引用合法性检查在 `src/parser/check_refs.cpp`，由 `checkReferences()` 统一执行；它保证 `\1` 这类引用指向存在的捕获组，即使反向引用本身最终会被拒绝，编号检查仍然要先做，否则错误信息会变成「引用不存在」而不是「反向引用不支持」。
+
+占位与位置的数据结构在 `src/parser/position.h` 与 `src/parser/position_info.h`。`Position` 是整数编号，`PositionInfo` 在编号之外还带标志位，用于表示「这个位置是否可以作为起点」「是否带断言」等。`GlushkovBuildState` 在 `src/parser/buildstate.h:52`，它持有 `NFABuilder`，提供 `connectRegions()`、`connectAccepts()`、`buildEdges()` 以及 `POS_EPSILON` 常量（`buildstate.h:58`）。构造器与构造状态的分工是：`NFABuilder` 管顶点与边，`GlushkovBuildState` 管「首尾集合如何接线」。
+
+下表按「组件类型—语义—是否被拒绝—拒绝位置」列出常见节点，便于把错误文本对上源码。单元格只写结论，完整语法清单见 04-08。
+
+| 组件 | 语义 | 当前状态 | 拒绝位置 |
+|---|---|---|---|
+| `ComponentSequence` | 串联 | 支持 | 无 |
+| `ComponentAlternation` | 分支 | 支持 | 无 |
+| `ComponentRepeat` | 量词 | 支持，占有型除外 | `unsupported.cpp` |
+| `ComponentClass` | 字符类 | 支持，含 UTF-8 变体 | 无 |
+| `ComponentBoundary` | 行首行尾 | 支持 | 无 |
+| `ComponentWordBoundary` | 词边界 | 非 UCP 支持 | `unsupported.cpp` |
+| `ComponentAssertion` | 前后向断言 | 不支持 | `unsupported.cpp` |
+| `ComponentBackReference` | 反向引用 | 不支持 | `unsupported.cpp` |
+
+组件树的节点字段与 `NG` 的对应关系见 05-08，解析相关的标志与语法参数见 04-02，模块边界见 07-01（字段见 05-08 ｜ 参数见 04-02 ｜ 模块见 07-01）。
+
+### 4. 关键流程与调用链
+
+解析从 `parse(ptr, globalMode)` 开始。第一步是 `read_control_verbs(p, pe, 0, globalMode)`，它识别模式最前面的 `(*UTF8)`、`(*UCP)`、`(*LIMIT_MATCH=...)` 之类控制动词，更新全局模式并前移指针。控制动词的语法在 `src/parser/control_verbs.rl`，与主解析器分开生成，这样主状态机不必为它们增加分支。
+
+第二步是状态机执行。`parse()` 准备 `cs`、`top`、`stack`、`ts`、`te` 等 Ragel 变量，以及 `accumulator`、`repeatN`、`repeatM`、`label`、`sequences` 等语义变量；然后 `%% write init;` 初始化，`%% write exec;` 执行。状态机每识别一个 token，就调用对应的语义动作：普通字符走 `addLiteral()`，转义走 `addEscaped()` 或 `addEscapedOctal()`、`addEscapedHex()`，分组开始走 `enterSequence()` 并把当前序列压入 `sequences`，分组结束走 `POP_SEQUENCE`，`|` 走 `currentSeq->addAlternation()`，量词走 `currentSeq->addRepeat()`。
+
+第三步是收尾检查。状态机跑完后，`parse()` 检查指针是否停在末尾、字符类是否闭合、注释是否闭合、`sequences` 是否为空；`sequences` 非空说明有未闭合的括号，错误文本会带上进入时的偏移。随后检查 `groupIndex` 是否超过 65535，这是捕获组编号的上限，超过就抛「The maximum number of capturing subexpressions is 65535.」。最后 `currentSeq->finalize()` 把顶层分支折叠，`checkReferences()` 校验所有命名与编号引用，返回根 `ComponentSequence`。
+
+第四步是解析后的语义检查，发生在 `compiler.cpp` 的 `addExpression()` 里。顺序是：`prefilterTree()`（仅预过滤）、`checkUnsupported()`、`checkEmbeddedStartAnchor()`、`checkEmbeddedEndAnchor()`、`optimise()`。`checkEmbeddedStartAnchor()` 与 `checkEmbeddedEndAnchor()` 不是「拒绝锚点」，而是检查锚点是否出现在不允许的位置，例如分支的一侧有 `^` 而另一侧没有，可能导致语义无法用单一自动机表达；具体判定在各组件的同名虚函数里。
+
+第五步是进入图构造。`buildGraph()` 调用 `pe.component->notePositions(*bs)`，组件树递归回答「我有几个位置」；`connectInitialStates()` 取 `first()` 接起点；`buildFollowSet()` 从首位置集合出发递归计算后继；`connectFinalStates()` 取 `last()` 接接受点；`buildEdges()` 落边。组件树的使命到此结束，之后的所有处理都在 `NGHolder` 上。
+
+组件树的形状与解析阶段的折叠关系见图 06-02-01。图中把「根序列」「分支」「量词」「字符类」与「被拒绝的断言」画在一起，注意断言节点在进入建图前就会被 `checkUnsupported()` 拦下。
+
+:::figure id=06-02-01 | name=组件树的节点家族与解析后检查 | dir=TD
+node c1 "parse()" blue
+node c2 "ComponentSequence<br/>根序列" teal
+node c3 "ComponentAlternation<br/>分支" teal
+node c4 "ComponentRepeat<br/>量词" teal
+node c5 "ComponentClass<br/>字符类" teal
+node c6 "ComponentAssertion<br/>零宽断言" amber
+node c7 "ComponentBoundary<br/>与 WordBoundary" amber
+node c8 "checkUnsupported()" red
+node c9 "NGHolder" green
+edge c1 -> c2 "根"
+edge c2 -> c3 "遇到竖线"
+edge c3 -> c4 "分支内量词"
+edge c2 -> c4 "量词"
+edge c4 -> c5 "原子"
+edge c2 -> c5 "字面量"
+edge c2 -> c6 "断言语法"
+edge c2 -> c7 "锚点"
+edge c6 -> c8 dashed "拒绝"
+edge c7 -> c8 dashed "UCP 时拒绝"
+edge c2 -> c9 "notePositions()"
+:::
+
+### 5. 配置/命令/代码实例
+
+下面的程序用 `hs_expression_info()` 观察两条模式的静态信息，再用 `hs_compile()` 触发一次「不支持构造」的错误。`hs_expression_info()` 只做解析与建图，不生成数据库，因此很适合在写模式阶段做快速体检。完整 API 签名见 04-04。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static void show_info(const char *pat, unsigned flags) {
+    hs_expr_info_t *info = NULL;
+    hs_compile_error_t *err = NULL;
+    hs_error_t rc = hs_expression_info(pat, flags, &info, &err);
+    if (rc != HS_SUCCESS) {
+        printf("pattern=%s rc=%d msg=%s expr=%d\n",
+               pat, (int)rc, err->message, err->expression);
+        hs_free_compile_error(err);
+        return;
+    }
+    printf("pattern=%s min=%u max=%u unordered=%u eod=%u only_eod=%u\n",
+           pat, info->min_width, info->max_width,
+           (unsigned)info->unordered_matches,
+           (unsigned)info->matches_at_eod,
+           (unsigned)info->matches_only_at_eod);
+    free(info); /* 由默认分配器分配，需由调用方释放 */
+}
+
+int main(void) {
+    show_info("a(b|c)+d", 0);
+    show_info("^foo[0-9]{2,4}$", 0);
+    show_info("(a)\\1", 0);
+
+    hs_database_t *db = NULL;
+    hs_compile_error_t *err = NULL;
+    hs_error_t rc = hs_compile("(a)\\1", 0, HS_MODE_BLOCK, NULL, &db, &err);
+    printf("compile rc=%d msg=%s expr=%d\n", (int)rc,
+           err ? err->message : "none", err ? err->expression : -1);
+    hs_free_compile_error(err);
+    return 0;
+}
+```
+
+一段可能的输出如下。示例输出，具体格式需对照实际版本核验。
+
+```text
+pattern=a(b|c)+d min=3 max=0 unordered=0 eod=0 only_eod=0
+pattern=^foo[0-9]{2,4}$ min=5 max=7 unordered=0 eod=0 only_eod=0
+pattern=(a)\1 rc=-4 msg=Back-references are unsupported. expr=0
+compile rc=-4 msg=Back-references are unsupported. expr=0
+```
+
+逐行判读。第一条 `a(b|c)+d` 的最小宽度是 3（一个 `a`、一个分支字符、一个 `d`），最大宽度为 0，表示没有有限上界；`unordered=0` 说明不会出现乱序报告，`eod=0` 说明不依赖数据末尾。第二条 `^foo[0-9]{2,4}$` 的最小宽度是 5（`foo` 三个字符加两位数字），最大宽度是 7（加四位数字），两个边界锚点让匹配宽度确定但位置受行首行尾约束。第三条在 `hs_expression_info()` 阶段就失败，返回码 `-4` 即 `HS_COMPILER_ERROR`，错误文本来自 `unsupported.cpp` 的 `ComponentBackReference` 分支，`expr=0` 表示第 0 条模式。最后一行用 `hs_compile()` 复现同一错误，说明两条 API 路径共用同一套解析与检查逻辑；若错误来自第 5 条模式，`expression` 就会是 5，调用方应把它当作数组下标而不是行号。
+
+命令行侧可以用 `hsdump` 把中间图与最终数据库转储出来，前提是构建时开了 `DUMP_SUPPORT`（默认 release 关闭，见 04-01）。`-N` 指定 block 模式，`-D` 转储数据库，`-o` 指定输出目录。
+
+```bash
+hsdump -N -D -o ./dump patterns.txt
+```
+
+转储目录里会按阶段生成组件树、`NGHolder` 的 dot 文件与 `RoseEngine` 的文本描述，适合对照本篇的节点类型与 06-03 的图结构。具体文件名与格式在不同版本间可能变化，需对照实际版本核验。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，不要用 PCRE 的完整语法心智模型来写 Hyperscan 模式。Hyperscan 支持的是子集：没有反向引用、没有捕获语义、没有任意零宽断言、没有递归与条件模式、没有 `\C`、`\R`、`\K`，占有量词只在预过滤下被容忍。写模式时应先问「这个构造能否被有限自动机表达」，而不是「PCRE 能不能跑」。
+
+第二，区分「语法接受」与「语义支持」。`(?=...)` 能被 Ragel 状态机识别并构造成 `ComponentAssertion`，但随后被 `checkUnsupported()` 拒绝；反过来，`\b` 在普通模式下完全支持，在 UCP 模式下却被拒绝。错误发生在不同阶段，说明「换一种写法」的可行性不同：前者通常无解，后者可以关掉 UCP 或改预过滤。
+
+第三，注意内联选项的作用域。`(?i)` 只影响它所在的分组及其后续，解析器用 `ExprState` 压栈保存模式，离开分组时恢复。把 `(?i)` 写在分支内部与写在模式开头，得到的组件树不同，最终字节码也可能不同。若发现大小写行为不符合预期，应先用 `hsdump` 看组件树，而不是猜运行期。
+
+第四，UTF-8 不是「把字节当字符」。开启 `HS_FLAG_UTF8` 后，非法 UTF-8 输入会在 `ParsedExpression` 构造函数里被 `isValidUtf8()` 拒绝；字符类会按码点展开，`\x{...}` 与 `.` 的语义都随码点变化。UTF-8 与大小写不敏感组合时，字面量会被提升为字符类，图的位置数可能增加，编译时间与字节码规模也随之增加。
+
+第五，量词展开是编译期的主要规模来源。`{0,n}` 会复制 n 份子图，`{m,n}` 会复制 n 份并处理可选尾部；`MAX_POSITIONS_EXPANDED` 是 500000，超过就抛「Bounded repeat is too large.」。实践上应尽量把大重复写成「字符类 + 有界重复」而不是「复杂子表达式 + 大重复」，并避免在重复内部放分支嵌套。
+
+第六，捕获组只用于编号与引用检查，不产生捕获结果。Hyperscan 的回调只有 `id`、`from`、`to`、`flags`，没有子匹配数组；需要捕获组时应使用 Chimera（见 06-14 与 07-11）。这也意味着 `(?:...)` 与 `(...)` 在匹配语义上等价，差别只在捕获编号与引用检查，不会影响性能。
+
+第七，错误位置要会用。`LocatedParseError` 会把偏移拼进文本，`hs_compile_error_t.expression` 是模式下标；两者结合才能定位到「第几条模式的第几个字符」。若错误来自 `checkUnsupported()`，文本里通常没有偏移，只有构造名称，这时应结合 `hsdump` 的组件树定位。
+
+### 7. 小结与延伸阅读
+
+解析层的职责不是「读懂所有 PCRE」，而是「把可表达的子集变成组件树，把不可表达的构造尽早拒绝」。组件树用 `first()`、`last()`、`empty()` 三个查询把语法结构转成图构造所需的语义；`notePositions()` 与 `buildFollowSet()` 把「数位置」与「连后继」分开，为重复展开与规模限制留下控制点。解析器本身是 Ragel 状态机加显式 sequence 栈，而不是递归下降；涉及实现细节时应以 `Parser.rl` 为准。
+
+对使用者而言，最重要的三条结论是：不支持构造在解析期就会失败，不要指望运行期补救；内联选项与 UTF-8/UCP 会改变组件树形状，从而改变字节码；大重复是编译期规模的主要来源，写模式时要主动控制。
+
+延伸阅读：06-03 讲组件树如何变成 Glushkov 图，以及 `notePositions()` 的位置编号如何映射到顶点；06-04 讲 Rose 如何在这些图上做角色划分；07-01 从模块角度列 `src/parser/` 的文件清单与扩展点；04-08 给出完整语法支持与错误速查。组件树节点的逐字段定义不在本册展开，统一见 05-08 的 `NG` 与组件树对应关系。
+
+## 06-03 Glushkov 图构造、限制与冗余消除
+
+### 1. 背景与动机
+
+把正则变成自动机有两条经典路线：Thompson 构造与 Glushkov 构造。Thompson 图允许 epsilon 边，状态数大致与模式长度成正比，构造简单，但运行时要处理「不消耗字节的状态转移」，对位并行与状态压缩都不友好。Glushkov 图（也称位置自动机）没有 epsilon 边：每个顶点对应模式中的一个「字符位置」，每条边表示「这个位置之后可以紧接那个位置」。这样一来，运行期的每一步都严格消耗一个字节，状态推进与输入偏移一一对应，非常适合 Hyperscan 的流式与块式扫描模型。
+
+Hyperscan 选择 Glushkov 还有一层工程原因：位置天然可编号。解析阶段 `notePositions()` 按组件顺序分配位置，构造阶段用同一套编号建顶点，运行期的状态位图可以直接用位置编号索引。代价是图可能比 Thompson 大：一个 `{0,1000}` 的重复会复制 1000 份子图，边数随分支与重复组合增长。因此 `nfagraph` 里一半以上的代码不是「建图」，而是「化简」与「限制」：在保证语义不变的前提下删边、删点、合并等价状态、把大重复拆成专用引擎，避免图规模把编译时间和字节码撑爆。
+
+理解这一层能解释很多现场现象。为什么 `a{1,1000}` 能编译而 `(abcdefghij){1,100000}` 直接报「Bounded repeat is too large.」？为什么两条语义等价的正则，一条生成的数据库比另一条小一半？为什么开了 SOM 之后某些本来能编译的模式失败？答案都在 Glushkov 构造与随后的化简规则里。本篇按「构造 → 归约 → 切分 → 交给 Rose」的顺序展开，图规模与限制贯穿始终。
+
+需要说明本册的版本边界。本篇核对的是 5.4.2 快照；任务清单里提到的 `src/nfagraph/ng_limit.cpp` 与 `ng_vivify.cpp` 在这个快照中并不存在（用 `find` 与全仓 grep 均无结果）。与「限制大重复」相关的职责落在 `src/nfagraph/ng_repeat.cpp`（`tooLargeToImplement()`、`processSubgraph()`）、`src/nfagraph/ng_puff.cpp`（`splitOffPuffs()`）与 `src/nfagraph/ng_lbr.cpp`（`constructLBR()`）；与「图增强/活化」相关的职责落在 `src/nfagraph/ng_misc_opt.cpp`（`improveGraph()`、`enlargeCyclicCR()`）。若读者手中是别的版本，应以实际文件名为准，不要按旧文献的 `ng_limit`/`ng_vivify` 去索引。
+
+### 2. 核心概念
+
+Glushkov 构造的核心是「位置」与「后继关系」。给定正则，先为每个可消耗字符的位置分配一个编号；再计算三个集合：`first`（可能作为匹配起点的位置）、`last`（可能作为匹配终点的位置）、`follow(p)`（位置 p 之后可以紧接的位置）。构造时把每个位置变成一个顶点，把 `follow` 关系变成边，再把 `first` 接到起点、`last` 接到接受点。因为每个顶点都对应一个具体字符位置，图中不存在「空转移」，任意一条从起点到接受点的路径都对应一个长度确定的匹配。
+
+Hyperscan 的图里有四个特殊顶点，序号固定在普通位置之前：`start`（锚定起点）、`startDs`（dot-star 起点，表示任意偏移都可以开始）、`accept`（普通接受）、`acceptEod`（仅在数据末尾接受）。`N_SPECIALS` 等于 4（`src/nfagraph/ng_holder.h:95`），任何 `index < N_SPECIALS` 的顶点都是特殊顶点。`start` 与 `startDs` 的区别决定了模式是否锚定：只有 `start` 出发的路径要求匹配从缓冲区起点开始；`startDs` 出发的路径可以在任意偏移开始，这也是后面 Rose 判断 anchored 与 floating 的结构依据。
+
+位置编号不是随便分配的，它必须与组件树的遍历顺序一致。`notePositions()` 在每个组件上递归执行：遇到字符类或单字节就分配一个位置，遇到重复就先给子组件分配一份、再按份数复制。`ComponentRepeat::notePositions()` 里能看到 `posFirst`、`posLast`、`vcount` 与 `copies` 的计算，以及 `MAX_POSITIONS_EXPANDED` 的检查（`src/parser/ComponentRepeat.cpp:123` 的 `notePositions()`，上限判断在 `:160`）。这一步发生在建图之前，因此「重复太大」的错误在建图前就能抛出，避免先分配再失败。
+
+`buildFollowSet()` 是建边的核心。它从首位置集合出发，递归地让每个组件回答「在我之后可以接什么」。`ComponentSequence` 把前一个孩子的 `last` 接到后一个孩子的 `first`；`ComponentAlternation` 把每个分支的 `first` 与 `last` 分别汇总；`ComponentRepeat` 先构造一份子图，再用 `cloneFollowSet()` 复制剩余份数，最后用 `wireRepeats()` 把可选尾部接上。`cloneFollowSet()` 只复制边，不复制顶点语义，因此位置编号在复制后仍然连续，便于批量处理。
+
+断言在 Glushkov 图里以「带标志的边」或「带标志的顶点」表示，而不是独立的零宽状态。`resolveAsserts()` 在 `ng.cpp` 的 `addGraph()` 早期被调用，它把断言拆成带 `assert_flags` 的边，或在必要时分裂顶点。`removeAssertVertices()` 则在 `buildGraph()` 返回前清理临时断言顶点。断言的语义最终由运行期的 `NFA` 引擎检查，这也是为什么含断言的图不适合做激进的等价合并：合并可能把「带断言」与「不带断言」的路径混在一起。
+
+化简的目标不是「最小化」，而是「在可接受的时间内得到一个足够小且语义正确的图」。`reduceGraph()` 明确采用「最多三轮、直到不再变化」的策略（`ng.cpp:169` 的 `MAX_PASSES = 3`），因为完整的图最小化代价太高，而且很多冗余对运行期影响很小。三轮里依次跑边冗余、等价合并、顶点冗余、环路径冗余；之后再做区域冗余、图增强、循环支配点删除。这个顺序有讲究：先删边能减少后续等价判断的输入，先合并等价点能让冗余删除发现更多模式，最后做增强是为了不把刚扩大的字符集又当成冗余删掉。
+
+### 3. 关键数据结构与源码位置
+
+构造器接口在 `src/nfagraph/ng_builder.h`。`NFABuilder`（`ng_builder.h:55`）定义 `makePositions()`、`getStart()`、`getStartDotStar()`、`getAccept()`、`getAcceptEOD()`、`addCharReach()`、`setAssertFlag()`、`addEdge()`、`cloneRegion()`、`getGraph()` 等纯虚函数；实现是 `NFABuilderImpl`，构造函数在 `src/nfagraph/ng_builder.cpp:115`，`getGraph()` 在 `:155`。`makeNFABuilder()` 是唯一入口，返回 `unique_ptr<NFABuilder>`。
+
+构造状态在 `src/parser/buildstate.h:52`。`GlushkovBuildState` 持有 `NFABuilder` 引用，提供 `connectRegions()`（把一组尾位置接到一组首位置）、`connectAccepts()`（把尾位置接到接受点）、`buildEdges()`（真正落边）与 `POS_EPSILON` 常量（`buildstate.h:58`）。`POS_EPSILON` 是一个哨兵位置，表示「空串也能到达」，在 `connectInitialStates()` 里会被特殊处理成「起点直接接接受点」。`makeGlushkovBuildState()` 在 `buildstate.h:88` 声明。
+
+图容器是 `NGHolder`，定义在 `src/nfagraph/ng_holder.h:108`，继承自 `ue2_graph`。顶点属性 `NFAGraphVertexProps` 至少包含 `char_reach`（字符可达集）与 `reports`（该顶点触发的报告集合），字段细节见 05-08。`NGHolder` 还保存 `kind`（`NFA_PREFIX`、`NFA_INFIX`、`NFA_SUFFIX`、`NFA_OUTFIX` 等，定义在 `src/nfa/nfa_kind.h:46`）与四个特殊顶点句柄。`NG` 类在 `src/nfagraph/ng.h:63`，它持有全局 `ReportManager`、`SomSlotManager`、`SmallWriteBuild` 与 `RoseBuild`，字段见 05-08。
+
+化简 pass 的入口分散在多个头文件里，下表给出对应关系。注意这些函数都直接修改传入的 `NGHolder`，返回值表示「是否发生了变化」，`reduceGraph()` 用这个返回值决定是否继续下一轮。
+
+| Pass | 作用 | 源码位置 |
+|---|---|---|
+| `removeEdgeRedundancy` | 删除被更短路径覆盖的边 | `ng_edge_redundancy.cpp` |
+| `reduceGraphEquivalences` | 合并入边出边等价的顶点 | `ng_equivalence.cpp` |
+| `removeRedundancy` | 删除冗余顶点与冗余字符 | `ng_redundancy.cpp` |
+| `removeCyclicPathRedundancy` | 删除环上的重复路径 | `ng_cyclic_redundancy.cpp` |
+| `improveGraph` | 扩张循环顶点的字符可达集 | `ng_misc_opt.cpp` |
+| `removeRegionRedundancy` | 删除区域级冗余 | `ng_region_redundancy.cpp` |
+
+组件切分在 `src/nfagraph/ng_calc_components.cpp`。`calcComponents()` 在 `:406`，它把一个 `NGHolder` 拆成若干连通分量；如果灰盒关闭了 `calcComponents` 或图是「字符类分支」的简单形式，就退化为单分量。`recalcComponents()` 在 `:434`，用于在 `reformLeadingDots()` 之后重新切分。切分的意义是让 Rose 可以按分量独立尝试不同实现（字面量、固定宽度、NFA、outfix），一个分量失败不影响其他分量。
+
+区域分析在 `src/nfagraph/ng_region.cpp`，入口 `assignRegions()`（声明于 `ng_region.h:46`）。它把图划分为若干由入口与出口界定的区域，`removeRegionRedundancy()` 再用区域信息判断哪些区域可以被更简单的等价结构替代。区域分析与连通分量分析解决的是不同问题：前者面向「局部结构的冗余」，后者面向「整图的可拆分性」。
+
+大重复相关代码在 `src/nfagraph/ng_repeat.cpp`、`ng_puff.cpp`、`ng_lbr.cpp`。`tooLargeToImplement()`（`ng_repeat.cpp:494`）判断上下界是否超过 `REPEAT_INF`；`processSubgraph()` 判断一个 reached subgraph 是否是「纯重复」；`splitOffPuffs()`（`ng_puff.cpp:491`）把纯重复拆成 puff；`constructLBR()`（`ng_lbr.cpp:251` 起有多个重载）为大重复构造专用 NFA。这些路径与解析期的 `MAX_POSITIONS_EXPANDED` 是两道不同的闸门：解析期限制「展开后的位置数」，运行期实现限制「无法展开时能否用专用引擎表达」。
+
+图的字段定义、与重复相关的参数以及模块文件清单分别见 05-08、04-03、07-02（字段见 05-08 ｜ 参数见 04-03 ｜ 模块见 07-02）。
+
+### 4. 关键流程与调用链
+
+建图从 `compiler.cpp` 的 `buildGraph()` 开始（`compiler.cpp:713`）。第一步 `makeNFABuilder(rm, cc, pe)` 创建构造器，构造器内部会预分配四个特殊顶点；第二步 `makeGlushkovBuildState(*builder, pe.expr.prefilter)` 创建构造状态，预编译模式下会调整某些边的优先级；第三步 `pe.component->notePositions(*bs)` 递归分配位置，这一步可能抛出「Bounded repeat is too large.」；第四步 `connectInitialStates(*bs, pe)` 取组件树的 `first()`，剥掉其中的 `start` 与 `startDs`，把真正的首位置接到两个起点，并把 `POS_EPSILON` 转成「起点直接接接受点」。
+
+第五步 `buildFollowSet()`。初始集合是 `{startDs, start}`，组件树递归地把「前驱的 last」与「后继的 first」连起来。对 `ComponentSequence`，它按孩子顺序传递；对 `ComponentAlternation`，它把每个分支独立构建后再汇总；对 `ComponentRepeat`，它先构建一份，再按 `m_firsts.size()` 复制剩余份数，每一份的偏移是 `posLast + 1 - posFirst` 的整数倍，最后 `wireRepeats()` 把可选部分接到后续。第六步 `connectFinalStates()` 把 `last()` 接到 `accept` 与 `acceptEod`，具体接哪个取决于组件是否要求 EOD。第七步 `buildEdges()` 一次性把缓存的边写入图，避免边插入过程中反复重排。
+
+第八步 `getGraph()` 取出 `NGHolder`，`buildGraph()` 随即调用 `removeAssertVertices()` 清理断言临时顶点，并可选地 dump「00_before_asserts」的 dot 文件。至此 `buildGraph()` 的使命结束，图交给 `NG::addGraph()`。
+
+`NG::addGraph()` 的处理顺序在 `ng.cpp:326` 起。它先 `clearReports()` 删掉无法到达接受点的报告，再检查 SOM 与 vacuous 的冲突；`ensureCodePointStart()` 保证 UTF-8 模式下起点落在码点边界；`can_never_match()` 在早期就拒绝不可能匹配的图。随后 `resolveAsserts()` 解析断言（`src/nfagraph/ng_asserts.cpp:457`）、`make_fuzzy()` 处理编辑距离与汉明距离、`pruneUseless()` 与 `pruneEmptyVertices()` 删除无用顶点。扩展参数在这一段被传播与归约，若约束导致没有任何路径能到接受点，会抛「Extended parameter constraints can not be satisfied...」。
+
+接下来是「按表达式」的化简：UTF-8 模式下 `relaxForbiddenUtf8()` 放宽非法码点；高置信模式下 `pruneHighlanderAccepts()` 剪掉接受点的其他出边；`splitOffVacuous()` 把可匹配空串的部分拆成边界报告；`smwr->add()` 把图交给 SmallWrite 构建器；`removeRedundancy()` 与 `prunePathsRedundantWithSuccessorOfCyclics()` 再做一轮合并；`splitOffLiterals()` 尝试把贯穿整图的字面量摘给 Rose。若此时所有顶点都被认领（`num_vertices(g) == N_SPECIALS`），直接返回成功。
+
+之后再 `calcComponents()` 切分，非 SOM 模式下对每个分量 `reformLeadingDots()`（`src/nfagraph/ng_anchored_dots.cpp:642`）并 `recalcComponents()`，然后逐分量 `addComponent()`。`addComponent()` 的顺序是：`reduceExtendedParams()`、`reduceGraph()`、`removeRegionRedundancy()`；若图已空则返回；否则依次尝试 SEP、SOM、anchored acyclic、小字面量集、固定宽度、装饰字面量、Violet、puff，最后尝试 outfix。每条路径失败就继续下一条，全部失败则整个表达式报「Pattern is too large.」。
+
+`reduceGraph()` 的内部循环见图 06-03-01。它先在不带 SOM 时合并循环 dot-star，然后最多跑三轮：每轮依次 `removeEdgeRedundancy()`、`reduceGraphEquivalences()`、`removeRedundancy()`、`removeCyclicPathRedundancy()`，任一 pass 改变图就继续，整轮无变化就提前退出。三轮之后，UTF-8 模式做 `utf8DotRestoration()`，再 `improveGraph()` 扩张字符集并补一次边冗余，随后 `removeCyclicDominated()`、再次合并循环 dot-star、删除 `startDs` 的兄弟节点。
+
+:::figure id=06-03-01 | name=reduceGraph 的三轮化简与收敛 | dir=TD
+node r1 "reduceGraph()" blue
+node r2 "removeEdgeRedundancy" teal
+node r3 "reduceGraphEquivalences" teal
+node r4 "removeRedundancy" teal
+node r5 "removeCyclicPathRedundancy" teal
+node r6 "improveGraph" amber
+node r7 "removeCyclicDominated" amber
+node r8 "图不变或满三轮" gray
+edge r1 -> r2 "进入第一轮"
+edge r2 -> r3 "边已精简"
+edge r3 -> r4 "等价点合并"
+edge r4 -> r5 "顶点冗余"
+edge r5 -> r6 "有变化"
+edge r5 -> r8 dashed "无变化"
+edge r6 -> r7 "字符集扩张"
+edge r7 -> r2 dashed "下一轮"
+edge r7 -> r8 "收敛"
+:::
+
+为什么是三轮而不是「跑到不动」？因为某些 pass 的收益递减，而每轮都要遍历全图；在超大图上无限迭代会让编译时间不可控。三轮是一个经验折中：绝大多数图在两轮内收敛，第三轮主要处理 `improveGraph()` 之后新出现的边冗余。灰盒里的 `performGraphSimplification` 可以整体关闭化简，用于调试或对比，但生产环境不应关闭。
+
+### 5. 配置/命令/代码实例
+
+下面的程序用 `hs_expression_info()` 观察重复对图规模与宽度的影响。它不生成数据库，只跑到建图与信息提取，因此适合快速验证「这个重复会不会太大」。完整 API 见 04-04，灰盒与构建选项见 04-01。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static void show(const char *pat) {
+    hs_expr_info_t *ei = NULL;
+    hs_compile_error_t *err = NULL;
+    hs_error_t rc = hs_expression_info(pat, 0, &ei, &err);
+    if (rc != HS_SUCCESS) {
+        printf("%-24s error: %s\n", pat, err->message);
+        hs_free_compile_error(err);
+        return;
+    }
+    printf("%-24s min=%-6u max=%-6u\n", pat,
+           ei->min_width, ei->max_width);
+    free(ei); /* 默认分配器分配，调用方释放 */
+}
+
+int main(void) {
+    show("a{1,4}");
+    show("(ab){2,3}");
+    show("a{1,1000}");
+    show("(abcdefghij){1,100000}");
+    return 0;
+}
+```
+
+一段可能的输出如下。示例输出，具体格式需对照实际版本核验。
+
+```text
+a{1,4}                   min=1      max=4
+(ab){2,3}                min=4      max=6
+a{1,1000}                min=1      max=1000
+(abcdefghij){1,100000}  error: Bounded repeat is too large.
+```
+
+逐行判读。第一行 `a{1,4}` 的最小宽度是 1、最大宽度是 4，对应四个复制位置加可选尾部；第二行 `(ab){2,3}` 的最小宽度是 4（两份 `ab`）、最大宽度是 6（三份），说明重复的宽度按「子图宽度乘份数」累积；第三行 `a{1,1000}` 的最大宽度是 1000，位置数约 1000，仍在 `MAX_POSITIONS_EXPANDED` 之内，因此可以编译，但字节码会明显变大；第四行子图宽度为 10、份数上限 100000，展开后位置数约一百万，超过 500000 的上限，`ComponentRepeat::notePositions()` 在建图前就抛出「Bounded repeat is too large.」。这里的 `max=0` 在 `hs_expr_info_t` 里表示无有限上界，不要误读成「最大宽度为零」。
+
+若要看图本身，可以用 `hsdump` 导出 dot 文件。`-N` 指定 block 模式，`-o` 指定输出目录，`-X` 关闭中间产物（这里不要加）。
+
+```bash
+hsdump -N -o ./ngdump patterns.txt
+```
+
+导出的 dot 片段经简化后形如下面的文本。示例输出，具体格式需对照实际版本核验。
+
+```text
+digraph NFA {
+  v0 [label="start"];
+  v1 [label="startDs"];
+  v2 [label="0: a"];
+  v3 [label="1: b"];
+  v4 [label="accept"];
+  v0 -> v2;
+  v1 -> v2;
+  v2 -> v3 [label="a"];
+  v2 -> v4 [label="b"];
+  v3 -> v4 [label="b"];
+}
+```
+
+判读要点：`v0` 与 `v1` 分别对应锚定起点与任意起点，普通位置从 `v2` 开始编号；顶点标签里的 `0:`、`1:` 是位置序号，不是状态机编号；`startDs` 与 `start` 同时指向首位置，表示该模式既可以从缓冲区起点匹配，也可以从任意偏移匹配；`accept` 只有入边没有出边，是终点哨兵。若图中出现大量结构相同、只有位置序号不同的子图，通常意味着重复尚未被折叠或拆分，应结合 `reduceGraph()` 的 pass 顺序判断是「尚未化简」还是「化简后仍然必要」。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，不要期望 Glushkov 图会被「最小化」。`reduceGraph()` 只做保守的局部化简，不做完整的 DFA 最小化；等价状态合并也有保守条件（入边出边必须等价、不能带断言等）。因此「语义等价的两条正则生成同样大小的图」是不成立的，写模式时应尽量让结构简单、分支少、重复边界清晰。
+
+第二，大重复有两道闸门，含义不同。解析期的 `MAX_POSITIONS_EXPANDED` 限制「展开后的位置总数」，超过就编译失败；运行期的 `tooLargeToImplement()` 与 LBR 路径限制「不展开时能否用专用引擎表达」。前者可以通过改写模式绕过（例如把 `(abcdefghij){1,100000}` 改成字符类加计数逻辑），后者则取决于重复是否「纯」（单个字符可达集）以及引擎是否支持该上下界。
+
+第三，`start` 与 `startDs` 的区分会一路影响 Rose。把 `^` 写进模式会让路径只能从 `start` 出发，从而更容易进入 anchored 表；不写 `^` 则从 `startDs` 出发，通常进入 floating 表。很多「加了 `^` 之后吞吐变快」的现象，本质是角色从 floating 变成 anchored，而不是锚点本身有魔法。
+
+第四，SOM 会关闭部分化简。`reduceGraph()` 在 `som` 为真时跳过 `mergeCyclicDotStars()`、`removeSiblingsOfStartDotStar()` 等依赖「起点唯一」的优化；`removeRegionRedundancy()` 也接受 `som` 参数。这解释了为什么同一个模式开了 `HS_FLAG_SOM_LEFTMOST` 后字节码变大、编译变慢，甚至某些模式直接报「Pattern is too large.」。
+
+第五，UTF-8 模式有额外的修复步骤。`utf8DotRestoration()` 会在化简后恢复被误删的 UTF-8 约束边，`relaxForbiddenUtf8()` 会放宽非法码点路径。若在 UTF-8 模式下看到「图比预期大」或「某些非法序列仍被匹配」，应先检查这两个函数是否被灰盒开关影响，而不是直接怀疑字符类展开。
+
+第六，断言必须尽早解析。`resolveAsserts()` 在 `addGraph()` 早期执行，`removeAssertVertices()` 在 `buildGraph()` 末尾清理；如果图里还残留断言顶点就进入等价合并，可能把不同断言语义的路径合并。调试时应看 dump 文件名里的阶段标记（`00_before_asserts`、`02_post_assert_resolve`），确认自己在看哪个阶段的图。
+
+第七，注意版本差异与文件重命名。本篇已核对：5.4.2 快照没有 `ng_limit.cpp` 与 `ng_vivify.cpp`，对应职责分散在 `ng_repeat.cpp`、`ng_puff.cpp`、`ng_lbr.cpp`、`ng_misc_opt.cpp`。若按旧文章的描述去找这两个文件，会得到「文件不存在」的结论，进而误判为源码缺失。涉及具体 pass 时，应以 `nfagraph` 目录的实际文件清单为准。
+
+### 7. 小结与延伸阅读
+
+Glushkov 构造把正则变成「位置 + 后继」的图：顶点是字符位置，边是 follow 关系，四个特殊顶点负责起点与接受。它的优势是无 epsilon、状态编号紧凑、运行期每步消耗一字节；代价是重复会复制子图，因此必须有规模限制与化简。`notePositions()` 在解析期就算出展开规模并设上限，`reduceGraph()` 用三轮保守化简控制图大小，`calcComponents()` 把图切成可独立处理的分量，`addComponent()` 再逐分量尝试不同实现。
+
+三条实践结论：语义等价不等于图等价，写模式要追求结构简单；大重复的限制分解析期与运行期两道，报错文本能区分；SOM 会改变化简规则，开 SOM 前应预期字节码膨胀。
+
+延伸阅读：06-04 讲这些图如何被 Rose 分成字面量与 NFA 两类角色；06-06 与 06-07 讲 NFA 与 Castle 如何执行这些图；07-02 从模块角度列 `nfagraph` 的文件与 pass 顺序；05-08 给出 `NG`、`NFAVertex`、`NFAEdge` 的字段定义。若需要对照实际版本的 pass 清单，直接读 `src/nfagraph/ng.cpp` 的 `reduceGraph()` 与 `addGraph()`，那是最权威的顺序表。
+
+## 06-04 Rose 分解：literal / anchored / floating / suffix 的角色划分
+
+### 1. 背景与动机
+
+如果 Hyperscan 只有 NFA，它仍然能正确匹配，但吞吐会停留在「每字节推进若干状态」的量级。真正把它拉到 GB/s 的是字面量匹配器：Teddy、Fat Teddy、FDR 可以在一条向量指令里同时比对几十上百个字面量，速度比逐状态推进快一个数量级以上。Rose 的全部工作，就是尽可能把自动机图「翻译成字面量匹配器能触发的东西」，只把无法字面量化的部分留给 NFA。
+
+这件事说起来简单，做起来要解决三个矛盾。第一，字面量匹配器只认「确定的字节串」，而正则里有字符类、量词、分支、断言；必须找到图中「从起点到接受点的一条确定路径」，把它抽成字面量，剩下的部分再想办法。第二，字面量匹配器不知道上下文：它在任意偏移看到一个字节串就报告，但模式可能要求「必须在起点」「必须在末尾」「必须后面还跟着某些东西」；因此触发之后需要确认，确认的距离就是 lag，也是流式状态大小的来源。第三，字面量太多或太短会让匹配器退化：短字面量命中率极高，确认成本压过收益；这时必须把「泛洪」部分拆成 NFA，让字面量只负责锚定。
+
+Rose 的四个角色就是这三个矛盾的产物。anchored 表负责「起点固定」的字面量，floating 表负责「任意偏移」的字面量，EOD 表负责「只在数据末尾」的字面量，suffix（以及 leftfix、outfix）负责「无法字面量化、只能由 NFA 推进」的部分。理解每个角色的判定条件，就能理解为什么同一个模式换个写法吞吐会差很多，也能理解 `RoseEngine` 头部那几个字节为什么会决定运行路径。
+
+### 2. 核心概念
+
+先区分两类东西：字面量角色与 NFA 角色。字面量角色最终进入 HWLM 表（anchored 表、floating 表、EOD 表、小块表），由 Teddy 或 FDR 执行；NFA 角色最终进入 Rose 的队列，由 LimEx NFA、Castle 或 Sheng 执行。字面量角色的作用是「快速发现候选位置」，NFA 角色的作用是「从候选位置继续推进并确认」。一个模式可以同时拥有两者：前缀字面量触发，后缀 NFA 确认。
+
+anchored 的判定最严格。一个字面量顶点要进入 anchored 表，必须满足：它只有一个父顶点，且父顶点是 Rose 起点（`root` 或 `anchored_root`）；父边要么是有限上界，要么连的是一个本身已锚定的图；并且它与后继字面量的重叠不超过 `maxHistoryAvailable + 1`。这四条在 `rose_build_add.cpp` 的 `doRoseLiteralVertex()` 里依次检查（`:561` 起），任何一条不满足就 `goto floating`。anchored 表只在缓冲区起点（或有界区域内）运行，因此命中率低、确认成本低，是最理想的位置。
+
+floating 是默认归宿。只要字面量不是「单一起点、有限上界、重叠可控」，就进 floating 表。floating 表在每个偏移都要运行，命中率高，必须靠「字面量足够长、区分度足够高」来压低确认次数。若一个字面量既是泛洪（例如 `aaaa...`）又很长，Rose 会把它拆成「短前缀字面量 + 后缀 NFA」，避免匹配器在泛洪上反复报告。
+
+EOD 是特殊角色。仅当模式要求「匹配必须在数据末尾结束」时，字面量才进 EOD 表；EOD 表只在 `hs_close_stream()` 或块扫描末尾运行一次，成本极低。`stealEodVertices()` 还会在 EOD 字面量很少时把它们挪进 floating 表，目的是减少一张表的维护成本；这个决策发生在 `buildRose()` 早期（`rose_build_compile.cpp:1706`）。
+
+suffix 是「触发之后的尾巴」。典型模式 `foo[0-9]{3}bar`：`foo` 可以进 floating 表作为触发，`[0-9]{3}bar` 无法整体字面量化，就变成 suffix NFA；触发报告到达后，suffix 从对应偏移开始推进，确认成功才回调。与 suffix 对应的是 leftfix（前缀）与 outfix（外缀）：leftfix 在触发之前运行，用来处理「触发点之前还有约束」；outfix 没有外部触发，自己从起点跑到终点，通常用于无法拆分的整图。
+
+四类角色的判定条件、运行时机与源码落点见下表。表里只写判定要点，具体阈值与历史预算的推导在下一节展开。
+
+| 角色 | 判定要点 | 运行时机 | 源码位置 |
+|---|---|---|---|
+| anchored | 单一起点父节点、有限上界、重叠不超限 | 起点或有界区域 | `doRoseLiteralVertex()` |
+| floating | 其余字面量的默认归宿 | 每个偏移 | `doRoseLiteralVertex()` |
+| EOD | 模式要求末尾结束 | 块尾或关流时 | `addRose()` 的 EOD 分支 |
+| suffix | 触发后仍需 NFA 确认 | 触发报告之后 | `convertFloodProneSuffixes()` |
+
+「lag」是理解 Rose 的关键参数。它表示「触发点之后还需要看多少字节才能确认」。lag 为 0 表示触发即确认，可以直接回调；lag 大于 0 表示需要延迟报告，流式模式下这段数据必须保留在 history 里。`historyRequired` 就是所有角色 lag 的最大值再加一些边界余量，它决定了流状态的大小，也决定了 `hs_stream_size()` 的量级。把模式写成「长字面量 + 短尾巴」通常会减小 lag，从而减小流状态。
+
+`noFloatingRoots` 容易被误读。它不是「没有 floating 字面量」，而是「没有任何 floating 字面量直接挂在 `root` 或 `anchored_root` 上」。`RoseBuildImpl::hasNoFloatingRoots()`（`src/rose/rose_build_misc.cpp:186`）遍历 `root` 与 `anchored_root` 的邻接顶点，只要发现一个 `isFloating()` 就返回 false。为真时，若当前没有在途匹配（`roseHasInFlightMatches()` 为假），运行期可以跳过整张 floating 表的扫描（`src/rose/block.c:234`、`src/rose/stream.c:629`），这对「全部模式都锚定」的数据库是巨大的节省。
+
+`runtimeImpl` 是三选一的运行路径。`pickRuntimeImpl()`（`rose_build_bytecode.cpp:331`）先看 `isPureFloating()`：如果资源里只有 floating 字面量、没有 NFA、没有程序、没有延迟，就返回 `ROSE_RUNTIME_PURE_LITERAL`；否则看 `isSingleOutfix()`：如果只有一个 outfix 且没有其他角色，返回 `ROSE_RUNTIME_SINGLE_OUTFIX`；其余返回 `ROSE_RUNTIME_FULL_ROSE`。运行期 `runtime.c:429` 按这个字段直接分派到 `pureLiteralBlockExec()`、`soleOutfixBlockExec()` 或 `rawBlockExec()`。
+
+`pureLiteral` 与 `runtimeImpl` 不是一回事。`pureLiteral` 是「这次编译来自纯字面量 API」的标记，由 `build(ng, &length, pureFlag)` 的第三个参数写入（普通路径传 0，`hs_compile_lit_multi_int` 传 1，见 `hs.cpp:255` 与 `hs.cpp:403`）。它会影响运行期的初始化与错误检查：`pureLiteralBlockExec()` 直接取 floating 表执行，如果没有表就置 `STATUS_ERROR`。而 `runtimeImpl` 是根据资源结构算出来的，两者可以同时为真，也可以只有其一。
+
+### 3. 关键数据结构与源码位置
+
+Rose 的抽象接口是 `RoseBuild`，位于 `src/rose/rose_build.h:82`。它暴露的操作不多但语义很重：`add(anchored, eod, lit, ids)` 加字面量；`addRose(RoseInGraph, prefilter)` 加一张 Rose 输入图；`addOutfix()` 加外缀；`addAnchoredAcyclic()` 尝试把图放进 anchored acyclic 表；`addMask()` 加掩码字面量；`buildRose(minWidth)` 生成最终引擎；`setSom()` 标记本库含 SOM。具体实现是 `RoseBuildImpl`，声明在 `src/rose/rose_build_impl.h`。
+
+这里需要纠正一处常见索引错误：一些大纲与旧文把字面量入口写成 `addRoseLiterals()`、把落库入口写成 `buildDatabase()`，但这两个名字在 5.4.2 快照中并不存在（全仓 grep 无结果）。实际入口是 `RoseBuildImpl::add()` 与 `addRose()`，落库是 `buildRose()` 与 `buildFinalEngine()`。阅读源码时应以 `rose_build.h` 的虚函数表为准，需对照实际版本核验。
+
+Rose 输入图在 `src/rose/rose_in_graph.h`。顶点类型 `RoseInType` 有 `RIV_LITERAL`、`RIV_START`、`RIV_ANCHORED_START`、`RIV_ACCEPT`、`RIV_ACCEPT_EOD` 五种（`rose_in_graph.h:61` 起）；`RoseInVertexProps` 保存字面量、延迟、偏移上下界与报告集合。边 `RoseInEdgeProps` 保存 `minBound`、`maxBound`、可选的 `graph`（子图）与 `graph_lag`。这套表示让「字面量 + 子图」可以组合成一条 Rose 路径，而不需要先把所有东西都变成 NFA。
+
+最终引擎 `RoseEngine` 在 `src/rose/rose_internal.h:331`。本册不重复字段表，只点出与角色相关的字段名：`pureLiteral`、`noFloatingRoots`、`runtimeImpl`、`mode`、`historyRequired`、`amatcherOffset`、`fmatcherOffset`、`ematcherOffset`、`sbmatcherOffset`、`amatcherMinWidth`、`fmatcherMinWidth`、`outfixBeginQueue`、`outfixEndQueue`、`leftfixBeginQueue`、`queueCount`、`stateSize`。逐字段含义、读写时机与版本差异见 05-05。
+
+字面量本身的表示在 `rose_graph.h` 与 `rose_build_impl.h`：`rose_literal_id` 带 `ue2_literal`、`rose_literal_table`、延迟与掩码；`rose_literal_table` 的枚举是 `ROSE_ANCHORED`、`ROSE_FLOATING`、`ROSE_EOD_ANCHORED`、`ROSE_ANCHORED_SMALL_BLOCK`（`rose_graph.h:59`）。`RoseBuildImpl` 用 `literal_info` 保存每个字面量被哪些顶点引用，用 `g` 保存 Rose 图，用 `root`、`anchored_root` 两个特殊顶点区分「任意起点」与「锚定起点」。
+
+资源统计在 `rose_build_resources.h` 的 `RoseResources`，字段包括 `has_outfixes`、`has_suffixes`、`has_leftfixes`、`has_literals`、`has_states`、`checks_groups`、`has_lit_delay`、`has_lit_check`、`has_anchored`、`has_floating`、`has_eod`。`pickRuntimeImpl()` 正是读这些布尔量做判断；调试时 dump 出的 `has_*` 行就是它。
+
+角色相关的字段定义、字面量参数与 Rose 模块的文件职责分别见 05-05、04-02、07-04（字段见 05-05 ｜ 参数见 04-02 ｜ 模块见 07-04）。
+
+### 4. 关键流程与调用链
+
+字面量进入 Rose 有两条入口。第一条是 `NG::addLiteral()`（`ng.cpp:579`）：纯字面量短路时调用，它注册外部报告、构造 `Report`、调用 `rose->add(false, false, literal, {id})`，并更新 `minWidth` 与 SmallWrite。第二条是 `RoseBuildImpl::add(bool anchored, bool eod, const ue2_literal &lit, reports)`（`rose_build_add.cpp:1639`）：它把字面量包装成一张三顶点的 `RoseInGraph`（起点、字面量、接受点），边上的 `maxBound` 在 anchored 时为 0、否则为 `ROSE_BOUND_INF`，然后调 `addRose()`。
+
+`addRose()` 是真正的分解器（`rose_build_add.cpp:1507`）。它遍历输入图的每个字面量顶点，调用 `doRoseLiteralVertex()` 决定角色。判定顺序是：若 `use_eod_table` 为真，直接进 EOD 表；否则看父顶点数量与类型；若只有一个父且父是起点、父边有有限上界（或连的是锚定图）、且与后继字面量的重叠不超过 `maxHistoryAvailable + 1`，就尝试 `tryForAnchoredVertex()`；失败则落到 `floating` 标签，按 `ROSE_FLOATING` 或 `ROSE_EOD_ANCHORED` 取字面量 id，再 `createVertices()` 建 Rose 顶点。
+
+这里有一个容易忽略的细节：`findRoseAnchorFloatingOverlap()` 计算的是「anchored 字面量与后继 floating 字面量之间的重叠字节数」。如果重叠太大，说明 anchored 触发后还需要保留太多历史才能确认，超过流式历史上限，因此宁可把它放进 floating 表。这个检查把「角色选择」与「流状态预算」直接绑定在一起。
+
+字面量之外的图走 `NG::addGraph()` 的 `addComponent()` 分支。`splitOffLiterals()` 先把贯穿整图的字面量摘走；剩下的图按分量尝试 `addAnchoredAcyclic()`（整图锚定且无环时进 anchored acyclic 表）、`handleSmallLiteralSets()`（小字面量集合）、`handleFixedWidth()`（固定宽度图）、`handleDecoratedLiterals()`（带装饰的字面量）、`doViolet()`（前缀/后缀拆分）、`splitOffPuffs()`（纯重复拆成 puff）、`addOutfix()`（外缀）。每条路径成功都会把对应顶点从图中删除，直到图为空或所有路径都失败。
+
+因此，拆分的判据可以概括为：能从起点连到接受点、且路径上每个位置都是单字符可达集的子图，抽成字面量；其余部分按角色变成 NFA。字面量负责回答「可能在哪里」，NFA 负责回答「是否真的成立」，两者用 lag 与触发报告衔接。
+
+角色确定后进入 `buildRose()`（`rose_build_compile.cpp:1682`）。它的顺序可以概括为「先规范化，再合并，再分组，最后落引擎」：`convertPrefixToBounds()` 把前缀转成边界；`convertFloodProneSuffixes()` 把泛洪后缀转成 suffix NFA；`makeCastles()` 把重复转成 Castle 原型；`rehomeAnchoredLiterals()` 重排锚定字面量；`stealEodVertices()` 考虑把少量 EOD 字面量挪进 floating；`addAnchoredSmallBlockLiterals()` 处理小块扫描；`dedupeSuffixes()`、`mergeDupeLeaves()`、`dedupeLeftfixes()`、`aliasRoles()` 做去重与别名；`assignHistories()` 计算每个角色的历史需求；`mergeSmallSuffixes()`、`mergeSmallLeftfixes()`、`mergeOutfixes()` 做小引擎合并；最后 `assignGroupsToLiterals()`、`findGroupSquashers()`、`buildRoseSquashMasks()` 分配组与掩码。
+
+`convertFloodProneSuffixes()` 值得单独说明（`rose_build_convert.cpp:264`）。它先 `findFloodProneSuffixLen()` 估算「多长的后缀算泛洪」，再逐字面量检查 `suffixFloodLen()`；若字面量尾部有足够长的重复（例如 `abcXXXX`），就把重复部分切出来变成一个 suffix NFA，字面量只保留前缀。这样 floating 表不会被 `XXXX` 这种高命中模式刷屏，suffix 只在触发后运行，成本被摊薄。
+
+`buildFinalEngine()`（`rose_build_bytecode.cpp:3609`）负责把 Rose 图变成扁平字节码。它先建一个 `RoseEngine proto`，设置 `mode`；计算 `historyRequired` 与长字面量阈值；`groupByFragment()` 把字面量按片段分组；`buildAnchoredDfas()` 建锚定 DFA；`makeBoundaryPrograms()`、`buildReportPrograms()` 建边界与报告程序；`prepOutfixes()`、`buildNfas()` 建 NFA 队列；`assignStateIndices()` 分配角色状态位；`buildLeftInfoTable()` 建左信息表；`writeAnchoredPrograms()`、`writeDelayPrograms()`、`buildLiteralPrograms()` 写各类程序；`buildFloatingMatcherProto()`、`buildEodAnchoredMatcherProto()`、`buildSmallBlockMatcherProto()` 建 HWLM 原型；最后 `buildAnchoredMatcher()`、`buildHWLMMatcher()` 生成实际表，`fillStateOffsets()` 排状态偏移，`writeNfaInfo()` 写 NFA 信息，`pickRuntimeImpl()` 决定运行路径。
+
+角色的整体划分与落库顺序见图 06-04-01。注意图中的箭头不是「数据流」而是「归属关系」：一张 NG 图最终会被拆到多个表/队列里，每个表只负责一类触发或推进。
+
+:::figure id=06-04-01 | name=Rose 的四类角色与 NFA 分工 | dir=TD
+node s1 "NG 图" blue
+node s2 "anchored 表<br/>起点固定" teal
+node s3 "floating 表<br/>任意偏移" amber
+node s4 "EOD 表<br/>仅数据末尾" purple
+node s5 "suffix NFA<br/>触发后确认" purple
+node s6 "leftfix 与 outfix" purple
+node s7 "RoseEngine 字节码" green
+edge s1 -> s2 "单一起点父节点"
+edge s1 -> s3 "多父或无界"
+edge s1 -> s4 "EOD 锚定"
+edge s1 -> s5 "泛洪后缀"
+edge s1 -> s6 "无法字面量化"
+edge s2 -> s7 "写表"
+edge s3 -> s7 "写表"
+edge s4 -> s7 "写表"
+edge s5 -> s7 "写队列"
+edge s6 -> s7 "写队列"
+:::
+
+运行期的三条路径见图 06-04-02。`runtimeImpl` 在编译期算好，运行期只做一次 switch，不再重新判断资源结构。
+
+:::figure id=06-04-02 | name=runtimeImpl 的三条运行路径 | dir=LR
+node q1 "runtimeImpl" blue
+node q2 "PURE_LITERAL" teal
+node q3 "SINGLE_OUTFIX" amber
+node q4 "FULL_ROSE" purple
+node q5 "pureLiteralBlockExec" green
+node q6 "soleOutfixBlockExec" green
+node q7 "rawBlockExec" green
+edge q1 -> q2 "仅浮动词表"
+edge q1 -> q3 "仅一个外缀"
+edge q1 -> q4 "其余情况"
+edge q2 -> q5 "直接跑 HWLM"
+edge q3 -> q6 "单队列"
+edge q4 -> q7 "程序与队列"
+:::
+
+### 5. 配置/命令/代码实例
+
+下面的程序用同一条字面量分别走普通编译与纯字面量编译，再比较数据库大小。两条路径的差别不在「匹配结果」，而在「是否经过解析、建图与 Rose 分解」。完整 API 参数见 04-04。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+
+static void report(const char *tag, hs_database_t *db) {
+    size_t sz = 0;
+    if (hs_database_size(db, &sz) == HS_SUCCESS) {
+        printf("%s: %zu bytes\n", tag, sz);
+    }
+}
+
+int main(void) {
+    hs_database_t *normal = NULL;
+    hs_database_t *literal = NULL;
+    hs_compile_error_t *err = NULL;
+
+    if (hs_compile("foobar", 0, HS_MODE_BLOCK, NULL,
+                   &normal, &err) != HS_SUCCESS) {
+        printf("normal compile failed: %s\n", err->message);
+        hs_free_compile_error(err);
+        return 1;
+    }
+
+    if (hs_compile_lit("foobar", 0, HS_MODE_BLOCK, NULL,
+                       &literal, &err) != HS_SUCCESS) {
+        printf("literal compile failed: %s\n", err->message);
+        hs_free_compile_error(err);
+        hs_free_database(normal);
+        return 1;
+    }
+
+    report("hs_compile    ", normal);
+    report("hs_compile_lit", literal);
+
+    hs_free_database(normal);
+    hs_free_database(literal);
+    return 0;
+}
+```
+
+一段可能的输出如下。示例输出，具体数值随版本、平台与对齐方式变化，需对照实际版本核验。
+
+```text
+hs_compile    : 1248 bytes
+hs_compile_lit: 968 bytes
+```
+
+逐行判读。两行都是 `hs_database_size()` 的结果，包含 `hs_database` 头部（偏移 192 字节）与字节码本体，因此即使是纯字面量也不会小到只有几十字节。普通路径的数据库更大，因为它包含报告程序、状态偏移、可能的小块表与边界程序；纯字面量路径跳过解析与建图，`RoseEngine` 里只有一个 floating HWLM 表与最少的头部字段，`runtimeImpl` 是 `ROSE_RUNTIME_PURE_LITERAL`，没有 NFA 队列。数值差异不是固定的：字面量越长、模式越多，两边的差距越明显；若普通路径也触发了 `shortcutLiteral()`，差距会缩小，因为两者最终都只依赖字面量表。
+
+用 `hsdump` 可以看到 `RoseEngine` 的角色摘要。命令与 06-03 相同，`-D` 表示转储最终数据库。
+
+```bash
+hsdump -N -D -o ./dump patterns.txt
+```
+
+转储文本中的 Rose 段节选如下。示例输出，具体格式需对照实际版本核验。
+
+```text
+Rose:
+
+mode:                : block
+properties           : pureLiteral
+dkey count           : 0
+som slot count       : 0
+som width            : 0 bytes
+rose count           : 0
+
+total engine size    : 968 bytes
+ - anchored matcher  : 0 bytes over 0 bytes
+ - floating matcher  : 704 bytes
+```
+
+判读要点：`mode` 为 `block` 说明这是块模式引擎；`properties` 里出现 `pureLiteral`，说明数据库来自纯字面量 API 且运行期走 `pureLiteralBlockExec()`；`dkey count` 为 0 表示没有去重键，`som slot count` 与 `som width` 为 0 表示没有 SOM；`rose count` 为 0 表示没有 NFA 角色队列；`anchored matcher` 为 0 字节，说明所有字面量都在 floating 表；`floating matcher` 占了大头，因为它就是 Teddy 或 FDR 的掩码表与确认表。若换成带 `^` 的模式，`anchored matcher` 通常不再为 0；若模式含 `.*` 尾巴，`rose count` 会大于 0，并在下方列出队列。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，anchored 不是「加了 `^` 就一定 anchored」。判定要求单一起点父节点、有限上界、重叠不超限；嵌套分组、可选前缀、无界重复都会破坏条件，使字面量回落到 floating。若希望走 anchored，应把模式写成「明确起点 + 有界长度 + 少量分支」，并避免在起点后立刻接无界通配。
+
+第二，floating 表的成本与字面量质量直接相关。短字面量、常见词、大小写混写、重复字符都会提高命中率，进而提高确认次数。实践上应尽量让触发字面量长于 3 字节、区分度高、少用 `.*` 连接；必要时用 `HS_FLAG_PREFILTER` 换取更小的图，但要接受漏报。
+
+第三，`noFloatingRoots` 是优化信号，不是功能开关。它为真时，运行期可以在没有在途匹配时跳过 floating 表；但它要求「没有任何 floating 字面量直接挂在 root 或 anchored_root 上」，这个条件很脆弱，增加一条无锚点模式就会破坏。不要为了这个优化强行改写业务模式，收益通常不如直接减少模式数量。
+
+第四，`runtimeImpl` 的三条路径能力不同。`PURE_LITERAL` 只跑 floating 表，不能处理 NFA、SOM、逻辑组合；`SINGLE_OUTFIX` 只跑一个外缀队列；只有 `FULL_ROSE` 才支持完整程序。若发现某些回调行为异常（例如 SOM 不生效、组合逻辑不触发），应先确认数据库是不是落到了简化路径。
+
+第五，`pureLiteral` 只能由纯字面量 API 设置。用 `hs_compile()` 编译一个字面量，即使内部走了 `shortcutLiteral()`，`pureLiteral` 仍然是 0，运行期走 `FULL_ROSE`（只是图很小）。不要用 `hs_database_info()` 的输出推断 `pureLiteral`，那个接口不暴露这个字段。
+
+第六，suffix 转换会改变「谁负责匹配」。`convertFloodProneSuffixes()` 把泛洪尾部切成 suffix NFA 后，字面量只匹配前缀，回调时机由 suffix 确认决定；这意味着报告的 `to` 偏移仍然正确，但内部多了一次队列推进。若用 `hsdump` 看到 `rose count` 比预期多，很可能就是泛洪后缀被拆了。
+
+第七，历史预算要留余量。`historyRequired` 由所有角色的 lag 最大值决定，流式模式下它直接变成每个流的状态大小；`findRoseAnchorFloatingOverlap()` 还会用 `maxHistoryAvailable` 做角色判定。若模式集里混有长 lag 的模式，整个数据库的流状态都会被抬高。把长 lag 模式单独编一个库，往往比混在一起更省内存。
+
+### 7. 小结与延伸阅读
+
+Rose 的核心不是「把图变小」，而是「把图分成两类」：能被字面量触发的部分进入 anchored、floating、EOD 表，不能字面量化的部分变成 suffix、leftfix、outfix 队列。角色判定由 `doRoseLiteralVertex()` 的四条条件决定，落库由 `buildRose()` 的十几道变换完成，运行路径由 `runtimeImpl` 三选一。`noFloatingRoots` 决定 floating 表能否条件执行，`pureLiteral` 标记纯字面量 API，`historyRequired` 把 lag 折算成流状态预算。
+
+三条实践结论：字面量质量决定 floating 表的成本，写模式时要主动设计高区分度的触发串；角色不是越「锚定」越好，锚定条件苛刻，强行改写往往得不偿失；运行路径是编译期算好的，排查行为差异要先看 `RoseEngine` 的属性而不是猜运行期。
+
+延伸阅读：06-05 讲 anchored、floating 表背后的 Teddy、Fat Teddy 与 FDR 如何工作；06-06 与 06-07 讲 suffix、leftfix、outfix 队列里的 NFA 与 Castle；06-11 讲 `historyRequired` 如何变成流状态与压缩；05-05 给出 `RoseEngine` 全部字段；07-04 从模块角度列 `rose_build_*.cpp` 的职责。若只想记一件事：Rose 的产物是一组「触发器 + 确认器」，吞吐取决于触发器有多快、确认器有多短。
+
+## 06-05 字面量前端：Teddy、Fat Teddy 与 FDR
+
+### 1. 背景与动机
+
+Rose 把图拆成「触发器」与「确认器」之后，触发器一侧的性能就决定了整个数据库的上限。触发器要解决的问题是：在每一个输入偏移，判断「当前位置是否结束了一个候选字面量」，而且候选字面量可能有几十上百条。最朴素的做法是逐条 `memcmp`，成本是「字面量数 × 长度」，在万级模式集上完全不可接受。Hyperscan 的解法是位并行：把多个字面量编码进同一组掩码表，用一条 SIMD 指令同时比对 16、32 或 64 个字节，再通过 bucket 把候选范围缩小到少数几条。
+
+这条路线有三个代表性引擎。Teddy 面向「少量短字面量」，用 8 个 bucket、最多 4 层掩码，在 128 位寄存器上做 nibble 查表；Fat Teddy 把 bucket 扩到 16，利用 AVX2 的 256 位寄存器承载双倍掩码，把容量推到 96 条；FDR 面向「大量字面量」，用 64 位 scheme、8 个 bucket 与可变的 stride，先做粗筛再做 confirm。三者之外还有一个 Noodle，专门处理「只有一条字面量」的极简情况，直接用向量比较，不需要掩码表。
+
+理解这一层能回答很多选型问题。为什么 48 条和 96 条是两个常见的分界？为什么同样 100 条字面量，短字面量多的那组更容易退化？为什么开了 AVX-512 VBMI 之后 Fat Teddy 会换一套实现？为什么 `hsdump` 里 `TEDDY` 的 `masks` 是 4 而 `buckets` 是 16？这些都能从编译期的引擎描述表与构建流程里找到答案。本篇只讲字面量前端，NFA 与 Castle 留给 06-06、06-07，Rose 的角色划分见 06-04。
+
+### 2. 核心概念
+
+先建立「bucket」的概念。一个字面量集合如果全部塞进一张掩码表，表会大到无法缓存，而且每次比较都会产生大量假阳性。bucket 的作用是分桶：每个字面量按首字符、尾字符或哈希被分配到某个 bucket，bucket 内共享一张掩码表；运行期先算出当前字节属于哪些 bucket，再只对命中的 bucket 做确认。bucket 越多，单桶内的字面量越少、假阳性越低，但掩码表与确认表也越大。Teddy 的 8 bucket 与 Fat Teddy 的 16 bucket，本质是用更多表换取更低假阳性。
+
+Teddy 的核心是「nibble 掩码」。每个输入字节被拆成高 4 位与低 4 位，分别查两张 16 项的掩码表；表中的每一项是一个 16 位位图，表示「这个 nibble 可能对应哪些谓词」。一个字面量的每个位置对应一个谓词，多个位置串起来就形成一条「掩码链」；运行期把连续几个位置的掩码做 AND，结果非零就说明「这里可能有一个字面量结束」。`MAX_NUM_MASKS` 是 4（`teddy_compile.cpp:77`），意味着 Teddy 最多用 4 层掩码描述一个字面量，字面量长度超过 4 时只取最后 4 个字节做匹配，前面的字节交给 confirm 或触发后的 NFA 确认。
+
+`masks` 与 `buckets` 是两个不同维度。`masks` 是「用几层 nibble 掩码」，取值 1 到 4；`buckets` 是「分几个桶」，取值 8 或 16。`TeddyEngineDef` 表（`teddy_engine_description.cpp:55`）把两者组合成 16 个引擎：ID 3 到 10 是 AVX2、16 bucket、masks 1 到 4（偶数 ID 为 packed），ID 11 到 18 是非 AVX2、8 bucket、masks 1 到 4。`packed` 表示是否把两个字面量压进一个谓词位，用于提高小集合的密度。
+
+Fat Teddy 是 Teddy 的 16 bucket 版本。它的 `maskWidth` 为 2，掩码表要按高低两半各存一份，所以 `teddy_internal.h` 的布局里写着「bucket 0..7 的 reinforcement 表」与「bucket 8..15 的 dup 表」。在 AVX2 上，16 个 bucket 正好对应 256 位寄存器的 16 个字节 lane；在 AVX-512 VBMI 上，`vpermb` 可以跨 lane 重排字节，于是可以用一条指令完成原本需要多次移位与 OR 的「掩码链对齐」，这就是 5.4.0 对 Fat Teddy 的 VBMI 优化（`CHANGELOG.md` 的 5.4.0 条目；实现见 `teddy_avx2.c` 的 `FAT_TEDDY_VBMI_*` 宏）。
+
+FDR 的核心是「scheme + stride + confirm」。FDR 用一个 64 位的 scheme 表示「当前偏移可能命中哪些 bucket」，主表索引的位宽由 `domain` 描述；`stride` 表示「每隔多少字节采一次样」，stride 大于 1 时主表不必逐字节查询，但一个 stride 窗口内的候选必须在 confirm 阶段按偏移拆开核对，否则会漏掉窗口内非采样点上的匹配。主表只回答「这个位置可能有候选」，confirm 表再按 bucket 与偏移逐个核对字面量，确认成功才回调。`FDR` 结构里的 `confOffset`、`floodOffset`、`stride`、`domain`、`domainMask`、`tabSize`、`start` 就是为这两段式服务的。
+
+Noodle 是单字面量引擎。`isNoodleable()` 只检查两件事：灰盒是否允许 Noodle，以及字面量集合是否恰好只有一条（`hwlm_build.cpp:107`）；满足就直接用 Noodle，不需要掩码表与 bucket。Noodle 在 `src/hwlm/noodle_engine*.c` 里按 SSE、AVX2、AVX-512 分别实现，本质是「向量化 memcmp + 首尾字节过滤」。它的存在说明 Hyperscan 并不强行把所有情况都塞进 Teddy/FDR：一条字面量用最简单的引擎往往最快。
+
+四个引擎的容量、结构与适用条件见下表。表中的数字来自当前引擎描述表与 `TEDDY_BUCKET_LOAD`，是编译期选择的依据，不是 API 承诺。
+
+| 引擎 | bucket 数 | 典型容量 | 适用条件 |
+|---|---|---|---|
+| Noodle | 不适用 | 1 条 | 只有一条字面量且灰盒允许 Noodle |
+| Teddy | 8 | 48 条 | 短字面量为主、容量不超过 48 条 |
+| Fat Teddy | 16 | 96 条 | 目标机支持 AVX2、容量 49 至 96 条 |
+| FDR | 8 | 数百条以上 | 规模超过 Teddy 容量或 Teddy 构建失败 |
+
+「flood」是字面量前端的共同敌人。若某个字符在数据里连续出现（例如日志里的 `=====`），任何包含该字符的字面量都会在每个偏移命中，确认次数爆炸。FDR 用 `FDRFlood` 结构做特殊处理：记录「哪些 id 会在 flood 上触发」，最多 16 个（`FDR_FLOOD_MAX_IDS` 为 16，见 `fdr_internal.h`）；超过 16 个就不再走 flood 快速路径，退化为普通确认。Teddy 则通过「reinforcement mask」抑制同一 bucket 内的重复命中。
+
+最后要区分「编译期引擎选择」与「运行期指令选择」。编译期 `chooseTeddyEngine()` 根据字面量数、长度、目标 CPU 特性选一个引擎 ID，写进 `Teddy.engineID`；运行期 fat runtime 再根据实际 CPU 选择该引擎的 SSE/AVX2/AVX-512 实现。也就是说，同一份数据库在不同机器上可能跑不同的指令路径，但 bucket 数、masks 数、确认表结构是编译期定死的。
+
+### 3. 关键数据结构与源码位置
+
+统一抽象是 `HWLM`，定义在 `src/hwlm/hwlm_internal.h`。`HWLM` 只有一个 `type` 字段与一个柔性数据区，`type` 取 `HWLM_ENGINE_FDR`（12）或 `HWLM_ENGINE_NOOD`（16）；`HWLM_C_DATA()` 宏把「HWLM 头之后的字节」解释成具体引擎（`hwlm_internal.h:56`）。`HWLMProto` 是编译期原型，保存 `engType`、`fdrEng`、`teddyEng`、`lits`、`bucketToLits` 与 `make_small` 标志；`hwlmBuild()` 先在原型上做选择，再 `fdrBuildTable()` 或 `teddyBuildTable()` 生成最终字节码。
+
+`FDR` 结构在 `src/fdr/fdr_internal.h`，字段包括 `engineID`、`size`、`maxStringLen`、`numStrings`、`confOffset`、`floodOffset`、`stride`、`domain`、`domainMask`、`tabSize`、`start`。`start` 是 128 位的初始状态，按各 bucket 的最小长度预置，用于减少无意义的 confirm。`FDR_Runtime_Args` 保存缓冲区、历史、起始偏移、回调、scratch 与 flood 检测指针，是运行期在各子函数之间传递的上下文。
+
+`Teddy` 结构在 `src/fdr/teddy_internal.h:57`，字段只有 `engineID`、`size`、`maxStringLen`、`numStrings`、`confOffset`、`floodOffset` 六个，后面紧跟掩码表、reinforcement 表（或 dup 表）、confirm 表与 flood 表。它的前六个字段与 `FDR` 兼容，所以 `fdrSize()`、`fdrIsTeddy()` 这类函数可以同时处理两者；`fdrIsTeddy()` 通过 engineID 判断（`fdr_dump.cpp:53`）。
+
+引擎描述表在 `src/fdr/teddy_engine_description.cpp` 与 `src/fdr/fdr_engine_description.cpp`。Teddy 的描述是 16 条 `TeddyEngineDef`，每条包含 ID、CPU 特性、masks 数、bucket 数、packed 标志；FDR 只有一条 `{0, 64, 8, 0}`，即 ID 0、scheme 宽 64、8 bucket。`FDR` 的具体 `bits` 与 `stride` 不是固定的，而是在 `chooseEngine()` 与 `findDesiredStride()` 里按字面量数动态选。
+
+字面量本身的表示是 `hwlmLiteral`（`src/hwlm/hwlm_literal.h`），包含字符串、大小写标志、掩码 `msk`、比较值 `cmp`、组 `groups`、id 与 squash 掩码。掩码与比较值是大小写不敏感与「混合大小写」处理的产物：对每个字节，`msk` 标记哪些位需要比较，`cmp` 给出期望值；这样一条字面量可以同时表达「全小写」「全大写」「指定大小写」三种形态，而不必为每种形态各存一份。
+
+bucket 与确认表的编译期表示在 `src/fdr/fdr_compile_internal.h` 与 `fdr_confirm_compile.cpp`。`BucketIndex` 是 bucket 编号，`bucketToLits` 是「bucket 到字面量下标列表」的映射；`setupFullConfs()` 生成完整确认表，`FDRCompiler::build()` 把主表、确认表、flood 表拼成最终字节码。逐字段定义见 05-07，本册不重复。字面量引擎的字段、构建选项与模块文件分别见 05-07、04-01、07-07（字段见 05-07 ｜ 参数见 04-01 ｜ 模块见 07-07）。
+
+### 4. 关键流程与调用链
+
+编译期入口是 `hwlmBuild()`（`src/hwlm/hwlm_build.cpp`）。它先做资源检查：字面量总数不能超过 `limitLiteralCount`，单条长度不能超过 `limitLiteralLength`，总字符数不能超过 `limitLiteralMatcherChars`，生成的引擎大小不能超过 `limitLiteralMatcherSize`。任一超限就返回空，Rose 会把这个字面量集合退回到 NFA 或拆分处理。随后 `isNoodleable()` 判断是否只有一条字面量；是则构造 `HWLM_ENGINE_NOOD` 原型，否则调用 `fdrBuildProto()`。
+
+`fdrBuildProto()` 先尝试 Teddy。若灰盒 `fdrAllowTeddy` 为真（默认 true，见 `src/grey.cpp:69`），调用 `teddyBuildProtoHinted()`；它内部 `chooseTeddyEngine()` 遍历 16 个引擎描述，按「目标 CPU 是否支持」「bucket 数是否够」「masks 是否不超过最长字面量」「短字面量比例是否过高」四条过滤，再按评分选最优。若 Teddy 构建失败（例如字面量太多、太长、太碎），`fdrBuildProtoInternal()` 会打印「build with teddy failed, will try with FDR」，回落到 FDR。
+
+Teddy 的容量约束由 `TEDDY_BUCKET_LOAD` 决定，值为 6（`teddy_engine_description.h:40`）。8 bucket 乘 6 等于 48，16 bucket 乘 6 等于 96，这就是 48 与 96 两个阈值的来源。`assignStringsToBuckets()` 还会检查 `lits.size() > numBuckets * TEDDY_BUCKET_LOAD`，超过就返回 false；`isAllowed()` 还会在字面量数超过 40 时检查「短于 masks 数的字面量是否超过五分之一」，防止大量短字面量把掩码表打散。`hwlmFloodProneSuffixLen()` 里的 48/96 判断（`hwlm_build.cpp:251`）与这套容量约束是同一组数字。
+
+FDR 的构建分三步。第一步 `chooseEngine()` 或 `getFdrDescription()` 选引擎描述；第二步 `assignStringsToBuckets()` 按首字符/尾字符与长度把字面量分到 8 个 bucket，长字面量优先进入编号较小的 bucket；第三步 `FDRCompiler::build()` 生成主表、确认表、flood 表与 squash 掩码。`findDesiredStride()` 按字面量数选 stride：少于 250 条时直接用最短长度，少于 800 条时用最短长度减一，少于 5000 条时最多用 2，超过 5000 条回落到 1。stride 越大，主表查询越少，但 confirm 需要回看的范围越大，因此是吞吐与确认成本的折中。
+
+运行期入口是 `hwlmExec()`。它按 `HWLM.type` 分派到 `fdrExec()` 或 Noodle；`fdrExec()` 再按 `fdrIsTeddy()` 分派到 Teddy 的扫描循环或 FDR 的主循环。Teddy 的循环按 16 或 32 字节推进，先算低 nibble 掩码、再算高 nibble 掩码，两者 AND 后得到「候选位图」，对每个候选位调用 confirm；FDR 的循环按 stride 采样，主表给出 scheme，`do_confirm_fdr()` 按 bucket 逐个核对。
+
+`do_confirm_fdr()` 的实现有一个值得记住的细节：它把确认表按 8 位一组处理，`const u8 bucket = 8;`（`src/fdr/fdr.c:333`），`conf0` 与 `conf8` 分别对应低 8 位与高 8 位。这不是「bucket 数固定为 8」的运行时约束，而是确认表按字节打包的实现细节；真正的 bucket 数来自引擎描述（FDR 为 8，Teddy 为 8 或 16）。理解这一点可以避免把 `do_confirm_fdr` 的 8 误读成「所有引擎都是 8 bucket」。
+
+引擎选择的整体路径见图 06-05-01。图中把 Noodle、Teddy、Fat Teddy、FDR 四条分支与它们的容量边界画在一起，注意 Teddy 失败会回落到 FDR，而不是直接报错。
+
+:::figure id=06-05-01 | name=字面量前端的四条分支与容量边界 | dir=TD
+node l1 "字面量集合" blue
+node l2 "Noodle<br/>单条" gray
+node l3 "Teddy<br/>8 bucket 至 48 条" teal
+node l4 "Fat Teddy<br/>16 bucket 至 96 条" teal
+node l5 "FDR<br/>大量或回落" amber
+node l6 "HWLM 表" purple
+node l7 "确认与回调" green
+edge l1 -> l2 "仅一条"
+edge l1 -> l3 "不超过 48"
+edge l1 -> l4 "不超过 96 且 AVX2"
+edge l1 -> l5 "超过 96 或 Teddy 失败"
+edge l2 -> l6 "单字面量"
+edge l3 -> l6 "掩码表"
+edge l4 -> l6 "双宽掩码"
+edge l5 -> l6 "主表与确认表"
+edge l6 -> l7 "命中确认"
+:::
+
+5.4.0 的 VBMI 优化要放在正确的位置上。Teddy 的 VBMI 支持最早出现在 5.3.0（CHANGELOG：「Improvement on literal matcher Teddy performance, including support for AVX-512 VBMI」）；5.4.0 的条目是「Improvement on literal matcher Fat Teddy performance, including support for AVX-512 VBMI」。也就是说，5.4.0 增强的是 Fat Teddy 的 VBMI 路径，而不是「首次引入 Teddy 的 VBMI」。在代码里，这条路径由 `HAVE_AVX512VBMI` 宏包住（`teddy_avx2.c:112`、`:169`），编译期由 `BUILD_AVX512VBMI` 控制（默认 OFF，见 04-01），运行期由 fat runtime 按 CPUID 选择。
+
+### 5. 配置/命令/代码实例
+
+下面的程序构造 8、48、96、200 条字面量，分别编译并打印数据库大小。它用普通 `hs_compile_multi()`，因为每条模式都是纯字面量，会自动走 `shortcutLiteral()` 进入 Rose 的 literal 路径。完整 API 见 04-04。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static void build(int n) {
+    const char **pats = calloc((size_t)n, sizeof(*pats));
+    unsigned *flags = calloc((size_t)n, sizeof(*flags));
+    unsigned *ids = calloc((size_t)n, sizeof(*ids));
+    hs_database_t *db = NULL;
+    hs_compile_error_t *err = NULL;
+
+    for (int i = 0; i < n; i++) {
+        char *s = malloc(24);
+        snprintf(s, 24, "token%05dend", i);
+        pats[i] = s;
+        ids[i] = (unsigned)i;
+    }
+
+    hs_error_t rc = hs_compile_multi(pats, flags, ids, NULL, (unsigned)n,
+                                     HS_MODE_BLOCK, NULL, &db, &err);
+    if (rc != HS_SUCCESS) {
+        printf("n=%d compile failed: %s\n", n, err->message);
+        hs_free_compile_error(err);
+    } else {
+        size_t sz = 0;
+        hs_database_size(db, &sz);
+        printf("n=%-4d db=%zu bytes\n", n, sz);
+        hs_free_database(db);
+    }
+
+    for (int i = 0; i < n; i++) {
+        free((void *)pats[i]);
+    }
+    free((void *)pats);
+    free(flags);
+    free(ids);
+}
+
+int main(void) {
+    build(8);
+    build(48);
+    build(96);
+    build(200);
+    return 0;
+}
+```
+
+一段可能的输出如下。示例输出，具体数值随版本、平台与字面量长度变化，需对照实际版本核验。
+
+```text
+n=8    db=1240 bytes
+n=48   db=1736 bytes
+n=96   db=3088 bytes
+n=200  db=6824 bytes
+```
+
+逐行判读。四行都调用 `hs_database_size()`，数值包含 `hs_database` 头部与字面量前端字节码。8 条时表很小，主要成本是头部与一张低 masks 的 Teddy 表；48 条时仍在 8 bucket、6 条每桶的容量内，表随字面量线性增长但 bucket 结构不变；96 条时跨过 48 的边界，若目标 CPU 支持 AVX2，会选择 16 bucket 的 Fat Teddy，掩码表宽度翻倍，因此从 1736 跳到 3088 字节，这个跳变是结构性的，不是简单的线性增长；200 条时超过 96，Teddy 容量不足，回落到 FDR，FDR 的主表、确认表与 flood 表一起计入，增长斜率再次变化。若目标机不支持 AVX2，96 条这一档仍会停留在 8 bucket Teddy 或直接回落 FDR，数值会不同；这正是「数据库大小与编译目标绑定」的体现。
+
+用 `hsdump` 可以看到具体引擎与 bucket 数。`-D` 转储数据库，输出里会包含 `TEDDY` 或 `FDR` 段。
+
+```bash
+hsdump -N -D -o ./dump patterns.txt
+```
+
+两段可能的输出如下。示例输出，具体格式需对照实际版本核验。
+
+```text
+TEDDY:         9
+    masks      4
+    buckets    16
+    packed     false
+    strings    96
+    size       2688 bytes
+    max length 12
+    floodoff   4128 (1020)
+
+FDR:           0
+    domain     8
+    stride     2
+    strings    200
+    size       6144 bytes
+    max length 12
+    floodoff   8192 (2000)
+```
+
+判读要点：`TEDDY: 9` 表示引擎 ID 9，对应 AVX2、4 masks、16 bucket、非 packed；`buckets 16` 说明这是 Fat Teddy，而不是 8 bucket 的普通 Teddy；`strings 96` 与 `buckets 16` 乘 `TEDDY_BUCKET_LOAD 6` 正好等于容量上限，说明这批字面量已经贴近边界，再增加就会回落 FDR；`max length 12` 大于 `masks 4`，意味着 Teddy 只用最后 4 个字节做掩码匹配，前面的字节依赖确认表或后续 NFA；`floodoff` 指向 flood 表，若为 0 表示没有 flood 处理。第二段 `FDR: 0` 是唯一的 FDR 引擎描述，`stride 2` 表示主表隔一个字节采样一次，`domain 8` 描述主表索引位宽；`strings 200` 超过 Teddy 容量，因此走 FDR 是预期结果。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，48 与 96 不是 API 承诺，而是当前实现的经验边界。它们来自 `TEDDY_BUCKET_LOAD = 6` 与 8/16 bucket 的乘积，还会被「字面量长度」「短字面量比例」「目标 CPU 是否支持 AVX2」「Teddy 构建是否成功」共同影响。写容量规划时不要把它当成硬阈值，应以 `hsdump` 的实际输出为准。
+
+第二，Teddy 偏爱短字面量，但不是越短越好。`numMasks` 最多 4，字面量长度超过 4 时只用尾部 4 字节做掩码，前面部分靠确认；如果大量字面量的尾部 4 字节相同（例如都以 `end` 结尾），掩码区分度会骤降，confirm 次数上升。设计字面量时应让「尾部 4 字节」尽量分散，或让触发字面量本身足够长、由 FDR 接管。
+
+第三，stride 大于 1 不等于漏匹配。FDR 的主表按 stride 采样，但 confirm 阶段会回看 `stride` 范围内的候选；只要 confirm 表覆盖完整，匹配结果不受影响。真正会漏匹配的是「起点不在采样网格且 confirm 未覆盖」的实现错误，正常版本不会出现。若怀疑漏报，应先用 `hscheck` 或 `hscollider` 对拍，而不是直接调 stride。
+
+第四，VBMI 优化有明确的适用边界。它需要三件事同时成立：构建时开了 `BUILD_AVX512VBMI`（默认 OFF）、目标 CPU 支持 AVX-512 VBMI、fat runtime 在运行期选中了对应变体。缺任何一条，就会回落到 AVX2 或 SSE 路径，功能不变、吞吐降低。不要把「源码里有 `FAT_TEDDY_VBMI_*` 宏」当成「默认构建就能用」，那是编译期条件编译的结果。
+
+第五，区分 5.3.0 与 5.4.0 的 Teddy 变更。5.3.0 是 Teddy 的 VBMI 支持与性能改进；5.4.0 是 Fat Teddy 的 VBMI 支持与性能改进，同时引入 Sheng32/Sheng64/McSheng64。写版本说明时不要把两者混成「5.4.0 首次引入 Teddy VBMI」，也不要把 Sheng 的引入归到 5.3.0。
+
+第六，flood 处理有上限。`FDRFlood` 最多记录 16 个 id（`FDR_FLOOD_MAX_IDS`），超过就不走 flood 快速路径。若数据里有长串重复字符，而命中该字符的字面量又很多，flood 路径可能失效，确认成本上升。缓解办法是减少「以高频字符结尾」的字面量，或在模式层用更长的上下文提高区分度。
+
+第七，混合大小写会破坏 shortcut。`NG::addLiteral()` 里的 `mixed_sensitivity()` 检查会把「同一字面量里既有大写又有小写、且不是全大小写不敏感」的情况退回完整图处理；`hwlmLiteral` 虽然支持 `msk`/`cmp` 掩码，但 Rose 的字面量 shortcut 不愿意为它承担复杂度。若发现字面量没有走 Teddy/FDR，应先检查大小写形态，而不是怀疑引擎选择。
+
+### 7. 小结与延伸阅读
+
+字面量前端是 Rose 触发器的执行者。Noodle 处理单条字面量；Teddy 用 8 bucket、最多 4 层 nibble 掩码处理不超过 48 条；Fat Teddy 用 16 bucket、双宽掩码与 AVX2 把容量推到 96 条；FDR 用 64 位 scheme、8 bucket、可变 stride 与 confirm 表处理更大规模或 Teddy 失败的集合。选择发生在编译期 `hwlmBuild()`，由 `chooseTeddyEngine()`、`TEDDY_BUCKET_LOAD`、`isAllowed()` 与 `fdrBuildProtoInternal()` 的回落逻辑共同决定；运行期只按 `HWLM.type` 与 `engineID` 分派。
+
+三条实践结论：容量边界是经验值，以 `hsdump` 的实际引擎与 bucket 数为准；字面量的「尾部区分度」比总长度更重要，尤其对 Teddy；VBMI 是编译期、CPU、运行期三重条件，不要把源码里的宏当成默认能力。
+
+延伸阅读：06-04 讲这些字面量表如何被 Rose 选为 anchored、floating 或 EOD；06-09 讲 shufti、truffle 等字符类加速器如何与字面量前端配合；06-13 讲 fat runtime 如何在运行期选择指令集变体；05-07 给出 `FDR`、`Teddy`、`HWLM` 的字段定义；07-06 与 07-07 从模块角度列 `hwlm` 与 `fdr` 的文件职责。若只记一件事：字面量前端不是「越多越好」，而是「在容量、区分度与确认成本之间找平衡」。

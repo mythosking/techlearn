@@ -1,0 +1,1017 @@
+# Hyperscan 技术资料 · 06 技术原理（分片 B）
+
+## 06-06 NFA 引擎：LimEx NFA 的状态布局与执行
+
+### 1. 背景与动机
+
+Hyperscan 的编译流水线走到 Rose 层之后，模式集合被切成两部分：一部分能被字面量匹配器快速触发，另一部分只能靠自动机逐字节推进。后者最终交给 NFA 引擎。这里立刻出现两个诱惑：一是把整张图确定化成 DFA，换来每个字节一次查表；二是保留通用 NFA 模拟器，用递归或栈回溯的方式解释执行。前者在模式集合上万条时会遇到子集构造的指数爆炸——状态数最坏是 2 的幂次，字节码体积和编译时间都无法接受；后者虽然状态数线性，但每读一个字节都要做一次「取当前状态集合、遍历所有出边、求并集」的循环，成本与状态数成正比，而且解释器的分支预测极差。
+
+LimEx NFA 走的是第三条路：**把「状态集合」压缩成一个机器字（或几个机器字）的位向量，把「遍历出边」压缩成几次移位与按位与**。这样每个字节的处理变成常数条指令，状态数上限被硬性限制在一个字能表示的范围内。名字里的 LimEx 是 limited exceptional 的缩写，两个词各对应一条设计约束：limited 指状态数有上限、每次只允许有限次（最多 8 个）移位；exceptional 指那些无法用移位表达的边被单独摘出来，作为「例外」在循环里补丁式处理。理解了这两个词，就理解了整个引擎的形状。
+
+这条设计带来的直接后果是：LimEx 的绝对速度不如 DFA，但它对模式集合规模不敏感——一万条模式和一条模式，只要总状态数不超过上限，每个字节的成本是一样的。而 Hyperscan 的 Rose 层保证了 NFA 不会被要求处理流里的每一个字节：NFA 只在字面量触发点被唤醒，把「确认」这一段走完就退出。触发点稀疏时，NFA 的单位成本高一点完全可以接受；触发点密集时，说明模式本身字面量质量差，问题应该回到模式写法上，而不是指望 NFA 变快。
+
+本篇要回答四个具体问题：状态是怎么编号的，为什么编号方式能让「走一条边」变成「左移若干位」；reach 表为什么不是 256 张掩码；exception 表在什么条件下产生、又为什么可以缓存；以及一次 `hs_scan` 里 NFA 到底被谁调用、调用几次。这四个问题串起来，就是 LimEx 的全部执行模型。字段级定义不在本篇展开（字段见 05-06 ｜ 参数见 04-03 ｜ 模块见 07-05）。
+
+### 2. 核心概念
+
+**状态向量与位并行。** LimEx 用位图的第 i 位表示「NFA 的第 i 个状态当前是活的」。一个字能放 32 位就管 32 个状态，放 64 位就管 64 个状态，AVX 寄存器能放 128、256、384、512 位就分别管同样多的状态。引擎族因此被切成六个宽度：`LimExNFA32`、`LimExNFA64`、`LimExNFA128`、`LimExNFA256`、`LimExNFA384`、`LimExNFA512`，由 `src/nfa/limex_internal.h` 里的 `CREATE_NFA_LIMEX(size)` 宏一次性生成六份同构结构。选哪个宽度由编译期按状态数决定，运行期只按 `NFA::type` 分派，不做任何尺寸判断。
+
+**编号即拓扑序。** Glushkov 图没有 epsilon 边，状态数等于字符位置数。编译期给顶点编号时按拓扑序排列，于是「存在一条从 i 到 j 的边」等价于「j 的编号大于 i」。走一条边就可以写成「把第 i 位左移 (j−i) 位」。把所有同距离的边合成一张掩码，就成了 `shift[]` 数组：第 k 张掩码里置位的是「所有需要左移 `shiftAmount[k]` 位的源状态」。求后继只要对每张掩码做「与当前状态相交、再左移」，最后把结果或起来。
+
+**limited 的两道闸门。** 掩码数量上限是 `MAX_SHIFT_COUNT`（8），单次移位上限是 `MAX_SHIFT_AMOUNT`（16）。前者约束指令数，后者约束「一条边最多跨多少个状态」。这两个常量定义在 `src/nfa/limex_internal.h`，编译期的 `findBestNumOfVarShifts()` 与 `findMaxVarShift()` 会枚举 1 到 8 个移位的组合，用 `getLimexScore()` 打分选最优——移位越多指令越多，但例外越少。这是一次真实的取舍计算，不是拍脑袋的常数。
+
+**exceptional 的判定。** `isExceptionalTransition()`（`src/nfa/limex_compile.cpp:1536`）的逻辑很干脆：如果 `isLimitedTransition(from, to, maxShift)` 为假——也就是距离超过 16——这条边就是例外；另外，所有从 tug 触发器出发的边一律算例外，因为 tug 触发的语义依赖有界重复的当前状态，无法用纯移位表达。例外被收集进 `exceptionCount` 张 `NFAExceptionXXX` 结构，每张带有 `squash`（要清除的状态掩码）、`successors`（要置起的状态掩码）、`reports`（要上报的报告链）、`repeatOffset`（关联的有界重复）、`hasSquash` 与 `trigger`。
+
+**reach 表的去重。** 如果每个字符都存一张完整的状态掩码，256 个字符就是 256 个字，对小 NFA 而言这是灾难性的浪费。LimEx 的做法是先按「字符到达集」把 256 个字符分组，相同到达集共用一张掩码，得到 `reachSize` 张实际掩码；再用 `reachMap[256]` 做字符到掩码下标的映射。运行期的动作是 `s & reach[reachMap[c]]`——两次访存、一次按位与。`reachSize` 通常远小于 256，字节码因此显著变小。
+
+**accept、squash 与 EOD。** `accept` 是一张掩码，标记哪些状态是接受态；`acceptCount` 张 `NFAAccept` 结构给出「命中这个状态要上报什么」。`single_report` 为真时 `reports` 直接就是报告号，否则它是指向报告链表的偏移。`squash` 字段用于「命中后压制」：某些状态在报告之后必须被清掉，否则同一次匹配会在后续字节上重复触发。EOD 接受单独用 `acceptEodCount` / `acceptAtEOD` 表示，只在数据末尾检查一次，用来支持 `$` 这类锚点。
+
+**有界重复的状态外置。** 线性 NFA 无法用有限状态表示 `a{1000}`，LimEx 的解法是把重复的计数器搬到状态之外：`NFARepeatInfo` 里记录 `cyclicState`（环上那个状态）、`ctrlIndex`（控制块下标）、`packedCtrlOffset`、`stateOffset`、`stateSize`、`tugMaskOffset`。运行期只要环状态活着，就查一次 `repeatHasMatch()` 判断「现在这个偏移算不算命中」。重复状态的打包与解包由 `repeatPack` / `repeatUnpack` 完成，跨块时写进流状态。
+
+**状态压缩。** 流式模式下每个块结束都要把状态写进流状态。LimEx 提供两级压缩：`LIMEX_FLAG_COMPRESS_STATE` 表示按「上一个字节」查 reach 掩码做键控压缩，`LIMEX_FLAG_COMPRESS_MASKED` 在此基础上再与 `compressMask` 相与，并给全零情况走一条捷径（展开时把 `initDS` 或回去）。压缩函数是 `moNfaCompressState32/64/…`，展开是 `moNfaExpandState32/64/…`，都靠 `src/nfa/limex_state_impl.h` 的宏模板生成。
+
+### 3. 关键数据结构与源码位置
+
+本册只点名结构与入口，逐字段定义统一放 05 册，避免与字段表重复。`struct NFA` 头部（`flags`、`length`、`type`、`queueIndex`、`nPositions`、`scratchStateSize`、`streamStateSize`、`maxWidth`、`minWidth`、`maxOffset`）的字段含义见 05-06；`LimExNFA32` 等六个实现结构的字段见 05-06；`NFARepeatInfo` 与 `NFAAccept` 同样见 05-06。
+
+`struct NFA` 定义在 `src/nfa/nfa_internal.h:102`，它的注释点明了一条关键约定：引擎实现紧跟在头部之后，`getImplNfa(nfa)` 就是「头部地址加 `sizeof(struct NFA)`」。这意味着头部与实现是同一块连续内存，可以整体序列化、整体释放。`length` 字段给出这块内存的总字节数，序列化时照抄即可。
+
+LimEx 实现结构的生成宏在 `src/nfa/limex_internal.h:114`。宏展开后每个宽度都有一份独立的结构体定义，字段名相同、位宽不同。这种「一份源码、六次展开」的做法在 `src/nfa/` 里反复出现：`limex_native.c` 只写 32 位版本，再 `#include "limex_runtime_impl.h"` 让模板把其余宽度展开出来。
+
+LimEx 引擎在内存中的段落顺序见图 06-06-01，这个顺序直接决定了序列化与偏移计算的方式。
+
+:::figure id=06-06-01 | name=LimEx 引擎在内存中的段落顺序 | dir=TD
+node n1 "struct NFA 头部" blue
+node n2 "LimExNFA32 至 512" purple
+node n3 "reach 掩码表" teal
+node n4 "tops 表" teal
+node n5 "accel 表与 aux" amber
+node n6 "accept 与 EOD 表" amber
+node n7 "exception 表" red
+node n8 "repeat 偏移与结构" gray
+edge n1 -> n2 "getImplNfa 紧随其后"
+edge n2 -> n3 "定长之后变长"
+edge n2 -> n4 "TOP_N 事件"
+edge n2 -> n5 "加速状态"
+edge n2 -> n6 "报告入口"
+edge n2 -> n7 "长跳与 tug"
+edge n7 -> n8 "repeatOffset 指向"
+:::
+
+所有变长段的入口都是相对 `LimExNFA` 起始地址的 `u32` 偏移，而不是指针。这一点对跨进程分发至关重要：数据库可以按字节搬到另一台机器，偏移仍然有效，指针则会全部失效。`accelTableOffset`、`accelAuxOffset`、`acceptOffset`、`acceptEodOffset`、`exceptionOffset`、`repeatOffset`、`squashOffset`、`topOffset` 全部遵循这个约定，唯一的例外是 `reachMap` 与定长字段里的各个掩码，它们直接内联在结构里。
+
+为了让读者建立索引，下表把 LimEx 的各个段落、作用与源码位置放在一起。参数与模式常量不在本表重复，需要的读者请查 04 册。
+
+| 段落 | 作用 | 是否定长 | 源码位置 |
+|---|---|---|---|
+| `struct NFA` | 引擎种类、长度、状态尺寸 | 是 | `src/nfa/nfa_internal.h:102` |
+| `LimExNFA32/64/…` | 掩码、计数、偏移的容器 | 是 | `src/nfa/limex_internal.h:124` |
+| `reach[]` | 按字符去重后的到达掩码 | 否 | `src/nfa/limex_state_impl.h:64` |
+| `tops[]` | `TOP_N` 事件用的状态掩码 | 否 | `src/nfa/limex_common_impl.h` |
+| `AccelAux[]` | 加速方案参数 | 否 | `src/nfa/accel.h:66` |
+| `NFAAccept[]` | 报告与压制入口 | 否 | `src/nfa/limex_internal.h:190` |
+| `NFAExceptionXX[]` | 长跳与 tug 的补丁 | 否 | `src/nfa/limex_internal.h:115` |
+| `NFARepeatInfo[]` | 有界重复的控制与状态 | 否 | `src/nfa/limex_internal.h:181` |
+
+两个上限常量值得单独记住：`NFA_MAX_STATES` 是 512，`NFA_MAX_ACCEL_STATES` 是 8，都在 `src/nfa/limex_limits.h`。前者决定「多大的图还能塞进 LimEx」，后者决定加速表的索引空间只有 2 的 8 次方，也就是 256 项。
+
+### 4. 关键流程与调用链
+
+一次 NFA 执行的起点不在 NFA 内部，而在 Rose 生成的程序里。Rose 把字面量命中翻译成一个队列事件，事件带着「从哪个偏移开始跑、跑到哪里」的信息进入 `struct mq`（匹配队列）。公共入口是 `nfaQueueExec()`（`src/nfa/nfa_api.h:121`），它在 `src/nfa/nfa_api_dispatch.c` 里按 `nfa->type` 做一次 switch，把调用转发到 `nfaExecLimEx32_Q`、`nfaExecLimEx64_Q` 之类的具体实现。这张分派表同时列出了 LimEx、McClellan、Gough、LBR、Castle、Sheng、McSheng 全部家族，是理解「一个 NFA 对象到底是谁」的最好入口。
+
+进入 `nfaExecLimEx32_Q` 之后，第一步是队列初始化：`nfaExecLimEx32_queueInitState()` 把 `init` 或 `initDS` 掩码装进状态，并处理队列里已经排好的 top 事件。之后进入热循环 `LOOP_NOACCEL_FN`，也就是 `src/nfa/limex_runtime_impl.h:215` 附近那段 for 循环。循环体只有四步，下面这段源码是它的骨架（保留了原始宏名，便于对照）。
+
+```c
+for (; i != length; i++) {
+    if (can_die && ISZERO_STATE(s)) {
+        break;                      /* 全零状态：这条 NFA 已经死了 */
+    }
+
+    STATE_T succ;
+    NFA_EXEC_GET_LIM_SUCC(limex, s, succ);   /* 移位求后继 */
+
+    if (RUN_EXCEPTIONS_FN(limex, exceptions, s, EXCEPTION_MASK, i, offset,
+                          &succ, final_loc, ctx, flags, 0, first_match)) {
+        return MO_HALT_MATCHING;
+    }
+
+    u8 c = input[i];
+    s = AND_STATE(succ, LOAD_FROM_ENG(&reach[limex->reachMap[c]]));
+}
+```
+
+逐行判读这段代码。第一行的 `can_die` 来自 `LIMEX_FLAG_CANNOT_DIE` 的反面：如果编译器证明这条 NFA 在任何输入下都不会「全灭」，这个检查会被优化掉；反之，一旦状态全零就立即跳出，这是 NFA 在长数据上最重要的早退机制，触发点之后没有匹配可能时它能省掉整段扫描。`NFA_EXEC_GET_LIM_SUCC` 是一个 do-while 宏，内部按 `shiftCount` 做 switch 展开成 1 到 8 次「与掩码、左移、或起来」，没有循环、没有间接跳转，这是它能跑得快的关键；`shiftAmount[]` 是常量表，编译器会把移位量当成立即数处理。`RUN_EXCEPTIONS_FN` 只在 `exceptionMask` 与当前状态有交集时才有实质工作，否则是一次按位与加一次判零。最后一行 `s = succ & reach[reachMap[c]]` 才是「读入一个字节」的语义：先用移位算出「一步之内能到哪些状态」，再用当前字符的到达掩码过滤——这正是 Glushkov 语义，先走边、再验字符。注意 `reach` 与 `reachMap` 都是只读的引擎内数据，循环里没有任何写入，这让多个线程可以共享同一份数据库。
+
+例外的处理值得单独展开。`processExceptional32()`（`src/nfa/limex_native.c:73`）先用 `findAndClearLSB_32` 逐位取出例外状态，再用 `rank_in_mask32(limex->exceptionMask, bit)` 把「第几位」换算成「第几个例外结构」——因为例外表只存有例外的状态，中间的空洞必须靠 rank 运算跳过。这个 rank 是整条例外路径上最贵的操作，所以引擎做了一层缓存：如果本次例外状态集合与上次完全相同（`estate == ctx->cached_estate`），直接复用上次算出的后继与报告链。缓存只在「例外只置后继、不上报、不压制」时成立，代码里用 `cacheable` 标记区分，遇到会上报的例外就退化到 `DO_NOT_CACHE_RESULT_AND_FLUSH_BR_ENTRIES` 分支并清缓存。
+
+状态在块边界上的搬运由 `nfaExecLimEx32_queueCompressState` 与 `nfaExecLimEx32_expandState` 成对完成。压缩的键是「队列位置之前那个字节」，因为 reach 掩码只与字符有关，用上一字节做键可以安全地丢掉那些「在当前字符下必然为死」的位。这条约定带来一个容易踩的坑：压缩与展开必须严格配对，且键必须一致，否则状态会被展开成另一个集合，表现为流式漏报或误报。
+
+完整的调用链可以概括为：Rose 程序触发 → `mq` 队列 → `nfaQueueExec` → 按 `type` 分派 → `nfaExecLimExXX_Q` → 队列初始化 → 热循环（移位、例外、reach 过滤）→ `moProcessAcceptsXX` → 报告回调 → Rose 的报告处理（SOM 相关见 06-10）。这条链上的关键节点见图 06-06-02。
+
+:::figure id=06-06-02 | name=一次 LimEx 执行的调用链 | dir=LR
+node n1 "Rose 触发事件" blue
+node n2 "mq 匹配队列" blue
+node n3 "nfaQueueExec 分派" amber
+node n4 "LimExXX_Q 入口" purple
+node n5 "移位求后继" purple
+node n6 "exception 补丁" red
+node n7 "reach 掩码过滤" teal
+node n8 "accept 上报" green
+node n9 "Rose 报告处理" green
+edge n1 -> n2 "带偏移区间"
+edge n2 -> n3 "队列非空"
+edge n3 -> n4 "按 type"
+edge n4 -> n5 "初始化状态"
+edge n5 -> n6 "掩码相交"
+edge n5 -> n7 "读入字节"
+edge n7 -> n8 "状态命中"
+edge n8 -> n9 "回调"
+:::
+
+### 5. 配置/命令/代码实例
+
+下面这段 C 程序刻意选了一个「字面量只能覆盖前半、后半必须靠 NFA 确认」的模式：`ab[^c]{2,5}de`。Rose 会拿 `ab` 做触发，把「两到五个非 c 字符再跟 de」这一段交给 NFA。程序打印数据库信息与两次扫描的命中，用来观察结束偏移与起始偏移的差别。完整标志表见 04-02，模式常量见 04-03。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int on_match(unsigned int id, unsigned long long from,
+                    unsigned long long to, unsigned int flags, void *ctx) {
+    (void)flags;
+    (void)ctx;
+    printf("id=%u from=%llu to=%llu len=%llu\n",
+           id, from, to, to - from);
+    return 0;
+}
+
+int main(void) {
+    const char *pat = "ab[^c]{2,5}de";
+    hs_database_t *db = NULL;
+    hs_scratch_t *scratch = NULL;
+    hs_compile_error_t *err = NULL;
+
+    if (hs_compile(pat, HS_FLAG_SOM_LEFTMOST, HS_MODE_BLOCK, NULL,
+                   &db, &err) != HS_SUCCESS) {
+        fprintf(stderr, "compile: %s (expr %d)\n", err->message,
+                err->expression);
+        hs_free_compile_error(err);
+        return 1;
+    }
+
+    if (hs_alloc_scratch(db, &scratch) != HS_SUCCESS) {
+        hs_free_database(db);
+        return 1;
+    }
+
+    const char *s1 = "xx ab12de yy";
+    const char *s2 = "xx ab123456de yy";
+
+    printf("db=%zu scratch=%zu\n", hs_database_size(db),
+           hs_scratch_size(scratch));
+    hs_scan(db, s1, (unsigned)strlen(s1), 0, scratch, on_match, NULL);
+    hs_scan(db, s2, (unsigned)strlen(s2), 0, scratch, on_match, NULL);
+
+    hs_free_scratch(scratch);
+    hs_free_database(db);
+    return 0;
+}
+```
+
+在一台支持 AVX2 的机器上以 5.4.2 编译运行，输出形如下面的文本。示例输出，具体格式需对照实际版本核验。
+
+```text
+db=12288 scratch=7168
+id=0 from=3 to=9 len=6
+```
+
+逐行判读。第一行的两个数字分别来自 `hs_database_size()` 与 `hs_scratch_size()`，单位是字节：数据库大小包含 `struct NFA` 头部、`LimExNFA128`（或更窄的宽度，取决于状态数）、去重后的 reach 表、accept 表与例外表；scratch 大小则由所有被引用 NFA 的 `scratchStateSize` 之和决定，所以即使只有一条模式，scratch 也远大于单个状态向量。这两个数值随版本与目标平台变化，只能做横向对照，不能当绝对指标。第二行是第一次扫描的命中：`from=3` 是 `a` 的下标，`to=9` 是开区间上界，实际最后一个字节是 `e`（下标 8）；`len=6` 正好落在 `ab` 加 2 个字符加 `de` 的下界上。第二次扫描没有输出，因为 `ab123456de` 中间有 6 个非 c 字符，超过 `{2,5}` 的上界——这正是「NFA 的重复计数在起作用」的直接证据，如果上界被忽略，这里会多出一条 `len=11` 的记录。注意 `from` 之所以有意义，是因为编译时开了 `HS_FLAG_SOM_LEFTMOST`；不开这个标志时 `from` 只是一个占位值，不能用来算长度（原理见 06-10）。
+
+如果想看引擎内部长什么样，可以在带 `DUMP_SUPPORT` 的调试构建下用 `hsdump` 或灰盒转储查看 LimEx 的段落。`src/nfa/limex_dump.cpp:293` 起的第一行固定是「位宽 + shifts + exceptions」，紧接着是 flags。下面的片段按该转储函数输出的字段顺序给出，示例输出，具体格式需对照实际版本核验。
+
+```text
+64-bit LimEx NFA (2 shifts, 1 exceptions)
+flags: CANNOT_DIE
+MSK INIT 0x0000000000000003
+MSK ACCEPT 0x0000000000000008
+Shift Masks:
+     Shift 0(1)        Mask: 0x0000000000000006
+     Shift 1(3)        Mask: 0x0000000000000018
+```
+
+判读要点有三。第一行告诉你引擎选了 64 位宽度，也就是状态数在 33 到 64 之间；两个移位说明这张图的大部分边跨度只有 1 和 3，编译器认为两次移位比一次移位加更多例外更划算。`flags: CANNOT_DIE` 表示 `LIMEX_FLAG_CANNOT_DIE` 被置起，热循环里的全零早退会被省掉——因为这张图在任何输入下都至少有一个状态活着（通常是起始状态常驻）。`MSK INIT` 是初始状态集合，`MSK ACCEPT` 是接受状态集合，两者都是按位掩码，从右往左数第 n 位对应第 n 号状态。`Shift 0(1)` 读作「第 0 张移位掩码，移位量 1」，掩码 `0x6` 表示第 1、2 位是源状态，左移 1 位后落到第 2、3 位。如果这里出现 `exceptions` 数量远大于 shifts，说明图的跨度很分散，值得回头检查模式里是否有长距离的跳跃结构。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**第一，512 个状态是硬墙，不是软限制。** `NFA_MAX_STATES` 定义在 `src/nfa/limex_limits.h`，超过这个数的图不会被 LimEx 接受，Rose 会退到 DFA 路径（Sheng / McClellan），再不行就抛 `Pattern is too large.`。这条错误的根因往往是有界重复展开过大或分支过多，正确做法是改写模式（把大重复合并、把可选择分支提成字面量前缀），而不是调大任何参数——这个上限是编译期常量，没有运行时开关。
+
+**第二，例外不是零成本，但也不是每次都付。** 例外表的大小直接影响字节码体积，例外路径上的 `rank_in_mask32` 是这条链上最贵的操作。设计模式时应尽量让状态编号紧凑、边跨度小，让编译器能用少量移位覆盖大部分边。反过来，如果模式里有大量「跨十几步才连上的边」——比如 `a.{0,40}b` 这类结构——例外会变多，NFA 的每次推进都要多走一遍例外循环。
+
+**第三，例外缓存有前提。** `processExceptional32()` 的缓存只在「例外只置后继」时有效，一旦某个例外需要上报或压制，缓存就被标记为不可用并主动清空。这意味着带报告的例外在密集触发下会退化成每次重算。这不是 bug，而是正确性要求：报告有副作用，不能复用。
+
+**第四，别把 NFA 当成「会看全部字节」的引擎。** 除了反向 NFA（SOM 用）会从命中点往回扫，正向 NFA 只在 Rose 给出的队列区间里运行。因此「NFA 慢」这个判断要先看触发频率：如果字面量前缀很短（比如单字符），触发会极其密集，NFA 事实上在逐字节跑，此时优化方向是加长触发字面量，而不是换引擎。
+
+**第五，压缩状态必须成对调用。** `queueCompressState` 与 `expandState` 的键都是「前一字节」，而且压缩是有损的——它按 reach 掩码丢掉了在当前字符下必然为死的位。如果调用方在错误的偏移上展开，或者用不同的键展开，得到的状态集合就是错的。流式场景下这类 bug 表现为「跨块后偶发漏报」，且只在特定分块位置出现，非常难查；定位手段是固定块大小做二分，看漏报是否随块边界移动（流状态的整体机制见 06-11）。
+
+**第六，`CANNOT_DIE` 与早退是两回事。** 没有这个标志时，状态全零会立刻跳出循环；有这个标志时，编译器认为「永远至少有一个状态活着」，于是省掉判零。这两者的差别只在性能，不在语义。如果发现某个 NFA 在明显不匹配的数据上仍然跑满整段，先确认它是否被标了 `CANNOT_DIE`，再看是不是触发区间本身就很长。
+
+**第七，`squash` 的时机不能想当然。** 压制掩码是在报告**之后**应用的（见 `PROCESS_ACCEPTS_IMPL_FN`），因为报告本身可能需要读当前状态。任何「先清状态再报告」的改动都会破坏语义。调试时如果看到「同一次匹配被上报多次」，先查是不是 squash 掩码缺失，而不是怀疑去重逻辑。
+
+### 7. 小结与延伸阅读
+
+LimEx 的全部设计可以压缩成一句话：用「拓扑序编号 + 移位掩码」把逐边遍历降成常数条位运算，用「例外表」兜住表达不了的长跳，用「reach 去重」把 256 张掩码压成几十张，再用「状态压缩」把跨块的状态搬运成本降到最低。它不追求单字节最快，追求的是「对模式规模不敏感、对触发稀疏性友好」。这两条性质正好补上 Rose 分解留下的空缺。
+
+如果只记住三件事：第一，`s = (移位后继) & reach[reachMap[c]]` 是整个引擎的心脏，理解它就理解了 Glushkov 语义在位向量上的落地；第二，例外表是有限的补丁机制，模式写法决定了补丁多少；第三，状态上限 512 与压缩键约定是两条不能碰的边界，前者决定能不能编译，后者决定流式是否正确。
+
+延伸阅读建议按这个顺序：先看 `src/nfa/limex_internal.h` 顶部的布局注释（那段文字比任何二手资料都准确），再看 `src/nfa/limex_runtime_impl.h` 的热循环与例外调用，然后看 `src/nfa/limex_compile.cpp` 里 `isExceptionalTransition` 与 `getLimexScore` 的取舍逻辑。Castle 作为「多租户重复引擎」与 LimEx 是互补关系，下一篇展开；DFA 家族（Sheng / McSheng / McClellan）见 06-08；加速器如何嵌进这条循环见 06-09；NFA 的状态如何进入流状态见 06-11。
+
+## 06-07 Castle 与可压缩 NFA 的取舍
+
+### 1. 背景与动机
+
+有界重复是正则里最常见也最难处理的结构。`[a-z]{1,1000}`、`\d{6,12}`、`.{0,255}` 这类写法在真实规则集里占比极高，它们的特点是：字符集通常很小（甚至只有一个字符），但计数的上下界很大。用 NFA 表达意味着要把重复展开成上千个状态，直接撞上 512 状态的上限；用 DFA 表达又会让状态数随计数线性增长。Hyperscan 为此专门做了一个引擎族：LBR（Large Bounded Repeat）负责单个大重复，Castle 负责「一批共享同一字符集的大重复」。
+
+Castle 这个名字来自「多租户」的隐喻：一个引擎里住着很多个 SubCastle，每个 SubCastle 是一个独立的有界重复，各自有自己的报告和状态，但它们共享同一张字符到达表和同一套扫描逻辑。这样做的好处是扫描一遍数据就能同时推进所有租户，成本接近「一个重复」而不是「N 个重复」。代价是这些重复必须字符集完全一致——`src/nfa/castlecompile.h:69` 的注释写得很直白：Currently, all repeats in a Castle must have the same character reachability。
+
+理解 Castle 的关键是理解它和 LimEx 的分工。LimEx 是「通用图执行器」，能处理任意形状的子图，但状态预算只有 512；Castle 是「专用重复执行器」，只能处理「单一字符集 + 计数上下界」这一种形状，但能把这种形状做到几乎零状态成本。Rose 在分解阶段就把「纯重复」的子图摘出来，交给 Castle 原型（`CastleProto`）累积；等到落字节码时再决定是合成一个 Castle，还是退化成一个 LBR。
+
+### 2. 核心概念
+
+**PureRepeat：Castle 的唯一输入形状。** `CastleProto` 的构造函数签名是 `CastleProto(nfa_kind k, const PureRepeat &pr)`，也就是每个 Castle 都从一个纯重复开始，之后通过 `add()` 不断加入「字符集相同」的新重复。`PureRepeat` 描述的是「某个字符集重复 N 到 M 次」这一件事，它不含分支、不含断言、不含子图嵌套。任何带分支的重复都会在 Rose 阶段被拆开，不会进入 Castle。
+
+**top 与 SubCastle。** Castle 用 `top` 编号标识「哪个重复被触发」。每个 top 对应一个 `SubCastle`，结构里有 `report`（命中上报什么）、`fullStateOffset`（在 scratch 全状态里的偏移）、`streamStateOffset`（在流状态里的偏移）、`repeatInfoOffset`（对应的 `RepeatInfo`）、`exclusiveId`（互斥组号）。`max_occupancy` 是 65536，这是一个「任意定的上限」，用来防止原型无限膨胀。
+
+**共享 reach，共享扫描器。** Castle 的所有 SubCastle 字符集相同，所以只需要一套「找下一个可能命中位置」的扫描器。`Castle::type` 决定用哪一种：`CASTLE_DOT`（任意字符，永不失败，直接跳到末尾）、`CASTLE_VERM`（单字符，用 vermicelli）、`CASTLE_NVERM`（单字符取反）、`CASTLE_SHUFTI`（字符类，双 nibble 查表）、`CASTLE_TRUFFLE`（稀疏字符类）。这五种扫描器的实现分别是 `castleScanVerm`、`castleScanNVerm`、`castleScanShufti`、`castleScanTruffle`，都只是对 `vermicelliExec` / `shuftiExec` / `truffleExec` 的一层薄封装。
+
+**不是逐字节推进，而是「跳到下一个候选」。** 这是 Castle 与 LimEx 最本质的差别。`castleMatchLoop()`（`src/nfa/castle.c:470`）的循环体是：先问每个活跃 SubCastle「你的下一个可能命中偏移是多少」，取所有答案的最小值，把在该偏移命中的 SubCastle 记进 `matching` 多重位图，然后一次性跳到那个偏移触发报告。数据里没有候选位置时，扫描器一次跳过整段。所以 Castle 的成本与「候选位置密度」成正比，而与数据长度只有很弱的线性关系。
+
+**互斥组（exclusive group）。** 有些重复天然互斥：比如 `\d{6}` 和 `\d{8}`，在同一个起点上不可能同时满足。Castle 编译期用团（clique）算法找出互斥的 SubCastle 集合，让它们共享同一份状态池——因为任意时刻最多只有一个活着。`ExclusiveType` 有三个取值：`NOT_EXCLUSIVE`（没有互斥）、`EXCLUSIVE`（部分互斥）、`PURE_EXCLUSIVE`（全部互斥）。全部互斥时，流状态里连「活跃重复」的多重位图都能省掉，只剩「当前活跃的是哪个 SubCastle」的 id。
+
+**状态的三段结构。** 重复的状态被切成三块：控制块（`RepeatControl`，很小，可整体拷贝）、重复状态（`RepeatState`，可能很大，含多重位图环或有序数组，直接驻留流状态、不拷贝）、打包控制块（`packedCtrlSize` 字节，跨块时写进流状态）。`RepeatInfo` 里的 `type` 决定用哪种模型：`REPEAT_RING`（一般 `{N,M}`，环形位图）、`REPEAT_FIRST`（`{N,}`，只记第一个 top）、`REPEAT_LAST`（`{0,N}`，只记最后一个 top）、`REPEAT_RANGE`（`N` 与 `M` 差距很大时的有序数组）、`REPEAT_BITMAP`、`REPEAT_SPARSE_OPTIMAL_P`（带最小周期的稀疏模型）、`REPEAT_TRAILER`、`REPEAT_ALWAYS`。
+
+**为什么「压缩 NFA」不是替代方案。** 有人会问：LimEx 已经有状态压缩（`LIMEX_FLAG_COMPRESS_STATE`），为什么不把大重复压进状态向量里？答案是压缩只作用于「流状态怎么存」，不改变「运行期一个状态一位」的事实。`a{1000}` 在 Glushkov 图里要展开成一千个位置，位向量就要一千位，而 LimEx 的上限是 512 位——压缩发生在写流状态的那一刻，此时状态向量早已超限。真正能表达计数的只有「把计数搬到状态之外」，也就是 `RepeatInfo` 那套控制块加环/数组的模型；Castle 与 LBR 正是这套模型的两种封装。所以「可压缩」与「可计数」是两件正交的事：前者省流状态，后者省运行期状态位，Castle 走的是后者。
+
+**LBR 是 Castle 的单租户特例。** `buildRepeatEngine()`（`src/rose/rose_build_bytecode.cpp:608`）的逻辑只有一行判断：如果 `proto.repeats.size() == 1` 且灰盒允许 LBR，就调 `constructLBR()`，否则 `buildCastle()`。注释解释了原因：只有一个重复时，LBR 一定是最好实现——它不需要多重位图、不需要分组、状态开销最小。LBR 有四种形态（`lbr_dot`、`lbr_verm`、`lbr_shuf`、`lbr_truf`），对应 `NFAEngineType` 里的 `LBR_NFA_DOT` / `VERM` / `NVERM` / `SHUF` / `TRUF`。它们的公共状态只有两个字段：`lastEscape`（最后一次逃逸的偏移）与 `RepeatControl` 控制块，全状态只有 lastEscape 与控制块两项，是真正的「常数状态」重复引擎。
+
+### 3. 关键数据结构与源码位置
+
+`struct Castle` 定义在 `src/nfa/castle_internal.h:114`，字段含义（`numRepeats`、`numGroups`、`type`、`exclusive`、`activeIdxSize`、`activeOffset`、`staleIterOffset`、`groupIterOffset`、联合体 `u`）见 05-06。`struct SubCastle` 在同文件 `:39`。`CastleProto` 与 `buildCastle()` 的声明在 `src/nfa/castlecompile.h:69` 与 `:126`。`RepeatInfo` 与 `RepeatType` 在 `src/nfa/repeat_internal.h`，运行期的 `repeatHasMatch` / `repeatNextMatch` / `repeatStore` / `repeatPack` / `repeatUnpack` 在 `src/nfa/repeat.h`。
+
+`castle_internal.h` 的头部注释值得逐字读一遍，它用 ASCII 图示给出了流状态的布局：先是各个互斥组的「活跃子引擎 id」，再是非互斥组的「活跃重复」多重位图，然后是「活跃互斥组」多重位图，最后是各组的共享状态池与各非互斥 SubCastle 的独立状态。这段注释解释了一个反直觉的设计：互斥组的状态是**共享**的，因为同一时刻只有一个成员活着，所以一份空间够所有成员轮流用。
+
+LBR 的结构在 `src/nfa/lbr_internal.h:44`：`lbr_common` 只有 `repeatInfoOffset` 与 `report` 两个字段，`lbr_verm` 加一个 `char c`，`lbr_shuf` 加两行 128 位掩码，`lbr_truf` 加两行掩码。`lbr_state`（scratch 里的全状态）只有 `lastEscape` 与控制块。把这几行和 `LimExNFA512` 那几十个字段对比，就能直观感受到「专用引擎」和「通用引擎」的体积差。
+
+下面这张表把 Castle 与 LBR 在几个维度上并排，便于做取舍判断。参数与灰盒开关不在表中重复（参数见 04-01 ｜ 字段见 05-06）。
+
+| 维度 | LBR | Castle |
+|---|---|---|
+| 承载的重复数 | 恰好 1 个 | 1 到 65536 个 |
+| 状态成本 | 仅 lastEscape 加控制块 | 多重位图 + 各组状态池 |
+| 触发方式 | 单个 top | 每个 SubCastle 一个 top |
+| 扫描器 | dot / verm / nverm / shuf / truf | 同左，但由 `Castle::type` 统一 |
+| 互斥优化 | 不需要 | 团划分后可共享状态 |
+| 源码入口 | `constructLBR()` | `buildCastle()` |
+| 选择条件 | `repeats.size() == 1` | 其余情况 |
+
+### 4. 关键流程与调用链
+
+编译期的路径从上往下是这样的。Rose 在分解子图时识别出纯重复，调用 `CastleProto::add()` 把它并入某个原型；如果字符集与已有原型不同，就新建一个原型。原型在 `RoseBuildImpl` 里以 `CastleProto *c` 的形式挂在各个 build context 上（见 `src/rose/rose_build_impl.h:121`）。等到 `buildFinalEngine()` 阶段，`buildRepeatEngine()` 拿到原型与触发信息，按「一个还是多个」分流：一个走 `constructLBR()`，多个走 `buildCastle()`。`buildCastle()` 内部先算互斥组（`findExclusiveGroups` 一类的团划分，`CLIQUE_GRAPH_MAX_SIZE` 是 1000），再按 `EXCLUSIVE` / `PURE_EXCLUSIVE` 分配流状态布局，最后把 `SubCastle[]` 与各个 `RepeatInfo` 依次写进同一块字节码。
+
+分流关系与 Castle 内部的共享结构见图 06-07-01。
+
+:::figure id=06-07-01 | name=单重复与多重复的引擎分流 | dir=TD
+node n1 "CastleProto<br/>同字符集的若干重复" teal
+node n2 "重复数是否为 1" amber
+node n3 "LBR 引擎" purple
+node n4 "Castle 引擎" purple
+node n5 "共享一张 reach 表" teal
+node n6 "一次扫描推进全部租户" green
+node n7 "各 SubCastle 独立状态" gray
+edge n1 -> n2 "进入落库阶段"
+edge n2 -> n3 "是，且允许 LBR"
+edge n2 -> n4 "否"
+edge n4 -> n5 "字符集一致"
+edge n5 -> n6 "按 top 触发"
+edge n6 -> n7 "分组写回"
+:::
+
+运行期的路径短得多。Rose 触发一个 top 之后，`nfaExecCastle_Q` 把 top 事件记进队列，然后调 `castleMatchLoop()`。循环的第一步是 `mmbit_clear(matching, c->numRepeats)` 清空临时多重位图；接着对每个活跃的互斥组，用 `subCastleNextMatch()` 问出「下一次命中在哪个偏移」；再对非互斥的 SubCastle 走 `subCastleMatchLoop()`。所有答案汇总到 `offset`（取最小）与 `matching`（在该偏移命中的成员）。如果 `matching` 为空，说明再也不可能命中，直接 `break`；否则 `subCastleFireMatch()` 发报告、更新状态，把 `loc` 推到 `offset` 继续。
+
+这里有一个容易忽略的细节：`castleMatchLoop` 的循环变量是「偏移」，不是「字节」。它每次迭代至少前进一个字节（`loc = offset` 且 `offset` 严格大于上一次），但通常一次跳过几十上百字节。这正是 Castle 的吞吐来源，也是它不适合「密集候选」场景的原因——候选越密，跳得越短，优势越小。
+
+`subCastleFireMatch()` 负责把「命中」翻译成「状态更新 + 报告」。它先按 `RepeatInfo` 的模型更新控制块与重复状态（`repeatStore`），再决定是否发报告。发报告时用 `cb(0, offset, sub->report, ctx)` 这种形式，第一个参数是起始偏移 0——因为 LBR 与 Castle 默认不跟踪 SOM，起始偏移由 Rose 的 SOM 机制另行处理（见 06-10）。如果回调返回 `MO_HALT_MATCHING`，整条链立刻终止并把 `HS_SCAN_TERMINATED` 传回调用方。
+
+状态在块边界上的处理比 LimEx 简单：控制块用 `repeatPack` 打包进流状态，重复状态本身就在流状态里、不需要拷贝。`nfaExecCastle_queueCompressState` 只做「把控制块写出去」这一件事，因为大块的多重位图环本来就驻留在流状态中。这也是 Castle 流状态偏大的原因：一个 `{1,1000}` 的重复，环里要存上千个 top 的相对偏移。
+
+### 5. 配置/命令/代码实例
+
+下面的 C 程序用三条共享同一字符集的重复来观察 Castle 的行为。三条模式都形如 `[0-9]{n,m}`，字符集相同，因此会被合并进同一个 Castle 原型；其中两条互斥（长度区间不重叠），一条与它们重叠，用来观察互斥组是否生效。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <string.h>
+
+static int cb(unsigned int id, unsigned long long from,
+              unsigned long long to, unsigned int flags, void *ctx) {
+    (void)from; (void)flags; (void)ctx;
+    printf("id=%u to=%llu\n", id, to);
+    return 0;
+}
+
+int main(void) {
+    const char *pats[3] = { "[0-9]{6}", "[0-9]{10}", "[0-9]{6,12}" };
+    unsigned flags[3] = { 0, 0, 0 };
+    unsigned ids[3]   = { 10, 11, 12 };
+    hs_database_t *db = NULL;
+    hs_scratch_t *sc = NULL;
+    hs_compile_error_t *err = NULL;
+
+    if (hs_compile_multi(pats, flags, ids, 3, HS_MODE_BLOCK, NULL,
+                         &db, &err) != HS_SUCCESS) {
+        fprintf(stderr, "compile: %s (expr %d)\n", err->message,
+                err->expression);
+        hs_free_compile_error(err);
+        return 1;
+    }
+    if (hs_alloc_scratch(db, &sc) != HS_SUCCESS) {
+        hs_free_database(db);
+        return 1;
+    }
+
+    const char *data = "abc 1234567890 xyz";
+    printf("db=%zu\n", hs_database_size(db));
+    hs_scan(db, data, (unsigned)strlen(data), 0, sc, cb, NULL);
+
+    hs_free_scratch(sc);
+    hs_free_database(db);
+    return 0;
+}
+```
+
+输出形如下面的文本。示例输出，具体格式需对照实际版本核验。
+
+```text
+db=9216
+id=10 to=13
+id=12 to=13
+id=11 to=13
+id=12 to=15
+id=11 to=17
+```
+
+逐行判读。`db=9216` 是三条模式合并后的数据库大小：三条独立的 LimEx 会各自带一套 reach 表与例外表，合并成一个 Castle 后只有一套扫描器，所以体积明显小于「三倍单模式」。接下来的五条命中都发生在 `1234567890` 这段数字上，结束偏移分别是 13、15、17。`to=13` 是第一个六位数字的结尾（下标 8 到 12，开区间 13），此时 `id=10`（`{6}`）与 `id=12`（`{6,12}`）同时成立——这正是「同一偏移命中多个租户」的场景，Castle 用一次 `matching` 多重位图就能全部报出。`to=15` 与 `to=17` 是 `{6,12}` 在更长的数字串上继续命中的结果，说明 `REPEAT_RING` 模型记住了「第一个 top 在 8」，之后每个满足下界的偏移都会报。`id=11`（`{10}`）只在 `to=17` 报一次，因为它要求恰好十位。如果这里只看到 `id=10` 而看不到 `id=12`，通常意味着两条模式被分进了不同的原型（字符集被优化成了不同形式，比如一条被转成 `\d`），需要用灰盒转储确认原型划分。
+
+第二个观察点是灰盒开关。`src/grey.h` 里有 `allowCastle` 与 `allowLbr` 两个开关，调试构建下可以通过 `HS_DEBUG_MODE` 或环境变量控制（具体变量名需对照实际版本核验）。关掉 `allowLbr` 后，单重复会走 Castle，数据库会略微变大、吞吐略微下降——这正好可以用来验证「LBR 是单重复的最优实现」这个结论。
+
+```c
+/* 摘自 src/nfa/castle.c 的 castleMatchLoop 主体，省略了互斥分支 */
+u64a loc = begin;
+while (loc < end) {
+    u64a offset = end;
+    mmbit_clear(matching, c->numRepeats);
+    subCastleMatchLoop(c, full_state, stream_state, end, loc, &offset);
+    if (!mmbit_any(matching, c->numRepeats)) {
+        break;                      /* 没有更多候选，整段结束 */
+    }
+    if (subCastleFireMatch(c, full_state, stream_state, cb, ctx, offset)
+        == MO_HALT_MATCHING) {
+        return MO_HALT_MATCHING;
+    }
+    loc = offset;                   /* 跳到刚命中的偏移继续 */
+}
+```
+
+逐行判读。`offset` 初值设成 `end` 是一个惯用法：任何 SubCastle 给出的候选偏移都小于 `end`，所以「没人给答案」时 `offset` 保持 `end`，循环自然结束。`mmbit_clear` 每轮清空临时位图，因为 `matching` 只在「当前这一批命中」内有意义。`subCastleMatchLoop` 是真正的工作函数，它遍历所有非互斥 SubCastle，各自算出 `repeatNextMatch` 并更新 `offset` 与 `matching`。`mmbit_any` 为假说明所有租户都报告「再也不会命中」（`REPEAT_STALE`），此时可以安全地放弃整段数据——这是 Castle 在「候选已经耗尽」时最重要的早退。最后 `loc = offset` 而不是 `loc++`，因为同一偏移上可能还有别的租户要报，下一轮会用 `repeatHasMatch` 再确认一次。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**第一，字符集必须完全一致才能合并。** 这是 Castle 最硬的约束，也是性能好坏的分水岭。`[0-9]{6}` 与 `\d{6}` 在语义上等价，但如果一条被优化成 10 个字符的集合、另一条被保留成 10 个字符加别的形式，它们就进不了同一个原型。写规则时应尽量用同一种写法表达同一类字符，让 Rose 有机会合并。
+
+**第二，单重复不要指望 Castle。** `buildRepeatEngine()` 会强制走 LBR。这不是优化选项，而是代码里的硬判断。所以「为什么我的单条 `.{0,100}` 没有走 Castle」这类问题没有意义——它走的是 LBR，而 LBR 更快。
+
+**第三，互斥组的划分是编译期做的，运行期不能改。** 团划分的复杂度在图规模大时会变得显著（`CLIQUE_GRAPH_MAX_SIZE` 是 1000，超过就不做完全划分）。如果一个 Castle 里塞了几百个长度各异的重复，编译时间会明显上升，而互斥优化可能只覆盖一部分。这种情况下拆成多个 Castle 反而更划算。
+
+**第四，Castle 的流状态偏大。** 一个 `{1,1000}` 的重复，`REPEAT_RING` 模型要在环里存上千个 top 的相对偏移，每个 top 一个位，加起来就是上百字节；几十个这样的重复叠在一个 Castle 里，流状态会到几 KB。流式服务里这个成本直接乘以并发流数，必须提前估算（流状态的整体模型见 06-11）。
+
+**第五，`end` 的语义是开区间。** `castleMatchLoop()` 的 `end` 参数是「扫描到此为止、不含」，所有比较都用 `loc < end`。把它当闭区间会导致最后一个字节上的命中丢失，这类 bug 在单元测试里很容易被「数据末尾正好命中」的用例抓到，但线上往往表现为「偶发漏报」。
+
+**第六，报告偏移与 SOM 是两套机制。** Castle 发报告时的起始偏移固定传 0，真正有意义的起始偏移由 Rose 的 SOM 槽位机制补上（见 06-10）。如果开了 `HS_FLAG_SOM_LEFTMOST` 却发现 `from` 不可信，先确认这条模式是不是走了 Castle/LBR 路径，再看 SOM 是否被正确分配到槽位。
+
+**第七，别把 LBR 的类型当成可配置项。** `CASTLE_DOT` / `VERM` / `NVERM` / `SHUFTI` / `TRUFFLE` 是由字符集自动推导的：单字符走 VERM，单字符取反走 NVERM，能构建 shufti 掩码走 SHUFTI，否则退 TRUFFLE，任意字符走 DOT。没有任何 API 可以强制指定，也不应该试图通过改写模式去「骗」某个类型——选错类型的代价远大于收益。
+
+### 7. 小结与延伸阅读
+
+Castle 与 LBR 解决的是同一类问题的两个极端：LBR 用「专用到极致」换常数状态，Castle 用「共享扫描器」换多租户的线性成本。判断标准只有一条——重复的数量。一个重复走 LBR，多个共享字符集的重复走 Castle，字符集不同的重复各自成组。这条分工在 `buildRepeatEngine()` 里只有几行代码，但它决定了有界重复这一类模式的全部性能特征。
+
+如果只记住三件事：第一，Castle 不是逐字节推进的引擎，它的成本与候选密度成正比；第二，互斥组让状态可以共享，`PURE_EXCLUSIVE` 时连活跃位图都省掉；第三，`REPEAT_RING` / `RANGE` / `SPARSE_OPTIMAL_P` 的选择直接决定流状态大小，而流状态是要乘以并发流数的。
+
+延伸阅读：`src/nfa/castle_internal.h` 顶部的流状态 ASCII 图是理解 Castle 布局的最短路径；`src/nfa/repeat.h` 的注释解释了「控制块 vs 重复状态」的划分理由；`src/nfa/castlecompile.cpp` 里的团划分与状态分配是编译期的主要工作量所在。单重复的 LBR 细节与 `vermicelli` 的关系见 06-09；DFA 家族在重复场景下的替代方案见 06-08；流状态的打包与还原见 06-11。
+
+## 06-08 状态压缩 DFA：Sheng32 / Sheng64 / McSheng64
+
+### 1. 背景与动机
+
+确定化有限自动机（DFA）在多正则匹配里有一个诱人的性质：每个字节只需要一次状态转移。没有状态向量、没有例外表、没有候选确认，读一个字节、查一次表、拿到新状态，如此而已。代价是状态爆炸：子集构造最坏情况下状态数相对于 NFA 状态数是指数的，而且每个状态都要为 256 个可能的字节各准备一条转移。传统表驱动 DFA 的存储是「状态数 × 256 × 2 字节」——每个状态 512 字节；一千个状态就是 0.5 MB，而且访问模式是「按输入字节跳转」，几乎每一步都命中不了 L1。
+
+Hyperscan 的第一代 DFA 实现是 McClellan，走的就是表驱动路线，用 8 位或 16 位表项，把「每个状态 256 条转移」放在一张连续表里。它的优点是实现简单、语义直接；缺点是表大、cache 行为差，而且状态越多越糟。Sheng 家族换了一个思路：**不存「每个状态一张 256 项的表」，而存「每个字符一张 64 字节的置换表」，用 SIMD 字节置换指令在寄存器里完成查表**。这样表的总大小与状态数解耦——只要状态数不超过 64，表就固定是 256 × 64 字节，即 16 KiB。
+
+这个变换在数学上是平凡的：DFA 的转移函数本来就是「给定字符 c 和旧状态 s，返回新状态 t」。把它按 c 切片，每一片就是一个「以 s 为下标、以 t 为值」的数组。SIMD 的字节置换指令 `pshufb` / `vpermb` 做的恰好是同一件事：`out[i] = table[in[i]]`，其中 `in` 是 16 或 64 个字节的向量。把「当前状态」广播到向量的每一个字节，做一次置换，取第 0 个字节，就完成了一次 DFA 转移。
+
+限制来自指令本身。`pshufb`（SSSE3）只能在 16 字节的 lane 内做置换，索引只有 4 位，所以最多表达 16 个状态；`vpermb`（AVX-512 VBMI）可以跨 64 字节做置换，索引 6 位，最多 64 个状态。这正是 5.4.0 引入 Sheng32 / Sheng64 / McSheng64 的技术前提：`CHANGELOG.md` 的 5.4.0 条目明确写着三个新引擎都是「leveraging AVX-512 VBMI」。没有 VBMI 的机器上，`sheng32Compile` 与 `sheng64Compile` 会在第一道检查就返回空指针，回落到 McClellan。
+
+### 2. 核心概念
+
+**状态字节的位域编码。** Sheng 家族不把状态存成整数，而是存成一个「带标志位的字节」。低若干位是状态编号，高位是标志：`SHENG_STATE_ACCEPT`（0x10）、`SHENG_STATE_DEAD`（0x20）、`SHENG_STATE_ACCEL`（0x40），掩码 `SHENG_STATE_MASK` 是 0xF；Sheng32 把编号扩到 5 位（掩码 0x1F），标志是 0x20 / 0x40 / 0x80；Sheng64 把编号扩到 6 位（掩码 0x3F），标志只剩 0x40（ACCEPT）与 0x80（DEAD），**没有独立的 ACCEL 位**。这组常量在 `src/nfa/sheng_internal.h:35` 到 `:50`，读代码时必须按版本对号入座，不能把 32 位的位图套到 64 位上。
+
+为什么要塞标志位？因为热循环里最重要的判断是「这一步有没有值得处理的事情」：命中了接受态要发报告，进入死态要提前退出，进入加速态可以跳过一段。如果标志位在同一个字节里，那么四次 `vpermb` 之后只要把四个结果或起来、与 `SHENG32_STATE_FLAG_MASK` 相与，一次判断就能知道「这 4 个字节里有没有事件」；只有非零时才进入慢路径逐字节处理。这个技巧叫 `hasInterestingStates32`，是 DFAx4 能跑起来的关键。
+
+Sheng32 状态字节的位域切分见图 06-08-01，这是读转储、写调试工具时最先要对上的东西。
+
+:::figure id=06-08-01 | name=Sheng32 状态字节的位域切分 | dir=LR
+node n1 "Sheng32 状态字节" blue
+node n2 "bit0 至 bit4 状态编号" teal
+node n3 "bit5 为 ACCEPT" amber
+node n4 "bit6 为 DEAD" red
+node n5 "bit7 为 ACCEL" green
+edge n1 -> n2 "低 5 位"
+edge n1 -> n3 "命中上报"
+edge n1 -> n4 "提前退出"
+edge n1 -> n5 "跳过一段"
+:::
+
+读这张图要注意两点。第一，标志位与编号在同一个字节里，所以「取编号」必须用 `& SHENG32_STATE_MASK`（0x1F），直接强转成整数会把标志位算进去，得到一个远超 `n_states` 的假编号。第二，四个字段的语义是「或」的关系而不是互斥：一个状态可以同时是 ACCEPT 与 ACCEL，热循环会先处理上报、再考虑跳过。Sheng64 的切分不同（编号 6 位、只有两个标志），Sheng 的切分又不同（编号 4 位、三个标志），三者不能混用同一套常量。
+
+**DFAx4：一条链、四个字节。** Sheng32 的主循环一次处理 4 个字节：`cur_state = vpermb512(cur_state, masks[c1])` 得到 a1，再 `vpermb512(cur_state, masks[c2])` 得到 a2，依次到 a4。注意这里**没有并行**：a2 依赖 a1 的结果，因为 DFA 的转移是串行的。那为什么还要展开四次？因为一次 64 字节的掩码加载有延迟，把四次加载与四次置换交错排布，可以让 CPU 在等待第一次置换结果时提前把后三张掩码取进来；同时循环计数、边界判断这些开销被摊到四个字节上。这是典型的「用指令级并行掩盖访存延迟」，不是算法层面的并行。
+
+**表大小与状态数的解耦。** 这是 Sheng 相对 McClellan 的核心优势，值得用数字说明。Sheng（16 状态）的 `shuffle_masks` 是 `m128[256]`，固定 4 KiB；Sheng32 与 Sheng64 的 `succ_masks` 是 `m512[256]`，固定 16 KiB。而未做字母表压缩的 McClellan 是「状态数 × 512 字节」，64 个状态就要 32 KiB，256 个状态要 128 KiB。也就是说在 16 到 64 状态这个区间，Sheng 家族不但更快，而且更小。超过 64 状态，Sheng 家族无能为力，只能回到 McClellan 或者混合引擎。
+
+**McSheng：稠密环走 lane，稀疏尾巴走表。** 真实 DFA 的形状往往不是均匀的：有一两个「粘性」的环（比如 `.*` 之后的循环），绝大多数时间都在环里打转；其余状态是分支产生的稀疏尾巴，每个状态只有少数几个出边。McSheng 的做法是把环上的状态放进 Sheng lane（最多 16 个，或 64 位版本最多 64 个），把尾巴状态放进「Sherman」结构——每个状态一张小的「字符→后继」表，用 SSE 比较指令查找。
+
+判定哪些状态进 lane 的函数是 `find_sheng_states()`（`src/nfa/mcsheng_compile.cpp:537`）。它先找出图中的环，跳过死状态，然后估算每个环的「粘性」：对环上顶点，把所有来自编号更大顶点的入边所对应的字符集合并起来，如果这个集合的字符数少于 30，就认为它不够粘、不值得放进 lane。找到第一个够粘的环之后，从它出发做 BFS，最多收 `MAX_SHENG_STATES`（16）或 `MAX_SHENG64_STATES`（64）个状态。剩下的状态编号整体后移，成为 Sherman 状态，`sheng_end` 就是这条分界线。
+
+**字母表压缩。** McSheng 还有一层优化：`remap[256]` 把 256 个字节映射到一个更小的字母表，`alphaShift` 给出压缩后的位宽。Sherman 表按压缩后的字符索引，一张表能小很多。这个映射在编译期算好、运行期只做一次查表，代价是每次 Sherman 查找多一次访存。
+
+**状态编号只有 14 位。** McSheng 用 `u16` 存状态，`ACCEPT_FLAG` 是 0x8000、`ACCEL_FLAG` 是 0x4000，剩下 `STATE_MASK` 是 0x3FFF，也就是最多 16384 个状态。这个上限比 McClellan 的 16 位状态编号（上限 65535）小，但远超实际使用；超过就会编译失败，回落到纯 McClellan。
+
+### 3. 关键数据结构与源码位置
+
+`struct sheng`、`struct sheng32`、`struct sheng64` 定义在 `src/nfa/sheng_internal.h:68`、`:81`、`:94`，字段（`shuffle_masks` / `succ_masks`、`length`、`aux_offset`、`report_offset`、`accel_offset`、`n_states`、`anchored`、`floating`、`flags`、`report`）的逐项含义见 05-06。`struct sstate_aux`（`accept`、`accept_eod`、`accel`、`top`）在同文件 `:61`，`struct report_list` 在 `:56`。
+
+`struct mcsheng` 与 `struct mcsheng64` 在 `src/nfa/mcsheng_internal.h:64` 与 `:95`，字段包括 `state_count`、`start_anchored`、`start_floating`、`sheng_end`、`sheng_accel_limit`、`accel_limit_8`、`accept_limit_8`、`sherman_limit`、`alphaShift`、`remap[256]`、`sheng_masks` / `sheng_succ_masks`。`SHERMAN_TYPE_OFFSET`、`SHERMAN_LEN_OFFSET`、`SHERMAN_DADDY_OFFSET`、`SHERMAN_CHARS_OFFSET` 这一组常量（`:42` 到 `:48`）描述 Sherman 状态的二进制布局：1 字节类型、1 字节长度、2 字节「父状态」、然后是字符数组与后继数组。
+
+引擎类型在 `src/nfa/nfa_internal.h:66` 的 `enum NFAEngineType` 里：`SHENG_NFA`（16 位版）、`SHENG_NFA_32`、`SHENG_NFA_64`、`MCSHENG_NFA_8`、`MCSHENG_NFA_16`、`MCSHENG_64_NFA_8`、`MCSHENG_64_NFA_16`。判断函数 `isShengType()`、`isSheng32Type()`、`isSheng64Type()`、`isShengMcClellanType()` 都在 `:160` 之后，运行期与转储代码全靠它们分流。
+
+下表把五个 DFA 引擎的关键参数并排，方便在选择失败时判断为什么落到了下一个梯次。参数与灰盒开关不在表中重复（参数见 04-01 ｜ 字段见 05-06 ｜ 模块见 07-05）。
+
+| 引擎 | 状态上限 | 转移表规模 | 关键指令 | 状态字节标志 |
+|---|---|---|---|---|
+| Sheng | 16 | 256 × 16 B = 4 KiB | `pshufb` | 0x10 / 0x20 / 0x40 |
+| Sheng32 | 32 | 256 × 64 B = 16 KiB | `vpermb` | 0x20 / 0x40 / 0x80 |
+| Sheng64 | 64 | 256 × 64 B = 16 KiB | `vpermb` | 0x40 / 0x80 |
+| McSheng | 16383，其中 16 或 64 个走 lane | lane 表 + Sherman 表 | `pshufb` / `vpermb` + SSE | 14 位编号加标志 |
+| McClellan | 8 位或 16 位编号 | 状态数 × 2 B × 字母表大小 | 普通 load | 无（纯编号） |
+
+### 4. 关键流程与调用链
+
+选择过程集中在 `src/rose/rose_build_bytecode.cpp:621` 的 `getDfa()`。它的顺序是固定的六级梯次，每一级失败才进下一级，这个顺序不能随意调换，因为它同时编码了「速度优先」与「体积优先」两种考虑。
+
+这条梯次链与最终 `NFA::type` 的落点见图 06-08-02。
+
+:::figure id=06-08-02 | name=raw_dfa 到具体引擎的六级选择 | dir=TD
+node n1 "raw_dfa 与状态数" blue
+node n2 "Sheng 不超过 16 态" purple
+node n3 "McSheng 混合" purple
+node n4 "Sheng32 不超过 32 态" purple
+node n5 "Sheng64 不超过 64 态" purple
+node n6 "McClellan 表 DFA" red
+node n7 "NFA::type 落库" green
+edge n1 -> n2 "第一级"
+edge n2 -> n7 "成功"
+edge n2 -> n3 "失败且非 transient"
+edge n3 -> n4 "仍失败"
+edge n4 -> n5 "仍失败"
+edge n5 -> n6 "全部失败"
+edge n6 -> n7 "最后兜底"
+:::
+
+逐级说明。第一级 `shengCompile()` 要求 `cc.grey.allowSheng` 为真且有效状态数不超过 16（`src/nfa/shengcompile.cpp:722`），它不需要任何特殊指令集，`pshufb` 是 SSSE3 就有的。第二级 `mcshengCompile()` 只在「非 transient」时尝试，注释解释了原因：transient prefix 通常跑在很小的块上，混合引擎额外的字节码不划算。第三级与第四级是 5.4.0 新增的，分别要求 `cc.target_info.has_avx512vbmi()` 且状态数落在 (16, 32] 与 (32, 64] 区间——注意 Sheng32 里的 `assert(info.size() > 16)`，它假定前一梯次已经失败了，所以这里的状态数必然大于 16。第五级 `mcshengCompile64()` 同样要求 VBMI。最后 `mcclellanCompile()` 兜底，接受任意状态数（受 8/16 位表项宽度限制）。
+
+编译一个 Sheng32 的过程可以概括为「三次遍历」。第一次遍历给每个 DFA 状态算一个状态字节：`getShengState32()` 判断它是不是接受态、死态、加速态，把标志位或进编号。第二次遍历为每个字符生成一张 64 字节的置换表：`createShuffleMasks<sheng32>()` 里有一个长度为 64 的 `buf`，对每个状态 `idx` 填入 `getShengState32(succ_state)`，然后整块写进 `succ_masks[chr]`。第三次遍历分配 aux 结构、报告链与加速表，把所有偏移回填到头部。这三步都在 `shengCompile_int<sheng32>()` 里完成，模板参数决定状态宽度与掩码类型。
+
+运行期入口是 `runSheng32()` / `runSheng32Cb()` / `runSheng32Sam()` 这一组，它们按「是否需要回调、是否需要 EOD、是否单报告」选择具体实现，最终落到 `sheng32_4_cod` 之类的展开函数（命名规则是「宽度 + 4 字节展开 + 模式后缀」）。热循环的结构如下（摘自 `src/nfa/sheng_impl4.h:288` 附近，保留原始变量名）。
+
+```c
+m512 cur_state = set64x8(*state);        /* 把状态字节广播到 64 个 lane */
+const m512 *masks = s->succ_masks;
+
+while (likely(end - cur_buf >= 4)) {
+    const m512 succ_mask1 = masks[*cur_buf];
+    cur_state = vpermb512(cur_state, succ_mask1);
+    const u8 a1 = movd512(cur_state);
+    const m512 succ_mask2 = masks[*(cur_buf + 1)];
+    cur_state = vpermb512(cur_state, succ_mask2);
+    const u8 a2 = movd512(cur_state);
+    /* 第三、第四个字节同理 */
+
+    if (unlikely(INTERESTING_FUNC32(a1, a2, a3, a4))) {
+        /* 逐字节处理 accept / dead / accel */
+    }
+    cur_buf += 4;
+}
+```
+
+判读这段代码要注意四点。第一，`set64x8(*state)` 把同一个状态字节复制到 64 个 lane，是因为 `vpermb` 的语义是「每个输出字节按对应输入字节的值去查表」；把输入全部设成同一个值，输出就全部是同一个「下一状态」，取第 0 个字节即可。第二，`masks[c]` 的索引是**输入字符**，这是 Sheng 与表驱动 DFA 最根本的区别：表按字符切，而不是按状态切。第三，四次置换是严格串行的，`cur_state` 被反复覆盖；展开四次的收益来自掩码加载与置换的交错，以及循环开销的分摊。第四，`INTERESTING_FUNC32` 只做一次或运算加掩码判断，四个结果都没有标志位时直接跳过慢路径——这一步决定了 99% 的字节只花四条置换指令。
+
+McSheng 的循环形状完全不同。它在每个字节上先判断 `s < sheng_end`：在 lane 里的状态走置换，超出的是 Sherman 状态，走 `doSherman16()`（`src/nfa/mcsheng.c:73`）。`doSherman16` 把该状态的字符数组加载成 128 位，与广播后的字符做 `eq128`，`movemask` 得到匹配位，去掉头部 4 字节的元数据（`z &= ~0xf`），再用 `ctz32` 找到第一个匹配的字符槽位，最后用「槽位 × 2 字节」偏移去后继数组取值。这条路径的指令数明显多于置换，所以混合引擎的收益完全取决于「多少比例的字节落在 lane 里」——`find_sheng_states` 选择最粘的环，就是为了最大化这个比例。
+
+状态在流式边界的处理比 LimEx 简单得多：DFA 状态就是一个字节（或两个字节），直接写进流状态即可，没有压缩、没有键、没有例外。这是 DFA 相对 NFA 的又一个小优势，代价是它无法表达「同一个 NFA 状态集合」这种更细的信息，因此在 SOM 与有界重复场景下必须换用别的引擎（SOM 反向扫描用 Gough，见 06-10）。
+
+### 5. 配置/命令/代码实例
+
+下面的程序编译两组模式，一组很小（几条短字面量，DFA 状态数个位数），一组稍大（包含字符类与可选分支，DFA 状态数在 20 上下），然后打印数据库大小。这样可以把「16 KiB 置换表」的成本从总大小里看出来。完整的编译参数见 04-04，模式常量见 04-03。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+
+static void try_compile(const char *tag, const char **pats, unsigned n) {
+    hs_database_t *db = NULL;
+    hs_compile_error_t *err = NULL;
+    unsigned *flags = NULL, *ids = NULL;
+
+    if (hs_compile_multi(pats, flags, ids, n, HS_MODE_BLOCK, NULL,
+                         &db, &err) != HS_SUCCESS) {
+        printf("%s: compile failed: %s\n", tag, err->message);
+        hs_free_compile_error(err);
+        return;
+    }
+    printf("%s: db=%zu bytes\n", tag, hs_database_size(db));
+    hs_free_database(db);
+}
+
+int main(void) {
+    const char *small[2] = { "abcdef", "ghijkl" };
+    const char *mid[3]   = { "[a-z]{3}[0-9]{2}", "foo|bar|baz",
+                             "x[0-9a-f]{4}y" };
+
+    try_compile("small", small, 2);
+    try_compile("mid", mid, 3);
+    return 0;
+}
+```
+
+在支持 AVX-512 VBMI 的机器上编译运行，输出形如下面的文本。示例输出，具体格式需对照实际版本核验。
+
+```text
+small: db=4224 bytes
+mid: db=18432 bytes
+```
+
+逐行判读。`small` 这一组的两条模式都是纯字面量，Rose 会把它们折叠成字面量表，根本不产生 DFA，4 KB 出头基本是 `hs_database` 头部、字面量表与报告表的开销。`mid` 这一组的三条模式都含字符类或分支，必然产生 DFA：`[a-z]{3}[0-9]{2}` 的状态数在十几到二十之间，会走到 Sheng32，光 `succ_masks` 就是 16 KiB，加上 aux、报告链与对齐填充，总大小 18 KB 左右完全对得上。这个数字是判断「到底用了哪个引擎」的第一手证据：如果一条中等复杂度的模式编出 100 KB 以上的库，说明状态数超过 64、落到了 McClellan 的 8 位表；如果只有 5 KB 左右，说明状态数不超过 16、走的是 Sheng。
+
+要看确切引擎，最直接的办法是带 `DUMP_SUPPORT` 的构建下用 `hsdump` 把每个 NFA 转储成文本，第一行就是引擎名。Sheng32 的转储格式在 `src/nfa/shengdump.cpp:273`，头部四行固定为状态数、引擎大小、三个偏移量、起止状态与标志位。下面的片段按该函数的输出顺序给出，示例输出，具体格式需对照实际版本核验。
+
+```text
+sheng32 DFA
+number of states: 21, DFA engine size: 17408
+aux base offset: 16384, reports base offset: 17024, accel offset: 0
+anchored start state: 0, floating start state: 1
+has accel: 0 can die: 1 single report: 0
+state id: 0, reports offset: 0, EOD reports offset: 0, accel offset: 0, top: 0
+state id: 5, reports offset: 17024, EOD reports offset: 0, accel offset: 0, top: 0
+```
+
+判读要点。第一行 `sheng32 DFA` 是引擎标识，出现它就意味着 VBMI 可用、状态数在 17 到 32 之间；如果这里是 `sheng64 DFA`，状态数就在 33 到 64 之间。第二行的 `DFA engine size: 17408` 略大于 16384，差额就是 aux 表、报告链与对齐填充——16384 正是 `256 × 64` 的掩码表。第三行的 `aux base offset` 是 16384，与掩码表大小完全吻合，说明表就在引擎起始处；`reports base offset` 紧随其后。第四行 `can die: 1` 表示 `SHENG_FLAG_CAN_DIE` 被置起，热循环里会在每个四字节组后检查死态并提前退出；`has accel: 0` 表示这个 DFA 没有可加速状态，所有字节都要走置换。最后两行是逐状态转储：`state id: 5` 的 `reports offset` 非零，说明 5 号状态是接受态，`aux->accept` 指向报告链；`top: 0` 表示它不作为 `TOP_N` 事件的触发器。如果看到某个状态的 `accel offset` 非零，说明这个状态是加速态，运行期会用 `run_accel` 跳过一段。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**第一，VBMI 是硬门槛，不是优化开关。** `sheng32Compile` 与 `sheng64Compile` 的第一段代码就是 `if (!cc.target_info.has_avx512vbmi()) return nullptr;`，`mcshengCompile64` 也一样。这意味着数据库的目标平台必须声明 `HS_CPU_FEATURES_AVX512VBMI`（位值 `1ULL << 4`），否则编译期就不会选这些引擎；而如果编译时声明了、目标机却不支持，加载会得到 `HS_DB_PLATFORM_ERROR`。跨机分发数据库时，这一条必须写进部署检查表（平台分派的整体机制见 06-13）。
+
+**第二，16 KiB 不是免费午餐。** 每条 Sheng32/Sheng64 引擎都要 16 KiB 的掩码表，一个数据库里如果有几十条这样的 DFA，字节码会膨胀到几百 KB。反过来，如果模式很小（状态数 ≤16），Sheng 只要 4 KiB，比 McClellan 的「16 × 512 B = 8 KiB」还小。所以「用新引擎一定更好」是错的，关键看状态数落在哪个区间。
+
+**第三，transient prefix 不走混合引擎。** `getDfa()` 里的 `is_transient` 判断把 `mcshengCompile` 与 `mcshengCompile64` 都跳过了，注释说明原因是额外字节码不划算、且这类引擎通常跑在小块上。这意味着同一张图在「作为前缀」与「作为后缀」时可能选到不同引擎，转储对比时不要误以为编译不稳定。
+
+**第四，64 位版本没有 ACCEL 位。** `SHENG64_STATE_ACCEPT` 是 0x40、`SHENG64_STATE_DEAD` 是 0x80，掩码 0x3F，没有 0x20 这一档。如果你按 Sheng32 的位图去解析 Sheng64 的状态字节，会把「接受态」误判成「加速态」。读转储或写调试工具时必须以 `nfa->type` 分支，不能一套常量走天下。
+
+**第五，状态数超过 64 会静默退化。** 没有任何警告，`getDfa()` 会一路失败到 `mcclellanCompile`，得到一个表驱动 DFA。表现是数据库突然变大、吞吐突然下降，但编译仍然成功。定位方法是看 `hs_database_size()` 的量级，或者直接转储看引擎名。想让状态数降下来，只能改写模式：减少可选分支、收紧字符类、把 `.*` 换成更具体的结构。
+
+**第六，McSheng 的收益取决于 lane 命中率。** 混合引擎只在「有一个足够粘的环」时才有意义，`find_sheng_states` 用「回边字符集至少 30 个字符」作为粘性门槛。如果一个 DFA 的环很稀疏（比如只在少数几个字符上自环），这个门槛过不去，`sheng_end` 会小于等于死状态，`mcshengCompile` 直接返回空。此时不要试图调参，应该接受「这张图不适合混合引擎」的事实。
+
+**第七，DFA 与 SOM 是两条路。** Sheng 家族不跟踪起始偏移；开了 `HS_FLAG_SOM_LEFTMOST` 的模式，Rose 会走 Gough（HAIG）之类的路径，SOM 的反向确认另有一套机制（见 06-10）。所以「为什么开了 SOM 之后数据库结构完全变了」不是异常，而是必然。
+
+### 7. 小结与延伸阅读
+
+Sheng 家族的价值不在于「比 McClellan 快多少」，而在于**把 DFA 的存储从「状态数 × 256」变成「256 × 64 字节」的常数**。这个变换让 16 到 64 状态这个最常见区间同时获得了更小的字节码与更好的 cache 行为，也让 5.4.0 成为一个有实质性能收益的版本。代价是它对指令集有硬要求，对状态数有硬上限，超过就只能回到表驱动。
+
+如果只记住三件事：第一，`vpermb` 的 `out[i] = table[in[i]]` 就是「按字符切片的转移表」，这是整个引擎的数学基础；第二，状态字节里塞了 ACCEPT / DEAD / ACCEL 三个标志，才能用一次或运算判断「这四个字节里有没有事件」；第三，`getDfa()` 的六级梯次是固定顺序，理解它就理解了一条模式最终变成什么引擎。
+
+延伸阅读：`src/nfa/sheng_impl4.h` 的 `SHENG32_IMPL` 是最短的完整实现，值得逐行读；`src/nfa/mcsheng_compile.cpp` 的 `find_sheng_states` 展示了「什么样的 DFA 适合混合」这一判断的量化方式；`src/nfa/nfa_internal.h` 的 `NFAEngineType` 与判断函数是阅读所有转储输出的字典。加速器如何在这条循环里跳过字节见 06-09；LimEx 作为「状态向量」路线与 DFA 的对比见 06-06；Castle 在重复场景下替代 DFA 的方式见 06-07。
+
+## 06-09 加速器与预过滤：accel、shufti、truffle、vermicelli
+
+### 1. 背景与动机
+
+NFA 与 DFA 都有一个共同的低效时刻：状态集合稳定、下一个字节大概率「不改变任何事」，但引擎仍然要逐字节走一遍形式上的转移。比如模式 `passwd=` 在正常流量里极少出现，绝大多数字节都是无关字符；如果每个字节都要做一次移位、一次掩码、一次判断，吞吐就被这些「什么也没发生」的字节吃掉了。Hyperscan 的应对不是「让转移更快」，而是「干脆不看这些字节」——用一个远比状态转移便宜的扫描原语，直接跳到下一个「可能改变状态」的位置。
+
+这个思路有三个必须同时满足的条件。第一是**安全性**：跳过的位置必须保证「即使看了也不会产生任何状态变化、不会产生任何报告」，否则就会漏报。第二是**收益性**：跳过一段的收益要大于调用原语的开销，跳两三个字节就调一次加速器是负收益。第三是**可判定性**：编译期必须能算出「哪些字符是可能改变状态的」，并且这个集合要小到能被某种原语表达。
+
+围绕这三点，Hyperscan 造了一组可以统称为「加速器」的原语，加上一个把「当前状态」翻译成「该用哪个加速器」的分派层。原语有四个名字：`vermicelli`（找单个或两个相邻字节）、`shufti`（用双 nibble 查表匹配字符类）、`truffle`（用三张掩码匹配稀疏字符类）、`accel`（分派层，`run_accel` 是唯一入口）。它们被 LimEx、Sheng、LBR、Castle 四个引擎共用，是整个 `src/nfa/` 目录里复用度最高的一层代码。
+
+需要先划清边界：加速器**不产生匹配**。它只回答「从当前位置开始，第一个可能需要处理的字节在哪」。真正的状态转移、报告、压制仍然由宿主引擎完成。这个分工让加速器可以被任意引擎复用，也让它的正确性可以独立验证——只要保证「不跳过任何 stop 字符」即可。
+
+### 2. 核心概念
+
+**stop 字符集。** 从一个状态集合出发，能让状态集合发生「有意义变化」的字符，称为 stop 字符（也叫 escape 字符）。其余字符读进去之后状态集合不变（或者只会在死状态上打转），可以整段跳过。编译期对每个加速状态算出这个集合，再按集合的形状选原语。集合大小决定了选择：1 个字符最简单，几十个字符就得用通用性更强的原语。
+
+**accel 状态与 pext 索引。** LimEx 不是「一个状态一个加速器」，而是「一组状态一个加速器」。`lim.ex->accel` 是一张掩码，标记哪些状态是「加速状态」；运行期用 `pext32(s, accel)` 把当前状态集合里落在加速状态上的那些位「压缩」成一个紧凑索引。`NFA_MAX_ACCEL_STATES` 是 8，所以索引最多 256 种组合，正好用一张 `accelTable[256]` 映射到 aux 数组的下标。这个设计的好处是：不同的加速状态组合可以对应不同的 stop 集，不需要为每种组合单独写分支。
+
+**vermicelli：找字节，或找相邻的两个字节。** 最基本的原语是「在缓冲区里找字节 c」。SSE 版一次比较 16 字节（`VERM_BOUNDARY` 为 16），AVX2 版一次比较 64 字节（`VERM_BOUNDARY` 为 64），两者都在 `src/nfa/vermicelli_sse.h` 里定义。单字节版本处理「模式里有一个必经字符」的情况，比如 `passwd=` 里的 `p`。双字节版本 `vermicelliDoubleExec` 一次找「相邻两个 c」，用于 `c{2}` 这类结构；它的注释坦白承认「double verm is not certain to be precise」——因为一次比较两个 16 字节块只能保证「这两个块里各有一个 c」，不能保证它们相邻，所以要回退到单字节版本确认。`find_verm_run()`（`src/nfa/vermicelli_run.h:82`）把「找 c{n} 的起点」包装成一个循环：先用双字节版找候选，再在 `[s, s+n)` 区间里找反例，找到就继续往后跳。
+
+**shufti：双 nibble 查表。** 一个字节可以拆成高 4 位与低 4 位，各 16 种取值。如果字符类能写成「若干组，每组是『某个高 nibble 集合 × 某个低 nibble 集合』」，就可以用两张 16 字节的表来表达：`lo` 表按低 nibble 索引、`hi` 表按高 nibble 索引，两者相与非零就表示命中。`shuftiFwdSlow()`（`src/nfa/shufti.c:76`）的慢速参考实现只有一行判断：`if (lo[c & 0xf] & hi[c >> 4]) break;`。快速版本用 `pshufb` 在 128 位寄存器里同时查 16 个字节，两次 `pshufb` 加一次 `and` 加一次 `movemask` 就能得到 16 个字节的命中位图。
+
+这个表达的极限是 8 组。`shuftiBuildMasks()`（`src/nfa/shufticompile.cpp:52`）先把字符按高 nibble 分组，再把「低 nibble 集合相同」的高 nibble 合并，最后看有多少个不同的低 nibble 集合——每个集合占 `lo`/`hi` 表里的一个位，而一个字节只有 8 位，超过 8 组就构造失败。源码注释写得很明确：always able to construct masks for 8 or fewer characters。这句话是「8 个字符以内一定能用 shufti」的保证，也是选择梯次里「先试 shufti」的底气。
+
+**truffle：稀疏字符类的兜底。** 当一个字符类的 nibble 分组超过 8 组，shufti 就无能为力了。truffle 换了一种编码：把字符拆成低 4 位（作为掩码内的偏移）与第 4、5、6 位（作为该偏移处字节里的位号），第 7 位决定用哪张表。这样两张 128 位表就能表达任意 256 个字符的子集，`truffleBuildMasks()` 的注释直接说「truffle is always able to represent an entire character class」。它的运行期是三次 `pshufb`：一张表处理「第 7 位为 0」的字符，一张处理「第 7 位为 1」的字符，第三张用常量 `0x8040201008040201` 把「第 4、5、6 位」翻译成位掩码。
+
+**为什么还需要「双字符」变体。** 有些模式的 stop 条件不是单个字符能决定的，比如「`ab` 或 `cd`」这种两字节前缀。`ACCEL_DVERM`、`ACCEL_DVERM_NOCASE`、`ACCEL_DSHUFTI` 就是为此准备的：它们同时看两个字符，只有两字节组合落在允许集合里才算候选。`ACCEL_DVERM_MASKED` 更进一步，用两张掩码 `m1`、`m2` 表达「哪些位必须相同」，`buildDvermMask()`（`src/nfa/accelcompile.cpp:97`）用「所有字符对的按位与」与「按位与的取反」算出掩码，再用「空洞数是否恰好等于字符对数的对数」判断这个集合是否真的能被掩码表达。
+
+**RED_TAPE：永不停止的加速。** `ACCEL_RED_TAPE` 是一个特殊值，`run_accel` 遇到它直接返回 `c_end`，表示「这一段完全不用看」。它用于「当前状态集合下，任何字符都不会产生有意义的变化」的极端情况——典型是纯 `.*` 的中间段。这个优化必须非常小心地证明，一旦判错就是整段漏报。
+
+### 3. 关键数据结构与源码位置
+
+`union AccelAux` 定义在 `src/nfa/accel.h:66`，各个成员（`generic`、`verm`、`dverm`、`mverm`、`mdverm`、`shufti`、`dshufti`、`truffle`）的字段含义见 05-06。`enum AccelType` 在同文件 `:44`，列出 17 种取值。`run_accel()` 的声明在 `:126`，实现在 `src/nfa/accel.c:35`。
+
+关键常量：`ACCEL_MIN_LEN` 是 16（缓冲区短于这个长度就不尝试加速），`BAD_ACCEL_DIST` 是 4、`SMALL_ACCEL_PENALTY` 是 8、`BIG_ACCEL_PENALTY` 是 32（这三个是 Sheng 用来避免「加速太频繁反而更慢」的惩罚值），都在 `src/nfa/accel.h:41` 到 `:49`。`ACCEL_MAX_STOP_CHAR` 是 24，定义在 `src/nfagraph/ng_limex_accel.h:52`，是「多少个 stop 字符以内还值得用 truffle」的门槛。
+
+下表把四个原语的能力边界放在一起。完整的参数与编译开关见 04 册，不在表中重复（参数见 04-01 ｜ 字段见 05-06 ｜ 模块见 07-08）。
+
+| 原语 | 输入形状 | 关键指令 | 可表达规模 | 源码 |
+|---|---|---|---|---|
+| vermicelli | 单字符或双字符 | `pcmpeqb` + `movemask` | 1 到 2 个字符 | `src/nfa/vermicelli_sse.h` |
+| shufti | 稠密字符类 | 两次 `pshufb` + `and` | 最多 8 个 nibble 组 | `src/nfa/shufti.c` |
+| truffle | 稀疏字符类 | 三次 `pshufb` | 任意 256 字符子集 | `src/nfa/truffle.c` |
+| accel | 分派层 | `pext` + 表查 | 最多 256 种状态组合 | `src/nfa/accel.c` |
+
+### 4. 关键流程与调用链
+
+编译期的入口是 `ng_limex_accel` 一组函数（`src/nfagraph/ng_limex_accel.cpp`），它们负责从图里识别「加速状态」并算出 stop 集；真正的编码在 `buildAccelAux()`（`src/nfa/accelcompile.cpp:228`）与 `buildAccelSingle()` / `buildAccelDouble()`。stop 字符集到加速原语的选择梯次见图 06-09-01，它同时给出了最终的统一入口。
+
+:::figure id=06-09-01 | name=stop 字符集到加速原语的选择梯次 | dir=TD
+node n1 "停止字符集" blue
+node n2 "恰 1 个字符" teal
+node n3 "2 个大小写字符" teal
+node n4 "可分成不超过 8 组" amber
+node n5 "不超过 24 个字符" amber
+node n6 "放弃加速" gray
+node n7 "run_accel 统一入口" green
+edge n1 -> n2 "计数"
+edge n2 -> n3 "不是单字符"
+edge n3 -> n4 "不是大小写对"
+edge n4 -> n5 "shufti 构建失败"
+edge n5 -> n6 "truffle 也超限"
+edge n2 -> n7 "ACCEL_VERM"
+edge n3 -> n7 "VERM_NOCASE"
+edge n4 -> n7 "ACCEL_SHUFTI"
+edge n5 -> n7 "ACCEL_TRUFFLE"
+:::
+
+选择逻辑的细节值得逐条对照源码。`buildAccelSingle()` 开头先排除「stop 集是全集」的情况（`info.single_stops.all()`），因为全集意味着任何字符都要处理，加速毫无意义。然后按 `outs`（stop 字符个数）分支：等于 1 就用 `ACCEL_VERM`，把字符写进 `aux->verm.c`；等于 2 且是「同一个字符的大小写对」（`isCaselessChar()`）就用 `ACCEL_VERM_NOCASE`，把字符大写化后存起来；否则尝试 `shuftiBuildMasks()`，成功就用 `ACCEL_SHUFTI`；失败则看 `outs` 是否不超过 `ACCEL_MAX_STOP_CHAR`，是就用 `ACCEL_TRUFFLE`；再不行就放弃，`accel_type` 保持 `ACCEL_NONE`。
+
+运行期的唯一入口是 `run_accel()`。它先按 `accel_type` 分派到对应的 `Exec`，再对返回值做一次偏移修正：`rv = MAX(c + accel->generic.offset, rv); rv -= accel->generic.offset;`。这个修正的语义是：`offset` 表示「加速窗口相对于状态有前置字节」，返回值不能早于 `c + offset`，否则会重复处理已经处理过的位置。每个分支在调用前还有一个长度保护，比如 `ACCEL_VERM` 要求 `c + 15 < c_end`，不够长就直接原样返回 `c`——短缓冲区走加速器只会亏。
+
+LimEx 侧的接入点有两处。第一处是热循环里的 `RUN_ACCEL_FN`：当状态集合与 `accel` 掩码相交时，调 `doAccel32/64/128/256/384/512`，内部 `pext(s, accel)` 得到索引，`accelTable[idx]` 得到 aux 下标，再交给 `run_accel`。第二处是循环外的「进入加速态」检查：如果初始状态就是加速态，可以一次性跳过一大段再进入逐字节循环。Sheng 侧的接入更简单：`sheng32_4_cod` 在开头检查 `INNER_ACCEL_FUNC32(*state) || OUTER_ACCEL_FUNC32(*state)`，命中就调 `run_accel`，并用 `BAD_ACCEL_DIST` 控制「如果只跳过很短一段，就给下一次加速加惩罚」，避免在密集 stop 字符上反复进出加速器。
+
+shufti 的内部结构见图 06-09-02，因为「双 nibble」这个词经常被误解成「两个字节」——它其实是「一个字节的两半」。
+
+:::figure id=06-09-02 | name=shufti 的双 nibble 查表 | dir=LR
+node n1 "输入字节 c" blue
+node n2 "低 4 位 c 与 0xf" teal
+node n3 "高 4 位 c 右移 4" teal
+node n4 "lo 表 pshufb" amber
+node n5 "hi 表 pshufb" amber
+node n6 "按位与" purple
+node n7 "movemask 得候选" green
+edge n1 -> n2 "取低半"
+edge n1 -> n3 "取高半"
+edge n2 -> n4 "作索引"
+edge n3 -> n5 "作索引"
+edge n4 -> n6 "位掩码"
+edge n5 -> n6 "位掩码"
+edge n6 -> n7 "16 字节并行"
+:::
+
+理解这张图的关键是：`lo` 表回答「这个低 nibble 属于哪些组」，`hi` 表回答「这个高 nibble 属于哪些组」，两者相与就是「同时满足两边的组」，非零即命中。所以一个字符类只要能表示成「组 × 组」的并集，就能被 shufti 表达；组数受限于 8 位。这也是为什么 `[a-z]` 能走 shufti（低 nibble 有三种集合、高 nibble 有 2 到 3 个），而 `[a-zA-Z0-9_]` 这种混合类往往要走 truffle。
+
+### 5. 配置/命令/代码实例
+
+下面这段 C 程序用三条模式分别压向三种原语：`GET /` 是双字符 stop（斜杠与空格），`[a-z]+@` 是稠密字符类，`[0-9a-f]{8}` 是十六进制类。程序只打印数据库大小与命中，用来观察不同原语对字节码体积的影响。完整参数见 04-04。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <string.h>
+
+static int on_match(unsigned int id, unsigned long long from,
+                    unsigned long long to, unsigned int flags, void *ctx) {
+    (void)from; (void)flags; (void)ctx;
+    printf("id=%u to=%llu\n", id, to);
+    return 0;
+}
+
+int main(void) {
+    const char *pats[3] = { "GET /", "[a-z]+@", "[0-9a-f]{8}" };
+    unsigned ids[3] = { 1, 2, 3 };
+    hs_database_t *db = NULL;
+    hs_scratch_t *sc = NULL;
+    hs_compile_error_t *err = NULL;
+
+    if (hs_compile_multi(pats, NULL, ids, 3, HS_MODE_BLOCK, NULL,
+                         &db, &err) != HS_SUCCESS) {
+        fprintf(stderr, "compile: %s (expr %d)\n", err->message,
+                err->expression);
+        hs_free_compile_error(err);
+        return 1;
+    }
+    if (hs_alloc_scratch(db, &sc) != HS_SUCCESS) {
+        hs_free_database(db);
+        return 1;
+    }
+
+    const char *data = "GET /index deadbeef user@host";
+    printf("db=%zu\n", hs_database_size(db));
+    hs_scan(db, data, (unsigned)strlen(data), 0, sc, on_match, NULL);
+
+    hs_free_scratch(sc);
+    hs_free_database(db);
+    return 0;
+}
+```
+
+输出形如下面的文本。示例输出，具体格式需对照实际版本核验。
+
+```text
+db=8384
+id=1 to=7
+id=3 to=22
+id=2 to=27
+```
+
+逐行判读。`db=8384` 里包含了三条模式各自的引擎与加速表：第一条 `GET /` 是五字符字面量，会进字面量表；后两条含字符类，会产生小型 DFA 或 NFA，加速表 `AccelAux` 每项只有几十字节，对总量影响很小——加速器的成本在编译期（要算 stop 集、要试构建掩码），不在字节码体积上。三条命中的结束偏移分别是 7、22、27：`to=7` 是 `GET /` 的结尾（下标 6 是斜杠），`to=22` 是 `deadbeef` 的结尾（八位十六进制全部命中），`to=27` 是 `user@` 的结尾。注意第三条 `[0-9a-f]{8}` 能命中 `deadbeef` 说明字符类的大小写敏感语义正确——如果编译时误加了 `HS_FLAG_CASELESS`，`DEADBEEF` 也会命中，但那属于标志语义问题，不是加速器的问题。
+
+第二个片段是 shufti 的慢速参考实现，来自 `src/nfa/shufti.c:76`。它只有四行，但把整个原语的语义说尽了。
+
+```c
+static really_inline
+const u8 *shuftiFwdSlow(const u8 *lo, const u8 *hi, const u8 *buf,
+                        const u8 *buf_end) {
+    for (; buf < buf_end; ++buf) {
+        u8 c = *buf;
+        if (lo[c & 0xf] & hi[c >> 4]) {
+            break;
+        }
+    }
+    return buf;
+}
+```
+
+逐行判读。`lo` 与 `hi` 都是 16 字节的表，`lo` 按低 4 位索引、`hi` 按高 4 位索引。`lo[c & 0xf]` 取出「这个低 nibble 属于哪些组」的位掩码，`hi[c >> 4]` 取出「这个高 nibble 属于哪些组」的位掩码，两者相与非零表示「存在一个组同时包含这两个 nibble」，也就是「这个字节属于目标字符类」。循环退出时 `buf` 指向第一个命中的字节，或者等于 `buf_end`（没有命中）。快速版本把这段逻辑用 `pshufb` 向量化：一次处理 16 个字节，用 `movemask` 把比较结果压成一个 16 位整数，再用 `ctz` 找第一个置位——语义完全一致，只是把 16 次循环换成了四条指令。理解了这个等价关系，就能明白为什么 shufti 的组数上限是 8：一个字节只有 8 位，装不下第 9 个组。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**第一，加速器算错就是漏报，不是慢一点。** stop 集必须包含「所有可能改变状态或触发报告的字符」，少一个就会跳过真实匹配。这类 bug 极难复现，因为它依赖具体数据与具体分块。验证手段只有一个：用 `hscollider` 与 PCRE 对拍，且语料要覆盖字符类边界（参见 07-12 的工具说明）。
+
+**第二，短缓冲区不要加速。** `ACCEL_MIN_LEN` 是 16，`run_accel` 的每个分支还有自己的 `c + 15 >= c_end` 判断。这些保护不是保守，而是必要：加速器的固定开销（加载掩码、构造向量）在 16 字节以内根本摊不平。自己写宿主代码时如果按很小的块喂数据，加速器会频繁放弃，表现为「块越小越慢」。
+
+**第三，双字符原语必须「提前一个字节停」。** `ACCEL_DVERM` 与 `ACCEL_DSHUFTI` 的调用都写成 `c_end - 1`，源码注释是 need to stop one early to get an accurate end state。原因是这些原语返回的是「两个字符中第一个的位置」，如果扫到缓冲区最后一个字节，第二个字符就越界了，返回位置也不再准确。少写这个 `- 1` 会导致越界读或位置错位。
+
+**第四，`offset` 修正不能省。** `run_accel` 末尾的 `MAX(c + offset, rv) - offset` 看起来绕，但它保证了「返回值不早于加速窗口的起点」。当 `offset` 非零时（表示加速方案的判定依赖前置字节），漏掉这一步会让上层重复处理已经走过的字节，表现为同一次匹配被上报多次。
+
+**第五，nocase 的掩码存的是大写。** `ACCEL_VERM_NOCASE` 的 `verm.c` 是 `info.single_stops.find_first() & CASE_CLEAR` 的结果，也就是大写形式；`vermicelliExec` 的 `nocase` 参数会在比较前把输入也大写化。自己构造 `AccelAux` 时如果存了小写，就会永远匹配不上。
+
+**第六，shufti 失败不等于没有加速。** 组数超过 8 时 `shuftiBuildMasks` 返回 -1，选择梯次会自动落到 truffle；只有当 stop 字符数也超过 24 时才彻底放弃。所以「字符类写得太散」的代价是「从两次 pshufb 变成三次 pshufb」，不是「完全没有加速」。真正需要警惕的是 stop 集接近全集的情况，那时任何原语都救不了。
+
+**第七，`RED_TAPE` 只应该由编译器生成。** 这个值表示「整段不用看」，正确性依赖编译期对图的严格分析。手写或修改字节码时绝不能自己塞一个 `ACCEL_RED_TAPE`，否则会把整段数据跳过。它出现在转储里是正常的，出现在手写结构里是灾难。
+
+### 7. 小结与延伸阅读
+
+加速器的本质是「用一个更便宜的判定，替换掉一串注定无事发生的状态转移」。它不改语义、不产生匹配、不参与状态更新，因此可以被所有引擎共享。四种原语覆盖了从「一个字符」到「任意字符类」的全部形状，选择梯次则由 stop 集的大小与结构决定：1 个字符走 vermicelli，8 组以内走 shufti，24 个字符以内走 truffle，再不行就放弃。
+
+如果只记住三件事：第一，`lo[c & 0xf] & hi[c >> 4]` 是 shufti 的全部秘密，组数上限 8 来自字节宽度；第二，加速器只回答「下一个候选在哪」，状态更新仍然由宿主引擎做；第三，短缓冲、双字符提前停、offset 修正这三个细节，是加速器正确性的三条命门。
+
+延伸阅读：`src/nfa/accel.c` 的 `run_accel` 是分派层的全貌，值得先读；`src/nfa/shufticompile.cpp` 与 `src/nfa/trufflecompile.cpp` 的注释解释了两种编码的构造与极限；`src/nfa/vermicelli_run.h` 的 `find_verm_run` 展示了「找 c{n} 起点」这个看似简单的任务为什么需要一个循环加反例检查。加速器如何嵌入 LimEx 的热循环见 06-06；Castle 与 LBR 如何复用这些原语见 06-07；DFA 引擎自带的加速路径见 06-08。
+## 06-10 SOM 语义与槽位管理
+
+### 1. 背景与动机
+
+Hyperscan 默认只报告匹配的结束偏移。这是自动机的自然产物：读到第 n 个字节、状态进入接受态，于是「这里有一个匹配结束」，至于它从哪开始，标准子集构造早就把这个信息丢掉了——DFA 的状态只记录「当前可能处在哪些位置」，不记录「最早的那个起点」。要补回起点，必须在自动机之外另建一套记忆机制，这套机制就是 SOM（Start of Match）。
+
+SOM 难在三个地方。第一是**语义**：正则匹配天然有多个起点，`a+` 在 `aaaa` 上有四个起点，用户要的通常是「最左」那个（leftmost），这就要求引擎在多个候选中保留最早的，而不是最后一个。第二是**时机**：起点信息在匹配开始的那一刻就已经确定，但报告要等到匹配结束才发出，中间可能隔着几十万个字节；在流式模式下，这段距离还会跨越无数次 `hs_scan_stream` 调用，起点必须被写进流状态、随流一起搬运。第三是**成本**：每个需要记起点的模式至少占一个槽位，每个槽位在流状态里占 2、4 或 8 字节；一万条模式就是几十到几百 KB 的流状态，乘以并发流数就是内存账单。
+
+Hyperscan 的解法是把「记起点」抽象成**槽位（slot）**。编译期为每个「需要起点的匹配路径」分配一个槽位号，运行期用一张 `som_store[]` 数组按槽位号存绝对值；流式边界上再把绝对值转成「相对当前流偏移的距离」写进流状态，宽度由 horizon 决定。这套设计的关键取舍都集中在 horizon 上：宽度越窄，流状态越省，但能记住的距离越短；一旦超出，回调拿到的不是错误码，而是一个特殊偏移值 `HS_OFFSET_PAST_HORIZON`。
+
+这也是本套资料反复强调「SOM 与 `SINGLEMATCH`、`PREFILTER` 互斥」的原因：那两个标志会改变「哪一次匹配被报告」的语义，而 SOM 的整个槽位分配与压制逻辑都建立在「每次匹配都要精确记录起点」的前提上，两者无法共存。互斥不是实现偷懒，而是语义冲突。
+
+### 2. 核心概念
+
+**leftmost 语义。** `HS_FLAG_SOM_LEFTMOST` 要求报告「最左起点」。注意它不等于「最长匹配」也不等于「最短匹配」：`a+` 在 `aaaa` 上仍然会在每个结束位置各报一次，每次报的起点都是 0。真正决定报几次的是 `HS_FLAG_SINGLEMATCH`（每条流最多一次）与去重逻辑，而这些标志与 SOM 互斥，所以开了 SOM 就只能是「每次结束都报、起点取最左」。
+
+**槽位不是模式。** 一个模式可能需要多个槽位（多个子图各记一个起点），多个模式也可能共享一个槽位（前缀完全相同）。`SomSlotManager` 的职责就是做这个多对多的映射，并且尽量让「相同的前缀」复用同一个槽位。判等用的是「前缀图结构 + escapes 字符集 + 父槽位 + 是否 reset 哨兵」四元组，`SlotEntryHasher` 与 `SlotEntryEqual`（`src/som/slot_manager.cpp:66`、`:79`）实现了这套哈希与比较，其中图结构用 `hash_holder` / `is_equal` 做结构等价判断，而不是指针比较。
+
+**距离与绝对偏移。** 运行期 `som_store[]` 里存的是绝对偏移（相对于流起点）。流状态里存的是**相对距离**：`rel = stream_offset - som_value`。这样做的原因是流状态要跨块搬运，而绝对偏移会越来越大、需要的位宽也越来越多；存相对距离则只要「匹配不太长」就能用窄类型装下。`storeSomValue()`（`src/som/som_stream.c:50`）负责这个转换，并在距离超出宽度时写入哨兵。
+
+**horizon 的三档。** `HS_MODE_SOM_HORIZON_LARGE` 用 8 字节（实际是 u64 全宽，等价于「不限」）、`MEDIUM` 用 4 字节（约 43 亿字节）、`SMALL` 用 2 字节（约 65534 字节）。这三档的语义在 `src/hs_compile.h:1178` 到 `:1218` 的注释里写得很清楚：LARGE 总是精确、MEDIUM 限制在 2^32 字节内、SMALL 限制在 2^16 字节内。模式位到字节数的映射在 `src/hs.cpp:155` 的 `getSomPrecision()`：LARGE 返回 8、MEDIUM 返回 4、SMALL 返回 2；**VECTORED 模式强制返回 8**，因为向量模式下块与块之间没有稳定的流偏移，只能用全宽；BLOCK 模式没有任何 horizon 位，返回 0。
+
+**block 模式下没有 horizon 问题。** 这是最容易被忽略的一点。`getSomPrecision()` 在没有 horizon 位时返回 0，`RoseEngine::somHorizon` 也就是 0；`src/database.c:1534` 的注释明确写着 somHorizon is 0 in block mode（SOM values live in scratch only）。也就是说 block 模式的 SOM 只存在 scratch 的 `som_store[]` 里，不写流状态，自然不存在截断，永远不会返回 `HS_OFFSET_PAST_HORIZON`。这个值只在流式（以及会写流状态的场景）里出现。
+
+**哨兵与 `HS_OFFSET_PAST_HORIZON`。** 三个宽度各有一个哨兵：u16 的 `SOM_SENTINEL_SMALL`（0xFFFF）、u32 的 `SOM_SENTINEL_MEDIUM`（0xFFFFFFFF）、u64 的 `SOM_SENTINEL_LARGE`（全 1）。写入时如果 `rel_offset` 超过哨兵值，就把它钳到哨兵；读出时看到哨兵就还原成 `SOM_SENTINEL_LARGE`，也就是 `~0ULL`。这个值一路传到回调，就是 `HS_OFFSET_PAST_HORIZON`（`src/hs_runtime.h:615` 定义为 `~0ULL`）。它不是一个错误码，而是一个「起点未知」的占位值，业务代码必须显式判断。
+
+**反向 NFA。** 有些情况下起点无法用「距离」表达：前缀是一个复杂的子图，匹配结束时根本无法从状态里推出「这次匹配从哪开始」。这时 Rose 会为这个前缀单独编一个**反向 NFA**，从结束偏移往回扫，扫到第一个接受态就是起点。`runRevNfa()`（`src/som/som_runtime.c:154`）实现了这条路径：先用 `getSomRevNFA()` 取出反向 NFA，再调 `nfaBlockExecReverse()`，回调 `somRevCallback` 只会把 `from_offset` 往更小的方向更新（`LIMIT_TO_AT_MOST`），从而保证「最左」。反向 NFA 必须是有界宽度的——源码里有一句 `assert(nfa->maxWidth); // No inf width rev NFAs`，这就是「部分无界重复开了 SOM 之后无法编译」的根源。
+
+**同一偏移上的竞争。** 同一批数据可能在同一个 `to_offset` 上产生多次「设置槽位」的请求（比如多个前缀同时到达）。Hyperscan 的规则是「最早的起点获胜」：`setSomLoc()` 用 `fatbit_set()` 的返回值判断这是不是本偏移的第一次写，是就直接存，不是就 `LIMIT_TO_AT_MOST` 取更小值。`som_set_now` 在 `to_offset` 变化时被清空，所以这个「本偏移」的作用域是精确的。
+
+### 3. 关键数据结构与源码位置
+
+`RoseEngine` 里与 SOM 相关的字段是 `hasSom`、`somHorizon`、`somLocationCount`、`somLocationFatbitSize`、`somRevOffsetOffset`、`somRevCount`，以及 `stateOffsets` 里的 `somValid`、`somWritable`、`somLocation`（`src/rose/rose_internal.h:331` 起，字段见 05-05）。`hasSom` 决定运行期走不走 SOM 路径；`somHorizon` 是每个槽位在流状态里的字节宽度；`somLocationCount` 是槽位总数，也是 `som_store[]` 的长度。
+
+`SomSlotManager` 定义在 `src/som/slot_manager.h:58`，私有字段是 `nextSomSlot`、`cache`、`rev_nfas`、`historyRequired`、`precision`（`:97` 到 `:109`）。接口有五个：`getSomSlot()`（常规分配，带缓存去重）、`getInitialResetSomSlot()`（为 reset 哨兵分配，需要检查「前缀是否会清掉尾巴」）、`getPrivateSomSlot()`（强制独占）、`rollbackSomTo()`（回滚到某个数量，用于「试了不行就退回」的场景）、`addRevNfa()`（登记反向 NFA 并返回索引）。`somHistoryRequired()` 返回流式模式下已经承诺的历史长度，这个值最终会影响 `historyRequired`。
+
+`struct som_operation` 在 `src/som/som_operation.h:57`，只有三个字段：`type`、`onmatch`（要改哪个槽位）、`aux`（距离或反向 NFA 索引）。15 种类型定义在 `:41` 到 `:55`，可以分成四组：内部写槽（`SOM_INTERNAL_LOC_SET` 及 `_IF_UNSET` / `_IF_WRITABLE`）、内部拷贝（`SOM_INTERNAL_LOC_COPY*`、`_MAKE_WRITABLE`）、从已有值设置（`SOM_INTERNAL_LOC_SET_FROM*`）、外部回调（`SOM_EXTERNAL_CALLBACK_REL` / `_ABS` / `_STORED` / `_REV_NFA`）。`writeSomOperation()`（`src/rose/rose_build_program.cpp:434`）负责把报告类型翻译成这些操作码。
+
+下表把四组操作与它们的语义放在一起，便于在阅读 `som_runtime.c` 的 switch 时对号入座。完整的结构体字段见 05-09，编译标志见 04-02。
+
+| 组别 | 代表类型 | 语义 | 运行期动作 |
+|---|---|---|---|
+| 直接写槽 | `SOM_INTERNAL_LOC_SET` | 用 `to - distance` 写槽 | `setSomLoc` |
+| 条件写槽 | `_IF_UNSET` / `_IF_WRITABLE` | 仅在未写或可写时写 | 查 multibit 再写 |
+| 槽间拷贝 | `SOM_INTERNAL_LOC_COPY` | 把另一个槽的值搬过来 | 读 `som_store` 再写 |
+| 外部回调 | `SOM_EXTERNAL_CALLBACK_REL` | 直接以相对距离上报 | 回调收到 `to - dist` |
+| 反向确认 | `SOM_EXTERNAL_CALLBACK_REV_NFA` | 跑反向 NFA 求起点 | `nfaBlockExecReverse` |
+
+三档 horizon 与「每流状态总量」的关系见图 06-10-01，`block` 模式作为对照放在一起。
+
+:::figure id=06-10-01 | name=四档 SOM 精度与流状态成本 | dir=TD
+node n1 "LARGE 8 字节" blue
+node n2 "MEDIUM 4 字节" teal
+node n3 "SMALL 2 字节" amber
+node n4 "block 仅存 scratch" gray
+node n5 "每流状态等于槽数乘宽度" red
+edge n1 -> n5 "最精确"
+edge n2 -> n5 "2 的 32 次方内"
+edge n3 -> n5 "2 的 16 次方内"
+edge n4 -> n5 "不占流状态"
+:::
+
+### 4. 关键流程与调用链
+
+编译期的起点在 `NG` 的构造函数。`NG::NG(cc, elements, somPrecision)`（`src/nfagraph/ng.cpp:81`）把 `somPrecision` 交给 `ssm`（`SomSlotManager`），此后整个编译过程共享这一个管理器。Rose 在分解阶段为每个「需要起点的报告」调用 `getSomSlot()`：如果缓存里有相同的前缀，直接复用槽位号；否则 `nextSomSlot++` 分配新号并登记。`getInitialResetSomSlot()` 更复杂，它要检查「这个 reset 哨兵是否会清掉尾巴」，`sentClearsTail()` 就是那个判定函数（`slot_manager.cpp:177`），只有通过检查的哨兵才能复用已有的 reset 组，否则新建一组。
+
+落字节码时，`buildFinalEngine()` 里有一行 `proto.somHorizon = ssm.somPrecision();`（`src/rose/rose_build_bytecode.cpp:3819`），把精度写进引擎头。同时 `somLocationCount` 由槽位总数决定，`somLocationFatbitSize` 由 `fatbit_size()` 算出。反向 NFA 被 `addRevNfa()` 收集进 `rev_nfas`，最终以「偏移表 + NFA 块」的形式挂在 `RoseEngine` 的 `somRevOffsetOffset` 处。
+
+运行期的路径可以概括为「写槽 → 存流 → 读槽 → 上报」。Rose 程序里的 `REPORT_SOM_AWARE` 指令调用 `roseHandleSomSom()`，后者把 `som_operation` 与当前 `som` 一起交给 `handleSomInternal()`（`src/som/som_runtime.c:229`）。这个函数先做两件事：如果 `to_offset` 变了就清空 `som_set_now` 与 `som_attempted_set`；然后按 `type` 分派到 `setSomLoc()`、`setSomLocRevNfa()` 或拷贝类操作。写槽时用 `mmbit_set()` 标记「这个槽已经有值」，用 `som_store_writable` 控制「是否允许覆盖」。
+
+流式边界上的搬运是成对的。`storeSomToStream()`（`som_stream.c:95`）在写流状态时遍历 `som_store_valid` 中所有已置位的槽，把绝对值转成相对距离写进 `state + stateOffsets.somLocation`；`loadSomFromStream()`（`:152`）在下一个块开始时做逆运算，把哨兵还原成 `~0ULL`。这两个函数都用 `mmbit_iterate` 遍历，所以成本与「已置位的槽数」成正比，而不是与总槽数成正比——大多数流上只有少数槽位有值，这一点对性能很关键。
+
+「编译期分配槽位」与「运行期写槽、跨块搬运、回调上报」这条完整路径见图 06-10-02。
+
+:::figure id=06-10-02 | name=SOM 槽位从分配到回调的路径 | dir=LR
+node n1 "需要起点的子图" teal
+node n2 "SomSlotManager 分配" amber
+node n3 "槽号与距离" amber
+node n4 "scratch 的 som_store" purple
+node n5 "流状态的 somLocation" purple
+node n6 "回调给出 from" green
+node n7 "距离超限的哨兵" red
+edge n1 -> n2 "编译期"
+edge n2 -> n3 "去重后编号"
+edge n3 -> n4 "报告时写入"
+edge n4 -> n5 "块边界打包"
+edge n5 -> n4 "下一块展开"
+edge n4 -> n6 "报告读取"
+edge n4 -> n7 "超出 horizon"
+edge n7 -> n6 "返回 PAST_HORIZON"
+:::
+
+注意图中 `n5 -> n4` 那条边是反向的：展开发生在下一块开始时，方向与打包相反，两者必须严格配对。如果宿主程序在错误的偏移上调用 `hs_scan_stream`（比如重放历史数据），展开出来的 `som_store` 就会带着错误的基准，表现为起点偏移整体偏移一个固定量——这类 bug 的典型特征是「所有 SOM 结果都差同一个值」。
+
+### 5. 配置/命令/代码实例
+
+下面的程序刻意制造一个「起点距离超过 64 KB」的流式匹配，用 SMALL 与 LARGE 两档各跑一遍，观察 `from` 的差别。数据是 `BEGIN` 加上 150000 个 `A` 再加 `END`，按 4096 字节分块喂进去。完整标志与模式常量见 04-02、04-03。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define TOTAL (5 + 150000 + 3)
+
+static int cb(unsigned int id, unsigned long long from,
+              unsigned long long to, unsigned int flags, void *ctx) {
+    (void)id; (void)flags; (void)ctx;
+    printf("from=%llu to=%llu\n", from, to);
+    return 0;
+}
+
+static void run(unsigned mode, const char *tag) {
+    hs_database_t *db = NULL;
+    hs_scratch_t *sc = NULL;
+    hs_stream_t *st = NULL;
+    hs_compile_error_t *err = NULL;
+
+    if (hs_compile("BEGIN[A-Z]*END", HS_FLAG_SOM_LEFTMOST,
+                   HS_MODE_STREAM | mode, NULL, &db, &err) != HS_SUCCESS) {
+        printf("%s: compile: %s\n", tag, err->message);
+        hs_free_compile_error(err);
+        return;
+    }
+    hs_alloc_scratch(db, &sc);
+
+    char *buf = malloc(TOTAL);
+    memcpy(buf, "BEGIN", 5);
+    memset(buf + 5, 'A', 150000);
+    memcpy(buf + 5 + 150000, "END", 3);
+
+    hs_open_stream(db, 0, &st);
+    for (size_t off = 0; off < TOTAL; off += 4096) {
+        size_t n = TOTAL - off < 4096 ? TOTAL - off : 4096;
+        /* 最后一个块用 close 的结束语义，其余用普通扫描 */
+        if (off + n == TOTAL) {
+            hs_close_stream(st, sc, cb, NULL);
+        } else {
+            hs_scan_stream(st, buf + off, (unsigned)n, 0, sc, cb, NULL);
+        }
+    }
+    printf("%s done\n", tag);
+
+    free(buf);
+    hs_free_scratch(sc);
+    hs_free_database(db);
+}
+
+int main(void) {
+    run(HS_MODE_SOM_HORIZON_SMALL, "small");
+    run(HS_MODE_SOM_HORIZON_LARGE, "large");
+    return 0;
+}
+```
+
+输出形如下面的文本。示例输出，具体格式需对照实际版本核验。
+
+```text
+from=18446744073709551615 to=150005
+small done
+from=0 to=150005
+large done
+```
+
+逐行判读。第一行是 SMALL 档的结果：`from` 是 18446744073709551615，也就是 2 的 64 次方减一，正是 `HS_OFFSET_PAST_HORIZON` 的值（`~0ULL`）。原因是起点 0 与终点 150005 之间的距离超过了 u16 能表示的范围（65534），在某个块边界打包时 `storeSomValue()` 把相对距离钳成了哨兵，后续展开就变成了 `~0ULL`。第二行 `to=150005` 说明结束偏移始终是精确的——horizon 只影响起点，不影响终点，这一点必须记牢：即使 `from` 不可用，`to` 仍然可以用来做「哪条规则命中了」的判断。第四行是 LARGE 档：同样的数据、同样的分块，`from=0` 精确到起点。两条结果的唯一差别就是 horizon，代码逻辑完全一样，这直接把「horizon 是精度预算」这句话变成了可复现的现象。
+
+有一个细节值得注意：SMALL 档并没有「报错」或「不报」，它照常回调、照常给 `to`，只是把 `from` 换成一个哨兵。这是刻意的 API 设计——SOM 是「尽力而为」的附加信息，不能让 horizon 越界变成扫描失败。业务代码如果直接把 `from` 拿去做减法（比如算长度），就会得到一个天文数字，因此必须写成 `if (from == HS_OFFSET_PAST_HORIZON) { /* 起点未知 */ }`。
+
+第二个片段是哨兵逻辑本身，来自 `src/som/som_stream.c:50` 的 `storeSomValue()`，删去了调试输出。
+
+```c
+if (som_value == SOM_SENTINEL_LARGE) {
+    switch (som_size) {
+    case 2: *(u16 *)stream_som_store = SOM_SENTINEL_SMALL;  break;
+    case 4: *(u32 *)stream_som_store = SOM_SENTINEL_MEDIUM; break;
+    case 8: *(u64a *)stream_som_store = SOM_SENTINEL_LARGE; break;
+    }
+    return;
+}
+u64a rel_offset = stream_offset - som_value;
+switch (som_size) {
+case 2: rel_offset = MIN(rel_offset, SOM_SENTINEL_SMALL);  break;
+case 4: rel_offset = MIN(rel_offset, SOM_SENTINEL_MEDIUM); break;
+case 8: break;
+}
+```
+
+逐行判读。第一段处理「值本身已经是哨兵」的情况：说明这个槽位在当前块里被标记为「起点未知」，写入时要把哨兵按目标宽度重新编码——u16 要写成 0xFFFF、u32 要写成 0xFFFFFFFF，不能直接截断 64 位的全 1（虽然结果相同，但显式分支让意图清楚）。第二段是正常路径：`stream_offset` 是当前流偏移，`som_value` 是绝对起点，两者相减得到相对距离。第三段是关键：`MIN(rel_offset, SENTINEL)` 把超限距离钳到哨兵值，而不是回绕或截断。这个 `MIN` 保证了「距离越界」与「距离恰好等于哨兵」在读出时都会被解释成「未知」，但代价是它把 0xFFFF 这个合法距离也变成了未知——这就是 SMALL 档的实际可用范围是 65534 而不是 65535 的原因。8 字节档不需要钳位，因为 `rel_offset` 本身就是 u64，只有「槽位从未被写过」才会出现哨兵。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**第一，不开 `HS_FLAG_SOM_LEFTMOST` 时 `from` 没有任何意义。** 回调签名里 `from` 永远存在，但只有开了这个标志才有语义。很多「起点不对」的现场其实是「根本没开 SOM」，此时 `from` 可能是 0、可能是上一次的残留值，取决于实现细节，绝不能当数据用。判断方法很简单：`hs_expression_info()` 返回的 `unordered_matches` 之类字段不直接告诉你 SOM，但编译标志是你自己传的，检查一遍即可。
+
+**第二，SOM 与三个标志互斥，且错误信息各不相同。** `src/compiler/compiler.cpp:193` 拒绝 `SINGLEMATCH + SOM_LEFTMOST`，错误文本是 `HS_FLAG_SINGLEMATCH is not supported in combination with HS_FLAG_SOM_LEFTMOST.`；`:216` 拒绝 `QUIET + SOM_LEFTMOST`；`:249` 拒绝 `PREFILTER + SOM_LEFTMOST`。这三条都在解析入口就抛出，属于 `HS_COMPILER_ERROR`。它们不是「暂时不支持」，而是语义上无法同时满足，不要期待未来版本会放开。
+
+**第三，horizon 是「精度预算」，不是「最大匹配长度」。** SMALL 档能记住 65534 字节以内的起点距离，但这不是说「超过 65534 的匹配就报不出来」——匹配照报，只是 `from` 变成 `HS_OFFSET_PAST_HORIZON`。选档时要问的是「业务能接受多大的起点误差」，而不是「最长模式有多长」。
+
+**第四，流状态成本 = 槽数 × 宽度。** `somLocationCount` 是全局槽位数，`somHorizon` 是宽度，两者相乘就是每条流为 SOM 付出的字节数（`src/database.c:1535` 就在算这个乘积，并用 64 位防止溢出）。一万条模式、每条一个槽、SMALL 档，就是 20 KB/流；十万并发流就是 2 GB。这个数字必须在容量规划阶段算清楚，而不是等到 OOM 才发现。
+
+**第五，`HS_OFFSET_PAST_HORIZON` 必须显式判断。** 它是 `~0ULL`，参与任何算术都会溢出。正确的写法是先比较再计算：`if (from != HS_OFFSET_PAST_HORIZON) { len = to - from; }`。如果业务一定要长度，可以退化成「至少 `to - horizon`」，但绝不能直接用哨兵做减法。
+
+**第六，反向 NFA 要求有界宽度。** `runRevNfa()` 里有一句断言「没有无界宽度的反向 NFA」，`nfa->maxWidth` 必须非零。这意味着 `.*` 这类无界重复开 SOM 时，Rose 只能用「距离」而不是「反向扫描」来记起点；如果某个结构既无法用距离表达、又无界，编译就会失败。这是「部分有界重复在开 SOM 后无法编译」的真实原因。
+
+**第七，别在错误的偏移上重放数据。** 流状态的 SOM 值是按「打包时的流偏移」编码的相对距离，重放历史数据（或用 `hs_reset_stream` 回到过去）会让展开的基准错位。正确做法是用 `hs_copy_stream` 分叉、用 `hs_reset_and_copy_stream` 重置，而不是把旧数据再喂一遍（流状态的整体语义见 06-11）。
+
+### 7. 小结与延伸阅读
+
+SOM 的本质是「在自动机之外维护一张起点表」，槽位是这张表的索引，horizon 是这张表的位宽预算，反向 NFA 是「无法用距离表达时的兜底」。四者合起来，把「起点」这个 DFA 天然丢失的信息重新变成可查询的输出，代价是流状态膨胀与一套复杂的竞争/压制规则。
+
+如果只记住三件事：第一，`from` 只在开了 `HS_FLAG_SOM_LEFTMOST` 时有意义，且流式下受 horizon 限制；第二，`HS_OFFSET_PAST_HORIZON` 是 `~0ULL`，必须显式判断，它只影响起点不影响终点；第三，槽位去重与反向 NFA 是编译期决定的，模式写法直接决定流状态大小。
+
+延伸阅读：`src/som/slot_manager.cpp` 的 `getSomSlot` 与 `getInitialResetSomSlot` 是槽位去重的全部逻辑，重点看 `SlotEntryEqual` 比较了哪四个维度；`src/som/som_runtime.c` 的 `handleSomInternal` 是 15 种操作的 switch，配合本篇的表格读最省力；`src/som/som_stream.c` 只有一百多行，却把「宽度、哨兵、相对距离」三件事讲透了。流状态的打包与压缩见 06-11；`RoseEngine` 里 SOM 相关字段的定义见 05-05；SOM 反向 NFA 与 Gough 引擎的关系见 06-08 的结尾。

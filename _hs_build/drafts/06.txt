@@ -1,0 +1,2798 @@
+# Hyperscan 技术资料 · 06 技术原理（分片 A）
+
+## 06-01 编译流水线总览：从正则文本到 RoseEngine 字节码
+
+### 1. 背景与动机
+
+Hyperscan 的设计哲学可以浓缩成一句话：把尽可能多的工作从「每个字节都要走一遍」的路径挪到「只走一次」的路径上。正则文本进入库的那一刻，Hyperscan 并不保留它，也不打算在扫描时解释它；它把模式集合翻译成一份自包含的、不可变的字节码，之后每一次 `hs_scan` 都只是让数据流过这张已经排布好的表。这个「编译一次、扫描无数次」的不对称，既是 Hyperscan 吞吐的来源，也是它全部使用约束的来源。
+
+把这条流水线讲清楚有三个现实收益。第一是定位编译失败。用户看到的往往只是一句 `HS_COMPILER_ERROR` 和一段错误文本，但错误究竟来自词法、语法、语义检查、图规模限制还是 Rose 的资源上限，决定了应该改模式、改标志还是改编译选项。第二是解释吞吐差异。两条看起来相似的正则，可能一条被整体折叠成字面量、走 Teddy 或 FDR，另一条却退化成大 NFA 甚至 Castle，吞吐差一个数量级；差异不是运行时随机产生的，而是在流水线的某个判定点上已经注定。第三是判断能力边界。SOM、近似匹配、流式历史、逻辑组合这些特性并不是运行时的开关，而是编译期就要写进字节码的结构；不理解这一点，就会反复尝试「先编译再想办法打开 SOM」这类不可能的操作。
+
+本册把机制与调用链集中在这里，正是因为后续每一篇都在展开本篇文章中的某一格。06-02 展开解析器与组件树，06-03 展开 Glushkov 图构造与化简，06-04 展开 Rose 的角色划分，06-05 展开字面量前端；06-06 之后进入 NFA、Castle、Sheng、加速器与 SOM、流状态、序列化、fat runtime 与 Chimera。读完本篇，应当能在脑中维持一条从 `hs_compile` 到 `hs_database` 的完整路径，并且知道每一步的输入、输出与典型失败方式。
+
+需要强调，Hyperscan 是编译加扫描的库，不是 DPI 产品。它不抓包、不做协议解析、不做流重组；`examples/pcapscan.cc` 只是演示如何把包载荷喂给扫描接口。流水线的终点是一份数据库，而不是一个可执行服务，这也是本套资料把「集成与部署」单独放在 03 册的原因。
+
+### 2. 核心概念
+
+整条流水线可以概括为「四次表示转换 + 一次落库」。四次转换分别是组件树、NG 图、Rose 图和 RoseEngine 字节码；落库则是把字节码包进带头部与完整性校验的 `hs_database`。每一次转换都在丢失信息，同时也在固化决策。理解「丢了什么」比记住「经过哪些函数」更重要，因为丢失的信息在运行期无法恢复。
+
+组件树是语法结构的直接映射。`ComponentSequence` 表示串联，`ComponentAlternation` 表示分支，`ComponentRepeat` 表示量词，`ComponentClass` 表示字符类，`ComponentBoundary` 与 `ComponentWordBoundary` 表示行首行尾与词边界。组件树保留的是「子表达式之间的组合关系」，它还带有 `first()`、`last()`、`empty()` 这三个用于 Glushkov 构造的语义查询。此时模式仍然是可以被打印、被改写的结构，尚未涉及任何状态编号。
+
+NG 图是 Glushkov 位置自动机。它把每个「字符位置」变成一个顶点，把「某个位置之后可以接某个位置」变成边。与 Thompson 构造不同，Glushkov 图没有 epsilon 边，状态数等于位置数，因此状态编号紧凑、运行期推进直接；代价是边数可能较多，且大重复会复制子图。`NGHolder` 里还保留 `start`、`startDs`、`accept`、`acceptEod` 四个特殊顶点，分别对应「锚定起点」「任意起点」「普通接受」「仅在数据末尾接受」。这四个顶点是后面 Rose 判断角色时的重要依据。
+
+Rose 图是「触发关系图」。它不再关心自动机的每个状态，而是把模式拆成两类东西：能被字面量匹配器快速触发的部分，以及只能由 NFA 逐字节推进的部分。字面量按照起点是否固定进入 anchored 表或 floating 表，靠近数据末尾的进入 EOD 表；无法用字面量表达的后缀、前缀、中缀、外缀则变成不同类型的 NFA 角色。Rose 图上的边带有 lag 与边界，表示「触发之后还需要确认多远」。这一步是 Hyperscan 性能的核心，也是 06-04 的主题。
+
+RoseEngine 是最终的扁平字节码。它由一个头部、若干偏移量、若干表（anchored 表、floating 表、EOD 表、小块表、NFA 信息表、左信息表、逻辑组合表）以及若干程序段组成。头部里的 `runtimeImpl`、`pureLiteral`、`noFloatingRoots`、`mode`、`historyRequired`、`hasSom` 等字段，决定了运行期走哪条快速路径。到了这一步，原始正则已经不存在，剩下的只是偏移与指令；因此 `hs_database_info` 只能报告版本、特性与模式，无法反查模式文本。
+
+还有两条旁路必须记住。其一是纯字面量 API：`hs_compile_lit` 与 `hs_compile_lit_multi` 不经过解析器和图构造，直接把字节串变成 `ue2_literal` 交给 Rose，因此只支持大小写不敏感、单次匹配与 SOM 这几个标志，扩展参数一律拒绝。其二是 `shortcutLiteral`：普通编译路径下，如果组件树被判定为纯字面量且不涉及混合大小写，也会跳过建图直接进 Rose。这两条旁路解释了为什么同一个模式用不同 API 编译，得到的字节码规模与运行路径可能不同。
+
+### 3. 关键数据结构与源码位置
+
+本册只点名结构体与入口，逐字段定义统一放在 05 册，避免与字段表重复。公共句柄 `hs_database` 的布局见 05-02；编译上下文 `CompileContext` 与表达式信息见 05-04；`NG`、`NGHolder` 与 `NFAVertex` 见 05-08；`RoseEngine` 与 `RoseContext` 见 05-05；字节码容器 `bytecode_ptr` 见 05-01 的分层索引。
+
+从源码角度看，装配中心是 `src/compiler/compiler.cpp`。`build()` 位于 `compiler.cpp:622`，它调用 `generateRoseEngine()`（`compiler.cpp:523`）拿到 `bytecode_ptr<RoseEngine>`，设置 `pureLiteral` 标志，再交给 `dbCreate()`（`compiler.cpp:561`）做对齐、填头与 HMAC。真正的图构造入口是 `buildGraph()`（`compiler.cpp:713`），它按 Glushkov 构造顺序把组件树变成 `NGHolder`，并在返回前调用 `removeAssertVertices()`。
+
+Rose 侧的抽象接口在 `src/rose/rose_build.h:82`，类名是 `RoseBuild`；具体实现是 `RoseBuildImpl`，声明在 `src/rose/rose_build_impl.h`。`buildRose()` 的实现位于 `src/rose/rose_build_compile.cpp:1682`，它先做一系列图变换，最后调用 `buildFinalEngine()`（`src/rose/rose_build_bytecode.cpp:3609`）分配并填充 `RoseEngine`。`RoseEngine` 的定义在 `src/rose/rose_internal.h:331`，字段含义见 05-05。
+
+`NG` 类在 `src/nfagraph/ng.h:63`，构造函数 `NG::NG` 在 `src/nfagraph/ng.cpp:81`，它一次性创建 `ReportManager`、`SomSlotManager`、`SmallWriteBuild` 与 `RoseBuild`。`NG::addGraph()` 在 `ng.cpp:326`，`NG::addLiteral()` 在 `ng.cpp:579`，`reduceGraph()` 在 `ng.cpp:156`。这三处是理解「图如何进入 Rose」的关键锚点。
+
+分配器与所有权由 `src/util/bytecode_ptr.h` 承担。`bytecode_ptr<T>` 在 `bytecode_ptr.h:56`，它同时记录指针与字节数，`size()` 返回字节数（`bytecode_ptr.h:119`）；`make_zeroed_bytecode_ptr()` 在 `bytecode_ptr.h:152`，先分配再清零。`RoseEngine` 与内部的表都放在同一块连续内存里，因此可以整体序列化、整体释放，这也是数据库能做到零拷贝分发的前提。
+
+下表把五个阶段的输入输出与入口放在一起，便于建立索引；参数与标志的完整语义见 04 册，不在本表重复。
+
+| 阶段 | 主要输入 | 主要输出 | 源码入口 |
+|---|---|---|---|
+| 解析 | 模式文本、编译标志 | 组件树 `Component` | `src/parser/Parser.rl` 的 `parse()` |
+| 建图 | 组件树、`ReportManager` | `NGHolder` | `compiler.cpp` 的 `buildGraph()` |
+| 归约 | `NGHolder` | 化简后的图与组件切分 | `ng.cpp` 的 `reduceGraph()`、`calcComponents()` |
+| 分解 | 若干 `NGHolder` | Rose 图与字面量表 | `ng.cpp` 的 `addGraph()` |
+| 落库 | Rose 图 | `RoseEngine` 与 `hs_database` | `rose_build_compile.cpp` 的 `buildRose()` |
+
+本篇只负责把调用链讲通，具体字段、参数与模块边界分别以对应分册为准（字段见 05-05 ｜ 参数见 04-02 ｜ 模块见 07-03）。
+
+### 4. 关键流程与调用链
+
+第一步在公共 API 层。`hs_compile()`（`src/hs.cpp:436`）先把单模式包装成单元素数组，直接调用 `hs_compile_multi_int()`（`src/hs.cpp:167`）；`hs_compile_multi()` 与 `hs_compile_ext_multi()` 也走同一个内部函数，只是传入的数组长度与扩展参数不同。这个函数先做参数校验：`db`、`expressions` 不能为空，`elements` 不能为零；随后在 `FAT_RUNTIME` 构建下检查 SSSE3 是否可用，不可用直接返回 `HS_ARCH_ERROR`；接着 `checkMode()` 校验扫描模式，`checkPlatform()` 校验目标平台描述，最后用 `limitPatternCount` 限制模式总数。
+
+第二步建立编译上下文。`CompileContext cc(isStreaming, isVectored, target_info, g)` 把「是否流式」「是否向量模式」「目标平台」「灰盒配置」四件事固定下来，这些值在整次编译中不再变化。随后 `NG ng(cc, elements, somPrecision)` 构造全局图容器；`NG` 的构造函数会创建报告管理器、SOM 槽位管理器、SmallWrite 构建器和 Rose 构建器。注意 `somPrecision` 来自模式位，如果流式模式下使用了 SOM 标志却没有指定 horizon，后面的 `addExpression` 会直接抛错。
+
+第三步逐条处理表达式。`addExpression()`（`compiler.cpp:336`）先判断是否为逻辑组合：组合表达式不走常规解析，而是交给 `ng.rm.pl.parseLogicalCombination()`，并且只允许 `QUIET`、`SINGLEMATCH` 与少量扩展参数。普通表达式则构造 `ParsedExpression`，其构造函数内部调用 `parse(expression, mode)` 得到组件树；解析失败会抛 `ParseError`，`hs_compile_multi_int` 捕获后设置表达式下标再原样抛出，保证错误能定位到具体模式。
+
+解析之后是一串语义检查。若开了 `HS_FLAG_PREFILTER`，先跑 `prefilterTree()` 做预过滤改写；随后 `checkUnsupported()` 遍历组件树，拒绝零宽断言、原子组、反向引用、条件引用、`\X`、占有量词以及 UCP 模式下的 `\b`；再调用 `checkEmbeddedStartAnchor()` 与 `checkEmbeddedEndAnchor()` 检查嵌入锚点是否合法；若灰盒开启组件树优化，`optimise()` 会在没有 `min_length` 与 SOM 的前提下做简化。之后才轮到 `shortcutLiteral()`：如果组件树能折叠成一个确定字面量（单字符类、固定次数重复、无分支与断言），直接走 `ng.addLiteral()`，跳过建图。
+
+第四步建图。`buildGraph()` 先 `makeNFABuilder()` 创建位置构造器，再 `makeGlushkovBuildState()` 创建构造状态；`notePositions()` 为组件树的每个位置分配顶点；`connectInitialStates()` 把 `start` 与 `startDs` 接到所有首位置；`buildFollowSet()` 递归计算后继关系；`connectFinalStates()` 把尾位置接到接受顶点；`buildEdges()` 一次性落边；`getGraph()` 取出 `NGHolder`；最后 `removeAssertVertices()` 处理断言顶点。这里任何一步发现图不可能匹配、或图过大，都会抛出 `CompileError`。
+
+第五步归约与分解。`NG::addGraph()` 先清理无效报告、确保 UTF-8 起点对齐、检查 `can_never_match()`；然后 `resolveAsserts()` 解析断言、`make_fuzzy()` 处理近似匹配、`pruneUseless()` 与 `pruneEmptyVertices()` 删无用顶点；接着传播并归约扩展参数、拆分 vacuous 模式、把图交给 SmallWrite 构建器、尝试 `splitOffLiterals()` 把贯穿整图的字面量摘走；再用 `calcComponents()` 把图拆成若干连通分量，逐分量调用 `addComponent()`，依次尝试 SEP、SOM、anchored acyclic、小字面量集、固定宽度、装饰字面量、Violet、puff、outfix 等处理路径。全部失败则抛 `Pattern is too large.`。
+
+第六步落库。`build()` 调 `generateRoseEngine()`，后者用 `ng.minWidth` 计算最小宽度（无限宽用 `ROSE_BOUND_INF`），再调 `ng.rose->buildRose(minWidth)`。`buildRose()` 内部完成角色合并、后缀转换、Castle 原型生成、历史分配、别名化与分组，最后 `buildFinalEngine()` 按「原型 `RoseEngine` → 分配 → 拷贝 → 写状态初始化表 → 写引擎 blob」的顺序落地。`dbCreate()` 再把这串字节码复制进 `hs_database`，按 64 字节对齐调整 `bytecode` 偏移，写入 `magic`、`version`、`length`、`platform`，并对字节码与头部各算一次 HMAC-SHA256。
+
+整条链路的阶段划分与数据流见图 06-01-01。
+
+:::figure id=06-01-01 | name=从正则文本到 hs_database 的五个阶段 | dir=TD
+node n1 "正则文本与标志" blue
+node n2 "Parser：组件树" teal
+node n3 "NG：Glushkov 图" teal
+node n4 "Reduction：化简" teal
+node n5 "RoseBuild：角色分解" amber
+node n6 "RoseEngine 字节码" amber
+node n7 "hs_database 与 HMAC" green
+node n8 "hs_compile 返回" blue
+edge n1 -> n2 "parse()"
+edge n2 -> n3 "buildGraph()"
+edge n3 -> n4 "reduceGraph()"
+edge n4 -> n5 "addGraph()"
+edge n5 -> n6 "buildRose()"
+edge n6 -> n7 "dbCreate()"
+edge n7 -> n8 "HS_SUCCESS"
+:::
+
+失败并不只发生在解析阶段。图 06-01-02 把四类异常出口与它们最终落到的返回码画在一起：解析错误、语义与标志冲突、资源上限、内存不足，最后都被 `hs_compile_multi_int` 收敛为 `HS_COMPILER_ERROR`，只是错误文本与 `expression` 下标不同。
+
+:::figure id=06-01-02 | name=编译失败的四个出口与统一返回 | dir=LR
+node e1 "addExpression" blue
+node e2 "ParseError：语法" red
+node e3 "CompileError：语义" red
+node e4 "ResourceLimitError" red
+node e5 "hs_compile_error_t" amber
+node e6 "HS_COMPILER_ERROR" gray
+edge e1 -> e2 "词法或语法"
+edge e1 -> e3 "标志或构造"
+edge e1 -> e4 "图或角色超限"
+edge e2 -> e5 "带下标"
+edge e3 -> e5 "带下标"
+edge e4 -> e5 "无下标"
+edge e5 -> e6 "统一出口"
+:::
+
+### 5. 配置/命令/代码实例
+
+下面的 C 程序走完整生命周期：编译一条带 SOM 的模式、打印数据库信息、分配 scratch、扫描一段数据、释放全部对象。它刻意只用一个模式，便于把回调里的 `id` 与 `from`、`to` 对上号。完整标志表见 04-02，模式常量见 04-03，这里不重复参数清单。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int on_match(unsigned int id, unsigned long long from,
+                    unsigned long long to, unsigned int flags, void *ctx) {
+    (void)flags;
+    (void)ctx;
+    printf("match id=%u [%llu, %llu)\n", id, from, to);
+    return 0; /* 返回 0 表示继续扫描 */
+}
+
+int main(void) {
+    const char *pattern = "GET /[a-z]+ HTTP/1\\.[01]";
+    const char *data = "x GET /index HTTP/1.1 y";
+    hs_database_t *db = NULL;
+    hs_scratch_t *scratch = NULL;
+    hs_compile_error_t *err = NULL;
+
+    if (hs_compile(pattern, HS_FLAG_CASELESS | HS_FLAG_SOM_LEFTMOST,
+                   HS_MODE_BLOCK, NULL, &db, &err) != HS_SUCCESS) {
+        fprintf(stderr, "compile failed: %s (expr %d)\n",
+                err->message, err->expression);
+        hs_free_compile_error(err);
+        return 1;
+    }
+
+    char *info = NULL;
+    if (hs_database_info(db, &info) == HS_SUCCESS) {
+        printf("%s\n", info);
+        free(info); /* 由默认 misc 分配器分配，需由调用方释放 */
+    }
+
+    if (hs_alloc_scratch(db, &scratch) != HS_SUCCESS) {
+        hs_free_database(db);
+        return 1;
+    }
+
+    if (hs_scan(db, data, (unsigned)strlen(data), 0, scratch,
+                on_match, NULL) != HS_SUCCESS) {
+        fprintf(stderr, "scan failed\n");
+    }
+
+    hs_free_scratch(scratch);
+    hs_free_database(db);
+    return 0;
+}
+```
+
+在一台支持 AVX2 的机器上以 5.4.2 编译运行，输出形如下面的文本。示例输出，具体格式需对照实际版本核验。
+
+```text
+Version: 5.4.2 Features: AVX2 Mode: BLOCK
+match id=0 [2, 21)
+```
+
+逐行判读。第一行来自 `hs_database_info()`，格式串在 `src/database.c:3357` 固定为「Version: 主.次.修订 Features: 特性 Mode: 模式」。`5.4.2` 对应 `HS_MAJOR/MINOR/PATCH`；`AVX2` 说明数据库的目标平台允许 AVX2，若目标机不支持任何向量特性，这一段会是空串；`BLOCK` 说明编译时用了 `HS_MODE_BLOCK`，同一份数据库不能拿到流式接口上使用，否则会得到 `HS_DB_MODE_ERROR`。第二行来自回调：`id=0` 是单模式编译时默认的外部报告号，`from=2` 是 `GET` 的起始偏移，`to=21` 是结束偏移且为开区间，即最后一个匹配字节的下标是 20；若没有开 `HS_FLAG_SOM_LEFTMOST`，`from` 不具语义，只有 `to` 可信。偏移都相对于本次扫描缓冲区起点，block 模式下不存在跨块换算问题。
+
+命令行侧可以用 `hscheck` 做「能不能编译」的快速判定。`-N` 表示 block 模式，`-s` 指定签名文件，具体选项全集见 04-07。
+
+```bash
+hscheck -N -s patterns.txt
+```
+
+`hscheck` 的价值不在吞吐，而在把「编译期拒绝」与「运行期不命中」分开：如果这里就失败，后面的扫描结果没有解释意义。反过来，如果 `hscheck` 通过而业务侧仍然不命中，问题通常落在模式语义、标志组合或数据边界上，应转到 08 册的诊断树。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，不要把编译当成廉价操作。流水线里有多次全图遍历与多轮化简，`buildRose()` 还要做角色合并与状态排布；模式集合越大、重复越多、分支越复杂，编译时间与峰值内存增长得比线性更快。生产环境的正确姿势是编译一次、序列化分发、`hs_deserialize_database()` 加载，而不是每次进程启动都重新编译。数据库是不可变对象，这也意味着运行期没有任何「热更新单条模式」的接口，更新只能换库。
+
+第二，要理解「编译成功」与「按预期匹配」是两件事。`hs_compile` 只保证模式被接受并且字节码自洽，不保证它符合你的业务语义。典型偏差来自 `HS_FLAG_PREFILTER`：预过滤模式允许漏报，换来更小的图和更高的吞吐；如果误把它当成精确匹配开关，就会出现「明明有却报不出」的现场。另一个偏差来自 `HS_FLAG_SINGLEMATCH`：它只保证每条流最多报一次，不保证报的是最早或最左的那一次。
+
+第三，注意模式长度与图规模的双重限制。`limitPatternLength` 在 `addExpression()` 入口就会拦下过长的模式；`ComponentRepeat` 还有 `MAX_REPEAT`（32767）与 `MAX_POSITIONS_EXPANDED`（500000）两道闸门，超过就抛「Bounded repeat is too large.」。这两类错误都发生在图构造前后，错误文本不同，处理方式也不同：前者应缩短模式或拆分，后者应把大重复改写成等价但更紧凑的形式，或依赖 `ng_lbr.cpp` 的大重复路径。
+
+第四，SOM 不是随便加的。流式模式下使用 `HS_FLAG_SOM_LEFTMOST` 必须同时指定 SOM horizon（`HS_MODE_SOM_HORIZON_LARGE/MEDIUM/SMALL`），否则 `addExpression()` 会抛「an SOM precision mode must be specified」。SOM 还会与 `SINGLEMATCH`、`PREFILTER` 互斥，组合会直接编译失败；部分有界重复在开 SOM 后也无法编译。这些都不是运行期能补救的，必须在写模式时决定。
+
+第五，留意平台绑定。`dbCreate()` 把 `target_to_platform()` 的结果写进 `platform` 字段；数据库跨机器分发时，如果目标机缺少编译时假定的指令集，加载会返回 `HS_DB_PLATFORM_ERROR`。fat runtime 构建下，一份库可以在多代 CPU 上分派，但数据库里的平台位仍然是对编译目标的承诺，不能用「库能跑」推断「库一定能加载这份数据库」。
+
+第六，谨慎对待纯字面量旁路。`shortcutLiteral()` 只处理不涉及混合大小写的字面量；`NG::addLiteral()` 里的 `mixed_sensitivity()` 检查会把混合大小写退回完整图处理。`hs_compile_lit` 更是完全绕过解析器，扩展参数一律拒绝，空串也拒绝。若你的模式本来是字面量，却因为大小写混写而没有走快速路径，不要误判为「Hyperscan 对字面量不优化」，应先检查字面量形态。
+
+第七，错误处理要看出口。`hs_compile_multi_int()` 对 `CompileError`、`std::bad_alloc` 与未知异常分别处理：前者生成带 `expression` 下标的错误对象，中者返回预置的「Unable to allocate memory.」，后者返回内部错误。`hs_free_compile_error()` 对三个静态错误对象做了特判，不会重复释放；但调用方仍然必须在每次失败后释放，否则会泄漏错误文本。
+
+### 7. 小结与延伸阅读
+
+本篇建立了整册的骨架：`hs_compile` 把模式交给 `hs_compile_multi_int`，在那里建立 `CompileContext` 与 `NG`，逐条 `addExpression` 完成解析、检查、建图与分解，最后由 `build()` 生成 `RoseEngine` 并包进带 HMAC 的 `hs_database`。五个阶段的产物分别是组件树、`NGHolder`、Rose 图、`RoseEngine` 与数据库；每往后一步，信息更少、决策更硬、运行期更不可改。
+
+如果只记住三件事：第一，编译期的判定点决定了运行期的路径，吞吐差异通常不是调参能解决的；第二，能力边界（SOM、近似、流式）在编译期就以字段和表的形式固化；第三，编译昂贵且数据库不可变，生产部署应以序列化分发为主。
+
+延伸阅读建议按顺序进行：06-02 看解析器如何把 PCRE 子集变成组件树，并理解哪些构造在解析期就被拒绝；06-03 看 Glushkov 构造与化简如何控制图规模；06-04 看 Rose 如何把图切成字面量与 NFA 两类角色；06-05 看字面量前端如何在 Teddy、Fat Teddy 与 FDR 之间选择。结构体字段随时查 05-05 与 05-08，API 与标志查 04-02、04-03、04-04，模块边界查 07-03 与 07-04。
+
+## 06-02 PCRE 语法解析与组件树构造
+
+### 1. 背景与动机
+
+Hyperscan 的语法跟随 PCRE，但它不是 PCRE 的实现。它需要在解析阶段就判断「这个构造能不能被自动机表达」，并且要把「不能」尽早变成一条可读的编译错误，而不是等到建图时才发现状态爆炸。组件树就是为此设计的中间层：它比原始文本更结构化，比自动机更接近语法，既能承载 `first()`、`last()` 这类图构造查询，也能被 `checkUnsupported()` 这样的访问器整体扫描。
+
+理解解析层有三个直接用处。第一，解释错误文本。`Zero-width assertions are not supported.`、`Back-references are unsupported.`、`Possessive quantifiers are not supported.` 这些话都来自解析后的组件树检查，而不是图构造；知道来源就能判断「换写法」是否有意义。第二，解释语义差异。`\b` 在普通模式下可用，在 UCP 模式下被拒绝；`^`、`$` 是边界组件，不是零宽断言；UTF-8 与大小写不敏感同时开启时，字面量会被提升为字符类。这些都不是文档随口一提，而是解析器的具体分支。第三，解释性能。组件树的形状直接影响 Glushkov 图的位置数：一个 `{0,1000}` 的重复会复制上千份子图，而一个字符类只占一个位置。
+
+需要先纠正一个常见说法。很多资料把 `src/parser/` 描述为「递归下降解析器」，但在这个 5.4.2 快照里，真正的解析器是由 Ragel 从 `src/parser/Parser.rl` 生成的状态机，配合一个显式的 `sequences` 栈来管理嵌套分组，而不是一组互相递归的 `parseAtom`、`parseRepeat` 函数。源码中能看到 `%% write init;` 与 `%% write exec;`（`Parser.rl:1983`、`Parser.rl:1984`），以及 `PUSH_SEQUENCE`、`POP_SEQUENCE` 宏（`Parser.rl:79`、`Parser.rl:84`）。说它「按递归结构组织语义」可以，说它「用递归下降实现」不准确；涉及实现细节时应以 `Parser.rl` 为准。
+
+### 2. 核心概念
+
+解析的输入是「以 NUL 结尾的模式文本 + `ParseMode`」，输出是一棵 `Component` 树。`ParseMode` 是一个很小的结构，保存 `caseless`、`dotall`、`multiline`、`ucp`、`utf8` 等布尔量（`src/parser/Parser.h:56` 起）。它不是全局常量，而是会随分组内联选项变化：`(?i)`、`(?s)`、`(?m)` 这类内联标志会在进入分组时压栈、离开时恢复，所以解析器用 `ExprState` 保存「当前序列 + 进入偏移 + 当时的模式」（`Parser.rl:88`）。
+
+组件树的节点类型可以按「组合」与「原子」两类理解。组合节点有 `ComponentSequence`（串联）、`ComponentAlternation`（分支）、`ComponentRepeat`（量词）；原子节点有 `ComponentClass`（ASCII 与 UTF-8 两个派生）、`ComponentByte`（单字节）、`ComponentEmpty`（空）、`ComponentBoundary`（`^`、`$`）、`ComponentWordBoundary`（`\b`、`\B`）。此外还有一批「解析得出、但检查时拒绝」的节点：`ComponentAssertion`（前后向断言）、`ComponentAtomicGroup`、`ComponentBackReference`、`ComponentCondReference`、`ComponentEUS`（`\X`）。它们存在的意义不是被实现，而是让错误信息能精确到构造类型与位置。
+
+`Component` 基类定义了图构造所需的三个语义查询：`first()` 返回「可能作为起点的位置集合」，`last()` 返回「可能作为终点的位置集合」，`empty()` 表示「是否可以匹配空串」。这三个查询是 Glushkov 构造的接口，组件树不需要知道状态编号，只需要回答「我的首位置、尾位置、是否可空」。`notePositions()` 与 `buildFollowSet()` 则把「分配位置」和「连接后继」分开，前者只数位置，后者才落边；这种两阶段设计让重复展开可以先算总量、再决定是否超限。
+
+分支的表示值得单独说明。`ComponentSequence` 并不在每次遇到 `|` 时立刻建一个 `ComponentAlternation`，而是先把「左分支」的 children 换进一个子序列、追加到 `alternation`，等到 `finalize()` 时再把整个 alternation 作为唯一孩子放回。`addAlternation()` 与 `finalize()` 的实现见 `src/parser/ComponentSequence.cpp:141` 与 `:151`。这意味着解析过程中树的形状是「边解析边折叠」的，最终每个分组都收敛为一个 sequence 或 alternation，便于后续统一处理。
+
+`empty()` 的语义值得单独说明。它回答的是「这个组件能否在不消耗字符的情况下完成」，而不是「这个组件是不是空串」；一个带 `*` 的组件通常 `empty()` 为真，因为它可以选择零次。这个查询直接影响 Glushkov 的首尾集合：如果前一个孩子可空，后一个孩子的 `first` 也要并入当前序列的 `first`。整棵树都可空时，`addExpression()` 会在建图后用 `matches_everywhere()` 检查，未开 `HS_FLAG_ALLOWEMPTY` 就抛「Pattern matches empty buffer; use HS_FLAG_ALLOWEMPTY to enable support.」。
+
+量词由 `ComponentRepeat` 表示，构造时带最小、最大与贪心类型。`RepeatType` 有三个值：`REPEAT_NONGREEDY`、`REPEAT_GREEDY`、`REPEAT_POSSESSIVE`（`ComponentRepeat.h:83`）。对 Hyperscan 而言，贪婪与非贪婪在「是否报告匹配」上没有区别，因为自动机不接受回溯语义；占有量词只在预过滤模式下被容忍，普通模式下会被 `checkUnsupported()` 拒绝。`ComponentSequence::addRepeat()` 还要求最后一个孩子 `repeatable()`，因此不能对断言、边界这类零宽节点直接加量词（`ComponentSequence.cpp:123`）。
+
+解析后的 `optimise()` 也会改写量词。它只在没有 `min_length` 与 SOM 时运行；`ComponentRepeat::optimise()` 在「根连接到 startDs」时会把 `m_max` 压成 `m_min`（`src/parser/ComponentRepeat.cpp:226`），理由是末尾多出的重复不会改变「是否匹配」的结论。这个改写能显著缩小图，但也意味着 `hsdump` 的 `orig` 与 `opt` 两个阶段看到的组件树形状可能不同；对比时要以阶段名为准。
+
+UTF-8 与 UCP 是解析层最容易被低估的部分。开启 `HS_FLAG_UTF8` 后，解析器必须把多字节字符当成一个位置，而不是逐字节；`addLiteral()` 在 `utf8 && caseless` 时会「借助字符类生成顶点」，因为一个 Unicode 字符的大小写折叠可能对应多个码点（`Parser.rl:172` 起）。`ComponentClass` 有 ASCII 与 UTF-8 两个实现，`getComponentClass(mode)` 按模式选择。开启 `HS_FLAG_UCP` 后，`\b` 的词边界语义依赖 Unicode 属性，当前实现不支持，除非同时开预过滤；这就是 `ComponentWordBoundary` 检查里 `c.ucp && !c.prefilter` 的来源（`src/parser/unsupported.cpp:71`）。
+
+最后要理解「检查发生在什么时候」。词法与语法错误在 Ragel 状态机执行时抛出 `LocatedParseError`，由 `parse()` 的 catch 块补上偏移；构造性拒绝（断言、反向引用、占有量词、UCP 词边界）发生在 `parse()` 返回之后的 `checkUnsupported()`；标志冲突（SOM 与 SINGLEMATCH、SOM 与 PREFILTER、未知标志）发生在 `ParsedExpression` 构造函数里；图规模限制发生在 `notePositions()` 的重复展开处。四类错误都在 `hs_compile` 返回之前发生，运行期不会再有「这个构造不支持」的异常。
+
+### 3. 关键数据结构与源码位置
+
+解析器的源文件是 `src/parser/Parser.rl`，构建时由 Ragel 生成 `Parser.cpp`；仓库快照里只有 `.rl` 源文件，生成的 `.cpp` 在构建目录中。入口函数 `parse()` 在 `Parser.rl:1915`，它先调用 `read_control_verbs()` 处理 `(*UTF8)`、`(*UCP)` 这类控制动词，再初始化状态机并执行。机器定义从 `Parser.rl:274` 的 `machine regex;` 开始，字符类、转义、量词、分组、内联选项都在同一个状态机里。
+
+组件基类在 `src/parser/Component.h:58`，纯虚接口包括 `clone()`、`accept()`、`first()`、`last()`、`empty()`、`notePositions()`、`buildFollowSet()`。派生类的头文件与实现一一对应：`ComponentSequence`、`ComponentAlternation`、`ComponentRepeat`、`ComponentClass`、`AsciiComponentClass`、`Utf8ComponentClass`、`ComponentBoundary`、`ComponentWordBoundary`、`ComponentAssertion`、`ComponentBackReference`、`ComponentCondReference`、`ComponentAtomicGroup`、`ComponentEUS`、`ComponentByte`、`ComponentEmpty`。
+
+错误类型在 `src/parser/parse_error.h`。`ParseError` 继承自 `CompileError`（`parse_error.h:43`），`LocatedParseError` 额外记录偏移并在 `locate()` 时把偏移拼进错误文本（`parse_error.h:52`）。`CompileError` 定义在 `src/util/compile_error.h`，带 `reason`、`hasIndex`、`index` 三个关键信息，最终由 `generateCompileError()` 转成 `hs_compile_error_t`。
+
+不支持构造的检查在 `src/parser/unsupported.cpp`，访问器是 `UnsupportedVisitor`，继承 `DefaultConstComponentVisitor`，对每类节点重载 `pre()` 并抛错。引用合法性检查在 `src/parser/check_refs.cpp`，由 `checkReferences()` 统一执行；它保证 `\1` 这类引用指向存在的捕获组，即使反向引用本身最终会被拒绝，编号检查仍然要先做，否则错误信息会变成「引用不存在」而不是「反向引用不支持」。
+
+占位与位置的数据结构在 `src/parser/position.h` 与 `src/parser/position_info.h`。`Position` 是整数编号，`PositionInfo` 在编号之外还带标志位，用于表示「这个位置是否可以作为起点」「是否带断言」等。`GlushkovBuildState` 在 `src/parser/buildstate.h:52`，它持有 `NFABuilder`，提供 `connectRegions()`、`connectAccepts()`、`buildEdges()` 以及 `POS_EPSILON` 常量（`buildstate.h:58`）。构造器与构造状态的分工是：`NFABuilder` 管顶点与边，`GlushkovBuildState` 管「首尾集合如何接线」。
+
+下表按「组件类型—语义—是否被拒绝—拒绝位置」列出常见节点，便于把错误文本对上源码。单元格只写结论，完整语法清单见 04-08。
+
+| 组件 | 语义 | 当前状态 | 拒绝位置 |
+|---|---|---|---|
+| `ComponentSequence` | 串联 | 支持 | 无 |
+| `ComponentAlternation` | 分支 | 支持 | 无 |
+| `ComponentRepeat` | 量词 | 支持，占有型除外 | `unsupported.cpp` |
+| `ComponentClass` | 字符类 | 支持，含 UTF-8 变体 | 无 |
+| `ComponentBoundary` | 行首行尾 | 支持 | 无 |
+| `ComponentWordBoundary` | 词边界 | 非 UCP 支持 | `unsupported.cpp` |
+| `ComponentAssertion` | 前后向断言 | 不支持 | `unsupported.cpp` |
+| `ComponentBackReference` | 反向引用 | 不支持 | `unsupported.cpp` |
+
+组件树的节点字段与 `NG` 的对应关系见 05-08，解析相关的标志与语法参数见 04-02，模块边界见 07-01（字段见 05-08 ｜ 参数见 04-02 ｜ 模块见 07-01）。
+
+### 4. 关键流程与调用链
+
+解析从 `parse(ptr, globalMode)` 开始。第一步是 `read_control_verbs(p, pe, 0, globalMode)`，它识别模式最前面的 `(*UTF8)`、`(*UCP)`、`(*LIMIT_MATCH=...)` 之类控制动词，更新全局模式并前移指针。控制动词的语法在 `src/parser/control_verbs.rl`，与主解析器分开生成，这样主状态机不必为它们增加分支。
+
+第二步是状态机执行。`parse()` 准备 `cs`、`top`、`stack`、`ts`、`te` 等 Ragel 变量，以及 `accumulator`、`repeatN`、`repeatM`、`label`、`sequences` 等语义变量；然后 `%% write init;` 初始化，`%% write exec;` 执行。状态机每识别一个 token，就调用对应的语义动作：普通字符走 `addLiteral()`，转义走 `addEscaped()` 或 `addEscapedOctal()`、`addEscapedHex()`，分组开始走 `enterSequence()` 并把当前序列压入 `sequences`，分组结束走 `POP_SEQUENCE`，`|` 走 `currentSeq->addAlternation()`，量词走 `currentSeq->addRepeat()`。
+
+第三步是收尾检查。状态机跑完后，`parse()` 检查指针是否停在末尾、字符类是否闭合、注释是否闭合、`sequences` 是否为空；`sequences` 非空说明有未闭合的括号，错误文本会带上进入时的偏移。随后检查 `groupIndex` 是否超过 65535，这是捕获组编号的上限，超过就抛「The maximum number of capturing subexpressions is 65535.」。最后 `currentSeq->finalize()` 把顶层分支折叠，`checkReferences()` 校验所有命名与编号引用，返回根 `ComponentSequence`。
+
+第四步是解析后的语义检查，发生在 `compiler.cpp` 的 `addExpression()` 里。顺序是：`prefilterTree()`（仅预过滤）、`checkUnsupported()`、`checkEmbeddedStartAnchor()`、`checkEmbeddedEndAnchor()`、`optimise()`。`checkEmbeddedStartAnchor()` 与 `checkEmbeddedEndAnchor()` 不是「拒绝锚点」，而是检查锚点是否出现在不允许的位置，例如分支的一侧有 `^` 而另一侧没有，可能导致语义无法用单一自动机表达；具体判定在各组件的同名虚函数里。
+
+第五步是进入图构造。`buildGraph()` 调用 `pe.component->notePositions(*bs)`，组件树递归回答「我有几个位置」；`connectInitialStates()` 取 `first()` 接起点；`buildFollowSet()` 从首位置集合出发递归计算后继；`connectFinalStates()` 取 `last()` 接接受点；`buildEdges()` 落边。组件树的使命到此结束，之后的所有处理都在 `NGHolder` 上。
+
+组件树的形状与解析阶段的折叠关系见图 06-02-01。图中把「根序列」「分支」「量词」「字符类」与「被拒绝的断言」画在一起，注意断言节点在进入建图前就会被 `checkUnsupported()` 拦下。
+
+:::figure id=06-02-01 | name=组件树的节点家族与解析后检查 | dir=TD
+node c1 "parse()" blue
+node c2 "ComponentSequence<br/>根序列" teal
+node c3 "ComponentAlternation<br/>分支" teal
+node c4 "ComponentRepeat<br/>量词" teal
+node c5 "ComponentClass<br/>字符类" teal
+node c6 "ComponentAssertion<br/>零宽断言" amber
+node c7 "ComponentBoundary<br/>与 WordBoundary" amber
+node c8 "checkUnsupported()" red
+node c9 "NGHolder" green
+edge c1 -> c2 "根"
+edge c2 -> c3 "遇到竖线"
+edge c3 -> c4 "分支内量词"
+edge c2 -> c4 "量词"
+edge c4 -> c5 "原子"
+edge c2 -> c5 "字面量"
+edge c2 -> c6 "断言语法"
+edge c2 -> c7 "锚点"
+edge c6 -> c8 dashed "拒绝"
+edge c7 -> c8 dashed "UCP 时拒绝"
+edge c2 -> c9 "notePositions()"
+:::
+
+### 5. 配置/命令/代码实例
+
+下面的程序用 `hs_expression_info()` 观察两条模式的静态信息，再用 `hs_compile()` 触发一次「不支持构造」的错误。`hs_expression_info()` 只做解析与建图，不生成数据库，因此很适合在写模式阶段做快速体检。完整 API 签名见 04-04。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static void show_info(const char *pat, unsigned flags) {
+    hs_expr_info_t *info = NULL;
+    hs_compile_error_t *err = NULL;
+    hs_error_t rc = hs_expression_info(pat, flags, &info, &err);
+    if (rc != HS_SUCCESS) {
+        printf("pattern=%s rc=%d msg=%s expr=%d\n",
+               pat, (int)rc, err->message, err->expression);
+        hs_free_compile_error(err);
+        return;
+    }
+    printf("pattern=%s min=%u max=%u unordered=%u eod=%u only_eod=%u\n",
+           pat, info->min_width, info->max_width,
+           (unsigned)info->unordered_matches,
+           (unsigned)info->matches_at_eod,
+           (unsigned)info->matches_only_at_eod);
+    free(info); /* 由默认分配器分配，需由调用方释放 */
+}
+
+int main(void) {
+    show_info("a(b|c)+d", 0);
+    show_info("^foo[0-9]{2,4}$", 0);
+    show_info("(a)\\1", 0);
+
+    hs_database_t *db = NULL;
+    hs_compile_error_t *err = NULL;
+    hs_error_t rc = hs_compile("(a)\\1", 0, HS_MODE_BLOCK, NULL, &db, &err);
+    printf("compile rc=%d msg=%s expr=%d\n", (int)rc,
+           err ? err->message : "none", err ? err->expression : -1);
+    hs_free_compile_error(err);
+    return 0;
+}
+```
+
+一段可能的输出如下。示例输出，具体格式需对照实际版本核验。
+
+```text
+pattern=a(b|c)+d min=3 max=0 unordered=0 eod=0 only_eod=0
+pattern=^foo[0-9]{2,4}$ min=5 max=7 unordered=0 eod=0 only_eod=0
+pattern=(a)\1 rc=-4 msg=Back-references are unsupported. expr=0
+compile rc=-4 msg=Back-references are unsupported. expr=0
+```
+
+逐行判读。第一条 `a(b|c)+d` 的最小宽度是 3（一个 `a`、一个分支字符、一个 `d`），最大宽度为 0，表示没有有限上界；`unordered=0` 说明不会出现乱序报告，`eod=0` 说明不依赖数据末尾。第二条 `^foo[0-9]{2,4}$` 的最小宽度是 5（`foo` 三个字符加两位数字），最大宽度是 7（加四位数字），两个边界锚点让匹配宽度确定但位置受行首行尾约束。第三条在 `hs_expression_info()` 阶段就失败，返回码 `-4` 即 `HS_COMPILER_ERROR`，错误文本来自 `unsupported.cpp` 的 `ComponentBackReference` 分支，`expr=0` 表示第 0 条模式。最后一行用 `hs_compile()` 复现同一错误，说明两条 API 路径共用同一套解析与检查逻辑；若错误来自第 5 条模式，`expression` 就会是 5，调用方应把它当作数组下标而不是行号。
+
+命令行侧可以用 `hsdump` 把中间图与最终数据库转储出来，前提是构建时开了 `DUMP_SUPPORT`（默认 release 关闭，见 04-01）。`-N` 指定 block 模式，`-D` 转储数据库，`-o` 指定输出目录。
+
+```bash
+hsdump -N -D -o ./dump patterns.txt
+```
+
+转储目录里会按阶段生成组件树、`NGHolder` 的 dot 文件与 `RoseEngine` 的文本描述，适合对照本篇的节点类型与 06-03 的图结构。具体文件名与格式在不同版本间可能变化，需对照实际版本核验。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，不要用 PCRE 的完整语法心智模型来写 Hyperscan 模式。Hyperscan 支持的是子集：没有反向引用、没有捕获语义、没有任意零宽断言、没有递归与条件模式、没有 `\C`、`\R`、`\K`，占有量词只在预过滤下被容忍。写模式时应先问「这个构造能否被有限自动机表达」，而不是「PCRE 能不能跑」。
+
+第二，区分「语法接受」与「语义支持」。`(?=...)` 能被 Ragel 状态机识别并构造成 `ComponentAssertion`，但随后被 `checkUnsupported()` 拒绝；反过来，`\b` 在普通模式下完全支持，在 UCP 模式下却被拒绝。错误发生在不同阶段，说明「换一种写法」的可行性不同：前者通常无解，后者可以关掉 UCP 或改预过滤。
+
+第三，注意内联选项的作用域。`(?i)` 只影响它所在的分组及其后续，解析器用 `ExprState` 压栈保存模式，离开分组时恢复。把 `(?i)` 写在分支内部与写在模式开头，得到的组件树不同，最终字节码也可能不同。若发现大小写行为不符合预期，应先用 `hsdump` 看组件树，而不是猜运行期。
+
+第四，UTF-8 不是「把字节当字符」。开启 `HS_FLAG_UTF8` 后，非法 UTF-8 输入会在 `ParsedExpression` 构造函数里被 `isValidUtf8()` 拒绝；字符类会按码点展开，`\x{...}` 与 `.` 的语义都随码点变化。UTF-8 与大小写不敏感组合时，字面量会被提升为字符类，图的位置数可能增加，编译时间与字节码规模也随之增加。
+
+第五，量词展开是编译期的主要规模来源。`{0,n}` 会复制 n 份子图，`{m,n}` 会复制 n 份并处理可选尾部；`MAX_POSITIONS_EXPANDED` 是 500000，超过就抛「Bounded repeat is too large.」。实践上应尽量把大重复写成「字符类 + 有界重复」而不是「复杂子表达式 + 大重复」，并避免在重复内部放分支嵌套。
+
+第六，捕获组只用于编号与引用检查，不产生捕获结果。Hyperscan 的回调只有 `id`、`from`、`to`、`flags`，没有子匹配数组；需要捕获组时应使用 Chimera（见 06-14 与 07-11）。这也意味着 `(?:...)` 与 `(...)` 在匹配语义上等价，差别只在捕获编号与引用检查，不会影响性能。
+
+第七，错误位置要会用。`LocatedParseError` 会把偏移拼进文本，`hs_compile_error_t.expression` 是模式下标；两者结合才能定位到「第几条模式的第几个字符」。若错误来自 `checkUnsupported()`，文本里通常没有偏移，只有构造名称，这时应结合 `hsdump` 的组件树定位。
+
+### 7. 小结与延伸阅读
+
+解析层的职责不是「读懂所有 PCRE」，而是「把可表达的子集变成组件树，把不可表达的构造尽早拒绝」。组件树用 `first()`、`last()`、`empty()` 三个查询把语法结构转成图构造所需的语义；`notePositions()` 与 `buildFollowSet()` 把「数位置」与「连后继」分开，为重复展开与规模限制留下控制点。解析器本身是 Ragel 状态机加显式 sequence 栈，而不是递归下降；涉及实现细节时应以 `Parser.rl` 为准。
+
+对使用者而言，最重要的三条结论是：不支持构造在解析期就会失败，不要指望运行期补救；内联选项与 UTF-8/UCP 会改变组件树形状，从而改变字节码；大重复是编译期规模的主要来源，写模式时要主动控制。
+
+延伸阅读：06-03 讲组件树如何变成 Glushkov 图，以及 `notePositions()` 的位置编号如何映射到顶点；06-04 讲 Rose 如何在这些图上做角色划分；07-01 从模块角度列 `src/parser/` 的文件清单与扩展点；04-08 给出完整语法支持与错误速查。组件树节点的逐字段定义不在本册展开，统一见 05-08 的 `NG` 与组件树对应关系。
+
+## 06-03 Glushkov 图构造、限制与冗余消除
+
+### 1. 背景与动机
+
+把正则变成自动机有两条经典路线：Thompson 构造与 Glushkov 构造。Thompson 图允许 epsilon 边，状态数大致与模式长度成正比，构造简单，但运行时要处理「不消耗字节的状态转移」，对位并行与状态压缩都不友好。Glushkov 图（也称位置自动机）没有 epsilon 边：每个顶点对应模式中的一个「字符位置」，每条边表示「这个位置之后可以紧接那个位置」。这样一来，运行期的每一步都严格消耗一个字节，状态推进与输入偏移一一对应，非常适合 Hyperscan 的流式与块式扫描模型。
+
+Hyperscan 选择 Glushkov 还有一层工程原因：位置天然可编号。解析阶段 `notePositions()` 按组件顺序分配位置，构造阶段用同一套编号建顶点，运行期的状态位图可以直接用位置编号索引。代价是图可能比 Thompson 大：一个 `{0,1000}` 的重复会复制 1000 份子图，边数随分支与重复组合增长。因此 `nfagraph` 里一半以上的代码不是「建图」，而是「化简」与「限制」：在保证语义不变的前提下删边、删点、合并等价状态、把大重复拆成专用引擎，避免图规模把编译时间和字节码撑爆。
+
+理解这一层能解释很多现场现象。为什么 `a{1,1000}` 能编译而 `(abcdefghij){1,100000}` 直接报「Bounded repeat is too large.」？为什么两条语义等价的正则，一条生成的数据库比另一条小一半？为什么开了 SOM 之后某些本来能编译的模式失败？答案都在 Glushkov 构造与随后的化简规则里。本篇按「构造 → 归约 → 切分 → 交给 Rose」的顺序展开，图规模与限制贯穿始终。
+
+需要说明本册的版本边界。本篇核对的是 5.4.2 快照；任务清单里提到的 `src/nfagraph/ng_limit.cpp` 与 `ng_vivify.cpp` 在这个快照中并不存在（用 `find` 与全仓 grep 均无结果）。与「限制大重复」相关的职责落在 `src/nfagraph/ng_repeat.cpp`（`tooLargeToImplement()`、`processSubgraph()`）、`src/nfagraph/ng_puff.cpp`（`splitOffPuffs()`）与 `src/nfagraph/ng_lbr.cpp`（`constructLBR()`）；与「图增强/活化」相关的职责落在 `src/nfagraph/ng_misc_opt.cpp`（`improveGraph()`、`enlargeCyclicCR()`）。若读者手中是别的版本，应以实际文件名为准，不要按旧文献的 `ng_limit`/`ng_vivify` 去索引。
+
+### 2. 核心概念
+
+Glushkov 构造的核心是「位置」与「后继关系」。给定正则，先为每个可消耗字符的位置分配一个编号；再计算三个集合：`first`（可能作为匹配起点的位置）、`last`（可能作为匹配终点的位置）、`follow(p)`（位置 p 之后可以紧接的位置）。构造时把每个位置变成一个顶点，把 `follow` 关系变成边，再把 `first` 接到起点、`last` 接到接受点。因为每个顶点都对应一个具体字符位置，图中不存在「空转移」，任意一条从起点到接受点的路径都对应一个长度确定的匹配。
+
+Hyperscan 的图里有四个特殊顶点，序号固定在普通位置之前：`start`（锚定起点）、`startDs`（dot-star 起点，表示任意偏移都可以开始）、`accept`（普通接受）、`acceptEod`（仅在数据末尾接受）。`N_SPECIALS` 等于 4（`src/nfagraph/ng_holder.h:95`），任何 `index < N_SPECIALS` 的顶点都是特殊顶点。`start` 与 `startDs` 的区别决定了模式是否锚定：只有 `start` 出发的路径要求匹配从缓冲区起点开始；`startDs` 出发的路径可以在任意偏移开始，这也是后面 Rose 判断 anchored 与 floating 的结构依据。
+
+位置编号不是随便分配的，它必须与组件树的遍历顺序一致。`notePositions()` 在每个组件上递归执行：遇到字符类或单字节就分配一个位置，遇到重复就先给子组件分配一份、再按份数复制。`ComponentRepeat::notePositions()` 里能看到 `posFirst`、`posLast`、`vcount` 与 `copies` 的计算，以及 `MAX_POSITIONS_EXPANDED` 的检查（`src/parser/ComponentRepeat.cpp:123` 的 `notePositions()`，上限判断在 `:160`）。这一步发生在建图之前，因此「重复太大」的错误在建图前就能抛出，避免先分配再失败。
+
+`buildFollowSet()` 是建边的核心。它从首位置集合出发，递归地让每个组件回答「在我之后可以接什么」。`ComponentSequence` 把前一个孩子的 `last` 接到后一个孩子的 `first`；`ComponentAlternation` 把每个分支的 `first` 与 `last` 分别汇总；`ComponentRepeat` 先构造一份子图，再用 `cloneFollowSet()` 复制剩余份数，最后用 `wireRepeats()` 把可选尾部接上。`cloneFollowSet()` 只复制边，不复制顶点语义，因此位置编号在复制后仍然连续，便于批量处理。
+
+断言在 Glushkov 图里以「带标志的边」或「带标志的顶点」表示，而不是独立的零宽状态。`resolveAsserts()` 在 `ng.cpp` 的 `addGraph()` 早期被调用，它把断言拆成带 `assert_flags` 的边，或在必要时分裂顶点。`removeAssertVertices()` 则在 `buildGraph()` 返回前清理临时断言顶点。断言的语义最终由运行期的 `NFA` 引擎检查，这也是为什么含断言的图不适合做激进的等价合并：合并可能把「带断言」与「不带断言」的路径混在一起。
+
+化简的目标不是「最小化」，而是「在可接受的时间内得到一个足够小且语义正确的图」。`reduceGraph()` 明确采用「最多三轮、直到不再变化」的策略（`ng.cpp:169` 的 `MAX_PASSES = 3`），因为完整的图最小化代价太高，而且很多冗余对运行期影响很小。三轮里依次跑边冗余、等价合并、顶点冗余、环路径冗余；之后再做区域冗余、图增强、循环支配点删除。这个顺序有讲究：先删边能减少后续等价判断的输入，先合并等价点能让冗余删除发现更多模式，最后做增强是为了不把刚扩大的字符集又当成冗余删掉。
+
+### 3. 关键数据结构与源码位置
+
+构造器接口在 `src/nfagraph/ng_builder.h`。`NFABuilder`（`ng_builder.h:55`）定义 `makePositions()`、`getStart()`、`getStartDotStar()`、`getAccept()`、`getAcceptEOD()`、`addCharReach()`、`setAssertFlag()`、`addEdge()`、`cloneRegion()`、`getGraph()` 等纯虚函数；实现是 `NFABuilderImpl`，构造函数在 `src/nfagraph/ng_builder.cpp:115`，`getGraph()` 在 `:155`。`makeNFABuilder()` 是唯一入口，返回 `unique_ptr<NFABuilder>`。
+
+构造状态在 `src/parser/buildstate.h:52`。`GlushkovBuildState` 持有 `NFABuilder` 引用，提供 `connectRegions()`（把一组尾位置接到一组首位置）、`connectAccepts()`（把尾位置接到接受点）、`buildEdges()`（真正落边）与 `POS_EPSILON` 常量（`buildstate.h:58`）。`POS_EPSILON` 是一个哨兵位置，表示「空串也能到达」，在 `connectInitialStates()` 里会被特殊处理成「起点直接接接受点」。`makeGlushkovBuildState()` 在 `buildstate.h:88` 声明。
+
+图容器是 `NGHolder`，定义在 `src/nfagraph/ng_holder.h:108`，继承自 `ue2_graph`。顶点属性 `NFAGraphVertexProps` 至少包含 `char_reach`（字符可达集）与 `reports`（该顶点触发的报告集合），字段细节见 05-08。`NGHolder` 还保存 `kind`（`NFA_PREFIX`、`NFA_INFIX`、`NFA_SUFFIX`、`NFA_OUTFIX` 等，定义在 `src/nfa/nfa_kind.h:46`）与四个特殊顶点句柄。`NG` 类在 `src/nfagraph/ng.h:63`，它持有全局 `ReportManager`、`SomSlotManager`、`SmallWriteBuild` 与 `RoseBuild`，字段见 05-08。
+
+化简 pass 的入口分散在多个头文件里，下表给出对应关系。注意这些函数都直接修改传入的 `NGHolder`，返回值表示「是否发生了变化」，`reduceGraph()` 用这个返回值决定是否继续下一轮。
+
+| Pass | 作用 | 源码位置 |
+|---|---|---|
+| `removeEdgeRedundancy` | 删除被更短路径覆盖的边 | `ng_edge_redundancy.cpp` |
+| `reduceGraphEquivalences` | 合并入边出边等价的顶点 | `ng_equivalence.cpp` |
+| `removeRedundancy` | 删除冗余顶点与冗余字符 | `ng_redundancy.cpp` |
+| `removeCyclicPathRedundancy` | 删除环上的重复路径 | `ng_cyclic_redundancy.cpp` |
+| `improveGraph` | 扩张循环顶点的字符可达集 | `ng_misc_opt.cpp` |
+| `removeRegionRedundancy` | 删除区域级冗余 | `ng_region_redundancy.cpp` |
+
+组件切分在 `src/nfagraph/ng_calc_components.cpp`。`calcComponents()` 在 `:406`，它把一个 `NGHolder` 拆成若干连通分量；如果灰盒关闭了 `calcComponents` 或图是「字符类分支」的简单形式，就退化为单分量。`recalcComponents()` 在 `:434`，用于在 `reformLeadingDots()` 之后重新切分。切分的意义是让 Rose 可以按分量独立尝试不同实现（字面量、固定宽度、NFA、outfix），一个分量失败不影响其他分量。
+
+区域分析在 `src/nfagraph/ng_region.cpp`，入口 `assignRegions()`（声明于 `ng_region.h:46`）。它把图划分为若干由入口与出口界定的区域，`removeRegionRedundancy()` 再用区域信息判断哪些区域可以被更简单的等价结构替代。区域分析与连通分量分析解决的是不同问题：前者面向「局部结构的冗余」，后者面向「整图的可拆分性」。
+
+大重复相关代码在 `src/nfagraph/ng_repeat.cpp`、`ng_puff.cpp`、`ng_lbr.cpp`。`tooLargeToImplement()`（`ng_repeat.cpp:494`）判断上下界是否超过 `REPEAT_INF`；`processSubgraph()` 判断一个 reached subgraph 是否是「纯重复」；`splitOffPuffs()`（`ng_puff.cpp:491`）把纯重复拆成 puff；`constructLBR()`（`ng_lbr.cpp:251` 起有多个重载）为大重复构造专用 NFA。这些路径与解析期的 `MAX_POSITIONS_EXPANDED` 是两道不同的闸门：解析期限制「展开后的位置数」，运行期实现限制「无法展开时能否用专用引擎表达」。
+
+图的字段定义、与重复相关的参数以及模块文件清单分别见 05-08、04-03、07-02（字段见 05-08 ｜ 参数见 04-03 ｜ 模块见 07-02）。
+
+### 4. 关键流程与调用链
+
+建图从 `compiler.cpp` 的 `buildGraph()` 开始（`compiler.cpp:713`）。第一步 `makeNFABuilder(rm, cc, pe)` 创建构造器，构造器内部会预分配四个特殊顶点；第二步 `makeGlushkovBuildState(*builder, pe.expr.prefilter)` 创建构造状态，预编译模式下会调整某些边的优先级；第三步 `pe.component->notePositions(*bs)` 递归分配位置，这一步可能抛出「Bounded repeat is too large.」；第四步 `connectInitialStates(*bs, pe)` 取组件树的 `first()`，剥掉其中的 `start` 与 `startDs`，把真正的首位置接到两个起点，并把 `POS_EPSILON` 转成「起点直接接接受点」。
+
+第五步 `buildFollowSet()`。初始集合是 `{startDs, start}`，组件树递归地把「前驱的 last」与「后继的 first」连起来。对 `ComponentSequence`，它按孩子顺序传递；对 `ComponentAlternation`，它把每个分支独立构建后再汇总；对 `ComponentRepeat`，它先构建一份，再按 `m_firsts.size()` 复制剩余份数，每一份的偏移是 `posLast + 1 - posFirst` 的整数倍，最后 `wireRepeats()` 把可选部分接到后续。第六步 `connectFinalStates()` 把 `last()` 接到 `accept` 与 `acceptEod`，具体接哪个取决于组件是否要求 EOD。第七步 `buildEdges()` 一次性把缓存的边写入图，避免边插入过程中反复重排。
+
+第八步 `getGraph()` 取出 `NGHolder`，`buildGraph()` 随即调用 `removeAssertVertices()` 清理断言临时顶点，并可选地 dump「00_before_asserts」的 dot 文件。至此 `buildGraph()` 的使命结束，图交给 `NG::addGraph()`。
+
+`NG::addGraph()` 的处理顺序在 `ng.cpp:326` 起。它先 `clearReports()` 删掉无法到达接受点的报告，再检查 SOM 与 vacuous 的冲突；`ensureCodePointStart()` 保证 UTF-8 模式下起点落在码点边界；`can_never_match()` 在早期就拒绝不可能匹配的图。随后 `resolveAsserts()` 解析断言（`src/nfagraph/ng_asserts.cpp:457`）、`make_fuzzy()` 处理编辑距离与汉明距离、`pruneUseless()` 与 `pruneEmptyVertices()` 删除无用顶点。扩展参数在这一段被传播与归约，若约束导致没有任何路径能到接受点，会抛「Extended parameter constraints can not be satisfied...」。
+
+接下来是「按表达式」的化简：UTF-8 模式下 `relaxForbiddenUtf8()` 放宽非法码点；高置信模式下 `pruneHighlanderAccepts()` 剪掉接受点的其他出边；`splitOffVacuous()` 把可匹配空串的部分拆成边界报告；`smwr->add()` 把图交给 SmallWrite 构建器；`removeRedundancy()` 与 `prunePathsRedundantWithSuccessorOfCyclics()` 再做一轮合并；`splitOffLiterals()` 尝试把贯穿整图的字面量摘给 Rose。若此时所有顶点都被认领（`num_vertices(g) == N_SPECIALS`），直接返回成功。
+
+之后再 `calcComponents()` 切分，非 SOM 模式下对每个分量 `reformLeadingDots()`（`src/nfagraph/ng_anchored_dots.cpp:642`）并 `recalcComponents()`，然后逐分量 `addComponent()`。`addComponent()` 的顺序是：`reduceExtendedParams()`、`reduceGraph()`、`removeRegionRedundancy()`；若图已空则返回；否则依次尝试 SEP、SOM、anchored acyclic、小字面量集、固定宽度、装饰字面量、Violet、puff，最后尝试 outfix。每条路径失败就继续下一条，全部失败则整个表达式报「Pattern is too large.」。
+
+`reduceGraph()` 的内部循环见图 06-03-01。它先在不带 SOM 时合并循环 dot-star，然后最多跑三轮：每轮依次 `removeEdgeRedundancy()`、`reduceGraphEquivalences()`、`removeRedundancy()`、`removeCyclicPathRedundancy()`，任一 pass 改变图就继续，整轮无变化就提前退出。三轮之后，UTF-8 模式做 `utf8DotRestoration()`，再 `improveGraph()` 扩张字符集并补一次边冗余，随后 `removeCyclicDominated()`、再次合并循环 dot-star、删除 `startDs` 的兄弟节点。
+
+:::figure id=06-03-01 | name=reduceGraph 的三轮化简与收敛 | dir=TD
+node r1 "reduceGraph()" blue
+node r2 "removeEdgeRedundancy" teal
+node r3 "reduceGraphEquivalences" teal
+node r4 "removeRedundancy" teal
+node r5 "removeCyclicPathRedundancy" teal
+node r6 "improveGraph" amber
+node r7 "removeCyclicDominated" amber
+node r8 "图不变或满三轮" gray
+edge r1 -> r2 "进入第一轮"
+edge r2 -> r3 "边已精简"
+edge r3 -> r4 "等价点合并"
+edge r4 -> r5 "顶点冗余"
+edge r5 -> r6 "有变化"
+edge r5 -> r8 dashed "无变化"
+edge r6 -> r7 "字符集扩张"
+edge r7 -> r2 dashed "下一轮"
+edge r7 -> r8 "收敛"
+:::
+
+为什么是三轮而不是「跑到不动」？因为某些 pass 的收益递减，而每轮都要遍历全图；在超大图上无限迭代会让编译时间不可控。三轮是一个经验折中：绝大多数图在两轮内收敛，第三轮主要处理 `improveGraph()` 之后新出现的边冗余。灰盒里的 `performGraphSimplification` 可以整体关闭化简，用于调试或对比，但生产环境不应关闭。
+
+### 5. 配置/命令/代码实例
+
+下面的程序用 `hs_expression_info()` 观察重复对图规模与宽度的影响。它不生成数据库，只跑到建图与信息提取，因此适合快速验证「这个重复会不会太大」。完整 API 见 04-04，灰盒与构建选项见 04-01。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static void show(const char *pat) {
+    hs_expr_info_t *ei = NULL;
+    hs_compile_error_t *err = NULL;
+    hs_error_t rc = hs_expression_info(pat, 0, &ei, &err);
+    if (rc != HS_SUCCESS) {
+        printf("%-24s error: %s\n", pat, err->message);
+        hs_free_compile_error(err);
+        return;
+    }
+    printf("%-24s min=%-6u max=%-6u\n", pat,
+           ei->min_width, ei->max_width);
+    free(ei); /* 默认分配器分配，调用方释放 */
+}
+
+int main(void) {
+    show("a{1,4}");
+    show("(ab){2,3}");
+    show("a{1,1000}");
+    show("(abcdefghij){1,100000}");
+    return 0;
+}
+```
+
+一段可能的输出如下。示例输出，具体格式需对照实际版本核验。
+
+```text
+a{1,4}                   min=1      max=4
+(ab){2,3}                min=4      max=6
+a{1,1000}                min=1      max=1000
+(abcdefghij){1,100000}  error: Bounded repeat is too large.
+```
+
+逐行判读。第一行 `a{1,4}` 的最小宽度是 1、最大宽度是 4，对应四个复制位置加可选尾部；第二行 `(ab){2,3}` 的最小宽度是 4（两份 `ab`）、最大宽度是 6（三份），说明重复的宽度按「子图宽度乘份数」累积；第三行 `a{1,1000}` 的最大宽度是 1000，位置数约 1000，仍在 `MAX_POSITIONS_EXPANDED` 之内，因此可以编译，但字节码会明显变大；第四行子图宽度为 10、份数上限 100000，展开后位置数约一百万，超过 500000 的上限，`ComponentRepeat::notePositions()` 在建图前就抛出「Bounded repeat is too large.」。这里的 `max=0` 在 `hs_expr_info_t` 里表示无有限上界，不要误读成「最大宽度为零」。
+
+若要看图本身，可以用 `hsdump` 导出 dot 文件。`-N` 指定 block 模式，`-o` 指定输出目录，`-X` 关闭中间产物（这里不要加）。
+
+```bash
+hsdump -N -o ./ngdump patterns.txt
+```
+
+导出的 dot 片段经简化后形如下面的文本。示例输出，具体格式需对照实际版本核验。
+
+```text
+digraph NFA {
+  v0 [label="start"];
+  v1 [label="startDs"];
+  v2 [label="0: a"];
+  v3 [label="1: b"];
+  v4 [label="accept"];
+  v0 -> v2;
+  v1 -> v2;
+  v2 -> v3 [label="a"];
+  v2 -> v4 [label="b"];
+  v3 -> v4 [label="b"];
+}
+```
+
+判读要点：`v0` 与 `v1` 分别对应锚定起点与任意起点，普通位置从 `v2` 开始编号；顶点标签里的 `0:`、`1:` 是位置序号，不是状态机编号；`startDs` 与 `start` 同时指向首位置，表示该模式既可以从缓冲区起点匹配，也可以从任意偏移匹配；`accept` 只有入边没有出边，是终点哨兵。若图中出现大量结构相同、只有位置序号不同的子图，通常意味着重复尚未被折叠或拆分，应结合 `reduceGraph()` 的 pass 顺序判断是「尚未化简」还是「化简后仍然必要」。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，不要期望 Glushkov 图会被「最小化」。`reduceGraph()` 只做保守的局部化简，不做完整的 DFA 最小化；等价状态合并也有保守条件（入边出边必须等价、不能带断言等）。因此「语义等价的两条正则生成同样大小的图」是不成立的，写模式时应尽量让结构简单、分支少、重复边界清晰。
+
+第二，大重复有两道闸门，含义不同。解析期的 `MAX_POSITIONS_EXPANDED` 限制「展开后的位置总数」，超过就编译失败；运行期的 `tooLargeToImplement()` 与 LBR 路径限制「不展开时能否用专用引擎表达」。前者可以通过改写模式绕过（例如把 `(abcdefghij){1,100000}` 改成字符类加计数逻辑），后者则取决于重复是否「纯」（单个字符可达集）以及引擎是否支持该上下界。
+
+第三，`start` 与 `startDs` 的区分会一路影响 Rose。把 `^` 写进模式会让路径只能从 `start` 出发，从而更容易进入 anchored 表；不写 `^` 则从 `startDs` 出发，通常进入 floating 表。很多「加了 `^` 之后吞吐变快」的现象，本质是角色从 floating 变成 anchored，而不是锚点本身有魔法。
+
+第四，SOM 会关闭部分化简。`reduceGraph()` 在 `som` 为真时跳过 `mergeCyclicDotStars()`、`removeSiblingsOfStartDotStar()` 等依赖「起点唯一」的优化；`removeRegionRedundancy()` 也接受 `som` 参数。这解释了为什么同一个模式开了 `HS_FLAG_SOM_LEFTMOST` 后字节码变大、编译变慢，甚至某些模式直接报「Pattern is too large.」。
+
+第五，UTF-8 模式有额外的修复步骤。`utf8DotRestoration()` 会在化简后恢复被误删的 UTF-8 约束边，`relaxForbiddenUtf8()` 会放宽非法码点路径。若在 UTF-8 模式下看到「图比预期大」或「某些非法序列仍被匹配」，应先检查这两个函数是否被灰盒开关影响，而不是直接怀疑字符类展开。
+
+第六，断言必须尽早解析。`resolveAsserts()` 在 `addGraph()` 早期执行，`removeAssertVertices()` 在 `buildGraph()` 末尾清理；如果图里还残留断言顶点就进入等价合并，可能把不同断言语义的路径合并。调试时应看 dump 文件名里的阶段标记（`00_before_asserts`、`02_post_assert_resolve`），确认自己在看哪个阶段的图。
+
+第七，注意版本差异与文件重命名。本篇已核对：5.4.2 快照没有 `ng_limit.cpp` 与 `ng_vivify.cpp`，对应职责分散在 `ng_repeat.cpp`、`ng_puff.cpp`、`ng_lbr.cpp`、`ng_misc_opt.cpp`。若按旧文章的描述去找这两个文件，会得到「文件不存在」的结论，进而误判为源码缺失。涉及具体 pass 时，应以 `nfagraph` 目录的实际文件清单为准。
+
+### 7. 小结与延伸阅读
+
+Glushkov 构造把正则变成「位置 + 后继」的图：顶点是字符位置，边是 follow 关系，四个特殊顶点负责起点与接受。它的优势是无 epsilon、状态编号紧凑、运行期每步消耗一字节；代价是重复会复制子图，因此必须有规模限制与化简。`notePositions()` 在解析期就算出展开规模并设上限，`reduceGraph()` 用三轮保守化简控制图大小，`calcComponents()` 把图切成可独立处理的分量，`addComponent()` 再逐分量尝试不同实现。
+
+三条实践结论：语义等价不等于图等价，写模式要追求结构简单；大重复的限制分解析期与运行期两道，报错文本能区分；SOM 会改变化简规则，开 SOM 前应预期字节码膨胀。
+
+延伸阅读：06-04 讲这些图如何被 Rose 分成字面量与 NFA 两类角色；06-06 与 06-07 讲 NFA 与 Castle 如何执行这些图；07-02 从模块角度列 `nfagraph` 的文件与 pass 顺序；05-08 给出 `NG`、`NFAVertex`、`NFAEdge` 的字段定义。若需要对照实际版本的 pass 清单，直接读 `src/nfagraph/ng.cpp` 的 `reduceGraph()` 与 `addGraph()`，那是最权威的顺序表。
+
+## 06-04 Rose 分解：literal / anchored / floating / suffix 的角色划分
+
+### 1. 背景与动机
+
+如果 Hyperscan 只有 NFA，它仍然能正确匹配，但吞吐会停留在「每字节推进若干状态」的量级。真正把它拉到 GB/s 的是字面量匹配器：Teddy、Fat Teddy、FDR 可以在一条向量指令里同时比对几十上百个字面量，速度比逐状态推进快一个数量级以上。Rose 的全部工作，就是尽可能把自动机图「翻译成字面量匹配器能触发的东西」，只把无法字面量化的部分留给 NFA。
+
+这件事说起来简单，做起来要解决三个矛盾。第一，字面量匹配器只认「确定的字节串」，而正则里有字符类、量词、分支、断言；必须找到图中「从起点到接受点的一条确定路径」，把它抽成字面量，剩下的部分再想办法。第二，字面量匹配器不知道上下文：它在任意偏移看到一个字节串就报告，但模式可能要求「必须在起点」「必须在末尾」「必须后面还跟着某些东西」；因此触发之后需要确认，确认的距离就是 lag，也是流式状态大小的来源。第三，字面量太多或太短会让匹配器退化：短字面量命中率极高，确认成本压过收益；这时必须把「泛洪」部分拆成 NFA，让字面量只负责锚定。
+
+Rose 的四个角色就是这三个矛盾的产物。anchored 表负责「起点固定」的字面量，floating 表负责「任意偏移」的字面量，EOD 表负责「只在数据末尾」的字面量，suffix（以及 leftfix、outfix）负责「无法字面量化、只能由 NFA 推进」的部分。理解每个角色的判定条件，就能理解为什么同一个模式换个写法吞吐会差很多，也能理解 `RoseEngine` 头部那几个字节为什么会决定运行路径。
+
+### 2. 核心概念
+
+先区分两类东西：字面量角色与 NFA 角色。字面量角色最终进入 HWLM 表（anchored 表、floating 表、EOD 表、小块表），由 Teddy 或 FDR 执行；NFA 角色最终进入 Rose 的队列，由 LimEx NFA、Castle 或 Sheng 执行。字面量角色的作用是「快速发现候选位置」，NFA 角色的作用是「从候选位置继续推进并确认」。一个模式可以同时拥有两者：前缀字面量触发，后缀 NFA 确认。
+
+anchored 的判定最严格。一个字面量顶点要进入 anchored 表，必须满足：它只有一个父顶点，且父顶点是 Rose 起点（`root` 或 `anchored_root`）；父边要么是有限上界，要么连的是一个本身已锚定的图；并且它与后继字面量的重叠不超过 `maxHistoryAvailable + 1`。这四条在 `rose_build_add.cpp` 的 `doRoseLiteralVertex()` 里依次检查（`:561` 起），任何一条不满足就 `goto floating`。anchored 表只在缓冲区起点（或有界区域内）运行，因此命中率低、确认成本低，是最理想的位置。
+
+floating 是默认归宿。只要字面量不是「单一起点、有限上界、重叠可控」，就进 floating 表。floating 表在每个偏移都要运行，命中率高，必须靠「字面量足够长、区分度足够高」来压低确认次数。若一个字面量既是泛洪（例如 `aaaa...`）又很长，Rose 会把它拆成「短前缀字面量 + 后缀 NFA」，避免匹配器在泛洪上反复报告。
+
+EOD 是特殊角色。仅当模式要求「匹配必须在数据末尾结束」时，字面量才进 EOD 表；EOD 表只在 `hs_close_stream()` 或块扫描末尾运行一次，成本极低。`stealEodVertices()` 还会在 EOD 字面量很少时把它们挪进 floating 表，目的是减少一张表的维护成本；这个决策发生在 `buildRose()` 早期（`rose_build_compile.cpp:1706`）。
+
+suffix 是「触发之后的尾巴」。典型模式 `foo[0-9]{3}bar`：`foo` 可以进 floating 表作为触发，`[0-9]{3}bar` 无法整体字面量化，就变成 suffix NFA；触发报告到达后，suffix 从对应偏移开始推进，确认成功才回调。与 suffix 对应的是 leftfix（前缀）与 outfix（外缀）：leftfix 在触发之前运行，用来处理「触发点之前还有约束」；outfix 没有外部触发，自己从起点跑到终点，通常用于无法拆分的整图。
+
+四类角色的判定条件、运行时机与源码落点见下表。表里只写判定要点，具体阈值与历史预算的推导在下一节展开。
+
+| 角色 | 判定要点 | 运行时机 | 源码位置 |
+|---|---|---|---|
+| anchored | 单一起点父节点、有限上界、重叠不超限 | 起点或有界区域 | `doRoseLiteralVertex()` |
+| floating | 其余字面量的默认归宿 | 每个偏移 | `doRoseLiteralVertex()` |
+| EOD | 模式要求末尾结束 | 块尾或关流时 | `addRose()` 的 EOD 分支 |
+| suffix | 触发后仍需 NFA 确认 | 触发报告之后 | `convertFloodProneSuffixes()` |
+
+「lag」是理解 Rose 的关键参数。它表示「触发点之后还需要看多少字节才能确认」。lag 为 0 表示触发即确认，可以直接回调；lag 大于 0 表示需要延迟报告，流式模式下这段数据必须保留在 history 里。`historyRequired` 就是所有角色 lag 的最大值再加一些边界余量，它决定了流状态的大小，也决定了 `hs_stream_size()` 的量级。把模式写成「长字面量 + 短尾巴」通常会减小 lag，从而减小流状态。
+
+`noFloatingRoots` 容易被误读。它不是「没有 floating 字面量」，而是「没有任何 floating 字面量直接挂在 `root` 或 `anchored_root` 上」。`RoseBuildImpl::hasNoFloatingRoots()`（`src/rose/rose_build_misc.cpp:186`）遍历 `root` 与 `anchored_root` 的邻接顶点，只要发现一个 `isFloating()` 就返回 false。为真时，若当前没有在途匹配（`roseHasInFlightMatches()` 为假），运行期可以跳过整张 floating 表的扫描（`src/rose/block.c:234`、`src/rose/stream.c:629`），这对「全部模式都锚定」的数据库是巨大的节省。
+
+`runtimeImpl` 是三选一的运行路径。`pickRuntimeImpl()`（`rose_build_bytecode.cpp:331`）先看 `isPureFloating()`：如果资源里只有 floating 字面量、没有 NFA、没有程序、没有延迟，就返回 `ROSE_RUNTIME_PURE_LITERAL`；否则看 `isSingleOutfix()`：如果只有一个 outfix 且没有其他角色，返回 `ROSE_RUNTIME_SINGLE_OUTFIX`；其余返回 `ROSE_RUNTIME_FULL_ROSE`。运行期 `runtime.c:429` 按这个字段直接分派到 `pureLiteralBlockExec()`、`soleOutfixBlockExec()` 或 `rawBlockExec()`。
+
+`pureLiteral` 与 `runtimeImpl` 不是一回事。`pureLiteral` 是「这次编译来自纯字面量 API」的标记，由 `build(ng, &length, pureFlag)` 的第三个参数写入（普通路径传 0，`hs_compile_lit_multi_int` 传 1，见 `hs.cpp:255` 与 `hs.cpp:403`）。它会影响运行期的初始化与错误检查：`pureLiteralBlockExec()` 直接取 floating 表执行，如果没有表就置 `STATUS_ERROR`。而 `runtimeImpl` 是根据资源结构算出来的，两者可以同时为真，也可以只有其一。
+
+### 3. 关键数据结构与源码位置
+
+Rose 的抽象接口是 `RoseBuild`，位于 `src/rose/rose_build.h:82`。它暴露的操作不多但语义很重：`add(anchored, eod, lit, ids)` 加字面量；`addRose(RoseInGraph, prefilter)` 加一张 Rose 输入图；`addOutfix()` 加外缀；`addAnchoredAcyclic()` 尝试把图放进 anchored acyclic 表；`addMask()` 加掩码字面量；`buildRose(minWidth)` 生成最终引擎；`setSom()` 标记本库含 SOM。具体实现是 `RoseBuildImpl`，声明在 `src/rose/rose_build_impl.h`。
+
+这里需要纠正一处常见索引错误：一些大纲与旧文把字面量入口写成 `addRoseLiterals()`、把落库入口写成 `buildDatabase()`，但这两个名字在 5.4.2 快照中并不存在（全仓 grep 无结果）。实际入口是 `RoseBuildImpl::add()` 与 `addRose()`，落库是 `buildRose()` 与 `buildFinalEngine()`。阅读源码时应以 `rose_build.h` 的虚函数表为准，需对照实际版本核验。
+
+Rose 输入图在 `src/rose/rose_in_graph.h`。顶点类型 `RoseInType` 有 `RIV_LITERAL`、`RIV_START`、`RIV_ANCHORED_START`、`RIV_ACCEPT`、`RIV_ACCEPT_EOD` 五种（`rose_in_graph.h:61` 起）；`RoseInVertexProps` 保存字面量、延迟、偏移上下界与报告集合。边 `RoseInEdgeProps` 保存 `minBound`、`maxBound`、可选的 `graph`（子图）与 `graph_lag`。这套表示让「字面量 + 子图」可以组合成一条 Rose 路径，而不需要先把所有东西都变成 NFA。
+
+最终引擎 `RoseEngine` 在 `src/rose/rose_internal.h:331`。本册不重复字段表，只点出与角色相关的字段名：`pureLiteral`、`noFloatingRoots`、`runtimeImpl`、`mode`、`historyRequired`、`amatcherOffset`、`fmatcherOffset`、`ematcherOffset`、`sbmatcherOffset`、`amatcherMinWidth`、`fmatcherMinWidth`、`outfixBeginQueue`、`outfixEndQueue`、`leftfixBeginQueue`、`queueCount`、`stateSize`。逐字段含义、读写时机与版本差异见 05-05。
+
+字面量本身的表示在 `rose_graph.h` 与 `rose_build_impl.h`：`rose_literal_id` 带 `ue2_literal`、`rose_literal_table`、延迟与掩码；`rose_literal_table` 的枚举是 `ROSE_ANCHORED`、`ROSE_FLOATING`、`ROSE_EOD_ANCHORED`、`ROSE_ANCHORED_SMALL_BLOCK`（`rose_graph.h:59`）。`RoseBuildImpl` 用 `literal_info` 保存每个字面量被哪些顶点引用，用 `g` 保存 Rose 图，用 `root`、`anchored_root` 两个特殊顶点区分「任意起点」与「锚定起点」。
+
+资源统计在 `rose_build_resources.h` 的 `RoseResources`，字段包括 `has_outfixes`、`has_suffixes`、`has_leftfixes`、`has_literals`、`has_states`、`checks_groups`、`has_lit_delay`、`has_lit_check`、`has_anchored`、`has_floating`、`has_eod`。`pickRuntimeImpl()` 正是读这些布尔量做判断；调试时 dump 出的 `has_*` 行就是它。
+
+角色相关的字段定义、字面量参数与 Rose 模块的文件职责分别见 05-05、04-02、07-04（字段见 05-05 ｜ 参数见 04-02 ｜ 模块见 07-04）。
+
+### 4. 关键流程与调用链
+
+字面量进入 Rose 有两条入口。第一条是 `NG::addLiteral()`（`ng.cpp:579`）：纯字面量短路时调用，它注册外部报告、构造 `Report`、调用 `rose->add(false, false, literal, {id})`，并更新 `minWidth` 与 SmallWrite。第二条是 `RoseBuildImpl::add(bool anchored, bool eod, const ue2_literal &lit, reports)`（`rose_build_add.cpp:1639`）：它把字面量包装成一张三顶点的 `RoseInGraph`（起点、字面量、接受点），边上的 `maxBound` 在 anchored 时为 0、否则为 `ROSE_BOUND_INF`，然后调 `addRose()`。
+
+`addRose()` 是真正的分解器（`rose_build_add.cpp:1507`）。它遍历输入图的每个字面量顶点，调用 `doRoseLiteralVertex()` 决定角色。判定顺序是：若 `use_eod_table` 为真，直接进 EOD 表；否则看父顶点数量与类型；若只有一个父且父是起点、父边有有限上界（或连的是锚定图）、且与后继字面量的重叠不超过 `maxHistoryAvailable + 1`，就尝试 `tryForAnchoredVertex()`；失败则落到 `floating` 标签，按 `ROSE_FLOATING` 或 `ROSE_EOD_ANCHORED` 取字面量 id，再 `createVertices()` 建 Rose 顶点。
+
+这里有一个容易忽略的细节：`findRoseAnchorFloatingOverlap()` 计算的是「anchored 字面量与后继 floating 字面量之间的重叠字节数」。如果重叠太大，说明 anchored 触发后还需要保留太多历史才能确认，超过流式历史上限，因此宁可把它放进 floating 表。这个检查把「角色选择」与「流状态预算」直接绑定在一起。
+
+字面量之外的图走 `NG::addGraph()` 的 `addComponent()` 分支。`splitOffLiterals()` 先把贯穿整图的字面量摘走；剩下的图按分量尝试 `addAnchoredAcyclic()`（整图锚定且无环时进 anchored acyclic 表）、`handleSmallLiteralSets()`（小字面量集合）、`handleFixedWidth()`（固定宽度图）、`handleDecoratedLiterals()`（带装饰的字面量）、`doViolet()`（前缀/后缀拆分）、`splitOffPuffs()`（纯重复拆成 puff）、`addOutfix()`（外缀）。每条路径成功都会把对应顶点从图中删除，直到图为空或所有路径都失败。
+
+因此，拆分的判据可以概括为：能从起点连到接受点、且路径上每个位置都是单字符可达集的子图，抽成字面量；其余部分按角色变成 NFA。字面量负责回答「可能在哪里」，NFA 负责回答「是否真的成立」，两者用 lag 与触发报告衔接。
+
+角色确定后进入 `buildRose()`（`rose_build_compile.cpp:1682`）。它的顺序可以概括为「先规范化，再合并，再分组，最后落引擎」：`convertPrefixToBounds()` 把前缀转成边界；`convertFloodProneSuffixes()` 把泛洪后缀转成 suffix NFA；`makeCastles()` 把重复转成 Castle 原型；`rehomeAnchoredLiterals()` 重排锚定字面量；`stealEodVertices()` 考虑把少量 EOD 字面量挪进 floating；`addAnchoredSmallBlockLiterals()` 处理小块扫描；`dedupeSuffixes()`、`mergeDupeLeaves()`、`dedupeLeftfixes()`、`aliasRoles()` 做去重与别名；`assignHistories()` 计算每个角色的历史需求；`mergeSmallSuffixes()`、`mergeSmallLeftfixes()`、`mergeOutfixes()` 做小引擎合并；最后 `assignGroupsToLiterals()`、`findGroupSquashers()`、`buildRoseSquashMasks()` 分配组与掩码。
+
+`convertFloodProneSuffixes()` 值得单独说明（`rose_build_convert.cpp:264`）。它先 `findFloodProneSuffixLen()` 估算「多长的后缀算泛洪」，再逐字面量检查 `suffixFloodLen()`；若字面量尾部有足够长的重复（例如 `abcXXXX`），就把重复部分切出来变成一个 suffix NFA，字面量只保留前缀。这样 floating 表不会被 `XXXX` 这种高命中模式刷屏，suffix 只在触发后运行，成本被摊薄。
+
+`buildFinalEngine()`（`rose_build_bytecode.cpp:3609`）负责把 Rose 图变成扁平字节码。它先建一个 `RoseEngine proto`，设置 `mode`；计算 `historyRequired` 与长字面量阈值；`groupByFragment()` 把字面量按片段分组；`buildAnchoredDfas()` 建锚定 DFA；`makeBoundaryPrograms()`、`buildReportPrograms()` 建边界与报告程序；`prepOutfixes()`、`buildNfas()` 建 NFA 队列；`assignStateIndices()` 分配角色状态位；`buildLeftInfoTable()` 建左信息表；`writeAnchoredPrograms()`、`writeDelayPrograms()`、`buildLiteralPrograms()` 写各类程序；`buildFloatingMatcherProto()`、`buildEodAnchoredMatcherProto()`、`buildSmallBlockMatcherProto()` 建 HWLM 原型；最后 `buildAnchoredMatcher()`、`buildHWLMMatcher()` 生成实际表，`fillStateOffsets()` 排状态偏移，`writeNfaInfo()` 写 NFA 信息，`pickRuntimeImpl()` 决定运行路径。
+
+角色的整体划分与落库顺序见图 06-04-01。注意图中的箭头不是「数据流」而是「归属关系」：一张 NG 图最终会被拆到多个表/队列里，每个表只负责一类触发或推进。
+
+:::figure id=06-04-01 | name=Rose 的四类角色与 NFA 分工 | dir=TD
+node s1 "NG 图" blue
+node s2 "anchored 表<br/>起点固定" teal
+node s3 "floating 表<br/>任意偏移" amber
+node s4 "EOD 表<br/>仅数据末尾" purple
+node s5 "suffix NFA<br/>触发后确认" purple
+node s6 "leftfix 与 outfix" purple
+node s7 "RoseEngine 字节码" green
+edge s1 -> s2 "单一起点父节点"
+edge s1 -> s3 "多父或无界"
+edge s1 -> s4 "EOD 锚定"
+edge s1 -> s5 "泛洪后缀"
+edge s1 -> s6 "无法字面量化"
+edge s2 -> s7 "写表"
+edge s3 -> s7 "写表"
+edge s4 -> s7 "写表"
+edge s5 -> s7 "写队列"
+edge s6 -> s7 "写队列"
+:::
+
+运行期的三条路径见图 06-04-02。`runtimeImpl` 在编译期算好，运行期只做一次 switch，不再重新判断资源结构。
+
+:::figure id=06-04-02 | name=runtimeImpl 的三条运行路径 | dir=LR
+node q1 "runtimeImpl" blue
+node q2 "PURE_LITERAL" teal
+node q3 "SINGLE_OUTFIX" amber
+node q4 "FULL_ROSE" purple
+node q5 "pureLiteralBlockExec" green
+node q6 "soleOutfixBlockExec" green
+node q7 "rawBlockExec" green
+edge q1 -> q2 "仅浮动词表"
+edge q1 -> q3 "仅一个外缀"
+edge q1 -> q4 "其余情况"
+edge q2 -> q5 "直接跑 HWLM"
+edge q3 -> q6 "单队列"
+edge q4 -> q7 "程序与队列"
+:::
+
+### 5. 配置/命令/代码实例
+
+下面的程序用同一条字面量分别走普通编译与纯字面量编译，再比较数据库大小。两条路径的差别不在「匹配结果」，而在「是否经过解析、建图与 Rose 分解」。完整 API 参数见 04-04。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+
+static void report(const char *tag, hs_database_t *db) {
+    size_t sz = 0;
+    if (hs_database_size(db, &sz) == HS_SUCCESS) {
+        printf("%s: %zu bytes\n", tag, sz);
+    }
+}
+
+int main(void) {
+    hs_database_t *normal = NULL;
+    hs_database_t *literal = NULL;
+    hs_compile_error_t *err = NULL;
+
+    if (hs_compile("foobar", 0, HS_MODE_BLOCK, NULL,
+                   &normal, &err) != HS_SUCCESS) {
+        printf("normal compile failed: %s\n", err->message);
+        hs_free_compile_error(err);
+        return 1;
+    }
+
+    if (hs_compile_lit("foobar", 0, HS_MODE_BLOCK, NULL,
+                       &literal, &err) != HS_SUCCESS) {
+        printf("literal compile failed: %s\n", err->message);
+        hs_free_compile_error(err);
+        hs_free_database(normal);
+        return 1;
+    }
+
+    report("hs_compile    ", normal);
+    report("hs_compile_lit", literal);
+
+    hs_free_database(normal);
+    hs_free_database(literal);
+    return 0;
+}
+```
+
+一段可能的输出如下。示例输出，具体数值随版本、平台与对齐方式变化，需对照实际版本核验。
+
+```text
+hs_compile    : 1248 bytes
+hs_compile_lit: 968 bytes
+```
+
+逐行判读。两行都是 `hs_database_size()` 的结果，包含 `hs_database` 头部（偏移 192 字节）与字节码本体，因此即使是纯字面量也不会小到只有几十字节。普通路径的数据库更大，因为它包含报告程序、状态偏移、可能的小块表与边界程序；纯字面量路径跳过解析与建图，`RoseEngine` 里只有一个 floating HWLM 表与最少的头部字段，`runtimeImpl` 是 `ROSE_RUNTIME_PURE_LITERAL`，没有 NFA 队列。数值差异不是固定的：字面量越长、模式越多，两边的差距越明显；若普通路径也触发了 `shortcutLiteral()`，差距会缩小，因为两者最终都只依赖字面量表。
+
+用 `hsdump` 可以看到 `RoseEngine` 的角色摘要。命令与 06-03 相同，`-D` 表示转储最终数据库。
+
+```bash
+hsdump -N -D -o ./dump patterns.txt
+```
+
+转储文本中的 Rose 段节选如下。示例输出，具体格式需对照实际版本核验。
+
+```text
+Rose:
+
+mode:                : block
+properties           : pureLiteral
+dkey count           : 0
+som slot count       : 0
+som width            : 0 bytes
+rose count           : 0
+
+total engine size    : 968 bytes
+ - anchored matcher  : 0 bytes over 0 bytes
+ - floating matcher  : 704 bytes
+```
+
+判读要点：`mode` 为 `block` 说明这是块模式引擎；`properties` 里出现 `pureLiteral`，说明数据库来自纯字面量 API 且运行期走 `pureLiteralBlockExec()`；`dkey count` 为 0 表示没有去重键，`som slot count` 与 `som width` 为 0 表示没有 SOM；`rose count` 为 0 表示没有 NFA 角色队列；`anchored matcher` 为 0 字节，说明所有字面量都在 floating 表；`floating matcher` 占了大头，因为它就是 Teddy 或 FDR 的掩码表与确认表。若换成带 `^` 的模式，`anchored matcher` 通常不再为 0；若模式含 `.*` 尾巴，`rose count` 会大于 0，并在下方列出队列。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，anchored 不是「加了 `^` 就一定 anchored」。判定要求单一起点父节点、有限上界、重叠不超限；嵌套分组、可选前缀、无界重复都会破坏条件，使字面量回落到 floating。若希望走 anchored，应把模式写成「明确起点 + 有界长度 + 少量分支」，并避免在起点后立刻接无界通配。
+
+第二，floating 表的成本与字面量质量直接相关。短字面量、常见词、大小写混写、重复字符都会提高命中率，进而提高确认次数。实践上应尽量让触发字面量长于 3 字节、区分度高、少用 `.*` 连接；必要时用 `HS_FLAG_PREFILTER` 换取更小的图，但要接受漏报。
+
+第三，`noFloatingRoots` 是优化信号，不是功能开关。它为真时，运行期可以在没有在途匹配时跳过 floating 表；但它要求「没有任何 floating 字面量直接挂在 root 或 anchored_root 上」，这个条件很脆弱，增加一条无锚点模式就会破坏。不要为了这个优化强行改写业务模式，收益通常不如直接减少模式数量。
+
+第四，`runtimeImpl` 的三条路径能力不同。`PURE_LITERAL` 只跑 floating 表，不能处理 NFA、SOM、逻辑组合；`SINGLE_OUTFIX` 只跑一个外缀队列；只有 `FULL_ROSE` 才支持完整程序。若发现某些回调行为异常（例如 SOM 不生效、组合逻辑不触发），应先确认数据库是不是落到了简化路径。
+
+第五，`pureLiteral` 只能由纯字面量 API 设置。用 `hs_compile()` 编译一个字面量，即使内部走了 `shortcutLiteral()`，`pureLiteral` 仍然是 0，运行期走 `FULL_ROSE`（只是图很小）。不要用 `hs_database_info()` 的输出推断 `pureLiteral`，那个接口不暴露这个字段。
+
+第六，suffix 转换会改变「谁负责匹配」。`convertFloodProneSuffixes()` 把泛洪尾部切成 suffix NFA 后，字面量只匹配前缀，回调时机由 suffix 确认决定；这意味着报告的 `to` 偏移仍然正确，但内部多了一次队列推进。若用 `hsdump` 看到 `rose count` 比预期多，很可能就是泛洪后缀被拆了。
+
+第七，历史预算要留余量。`historyRequired` 由所有角色的 lag 最大值决定，流式模式下它直接变成每个流的状态大小；`findRoseAnchorFloatingOverlap()` 还会用 `maxHistoryAvailable` 做角色判定。若模式集里混有长 lag 的模式，整个数据库的流状态都会被抬高。把长 lag 模式单独编一个库，往往比混在一起更省内存。
+
+### 7. 小结与延伸阅读
+
+Rose 的核心不是「把图变小」，而是「把图分成两类」：能被字面量触发的部分进入 anchored、floating、EOD 表，不能字面量化的部分变成 suffix、leftfix、outfix 队列。角色判定由 `doRoseLiteralVertex()` 的四条条件决定，落库由 `buildRose()` 的十几道变换完成，运行路径由 `runtimeImpl` 三选一。`noFloatingRoots` 决定 floating 表能否条件执行，`pureLiteral` 标记纯字面量 API，`historyRequired` 把 lag 折算成流状态预算。
+
+三条实践结论：字面量质量决定 floating 表的成本，写模式时要主动设计高区分度的触发串；角色不是越「锚定」越好，锚定条件苛刻，强行改写往往得不偿失；运行路径是编译期算好的，排查行为差异要先看 `RoseEngine` 的属性而不是猜运行期。
+
+延伸阅读：06-05 讲 anchored、floating 表背后的 Teddy、Fat Teddy 与 FDR 如何工作；06-06 与 06-07 讲 suffix、leftfix、outfix 队列里的 NFA 与 Castle；06-11 讲 `historyRequired` 如何变成流状态与压缩；05-05 给出 `RoseEngine` 全部字段；07-04 从模块角度列 `rose_build_*.cpp` 的职责。若只想记一件事：Rose 的产物是一组「触发器 + 确认器」，吞吐取决于触发器有多快、确认器有多短。
+
+## 06-05 字面量前端：Teddy、Fat Teddy 与 FDR
+
+### 1. 背景与动机
+
+Rose 把图拆成「触发器」与「确认器」之后，触发器一侧的性能就决定了整个数据库的上限。触发器要解决的问题是：在每一个输入偏移，判断「当前位置是否结束了一个候选字面量」，而且候选字面量可能有几十上百条。最朴素的做法是逐条 `memcmp`，成本是「字面量数 × 长度」，在万级模式集上完全不可接受。Hyperscan 的解法是位并行：把多个字面量编码进同一组掩码表，用一条 SIMD 指令同时比对 16、32 或 64 个字节，再通过 bucket 把候选范围缩小到少数几条。
+
+这条路线有三个代表性引擎。Teddy 面向「少量短字面量」，用 8 个 bucket、最多 4 层掩码，在 128 位寄存器上做 nibble 查表；Fat Teddy 把 bucket 扩到 16，利用 AVX2 的 256 位寄存器承载双倍掩码，把容量推到 96 条；FDR 面向「大量字面量」，用 64 位 scheme、8 个 bucket 与可变的 stride，先做粗筛再做 confirm。三者之外还有一个 Noodle，专门处理「只有一条字面量」的极简情况，直接用向量比较，不需要掩码表。
+
+理解这一层能回答很多选型问题。为什么 48 条和 96 条是两个常见的分界？为什么同样 100 条字面量，短字面量多的那组更容易退化？为什么开了 AVX-512 VBMI 之后 Fat Teddy 会换一套实现？为什么 `hsdump` 里 `TEDDY` 的 `masks` 是 4 而 `buckets` 是 16？这些都能从编译期的引擎描述表与构建流程里找到答案。本篇只讲字面量前端，NFA 与 Castle 留给 06-06、06-07，Rose 的角色划分见 06-04。
+
+### 2. 核心概念
+
+先建立「bucket」的概念。一个字面量集合如果全部塞进一张掩码表，表会大到无法缓存，而且每次比较都会产生大量假阳性。bucket 的作用是分桶：每个字面量按首字符、尾字符或哈希被分配到某个 bucket，bucket 内共享一张掩码表；运行期先算出当前字节属于哪些 bucket，再只对命中的 bucket 做确认。bucket 越多，单桶内的字面量越少、假阳性越低，但掩码表与确认表也越大。Teddy 的 8 bucket 与 Fat Teddy 的 16 bucket，本质是用更多表换取更低假阳性。
+
+Teddy 的核心是「nibble 掩码」。每个输入字节被拆成高 4 位与低 4 位，分别查两张 16 项的掩码表；表中的每一项是一个 16 位位图，表示「这个 nibble 可能对应哪些谓词」。一个字面量的每个位置对应一个谓词，多个位置串起来就形成一条「掩码链」；运行期把连续几个位置的掩码做 AND，结果非零就说明「这里可能有一个字面量结束」。`MAX_NUM_MASKS` 是 4（`teddy_compile.cpp:77`），意味着 Teddy 最多用 4 层掩码描述一个字面量，字面量长度超过 4 时只取最后 4 个字节做匹配，前面的字节交给 confirm 或触发后的 NFA 确认。
+
+`masks` 与 `buckets` 是两个不同维度。`masks` 是「用几层 nibble 掩码」，取值 1 到 4；`buckets` 是「分几个桶」，取值 8 或 16。`TeddyEngineDef` 表（`teddy_engine_description.cpp:55`）把两者组合成 16 个引擎：ID 3 到 10 是 AVX2、16 bucket、masks 1 到 4（偶数 ID 为 packed），ID 11 到 18 是非 AVX2、8 bucket、masks 1 到 4。`packed` 表示是否把两个字面量压进一个谓词位，用于提高小集合的密度。
+
+Fat Teddy 是 Teddy 的 16 bucket 版本。它的 `maskWidth` 为 2，掩码表要按高低两半各存一份，所以 `teddy_internal.h` 的布局里写着「bucket 0..7 的 reinforcement 表」与「bucket 8..15 的 dup 表」。在 AVX2 上，16 个 bucket 正好对应 256 位寄存器的 16 个字节 lane；在 AVX-512 VBMI 上，`vpermb` 可以跨 lane 重排字节，于是可以用一条指令完成原本需要多次移位与 OR 的「掩码链对齐」，这就是 5.4.0 对 Fat Teddy 的 VBMI 优化（`CHANGELOG.md` 的 5.4.0 条目；实现见 `teddy_avx2.c` 的 `FAT_TEDDY_VBMI_*` 宏）。
+
+FDR 的核心是「scheme + stride + confirm」。FDR 用一个 64 位的 scheme 表示「当前偏移可能命中哪些 bucket」，主表索引的位宽由 `domain` 描述；`stride` 表示「每隔多少字节采一次样」，stride 大于 1 时主表不必逐字节查询，但一个 stride 窗口内的候选必须在 confirm 阶段按偏移拆开核对，否则会漏掉窗口内非采样点上的匹配。主表只回答「这个位置可能有候选」，confirm 表再按 bucket 与偏移逐个核对字面量，确认成功才回调。`FDR` 结构里的 `confOffset`、`floodOffset`、`stride`、`domain`、`domainMask`、`tabSize`、`start` 就是为这两段式服务的。
+
+Noodle 是单字面量引擎。`isNoodleable()` 只检查两件事：灰盒是否允许 Noodle，以及字面量集合是否恰好只有一条（`hwlm_build.cpp:107`）；满足就直接用 Noodle，不需要掩码表与 bucket。Noodle 在 `src/hwlm/noodle_engine*.c` 里按 SSE、AVX2、AVX-512 分别实现，本质是「向量化 memcmp + 首尾字节过滤」。它的存在说明 Hyperscan 并不强行把所有情况都塞进 Teddy/FDR：一条字面量用最简单的引擎往往最快。
+
+四个引擎的容量、结构与适用条件见下表。表中的数字来自当前引擎描述表与 `TEDDY_BUCKET_LOAD`，是编译期选择的依据，不是 API 承诺。
+
+| 引擎 | bucket 数 | 典型容量 | 适用条件 |
+|---|---|---|---|
+| Noodle | 不适用 | 1 条 | 只有一条字面量且灰盒允许 Noodle |
+| Teddy | 8 | 48 条 | 短字面量为主、容量不超过 48 条 |
+| Fat Teddy | 16 | 96 条 | 目标机支持 AVX2、容量 49 至 96 条 |
+| FDR | 8 | 数百条以上 | 规模超过 Teddy 容量或 Teddy 构建失败 |
+
+「flood」是字面量前端的共同敌人。若某个字符在数据里连续出现（例如日志里的 `=====`），任何包含该字符的字面量都会在每个偏移命中，确认次数爆炸。FDR 用 `FDRFlood` 结构做特殊处理：记录「哪些 id 会在 flood 上触发」，最多 16 个（`FDR_FLOOD_MAX_IDS` 为 16，见 `fdr_internal.h`）；超过 16 个就不再走 flood 快速路径，退化为普通确认。Teddy 则通过「reinforcement mask」抑制同一 bucket 内的重复命中。
+
+最后要区分「编译期引擎选择」与「运行期指令选择」。编译期 `chooseTeddyEngine()` 根据字面量数、长度、目标 CPU 特性选一个引擎 ID，写进 `Teddy.engineID`；运行期 fat runtime 再根据实际 CPU 选择该引擎的 SSE/AVX2/AVX-512 实现。也就是说，同一份数据库在不同机器上可能跑不同的指令路径，但 bucket 数、masks 数、确认表结构是编译期定死的。
+
+### 3. 关键数据结构与源码位置
+
+统一抽象是 `HWLM`，定义在 `src/hwlm/hwlm_internal.h`。`HWLM` 只有一个 `type` 字段与一个柔性数据区，`type` 取 `HWLM_ENGINE_FDR`（12）或 `HWLM_ENGINE_NOOD`（16）；`HWLM_C_DATA()` 宏把「HWLM 头之后的字节」解释成具体引擎（`hwlm_internal.h:56`）。`HWLMProto` 是编译期原型，保存 `engType`、`fdrEng`、`teddyEng`、`lits`、`bucketToLits` 与 `make_small` 标志；`hwlmBuild()` 先在原型上做选择，再 `fdrBuildTable()` 或 `teddyBuildTable()` 生成最终字节码。
+
+`FDR` 结构在 `src/fdr/fdr_internal.h`，字段包括 `engineID`、`size`、`maxStringLen`、`numStrings`、`confOffset`、`floodOffset`、`stride`、`domain`、`domainMask`、`tabSize`、`start`。`start` 是 128 位的初始状态，按各 bucket 的最小长度预置，用于减少无意义的 confirm。`FDR_Runtime_Args` 保存缓冲区、历史、起始偏移、回调、scratch 与 flood 检测指针，是运行期在各子函数之间传递的上下文。
+
+`Teddy` 结构在 `src/fdr/teddy_internal.h:57`，字段只有 `engineID`、`size`、`maxStringLen`、`numStrings`、`confOffset`、`floodOffset` 六个，后面紧跟掩码表、reinforcement 表（或 dup 表）、confirm 表与 flood 表。它的前六个字段与 `FDR` 兼容，所以 `fdrSize()`、`fdrIsTeddy()` 这类函数可以同时处理两者；`fdrIsTeddy()` 通过 engineID 判断（`fdr_dump.cpp:53`）。
+
+引擎描述表在 `src/fdr/teddy_engine_description.cpp` 与 `src/fdr/fdr_engine_description.cpp`。Teddy 的描述是 16 条 `TeddyEngineDef`，每条包含 ID、CPU 特性、masks 数、bucket 数、packed 标志；FDR 只有一条 `{0, 64, 8, 0}`，即 ID 0、scheme 宽 64、8 bucket。`FDR` 的具体 `bits` 与 `stride` 不是固定的，而是在 `chooseEngine()` 与 `findDesiredStride()` 里按字面量数动态选。
+
+字面量本身的表示是 `hwlmLiteral`（`src/hwlm/hwlm_literal.h`），包含字符串、大小写标志、掩码 `msk`、比较值 `cmp`、组 `groups`、id 与 squash 掩码。掩码与比较值是大小写不敏感与「混合大小写」处理的产物：对每个字节，`msk` 标记哪些位需要比较，`cmp` 给出期望值；这样一条字面量可以同时表达「全小写」「全大写」「指定大小写」三种形态，而不必为每种形态各存一份。
+
+bucket 与确认表的编译期表示在 `src/fdr/fdr_compile_internal.h` 与 `fdr_confirm_compile.cpp`。`BucketIndex` 是 bucket 编号，`bucketToLits` 是「bucket 到字面量下标列表」的映射；`setupFullConfs()` 生成完整确认表，`FDRCompiler::build()` 把主表、确认表、flood 表拼成最终字节码。逐字段定义见 05-07，本册不重复。字面量引擎的字段、构建选项与模块文件分别见 05-07、04-01、07-07（字段见 05-07 ｜ 参数见 04-01 ｜ 模块见 07-07）。
+
+### 4. 关键流程与调用链
+
+编译期入口是 `hwlmBuild()`（`src/hwlm/hwlm_build.cpp`）。它先做资源检查：字面量总数不能超过 `limitLiteralCount`，单条长度不能超过 `limitLiteralLength`，总字符数不能超过 `limitLiteralMatcherChars`，生成的引擎大小不能超过 `limitLiteralMatcherSize`。任一超限就返回空，Rose 会把这个字面量集合退回到 NFA 或拆分处理。随后 `isNoodleable()` 判断是否只有一条字面量；是则构造 `HWLM_ENGINE_NOOD` 原型，否则调用 `fdrBuildProto()`。
+
+`fdrBuildProto()` 先尝试 Teddy。若灰盒 `fdrAllowTeddy` 为真（默认 true，见 `src/grey.cpp:69`），调用 `teddyBuildProtoHinted()`；它内部 `chooseTeddyEngine()` 遍历 16 个引擎描述，按「目标 CPU 是否支持」「bucket 数是否够」「masks 是否不超过最长字面量」「短字面量比例是否过高」四条过滤，再按评分选最优。若 Teddy 构建失败（例如字面量太多、太长、太碎），`fdrBuildProtoInternal()` 会打印「build with teddy failed, will try with FDR」，回落到 FDR。
+
+Teddy 的容量约束由 `TEDDY_BUCKET_LOAD` 决定，值为 6（`teddy_engine_description.h:40`）。8 bucket 乘 6 等于 48，16 bucket 乘 6 等于 96，这就是 48 与 96 两个阈值的来源。`assignStringsToBuckets()` 还会检查 `lits.size() > numBuckets * TEDDY_BUCKET_LOAD`，超过就返回 false；`isAllowed()` 还会在字面量数超过 40 时检查「短于 masks 数的字面量是否超过五分之一」，防止大量短字面量把掩码表打散。`hwlmFloodProneSuffixLen()` 里的 48/96 判断（`hwlm_build.cpp:251`）与这套容量约束是同一组数字。
+
+FDR 的构建分三步。第一步 `chooseEngine()` 或 `getFdrDescription()` 选引擎描述；第二步 `assignStringsToBuckets()` 按首字符/尾字符与长度把字面量分到 8 个 bucket，长字面量优先进入编号较小的 bucket；第三步 `FDRCompiler::build()` 生成主表、确认表、flood 表与 squash 掩码。`findDesiredStride()` 按字面量数选 stride：少于 250 条时直接用最短长度，少于 800 条时用最短长度减一，少于 5000 条时最多用 2，超过 5000 条回落到 1。stride 越大，主表查询越少，但 confirm 需要回看的范围越大，因此是吞吐与确认成本的折中。
+
+运行期入口是 `hwlmExec()`。它按 `HWLM.type` 分派到 `fdrExec()` 或 Noodle；`fdrExec()` 再按 `fdrIsTeddy()` 分派到 Teddy 的扫描循环或 FDR 的主循环。Teddy 的循环按 16 或 32 字节推进，先算低 nibble 掩码、再算高 nibble 掩码，两者 AND 后得到「候选位图」，对每个候选位调用 confirm；FDR 的循环按 stride 采样，主表给出 scheme，`do_confirm_fdr()` 按 bucket 逐个核对。
+
+`do_confirm_fdr()` 的实现有一个值得记住的细节：它把确认表按 8 位一组处理，`const u8 bucket = 8;`（`src/fdr/fdr.c:333`），`conf0` 与 `conf8` 分别对应低 8 位与高 8 位。这不是「bucket 数固定为 8」的运行时约束，而是确认表按字节打包的实现细节；真正的 bucket 数来自引擎描述（FDR 为 8，Teddy 为 8 或 16）。理解这一点可以避免把 `do_confirm_fdr` 的 8 误读成「所有引擎都是 8 bucket」。
+
+引擎选择的整体路径见图 06-05-01。图中把 Noodle、Teddy、Fat Teddy、FDR 四条分支与它们的容量边界画在一起，注意 Teddy 失败会回落到 FDR，而不是直接报错。
+
+:::figure id=06-05-01 | name=字面量前端的四条分支与容量边界 | dir=TD
+node l1 "字面量集合" blue
+node l2 "Noodle<br/>单条" gray
+node l3 "Teddy<br/>8 bucket 至 48 条" teal
+node l4 "Fat Teddy<br/>16 bucket 至 96 条" teal
+node l5 "FDR<br/>大量或回落" amber
+node l6 "HWLM 表" purple
+node l7 "确认与回调" green
+edge l1 -> l2 "仅一条"
+edge l1 -> l3 "不超过 48"
+edge l1 -> l4 "不超过 96 且 AVX2"
+edge l1 -> l5 "超过 96 或 Teddy 失败"
+edge l2 -> l6 "单字面量"
+edge l3 -> l6 "掩码表"
+edge l4 -> l6 "双宽掩码"
+edge l5 -> l6 "主表与确认表"
+edge l6 -> l7 "命中确认"
+:::
+
+5.4.0 的 VBMI 优化要放在正确的位置上。Teddy 的 VBMI 支持最早出现在 5.3.0（CHANGELOG：「Improvement on literal matcher Teddy performance, including support for AVX-512 VBMI」）；5.4.0 的条目是「Improvement on literal matcher Fat Teddy performance, including support for AVX-512 VBMI」。也就是说，5.4.0 增强的是 Fat Teddy 的 VBMI 路径，而不是「首次引入 Teddy 的 VBMI」。在代码里，这条路径由 `HAVE_AVX512VBMI` 宏包住（`teddy_avx2.c:112`、`:169`），编译期由 `BUILD_AVX512VBMI` 控制（默认 OFF，见 04-01），运行期由 fat runtime 按 CPUID 选择。
+
+### 5. 配置/命令/代码实例
+
+下面的程序构造 8、48、96、200 条字面量，分别编译并打印数据库大小。它用普通 `hs_compile_multi()`，因为每条模式都是纯字面量，会自动走 `shortcutLiteral()` 进入 Rose 的 literal 路径。完整 API 见 04-04。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static void build(int n) {
+    const char **pats = calloc((size_t)n, sizeof(*pats));
+    unsigned *flags = calloc((size_t)n, sizeof(*flags));
+    unsigned *ids = calloc((size_t)n, sizeof(*ids));
+    hs_database_t *db = NULL;
+    hs_compile_error_t *err = NULL;
+
+    for (int i = 0; i < n; i++) {
+        char *s = malloc(24);
+        snprintf(s, 24, "token%05dend", i);
+        pats[i] = s;
+        ids[i] = (unsigned)i;
+    }
+
+    hs_error_t rc = hs_compile_multi(pats, flags, ids, NULL, (unsigned)n,
+                                     HS_MODE_BLOCK, NULL, &db, &err);
+    if (rc != HS_SUCCESS) {
+        printf("n=%d compile failed: %s\n", n, err->message);
+        hs_free_compile_error(err);
+    } else {
+        size_t sz = 0;
+        hs_database_size(db, &sz);
+        printf("n=%-4d db=%zu bytes\n", n, sz);
+        hs_free_database(db);
+    }
+
+    for (int i = 0; i < n; i++) {
+        free((void *)pats[i]);
+    }
+    free((void *)pats);
+    free(flags);
+    free(ids);
+}
+
+int main(void) {
+    build(8);
+    build(48);
+    build(96);
+    build(200);
+    return 0;
+}
+```
+
+一段可能的输出如下。示例输出，具体数值随版本、平台与字面量长度变化，需对照实际版本核验。
+
+```text
+n=8    db=1240 bytes
+n=48   db=1736 bytes
+n=96   db=3088 bytes
+n=200  db=6824 bytes
+```
+
+逐行判读。四行都调用 `hs_database_size()`，数值包含 `hs_database` 头部与字面量前端字节码。8 条时表很小，主要成本是头部与一张低 masks 的 Teddy 表；48 条时仍在 8 bucket、6 条每桶的容量内，表随字面量线性增长但 bucket 结构不变；96 条时跨过 48 的边界，若目标 CPU 支持 AVX2，会选择 16 bucket 的 Fat Teddy，掩码表宽度翻倍，因此从 1736 跳到 3088 字节，这个跳变是结构性的，不是简单的线性增长；200 条时超过 96，Teddy 容量不足，回落到 FDR，FDR 的主表、确认表与 flood 表一起计入，增长斜率再次变化。若目标机不支持 AVX2，96 条这一档仍会停留在 8 bucket Teddy 或直接回落 FDR，数值会不同；这正是「数据库大小与编译目标绑定」的体现。
+
+用 `hsdump` 可以看到具体引擎与 bucket 数。`-D` 转储数据库，输出里会包含 `TEDDY` 或 `FDR` 段。
+
+```bash
+hsdump -N -D -o ./dump patterns.txt
+```
+
+两段可能的输出如下。示例输出，具体格式需对照实际版本核验。
+
+```text
+TEDDY:         9
+    masks      4
+    buckets    16
+    packed     false
+    strings    96
+    size       2688 bytes
+    max length 12
+    floodoff   4128 (1020)
+
+FDR:           0
+    domain     8
+    stride     2
+    strings    200
+    size       6144 bytes
+    max length 12
+    floodoff   8192 (2000)
+```
+
+判读要点：`TEDDY: 9` 表示引擎 ID 9，对应 AVX2、4 masks、16 bucket、非 packed；`buckets 16` 说明这是 Fat Teddy，而不是 8 bucket 的普通 Teddy；`strings 96` 与 `buckets 16` 乘 `TEDDY_BUCKET_LOAD 6` 正好等于容量上限，说明这批字面量已经贴近边界，再增加就会回落 FDR；`max length 12` 大于 `masks 4`，意味着 Teddy 只用最后 4 个字节做掩码匹配，前面的字节依赖确认表或后续 NFA；`floodoff` 指向 flood 表，若为 0 表示没有 flood 处理。第二段 `FDR: 0` 是唯一的 FDR 引擎描述，`stride 2` 表示主表隔一个字节采样一次，`domain 8` 描述主表索引位宽；`strings 200` 超过 Teddy 容量，因此走 FDR 是预期结果。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，48 与 96 不是 API 承诺，而是当前实现的经验边界。它们来自 `TEDDY_BUCKET_LOAD = 6` 与 8/16 bucket 的乘积，还会被「字面量长度」「短字面量比例」「目标 CPU 是否支持 AVX2」「Teddy 构建是否成功」共同影响。写容量规划时不要把它当成硬阈值，应以 `hsdump` 的实际输出为准。
+
+第二，Teddy 偏爱短字面量，但不是越短越好。`numMasks` 最多 4，字面量长度超过 4 时只用尾部 4 字节做掩码，前面部分靠确认；如果大量字面量的尾部 4 字节相同（例如都以 `end` 结尾），掩码区分度会骤降，confirm 次数上升。设计字面量时应让「尾部 4 字节」尽量分散，或让触发字面量本身足够长、由 FDR 接管。
+
+第三，stride 大于 1 不等于漏匹配。FDR 的主表按 stride 采样，但 confirm 阶段会回看 `stride` 范围内的候选；只要 confirm 表覆盖完整，匹配结果不受影响。真正会漏匹配的是「起点不在采样网格且 confirm 未覆盖」的实现错误，正常版本不会出现。若怀疑漏报，应先用 `hscheck` 或 `hscollider` 对拍，而不是直接调 stride。
+
+第四，VBMI 优化有明确的适用边界。它需要三件事同时成立：构建时开了 `BUILD_AVX512VBMI`（默认 OFF）、目标 CPU 支持 AVX-512 VBMI、fat runtime 在运行期选中了对应变体。缺任何一条，就会回落到 AVX2 或 SSE 路径，功能不变、吞吐降低。不要把「源码里有 `FAT_TEDDY_VBMI_*` 宏」当成「默认构建就能用」，那是编译期条件编译的结果。
+
+第五，区分 5.3.0 与 5.4.0 的 Teddy 变更。5.3.0 是 Teddy 的 VBMI 支持与性能改进；5.4.0 是 Fat Teddy 的 VBMI 支持与性能改进，同时引入 Sheng32/Sheng64/McSheng64。写版本说明时不要把两者混成「5.4.0 首次引入 Teddy VBMI」，也不要把 Sheng 的引入归到 5.3.0。
+
+第六，flood 处理有上限。`FDRFlood` 最多记录 16 个 id（`FDR_FLOOD_MAX_IDS`），超过就不走 flood 快速路径。若数据里有长串重复字符，而命中该字符的字面量又很多，flood 路径可能失效，确认成本上升。缓解办法是减少「以高频字符结尾」的字面量，或在模式层用更长的上下文提高区分度。
+
+第七，混合大小写会破坏 shortcut。`NG::addLiteral()` 里的 `mixed_sensitivity()` 检查会把「同一字面量里既有大写又有小写、且不是全大小写不敏感」的情况退回完整图处理；`hwlmLiteral` 虽然支持 `msk`/`cmp` 掩码，但 Rose 的字面量 shortcut 不愿意为它承担复杂度。若发现字面量没有走 Teddy/FDR，应先检查大小写形态，而不是怀疑引擎选择。
+
+### 7. 小结与延伸阅读
+
+字面量前端是 Rose 触发器的执行者。Noodle 处理单条字面量；Teddy 用 8 bucket、最多 4 层 nibble 掩码处理不超过 48 条；Fat Teddy 用 16 bucket、双宽掩码与 AVX2 把容量推到 96 条；FDR 用 64 位 scheme、8 bucket、可变 stride 与 confirm 表处理更大规模或 Teddy 失败的集合。选择发生在编译期 `hwlmBuild()`，由 `chooseTeddyEngine()`、`TEDDY_BUCKET_LOAD`、`isAllowed()` 与 `fdrBuildProtoInternal()` 的回落逻辑共同决定；运行期只按 `HWLM.type` 与 `engineID` 分派。
+
+三条实践结论：容量边界是经验值，以 `hsdump` 的实际引擎与 bucket 数为准；字面量的「尾部区分度」比总长度更重要，尤其对 Teddy；VBMI 是编译期、CPU、运行期三重条件，不要把源码里的宏当成默认能力。
+
+延伸阅读：06-04 讲这些字面量表如何被 Rose 选为 anchored、floating 或 EOD；06-09 讲 shufti、truffle 等字符类加速器如何与字面量前端配合；06-13 讲 fat runtime 如何在运行期选择指令集变体；05-07 给出 `FDR`、`Teddy`、`HWLM` 的字段定义；07-06 与 07-07 从模块角度列 `hwlm` 与 `fdr` 的文件职责。若只记一件事：字面量前端不是「越多越好」，而是「在容量、区分度与确认成本之间找平衡」。
+
+## 06-06 NFA 引擎：LimEx NFA 的状态布局与执行
+
+### 1. 背景与动机
+
+Hyperscan 的编译流水线走到 Rose 层之后，模式集合被切成两部分：一部分能被字面量匹配器快速触发，另一部分只能靠自动机逐字节推进。后者最终交给 NFA 引擎。这里立刻出现两个诱惑：一是把整张图确定化成 DFA，换来每个字节一次查表；二是保留通用 NFA 模拟器，用递归或栈回溯的方式解释执行。前者在模式集合上万条时会遇到子集构造的指数爆炸——状态数最坏是 2 的幂次，字节码体积和编译时间都无法接受；后者虽然状态数线性，但每读一个字节都要做一次「取当前状态集合、遍历所有出边、求并集」的循环，成本与状态数成正比，而且解释器的分支预测极差。
+
+LimEx NFA 走的是第三条路：**把「状态集合」压缩成一个机器字（或几个机器字）的位向量，把「遍历出边」压缩成几次移位与按位与**。这样每个字节的处理变成常数条指令，状态数上限被硬性限制在一个字能表示的范围内。名字里的 LimEx 是 limited exceptional 的缩写，两个词各对应一条设计约束：limited 指状态数有上限、每次只允许有限次（最多 8 个）移位；exceptional 指那些无法用移位表达的边被单独摘出来，作为「例外」在循环里补丁式处理。理解了这两个词，就理解了整个引擎的形状。
+
+这条设计带来的直接后果是：LimEx 的绝对速度不如 DFA，但它对模式集合规模不敏感——一万条模式和一条模式，只要总状态数不超过上限，每个字节的成本是一样的。而 Hyperscan 的 Rose 层保证了 NFA 不会被要求处理流里的每一个字节：NFA 只在字面量触发点被唤醒，把「确认」这一段走完就退出。触发点稀疏时，NFA 的单位成本高一点完全可以接受；触发点密集时，说明模式本身字面量质量差，问题应该回到模式写法上，而不是指望 NFA 变快。
+
+本篇要回答四个具体问题：状态是怎么编号的，为什么编号方式能让「走一条边」变成「左移若干位」；reach 表为什么不是 256 张掩码；exception 表在什么条件下产生、又为什么可以缓存；以及一次 `hs_scan` 里 NFA 到底被谁调用、调用几次。这四个问题串起来，就是 LimEx 的全部执行模型。字段级定义不在本篇展开（字段见 05-06 ｜ 参数见 04-03 ｜ 模块见 07-05）。
+
+### 2. 核心概念
+
+**状态向量与位并行。** LimEx 用位图的第 i 位表示「NFA 的第 i 个状态当前是活的」。一个字能放 32 位就管 32 个状态，放 64 位就管 64 个状态，AVX 寄存器能放 128、256、384、512 位就分别管同样多的状态。引擎族因此被切成六个宽度：`LimExNFA32`、`LimExNFA64`、`LimExNFA128`、`LimExNFA256`、`LimExNFA384`、`LimExNFA512`，由 `src/nfa/limex_internal.h` 里的 `CREATE_NFA_LIMEX(size)` 宏一次性生成六份同构结构。选哪个宽度由编译期按状态数决定，运行期只按 `NFA::type` 分派，不做任何尺寸判断。
+
+**编号即拓扑序。** Glushkov 图没有 epsilon 边，状态数等于字符位置数。编译期给顶点编号时按拓扑序排列，于是「存在一条从 i 到 j 的边」等价于「j 的编号大于 i」。走一条边就可以写成「把第 i 位左移 (j−i) 位」。把所有同距离的边合成一张掩码，就成了 `shift[]` 数组：第 k 张掩码里置位的是「所有需要左移 `shiftAmount[k]` 位的源状态」。求后继只要对每张掩码做「与当前状态相交、再左移」，最后把结果或起来。
+
+**limited 的两道闸门。** 掩码数量上限是 `MAX_SHIFT_COUNT`（8），单次移位上限是 `MAX_SHIFT_AMOUNT`（16）。前者约束指令数，后者约束「一条边最多跨多少个状态」。这两个常量定义在 `src/nfa/limex_internal.h`，编译期的 `findBestNumOfVarShifts()` 与 `findMaxVarShift()` 会枚举 1 到 8 个移位的组合，用 `getLimexScore()` 打分选最优——移位越多指令越多，但例外越少。这是一次真实的取舍计算，不是拍脑袋的常数。
+
+**exceptional 的判定。** `isExceptionalTransition()`（`src/nfa/limex_compile.cpp:1536`）的逻辑很干脆：如果 `isLimitedTransition(from, to, maxShift)` 为假——也就是距离超过 16——这条边就是例外；另外，所有从 tug 触发器出发的边一律算例外，因为 tug 触发的语义依赖有界重复的当前状态，无法用纯移位表达。例外被收集进 `exceptionCount` 张 `NFAExceptionXXX` 结构，每张带有 `squash`（要清除的状态掩码）、`successors`（要置起的状态掩码）、`reports`（要上报的报告链）、`repeatOffset`（关联的有界重复）、`hasSquash` 与 `trigger`。
+
+**reach 表的去重。** 如果每个字符都存一张完整的状态掩码，256 个字符就是 256 个字，对小 NFA 而言这是灾难性的浪费。LimEx 的做法是先按「字符到达集」把 256 个字符分组，相同到达集共用一张掩码，得到 `reachSize` 张实际掩码；再用 `reachMap[256]` 做字符到掩码下标的映射。运行期的动作是 `s & reach[reachMap[c]]`——两次访存、一次按位与。`reachSize` 通常远小于 256，字节码因此显著变小。
+
+**accept、squash 与 EOD。** `accept` 是一张掩码，标记哪些状态是接受态；`acceptCount` 张 `NFAAccept` 结构给出「命中这个状态要上报什么」。`single_report` 为真时 `reports` 直接就是报告号，否则它是指向报告链表的偏移。`squash` 字段用于「命中后压制」：某些状态在报告之后必须被清掉，否则同一次匹配会在后续字节上重复触发。EOD 接受单独用 `acceptEodCount` / `acceptAtEOD` 表示，只在数据末尾检查一次，用来支持 `$` 这类锚点。
+
+**有界重复的状态外置。** 线性 NFA 无法用有限状态表示 `a{1000}`，LimEx 的解法是把重复的计数器搬到状态之外：`NFARepeatInfo` 里记录 `cyclicState`（环上那个状态）、`ctrlIndex`（控制块下标）、`packedCtrlOffset`、`stateOffset`、`stateSize`、`tugMaskOffset`。运行期只要环状态活着，就查一次 `repeatHasMatch()` 判断「现在这个偏移算不算命中」。重复状态的打包与解包由 `repeatPack` / `repeatUnpack` 完成，跨块时写进流状态。
+
+**状态压缩。** 流式模式下每个块结束都要把状态写进流状态。LimEx 提供两级压缩：`LIMEX_FLAG_COMPRESS_STATE` 表示按「上一个字节」查 reach 掩码做键控压缩，`LIMEX_FLAG_COMPRESS_MASKED` 在此基础上再与 `compressMask` 相与，并给全零情况走一条捷径（展开时把 `initDS` 或回去）。压缩函数是 `moNfaCompressState32/64/…`，展开是 `moNfaExpandState32/64/…`，都靠 `src/nfa/limex_state_impl.h` 的宏模板生成。
+
+### 3. 关键数据结构与源码位置
+
+本册只点名结构与入口，逐字段定义统一放 05 册，避免与字段表重复。`struct NFA` 头部（`flags`、`length`、`type`、`queueIndex`、`nPositions`、`scratchStateSize`、`streamStateSize`、`maxWidth`、`minWidth`、`maxOffset`）的字段含义见 05-06；`LimExNFA32` 等六个实现结构的字段见 05-06；`NFARepeatInfo` 与 `NFAAccept` 同样见 05-06。
+
+`struct NFA` 定义在 `src/nfa/nfa_internal.h:102`，它的注释点明了一条关键约定：引擎实现紧跟在头部之后，`getImplNfa(nfa)` 就是「头部地址加 `sizeof(struct NFA)`」。这意味着头部与实现是同一块连续内存，可以整体序列化、整体释放。`length` 字段给出这块内存的总字节数，序列化时照抄即可。
+
+LimEx 实现结构的生成宏在 `src/nfa/limex_internal.h:114`。宏展开后每个宽度都有一份独立的结构体定义，字段名相同、位宽不同。这种「一份源码、六次展开」的做法在 `src/nfa/` 里反复出现：`limex_native.c` 只写 32 位版本，再 `#include "limex_runtime_impl.h"` 让模板把其余宽度展开出来。
+
+LimEx 引擎在内存中的段落顺序见图 06-06-01，这个顺序直接决定了序列化与偏移计算的方式。
+
+:::figure id=06-06-01 | name=LimEx 引擎在内存中的段落顺序 | dir=TD
+node n1 "struct NFA 头部" blue
+node n2 "LimExNFA32 至 512" purple
+node n3 "reach 掩码表" teal
+node n4 "tops 表" teal
+node n5 "accel 表与 aux" amber
+node n6 "accept 与 EOD 表" amber
+node n7 "exception 表" red
+node n8 "repeat 偏移与结构" gray
+edge n1 -> n2 "getImplNfa 紧随其后"
+edge n2 -> n3 "定长之后变长"
+edge n2 -> n4 "TOP_N 事件"
+edge n2 -> n5 "加速状态"
+edge n2 -> n6 "报告入口"
+edge n2 -> n7 "长跳与 tug"
+edge n7 -> n8 "repeatOffset 指向"
+:::
+
+所有变长段的入口都是相对 `LimExNFA` 起始地址的 `u32` 偏移，而不是指针。这一点对跨进程分发至关重要：数据库可以按字节搬到另一台机器，偏移仍然有效，指针则会全部失效。`accelTableOffset`、`accelAuxOffset`、`acceptOffset`、`acceptEodOffset`、`exceptionOffset`、`repeatOffset`、`squashOffset`、`topOffset` 全部遵循这个约定，唯一的例外是 `reachMap` 与定长字段里的各个掩码，它们直接内联在结构里。
+
+为了让读者建立索引，下表把 LimEx 的各个段落、作用与源码位置放在一起。参数与模式常量不在本表重复，需要的读者请查 04 册。
+
+| 段落 | 作用 | 是否定长 | 源码位置 |
+|---|---|---|---|
+| `struct NFA` | 引擎种类、长度、状态尺寸 | 是 | `src/nfa/nfa_internal.h:102` |
+| `LimExNFA32/64/…` | 掩码、计数、偏移的容器 | 是 | `src/nfa/limex_internal.h:124` |
+| `reach[]` | 按字符去重后的到达掩码 | 否 | `src/nfa/limex_state_impl.h:64` |
+| `tops[]` | `TOP_N` 事件用的状态掩码 | 否 | `src/nfa/limex_common_impl.h` |
+| `AccelAux[]` | 加速方案参数 | 否 | `src/nfa/accel.h:66` |
+| `NFAAccept[]` | 报告与压制入口 | 否 | `src/nfa/limex_internal.h:190` |
+| `NFAExceptionXX[]` | 长跳与 tug 的补丁 | 否 | `src/nfa/limex_internal.h:115` |
+| `NFARepeatInfo[]` | 有界重复的控制与状态 | 否 | `src/nfa/limex_internal.h:181` |
+
+两个上限常量值得单独记住：`NFA_MAX_STATES` 是 512，`NFA_MAX_ACCEL_STATES` 是 8，都在 `src/nfa/limex_limits.h`。前者决定「多大的图还能塞进 LimEx」，后者决定加速表的索引空间只有 2 的 8 次方，也就是 256 项。
+
+### 4. 关键流程与调用链
+
+一次 NFA 执行的起点不在 NFA 内部，而在 Rose 生成的程序里。Rose 把字面量命中翻译成一个队列事件，事件带着「从哪个偏移开始跑、跑到哪里」的信息进入 `struct mq`（匹配队列）。公共入口是 `nfaQueueExec()`（`src/nfa/nfa_api.h:121`），它在 `src/nfa/nfa_api_dispatch.c` 里按 `nfa->type` 做一次 switch，把调用转发到 `nfaExecLimEx32_Q`、`nfaExecLimEx64_Q` 之类的具体实现。这张分派表同时列出了 LimEx、McClellan、Gough、LBR、Castle、Sheng、McSheng 全部家族，是理解「一个 NFA 对象到底是谁」的最好入口。
+
+进入 `nfaExecLimEx32_Q` 之后，第一步是队列初始化：`nfaExecLimEx32_queueInitState()` 把 `init` 或 `initDS` 掩码装进状态，并处理队列里已经排好的 top 事件。之后进入热循环 `LOOP_NOACCEL_FN`，也就是 `src/nfa/limex_runtime_impl.h:215` 附近那段 for 循环。循环体只有四步，下面这段源码是它的骨架（保留了原始宏名，便于对照）。
+
+```c
+for (; i != length; i++) {
+    if (can_die && ISZERO_STATE(s)) {
+        break;                      /* 全零状态：这条 NFA 已经死了 */
+    }
+
+    STATE_T succ;
+    NFA_EXEC_GET_LIM_SUCC(limex, s, succ);   /* 移位求后继 */
+
+    if (RUN_EXCEPTIONS_FN(limex, exceptions, s, EXCEPTION_MASK, i, offset,
+                          &succ, final_loc, ctx, flags, 0, first_match)) {
+        return MO_HALT_MATCHING;
+    }
+
+    u8 c = input[i];
+    s = AND_STATE(succ, LOAD_FROM_ENG(&reach[limex->reachMap[c]]));
+}
+```
+
+逐行判读这段代码。第一行的 `can_die` 来自 `LIMEX_FLAG_CANNOT_DIE` 的反面：如果编译器证明这条 NFA 在任何输入下都不会「全灭」，这个检查会被优化掉；反之，一旦状态全零就立即跳出，这是 NFA 在长数据上最重要的早退机制，触发点之后没有匹配可能时它能省掉整段扫描。`NFA_EXEC_GET_LIM_SUCC` 是一个 do-while 宏，内部按 `shiftCount` 做 switch 展开成 1 到 8 次「与掩码、左移、或起来」，没有循环、没有间接跳转，这是它能跑得快的关键；`shiftAmount[]` 是常量表，编译器会把移位量当成立即数处理。`RUN_EXCEPTIONS_FN` 只在 `exceptionMask` 与当前状态有交集时才有实质工作，否则是一次按位与加一次判零。最后一行 `s = succ & reach[reachMap[c]]` 才是「读入一个字节」的语义：先用移位算出「一步之内能到哪些状态」，再用当前字符的到达掩码过滤——这正是 Glushkov 语义，先走边、再验字符。注意 `reach` 与 `reachMap` 都是只读的引擎内数据，循环里没有任何写入，这让多个线程可以共享同一份数据库。
+
+例外的处理值得单独展开。`processExceptional32()`（`src/nfa/limex_native.c:73`）先用 `findAndClearLSB_32` 逐位取出例外状态，再用 `rank_in_mask32(limex->exceptionMask, bit)` 把「第几位」换算成「第几个例外结构」——因为例外表只存有例外的状态，中间的空洞必须靠 rank 运算跳过。这个 rank 是整条例外路径上最贵的操作，所以引擎做了一层缓存：如果本次例外状态集合与上次完全相同（`estate == ctx->cached_estate`），直接复用上次算出的后继与报告链。缓存只在「例外只置后继、不上报、不压制」时成立，代码里用 `cacheable` 标记区分，遇到会上报的例外就退化到 `DO_NOT_CACHE_RESULT_AND_FLUSH_BR_ENTRIES` 分支并清缓存。
+
+状态在块边界上的搬运由 `nfaExecLimEx32_queueCompressState` 与 `nfaExecLimEx32_expandState` 成对完成。压缩的键是「队列位置之前那个字节」，因为 reach 掩码只与字符有关，用上一字节做键可以安全地丢掉那些「在当前字符下必然为死」的位。这条约定带来一个容易踩的坑：压缩与展开必须严格配对，且键必须一致，否则状态会被展开成另一个集合，表现为流式漏报或误报。
+
+完整的调用链可以概括为：Rose 程序触发 → `mq` 队列 → `nfaQueueExec` → 按 `type` 分派 → `nfaExecLimExXX_Q` → 队列初始化 → 热循环（移位、例外、reach 过滤）→ `moProcessAcceptsXX` → 报告回调 → Rose 的报告处理（SOM 相关见 06-10）。这条链上的关键节点见图 06-06-02。
+
+:::figure id=06-06-02 | name=一次 LimEx 执行的调用链 | dir=LR
+node n1 "Rose 触发事件" blue
+node n2 "mq 匹配队列" blue
+node n3 "nfaQueueExec 分派" amber
+node n4 "LimExXX_Q 入口" purple
+node n5 "移位求后继" purple
+node n6 "exception 补丁" red
+node n7 "reach 掩码过滤" teal
+node n8 "accept 上报" green
+node n9 "Rose 报告处理" green
+edge n1 -> n2 "带偏移区间"
+edge n2 -> n3 "队列非空"
+edge n3 -> n4 "按 type"
+edge n4 -> n5 "初始化状态"
+edge n5 -> n6 "掩码相交"
+edge n5 -> n7 "读入字节"
+edge n7 -> n8 "状态命中"
+edge n8 -> n9 "回调"
+:::
+
+### 5. 配置/命令/代码实例
+
+下面这段 C 程序刻意选了一个「字面量只能覆盖前半、后半必须靠 NFA 确认」的模式：`ab[^c]{2,5}de`。Rose 会拿 `ab` 做触发，把「两到五个非 c 字符再跟 de」这一段交给 NFA。程序打印数据库信息与两次扫描的命中，用来观察结束偏移与起始偏移的差别。完整标志表见 04-02，模式常量见 04-03。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int on_match(unsigned int id, unsigned long long from,
+                    unsigned long long to, unsigned int flags, void *ctx) {
+    (void)flags;
+    (void)ctx;
+    printf("id=%u from=%llu to=%llu len=%llu\n",
+           id, from, to, to - from);
+    return 0;
+}
+
+int main(void) {
+    const char *pat = "ab[^c]{2,5}de";
+    hs_database_t *db = NULL;
+    hs_scratch_t *scratch = NULL;
+    hs_compile_error_t *err = NULL;
+
+    if (hs_compile(pat, HS_FLAG_SOM_LEFTMOST, HS_MODE_BLOCK, NULL,
+                   &db, &err) != HS_SUCCESS) {
+        fprintf(stderr, "compile: %s (expr %d)\n", err->message,
+                err->expression);
+        hs_free_compile_error(err);
+        return 1;
+    }
+
+    if (hs_alloc_scratch(db, &scratch) != HS_SUCCESS) {
+        hs_free_database(db);
+        return 1;
+    }
+
+    const char *s1 = "xx ab12de yy";
+    const char *s2 = "xx ab123456de yy";
+
+    printf("db=%zu scratch=%zu\n", hs_database_size(db),
+           hs_scratch_size(scratch));
+    hs_scan(db, s1, (unsigned)strlen(s1), 0, scratch, on_match, NULL);
+    hs_scan(db, s2, (unsigned)strlen(s2), 0, scratch, on_match, NULL);
+
+    hs_free_scratch(scratch);
+    hs_free_database(db);
+    return 0;
+}
+```
+
+在一台支持 AVX2 的机器上以 5.4.2 编译运行，输出形如下面的文本。示例输出，具体格式需对照实际版本核验。
+
+```text
+db=12288 scratch=7168
+id=0 from=3 to=9 len=6
+```
+
+逐行判读。第一行的两个数字分别来自 `hs_database_size()` 与 `hs_scratch_size()`，单位是字节：数据库大小包含 `struct NFA` 头部、`LimExNFA128`（或更窄的宽度，取决于状态数）、去重后的 reach 表、accept 表与例外表；scratch 大小则由所有被引用 NFA 的 `scratchStateSize` 之和决定，所以即使只有一条模式，scratch 也远大于单个状态向量。这两个数值随版本与目标平台变化，只能做横向对照，不能当绝对指标。第二行是第一次扫描的命中：`from=3` 是 `a` 的下标，`to=9` 是开区间上界，实际最后一个字节是 `e`（下标 8）；`len=6` 正好落在 `ab` 加 2 个字符加 `de` 的下界上。第二次扫描没有输出，因为 `ab123456de` 中间有 6 个非 c 字符，超过 `{2,5}` 的上界——这正是「NFA 的重复计数在起作用」的直接证据，如果上界被忽略，这里会多出一条 `len=11` 的记录。注意 `from` 之所以有意义，是因为编译时开了 `HS_FLAG_SOM_LEFTMOST`；不开这个标志时 `from` 只是一个占位值，不能用来算长度（原理见 06-10）。
+
+如果想看引擎内部长什么样，可以在带 `DUMP_SUPPORT` 的调试构建下用 `hsdump` 或灰盒转储查看 LimEx 的段落。`src/nfa/limex_dump.cpp:293` 起的第一行固定是「位宽 + shifts + exceptions」，紧接着是 flags。下面的片段按该转储函数输出的字段顺序给出，示例输出，具体格式需对照实际版本核验。
+
+```text
+64-bit LimEx NFA (2 shifts, 1 exceptions)
+flags: CANNOT_DIE
+MSK INIT 0x0000000000000003
+MSK ACCEPT 0x0000000000000008
+Shift Masks:
+     Shift 0(1)        Mask: 0x0000000000000006
+     Shift 1(3)        Mask: 0x0000000000000018
+```
+
+判读要点有三。第一行告诉你引擎选了 64 位宽度，也就是状态数在 33 到 64 之间；两个移位说明这张图的大部分边跨度只有 1 和 3，编译器认为两次移位比一次移位加更多例外更划算。`flags: CANNOT_DIE` 表示 `LIMEX_FLAG_CANNOT_DIE` 被置起，热循环里的全零早退会被省掉——因为这张图在任何输入下都至少有一个状态活着（通常是起始状态常驻）。`MSK INIT` 是初始状态集合，`MSK ACCEPT` 是接受状态集合，两者都是按位掩码，从右往左数第 n 位对应第 n 号状态。`Shift 0(1)` 读作「第 0 张移位掩码，移位量 1」，掩码 `0x6` 表示第 1、2 位是源状态，左移 1 位后落到第 2、3 位。如果这里出现 `exceptions` 数量远大于 shifts，说明图的跨度很分散，值得回头检查模式里是否有长距离的跳跃结构。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**第一，512 个状态是硬墙，不是软限制。** `NFA_MAX_STATES` 定义在 `src/nfa/limex_limits.h`，超过这个数的图不会被 LimEx 接受，Rose 会退到 DFA 路径（Sheng / McClellan），再不行就抛 `Pattern is too large.`。这条错误的根因往往是有界重复展开过大或分支过多，正确做法是改写模式（把大重复合并、把可选择分支提成字面量前缀），而不是调大任何参数——这个上限是编译期常量，没有运行时开关。
+
+**第二，例外不是零成本，但也不是每次都付。** 例外表的大小直接影响字节码体积，例外路径上的 `rank_in_mask32` 是这条链上最贵的操作。设计模式时应尽量让状态编号紧凑、边跨度小，让编译器能用少量移位覆盖大部分边。反过来，如果模式里有大量「跨十几步才连上的边」——比如 `a.{0,40}b` 这类结构——例外会变多，NFA 的每次推进都要多走一遍例外循环。
+
+**第三，例外缓存有前提。** `processExceptional32()` 的缓存只在「例外只置后继」时有效，一旦某个例外需要上报或压制，缓存就被标记为不可用并主动清空。这意味着带报告的例外在密集触发下会退化成每次重算。这不是 bug，而是正确性要求：报告有副作用，不能复用。
+
+**第四，别把 NFA 当成「会看全部字节」的引擎。** 除了反向 NFA（SOM 用）会从命中点往回扫，正向 NFA 只在 Rose 给出的队列区间里运行。因此「NFA 慢」这个判断要先看触发频率：如果字面量前缀很短（比如单字符），触发会极其密集，NFA 事实上在逐字节跑，此时优化方向是加长触发字面量，而不是换引擎。
+
+**第五，压缩状态必须成对调用。** `queueCompressState` 与 `expandState` 的键都是「前一字节」，而且压缩是有损的——它按 reach 掩码丢掉了在当前字符下必然为死的位。如果调用方在错误的偏移上展开，或者用不同的键展开，得到的状态集合就是错的。流式场景下这类 bug 表现为「跨块后偶发漏报」，且只在特定分块位置出现，非常难查；定位手段是固定块大小做二分，看漏报是否随块边界移动（流状态的整体机制见 06-11）。
+
+**第六，`CANNOT_DIE` 与早退是两回事。** 没有这个标志时，状态全零会立刻跳出循环；有这个标志时，编译器认为「永远至少有一个状态活着」，于是省掉判零。这两者的差别只在性能，不在语义。如果发现某个 NFA 在明显不匹配的数据上仍然跑满整段，先确认它是否被标了 `CANNOT_DIE`，再看是不是触发区间本身就很长。
+
+**第七，`squash` 的时机不能想当然。** 压制掩码是在报告**之后**应用的（见 `PROCESS_ACCEPTS_IMPL_FN`），因为报告本身可能需要读当前状态。任何「先清状态再报告」的改动都会破坏语义。调试时如果看到「同一次匹配被上报多次」，先查是不是 squash 掩码缺失，而不是怀疑去重逻辑。
+
+### 7. 小结与延伸阅读
+
+LimEx 的全部设计可以压缩成一句话：用「拓扑序编号 + 移位掩码」把逐边遍历降成常数条位运算，用「例外表」兜住表达不了的长跳，用「reach 去重」把 256 张掩码压成几十张，再用「状态压缩」把跨块的状态搬运成本降到最低。它不追求单字节最快，追求的是「对模式规模不敏感、对触发稀疏性友好」。这两条性质正好补上 Rose 分解留下的空缺。
+
+如果只记住三件事：第一，`s = (移位后继) & reach[reachMap[c]]` 是整个引擎的心脏，理解它就理解了 Glushkov 语义在位向量上的落地；第二，例外表是有限的补丁机制，模式写法决定了补丁多少；第三，状态上限 512 与压缩键约定是两条不能碰的边界，前者决定能不能编译，后者决定流式是否正确。
+
+延伸阅读建议按这个顺序：先看 `src/nfa/limex_internal.h` 顶部的布局注释（那段文字比任何二手资料都准确），再看 `src/nfa/limex_runtime_impl.h` 的热循环与例外调用，然后看 `src/nfa/limex_compile.cpp` 里 `isExceptionalTransition` 与 `getLimexScore` 的取舍逻辑。Castle 作为「多租户重复引擎」与 LimEx 是互补关系，下一篇展开；DFA 家族（Sheng / McSheng / McClellan）见 06-08；加速器如何嵌进这条循环见 06-09；NFA 的状态如何进入流状态见 06-11。
+
+## 06-07 Castle 与可压缩 NFA 的取舍
+
+### 1. 背景与动机
+
+有界重复是正则里最常见也最难处理的结构。`[a-z]{1,1000}`、`\d{6,12}`、`.{0,255}` 这类写法在真实规则集里占比极高，它们的特点是：字符集通常很小（甚至只有一个字符），但计数的上下界很大。用 NFA 表达意味着要把重复展开成上千个状态，直接撞上 512 状态的上限；用 DFA 表达又会让状态数随计数线性增长。Hyperscan 为此专门做了一个引擎族：LBR（Large Bounded Repeat）负责单个大重复，Castle 负责「一批共享同一字符集的大重复」。
+
+Castle 这个名字来自「多租户」的隐喻：一个引擎里住着很多个 SubCastle，每个 SubCastle 是一个独立的有界重复，各自有自己的报告和状态，但它们共享同一张字符到达表和同一套扫描逻辑。这样做的好处是扫描一遍数据就能同时推进所有租户，成本接近「一个重复」而不是「N 个重复」。代价是这些重复必须字符集完全一致——`src/nfa/castlecompile.h:69` 的注释写得很直白：Currently, all repeats in a Castle must have the same character reachability。
+
+理解 Castle 的关键是理解它和 LimEx 的分工。LimEx 是「通用图执行器」，能处理任意形状的子图，但状态预算只有 512；Castle 是「专用重复执行器」，只能处理「单一字符集 + 计数上下界」这一种形状，但能把这种形状做到几乎零状态成本。Rose 在分解阶段就把「纯重复」的子图摘出来，交给 Castle 原型（`CastleProto`）累积；等到落字节码时再决定是合成一个 Castle，还是退化成一个 LBR。
+
+### 2. 核心概念
+
+**PureRepeat：Castle 的唯一输入形状。** `CastleProto` 的构造函数签名是 `CastleProto(nfa_kind k, const PureRepeat &pr)`，也就是每个 Castle 都从一个纯重复开始，之后通过 `add()` 不断加入「字符集相同」的新重复。`PureRepeat` 描述的是「某个字符集重复 N 到 M 次」这一件事，它不含分支、不含断言、不含子图嵌套。任何带分支的重复都会在 Rose 阶段被拆开，不会进入 Castle。
+
+**top 与 SubCastle。** Castle 用 `top` 编号标识「哪个重复被触发」。每个 top 对应一个 `SubCastle`，结构里有 `report`（命中上报什么）、`fullStateOffset`（在 scratch 全状态里的偏移）、`streamStateOffset`（在流状态里的偏移）、`repeatInfoOffset`（对应的 `RepeatInfo`）、`exclusiveId`（互斥组号）。`max_occupancy` 是 65536，这是一个「任意定的上限」，用来防止原型无限膨胀。
+
+**共享 reach，共享扫描器。** Castle 的所有 SubCastle 字符集相同，所以只需要一套「找下一个可能命中位置」的扫描器。`Castle::type` 决定用哪一种：`CASTLE_DOT`（任意字符，永不失败，直接跳到末尾）、`CASTLE_VERM`（单字符，用 vermicelli）、`CASTLE_NVERM`（单字符取反）、`CASTLE_SHUFTI`（字符类，双 nibble 查表）、`CASTLE_TRUFFLE`（稀疏字符类）。这五种扫描器的实现分别是 `castleScanVerm`、`castleScanNVerm`、`castleScanShufti`、`castleScanTruffle`，都只是对 `vermicelliExec` / `shuftiExec` / `truffleExec` 的一层薄封装。
+
+**不是逐字节推进，而是「跳到下一个候选」。** 这是 Castle 与 LimEx 最本质的差别。`castleMatchLoop()`（`src/nfa/castle.c:470`）的循环体是：先问每个活跃 SubCastle「你的下一个可能命中偏移是多少」，取所有答案的最小值，把在该偏移命中的 SubCastle 记进 `matching` 多重位图，然后一次性跳到那个偏移触发报告。数据里没有候选位置时，扫描器一次跳过整段。所以 Castle 的成本与「候选位置密度」成正比，而与数据长度只有很弱的线性关系。
+
+**互斥组（exclusive group）。** 有些重复天然互斥：比如 `\d{6}` 和 `\d{8}`，在同一个起点上不可能同时满足。Castle 编译期用团（clique）算法找出互斥的 SubCastle 集合，让它们共享同一份状态池——因为任意时刻最多只有一个活着。`ExclusiveType` 有三个取值：`NOT_EXCLUSIVE`（没有互斥）、`EXCLUSIVE`（部分互斥）、`PURE_EXCLUSIVE`（全部互斥）。全部互斥时，流状态里连「活跃重复」的多重位图都能省掉，只剩「当前活跃的是哪个 SubCastle」的 id。
+
+**状态的三段结构。** 重复的状态被切成三块：控制块（`RepeatControl`，很小，可整体拷贝）、重复状态（`RepeatState`，可能很大，含多重位图环或有序数组，直接驻留流状态、不拷贝）、打包控制块（`packedCtrlSize` 字节，跨块时写进流状态）。`RepeatInfo` 里的 `type` 决定用哪种模型：`REPEAT_RING`（一般 `{N,M}`，环形位图）、`REPEAT_FIRST`（`{N,}`，只记第一个 top）、`REPEAT_LAST`（`{0,N}`，只记最后一个 top）、`REPEAT_RANGE`（`N` 与 `M` 差距很大时的有序数组）、`REPEAT_BITMAP`、`REPEAT_SPARSE_OPTIMAL_P`（带最小周期的稀疏模型）、`REPEAT_TRAILER`、`REPEAT_ALWAYS`。
+
+**为什么「压缩 NFA」不是替代方案。** 有人会问：LimEx 已经有状态压缩（`LIMEX_FLAG_COMPRESS_STATE`），为什么不把大重复压进状态向量里？答案是压缩只作用于「流状态怎么存」，不改变「运行期一个状态一位」的事实。`a{1000}` 在 Glushkov 图里要展开成一千个位置，位向量就要一千位，而 LimEx 的上限是 512 位——压缩发生在写流状态的那一刻，此时状态向量早已超限。真正能表达计数的只有「把计数搬到状态之外」，也就是 `RepeatInfo` 那套控制块加环/数组的模型；Castle 与 LBR 正是这套模型的两种封装。所以「可压缩」与「可计数」是两件正交的事：前者省流状态，后者省运行期状态位，Castle 走的是后者。
+
+**LBR 是 Castle 的单租户特例。** `buildRepeatEngine()`（`src/rose/rose_build_bytecode.cpp:608`）的逻辑只有一行判断：如果 `proto.repeats.size() == 1` 且灰盒允许 LBR，就调 `constructLBR()`，否则 `buildCastle()`。注释解释了原因：只有一个重复时，LBR 一定是最好实现——它不需要多重位图、不需要分组、状态开销最小。LBR 有四种形态（`lbr_dot`、`lbr_verm`、`lbr_shuf`、`lbr_truf`），对应 `NFAEngineType` 里的 `LBR_NFA_DOT` / `VERM` / `NVERM` / `SHUF` / `TRUF`。它们的公共状态只有两个字段：`lastEscape`（最后一次逃逸的偏移）与 `RepeatControl` 控制块，全状态只有 lastEscape 与控制块两项，是真正的「常数状态」重复引擎。
+
+### 3. 关键数据结构与源码位置
+
+`struct Castle` 定义在 `src/nfa/castle_internal.h:114`，字段含义（`numRepeats`、`numGroups`、`type`、`exclusive`、`activeIdxSize`、`activeOffset`、`staleIterOffset`、`groupIterOffset`、联合体 `u`）见 05-06。`struct SubCastle` 在同文件 `:39`。`CastleProto` 与 `buildCastle()` 的声明在 `src/nfa/castlecompile.h:69` 与 `:126`。`RepeatInfo` 与 `RepeatType` 在 `src/nfa/repeat_internal.h`，运行期的 `repeatHasMatch` / `repeatNextMatch` / `repeatStore` / `repeatPack` / `repeatUnpack` 在 `src/nfa/repeat.h`。
+
+`castle_internal.h` 的头部注释值得逐字读一遍，它用 ASCII 图示给出了流状态的布局：先是各个互斥组的「活跃子引擎 id」，再是非互斥组的「活跃重复」多重位图，然后是「活跃互斥组」多重位图，最后是各组的共享状态池与各非互斥 SubCastle 的独立状态。这段注释解释了一个反直觉的设计：互斥组的状态是**共享**的，因为同一时刻只有一个成员活着，所以一份空间够所有成员轮流用。
+
+LBR 的结构在 `src/nfa/lbr_internal.h:44`：`lbr_common` 只有 `repeatInfoOffset` 与 `report` 两个字段，`lbr_verm` 加一个 `char c`，`lbr_shuf` 加两行 128 位掩码，`lbr_truf` 加两行掩码。`lbr_state`（scratch 里的全状态）只有 `lastEscape` 与控制块。把这几行和 `LimExNFA512` 那几十个字段对比，就能直观感受到「专用引擎」和「通用引擎」的体积差。
+
+下面这张表把 Castle 与 LBR 在几个维度上并排，便于做取舍判断。参数与灰盒开关不在表中重复（参数见 04-01 ｜ 字段见 05-06）。
+
+| 维度 | LBR | Castle |
+|---|---|---|
+| 承载的重复数 | 恰好 1 个 | 1 到 65536 个 |
+| 状态成本 | 仅 lastEscape 加控制块 | 多重位图 + 各组状态池 |
+| 触发方式 | 单个 top | 每个 SubCastle 一个 top |
+| 扫描器 | dot / verm / nverm / shuf / truf | 同左，但由 `Castle::type` 统一 |
+| 互斥优化 | 不需要 | 团划分后可共享状态 |
+| 源码入口 | `constructLBR()` | `buildCastle()` |
+| 选择条件 | `repeats.size() == 1` | 其余情况 |
+
+### 4. 关键流程与调用链
+
+编译期的路径从上往下是这样的。Rose 在分解子图时识别出纯重复，调用 `CastleProto::add()` 把它并入某个原型；如果字符集与已有原型不同，就新建一个原型。原型在 `RoseBuildImpl` 里以 `CastleProto *c` 的形式挂在各个 build context 上（见 `src/rose/rose_build_impl.h:121`）。等到 `buildFinalEngine()` 阶段，`buildRepeatEngine()` 拿到原型与触发信息，按「一个还是多个」分流：一个走 `constructLBR()`，多个走 `buildCastle()`。`buildCastle()` 内部先算互斥组（`findExclusiveGroups` 一类的团划分，`CLIQUE_GRAPH_MAX_SIZE` 是 1000），再按 `EXCLUSIVE` / `PURE_EXCLUSIVE` 分配流状态布局，最后把 `SubCastle[]` 与各个 `RepeatInfo` 依次写进同一块字节码。
+
+分流关系与 Castle 内部的共享结构见图 06-07-01。
+
+:::figure id=06-07-01 | name=单重复与多重复的引擎分流 | dir=TD
+node n1 "CastleProto<br/>同字符集的若干重复" teal
+node n2 "重复数是否为 1" amber
+node n3 "LBR 引擎" purple
+node n4 "Castle 引擎" purple
+node n5 "共享一张 reach 表" teal
+node n6 "一次扫描推进全部租户" green
+node n7 "各 SubCastle 独立状态" gray
+edge n1 -> n2 "进入落库阶段"
+edge n2 -> n3 "是，且允许 LBR"
+edge n2 -> n4 "否"
+edge n4 -> n5 "字符集一致"
+edge n5 -> n6 "按 top 触发"
+edge n6 -> n7 "分组写回"
+:::
+
+运行期的路径短得多。Rose 触发一个 top 之后，`nfaExecCastle_Q` 把 top 事件记进队列，然后调 `castleMatchLoop()`。循环的第一步是 `mmbit_clear(matching, c->numRepeats)` 清空临时多重位图；接着对每个活跃的互斥组，用 `subCastleNextMatch()` 问出「下一次命中在哪个偏移」；再对非互斥的 SubCastle 走 `subCastleMatchLoop()`。所有答案汇总到 `offset`（取最小）与 `matching`（在该偏移命中的成员）。如果 `matching` 为空，说明再也不可能命中，直接 `break`；否则 `subCastleFireMatch()` 发报告、更新状态，把 `loc` 推到 `offset` 继续。
+
+这里有一个容易忽略的细节：`castleMatchLoop` 的循环变量是「偏移」，不是「字节」。它每次迭代至少前进一个字节（`loc = offset` 且 `offset` 严格大于上一次），但通常一次跳过几十上百字节。这正是 Castle 的吞吐来源，也是它不适合「密集候选」场景的原因——候选越密，跳得越短，优势越小。
+
+`subCastleFireMatch()` 负责把「命中」翻译成「状态更新 + 报告」。它先按 `RepeatInfo` 的模型更新控制块与重复状态（`repeatStore`），再决定是否发报告。发报告时用 `cb(0, offset, sub->report, ctx)` 这种形式，第一个参数是起始偏移 0——因为 LBR 与 Castle 默认不跟踪 SOM，起始偏移由 Rose 的 SOM 机制另行处理（见 06-10）。如果回调返回 `MO_HALT_MATCHING`，整条链立刻终止并把 `HS_SCAN_TERMINATED` 传回调用方。
+
+状态在块边界上的处理比 LimEx 简单：控制块用 `repeatPack` 打包进流状态，重复状态本身就在流状态里、不需要拷贝。`nfaExecCastle_queueCompressState` 只做「把控制块写出去」这一件事，因为大块的多重位图环本来就驻留在流状态中。这也是 Castle 流状态偏大的原因：一个 `{1,1000}` 的重复，环里要存上千个 top 的相对偏移。
+
+### 5. 配置/命令/代码实例
+
+下面的 C 程序用三条共享同一字符集的重复来观察 Castle 的行为。三条模式都形如 `[0-9]{n,m}`，字符集相同，因此会被合并进同一个 Castle 原型；其中两条互斥（长度区间不重叠），一条与它们重叠，用来观察互斥组是否生效。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <string.h>
+
+static int cb(unsigned int id, unsigned long long from,
+              unsigned long long to, unsigned int flags, void *ctx) {
+    (void)from; (void)flags; (void)ctx;
+    printf("id=%u to=%llu\n", id, to);
+    return 0;
+}
+
+int main(void) {
+    const char *pats[3] = { "[0-9]{6}", "[0-9]{10}", "[0-9]{6,12}" };
+    unsigned flags[3] = { 0, 0, 0 };
+    unsigned ids[3]   = { 10, 11, 12 };
+    hs_database_t *db = NULL;
+    hs_scratch_t *sc = NULL;
+    hs_compile_error_t *err = NULL;
+
+    if (hs_compile_multi(pats, flags, ids, 3, HS_MODE_BLOCK, NULL,
+                         &db, &err) != HS_SUCCESS) {
+        fprintf(stderr, "compile: %s (expr %d)\n", err->message,
+                err->expression);
+        hs_free_compile_error(err);
+        return 1;
+    }
+    if (hs_alloc_scratch(db, &sc) != HS_SUCCESS) {
+        hs_free_database(db);
+        return 1;
+    }
+
+    const char *data = "abc 1234567890 xyz";
+    printf("db=%zu\n", hs_database_size(db));
+    hs_scan(db, data, (unsigned)strlen(data), 0, sc, cb, NULL);
+
+    hs_free_scratch(sc);
+    hs_free_database(db);
+    return 0;
+}
+```
+
+输出形如下面的文本。示例输出，具体格式需对照实际版本核验。
+
+```text
+db=9216
+id=10 to=13
+id=12 to=13
+id=11 to=13
+id=12 to=15
+id=11 to=17
+```
+
+逐行判读。`db=9216` 是三条模式合并后的数据库大小：三条独立的 LimEx 会各自带一套 reach 表与例外表，合并成一个 Castle 后只有一套扫描器，所以体积明显小于「三倍单模式」。接下来的五条命中都发生在 `1234567890` 这段数字上，结束偏移分别是 13、15、17。`to=13` 是第一个六位数字的结尾（下标 8 到 12，开区间 13），此时 `id=10`（`{6}`）与 `id=12`（`{6,12}`）同时成立——这正是「同一偏移命中多个租户」的场景，Castle 用一次 `matching` 多重位图就能全部报出。`to=15` 与 `to=17` 是 `{6,12}` 在更长的数字串上继续命中的结果，说明 `REPEAT_RING` 模型记住了「第一个 top 在 8」，之后每个满足下界的偏移都会报。`id=11`（`{10}`）只在 `to=17` 报一次，因为它要求恰好十位。如果这里只看到 `id=10` 而看不到 `id=12`，通常意味着两条模式被分进了不同的原型（字符集被优化成了不同形式，比如一条被转成 `\d`），需要用灰盒转储确认原型划分。
+
+第二个观察点是灰盒开关。`src/grey.h` 里有 `allowCastle` 与 `allowLbr` 两个开关，调试构建下可以通过 `HS_DEBUG_MODE` 或环境变量控制（具体变量名需对照实际版本核验）。关掉 `allowLbr` 后，单重复会走 Castle，数据库会略微变大、吞吐略微下降——这正好可以用来验证「LBR 是单重复的最优实现」这个结论。
+
+```c
+/* 摘自 src/nfa/castle.c 的 castleMatchLoop 主体，省略了互斥分支 */
+u64a loc = begin;
+while (loc < end) {
+    u64a offset = end;
+    mmbit_clear(matching, c->numRepeats);
+    subCastleMatchLoop(c, full_state, stream_state, end, loc, &offset);
+    if (!mmbit_any(matching, c->numRepeats)) {
+        break;                      /* 没有更多候选，整段结束 */
+    }
+    if (subCastleFireMatch(c, full_state, stream_state, cb, ctx, offset)
+        == MO_HALT_MATCHING) {
+        return MO_HALT_MATCHING;
+    }
+    loc = offset;                   /* 跳到刚命中的偏移继续 */
+}
+```
+
+逐行判读。`offset` 初值设成 `end` 是一个惯用法：任何 SubCastle 给出的候选偏移都小于 `end`，所以「没人给答案」时 `offset` 保持 `end`，循环自然结束。`mmbit_clear` 每轮清空临时位图，因为 `matching` 只在「当前这一批命中」内有意义。`subCastleMatchLoop` 是真正的工作函数，它遍历所有非互斥 SubCastle，各自算出 `repeatNextMatch` 并更新 `offset` 与 `matching`。`mmbit_any` 为假说明所有租户都报告「再也不会命中」（`REPEAT_STALE`），此时可以安全地放弃整段数据——这是 Castle 在「候选已经耗尽」时最重要的早退。最后 `loc = offset` 而不是 `loc++`，因为同一偏移上可能还有别的租户要报，下一轮会用 `repeatHasMatch` 再确认一次。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**第一，字符集必须完全一致才能合并。** 这是 Castle 最硬的约束，也是性能好坏的分水岭。`[0-9]{6}` 与 `\d{6}` 在语义上等价，但如果一条被优化成 10 个字符的集合、另一条被保留成 10 个字符加别的形式，它们就进不了同一个原型。写规则时应尽量用同一种写法表达同一类字符，让 Rose 有机会合并。
+
+**第二，单重复不要指望 Castle。** `buildRepeatEngine()` 会强制走 LBR。这不是优化选项，而是代码里的硬判断。所以「为什么我的单条 `.{0,100}` 没有走 Castle」这类问题没有意义——它走的是 LBR，而 LBR 更快。
+
+**第三，互斥组的划分是编译期做的，运行期不能改。** 团划分的复杂度在图规模大时会变得显著（`CLIQUE_GRAPH_MAX_SIZE` 是 1000，超过就不做完全划分）。如果一个 Castle 里塞了几百个长度各异的重复，编译时间会明显上升，而互斥优化可能只覆盖一部分。这种情况下拆成多个 Castle 反而更划算。
+
+**第四，Castle 的流状态偏大。** 一个 `{1,1000}` 的重复，`REPEAT_RING` 模型要在环里存上千个 top 的相对偏移，每个 top 一个位，加起来就是上百字节；几十个这样的重复叠在一个 Castle 里，流状态会到几 KB。流式服务里这个成本直接乘以并发流数，必须提前估算（流状态的整体模型见 06-11）。
+
+**第五，`end` 的语义是开区间。** `castleMatchLoop()` 的 `end` 参数是「扫描到此为止、不含」，所有比较都用 `loc < end`。把它当闭区间会导致最后一个字节上的命中丢失，这类 bug 在单元测试里很容易被「数据末尾正好命中」的用例抓到，但线上往往表现为「偶发漏报」。
+
+**第六，报告偏移与 SOM 是两套机制。** Castle 发报告时的起始偏移固定传 0，真正有意义的起始偏移由 Rose 的 SOM 槽位机制补上（见 06-10）。如果开了 `HS_FLAG_SOM_LEFTMOST` 却发现 `from` 不可信，先确认这条模式是不是走了 Castle/LBR 路径，再看 SOM 是否被正确分配到槽位。
+
+**第七，别把 LBR 的类型当成可配置项。** `CASTLE_DOT` / `VERM` / `NVERM` / `SHUFTI` / `TRUFFLE` 是由字符集自动推导的：单字符走 VERM，单字符取反走 NVERM，能构建 shufti 掩码走 SHUFTI，否则退 TRUFFLE，任意字符走 DOT。没有任何 API 可以强制指定，也不应该试图通过改写模式去「骗」某个类型——选错类型的代价远大于收益。
+
+### 7. 小结与延伸阅读
+
+Castle 与 LBR 解决的是同一类问题的两个极端：LBR 用「专用到极致」换常数状态，Castle 用「共享扫描器」换多租户的线性成本。判断标准只有一条——重复的数量。一个重复走 LBR，多个共享字符集的重复走 Castle，字符集不同的重复各自成组。这条分工在 `buildRepeatEngine()` 里只有几行代码，但它决定了有界重复这一类模式的全部性能特征。
+
+如果只记住三件事：第一，Castle 不是逐字节推进的引擎，它的成本与候选密度成正比；第二，互斥组让状态可以共享，`PURE_EXCLUSIVE` 时连活跃位图都省掉；第三，`REPEAT_RING` / `RANGE` / `SPARSE_OPTIMAL_P` 的选择直接决定流状态大小，而流状态是要乘以并发流数的。
+
+延伸阅读：`src/nfa/castle_internal.h` 顶部的流状态 ASCII 图是理解 Castle 布局的最短路径；`src/nfa/repeat.h` 的注释解释了「控制块 vs 重复状态」的划分理由；`src/nfa/castlecompile.cpp` 里的团划分与状态分配是编译期的主要工作量所在。单重复的 LBR 细节与 `vermicelli` 的关系见 06-09；DFA 家族在重复场景下的替代方案见 06-08；流状态的打包与还原见 06-11。
+
+## 06-08 状态压缩 DFA：Sheng32 / Sheng64 / McSheng64
+
+### 1. 背景与动机
+
+确定化有限自动机（DFA）在多正则匹配里有一个诱人的性质：每个字节只需要一次状态转移。没有状态向量、没有例外表、没有候选确认，读一个字节、查一次表、拿到新状态，如此而已。代价是状态爆炸：子集构造最坏情况下状态数相对于 NFA 状态数是指数的，而且每个状态都要为 256 个可能的字节各准备一条转移。传统表驱动 DFA 的存储是「状态数 × 256 × 2 字节」——每个状态 512 字节；一千个状态就是 0.5 MB，而且访问模式是「按输入字节跳转」，几乎每一步都命中不了 L1。
+
+Hyperscan 的第一代 DFA 实现是 McClellan，走的就是表驱动路线，用 8 位或 16 位表项，把「每个状态 256 条转移」放在一张连续表里。它的优点是实现简单、语义直接；缺点是表大、cache 行为差，而且状态越多越糟。Sheng 家族换了一个思路：**不存「每个状态一张 256 项的表」，而存「每个字符一张 64 字节的置换表」，用 SIMD 字节置换指令在寄存器里完成查表**。这样表的总大小与状态数解耦——只要状态数不超过 64，表就固定是 256 × 64 字节，即 16 KiB。
+
+这个变换在数学上是平凡的：DFA 的转移函数本来就是「给定字符 c 和旧状态 s，返回新状态 t」。把它按 c 切片，每一片就是一个「以 s 为下标、以 t 为值」的数组。SIMD 的字节置换指令 `pshufb` / `vpermb` 做的恰好是同一件事：`out[i] = table[in[i]]`，其中 `in` 是 16 或 64 个字节的向量。把「当前状态」广播到向量的每一个字节，做一次置换，取第 0 个字节，就完成了一次 DFA 转移。
+
+限制来自指令本身。`pshufb`（SSSE3）只能在 16 字节的 lane 内做置换，索引只有 4 位，所以最多表达 16 个状态；`vpermb`（AVX-512 VBMI）可以跨 64 字节做置换，索引 6 位，最多 64 个状态。这正是 5.4.0 引入 Sheng32 / Sheng64 / McSheng64 的技术前提：`CHANGELOG.md` 的 5.4.0 条目明确写着三个新引擎都是「leveraging AVX-512 VBMI」。没有 VBMI 的机器上，`sheng32Compile` 与 `sheng64Compile` 会在第一道检查就返回空指针，回落到 McClellan。
+
+### 2. 核心概念
+
+**状态字节的位域编码。** Sheng 家族不把状态存成整数，而是存成一个「带标志位的字节」。低若干位是状态编号，高位是标志：`SHENG_STATE_ACCEPT`（0x10）、`SHENG_STATE_DEAD`（0x20）、`SHENG_STATE_ACCEL`（0x40），掩码 `SHENG_STATE_MASK` 是 0xF；Sheng32 把编号扩到 5 位（掩码 0x1F），标志是 0x20 / 0x40 / 0x80；Sheng64 把编号扩到 6 位（掩码 0x3F），标志只剩 0x40（ACCEPT）与 0x80（DEAD），**没有独立的 ACCEL 位**。这组常量在 `src/nfa/sheng_internal.h:35` 到 `:50`，读代码时必须按版本对号入座，不能把 32 位的位图套到 64 位上。
+
+为什么要塞标志位？因为热循环里最重要的判断是「这一步有没有值得处理的事情」：命中了接受态要发报告，进入死态要提前退出，进入加速态可以跳过一段。如果标志位在同一个字节里，那么四次 `vpermb` 之后只要把四个结果或起来、与 `SHENG32_STATE_FLAG_MASK` 相与，一次判断就能知道「这 4 个字节里有没有事件」；只有非零时才进入慢路径逐字节处理。这个技巧叫 `hasInterestingStates32`，是 DFAx4 能跑起来的关键。
+
+Sheng32 状态字节的位域切分见图 06-08-01，这是读转储、写调试工具时最先要对上的东西。
+
+:::figure id=06-08-01 | name=Sheng32 状态字节的位域切分 | dir=LR
+node n1 "Sheng32 状态字节" blue
+node n2 "bit0 至 bit4 状态编号" teal
+node n3 "bit5 为 ACCEPT" amber
+node n4 "bit6 为 DEAD" red
+node n5 "bit7 为 ACCEL" green
+edge n1 -> n2 "低 5 位"
+edge n1 -> n3 "命中上报"
+edge n1 -> n4 "提前退出"
+edge n1 -> n5 "跳过一段"
+:::
+
+读这张图要注意两点。第一，标志位与编号在同一个字节里，所以「取编号」必须用 `& SHENG32_STATE_MASK`（0x1F），直接强转成整数会把标志位算进去，得到一个远超 `n_states` 的假编号。第二，四个字段的语义是「或」的关系而不是互斥：一个状态可以同时是 ACCEPT 与 ACCEL，热循环会先处理上报、再考虑跳过。Sheng64 的切分不同（编号 6 位、只有两个标志），Sheng 的切分又不同（编号 4 位、三个标志），三者不能混用同一套常量。
+
+**DFAx4：一条链、四个字节。** Sheng32 的主循环一次处理 4 个字节：`cur_state = vpermb512(cur_state, masks[c1])` 得到 a1，再 `vpermb512(cur_state, masks[c2])` 得到 a2，依次到 a4。注意这里**没有并行**：a2 依赖 a1 的结果，因为 DFA 的转移是串行的。那为什么还要展开四次？因为一次 64 字节的掩码加载有延迟，把四次加载与四次置换交错排布，可以让 CPU 在等待第一次置换结果时提前把后三张掩码取进来；同时循环计数、边界判断这些开销被摊到四个字节上。这是典型的「用指令级并行掩盖访存延迟」，不是算法层面的并行。
+
+**表大小与状态数的解耦。** 这是 Sheng 相对 McClellan 的核心优势，值得用数字说明。Sheng（16 状态）的 `shuffle_masks` 是 `m128[256]`，固定 4 KiB；Sheng32 与 Sheng64 的 `succ_masks` 是 `m512[256]`，固定 16 KiB。而未做字母表压缩的 McClellan 是「状态数 × 512 字节」，64 个状态就要 32 KiB，256 个状态要 128 KiB。也就是说在 16 到 64 状态这个区间，Sheng 家族不但更快，而且更小。超过 64 状态，Sheng 家族无能为力，只能回到 McClellan 或者混合引擎。
+
+**McSheng：稠密环走 lane，稀疏尾巴走表。** 真实 DFA 的形状往往不是均匀的：有一两个「粘性」的环（比如 `.*` 之后的循环），绝大多数时间都在环里打转；其余状态是分支产生的稀疏尾巴，每个状态只有少数几个出边。McSheng 的做法是把环上的状态放进 Sheng lane（最多 16 个，或 64 位版本最多 64 个），把尾巴状态放进「Sherman」结构——每个状态一张小的「字符→后继」表，用 SSE 比较指令查找。
+
+判定哪些状态进 lane 的函数是 `find_sheng_states()`（`src/nfa/mcsheng_compile.cpp:537`）。它先找出图中的环，跳过死状态，然后估算每个环的「粘性」：对环上顶点，把所有来自编号更大顶点的入边所对应的字符集合并起来，如果这个集合的字符数少于 30，就认为它不够粘、不值得放进 lane。找到第一个够粘的环之后，从它出发做 BFS，最多收 `MAX_SHENG_STATES`（16）或 `MAX_SHENG64_STATES`（64）个状态。剩下的状态编号整体后移，成为 Sherman 状态，`sheng_end` 就是这条分界线。
+
+**字母表压缩。** McSheng 还有一层优化：`remap[256]` 把 256 个字节映射到一个更小的字母表，`alphaShift` 给出压缩后的位宽。Sherman 表按压缩后的字符索引，一张表能小很多。这个映射在编译期算好、运行期只做一次查表，代价是每次 Sherman 查找多一次访存。
+
+**状态编号只有 14 位。** McSheng 用 `u16` 存状态，`ACCEPT_FLAG` 是 0x8000、`ACCEL_FLAG` 是 0x4000，剩下 `STATE_MASK` 是 0x3FFF，也就是最多 16384 个状态。这个上限比 McClellan 的 16 位状态编号（上限 65535）小，但远超实际使用；超过就会编译失败，回落到纯 McClellan。
+
+### 3. 关键数据结构与源码位置
+
+`struct sheng`、`struct sheng32`、`struct sheng64` 定义在 `src/nfa/sheng_internal.h:68`、`:81`、`:94`，字段（`shuffle_masks` / `succ_masks`、`length`、`aux_offset`、`report_offset`、`accel_offset`、`n_states`、`anchored`、`floating`、`flags`、`report`）的逐项含义见 05-06。`struct sstate_aux`（`accept`、`accept_eod`、`accel`、`top`）在同文件 `:61`，`struct report_list` 在 `:56`。
+
+`struct mcsheng` 与 `struct mcsheng64` 在 `src/nfa/mcsheng_internal.h:64` 与 `:95`，字段包括 `state_count`、`start_anchored`、`start_floating`、`sheng_end`、`sheng_accel_limit`、`accel_limit_8`、`accept_limit_8`、`sherman_limit`、`alphaShift`、`remap[256]`、`sheng_masks` / `sheng_succ_masks`。`SHERMAN_TYPE_OFFSET`、`SHERMAN_LEN_OFFSET`、`SHERMAN_DADDY_OFFSET`、`SHERMAN_CHARS_OFFSET` 这一组常量（`:42` 到 `:48`）描述 Sherman 状态的二进制布局：1 字节类型、1 字节长度、2 字节「父状态」、然后是字符数组与后继数组。
+
+引擎类型在 `src/nfa/nfa_internal.h:66` 的 `enum NFAEngineType` 里：`SHENG_NFA`（16 位版）、`SHENG_NFA_32`、`SHENG_NFA_64`、`MCSHENG_NFA_8`、`MCSHENG_NFA_16`、`MCSHENG_64_NFA_8`、`MCSHENG_64_NFA_16`。判断函数 `isShengType()`、`isSheng32Type()`、`isSheng64Type()`、`isShengMcClellanType()` 都在 `:160` 之后，运行期与转储代码全靠它们分流。
+
+下表把五个 DFA 引擎的关键参数并排，方便在选择失败时判断为什么落到了下一个梯次。参数与灰盒开关不在表中重复（参数见 04-01 ｜ 字段见 05-06 ｜ 模块见 07-05）。
+
+| 引擎 | 状态上限 | 转移表规模 | 关键指令 | 状态字节标志 |
+|---|---|---|---|---|
+| Sheng | 16 | 256 × 16 B = 4 KiB | `pshufb` | 0x10 / 0x20 / 0x40 |
+| Sheng32 | 32 | 256 × 64 B = 16 KiB | `vpermb` | 0x20 / 0x40 / 0x80 |
+| Sheng64 | 64 | 256 × 64 B = 16 KiB | `vpermb` | 0x40 / 0x80 |
+| McSheng | 16383，其中 16 或 64 个走 lane | lane 表 + Sherman 表 | `pshufb` / `vpermb` + SSE | 14 位编号加标志 |
+| McClellan | 8 位或 16 位编号 | 状态数 × 2 B × 字母表大小 | 普通 load | 无（纯编号） |
+
+### 4. 关键流程与调用链
+
+选择过程集中在 `src/rose/rose_build_bytecode.cpp:621` 的 `getDfa()`。它的顺序是固定的六级梯次，每一级失败才进下一级，这个顺序不能随意调换，因为它同时编码了「速度优先」与「体积优先」两种考虑。
+
+这条梯次链与最终 `NFA::type` 的落点见图 06-08-02。
+
+:::figure id=06-08-02 | name=raw_dfa 到具体引擎的六级选择 | dir=TD
+node n1 "raw_dfa 与状态数" blue
+node n2 "Sheng 不超过 16 态" purple
+node n3 "McSheng 混合" purple
+node n4 "Sheng32 不超过 32 态" purple
+node n5 "Sheng64 不超过 64 态" purple
+node n6 "McClellan 表 DFA" red
+node n7 "NFA::type 落库" green
+edge n1 -> n2 "第一级"
+edge n2 -> n7 "成功"
+edge n2 -> n3 "失败且非 transient"
+edge n3 -> n4 "仍失败"
+edge n4 -> n5 "仍失败"
+edge n5 -> n6 "全部失败"
+edge n6 -> n7 "最后兜底"
+:::
+
+逐级说明。第一级 `shengCompile()` 要求 `cc.grey.allowSheng` 为真且有效状态数不超过 16（`src/nfa/shengcompile.cpp:722`），它不需要任何特殊指令集，`pshufb` 是 SSSE3 就有的。第二级 `mcshengCompile()` 只在「非 transient」时尝试，注释解释了原因：transient prefix 通常跑在很小的块上，混合引擎额外的字节码不划算。第三级与第四级是 5.4.0 新增的，分别要求 `cc.target_info.has_avx512vbmi()` 且状态数落在 (16, 32] 与 (32, 64] 区间——注意 Sheng32 里的 `assert(info.size() > 16)`，它假定前一梯次已经失败了，所以这里的状态数必然大于 16。第五级 `mcshengCompile64()` 同样要求 VBMI。最后 `mcclellanCompile()` 兜底，接受任意状态数（受 8/16 位表项宽度限制）。
+
+编译一个 Sheng32 的过程可以概括为「三次遍历」。第一次遍历给每个 DFA 状态算一个状态字节：`getShengState32()` 判断它是不是接受态、死态、加速态，把标志位或进编号。第二次遍历为每个字符生成一张 64 字节的置换表：`createShuffleMasks<sheng32>()` 里有一个长度为 64 的 `buf`，对每个状态 `idx` 填入 `getShengState32(succ_state)`，然后整块写进 `succ_masks[chr]`。第三次遍历分配 aux 结构、报告链与加速表，把所有偏移回填到头部。这三步都在 `shengCompile_int<sheng32>()` 里完成，模板参数决定状态宽度与掩码类型。
+
+运行期入口是 `runSheng32()` / `runSheng32Cb()` / `runSheng32Sam()` 这一组，它们按「是否需要回调、是否需要 EOD、是否单报告」选择具体实现，最终落到 `sheng32_4_cod` 之类的展开函数（命名规则是「宽度 + 4 字节展开 + 模式后缀」）。热循环的结构如下（摘自 `src/nfa/sheng_impl4.h:288` 附近，保留原始变量名）。
+
+```c
+m512 cur_state = set64x8(*state);        /* 把状态字节广播到 64 个 lane */
+const m512 *masks = s->succ_masks;
+
+while (likely(end - cur_buf >= 4)) {
+    const m512 succ_mask1 = masks[*cur_buf];
+    cur_state = vpermb512(cur_state, succ_mask1);
+    const u8 a1 = movd512(cur_state);
+    const m512 succ_mask2 = masks[*(cur_buf + 1)];
+    cur_state = vpermb512(cur_state, succ_mask2);
+    const u8 a2 = movd512(cur_state);
+    /* 第三、第四个字节同理 */
+
+    if (unlikely(INTERESTING_FUNC32(a1, a2, a3, a4))) {
+        /* 逐字节处理 accept / dead / accel */
+    }
+    cur_buf += 4;
+}
+```
+
+判读这段代码要注意四点。第一，`set64x8(*state)` 把同一个状态字节复制到 64 个 lane，是因为 `vpermb` 的语义是「每个输出字节按对应输入字节的值去查表」；把输入全部设成同一个值，输出就全部是同一个「下一状态」，取第 0 个字节即可。第二，`masks[c]` 的索引是**输入字符**，这是 Sheng 与表驱动 DFA 最根本的区别：表按字符切，而不是按状态切。第三，四次置换是严格串行的，`cur_state` 被反复覆盖；展开四次的收益来自掩码加载与置换的交错，以及循环开销的分摊。第四，`INTERESTING_FUNC32` 只做一次或运算加掩码判断，四个结果都没有标志位时直接跳过慢路径——这一步决定了 99% 的字节只花四条置换指令。
+
+McSheng 的循环形状完全不同。它在每个字节上先判断 `s < sheng_end`：在 lane 里的状态走置换，超出的是 Sherman 状态，走 `doSherman16()`（`src/nfa/mcsheng.c:73`）。`doSherman16` 把该状态的字符数组加载成 128 位，与广播后的字符做 `eq128`，`movemask` 得到匹配位，去掉头部 4 字节的元数据（`z &= ~0xf`），再用 `ctz32` 找到第一个匹配的字符槽位，最后用「槽位 × 2 字节」偏移去后继数组取值。这条路径的指令数明显多于置换，所以混合引擎的收益完全取决于「多少比例的字节落在 lane 里」——`find_sheng_states` 选择最粘的环，就是为了最大化这个比例。
+
+状态在流式边界的处理比 LimEx 简单得多：DFA 状态就是一个字节（或两个字节），直接写进流状态即可，没有压缩、没有键、没有例外。这是 DFA 相对 NFA 的又一个小优势，代价是它无法表达「同一个 NFA 状态集合」这种更细的信息，因此在 SOM 与有界重复场景下必须换用别的引擎（SOM 反向扫描用 Gough，见 06-10）。
+
+### 5. 配置/命令/代码实例
+
+下面的程序编译两组模式，一组很小（几条短字面量，DFA 状态数个位数），一组稍大（包含字符类与可选分支，DFA 状态数在 20 上下），然后打印数据库大小。这样可以把「16 KiB 置换表」的成本从总大小里看出来。完整的编译参数见 04-04，模式常量见 04-03。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+
+static void try_compile(const char *tag, const char **pats, unsigned n) {
+    hs_database_t *db = NULL;
+    hs_compile_error_t *err = NULL;
+    unsigned *flags = NULL, *ids = NULL;
+
+    if (hs_compile_multi(pats, flags, ids, n, HS_MODE_BLOCK, NULL,
+                         &db, &err) != HS_SUCCESS) {
+        printf("%s: compile failed: %s\n", tag, err->message);
+        hs_free_compile_error(err);
+        return;
+    }
+    printf("%s: db=%zu bytes\n", tag, hs_database_size(db));
+    hs_free_database(db);
+}
+
+int main(void) {
+    const char *small[2] = { "abcdef", "ghijkl" };
+    const char *mid[3]   = { "[a-z]{3}[0-9]{2}", "foo|bar|baz",
+                             "x[0-9a-f]{4}y" };
+
+    try_compile("small", small, 2);
+    try_compile("mid", mid, 3);
+    return 0;
+}
+```
+
+在支持 AVX-512 VBMI 的机器上编译运行，输出形如下面的文本。示例输出，具体格式需对照实际版本核验。
+
+```text
+small: db=4224 bytes
+mid: db=18432 bytes
+```
+
+逐行判读。`small` 这一组的两条模式都是纯字面量，Rose 会把它们折叠成字面量表，根本不产生 DFA，4 KB 出头基本是 `hs_database` 头部、字面量表与报告表的开销。`mid` 这一组的三条模式都含字符类或分支，必然产生 DFA：`[a-z]{3}[0-9]{2}` 的状态数在十几到二十之间，会走到 Sheng32，光 `succ_masks` 就是 16 KiB，加上 aux、报告链与对齐填充，总大小 18 KB 左右完全对得上。这个数字是判断「到底用了哪个引擎」的第一手证据：如果一条中等复杂度的模式编出 100 KB 以上的库，说明状态数超过 64、落到了 McClellan 的 8 位表；如果只有 5 KB 左右，说明状态数不超过 16、走的是 Sheng。
+
+要看确切引擎，最直接的办法是带 `DUMP_SUPPORT` 的构建下用 `hsdump` 把每个 NFA 转储成文本，第一行就是引擎名。Sheng32 的转储格式在 `src/nfa/shengdump.cpp:273`，头部四行固定为状态数、引擎大小、三个偏移量、起止状态与标志位。下面的片段按该函数的输出顺序给出，示例输出，具体格式需对照实际版本核验。
+
+```text
+sheng32 DFA
+number of states: 21, DFA engine size: 17408
+aux base offset: 16384, reports base offset: 17024, accel offset: 0
+anchored start state: 0, floating start state: 1
+has accel: 0 can die: 1 single report: 0
+state id: 0, reports offset: 0, EOD reports offset: 0, accel offset: 0, top: 0
+state id: 5, reports offset: 17024, EOD reports offset: 0, accel offset: 0, top: 0
+```
+
+判读要点。第一行 `sheng32 DFA` 是引擎标识，出现它就意味着 VBMI 可用、状态数在 17 到 32 之间；如果这里是 `sheng64 DFA`，状态数就在 33 到 64 之间。第二行的 `DFA engine size: 17408` 略大于 16384，差额就是 aux 表、报告链与对齐填充——16384 正是 `256 × 64` 的掩码表。第三行的 `aux base offset` 是 16384，与掩码表大小完全吻合，说明表就在引擎起始处；`reports base offset` 紧随其后。第四行 `can die: 1` 表示 `SHENG_FLAG_CAN_DIE` 被置起，热循环里会在每个四字节组后检查死态并提前退出；`has accel: 0` 表示这个 DFA 没有可加速状态，所有字节都要走置换。最后两行是逐状态转储：`state id: 5` 的 `reports offset` 非零，说明 5 号状态是接受态，`aux->accept` 指向报告链；`top: 0` 表示它不作为 `TOP_N` 事件的触发器。如果看到某个状态的 `accel offset` 非零，说明这个状态是加速态，运行期会用 `run_accel` 跳过一段。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**第一，VBMI 是硬门槛，不是优化开关。** `sheng32Compile` 与 `sheng64Compile` 的第一段代码就是 `if (!cc.target_info.has_avx512vbmi()) return nullptr;`，`mcshengCompile64` 也一样。这意味着数据库的目标平台必须声明 `HS_CPU_FEATURES_AVX512VBMI`（位值 `1ULL << 4`），否则编译期就不会选这些引擎；而如果编译时声明了、目标机却不支持，加载会得到 `HS_DB_PLATFORM_ERROR`。跨机分发数据库时，这一条必须写进部署检查表（平台分派的整体机制见 06-13）。
+
+**第二，16 KiB 不是免费午餐。** 每条 Sheng32/Sheng64 引擎都要 16 KiB 的掩码表，一个数据库里如果有几十条这样的 DFA，字节码会膨胀到几百 KB。反过来，如果模式很小（状态数 ≤16），Sheng 只要 4 KiB，比 McClellan 的「16 × 512 B = 8 KiB」还小。所以「用新引擎一定更好」是错的，关键看状态数落在哪个区间。
+
+**第三，transient prefix 不走混合引擎。** `getDfa()` 里的 `is_transient` 判断把 `mcshengCompile` 与 `mcshengCompile64` 都跳过了，注释说明原因是额外字节码不划算、且这类引擎通常跑在小块上。这意味着同一张图在「作为前缀」与「作为后缀」时可能选到不同引擎，转储对比时不要误以为编译不稳定。
+
+**第四，64 位版本没有 ACCEL 位。** `SHENG64_STATE_ACCEPT` 是 0x40、`SHENG64_STATE_DEAD` 是 0x80，掩码 0x3F，没有 0x20 这一档。如果你按 Sheng32 的位图去解析 Sheng64 的状态字节，会把「接受态」误判成「加速态」。读转储或写调试工具时必须以 `nfa->type` 分支，不能一套常量走天下。
+
+**第五，状态数超过 64 会静默退化。** 没有任何警告，`getDfa()` 会一路失败到 `mcclellanCompile`，得到一个表驱动 DFA。表现是数据库突然变大、吞吐突然下降，但编译仍然成功。定位方法是看 `hs_database_size()` 的量级，或者直接转储看引擎名。想让状态数降下来，只能改写模式：减少可选分支、收紧字符类、把 `.*` 换成更具体的结构。
+
+**第六，McSheng 的收益取决于 lane 命中率。** 混合引擎只在「有一个足够粘的环」时才有意义，`find_sheng_states` 用「回边字符集至少 30 个字符」作为粘性门槛。如果一个 DFA 的环很稀疏（比如只在少数几个字符上自环），这个门槛过不去，`sheng_end` 会小于等于死状态，`mcshengCompile` 直接返回空。此时不要试图调参，应该接受「这张图不适合混合引擎」的事实。
+
+**第七，DFA 与 SOM 是两条路。** Sheng 家族不跟踪起始偏移；开了 `HS_FLAG_SOM_LEFTMOST` 的模式，Rose 会走 Gough（HAIG）之类的路径，SOM 的反向确认另有一套机制（见 06-10）。所以「为什么开了 SOM 之后数据库结构完全变了」不是异常，而是必然。
+
+### 7. 小结与延伸阅读
+
+Sheng 家族的价值不在于「比 McClellan 快多少」，而在于**把 DFA 的存储从「状态数 × 256」变成「256 × 64 字节」的常数**。这个变换让 16 到 64 状态这个最常见区间同时获得了更小的字节码与更好的 cache 行为，也让 5.4.0 成为一个有实质性能收益的版本。代价是它对指令集有硬要求，对状态数有硬上限，超过就只能回到表驱动。
+
+如果只记住三件事：第一，`vpermb` 的 `out[i] = table[in[i]]` 就是「按字符切片的转移表」，这是整个引擎的数学基础；第二，状态字节里塞了 ACCEPT / DEAD / ACCEL 三个标志，才能用一次或运算判断「这四个字节里有没有事件」；第三，`getDfa()` 的六级梯次是固定顺序，理解它就理解了一条模式最终变成什么引擎。
+
+延伸阅读：`src/nfa/sheng_impl4.h` 的 `SHENG32_IMPL` 是最短的完整实现，值得逐行读；`src/nfa/mcsheng_compile.cpp` 的 `find_sheng_states` 展示了「什么样的 DFA 适合混合」这一判断的量化方式；`src/nfa/nfa_internal.h` 的 `NFAEngineType` 与判断函数是阅读所有转储输出的字典。加速器如何在这条循环里跳过字节见 06-09；LimEx 作为「状态向量」路线与 DFA 的对比见 06-06；Castle 在重复场景下替代 DFA 的方式见 06-07。
+
+## 06-09 加速器与预过滤：accel、shufti、truffle、vermicelli
+
+### 1. 背景与动机
+
+NFA 与 DFA 都有一个共同的低效时刻：状态集合稳定、下一个字节大概率「不改变任何事」，但引擎仍然要逐字节走一遍形式上的转移。比如模式 `passwd=` 在正常流量里极少出现，绝大多数字节都是无关字符；如果每个字节都要做一次移位、一次掩码、一次判断，吞吐就被这些「什么也没发生」的字节吃掉了。Hyperscan 的应对不是「让转移更快」，而是「干脆不看这些字节」——用一个远比状态转移便宜的扫描原语，直接跳到下一个「可能改变状态」的位置。
+
+这个思路有三个必须同时满足的条件。第一是**安全性**：跳过的位置必须保证「即使看了也不会产生任何状态变化、不会产生任何报告」，否则就会漏报。第二是**收益性**：跳过一段的收益要大于调用原语的开销，跳两三个字节就调一次加速器是负收益。第三是**可判定性**：编译期必须能算出「哪些字符是可能改变状态的」，并且这个集合要小到能被某种原语表达。
+
+围绕这三点，Hyperscan 造了一组可以统称为「加速器」的原语，加上一个把「当前状态」翻译成「该用哪个加速器」的分派层。原语有四个名字：`vermicelli`（找单个或两个相邻字节）、`shufti`（用双 nibble 查表匹配字符类）、`truffle`（用三张掩码匹配稀疏字符类）、`accel`（分派层，`run_accel` 是唯一入口）。它们被 LimEx、Sheng、LBR、Castle 四个引擎共用，是整个 `src/nfa/` 目录里复用度最高的一层代码。
+
+需要先划清边界：加速器**不产生匹配**。它只回答「从当前位置开始，第一个可能需要处理的字节在哪」。真正的状态转移、报告、压制仍然由宿主引擎完成。这个分工让加速器可以被任意引擎复用，也让它的正确性可以独立验证——只要保证「不跳过任何 stop 字符」即可。
+
+### 2. 核心概念
+
+**stop 字符集。** 从一个状态集合出发，能让状态集合发生「有意义变化」的字符，称为 stop 字符（也叫 escape 字符）。其余字符读进去之后状态集合不变（或者只会在死状态上打转），可以整段跳过。编译期对每个加速状态算出这个集合，再按集合的形状选原语。集合大小决定了选择：1 个字符最简单，几十个字符就得用通用性更强的原语。
+
+**accel 状态与 pext 索引。** LimEx 不是「一个状态一个加速器」，而是「一组状态一个加速器」。`lim.ex->accel` 是一张掩码，标记哪些状态是「加速状态」；运行期用 `pext32(s, accel)` 把当前状态集合里落在加速状态上的那些位「压缩」成一个紧凑索引。`NFA_MAX_ACCEL_STATES` 是 8，所以索引最多 256 种组合，正好用一张 `accelTable[256]` 映射到 aux 数组的下标。这个设计的好处是：不同的加速状态组合可以对应不同的 stop 集，不需要为每种组合单独写分支。
+
+**vermicelli：找字节，或找相邻的两个字节。** 最基本的原语是「在缓冲区里找字节 c」。SSE 版一次比较 16 字节（`VERM_BOUNDARY` 为 16），AVX2 版一次比较 64 字节（`VERM_BOUNDARY` 为 64），两者都在 `src/nfa/vermicelli_sse.h` 里定义。单字节版本处理「模式里有一个必经字符」的情况，比如 `passwd=` 里的 `p`。双字节版本 `vermicelliDoubleExec` 一次找「相邻两个 c」，用于 `c{2}` 这类结构；它的注释坦白承认「double verm is not certain to be precise」——因为一次比较两个 16 字节块只能保证「这两个块里各有一个 c」，不能保证它们相邻，所以要回退到单字节版本确认。`find_verm_run()`（`src/nfa/vermicelli_run.h:82`）把「找 c{n} 的起点」包装成一个循环：先用双字节版找候选，再在 `[s, s+n)` 区间里找反例，找到就继续往后跳。
+
+**shufti：双 nibble 查表。** 一个字节可以拆成高 4 位与低 4 位，各 16 种取值。如果字符类能写成「若干组，每组是『某个高 nibble 集合 × 某个低 nibble 集合』」，就可以用两张 16 字节的表来表达：`lo` 表按低 nibble 索引、`hi` 表按高 nibble 索引，两者相与非零就表示命中。`shuftiFwdSlow()`（`src/nfa/shufti.c:76`）的慢速参考实现只有一行判断：`if (lo[c & 0xf] & hi[c >> 4]) break;`。快速版本用 `pshufb` 在 128 位寄存器里同时查 16 个字节，两次 `pshufb` 加一次 `and` 加一次 `movemask` 就能得到 16 个字节的命中位图。
+
+这个表达的极限是 8 组。`shuftiBuildMasks()`（`src/nfa/shufticompile.cpp:52`）先把字符按高 nibble 分组，再把「低 nibble 集合相同」的高 nibble 合并，最后看有多少个不同的低 nibble 集合——每个集合占 `lo`/`hi` 表里的一个位，而一个字节只有 8 位，超过 8 组就构造失败。源码注释写得很明确：always able to construct masks for 8 or fewer characters。这句话是「8 个字符以内一定能用 shufti」的保证，也是选择梯次里「先试 shufti」的底气。
+
+**truffle：稀疏字符类的兜底。** 当一个字符类的 nibble 分组超过 8 组，shufti 就无能为力了。truffle 换了一种编码：把字符拆成低 4 位（作为掩码内的偏移）与第 4、5、6 位（作为该偏移处字节里的位号），第 7 位决定用哪张表。这样两张 128 位表就能表达任意 256 个字符的子集，`truffleBuildMasks()` 的注释直接说「truffle is always able to represent an entire character class」。它的运行期是三次 `pshufb`：一张表处理「第 7 位为 0」的字符，一张处理「第 7 位为 1」的字符，第三张用常量 `0x8040201008040201` 把「第 4、5、6 位」翻译成位掩码。
+
+**为什么还需要「双字符」变体。** 有些模式的 stop 条件不是单个字符能决定的，比如「`ab` 或 `cd`」这种两字节前缀。`ACCEL_DVERM`、`ACCEL_DVERM_NOCASE`、`ACCEL_DSHUFTI` 就是为此准备的：它们同时看两个字符，只有两字节组合落在允许集合里才算候选。`ACCEL_DVERM_MASKED` 更进一步，用两张掩码 `m1`、`m2` 表达「哪些位必须相同」，`buildDvermMask()`（`src/nfa/accelcompile.cpp:97`）用「所有字符对的按位与」与「按位与的取反」算出掩码，再用「空洞数是否恰好等于字符对数的对数」判断这个集合是否真的能被掩码表达。
+
+**RED_TAPE：永不停止的加速。** `ACCEL_RED_TAPE` 是一个特殊值，`run_accel` 遇到它直接返回 `c_end`，表示「这一段完全不用看」。它用于「当前状态集合下，任何字符都不会产生有意义的变化」的极端情况——典型是纯 `.*` 的中间段。这个优化必须非常小心地证明，一旦判错就是整段漏报。
+
+### 3. 关键数据结构与源码位置
+
+`union AccelAux` 定义在 `src/nfa/accel.h:66`，各个成员（`generic`、`verm`、`dverm`、`mverm`、`mdverm`、`shufti`、`dshufti`、`truffle`）的字段含义见 05-06。`enum AccelType` 在同文件 `:44`，列出 17 种取值。`run_accel()` 的声明在 `:126`，实现在 `src/nfa/accel.c:35`。
+
+关键常量：`ACCEL_MIN_LEN` 是 16（缓冲区短于这个长度就不尝试加速），`BAD_ACCEL_DIST` 是 4、`SMALL_ACCEL_PENALTY` 是 8、`BIG_ACCEL_PENALTY` 是 32（这三个是 Sheng 用来避免「加速太频繁反而更慢」的惩罚值），都在 `src/nfa/accel.h:41` 到 `:49`。`ACCEL_MAX_STOP_CHAR` 是 24，定义在 `src/nfagraph/ng_limex_accel.h:52`，是「多少个 stop 字符以内还值得用 truffle」的门槛。
+
+下表把四个原语的能力边界放在一起。完整的参数与编译开关见 04 册，不在表中重复（参数见 04-01 ｜ 字段见 05-06 ｜ 模块见 07-08）。
+
+| 原语 | 输入形状 | 关键指令 | 可表达规模 | 源码 |
+|---|---|---|---|---|
+| vermicelli | 单字符或双字符 | `pcmpeqb` + `movemask` | 1 到 2 个字符 | `src/nfa/vermicelli_sse.h` |
+| shufti | 稠密字符类 | 两次 `pshufb` + `and` | 最多 8 个 nibble 组 | `src/nfa/shufti.c` |
+| truffle | 稀疏字符类 | 三次 `pshufb` | 任意 256 字符子集 | `src/nfa/truffle.c` |
+| accel | 分派层 | `pext` + 表查 | 最多 256 种状态组合 | `src/nfa/accel.c` |
+
+### 4. 关键流程与调用链
+
+编译期的入口是 `ng_limex_accel` 一组函数（`src/nfagraph/ng_limex_accel.cpp`），它们负责从图里识别「加速状态」并算出 stop 集；真正的编码在 `buildAccelAux()`（`src/nfa/accelcompile.cpp:228`）与 `buildAccelSingle()` / `buildAccelDouble()`。stop 字符集到加速原语的选择梯次见图 06-09-01，它同时给出了最终的统一入口。
+
+:::figure id=06-09-01 | name=stop 字符集到加速原语的选择梯次 | dir=TD
+node n1 "停止字符集" blue
+node n2 "恰 1 个字符" teal
+node n3 "2 个大小写字符" teal
+node n4 "可分成不超过 8 组" amber
+node n5 "不超过 24 个字符" amber
+node n6 "放弃加速" gray
+node n7 "run_accel 统一入口" green
+edge n1 -> n2 "计数"
+edge n2 -> n3 "不是单字符"
+edge n3 -> n4 "不是大小写对"
+edge n4 -> n5 "shufti 构建失败"
+edge n5 -> n6 "truffle 也超限"
+edge n2 -> n7 "ACCEL_VERM"
+edge n3 -> n7 "VERM_NOCASE"
+edge n4 -> n7 "ACCEL_SHUFTI"
+edge n5 -> n7 "ACCEL_TRUFFLE"
+:::
+
+选择逻辑的细节值得逐条对照源码。`buildAccelSingle()` 开头先排除「stop 集是全集」的情况（`info.single_stops.all()`），因为全集意味着任何字符都要处理，加速毫无意义。然后按 `outs`（stop 字符个数）分支：等于 1 就用 `ACCEL_VERM`，把字符写进 `aux->verm.c`；等于 2 且是「同一个字符的大小写对」（`isCaselessChar()`）就用 `ACCEL_VERM_NOCASE`，把字符大写化后存起来；否则尝试 `shuftiBuildMasks()`，成功就用 `ACCEL_SHUFTI`；失败则看 `outs` 是否不超过 `ACCEL_MAX_STOP_CHAR`，是就用 `ACCEL_TRUFFLE`；再不行就放弃，`accel_type` 保持 `ACCEL_NONE`。
+
+运行期的唯一入口是 `run_accel()`。它先按 `accel_type` 分派到对应的 `Exec`，再对返回值做一次偏移修正：`rv = MAX(c + accel->generic.offset, rv); rv -= accel->generic.offset;`。这个修正的语义是：`offset` 表示「加速窗口相对于状态有前置字节」，返回值不能早于 `c + offset`，否则会重复处理已经处理过的位置。每个分支在调用前还有一个长度保护，比如 `ACCEL_VERM` 要求 `c + 15 < c_end`，不够长就直接原样返回 `c`——短缓冲区走加速器只会亏。
+
+LimEx 侧的接入点有两处。第一处是热循环里的 `RUN_ACCEL_FN`：当状态集合与 `accel` 掩码相交时，调 `doAccel32/64/128/256/384/512`，内部 `pext(s, accel)` 得到索引，`accelTable[idx]` 得到 aux 下标，再交给 `run_accel`。第二处是循环外的「进入加速态」检查：如果初始状态就是加速态，可以一次性跳过一大段再进入逐字节循环。Sheng 侧的接入更简单：`sheng32_4_cod` 在开头检查 `INNER_ACCEL_FUNC32(*state) || OUTER_ACCEL_FUNC32(*state)`，命中就调 `run_accel`，并用 `BAD_ACCEL_DIST` 控制「如果只跳过很短一段，就给下一次加速加惩罚」，避免在密集 stop 字符上反复进出加速器。
+
+shufti 的内部结构见图 06-09-02，因为「双 nibble」这个词经常被误解成「两个字节」——它其实是「一个字节的两半」。
+
+:::figure id=06-09-02 | name=shufti 的双 nibble 查表 | dir=LR
+node n1 "输入字节 c" blue
+node n2 "低 4 位 c 与 0xf" teal
+node n3 "高 4 位 c 右移 4" teal
+node n4 "lo 表 pshufb" amber
+node n5 "hi 表 pshufb" amber
+node n6 "按位与" purple
+node n7 "movemask 得候选" green
+edge n1 -> n2 "取低半"
+edge n1 -> n3 "取高半"
+edge n2 -> n4 "作索引"
+edge n3 -> n5 "作索引"
+edge n4 -> n6 "位掩码"
+edge n5 -> n6 "位掩码"
+edge n6 -> n7 "16 字节并行"
+:::
+
+理解这张图的关键是：`lo` 表回答「这个低 nibble 属于哪些组」，`hi` 表回答「这个高 nibble 属于哪些组」，两者相与就是「同时满足两边的组」，非零即命中。所以一个字符类只要能表示成「组 × 组」的并集，就能被 shufti 表达；组数受限于 8 位。这也是为什么 `[a-z]` 能走 shufti（低 nibble 有三种集合、高 nibble 有 2 到 3 个），而 `[a-zA-Z0-9_]` 这种混合类往往要走 truffle。
+
+### 5. 配置/命令/代码实例
+
+下面这段 C 程序用三条模式分别压向三种原语：`GET /` 是双字符 stop（斜杠与空格），`[a-z]+@` 是稠密字符类，`[0-9a-f]{8}` 是十六进制类。程序只打印数据库大小与命中，用来观察不同原语对字节码体积的影响。完整参数见 04-04。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <string.h>
+
+static int on_match(unsigned int id, unsigned long long from,
+                    unsigned long long to, unsigned int flags, void *ctx) {
+    (void)from; (void)flags; (void)ctx;
+    printf("id=%u to=%llu\n", id, to);
+    return 0;
+}
+
+int main(void) {
+    const char *pats[3] = { "GET /", "[a-z]+@", "[0-9a-f]{8}" };
+    unsigned ids[3] = { 1, 2, 3 };
+    hs_database_t *db = NULL;
+    hs_scratch_t *sc = NULL;
+    hs_compile_error_t *err = NULL;
+
+    if (hs_compile_multi(pats, NULL, ids, 3, HS_MODE_BLOCK, NULL,
+                         &db, &err) != HS_SUCCESS) {
+        fprintf(stderr, "compile: %s (expr %d)\n", err->message,
+                err->expression);
+        hs_free_compile_error(err);
+        return 1;
+    }
+    if (hs_alloc_scratch(db, &sc) != HS_SUCCESS) {
+        hs_free_database(db);
+        return 1;
+    }
+
+    const char *data = "GET /index deadbeef user@host";
+    printf("db=%zu\n", hs_database_size(db));
+    hs_scan(db, data, (unsigned)strlen(data), 0, sc, on_match, NULL);
+
+    hs_free_scratch(sc);
+    hs_free_database(db);
+    return 0;
+}
+```
+
+输出形如下面的文本。示例输出，具体格式需对照实际版本核验。
+
+```text
+db=8384
+id=1 to=7
+id=3 to=22
+id=2 to=27
+```
+
+逐行判读。`db=8384` 里包含了三条模式各自的引擎与加速表：第一条 `GET /` 是五字符字面量，会进字面量表；后两条含字符类，会产生小型 DFA 或 NFA，加速表 `AccelAux` 每项只有几十字节，对总量影响很小——加速器的成本在编译期（要算 stop 集、要试构建掩码），不在字节码体积上。三条命中的结束偏移分别是 7、22、27：`to=7` 是 `GET /` 的结尾（下标 6 是斜杠），`to=22` 是 `deadbeef` 的结尾（八位十六进制全部命中），`to=27` 是 `user@` 的结尾。注意第三条 `[0-9a-f]{8}` 能命中 `deadbeef` 说明字符类的大小写敏感语义正确——如果编译时误加了 `HS_FLAG_CASELESS`，`DEADBEEF` 也会命中，但那属于标志语义问题，不是加速器的问题。
+
+第二个片段是 shufti 的慢速参考实现，来自 `src/nfa/shufti.c:76`。它只有四行，但把整个原语的语义说尽了。
+
+```c
+static really_inline
+const u8 *shuftiFwdSlow(const u8 *lo, const u8 *hi, const u8 *buf,
+                        const u8 *buf_end) {
+    for (; buf < buf_end; ++buf) {
+        u8 c = *buf;
+        if (lo[c & 0xf] & hi[c >> 4]) {
+            break;
+        }
+    }
+    return buf;
+}
+```
+
+逐行判读。`lo` 与 `hi` 都是 16 字节的表，`lo` 按低 4 位索引、`hi` 按高 4 位索引。`lo[c & 0xf]` 取出「这个低 nibble 属于哪些组」的位掩码，`hi[c >> 4]` 取出「这个高 nibble 属于哪些组」的位掩码，两者相与非零表示「存在一个组同时包含这两个 nibble」，也就是「这个字节属于目标字符类」。循环退出时 `buf` 指向第一个命中的字节，或者等于 `buf_end`（没有命中）。快速版本把这段逻辑用 `pshufb` 向量化：一次处理 16 个字节，用 `movemask` 把比较结果压成一个 16 位整数，再用 `ctz` 找第一个置位——语义完全一致，只是把 16 次循环换成了四条指令。理解了这个等价关系，就能明白为什么 shufti 的组数上限是 8：一个字节只有 8 位，装不下第 9 个组。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**第一，加速器算错就是漏报，不是慢一点。** stop 集必须包含「所有可能改变状态或触发报告的字符」，少一个就会跳过真实匹配。这类 bug 极难复现，因为它依赖具体数据与具体分块。验证手段只有一个：用 `hscollider` 与 PCRE 对拍，且语料要覆盖字符类边界（参见 07-12 的工具说明）。
+
+**第二，短缓冲区不要加速。** `ACCEL_MIN_LEN` 是 16，`run_accel` 的每个分支还有自己的 `c + 15 >= c_end` 判断。这些保护不是保守，而是必要：加速器的固定开销（加载掩码、构造向量）在 16 字节以内根本摊不平。自己写宿主代码时如果按很小的块喂数据，加速器会频繁放弃，表现为「块越小越慢」。
+
+**第三，双字符原语必须「提前一个字节停」。** `ACCEL_DVERM` 与 `ACCEL_DSHUFTI` 的调用都写成 `c_end - 1`，源码注释是 need to stop one early to get an accurate end state。原因是这些原语返回的是「两个字符中第一个的位置」，如果扫到缓冲区最后一个字节，第二个字符就越界了，返回位置也不再准确。少写这个 `- 1` 会导致越界读或位置错位。
+
+**第四，`offset` 修正不能省。** `run_accel` 末尾的 `MAX(c + offset, rv) - offset` 看起来绕，但它保证了「返回值不早于加速窗口的起点」。当 `offset` 非零时（表示加速方案的判定依赖前置字节），漏掉这一步会让上层重复处理已经走过的字节，表现为同一次匹配被上报多次。
+
+**第五，nocase 的掩码存的是大写。** `ACCEL_VERM_NOCASE` 的 `verm.c` 是 `info.single_stops.find_first() & CASE_CLEAR` 的结果，也就是大写形式；`vermicelliExec` 的 `nocase` 参数会在比较前把输入也大写化。自己构造 `AccelAux` 时如果存了小写，就会永远匹配不上。
+
+**第六，shufti 失败不等于没有加速。** 组数超过 8 时 `shuftiBuildMasks` 返回 -1，选择梯次会自动落到 truffle；只有当 stop 字符数也超过 24 时才彻底放弃。所以「字符类写得太散」的代价是「从两次 pshufb 变成三次 pshufb」，不是「完全没有加速」。真正需要警惕的是 stop 集接近全集的情况，那时任何原语都救不了。
+
+**第七，`RED_TAPE` 只应该由编译器生成。** 这个值表示「整段不用看」，正确性依赖编译期对图的严格分析。手写或修改字节码时绝不能自己塞一个 `ACCEL_RED_TAPE`，否则会把整段数据跳过。它出现在转储里是正常的，出现在手写结构里是灾难。
+
+### 7. 小结与延伸阅读
+
+加速器的本质是「用一个更便宜的判定，替换掉一串注定无事发生的状态转移」。它不改语义、不产生匹配、不参与状态更新，因此可以被所有引擎共享。四种原语覆盖了从「一个字符」到「任意字符类」的全部形状，选择梯次则由 stop 集的大小与结构决定：1 个字符走 vermicelli，8 组以内走 shufti，24 个字符以内走 truffle，再不行就放弃。
+
+如果只记住三件事：第一，`lo[c & 0xf] & hi[c >> 4]` 是 shufti 的全部秘密，组数上限 8 来自字节宽度；第二，加速器只回答「下一个候选在哪」，状态更新仍然由宿主引擎做；第三，短缓冲、双字符提前停、offset 修正这三个细节，是加速器正确性的三条命门。
+
+延伸阅读：`src/nfa/accel.c` 的 `run_accel` 是分派层的全貌，值得先读；`src/nfa/shufticompile.cpp` 与 `src/nfa/trufflecompile.cpp` 的注释解释了两种编码的构造与极限；`src/nfa/vermicelli_run.h` 的 `find_verm_run` 展示了「找 c{n} 起点」这个看似简单的任务为什么需要一个循环加反例检查。加速器如何嵌入 LimEx 的热循环见 06-06；Castle 与 LBR 如何复用这些原语见 06-07；DFA 引擎自带的加速路径见 06-08。
+## 06-10 SOM 语义与槽位管理
+
+### 1. 背景与动机
+
+Hyperscan 默认只报告匹配的结束偏移。这是自动机的自然产物：读到第 n 个字节、状态进入接受态，于是「这里有一个匹配结束」，至于它从哪开始，标准子集构造早就把这个信息丢掉了——DFA 的状态只记录「当前可能处在哪些位置」，不记录「最早的那个起点」。要补回起点，必须在自动机之外另建一套记忆机制，这套机制就是 SOM（Start of Match）。
+
+SOM 难在三个地方。第一是**语义**：正则匹配天然有多个起点，`a+` 在 `aaaa` 上有四个起点，用户要的通常是「最左」那个（leftmost），这就要求引擎在多个候选中保留最早的，而不是最后一个。第二是**时机**：起点信息在匹配开始的那一刻就已经确定，但报告要等到匹配结束才发出，中间可能隔着几十万个字节；在流式模式下，这段距离还会跨越无数次 `hs_scan_stream` 调用，起点必须被写进流状态、随流一起搬运。第三是**成本**：每个需要记起点的模式至少占一个槽位，每个槽位在流状态里占 2、4 或 8 字节；一万条模式就是几十到几百 KB 的流状态，乘以并发流数就是内存账单。
+
+Hyperscan 的解法是把「记起点」抽象成**槽位（slot）**。编译期为每个「需要起点的匹配路径」分配一个槽位号，运行期用一张 `som_store[]` 数组按槽位号存绝对值；流式边界上再把绝对值转成「相对当前流偏移的距离」写进流状态，宽度由 horizon 决定。这套设计的关键取舍都集中在 horizon 上：宽度越窄，流状态越省，但能记住的距离越短；一旦超出，回调拿到的不是错误码，而是一个特殊偏移值 `HS_OFFSET_PAST_HORIZON`。
+
+这也是本套资料反复强调「SOM 与 `SINGLEMATCH`、`PREFILTER` 互斥」的原因：那两个标志会改变「哪一次匹配被报告」的语义，而 SOM 的整个槽位分配与压制逻辑都建立在「每次匹配都要精确记录起点」的前提上，两者无法共存。互斥不是实现偷懒，而是语义冲突。
+
+### 2. 核心概念
+
+**leftmost 语义。** `HS_FLAG_SOM_LEFTMOST` 要求报告「最左起点」。注意它不等于「最长匹配」也不等于「最短匹配」：`a+` 在 `aaaa` 上仍然会在每个结束位置各报一次，每次报的起点都是 0。真正决定报几次的是 `HS_FLAG_SINGLEMATCH`（每条流最多一次）与去重逻辑，而这些标志与 SOM 互斥，所以开了 SOM 就只能是「每次结束都报、起点取最左」。
+
+**槽位不是模式。** 一个模式可能需要多个槽位（多个子图各记一个起点），多个模式也可能共享一个槽位（前缀完全相同）。`SomSlotManager` 的职责就是做这个多对多的映射，并且尽量让「相同的前缀」复用同一个槽位。判等用的是「前缀图结构 + escapes 字符集 + 父槽位 + 是否 reset 哨兵」四元组，`SlotEntryHasher` 与 `SlotEntryEqual`（`src/som/slot_manager.cpp:66`、`:79`）实现了这套哈希与比较，其中图结构用 `hash_holder` / `is_equal` 做结构等价判断，而不是指针比较。
+
+**距离与绝对偏移。** 运行期 `som_store[]` 里存的是绝对偏移（相对于流起点）。流状态里存的是**相对距离**：`rel = stream_offset - som_value`。这样做的原因是流状态要跨块搬运，而绝对偏移会越来越大、需要的位宽也越来越多；存相对距离则只要「匹配不太长」就能用窄类型装下。`storeSomValue()`（`src/som/som_stream.c:50`）负责这个转换，并在距离超出宽度时写入哨兵。
+
+**horizon 的三档。** `HS_MODE_SOM_HORIZON_LARGE` 用 8 字节（实际是 u64 全宽，等价于「不限」）、`MEDIUM` 用 4 字节（约 43 亿字节）、`SMALL` 用 2 字节（约 65534 字节）。这三档的语义在 `src/hs_compile.h:1178` 到 `:1218` 的注释里写得很清楚：LARGE 总是精确、MEDIUM 限制在 2^32 字节内、SMALL 限制在 2^16 字节内。模式位到字节数的映射在 `src/hs.cpp:155` 的 `getSomPrecision()`：LARGE 返回 8、MEDIUM 返回 4、SMALL 返回 2；**VECTORED 模式强制返回 8**，因为向量模式下块与块之间没有稳定的流偏移，只能用全宽；BLOCK 模式没有任何 horizon 位，返回 0。
+
+**block 模式下没有 horizon 问题。** 这是最容易被忽略的一点。`getSomPrecision()` 在没有 horizon 位时返回 0，`RoseEngine::somHorizon` 也就是 0；`src/database.c:1534` 的注释明确写着 somHorizon is 0 in block mode（SOM values live in scratch only）。也就是说 block 模式的 SOM 只存在 scratch 的 `som_store[]` 里，不写流状态，自然不存在截断，永远不会返回 `HS_OFFSET_PAST_HORIZON`。这个值只在流式（以及会写流状态的场景）里出现。
+
+**哨兵与 `HS_OFFSET_PAST_HORIZON`。** 三个宽度各有一个哨兵：u16 的 `SOM_SENTINEL_SMALL`（0xFFFF）、u32 的 `SOM_SENTINEL_MEDIUM`（0xFFFFFFFF）、u64 的 `SOM_SENTINEL_LARGE`（全 1）。写入时如果 `rel_offset` 超过哨兵值，就把它钳到哨兵；读出时看到哨兵就还原成 `SOM_SENTINEL_LARGE`，也就是 `~0ULL`。这个值一路传到回调，就是 `HS_OFFSET_PAST_HORIZON`（`src/hs_runtime.h:615` 定义为 `~0ULL`）。它不是一个错误码，而是一个「起点未知」的占位值，业务代码必须显式判断。
+
+**反向 NFA。** 有些情况下起点无法用「距离」表达：前缀是一个复杂的子图，匹配结束时根本无法从状态里推出「这次匹配从哪开始」。这时 Rose 会为这个前缀单独编一个**反向 NFA**，从结束偏移往回扫，扫到第一个接受态就是起点。`runRevNfa()`（`src/som/som_runtime.c:154`）实现了这条路径：先用 `getSomRevNFA()` 取出反向 NFA，再调 `nfaBlockExecReverse()`，回调 `somRevCallback` 只会把 `from_offset` 往更小的方向更新（`LIMIT_TO_AT_MOST`），从而保证「最左」。反向 NFA 必须是有界宽度的——源码里有一句 `assert(nfa->maxWidth); // No inf width rev NFAs`，这就是「部分无界重复开了 SOM 之后无法编译」的根源。
+
+**同一偏移上的竞争。** 同一批数据可能在同一个 `to_offset` 上产生多次「设置槽位」的请求（比如多个前缀同时到达）。Hyperscan 的规则是「最早的起点获胜」：`setSomLoc()` 用 `fatbit_set()` 的返回值判断这是不是本偏移的第一次写，是就直接存，不是就 `LIMIT_TO_AT_MOST` 取更小值。`som_set_now` 在 `to_offset` 变化时被清空，所以这个「本偏移」的作用域是精确的。
+
+### 3. 关键数据结构与源码位置
+
+`RoseEngine` 里与 SOM 相关的字段是 `hasSom`、`somHorizon`、`somLocationCount`、`somLocationFatbitSize`、`somRevOffsetOffset`、`somRevCount`，以及 `stateOffsets` 里的 `somValid`、`somWritable`、`somLocation`（`src/rose/rose_internal.h:331` 起，字段见 05-05）。`hasSom` 决定运行期走不走 SOM 路径；`somHorizon` 是每个槽位在流状态里的字节宽度；`somLocationCount` 是槽位总数，也是 `som_store[]` 的长度。
+
+`SomSlotManager` 定义在 `src/som/slot_manager.h:58`，私有字段是 `nextSomSlot`、`cache`、`rev_nfas`、`historyRequired`、`precision`（`:97` 到 `:109`）。接口有五个：`getSomSlot()`（常规分配，带缓存去重）、`getInitialResetSomSlot()`（为 reset 哨兵分配，需要检查「前缀是否会清掉尾巴」）、`getPrivateSomSlot()`（强制独占）、`rollbackSomTo()`（回滚到某个数量，用于「试了不行就退回」的场景）、`addRevNfa()`（登记反向 NFA 并返回索引）。`somHistoryRequired()` 返回流式模式下已经承诺的历史长度，这个值最终会影响 `historyRequired`。
+
+`struct som_operation` 在 `src/som/som_operation.h:57`，只有三个字段：`type`、`onmatch`（要改哪个槽位）、`aux`（距离或反向 NFA 索引）。15 种类型定义在 `:41` 到 `:55`，可以分成四组：内部写槽（`SOM_INTERNAL_LOC_SET` 及 `_IF_UNSET` / `_IF_WRITABLE`）、内部拷贝（`SOM_INTERNAL_LOC_COPY*`、`_MAKE_WRITABLE`）、从已有值设置（`SOM_INTERNAL_LOC_SET_FROM*`）、外部回调（`SOM_EXTERNAL_CALLBACK_REL` / `_ABS` / `_STORED` / `_REV_NFA`）。`writeSomOperation()`（`src/rose/rose_build_program.cpp:434`）负责把报告类型翻译成这些操作码。
+
+下表把四组操作与它们的语义放在一起，便于在阅读 `som_runtime.c` 的 switch 时对号入座。完整的结构体字段见 05-09，编译标志见 04-02。
+
+| 组别 | 代表类型 | 语义 | 运行期动作 |
+|---|---|---|---|
+| 直接写槽 | `SOM_INTERNAL_LOC_SET` | 用 `to - distance` 写槽 | `setSomLoc` |
+| 条件写槽 | `_IF_UNSET` / `_IF_WRITABLE` | 仅在未写或可写时写 | 查 multibit 再写 |
+| 槽间拷贝 | `SOM_INTERNAL_LOC_COPY` | 把另一个槽的值搬过来 | 读 `som_store` 再写 |
+| 外部回调 | `SOM_EXTERNAL_CALLBACK_REL` | 直接以相对距离上报 | 回调收到 `to - dist` |
+| 反向确认 | `SOM_EXTERNAL_CALLBACK_REV_NFA` | 跑反向 NFA 求起点 | `nfaBlockExecReverse` |
+
+三档 horizon 与「每流状态总量」的关系见图 06-10-01，`block` 模式作为对照放在一起。
+
+:::figure id=06-10-01 | name=四档 SOM 精度与流状态成本 | dir=TD
+node n1 "LARGE 8 字节" blue
+node n2 "MEDIUM 4 字节" teal
+node n3 "SMALL 2 字节" amber
+node n4 "block 仅存 scratch" gray
+node n5 "每流状态等于槽数乘宽度" red
+edge n1 -> n5 "最精确"
+edge n2 -> n5 "2 的 32 次方内"
+edge n3 -> n5 "2 的 16 次方内"
+edge n4 -> n5 "不占流状态"
+:::
+
+### 4. 关键流程与调用链
+
+编译期的起点在 `NG` 的构造函数。`NG::NG(cc, elements, somPrecision)`（`src/nfagraph/ng.cpp:81`）把 `somPrecision` 交给 `ssm`（`SomSlotManager`），此后整个编译过程共享这一个管理器。Rose 在分解阶段为每个「需要起点的报告」调用 `getSomSlot()`：如果缓存里有相同的前缀，直接复用槽位号；否则 `nextSomSlot++` 分配新号并登记。`getInitialResetSomSlot()` 更复杂，它要检查「这个 reset 哨兵是否会清掉尾巴」，`sentClearsTail()` 就是那个判定函数（`slot_manager.cpp:177`），只有通过检查的哨兵才能复用已有的 reset 组，否则新建一组。
+
+落字节码时，`buildFinalEngine()` 里有一行 `proto.somHorizon = ssm.somPrecision();`（`src/rose/rose_build_bytecode.cpp:3819`），把精度写进引擎头。同时 `somLocationCount` 由槽位总数决定，`somLocationFatbitSize` 由 `fatbit_size()` 算出。反向 NFA 被 `addRevNfa()` 收集进 `rev_nfas`，最终以「偏移表 + NFA 块」的形式挂在 `RoseEngine` 的 `somRevOffsetOffset` 处。
+
+运行期的路径可以概括为「写槽 → 存流 → 读槽 → 上报」。Rose 程序里的 `REPORT_SOM_AWARE` 指令调用 `roseHandleSomSom()`，后者把 `som_operation` 与当前 `som` 一起交给 `handleSomInternal()`（`src/som/som_runtime.c:229`）。这个函数先做两件事：如果 `to_offset` 变了就清空 `som_set_now` 与 `som_attempted_set`；然后按 `type` 分派到 `setSomLoc()`、`setSomLocRevNfa()` 或拷贝类操作。写槽时用 `mmbit_set()` 标记「这个槽已经有值」，用 `som_store_writable` 控制「是否允许覆盖」。
+
+流式边界上的搬运是成对的。`storeSomToStream()`（`som_stream.c:95`）在写流状态时遍历 `som_store_valid` 中所有已置位的槽，把绝对值转成相对距离写进 `state + stateOffsets.somLocation`；`loadSomFromStream()`（`:152`）在下一个块开始时做逆运算，把哨兵还原成 `~0ULL`。这两个函数都用 `mmbit_iterate` 遍历，所以成本与「已置位的槽数」成正比，而不是与总槽数成正比——大多数流上只有少数槽位有值，这一点对性能很关键。
+
+「编译期分配槽位」与「运行期写槽、跨块搬运、回调上报」这条完整路径见图 06-10-02。
+
+:::figure id=06-10-02 | name=SOM 槽位从分配到回调的路径 | dir=LR
+node n1 "需要起点的子图" teal
+node n2 "SomSlotManager 分配" amber
+node n3 "槽号与距离" amber
+node n4 "scratch 的 som_store" purple
+node n5 "流状态的 somLocation" purple
+node n6 "回调给出 from" green
+node n7 "距离超限的哨兵" red
+edge n1 -> n2 "编译期"
+edge n2 -> n3 "去重后编号"
+edge n3 -> n4 "报告时写入"
+edge n4 -> n5 "块边界打包"
+edge n5 -> n4 "下一块展开"
+edge n4 -> n6 "报告读取"
+edge n4 -> n7 "超出 horizon"
+edge n7 -> n6 "返回 PAST_HORIZON"
+:::
+
+注意图中 `n5 -> n4` 那条边是反向的：展开发生在下一块开始时，方向与打包相反，两者必须严格配对。如果宿主程序在错误的偏移上调用 `hs_scan_stream`（比如重放历史数据），展开出来的 `som_store` 就会带着错误的基准，表现为起点偏移整体偏移一个固定量——这类 bug 的典型特征是「所有 SOM 结果都差同一个值」。
+
+### 5. 配置/命令/代码实例
+
+下面的程序刻意制造一个「起点距离超过 64 KB」的流式匹配，用 SMALL 与 LARGE 两档各跑一遍，观察 `from` 的差别。数据是 `BEGIN` 加上 150000 个 `A` 再加 `END`，按 4096 字节分块喂进去。完整标志与模式常量见 04-02、04-03。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define TOTAL (5 + 150000 + 3)
+
+static int cb(unsigned int id, unsigned long long from,
+              unsigned long long to, unsigned int flags, void *ctx) {
+    (void)id; (void)flags; (void)ctx;
+    printf("from=%llu to=%llu\n", from, to);
+    return 0;
+}
+
+static void run(unsigned mode, const char *tag) {
+    hs_database_t *db = NULL;
+    hs_scratch_t *sc = NULL;
+    hs_stream_t *st = NULL;
+    hs_compile_error_t *err = NULL;
+
+    if (hs_compile("BEGIN[A-Z]*END", HS_FLAG_SOM_LEFTMOST,
+                   HS_MODE_STREAM | mode, NULL, &db, &err) != HS_SUCCESS) {
+        printf("%s: compile: %s\n", tag, err->message);
+        hs_free_compile_error(err);
+        return;
+    }
+    hs_alloc_scratch(db, &sc);
+
+    char *buf = malloc(TOTAL);
+    memcpy(buf, "BEGIN", 5);
+    memset(buf + 5, 'A', 150000);
+    memcpy(buf + 5 + 150000, "END", 3);
+
+    hs_open_stream(db, 0, &st);
+    for (size_t off = 0; off < TOTAL; off += 4096) {
+        size_t n = TOTAL - off < 4096 ? TOTAL - off : 4096;
+        /* 最后一个块用 close 的结束语义，其余用普通扫描 */
+        if (off + n == TOTAL) {
+            hs_close_stream(st, sc, cb, NULL);
+        } else {
+            hs_scan_stream(st, buf + off, (unsigned)n, 0, sc, cb, NULL);
+        }
+    }
+    printf("%s done\n", tag);
+
+    free(buf);
+    hs_free_scratch(sc);
+    hs_free_database(db);
+}
+
+int main(void) {
+    run(HS_MODE_SOM_HORIZON_SMALL, "small");
+    run(HS_MODE_SOM_HORIZON_LARGE, "large");
+    return 0;
+}
+```
+
+输出形如下面的文本。示例输出，具体格式需对照实际版本核验。
+
+```text
+from=18446744073709551615 to=150005
+small done
+from=0 to=150005
+large done
+```
+
+逐行判读。第一行是 SMALL 档的结果：`from` 是 18446744073709551615，也就是 2 的 64 次方减一，正是 `HS_OFFSET_PAST_HORIZON` 的值（`~0ULL`）。原因是起点 0 与终点 150005 之间的距离超过了 u16 能表示的范围（65534），在某个块边界打包时 `storeSomValue()` 把相对距离钳成了哨兵，后续展开就变成了 `~0ULL`。第二行 `to=150005` 说明结束偏移始终是精确的——horizon 只影响起点，不影响终点，这一点必须记牢：即使 `from` 不可用，`to` 仍然可以用来做「哪条规则命中了」的判断。第四行是 LARGE 档：同样的数据、同样的分块，`from=0` 精确到起点。两条结果的唯一差别就是 horizon，代码逻辑完全一样，这直接把「horizon 是精度预算」这句话变成了可复现的现象。
+
+有一个细节值得注意：SMALL 档并没有「报错」或「不报」，它照常回调、照常给 `to`，只是把 `from` 换成一个哨兵。这是刻意的 API 设计——SOM 是「尽力而为」的附加信息，不能让 horizon 越界变成扫描失败。业务代码如果直接把 `from` 拿去做减法（比如算长度），就会得到一个天文数字，因此必须写成 `if (from == HS_OFFSET_PAST_HORIZON) { /* 起点未知 */ }`。
+
+第二个片段是哨兵逻辑本身，来自 `src/som/som_stream.c:50` 的 `storeSomValue()`，删去了调试输出。
+
+```c
+if (som_value == SOM_SENTINEL_LARGE) {
+    switch (som_size) {
+    case 2: *(u16 *)stream_som_store = SOM_SENTINEL_SMALL;  break;
+    case 4: *(u32 *)stream_som_store = SOM_SENTINEL_MEDIUM; break;
+    case 8: *(u64a *)stream_som_store = SOM_SENTINEL_LARGE; break;
+    }
+    return;
+}
+u64a rel_offset = stream_offset - som_value;
+switch (som_size) {
+case 2: rel_offset = MIN(rel_offset, SOM_SENTINEL_SMALL);  break;
+case 4: rel_offset = MIN(rel_offset, SOM_SENTINEL_MEDIUM); break;
+case 8: break;
+}
+```
+
+逐行判读。第一段处理「值本身已经是哨兵」的情况：说明这个槽位在当前块里被标记为「起点未知」，写入时要把哨兵按目标宽度重新编码——u16 要写成 0xFFFF、u32 要写成 0xFFFFFFFF，不能直接截断 64 位的全 1（虽然结果相同，但显式分支让意图清楚）。第二段是正常路径：`stream_offset` 是当前流偏移，`som_value` 是绝对起点，两者相减得到相对距离。第三段是关键：`MIN(rel_offset, SENTINEL)` 把超限距离钳到哨兵值，而不是回绕或截断。这个 `MIN` 保证了「距离越界」与「距离恰好等于哨兵」在读出时都会被解释成「未知」，但代价是它把 0xFFFF 这个合法距离也变成了未知——这就是 SMALL 档的实际可用范围是 65534 而不是 65535 的原因。8 字节档不需要钳位，因为 `rel_offset` 本身就是 u64，只有「槽位从未被写过」才会出现哨兵。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**第一，不开 `HS_FLAG_SOM_LEFTMOST` 时 `from` 没有任何意义。** 回调签名里 `from` 永远存在，但只有开了这个标志才有语义。很多「起点不对」的现场其实是「根本没开 SOM」，此时 `from` 可能是 0、可能是上一次的残留值，取决于实现细节，绝不能当数据用。判断方法很简单：`hs_expression_info()` 返回的 `unordered_matches` 之类字段不直接告诉你 SOM，但编译标志是你自己传的，检查一遍即可。
+
+**第二，SOM 与三个标志互斥，且错误信息各不相同。** `src/compiler/compiler.cpp:193` 拒绝 `SINGLEMATCH + SOM_LEFTMOST`，错误文本是 `HS_FLAG_SINGLEMATCH is not supported in combination with HS_FLAG_SOM_LEFTMOST.`；`:216` 拒绝 `QUIET + SOM_LEFTMOST`；`:249` 拒绝 `PREFILTER + SOM_LEFTMOST`。这三条都在解析入口就抛出，属于 `HS_COMPILER_ERROR`。它们不是「暂时不支持」，而是语义上无法同时满足，不要期待未来版本会放开。
+
+**第三，horizon 是「精度预算」，不是「最大匹配长度」。** SMALL 档能记住 65534 字节以内的起点距离，但这不是说「超过 65534 的匹配就报不出来」——匹配照报，只是 `from` 变成 `HS_OFFSET_PAST_HORIZON`。选档时要问的是「业务能接受多大的起点误差」，而不是「最长模式有多长」。
+
+**第四，流状态成本 = 槽数 × 宽度。** `somLocationCount` 是全局槽位数，`somHorizon` 是宽度，两者相乘就是每条流为 SOM 付出的字节数（`src/database.c:1535` 就在算这个乘积，并用 64 位防止溢出）。一万条模式、每条一个槽、SMALL 档，就是 20 KB/流；十万并发流就是 2 GB。这个数字必须在容量规划阶段算清楚，而不是等到 OOM 才发现。
+
+**第五，`HS_OFFSET_PAST_HORIZON` 必须显式判断。** 它是 `~0ULL`，参与任何算术都会溢出。正确的写法是先比较再计算：`if (from != HS_OFFSET_PAST_HORIZON) { len = to - from; }`。如果业务一定要长度，可以退化成「至少 `to - horizon`」，但绝不能直接用哨兵做减法。
+
+**第六，反向 NFA 要求有界宽度。** `runRevNfa()` 里有一句断言「没有无界宽度的反向 NFA」，`nfa->maxWidth` 必须非零。这意味着 `.*` 这类无界重复开 SOM 时，Rose 只能用「距离」而不是「反向扫描」来记起点；如果某个结构既无法用距离表达、又无界，编译就会失败。这是「部分有界重复在开 SOM 后无法编译」的真实原因。
+
+**第七，别在错误的偏移上重放数据。** 流状态的 SOM 值是按「打包时的流偏移」编码的相对距离，重放历史数据（或用 `hs_reset_stream` 回到过去）会让展开的基准错位。正确做法是用 `hs_copy_stream` 分叉、用 `hs_reset_and_copy_stream` 重置，而不是把旧数据再喂一遍（流状态的整体语义见 06-11）。
+
+### 7. 小结与延伸阅读
+
+SOM 的本质是「在自动机之外维护一张起点表」，槽位是这张表的索引，horizon 是这张表的位宽预算，反向 NFA 是「无法用距离表达时的兜底」。四者合起来，把「起点」这个 DFA 天然丢失的信息重新变成可查询的输出，代价是流状态膨胀与一套复杂的竞争/压制规则。
+
+如果只记住三件事：第一，`from` 只在开了 `HS_FLAG_SOM_LEFTMOST` 时有意义，且流式下受 horizon 限制；第二，`HS_OFFSET_PAST_HORIZON` 是 `~0ULL`，必须显式判断，它只影响起点不影响终点；第三，槽位去重与反向 NFA 是编译期决定的，模式写法直接决定流状态大小。
+
+延伸阅读：`src/som/slot_manager.cpp` 的 `getSomSlot` 与 `getInitialResetSomSlot` 是槽位去重的全部逻辑，重点看 `SlotEntryEqual` 比较了哪四个维度；`src/som/som_runtime.c` 的 `handleSomInternal` 是 15 种操作的 switch，配合本篇的表格读最省力；`src/som/som_stream.c` 只有一百多行，却把「宽度、哨兵、相对距离」三件事讲透了。流状态的打包与压缩见 06-11；`RoseEngine` 里 SOM 相关字段的定义见 05-05；SOM 反向 NFA 与 Gough 引擎的关系见 06-08 的结尾。
+
+## 06-11 流式匹配与流状态压缩
+
+### 1. 背景与动机
+
+块模式与流模式的区别，表面上是「一次给一整块」还是「分多次给」，实质上是「有没有一个跨调用存活的对象」。块模式每次 `hs_scan` 都从零开始，函数返回后所有中间结果都作废；流模式必须把「已经看过但还没有结论」的那部分信息留在内存里，因为一个匹配可能从三个月前的第一个字节开始，到今天这一块才闭合。这个跨调用存活的内存，就是流状态。
+
+流状态一旦存在，就带来三个工程问题。第一是容量。`hs_stream_size()` 返回的是状态体的固定上界，等于 `sizeof(struct hs_stream)` 加 `RoseEngine::stateOffsets.end`；对上千条模式、开启 SOM 的数据库，这个值可能是几 KB 到几十 KB。一个网关同时维持十万条 TCP 会话，乘起来就是 GB 级常驻内存。而真实状态里绝大部分区域是空的：表示「哪些队列活跃」的位图大多数位为 0，SOM 槽位大多数无效，anchored 表在流推进足够远之后再也用不到。把这些空区域也原样保存，是纯粹的浪费。
+
+第二是持久化与迁移。会话要能被换出到磁盘、搬迁到另一台机器、在进程崩溃后由接管者恢复。这就要求状态能被写成一个字节串，并且能在新进程里、对着同一份数据库重新变成一个可继续喂数据的流。这也解释了为什么 Hyperscan 提供的是 `hs_compress_stream` 而不是「你自己 memcpy 那几十 KB」：只有库自己知道哪些字段是「活的」。
+
+第三是解释「压缩后大小为什么会变」。很多人第一次用 `hs_compress_stream` 时会假设输出是定长的，于是按 `hs_stream_size` 的返回值一次性备好缓冲，结果发现 `used_space` 远小于上界，或者在不同时刻压缩同一流得到不同长度。这个波动不是实现瑕疵，而是「按活跃性搬运」的必然结果：活跃队列越多、SOM 槽越满、历史窗口越靠前，压缩表示就越长。
+
+还有一个容易被忽略的动机：压缩表示是**不带自描述信息**的。它没有魔数、没有版本号、没有数据库指纹，格式完全由 `RoseEngine` 的布局决定。这不是疏忽，而是把「绑定关系」交给调用方：只有你能决定这个字节串属于哪份数据库、哪个版本、哪条会话。理解这一点，才能理解本篇后半部分几乎所有陷阱的来源。
+
+### 2. 核心概念
+
+`struct hs_stream` 本身极小，只有两个字段：指向 `RoseEngine` 的 `rose` 指针，以及当前流的累计偏移 `offset`。真正的状态体紧跟在结构体之后，基址由 `getMultiState()` 计算，即「流指针加结构体大小」。状态体内部的每一块区域都通过 `RoseEngine::stateOffsets` 里的偏移定位，因此同一个数据库编译出来的所有流，布局完全一致。
+
+需要强调 `offset` 的语义：它是**整个流**已经喂入的字节数，不是当前块的偏移。回调里拿到的 `from`、`to` 也相对于整个流的起点。这一点与块模式一致（块模式整个流就是那一块），但流模式下跨块时如果按块内偏移理解，就会得出「匹配位置越跑越靠前」的错觉。
+
+状态体可以按「用途」分成四组。第一组是调度位图：状态标志字节、表示哪些角色有状态的 multibit、活跃叶子队列位图、活跃左扩展队列位图。第二组是引擎私有状态：每个 NFA 的 `streamState`（按 `NfaInfo::stateOffset` 定位）、左扩展的 lag 字节表、long literal 状态、anchored 表状态。第三组是逻辑与组合：耗尽向量、逻辑向量、组合向量。第四组是数据与偏移：历史缓冲区 `history`、组标志、SOM 的 valid/writable 位图与槽位数组。
+
+`history` 是流式语义的核心。它的长度由编译期算出的 `historyRequired` 决定，含义是「为了判断跨块的 anchored / floating 匹配，最多需要回看多少字节」。`maintainHistoryBuffer()` 在每次扫描成功后把新数据尾部拷进历史窗口；如果本次块长小于窗口，就先把旧历史左移再拷。历史只保留最近的一段，因此**早于窗口的数据不可重放**——这正是「流式模式要求数据按序、不能回头补历史」的技术根据。
+
+multibit（简称 mmbit）是 Hyperscan 自己实现的分层位图，用来表示「哪些队列/角色/键是活跃的」。位数多时它不是一块平坦的位数组，而是金字塔：上层每个字描述下层若干字是否有非零位。压缩算法就建立在这个结构上：深度优先遍历，若某块的「有效位子集」与整块等价（`mmbit_popcount` 相等），就说明下层没有额外信息，整块省略；全零时只写一个字的头。于是「活跃队列很少」的流能压得非常小，「几乎所有队列都活跃」的流压缩收益趋近于零。
+
+SOM 的搬运是另一个典型：压缩时只遍历 `somValid` 位图中为 1 的槽，把该槽 `somHorizon` 字节的偏移值拷出去；无效槽完全不占空间。这是「按需搬运」而不是「压缩算法」的最佳例子，也说明为什么开 SOM 的流压缩后大小与「有多少模式已经见过起点」强相关。
+
+最后要区分三种「大小」：`hs_stream_size()` 是状态体上界；`hs_compress_stream()` 的输出是当前活跃状态的编码；两者之间没有固定比例。把上界当预算、把压缩输出当实际占用，是容量规划的正确做法。
+
+### 3. 关键数据结构与源码位置
+
+流对象的定义在 `src/state.h`，`struct hs_stream` 与 `getMultiState()` 都在这个文件里，注释明确写了「状态体紧跟结构体、偏移以结构体末尾为基准」。`RoseEngine` 中与本篇相关的字段是 `historyRequired`、`stateOffsets`、`anchoredDistance`、`activeArrayCount`、`activeLeftCount`、`leftfixBeginQueue`、`somLocationCount`、`somHorizon`、`rolesWithStateCount`、`ekeyCount`、`lkeyCount`、`lopCount`、`ckeyCount`，定义在 `src/rose/rose_internal.h`（字段见 05-05）。
+
+压缩与还原的实现极有特色：真正的搬运逻辑只写了一遍，放在 `src/stream_compress_impl.h`，靠六个宏在 `src/stream_compress.c` 里被定义三次，展开成三个函数。`COPY` 在压缩侧是 `COPY_IN`（断言后 `memcpy` 到缓冲），在还原侧是 `COPY_OUT`（先检查剩余空间，不够就返回 0），在计长侧是 `SIZE_COPY_IN`（只累加偏移、不碰内存）。`COPY_MULTIBIT` 对应 `mmbit_compress` / `mmbit_decompress` / `mmbit_compsize` 三个位图接口，`FN_SUFFIX` 决定函数名后缀 `sc_compress` / `sc_expand` / `sc_size`。这种「一份模板三种语义」的写法，既保证了压缩与还原的字段顺序绝对一致，也解释了为什么计长路径不做边界检查——它根本不写缓冲区。
+
+对外的三个入口在 `src/stream_compress.h`：`compress_stream()`、`expand_stream()`、`size_compress_stream()`。公共 API 在 `src/runtime.c`：`hs_open_stream`（`runtime.c:556`）、`hs_scan_stream`（`runtime.c:1019`）、`hs_close_stream`（`runtime.c:1038`）、`hs_reset_stream`（`runtime.c:1067`）、`hs_copy_stream`（`runtime.c:747`）、`hs_reset_and_copy_stream`（`runtime.c:775`）、`hs_stream_size`（`runtime.c:1097`）、`hs_compress_stream`（`runtime.c:1225`）、`hs_expand_stream`（`runtime.c:1258`）、`hs_reset_and_expand_stream`（`runtime.c:1298`）。位图接口见 `src/util/multibit.h` 与 `src/util/multibit_compress.h`。
+
+下表把状态区域与对应的处理手段放在一起，便于对照源码阅读；参数与返回码语义见 04-05。
+
+| 状态区域 | 压缩手段 | 触发条件与说明 |
+|---|---|---|
+| 状态标志、`offset` | 定长 `memcpy` | 总是搬运，标志位决定流是否已终止 |
+| 角色 / 活跃队列位图 | mmbit 金字塔裁剪 | 按活跃位数收益，全零时只留一个字 |
+| 各 NFA 的 `streamState` | 按活跃位迭代搬运 | 只搬 `activeLeafArray` 中置位的队列 |
+| 左扩展 lag 字节 | 按活跃位搬 1 字节 | 仅非瞬态左扩展，且 lag 索引有效 |
+| SOM 槽位 | 只搬 `somValid` 为 1 的槽 | 每槽宽度等于 `somHorizon` |
+| anchored 表状态 | 条件搬运 | 仅当 `offset <= anchoredDistance` 时搬 |
+| 历史缓冲区 | 只搬有效尾部 | 长度取 `min(offset, historyRequired)` |
+
+从这张表能看出一个规律：搬运量由「活跃度」决定，而不是由「数据库规模」决定。这也解释了为什么同一个数据库上，刚打开的流压缩后很小，跑了很久且大量模式见过起点的流压缩后接近上界。
+
+### 4. 关键流程与调用链
+
+打开流的第一步是校验。`hs_open_stream()` 先查 `stream` 指针非空，把它置空，然后 `validDatabase()`（只查魔数与版本），再检查 `db->bytecode` 落在头部区间内、`hs_get_bytecode()` 结果 16 字节对齐，接着比较 `rose->mode` 是否等于 `HS_MODE_STREAM`——不等就是 `HS_DB_MODE_ERROR`。之后调用 `validateStateLayout()` 做一次完整的偏移合法性检查，因为后面的 `init_stream()` 会按这些偏移直接写内存。全部通过才按 `sizeof(struct hs_stream) + stateOffsets.end` 分配。
+
+`init_stream()` 有三个细节值得记住。第一，当 `init_history` 为真时，它把历史窗口末尾 16 字节填成 `0x5a`，理由是 FDR 引擎会无条件读取这 16 字节做前缀比较，初值必须确定（源码注释写得很直白）。第二，`s->offset` 置 0，`setStreamStatus(state, 0)`，再 `roseInitState()` 按数据库里的初始化表铺开各区域。第三，清空耗尽向量、清空逻辑与组合向量、初始化 SOM 状态。`hs_reset_stream()` 复用同一个流对象时 `init_history` 传 0，历史保留，只重置其余状态——这是复用时唯一「不清」的区域。
+
+扫描的调用链是 `hs_scan_stream()` → `markScratchInUse()` → `hs_scan_stream_internal()`。后者按顺序做：读状态标志，若已 `TERMINATED` / `EXHAUSTED` / `ERROR` 则直接返回对应码（终止返回 `HS_SCAN_TERMINATED`，耗尽返回 `HS_SUCCESS`）；长度为 0 直接返回成功且不推进偏移；用 `getHistoryAmount()` 算出可回看的历史量；`populateCoreInfo()` 把数据指针、长度、历史指针、流偏移塞进 scratch；有 SOM 时 `loadSomFromStream()` 把槽位读进 scratch；偏移为 0 时跑一次零偏移 boundary 程序；然后按 `rose->runtimeImpl` 三分支执行（完整 Rose、纯字面量、单外缀）。
+
+扫描收尾的顺序同样重要：先 `setStreamStatus()` 把可能被置位的终止/耗尽标志写回流；若有内部错误返回 `HS_UNKNOWN_ERROR`；否则在「未要求停止」的前提下调用 `maintainHistoryBuffer()`、把 `id->offset` 增加本次长度、并在有 SOM 时 `storeSomToStream()` 把 scratch 里的槽位写回。注意历史推进与偏移推进是**同一个条件分支**里的，任何导致停止匹配的情况都不会推进历史——这也意味着流的「已消费偏移」与「历史内容」始终一致。
+
+压缩链路的入口是 `hs_compress_stream()`。它先调 `size_compress_stream()` 算出精确需求（返回 0 视为布局非法），把需求写进 `used_space`，空间不足就返回 `HS_INSUFFICIENT_SPACE`；空间足够才真正 `compress_stream()`。还原链路的入口是 `hs_expand_stream()`：校验数据库、对齐、模式，按上界分配，再 `expand_stream()`；展开失败会先释放内存再返回 `HS_INVALID`，不会泄漏半个流。
+
+`hs_reset_and_expand_stream()` 是「原地还原」，语义上等价于「先把旧流的 EOD 报告补完，再把压缩表示覆盖上去」。因此传入回调时它会先跑一遍 `report_eod_matches()`，让旧流尾部的待报告匹配有机会吐出来，然后才覆盖。很多「还原后丢了最后一条匹配」的现场，根因就是用了 `hs_expand_stream()` 而不是这个接口，或者用了这个接口却没传回调。
+
+流状态从打开到压缩、还原、复用的完整关系见图 06-11-01，其中压缩与还原之间是「同一份 `RoseEngine` 下的编码与解码」这一强绑定关系。
+
+:::figure id=06-11-01 | name=流对象生命周期与压缩还原的四种接续方式 | dir=LR
+node n1 "hs_open_stream" blue
+node n2 "hs_scan_stream 分块喂入" blue
+node n3 "hs_compress_stream 冻结" amber
+node n4 "hs_close_stream 释放" gray
+node n5 "hs_expand_stream 新建" green
+node n6 "hs_reset_and_expand_stream" green
+node n7 "hs_reset_stream 清空复用" teal
+node n8 "hs_copy_stream 分叉" teal
+edge n1 -> n2 "按序喂块"
+edge n2 -> n3 "保存活跃状态"
+edge n3 -> n5 "跨进程落盘"
+edge n5 -> n2 "继续扫描"
+edge n3 -> n6 "原地覆盖还原"
+edge n6 -> n2 "继续扫描"
+edge n2 -> n4 "结束并补 EOD"
+edge n1 -> n7 "同一会话换新"
+edge n7 -> n2 "重新开始"
+edge n1 -> n8 "复制整块状态"
+edge n8 -> n2 "两副本独立推进"
+:::
+
+压缩时到底搬了哪些区域、按什么顺序搬，见图 06-11-02。图中「固定字段」「位图裁剪」「活跃项迭代」是三条并列的搬运策略，最后都汇入同一个字节串。
+
+:::figure id=06-11-02 | name=流状态压缩的三条搬运策略与还原路径 | dir=TD
+node n1 "hs_stream：rose 指针 + offset" blue
+node n2 "状态体：stateOffsets 分区" blue
+node n3 "固定字段直接 memcpy" teal
+node n4 "mmbit 金字塔裁剪" teal
+node n5 "活跃 NFA 的 streamState" amber
+node n6 "有效 SOM 槽位" purple
+node n7 "压缩字节串" amber
+node n8 "hs_expand_stream 还原" green
+edge n1 -> n2 "取状态基址"
+edge n2 -> n3 "状态标志与偏移"
+edge n2 -> n4 "活跃位图"
+edge n2 -> n5 "按活跃位迭代"
+edge n2 -> n6 "按 valid 位迭代"
+edge n3 -> n7 "顺序写出"
+edge n4 -> n7 "变长写入"
+edge n5 -> n7 "按队列写入"
+edge n6 -> n7 "按槽写入"
+edge n7 -> n8 "同一 RoseEngine"
+:::
+
+### 5. 配置/命令/代码实例
+
+下面的程序把「打开 → 分块扫描 → 查询压缩所需空间 → 压缩 → 关闭 → 还原 → 继续扫描」串成一条完整链路。模式 `ab+c` 跨两块才闭合，正好用来验证历史回看；SOM 打开是为了让输出能看出跨块匹配的起点仍被正确保留。完整 API 参数见 04-05，编译标志见 04-02。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int on_match(unsigned int id, unsigned long long from,
+                    unsigned long long to, unsigned int flags, void *ctx) {
+    (void)flags;
+    (void)ctx;
+    printf("match id=%u [%llu, %llu)\n", id, from, to);
+    return 0; /* 0 表示继续扫描 */
+}
+
+int main(void) {
+    hs_database_t *db = NULL;
+    hs_scratch_t *scratch = NULL;
+    hs_compile_error_t *cerr = NULL;
+    hs_stream_t *stream = NULL;
+    hs_stream_t *restored = NULL;
+
+    if (hs_compile("ab+c", HS_FLAG_SOM_LEFTMOST, HS_MODE_STREAM, NULL,
+                   &db, &cerr) != HS_SUCCESS) {
+        fprintf(stderr, "compile failed: %s\n", cerr->message);
+        hs_free_compile_error(cerr);
+        return 1;
+    }
+    if (hs_alloc_scratch(db, &scratch) != HS_SUCCESS) {
+        hs_free_database(db);
+        return 1;
+    }
+
+    size_t ceiling = 0;
+    hs_stream_size(db, &ceiling);
+    printf("stream_size ceiling = %zu\n", ceiling);
+
+    hs_open_stream(db, 0, &stream);
+    hs_scan_stream(stream, "xabb", 4, 0, scratch, on_match, NULL);
+
+    size_t need = 0, used = 0;
+    hs_compress_stream(stream, NULL, 0, &need); /* 只查询所需空间 */
+    char *frozen = malloc(need);
+    if (hs_compress_stream(stream, frozen, need, &used) == HS_SUCCESS) {
+        printf("compressed = %zu bytes\n", used);
+    }
+
+    hs_scan_stream(stream, "bc", 2, 0, scratch, on_match, NULL);
+    hs_close_stream(stream, scratch, on_match, NULL);
+
+    if (hs_expand_stream(db, &restored, frozen, used) == HS_SUCCESS) {
+        hs_scan_stream(restored, "bc", 2, 0, scratch, on_match, NULL);
+        hs_close_stream(restored, scratch, on_match, NULL);
+    }
+
+    free(frozen);
+    hs_free_scratch(scratch);
+    hs_free_database(db);
+    return 0;
+}
+```
+
+示例输出，具体格式需对照实际版本核验。
+
+```text
+stream_size ceiling = 1184
+compressed = 47 bytes
+match id=0 [1, 6)
+match id=0 [1, 6)
+```
+
+逐行判读。第一行的 1184 是 `hs_stream_size()` 给出的状态上界，等于 `sizeof(struct hs_stream)` 加 `stateOffsets.end`；它随模式数量、是否开 SOM、SOM horizon 大小、各引擎状态宽度共同变化，换一条模式就会变，不能当常量。第二行的 47 是压缩后的实际字节数，远小于上界，原因正是此时活跃队列只有一条、SOM 只有一个槽有效、`historyRequired` 只有几个字节；这个数会随流推进而增长，绝不能当容量预算用。第三行来自原始流的第二块：`xabb` 加 `bc` 组成 `xabbc`，`ab+c` 从头匹配到偏移 6，开区间写法表示最后一个字节下标为 5；起偏移 1 由 `HS_FLAG_SOM_LEFTMOST` 提供，没有这个标志时 `from` 无意义。第四行与第三行完全相同，但它来自**还原出来的流**——因为压缩点在此之前，还原后重新喂相同的 `bc` 必然得到相同的匹配，这一对重复行正是「压缩是无损的」最直观的证据。如果第四行消失或偏移不对，先怀疑还原时用了不同的数据库，而不是怀疑压缩算法。
+
+第二种常见写法是「先探测、再分配、失败重试」。因为 `hs_compress_stream()` 在空间不足时会返回 `HS_INSUFFICIENT_SPACE` 并把需求写回 `used_space`，所以可以按下面的方式做定长缓冲池。
+
+```c
+size_t need = 0;
+hs_error_t rv = hs_compress_stream(stream, buf, cap, &need);
+if (rv == HS_INSUFFICIENT_SPACE) {
+    char *bigger = realloc(buf, need);
+    if (bigger) {
+        buf = bigger;
+        cap = need;
+        rv = hs_compress_stream(stream, buf, cap, &need);
+    }
+}
+if (rv == HS_SUCCESS) {
+    /* need 现在是实际使用量，可写入会话表 */
+}
+```
+
+注意 `need` 在成功时是「已用」，在失败时是「所需」，语义随返回值变化，这是接口里最容易写错的一处。稳妥的做法是每次调用后立刻按返回值分支处理，不要先读 `need` 再判断。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，压缩表示没有自描述头，跨版本、跨平台、跨数据库展开都是未定义行为。它只包含「字段的裸字节」，解码完全依赖 `RoseEngine` 的布局；一旦数据库换了版本，偏移含义就变了，`expand_stream()` 会按错误的位置解释内存。生产上应把「数据库指纹 + 版本 + 会话编号」写在自己的封装头里，还原前先比对，而不是把裸压缩串直接扔进共享缓存。
+
+第二，压缩表示里包含状态标志，因此「已终止的流」压缩后展开仍然是已终止的。如果业务在回调里返回非零终止了扫描，然后想把流冻结、稍后恢复，恢复后第一次 `hs_scan_stream()` 会直接返回 `HS_SCAN_TERMINATED`，不会处理新数据。这不是 bug，而是「终止」被当作流的终态记录下来了。需要「可恢复的暂停」时，不要在回调里终止，改用 `hs_copy_stream()` 分叉。
+
+第三，`hs_compress_stream()` 不关闭流。压缩之后原流依然可用、依然需要 `hs_close_stream()` 释放；忘记关闭就是稳定的内存泄漏，而且泄漏量与流数量成正比，在小流量测试里根本看不出来。
+
+第四，`offset` 是流级累计值，跨块不会归零。把回调里的 `from`、`to` 减去「本块起始偏移」是错的；正确做法是直接用流级偏移，或者在业务层维护「本会话已喂入字节数」做展示换算。
+
+第五，历史窗口之外不可回放。`historyRequired` 是编译期按模式算出的上界，喂数据的顺序一旦打乱（比如 TCP 乱序段直接送进来、或者重传时重复喂了旧数据），匹配结果就没有意义。流式接口不做重组、不做去重，这是库的能力边界。
+
+第六，`hs_stream_size()` 是上界不是实际占用。把它乘以会话数做容量规划会严重高估；把压缩输出当上界又会低估并频繁触发 `HS_INSUFFICIENT_SPACE`。可行做法是「按上界分配对象池、按压缩输出计入持久化容量」两套数字分开管理。
+
+第七，`hs_reset_stream()` 保留历史、重置其余状态，`init_stream` 的 `init_history` 参数为 0 就是这个意思；如果业务希望「完全等价于新流」，需要在重置后先喂一段与旧数据无关的填充，或者直接关闭重开。误以为重置会清历史，会导致新会话的第一个匹配莫名带上旧会话的尾巴。
+
+第八，scratch 依然不是线程安全的。流可以多线程各自持有，但**同一个 scratch 不能并发进入**；`hs_scan_stream()` 里 `markScratchInUse()` 失败会直接返回 `HS_SCRATCH_IN_USE`，这是保护而不是排队。正确模型是「一线程一 scratch，流可跨线程迁移但迁移时必须保证没有并发扫描」。
+
+### 7. 小结与延伸阅读
+
+流式匹配的本质是「把未决状态外化成一块可搬运的内存」。Hyperscan 把这块内存切成若干语义明确的区域，用 `stateOffsets` 索引，用 multibit 描述活跃性，再用一份三展开的模板实现「压缩 / 还原 / 计长」三条路径。压缩之所以有效，不是因为用了通用压缩算法，而是因为真实流里大量区域是空的，而库知道怎么只搬活的那些。
+
+记住三件事：压缩表示与数据库强绑定，必须自带版本与指纹；压缩是逐字段按活跃度搬运，长度随状态波动；压缩不等于关闭，还原不等于续传，`hs_reset_and_expand_stream` 才是「原地接续」的语义。
+
+延伸阅读建议：想弄清状态区域逐字段含义查 05-09 与 05-05；想弄清 `hs_open_stream` 系列 API 的返回码与参数查 04-05；想弄清 `historyRequired` 与 SOM horizon 是如何在编译期算出来的，回看 06-10 与 06-04；工程侧的流式接入与数据库分发分别见 03-05、03-03；模块边界见 07-10。本篇的检索口径统一为（字段见 05-09 ｜ 参数见 04-05 ｜ 模块见 07-10）。
+
+## 06-12 数据库序列化、版本校验与 HMAC 完整性
+
+### 1. 背景与动机
+
+Hyperscan 的数据库是编译产物，编译一次可能要几秒到几分钟，扫描一块数据却只要微秒级。这个不对称决定了生产部署的正确形态：在构建机上编译、序列化成字节流、分发到成百上千个节点、在节点上反序列化加载。序列化因此不是「可选优化」，而是部署模型的基础设施。
+
+一旦数据库变成「在网络上传输、在磁盘上存放的字节流」，它就从「可信的内部对象」变成了「不可信的输入」。这个转变很关键，因为数据库不是纯数据：它是一段被运行的字节码，里面有大量偏移量、表长度、状态宽度。一个被篡改的偏移可以让扫描器越界读，一个被篡改的长度可以让反序列化拷贝溢出。所以 Hyperscan 在头部放了两级完整性校验：`hmac_hdr` 保护头部字段（尤其是 `length`），`hmac` 保护字节码本体。顺序不能反——不先确认 `length` 可信，就不能按 `length` 去读字节码算 HMAC。
+
+第三个动机是「版本与平台绑定」。数据库里嵌着编译时的假设：字节码的布局随版本变化，指令集随目标平台变化，扫描模式（block / stream / vectored）也写进了引擎头。加载时必须逐项核对，否则轻则行为错乱，重则崩溃。这三个核对分别对应 `HS_DB_VERSION_ERROR`、`HS_DB_PLATFORM_ERROR`、`HS_DB_MODE_ERROR`，它们是排障时最有信息量的三个返回码。
+
+最后要澄清一个常见误解：HMAC 在这里证明的是「这段字节由持有 `HS_DB_HMAC_KEY` 的构建产出，且未被改动」，而不是「这段字节是可信的」。密钥是编译进库里的常量，任何拿到库文件的人都能提取。它的真实作用是防传输损坏、防误配（把 A 版本的库配给 B 版本的数据库）、防「随手改一个字节试试」的低成本篡改，而不是防御有能力读二进制并重新签名的攻击者。把它当签名体系用，是安全设计上的误判。
+
+### 2. 核心概念
+
+数据库头部是固定 192 字节的结构：`magic`、`version`、`length`、`platform`、`bytecode`、`hmac[32]`、`hmac_hdr[32]`、`padding[25]`，随后是可变的 `bytes[]`。`bytes[]` 起始偏移固定为 192，`padding` 的作用就是把头部撑到这个位置，同时保证按 64 字节缓存行对齐调整 `bytecode` 时，字节码起点不会落进两个 HMAC 字段里。`bytecode` 是「相对数据库起点的字节码偏移」，由于对齐需要，它可能小于 192，所以合法范围是 `[offsetof(padding), offsetof(bytes)]` 这个区间，运行时会显式检查。
+
+`HS_DB_MAGIC` 默认是 `0xdbdbdbdb`，可以在构建期用 `-DHS_DB_MAGIC=` 替换成站点私有值；`HS_DB_VERSION` 直接取 `HS_VERSION_32BIT`，即把主次修订版本压进一个 32 位整数。这两个值构成「廉价校验」：`validDatabase()` 只查这两项，因为它在每次扫描入口都会被调用，不能做重活。真正完整的检查是 `dbIsValid()`，它还会查平台、对齐、两级 HMAC、字节码偏移、状态布局、NFA 表边界。
+
+序列化格式有一个很容易被忽略的细节：**序列化流里没有 `bytecode` 字段**。`hs_serialize_database()` 按 `magic`、`version`、`length`、`platform`（两个 32 位）、`hmac`、`hmac_hdr` 的顺序写出，然后直接跟字节码本体；反序列化时由 `db_copy_bytecode()` 根据目标缓冲区地址重新计算对齐后的偏移并写回头部。这样同一份序列化数据可以在不同对齐的缓冲区里加载，代价是「序列化长度 = 192 + length」而不是「头部原样拷贝」。
+
+平台描述 `platform` 是一个 64 位掩码，除了 CPU 特性位，还有几个「否定位」：`HS_PLATFORM_NOAVX2`、`HS_PLATFORM_NOAVX512`、`HS_PLATFORM_NOAVX512VBMI`，它们表示「编译时明确知道目标不支持该特性」。`HS_PLATFORM_ALL`（`0xabcdef11abcdef00`）表示通用数据库，任何平台都接受。这一套设计的目的是让「用 AVX2 编译的数据库」不会被「只有 SSSE3 的机器」加载，也让「通用数据库」能到处跑。
+
+两级 HMAC 的分工值得单独说。`hmac_hdr` 覆盖头部字段（含 `length`），`hmac` 覆盖 `length` 字节的字节码。校验顺序是「先头后体」，原因很实在：不知道 `length` 是否可信，就不能按它去读内存。`db_check_header_integrity()` 与 `db_check_integrity()` 分别对应这两级，比较时用 `CRYPTO_memcmp()` 做常量时间比较，避免时序侧信道。
+
+最后是「只读保护」。反序列化成功后会对整块内存调用 `hs_db_protect()`，把它标记为只读。这既是安全加固（防止运行期被改写），也意味着调用方不能把 `hs_deserialize_database_at()` 的目标缓冲区当成普通内存随意写。
+
+### 3. 关键数据结构与源码位置
+
+头部结构 `struct hs_database` 定义在 `src/database.h`，`hs_get_bytecode()` 与 `validDatabase()` 是同文件的 inline 函数；`HS_DB_VERSION` 与 `HS_DB_MAGIC` 也在该文件。HMAC 密钥在 `src/hs_db_hmac_key.h`：默认是一段 32 字节的静态数组 `HS_DB_HMAC_KEY`，若定义了 `HS_DB_HMAC_KEY_OVERRIDE` 则改用外部传入的数组，这是一个纯编译期开关，没有运行期换钥接口。字段逐项含义见 05-02。
+
+实现全部在 `src/database.c`：`hs_serialize_database`（`database.c:116`）、`db_check_platform`（`database.c:179`）、`db_decode_header`（`database.c:198`）、`db_check_integrity`（`database.c:254`）、`hs_deserialize_database_at`（`database.c:2935`）、`hs_deserialize_database`（`database.c:3008`）、`hs_database_size`（`database.c:3085`）、`hs_serialized_database_size`（`database.c:3106`）、`dbIsValid`（`database.c:3124`）、`hs_database_info`（`database.c:3397`）。另有 `db_validate_rose_offsets()` 与 `db_validate_mcsheng_succ_table()` 等一批结构校验函数，负责在加载期把「伪造偏移」挡在运行之前。
+
+需要特别指出：`dbIsValid()` 的校验链里**没有**扫描模式检查。模式检查发生在运行接口入口，`hs_scan()` 比较 `rose->mode != HS_MODE_BLOCK`、`hs_open_stream()` 与 `hs_stream_size()` 比较 `HS_MODE_STREAM`、`hs_scan_vector()` 比较 `HS_MODE_VECTORED`，不符即返回 `HS_DB_MODE_ERROR`。这意味着同一个数据库可以被成功反序列化，却在第一次扫描时告诉您模式不对——排障时不要把这两个阶段混为一谈。
+
+下表把常见返回码与其真正触发点对应起来，避免把「加载失败」笼统归因于 HMAC。
+
+| 返回码 | 触发点 | 典型原因 |
+|---|---|---|
+| `HS_INVALID` | 魔数、长度、对齐、HMAC、偏移校验 | 字节流被截断或改写，缓冲区未对齐 |
+| `HS_DB_VERSION_ERROR` | `db_decode_header` 的版本比较 | 数据库与库版本不一致 |
+| `HS_DB_PLATFORM_ERROR` | `db_check_platform` | 目标机缺少编译时假定的指令集 |
+| `HS_DB_MODE_ERROR` | `hs_scan` / `hs_open_stream` 入口 | 用块库走流式接口，或反之 |
+| `HS_NOMEM` | 反序列化分配或分配器回调 | 内存不足，或自定义分配器返回空 |
+| `HS_BAD_ALIGN` | 序列化 / `_at` 反序列化 | 数据库或目标缓冲区未按要求对齐 |
+
+一个实用推论：如果 `hs_serialized_database_size()` 就已经失败，说明头部结构本身有问题（长度不足、魔数错、版本错），根本还没走到 HMAC；如果它成功而 `hs_deserialize_database()` 失败，问题多半在 HMAC 或后续结构校验。
+
+### 4. 关键流程与调用链
+
+序列化链路较短但有几处校验不能省。`hs_serialize_database()` 先查三个指针非空，再 `db_correctly_aligned()` 检查对齐（不对齐返回 `HS_BAD_ALIGN`），然后 `validDatabase()` 查魔数与版本，接着**先**校验头部 HMAC、**再**校验字节码 HMAC——注释写得很清楚：只有确认 `length` 真实，才能按它去读字节码。全部通过后按 `192 + length` 分配内存，逐字段写出，最后把字节码整段拷到头部之后。
+
+反序列化链路分为「解码头部」与「装载」两段。`db_decode_header()` 是两段共用的：先要求至少 12 字节（保证老数据库能走到版本检查而不是直接报无效），用非对齐读取出 `magic`；魔数不符返回 `HS_INVALID`；版本不符返回 `HS_DB_VERSION_ERROR`；确认前两项后才要求完整 192 字节头部；读 `length` 并核对「传入长度 == 192 + length」；最后读出 `platform` 与两个 HMAC，把指针推进到字节码起点。
+
+装载段的关键差别在内存归属。`hs_deserialize_database()` 自己用 `hs_db_alloc()` 分配（页对齐），把头部与字节码拷进去，再做两级 HMAC 与结构校验，成功后 `hs_db_protect()` 置只读；`hs_deserialize_database_at()` 则要求调用方提供 8 字节对齐、容量足够的缓冲区，它只做 `memset`、拷头、`db_copy_bytecode()`、校验，最后同样置只读。前者的注释明确提醒：函数**无法**验证你给的缓冲区到底有多大，必须自己先调 `hs_serialized_database_size()` 拿到所需尺寸。
+
+`db_copy_bytecode()` 是「零拷贝」假象的来源：它并不真的零拷贝，而是把字节码搬到目标缓冲区里紧邻头部的对齐位置，并回填 `db->bytecode`。所谓「at」版本省掉的是一次额外分配和一次整体搬运（数据本来就在你的缓冲区里），代价是你要自己管对齐、容量与生命周期。真正的零拷贝只有一种情况：数据库本来就已经在内存里且对齐正确，那就根本不需要反序列化。
+
+加载完成后的校验链与 `dbIsValid()` 一致：魔数 → 版本 → 平台 → 对齐 → 头部 HMAC → 字节码 HMAC → 字节码偏移范围 → 状态布局 → NFA 表边界。任意一步失败都会释放已分配内存并返回，不会留下半加载对象。整条顺序见图 06-12-01。
+
+:::figure id=06-12-01 | name=反序列化的校验顺序与两级 HMAC 分工 | dir=TD
+node n1 "序列化字节串" blue
+node n2 "db_decode_header" teal
+node n3 "magic 与 version 检查" teal
+node n4 "db_check_platform" amber
+node n5 "拷贝头部与字节码" amber
+node n6 "hmac_hdr 校验头部" purple
+node n7 "hmac 校验字节码" purple
+node n8 "偏移与状态布局校验" teal
+node n9 "hs_scan 入口查 mode" red
+edge n1 -> n2 "非对齐读取"
+edge n2 -> n3 "前 12 字节"
+edge n3 -> n4 "版本一致"
+edge n4 -> n5 "平台兼容"
+edge n5 -> n6 "先验 length"
+edge n6 -> n7 "再验内容"
+edge n7 -> n8 "结构自洽"
+edge n8 -> n9 "模式不符报错"
+:::
+
+图中 n3 到 n4 之间隐含一个失败分支：版本不符时直接返回 `HS_DB_VERSION_ERROR`，不会走到平台检查。这也是为什么「升级库之后老数据库报版本错」永远比「报平台错」更早出现——两个错误不可能同时被看到。
+
+### 5. 配置/命令/代码实例
+
+下面的程序演示完整往返，并在最后故意翻转字节码首字节，观察篡改后的返回码。序列化后第 192 字节正是字节码起点（头部固定 192 字节），所以翻转它等价于破坏内容而不动头部。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    hs_database_t *db = NULL;
+    hs_database_t *loaded = NULL;
+    hs_compile_error_t *cerr = NULL;
+
+    if (hs_compile("foo[0-9]{3}", 0, HS_MODE_BLOCK, NULL, &db, &cerr)
+        != HS_SUCCESS) {
+        fprintf(stderr, "compile: %s\n", cerr->message);
+        hs_free_compile_error(cerr);
+        return 1;
+    }
+
+    char *bytes = NULL;
+    size_t len = 0;
+    if (hs_serialize_database(db, &bytes, &len) != HS_SUCCESS) {
+        fprintf(stderr, "serialize failed\n");
+        return 1;
+    }
+    printf("serialized length = %zu\n", len);
+
+    size_t want = 0;
+    if (hs_serialized_database_size(bytes, len, &want) == HS_SUCCESS) {
+        printf("deserialized size = %zu\n", want);
+    }
+
+    if (hs_deserialize_database(bytes, len, &loaded) == HS_SUCCESS) {
+        char *info = NULL;
+        if (hs_database_info(loaded, &info) == HS_SUCCESS) {
+            printf("%s\n", info);
+            free(info);
+        }
+        hs_free_database(loaded);
+        loaded = NULL;
+    }
+
+    bytes[192] ^= 0x01; /* 篡改字节码第一个字节，头部不动 */
+    hs_error_t rv = hs_deserialize_database(bytes, len, &loaded);
+    printf("tampered deserialize rv = %d\n", rv);
+
+    free(bytes);
+    hs_free_database(db);
+    return 0;
+}
+```
+
+示例输出，具体格式需对照实际版本核验。
+
+```text
+serialized length = 1933
+deserialized size = 1933
+Version: 5.4.2 Features: AVX2 Mode: BLOCK
+tampered deserialize rv = -1
+```
+
+逐行判读。第一行的 1933 等于 192 加字节码长度，说明序列化长度与头部长度是固定换算关系，看到这个数就能反推字节码本体大小；不同模式、不同模式集会显著改变它，此处的具体数值仅作示例。第二行来自 `hs_serialized_database_size()`，它只解码头部、不碰字节码，因此速度极快，适合在「先问多大再分配」的两段式加载里做前置探测；它与第一行相等是正常的，因为反序列化后占用恰好是「头部 + 字节码」。第三行是 `hs_database_info()` 的输出，格式固定为版本、特性、模式三段；`AVX2` 表示该数据库的目标平台允许 AVX2，`BLOCK` 表示只能用 `hs_scan()`，若拿它去 `hs_open_stream()` 会得到 `HS_DB_MODE_ERROR`。第四行的 `-1` 是 `HS_INVALID`，不是专门的「HMAC 错误码」——这一点很容易误判：HMAC 不匹配、魔数错、对齐错、结构校验失败都归到同一个返回值，只能靠上下文（哪一步失败）区分，所以生产代码应在每步之后立即记录阶段，而不是只记最终码。
+
+如果希望把「篡改」与「版本不符」区分开，可以再做一个实验：把 `bytes` 的第 4 到第 7 字节（`version` 字段）改成别的值，重新反序列化，会得到 `-5`，即 `HS_DB_VERSION_ERROR`。这个差别来自 `db_decode_header()` 的判断顺序：版本检查发生在长度检查与 HMAC 之前，所以改版本一定会先被抓住。
+
+```c
+/* 把 version 字段（偏移 4，长度 4）改成 0x00000000 */
+bytes[4] = 0;
+bytes[5] = 0;
+bytes[6] = 0;
+bytes[7] = 0;
+hs_error_t vrv = hs_deserialize_database(bytes, len, &loaded);
+printf("bad version rv = %d\n", vrv); /* 期望 -5 */
+```
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，不要依赖 HMAC 做「来源认证」。密钥编译在库里，攻击者拿得到；它的定位是完整性校验与误配拦截。需要真正的信任链，应在数据库外层加自己的签名，并在加载前验证签名再交给 Hyperscan。
+
+第二，`-DHS_DB_HMAC_KEY_OVERRIDE` 是构建期开关，一旦启用，用默认密钥构建的旧数据库会全部加载失败，且错误码是 `HS_INVALID`，没有任何「密钥不匹配」的提示。切换密钥必须与数据库重新分发同步进行，不能灰度一半。
+
+第三，`HS_DB_VERSION` 只比较主次修订压成的整数，不比较构建配置。相同版本号、不同 `HS_DB_MAGIC`、不同 `BUILD_AVX512`、不同 `HS_DB_HMAC_KEY_OVERRIDE` 构建出来的库互不接受。跨团队分发数据库时，应把「构建配置指纹」也写进你自己的分发元数据。
+
+第四，`hs_deserialize_database_at()` 不会替你检查缓冲区大小，注释里明确把责任交给调用方。正确顺序永远是：`hs_serialized_database_size()` 拿尺寸 → 分配（8 字节对齐）→ `_at` 加载。省掉第一步就是堆溢出。
+
+第五，加载成功后内存被置为只读。任何「加载后原地改一个字段做实验」的想法都会导致段错误，而不是静默生效。需要可变副本就先复制到自己的缓冲区，再对副本加载。
+
+第六，不要每次进程启动重新编译。编译成本高、峰值内存大，而且会让「同一份配置在不同节点产生不同字节码」成为可能（编译期启发式、硬件特性都会影响产物）。正确姿势是构建期编译、分发、加载；只有开发期才反复编译。
+
+第七，`hs_database_info()` 返回的字符串由默认分配器分配，必须由调用方 `free()`；它只报告版本、特性、模式，不包含模式文本——因为字节码里根本没有原始正则。想核对「这份数据库是不是我编的那份」，只能比对 HMAC 或自己记录的指纹。
+
+第八，序列化数据的长度必须精确。少一个字节会在 `db_decode_header()` 的「长度 == 192 + length」检查处失败；多一个字节同样失败，因为它要求严格相等。文件传输时不要用「读到 EOF 为止」的宽松解析。
+
+### 7. 小结与延伸阅读
+
+序列化把「内存里的编译产物」变成「可分发、可校验的字节流」，代价是把可信对象变成了不可信输入，于是有了头部、魔数、版本、平台、两级 HMAC 与一整套结构校验。校验顺序是设计的核心：先能安全读取（长度、魔数、版本），再验证完整（头 HMAC、体 HMAC），最后验证自洽（偏移、状态布局、NFA 表边界）；模式检查不在这一层，而在扫描入口。
+
+三句话记住本篇：数据库是字节码不是数据，加载等于执行，所以要按不可信输入对待；两级 HMAC 的先后不能反，因为 `length` 本身需要先被认证；版本、平台、模式是三个不同阶段的检查，返回码不同、处置方式也不同。
+
+延伸阅读：字段与偏移细节见 05-02；API 签名与返回码全集见 04-06；工程侧的分发与加载流程见 03-03；安全模型与密钥管理见 08-05；模块边界见 07-10。想理解字节码里到底有什么、为什么偏移校验如此繁琐，回看 06-01 与 06-04。本篇的检索口径统一为（字段见 05-02 ｜ 参数见 04-06 ｜ 模块见 07-10）。
+
+## 06-13 fat runtime 与 CPU 特性分派
+
+### 1. 背景与动机
+
+Hyperscan 的性能高度依赖指令集。字面量前端的 Teddy 用 nibble 查表做位并行，FDR 用分桶加确认表，Sheng 系列用向量 shuffle 做状态压缩，这些引擎在不同微架构上的最佳实现完全不同：SSSE3 只有 16 字节向量，AVX2 有 32 字节，AVX-512BW 有 64 字节且多了掩码寄存器，AVX512VBMI 还多了字节级置换。同一份源码，用不同 `-march` 编译出来的扫描循环，吞吐可以差出数倍。
+
+于是产生一个分发难题：库要交付给成千上万台机器，这些机器的 CPU 代际跨越十年。三条路各有代价。第一条是 `-march=native`，在构建机上达到最优，但产物一到老机器上就执行非法指令，且「构建机是哪台」成了不可复现的隐变量。第二条是每个微架构编一份库，让运维按机器选，代价是发行包膨胀、部署脚本复杂、容器镜像要按节点打标签。第三条是把多份实现塞进同一个动态库，在装载时按当前 CPU 选一份——这就是 fat runtime。
+
+「fat」这个词说的就是体积：同一批源文件被编译五遍，分别针对 core2、corei7、avx2、avx512、avx512vbmi，每份都带自己的符号，最后链接进同一个 `libhs.so`，所以库比单架构版本大数倍。换来的是「编译一次、到处运行」，并且在这台机器上跑的就是这台机器能跑的最快实现。
+
+理解这套机制有三个现实收益。第一，能解释 `HS_ARCH_ERROR` 从哪来：它不是「模式有问题」，而是「这台机器连 SSSE3 都没有」，或者更常见——库在装载时找不到可用实现。第二，能解释「库能跑但数据库加载失败」这种看似矛盾的现象：库的分派是运行期 CPU 探测，数据库的平台位却是编译期的承诺，两者是两套机制。第三，能判断构建选项该怎么选：`FAT_RUNTIME` 决定「一份库多实现」，`BUILD_AVX512` 决定「多实现里是否包含 AVX-512 那两份」，两者的默认值与适用条件完全不同。
+
+需要强调一点边界：fat runtime 是 Linux 上的特性，依赖 GNU 的 `ifunc` 扩展。Windows 的 MSVC 没有对应机制，只能编单架构库；ARM 平台的 Vectorscan 分支有自己的分派方案，不能把这里的结论直接搬过去。这也是本套资料反复标注「上游开源版」的原因。
+
+### 2. 核心概念
+
+微架构分组是这套机制的骨架。构建时按 `-march` 把同一批运行期源文件编成五组：`core2`（SSSE3 基线）、`corei7`（SSE4.2 加 POPCNT）、`avx2`（`-march=core-avx2`）、`avx512`（Skylake 级别的 AVX-512BW）、`avx512vbmi`（Ice Lake 级别）。每组产出一个 OBJECT 库，符号名统一加上后缀：`core2_`、`corei7_`、`avx2_`、`avx512_`、`avx512vbmi_`。公共符号 `hs_scan` 本身不实现任何逻辑，它只是一层跳板。
+
+跳板的实现是 `ifunc`（indirect function）。写法是「声明一个同名函数，挂上 `__attribute__((ifunc("resolver名")))`」，动态链接器在装载时调用 resolver，把返回值（某个实现的地址）填进这个符号。关键在于**解析只发生一次**：之后每次调用 `hs_scan` 都是一次普通的间接跳转，没有 `cpuid`、没有分支预测惩罚、没有每次调用的探测开销。这是 fat runtime 相对「每次调用查表」方案的核心优势。
+
+resolver 的顺序就是优先级：先 `check_avx512vbmi()`，再 `check_avx512()`，再 `check_avx2()`，再「`check_sse42()` 且 `check_popcnt()`」，再 `check_ssse3()`，全不满足则返回 `error_` 版本。`error_` 版本不做任何事，直接返回 `HS_ARCH_ERROR`。这个顺序体现了两条原则：能力越强越优先；能力必须「配套」——corei7 那档要求 SSE4.2 与 POPCNT 同时具备，因为那份实现里两者都用。
+
+`check_*` 系列在 `src/util/cpuid_inline.h`，每个函数做一次 `cpuid` 并按位判断，内部还处理了操作系统是否开启相应寄存器状态（XGETBV）的情况。这些函数是 `static inline`，编译进各自的实现里；resolver 只在装载时跑一遍，所以这点开销无所谓。
+
+`hs_valid_platform()` 是一个容易误解的接口：它只检查 SSSE3，因为那是 Hyperscan 的硬性下限。它返回 `HS_SUCCESS` 不代表 AVX2 可用，更不代表数据库能加载。真正想知道「这台机器支持什么」要用 `hs_populate_platform()`：它把 `cpuid_flags()` 的结果写进 `hs_platform_info_t::cpu_features`（只含 AVX2、AVX512、AVX512VBMI 三位），把 `cpuid_tune()` 的微架构家族写进 `tune`。这两个值可以直接传给 `hs_compile` 的 `platform` 参数，让编译产物针对本机优化。
+
+平台位是另一套东西。`database.h` 里定义了 `HS_PLATFORM_NOAVX2`、`HS_PLATFORM_NOAVX512`、`HS_PLATFORM_NOAVX512VBMI` 三个「否定位」，以及 `HS_PLATFORM_ALL` 这个通用值。否定式编码的好处是「缺省即可用」：没写否定位，就表示编译时假定这些特性可用。`hs_current_platform` 是一个 `static const` 常量，由 `HAVE_AVX2` 等编译期宏拼出来——注意它是**编译期**决定的，不是运行期探测的。在 fat 构建下，每个微架构分组的 `database.c` 各编一份，于是各分组看到的 `hs_current_platform` 也不同，平台校验自然跟着「选中的实现」走：选了 AVX2 实现，就只接受允许 AVX2 的数据库。
+
+构建条件值得单独记。`FAT_RUNTIME` 只在 `CMAKE_SYSTEM_NAME MATCHES Linux` 时才被定义，且要满足三个前提：编译器支持 `ifunc` 属性（`HAS_C_ATTR_IFUNC`）、生成器是 Unix Makefiles 或 CMake 3.0 以上的 Ninja、Clang 版本不低于 3.9。任一条不满足，`FAT_RUNTIME_REQUISITES` 为假，这个选项根本不会出现。默认值取 `${RELEASE_BUILD}`，也就是 release 构建默认开启、debug 构建默认关闭。`BUILD_AVX512` 与 `BUILD_AVX512VBMI` 则是普通的 `option`，默认都是 `OFF`；后者为真时会强制把前者也打开，因为 VBMI 隐含 AVX-512。
+
+不打开这两个选项时，CMake 会往 `dispatcher.c` 的编译命令里加 `-DDISABLE_AVX512_DISPATCH` 与 `-DDISABLE_AVX512VBMI_DISPATCH`。`dispatcher.c` 顶部据此把 `avx512_` 前缀重定义成 `disabled_`、把 `check_avx512()` 重定义成恒假。于是「库里没有这份实现」和「有实现但探测不到」在代码上统一成了同一种形态：resolver 跳过这一档。这样 dispatcher 的源码只有一份，不需要为每种开关组合写条件编译分支。
+
+### 3. 关键数据结构与源码位置
+
+分派层只有一个文件：`src/dispatcher.c`。核心是 `CREATE_DISPATCH` 宏（`dispatcher.c:46`），它为每个公共函数生成五条前置声明、一个 `error_` 实现、一个 `resolve_` 解析器（`dispatcher.c:60`），以及挂了 `ifunc` 属性的公共符号（`dispatcher.c:82`）。宏之后是一长串展开：`hs_scan`、`hs_stream_size`、`hs_database_size`、`dbIsValid`、`hs_open_stream`、`hs_scan_stream`、`hs_close_stream`、`hs_scan_vector`、`hs_database_info`、`hs_copy_stream`、`hs_reset_stream`、`hs_reset_and_copy_stream`、`hs_serialize_database`、`hs_deserialize_database`、`hs_deserialize_database_at`、`hs_serialized_database_info`、`hs_serialized_database_size`、`hs_compress_stream`、`hs_expand_stream`、`hs_reset_and_expand_stream`（`dispatcher.c:84` 起）。逐个看这张清单能发现一个事实：**分派粒度是公共 API**，不是内部函数；库内部调用走的是同一份实现里的直接调用，没有二次间接。
+
+CPU 探测在 `src/util/cpuid_inline.h`：`check_avx2`（`cpuid_inline.h:112`）、`check_avx512`（`cpuid_inline.h:148`）、`check_avx512vbmi`（`cpuid_inline.h:191`）、`check_ssse3`（`cpuid_inline.h:236`）、`check_sse42`（`cpuid_inline.h:243`）、`check_popcnt`（`cpuid_inline.h:250`）。平台信息组装在 `src/util/cpuid_flags.c`：`cpuid_flags`（`cpuid_flags.c:40`）只置三个特性位，`cpuid_tune`（`cpuid_flags.c:146`）按 family/model 查表映射到 `HS_TUNE_FAMILY_*`。公共入口 `hs_valid_platform()` 在 `src/hs_valid_platform.c`，`hs_populate_platform()` 在 `src/hs.cpp` 末尾附近，两者都很短。
+
+编译期特性宏在 `src/util/arch.h`：`HAVE_SSE2`、`HAVE_SSE41`、`HAVE_SSE42`、`HAVE_AVX`、`HAVE_AVX2`、`HAVE_AVX512`（对应 `__AVX512BW__`）、`HAVE_AVX512VBMI`、`HAVE_POPCOUNT_INSTR`、`HAVE_BMI`、`HAVE_BMI2`。这些宏不只用于分派，也用于各引擎在编译期裁掉本平台用不上的代码路径——所以「同一份源码在不同分组里编出来的引擎集合都可能不同」。
+
+构建侧全部在 `CMakeLists.txt`：`BUILD_AVX512` 与 `BUILD_AVX512VBMI` 的 `option` 与蕴含关系（`CMakeLists.txt:142` 起）、`FAT_RUNTIME_REQUISITES` 的四项判定与 `CMAKE_DEPENDENT_OPTION`（`CMakeLists.txt:332` 起）、非 fat 分支的单一 `-march` 编译（`CMakeLists.txt:1194` 起）、fat 分支的五组 OBJECT 库与 `-DDISABLE_*_DISPATCH`（`CMakeLists.txt:1224` 起）。分组编译时用 `cmake/build_wrapper.sh` 配合 `cmake/keep.syms.in` 做符号重命名与保留，这条链路决定了 `libhs.so` 里最终存在哪些带后缀的符号。
+
+下表把分组、编译标志与符号后缀对应起来，便于在 `nm` 输出里对号入座；构建变量全集见 04-01，平台与特性常量见 04-03。
+
+| 微架构分组 | 编译标志 | 符号后缀 | 最低硬件要求 |
+|---|---|---|---|
+| core2 | `-march=core2` | `core2_` | SSSE3 |
+| corei7 | `-march=corei7` | `corei7_` | SSE4.2 且 POPCNT |
+| avx2 | `-march=core-avx2` | `avx2_` | AVX2 |
+| avx512 | `${SKYLAKE_FLAG}` | `avx512_` | AVX-512BW |
+| avx512vbmi | `${ICELAKE_FLAG}` | `avx512vbmi_` | AVX512VBMI |
+| 兜底 | 无 | `error_` | 无，直接返回错误码 |
+
+`SKYLAKE_FLAG` 与 `ICELAKE_FLAG` 的具体取值由 `cmake/arch.cmake` 按编译器能力探测，不同 GCC 版本上可能回退到近似标志，因此「打开 `BUILD_AVX512` 就一定有 AVX-512BW 实现」这句话要打个折扣，需对照实际工具链核验。
+
+### 4. 关键流程与调用链
+
+构建期的分流从 `CMakeLists.txt:332` 开始。先判断系统是不是 Linux；不是就整段跳过，`FAT_RUNTIME` 选项不存在，缓存里查不到这个键。是 Linux 则依次判断 Clang 版本、生成器类型、`ifunc` 支持，三项全过才把 `FAT_RUNTIME_REQUISITES` 置真，再用 `CMAKE_DEPENDENT_OPTION` 定义 `FAT_RUNTIME`，默认值等于 `RELEASE_BUILD`。
+
+进入 fat 分支后，CMake 为每个分组建一个 OBJECT 库：`hs_exec_core2`、`hs_exec_corei7`、`hs_exec_avx2`，条件满足时再加 `hs_exec_avx512` 与 `hs_exec_avx512vbmi`。每个库都编译同一批 `hs_exec_SRCS`（运行期引擎与 `database.c`、`runtime.c` 等），AVX-512 那两组还会额外并入 `hs_exec_avx2_SRCS`。编译时通过 `RULE_LAUNCH_COMPILE` 调用 `build_wrapper.sh`，用 `objcopy` 把全局符号按分组重命名——这是「同一份源码编出五套互不冲突的符号」的实现手段。最后 `hs_exec_common`（含 `dispatcher.c`）与所有分组一起链进 `hs` 与 `hs_runtime`。
+
+运行期的分流发生在装载时。动态链接器遇到带 `ifunc` 的符号，调用 `resolve_hs_scan()`；resolver 依次问 `check_avx512vbmi()`、`check_avx512()`、`check_avx2()`、`check_sse42() && check_popcnt()`、`check_ssse3()`，返回第一个为真的实现地址；全假返回 `error_hs_scan`。这个返回值被写入符号的解析结果，后续调用直接跳过去。整个过程没有加锁、没有缓存失效问题，因为 `ifunc` 的解析由装载器保证只做一次。
+
+需要注意的是 resolver 的失败路径不是「装载失败」，而是「装载成功但调用返回 `HS_ARCH_ERROR`」。这个设计让「库能被加载」与「库能用」解耦：即使跑在不支持 SSSE3 的机器上，程序也能启动，只有在真正调用扫描接口时才拿到错误码。这对「先启动、后探测能力」的服务模型是有利的，但也意味着监控必须覆盖首次调用的返回码，否则会看到「进程活着但一条流量都没处理」的诡异现象。
+
+编译侧还有一处 `FAT_RUNTIME` 条件编译：`hs_compile_multi_int()` 在入口处检查 `check_ssse3()`，不满足直接返回 `HS_ARCH_ERROR` 并给出「Unsupported architecture」；`hs_expression_info`、`hs_free_compile_error` 等入口也有同样的守卫（`src/hs.cpp` 中三处 `#if defined(FAT_RUNTIME)`）。为什么编译也要查？因为 fat 库为了能在老机器上装载，装载路径本身不能含 SSSE3 指令，但编译与扫描路径是按分组编的，真的跑起来必须有 SSSE3 打底。
+
+最后要理解平台位的闭环：编译时 `hs_compile` 把 `platform` 参数（或 `get_current_target()` 的结果）写进数据库头部；加载时 `db_check_platform()` 把它与当前实现里的 `hs_current_platform` 比对，不等就返回 `HS_DB_PLATFORM_ERROR`。这条链解释了那个常见困惑——「同一个 `.so` 在这台机器上能跑，为什么加载那份数据库失败」：库能跑只说明有可用实现，数据库能否加载还取决于它的平台位是否被这份实现接受。如果希望数据库到处都能加载，编译时传 `HS_PLATFORM_ALL`。
+
+resolver 的优先级链与失败分支见图 06-13-01。图中每一档「不支持」都落到下一档，只有全部落空才进 `error_`。
+
+:::figure id=06-13-01 | name=ifunc 解析器的五档优先级与失败兜底 | dir=TD
+node n1 "hs_scan 公共符号" blue
+node n2 "ifunc 解析器 resolve_" teal
+node n3 "check_avx512vbmi" amber
+node n4 "check_avx512" amber
+node n5 "check_avx2" amber
+node n6 "sse42 且 popcnt" amber
+node n7 "check_ssse3" amber
+node n8 "error_ 实现" red
+node n9 "选定实现地址" green
+edge n1 -> n2 "装载时解析一次"
+edge n2 -> n3 "第一优先"
+edge n3 -> n9 "avx512vbmi_"
+edge n3 -> n4 "不支持"
+edge n4 -> n9 "avx512_"
+edge n4 -> n5 "不支持"
+edge n5 -> n9 "avx2_"
+edge n5 -> n6 "不支持"
+edge n6 -> n9 "corei7_"
+edge n6 -> n7 "不支持"
+edge n7 -> n9 "core2_"
+edge n7 -> n8 "全不支持"
+:::
+
+图里没有画「解析结果被缓存」这一步，因为它不是代码，而是装载器的语义：resolver 的返回值被写进符号表项后就不再重算。理解这一点，才能解释为什么「在容器里改了 CPU 亲和性」不会让分派结果变化——分派在进程装载时就定了。
+
+### 5. 配置/命令/代码实例
+
+先看构建侧。下面的命令在 Linux 上以 release 配置一次，然后从缓存里读出三个关键变量。默认情况下 `FAT_RUNTIME` 应为 `ON`，两个 AVX-512 选项应为 `OFF`。
+
+```bash
+mkdir -p build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_AVX512=OFF -DBUILD_AVX512VBMI=OFF ../
+grep -E "^(FAT_RUNTIME|BUILD_AVX512|BUILD_AVX512VBMI):" CMakeCache.txt
+```
+
+示例输出，具体格式需对照实际版本核验。
+
+```text
+FAT_RUNTIME:BOOL=ON
+BUILD_AVX512:BOOL=OFF
+BUILD_AVX512VBMI:BOOL=OFF
+```
+
+逐行判读。第一行说明这次构建走的是「一份库多套实现」的路径，产物里应当能找到 `avx2_hs_scan`、`corei7_hs_scan` 这类带后缀的符号；如果这里是 `OFF`，说明 `FAT_RUNTIME_REQUISITES` 有一项没满足——最常见的是生成器不是 Unix Makefiles 或 Ninja，其次是编译器不支持 `ifunc`，CMake 在配置阶段会打印具体原因，往上翻几十行就能看到。第二、三行为 `OFF` 表示库里不含 AVX-512 与 VBMI 两组实现，resolver 里对应的两个 `check_*` 被编译成恒假；这不影响功能，只影响在 Skylake 及以上机器上的峰值吞吐。如果第三行是 `ON` 而第二行是 `OFF`，说明缓存被人手工改过——正常情况下 `BUILD_AVX512VBMI` 会把 `BUILD_AVX512` 强制拉成 `ON`。如果三行全部查不到，先确认是不是在非 Linux 平台构建：那里根本没有这几个选项。
+
+再看运行侧。下面的程序回答两个问题：「这台机器能不能跑 Hyperscan」以及「它能跑哪一档」。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+
+int main(void) {
+    hs_error_t v = hs_valid_platform();
+    printf("hs_valid_platform = %d\n", v);
+
+    hs_platform_info_t p;
+    if (hs_populate_platform(&p) == HS_SUCCESS) {
+        printf("cpu_features = 0x%llx tune = %u\n",
+               (unsigned long long)p.cpu_features, p.tune);
+    } else {
+        printf("hs_populate_platform failed\n");
+    }
+    return 0;
+}
+```
+
+示例输出，具体格式需对照实际版本核验。
+
+```text
+hs_valid_platform = 0
+cpu_features = 0x4 tune = 6
+```
+
+逐行判读。第一行 `0` 是 `HS_SUCCESS`，含义仅为「这台机器至少有 SSSE3」，这是 Hyperscan 的硬性下限，不代表能跑 AVX2；如果这里是 `-11`（`HS_ARCH_ERROR`），后面的扫描一定失败，应当直接拒绝启动而不是重试。第二行的 `cpu_features` 是 `HS_CPU_FEATURES_*` 的按位或，`0x4` 等于 `1ULL << 2`，即只置了 `HS_CPU_FEATURES_AVX2` 这一位，说明这台机器支持 AVX2 但不支持 AVX-512（否则会多出 `0x8` 甚至 `0x10`）；这个值可以直接作为 `hs_compile` 的 `platform->cpu_features` 传入，让编译产物针对本机生成。`tune = 6` 是 `cpuid_tune()` 按 family/model 映射出的微架构家族编号，对照 `hs_compile.h` 的 `HS_TUNE_FAMILY_*` 序列，6 对应 Skylake 家族；换一台机器这个数会变，具体映射需对照实际版本核验。要注意这两个值描述的是「当前机器」，不是「当前库」——库的分派结果无法通过公共 API 查询，只能靠 `nm` 看符号、靠基准测试间接判断。
+
+如果想知道某个 `.so` 到底带了哪几套实现，可以用符号表反查。带后缀的符号存在，说明该分组被编进了库；只有 `error_` 而没有某档，说明该档被 `DISABLE_*_DISPATCH` 关掉了。
+
+```bash
+nm -D --defined-only build/lib/libhs.so | grep -E "_(hs_scan|hs_open_stream)$"
+```
+
+`nm` 的输出里，`hs_scan` 本身通常显示为 `i`（间接函数）类型，带后缀的才是真正的代码符号。这条命令的价值在于验证「构建选项是否真的生效」——比读 CMake 缓存更直接。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，不要把 `hs_valid_platform()` 当成能力探测。它只查 SSSE3，在只支持 SSSE3 的机器上也会返回成功，随后 AVX2 相关路径根本不会被执行（分派会退到 core2），性能可能只有预期的三分之一。要判断实际档位，用 `hs_populate_platform()` 读特性位，或者直接用基准测试对比。
+
+第二，`FAT_RUNTIME` 在非 Linux 平台上不存在，不是「默认关闭」。跨平台项目里写 `-DFAT_RUNTIME=ON` 在 Windows 上不会报错，但也不会生效，产物仍是单架构。构建脚本应当显式检查平台，而不是假设选项一定被识别。
+
+第三，关闭 fat runtime 后，库只含一套 `-march` 实现，通常就是构建机默认的架构。这种库拿到老机器上不是返回 `HS_ARCH_ERROR`，而是直接执行非法指令导致进程崩溃——错误形态完全不同。要发布到异构机群，必须用 fat runtime 或明确的最低架构标志（如 `-march=core2`）构建。
+
+第四，`BUILD_AVX512` 不是「打开就更快」。AVX-512 在部分负载下会触发降频，且 512 位向量对短模式、小块的收益有限；Hyperscan 把它标为实验性选项、默认关闭，是有工程依据的。上线前应在目标机群上做 A/B，而不是看单机峰值。
+
+第五，数据库的平台位是编译期承诺，不是运行期探测。用 `hs_populate_platform()` 的结果去编译，得到的数据库就只能在那台机器（或同档机器）上加载；要跨机群分发，编译时传 `HS_PLATFORM_ALL`，接受「不针对具体微架构优化」的代价。把这两件事混为一谈，就会出现「同一份数据库在一半节点上 `HS_DB_PLATFORM_ERROR`」的现场。
+
+第六，静态链接 fat runtime 时，`ifunc` 依赖链接器与 C 库的支持。老版本 binutils 或不支持 `STT_GNU_IFUNC` 的工具链可能在链接期就报错，或者运行期解析失败。这类问题不会在编译日志里显眼地出现，需对照工具链版本核验。
+
+第七，`libhs` 与 `libhs_runtime` 是两种产物：后者只含扫描侧，不含编译 API。用 `libhs_runtime` 的节点无法 `hs_compile`，只能加载序列化数据库。分派逻辑两者都有，但「能编译」这件事取决于链接了哪个库——这是部署时最容易配错的一处（模块见 07-10）。
+
+第八，不要在运行期期待「换 CPU 就换实现」。解析在装载时完成，容器热迁移、cpuset 调整、甚至在同一进程里 `dlopen` 两次（同一路径）都不会重新解析。需要按机器定制时，应在编排层决定用哪份库或哪份数据库，而不是指望库自己适配。
+
+### 7. 小结与延伸阅读
+
+fat runtime 用「多份编译 + 装载时分派」换取了「一份库到处跑」。它的三个关键点分别是：构建期按 `-march` 分组并用符号后缀隔离；运行期用 `ifunc` 在装载时解析一次并缓存；失败路径收敛到 `error_` 实现，把「不支持」变成 `HS_ARCH_ERROR` 而不是装载失败。与之配套的平台位机制则把「编译时的硬件承诺」写进数据库，加载时与当前实现比对，形成另一条独立的兼容性检查。
+
+记住三件事：分派是装载时的一次性决策，不是每次调用的探测；`hs_valid_platform` 只保证 SSSE3，能力探测要用 `hs_populate_platform`；数据库的平台位与库的分派是两套机制，前者决定「能不能加载」，后者决定「跑得多快」。
+
+延伸阅读：构建变量全集与默认值见 04-01，平台与调优常量见 04-03，工程侧的库形态选择见 02-05，模块职责见 07-10；想理解各档实现在引擎层面差在哪里，回看 06-05、06-08 与 06-09。本篇的检索口径统一为（字段见 05-05 ｜ 参数见 04-01 ｜ 模块见 07-10）。
+
+## 06-14 Chimera 混合引擎：Hyperscan 预过滤 + PCRE 确认
+
+### 1. 背景与动机
+
+Hyperscan 的能力边界很清楚：不支持反向引用、不支持捕获子表达式、不支持任意零宽断言、不支持递归与条件模式。这些构造在真实规则集里并不罕见——「密码出现在 URL 参数里」「同一个单词重复出现」「邮箱的本地部分与域名部分满足某种关系」，都需要回溯语义或捕获结果。纯 Hyperscan 在这些规则上只能拒绝编译。
+
+另一条路是纯 PCRE。功能完整，但代价是「一条模式扫一遍数据」：一万条规则就是一万次全缓冲区扫描，再叠加回溯的最坏情况复杂度，吞吐会掉到不可接受。而且 PCRE 是单模式引擎，没有「一次扫描同时匹配上万条」的概念。
+
+Chimera 的思路是把两者叠起来：用 Hyperscan 的多模式能力做一次快速扫描，把「可能命中」的位置找出来，再让 PCRE 只在这些位置上做精确确认与捕获。Hyperscan 在这里扮演的是**触发器**（trigger）而不是判定器：它只需要保证「真匹配不会被漏掉」，多报一些无所谓，因为后面有 PCRE 兜底。这与 Hyperscan 的预过滤语义正好吻合——`HS_FLAG_PREFILTER` 会把不支持的构造放宽成超集，允许多报，但不允许漏报。
+
+这个设计的收益完全由「命中率」决定。如果规则集在流量上几乎不命中，Hyperscan 一次扫描就排除了 99.9% 的数据，PCRE 只在极少数位置跑，总体吞吐接近纯 Hyperscan。如果规则本身很宽（比如 `\w+` 这种），Hyperscan 会在几乎每个位置触发，PCRE 就要跑几乎每个位置，此时 Chimera 比纯 PCRE 还慢——多了一次 Hyperscan 扫描的开销。所以「Chimera 一定比 PCRE 快」是错的，「Chimera 在稀疏命中场景下接近 Hyperscan」才是准确的表述。
+
+还有一层动机是工程上的：Chimera 把「哪些模式能被 Hyperscan 覆盖」这件事编译期就判定完了，运行期不需要业务代码做分流。规则作者写 PCRE 语法，编译器自动决定每条模式走「Hyperscan 触发 + PCRE 确认」还是「直接 PCRE 扫描」，业务代码只看到一个 `ch_scan`。
+
+需要提前说清边界：Chimera 只有块模式，`ch_compile` 内部固定用 `HS_MODE_BLOCK` 编译底层 Hyperscan 库，公开 API 里没有 `ch_open_stream` / `ch_scan_stream`。需要流式 + 捕获组的场景，只能自己做分块与状态拼接，而那已经超出库的能力范围。
+
+### 2. 核心概念
+
+Chimera 把每条模式分成两类。**guarded** 模式：能用 Hyperscan 的预过滤形式编译出来，于是进入底层多模式库，由 Hyperscan 负责触发。**unguarded** 模式：连预过滤都编不出来（比如某些极端构造），只能自己用 PCRE 全量扫描。分类发生在编译期，判据是 `isHyperscanSupported(pattern, flags | HS_FLAG_PREFILTER, platform)` 是否成功。
+
+在 guarded 里还有一条快速路径：**定宽模式**。如果 `hs_expression_info` 报出的 `min_width` 等于 `max_width`、宽度有限且非零，同时该模式没有捕获组、匹配有序、且不带预过滤也能编译成功，那么 Chimera 认为「Hyperscan 报出的位置就是精确结果」，运行时直接采信，不再调用 PCRE。这条路径把「定宽字面量类规则」的成本压到接近纯 Hyperscan，是 Chimera 性能模型里最重要的优化。
+
+「确认」的具体含义是：Hyperscan 报了一个结束偏移 `to`，Chimera 从该模式上次扫描的起点 `scanStart` 开始，用 `pcre_exec` 在 `[scanStart, length)` 上找第一个匹配；若找到的匹配结束位置不晚于 `to`，就认为确认通过并报告，否则继续找。这个「以 Hyperscan 的结束位置为界」的机制保证了报告顺序与纯 PCRE 一致，不会因为触发器多报而输出多余的匹配。
+
+报告顺序由优先队列保证。每条模式确认出的匹配按 `(from, to)` 入队，出队时按 `to` 升序、同 `to` 按插入顺序，于是用户看到的回调序列与「把所有模式交给 PCRE 逐条扫、再按结束位置归并」的结果一致。这个顺序性对规则引擎很重要——很多业务逻辑依赖「先短后长」「同位置按规则号」的稳定输出。
+
+捕获组通过 `ch_capture_t` 数组传递。回调签名里除了 `from`、`to`，还有 `size`（捕获组个数）与 `captured` 指针；数组第 0 项是整个匹配，第 i 项是第 i 个捕获组，未参与匹配的组用 `CH_CAPTURE_FLAG_ACTIVE` 区分。只有在 `CH_MODE_GROUPS` 模式下才填充捕获组，`CH_MODE_NOGROUPS` 下 `size` 为 0——这是纯性能取舍，不开捕获可以省掉 ovector 的填充与拷贝。
+
+错误处理是另一条独立通道。`ch_scan` 接受两个回调：匹配回调与错误回调。当 PCRE 撞到 `match_limit` 或 `match_limit_recursion` 时，会调用错误回调并传 `CH_ERROR_MATCHLIMIT` 或 `CH_ERROR_RECURSIONLIMIT`；如果没提供错误回调，这类错误被静默忽略、当作「没匹配」。这个默认行为很危险：规则写得不好导致回溯爆炸时，你会看到「某些匹配时有时无」，而不是一个明确的错误。
+
+最后是数据库结构。Chimera 数据库 = `ch_database` 头 + `ch_bytecode` 头 + 底层 Hyperscan 数据库 + 模式偏移数组 + unguarded 索引数组 + 每条模式的 `ch_pattern` 与 PCRE 字节码/study 数据。`CH_DB_MAGIC` 是 `0xdededede`，与 Hyperscan 的 `0xdbdbdbdb` 刻意不同，避免两类数据库被互相误加载。
+
+### 3. 关键数据结构与源码位置
+
+`src/` 之外，Chimera 全部在 `chimera/` 目录。头文件三个：`chimera/ch_compile.h`（编译 API、`CH_MODE_NOGROUPS` 为 0、`CH_MODE_GROUPS` 为 1048576、`ch_compile_error_t`）、`chimera/ch_runtime.h`（`ch_scan`、`ch_match_event_handler`、`ch_capture_t`、三个回调返回值）、`chimera/ch_common.h`（`CH_SUCCESS` 为 0、`CH_INVALID` 为 -1、`CH_SCAN_TERMINATED` 为 -3、`CH_DB_VERSION_ERROR` 为 -5、`CH_SCRATCH_IN_USE` 为 -10、`CH_FAIL_INTERNAL` 为 -32）。`chimera/ch.h` 只是把编译与运行期两个头包含进来。
+
+数据库布局在 `chimera/ch_database.h`：`struct ch_database`（魔数、版本、长度、保留位、`bytecode` 偏移、`padding[16]`、`bytes[]`）、`struct ch_bytecode`（长度、整库标志、模式数、活跃位图大小、底层数据库偏移、模式偏移表偏移、unguarded 列表偏移与数量、最大捕获组数）、`struct ch_pattern`（用户 id、每模式标志、最小/最大/固定宽度、study 偏移、长度、内嵌 `pcre_extra`）。字段逐项含义见 05-09，本篇不重复。
+
+编译实现在 `chimera/ch_compile.cpp`：`PatternData` 构造函数（`ch_compile.cpp:271`）负责 `pcre_compile` 与信息提取，`buildPcre`（`ch_compile.cpp:335`）调 `pcre_compile` 与 `pcre_study(PCRE_STUDY_JIT_COMPILE)`，`ch_compile_multi_int`（`ch_compile.cpp:474`）负责分类、建底层库与布局，`ch_compile`（`ch_compile.cpp:672`）、`ch_compile_multi`（`ch_compile.cpp:734`）、`ch_compile_ext_multi` 是三个公开入口（后者多两个参数：`match_limit` 与 `match_limit_recursion`）。
+
+运行期在 `chimera/ch_runtime.c`：`ch_scan_i`（`ch_runtime.c:527`）是总控，`initQueue`（`ch_runtime.c:491`）给 unguarded 模式预置首次扫描，`scanHyperscan`（`ch_runtime.c:472`）调 `hs_scan`，`multiCallback`（`ch_runtime.c:369`）是 Hyperscan 的回调、决定「直接入队」还是「跑 PCRE 确认」，`scanPcre`（`ch_runtime.c:211`）执行一次 `pcre_exec` 并入队，`catchupPcre`（`ch_runtime.c:296`）按顺序出队并回调用户，`handlePcreNonMatch`（`ch_runtime.c:182`）把 PCRE 返回码翻译成 Chimera 错误。scratch 管理在 `chimera/ch_scratch.c`：`ch_alloc_scratch`（`ch_scratch.c:141`）、`ch_clone_scratch`（`ch_scratch.c:256`）、`ch_scratch_size`（`ch_scratch.c:316`）、`ch_free_scratch`（`ch_scratch.c:285`）。链接关系在 `chimera/CMakeLists.txt`：`target_link_libraries(chimera hs pcre)`，且 `add_dependencies(chimera hs pcre)`。
+
+scratch 结构值得单独提一句：Chimera 的 scratch 里嵌着一个 `hs_scratch_t *multi_scratch`，由 `hs_alloc_scratch` 分配并随 `ch_clone_scratch` 一起克隆。所以「Chimera scratch 非线程安全」与「Hyperscan scratch 非线程安全」是同一件事的两层——共享一个 `ch_scratch_t` 并发 `ch_scan`，会在 `markScratchInUse` 处拿到 `CH_SCRATCH_IN_USE`。
+
+下表按模式特征归纳编译期的分类结果与运行期代价；API 参数与返回码全集见 04-04 与 04-05，模块边界见 07-11。
+
+| 模式特征 | 是否进底层 Hyperscan | 是否需 PCRE 确认 | 运行期代价 |
+|---|---|---|---|
+| 定宽、无捕获、可精确编译 | 是，关闭预过滤并开 SOM | 否 | 接近纯 Hyperscan |
+| 变宽、可预过滤编译 | 是，`HS_FLAG_PREFILTER` | 是 | 触发次数决定 PCRE 开销 |
+| 含捕获组、可预过滤编译 | 是 | 是 | 多一次 ovector 填充 |
+| 连预过滤都无法编译 | 否，进 unguarded 列表 | 是，全量扫描 | 接近纯 PCRE |
+| 全部模式都 unguarded | 否 | 是 | 与纯 PCRE 基本相同 |
+
+最后一行是个有用的判据：如果 `ch_database_info()` 的输出只有 `Chimera ` 而后面没有 Hyperscan 的版本信息，说明整库没有底层 Hyperscan 数据库（`CHIMERA_FLAG_NO_MULTIMATCH`），此时 Chimera 退化成了「PCRE 的批量封装」，性能不会有任何惊喜。
+
+### 4. 关键流程与调用链
+
+编译期先从 PCRE 开始。`PatternData` 构造函数先 `flags |= HS_FLAG_ALLOWEMPTY`，理由写在注释里：避免为了「空匹配」把模式交给 PCRE 反复确认。然后 `buildPcre()`：`pcre_compile` 拿字节码，失败就抛 `CompileError`；`pcre_study` 带 `PCRE_STUDY_JIT_COMPILE` 生成 JIT 数据（返回 NULL 且无错误是合法的，表示没什么可优化的）；再用 `pcre_fullinfo` 取 `PCRE_INFO_SIZE`、`PCRE_INFO_STUDYSIZE`、`PCRE_INFO_CAPTURECOUNT`、`PCRE_INFO_OPTIONS`（用于判断是否 UTF-8）。
+
+接着取宽度信息。`hs_expression_info` 用「预过滤 + 去 SINGLEMATCH」的标志问 Hyperscan 要 `min_width` 与 `max_width`，同时看 `unordered_matches` 判断报告是否有序。若这一步就失败，说明连预过滤都编不出来，该模式进 unguarded 列表，后续完全靠 PCRE。
+
+宽度拿到后做定宽判定：`min_width == max_width`、非零、有限、无捕获组、有序、且用「原始标志 + SOM」能编译成功，五条全满足才把 `fixedWidth` 置成该宽度。注意这里用的是 `rawflags`（含 `HS_FLAG_SOM_LEFTMOST`、去掉 `SINGLEMATCH`），因为定宽路径要靠 SOM 拿起点；而 `SINGLEMATCH` 与 SOM 互斥。
+
+然后分类。`guard = isHyperscanSupported(pattern, flags | HS_FLAG_PREFILTER, platform)`。为真的模式进 `multiExpr` / `multiFlags` / `multiIds` 三个数组，索引用模式在数组中的位置（不是用户 id），这样 Hyperscan 回调里的 `id` 就是数组下标，可以直接索引 `patternData`。为假的进 `unguarded` 列表。若某个模式是定宽的，编译标志会额外加上 `HS_FLAG_SOM_LEFTMOST`、去掉 `HS_FLAG_PREFILTER` 与 `HS_FLAG_SINGLEMATCH`。
+
+全部模式处理完后，若 `multiExpr` 非空，调一次 `hs_compile_multi` 建底层库（固定 `HS_MODE_BLOCK`），再用 `hs_database_size` 量尺寸。接着算总布局：`ch_bytecode` 头 + 底层库 + 对齐 + unguarded 索引数组 + 模式偏移数组 + 各模式块 + 128 字节对齐余量。分配、清零、填头、填 `ch_bytecode` 的各个偏移、按 `CHIMERA_FLAG_NO_MULTIMATCH` / `GROUPS` / `ALL_CONFIRM` / `ALL_SINGLE` 置整库标志，最后逐模式写 `ch_pattern` 与 PCRE 字节码。
+
+运行期从 `ch_scan` 进 `ch_scan_i`。先校验数据库（`hydbIsValid` 查魔数与版本）、scratch 对齐与魔数，`markScratchInUse`；再检查 `length <= INT_MAX`，因为 `pcre_exec` 的长度参数是 `int`。然后清空队列、构造 `HybridContext`（数据、长度、数据库、scratch、队列、两个回调、上下文）。
+
+第一步是 `initQueue`：对每个 unguarded 模式，在 `active` 位图里置位，然后 `scanPcre(length, 0, patternId)` 做一次全缓冲区扫描，找到的匹配入队。这一步的语义是「这些模式没有触发器，只能自己找第一个匹配」。
+
+第二步是 `scanHyperscan`（只要不是 `NO_MULTIMATCH`）：`hs_scan` 底层库，回调是 `multiCallback`。回调里对每个触发做判定：若该模式需要确认且已经在 `active` 里（说明之前已经确认过一次、有一条待续的扫描链），直接返回 0（继续扫描，不重复确认）；否则置位 `active`，检查「本次 `to` 是否早于 `scanStart + minWidth`」（太早则忽略），检查 `SINGLEMATCH`，然后分两路：定宽模式直接算出 `[from, to)` 入队；变宽模式调 `scanPcre` 从 `scanStart` 开始确认，确认到的匹配入队，并把 `scanStart` 推进到匹配之后。
+
+第三步是 `catchupPcre` 收尾：把队列里剩余项按 `to` 升序弹出，逐个调用户回调；若回调返回 `CH_CALLBACK_SKIP_PATTERN`，把该模式的 `scanStart` 推到缓冲区末尾（等于放弃这条模式后续的匹配）；若返回 `CH_CALLBACK_TERMINATE`，整体返回 `CH_SCAN_TERMINATED`。每弹出一项，如果这条模式还没到 `SINGLEMATCH` 上限，会再跑一次 `scanPcre` 把下一个匹配补进队列，形成「边报告边补货」的流水。
+
+两段式的数据流见图 06-14-01：上半是编译期如何把模式分成 guard 与 unguarded，下半是运行期如何用 Hyperscan 触发、用 PCRE 确认、用优先队列排序。
+
+:::figure id=06-14-01 | name=Chimera 编译分类与运行时两段式确认 | dir=TD
+node n1 "ch_compile 输入模式集" blue
+node n2 "pcre_compile 与 study" teal
+node n3 "hs_expression_info 取宽度" teal
+node n4 "guard 与 unguarded 分类" amber
+node n5 "hs_compile_multi 建触发器库" amber
+node n6 "hs_scan 触发 multiCallback" green
+node n7 "定宽直接入队" green
+node n8 "scanPcre 确认并捕获" purple
+node n9 "catchupPcre 顺序回调" green
+edge n1 -> n2 "先编 PCRE"
+edge n2 -> n3 "取 min 与 max 宽度"
+edge n3 -> n4 "判定可覆盖性"
+edge n4 -> n5 "guard 子集"
+edge n4 -> n8 "unguarded 子集"
+edge n5 -> n6 "块模式扫描"
+edge n6 -> n7 "定宽模式"
+edge n6 -> n8 "变宽模式"
+edge n7 -> n9 "按 to 入队"
+edge n8 -> n9 "带捕获组结果"
+:::
+
+图中 `catchupPcre` 被画成终点，实际上它同时是「补货」的起点：每弹出一次就可能再触发一次 `scanPcre`。这个环在图上省略了，因为它会让图变成环状而难以阅读；理解「队列驱动、边报边补」即可。
+
+### 5. 配置/命令/代码实例
+
+下面的程序编译一条带两个捕获组的模式，扫描一段文本，打印整段匹配与各组偏移。链接时需要同时给 `chimera`、`hs`、`pcre` 三个库，顺序不能颠倒（依赖在前）。
+
+```c
+#include <hs/ch.h>
+#include <stdio.h>
+#include <string.h>
+
+static ch_callback_t on_match(unsigned int id, unsigned long long from,
+                              unsigned long long to, unsigned int flags,
+                              unsigned int size,
+                              const ch_capture_t *caps, void *ctx) {
+    (void)flags;
+    (void)ctx;
+    printf("id=%u [%llu,%llu) groups=%u\n", id, from, to, size);
+    for (unsigned int i = 0; i < size; i++) {
+        if (caps[i].flags & CH_CAPTURE_FLAG_ACTIVE) {
+            printf("  g%u [%llu,%llu)\n", i, caps[i].from, caps[i].to);
+        }
+    }
+    return CH_CALLBACK_CONTINUE;
+}
+
+int main(void) {
+    ch_database_t *db = NULL;
+    ch_scratch_t *scratch = NULL;
+    ch_compile_error_t *cerr = NULL;
+    const char *pat = "(\\w+)@(\\w+)\\.com";
+    const char *data = "x bob@example.com";
+
+    if (ch_compile(pat, 0, CH_MODE_GROUPS, NULL, &db, &cerr) != CH_SUCCESS) {
+        fprintf(stderr, "ch_compile: %s\n", cerr->message);
+        ch_free_compile_error(cerr);
+        return 1;
+    }
+    if (ch_alloc_scratch(db, &scratch) != CH_SUCCESS) {
+        ch_free_database(db);
+        return 1;
+    }
+    ch_error_t rv = ch_scan(db, data, (unsigned int)strlen(data), 0,
+                            scratch, on_match, NULL, NULL);
+    printf("ch_scan rv = %d\n", rv);
+
+    ch_free_scratch(scratch);
+    ch_free_database(db);
+    return 0;
+}
+```
+
+编译命令与运行结果如下。Chimera 是静态库，链接顺序必须是 `-lchimera -lhs -lpcre`，并且 C++ 运行库也要带上（Chimera 的编译侧是 C++ 写的）。示例输出，具体格式需对照实际版本核验。
+
+```bash
+gcc demo.c -o demo -lchimera -lhs -lpcre -lstdc++ -lm
+./demo
+```
+
+```text
+id=0 [2,17) groups=3
+  g0 [2,17)
+  g1 [2,5)
+  g2 [6,13)
+ch_scan rv = 0
+```
+
+逐行判读。第一行的 `id=0` 是编译时传入的 id（`ch_compile` 单模式固定为 0），`[2,17)` 是整段匹配的开区间偏移：数据是 `x bob@example.com`，`x ` 占两个字节，所以 `bob` 从 2 开始，`com` 到 16 结束、开区间写 17。`groups=3` 表示本次传送了 3 个 `ch_capture_t`：第 0 项是整段匹配，第 1、2 项是两个捕获组；这个数来自编译期的 `maxCaptureGroups`（本例为 2）加 1，而不是「本模式实际参与匹配的组数」。第二行 `g0 [2,17)` 与第一行完全一致，是约定俗成的「第 0 组等于整段匹配」。第三行 `g1 [2,5)` 对应 `(\w+)` 捕获到的 `bob`，长度 3。第四行 `g2 [6,13)` 对应第二个 `(\w+)` 捕获到的 `example`，起点 6 是因为 `@` 在 5。注意偏移都是字节偏移而不是字符偏移；在 UTF-8 数据上开 `HS_FLAG_UTF8` 后仍按字节计，业务侧若要按字符展示需要自行换算。最后一行的 `0` 是 `CH_SUCCESS`；若这里是 `-3` 说明回调返回了终止，`-1` 说明参数或数据库有问题，`-10` 说明 scratch 正在被另一线程使用。
+
+`ch_database_info()` 的输出在这种模式上应当是 `Chimera ` 加上底层 Hyperscan 的信息串（类似 `Chimera Version: 5.4.2 Features: AVX2 Mode: BLOCK`），因为这条模式可以被预过滤编译、进了 guard 集合。如果输出只有 `Chimera ` 而没有后半段，说明整库退化为纯 PCRE 封装，性能会明显低于预期，应检查模式里是否有连预过滤都无法处理的构造。
+
+想观察「确认」这一步真的发生了，可以把模式改成变宽的（例如 `(\w+)@(\w+)\.(com|org)`），再用一个不命中的文本跑一遍；此时 Hyperscan 不触发，`scanPcre` 也不会被调用，输出为空。反过来用一个宽模式（例如 `\w+`）跑长文本，会看到大量触发与大量确认，这正是「命中率决定收益」的直观体现。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，Chimera 只有块模式。`ch_compile` 内部固定 `HS_MODE_BLOCK`，公开 API 没有流式接口。想在 TCP 流上用它，必须自己保证「匹配不跨块」，或者接受跨块漏报；这与 Hyperscan 的流式能力是两回事，不要混淆。
+
+第二，性能完全取决于命中率。宽模式（`\w+`、`.*`、单字符类）会让 Hyperscan 在几乎每个位置触发，PCRE 被调用几乎每个位置，总耗时可能超过纯 PCRE。选型前应先估算「每 MB 触发次数」，而不是只看规则条数。
+
+第三，必须提供错误回调。不传 `onError` 时，`PCRE_ERROR_MATCHLIMIT` 与 `PCRE_ERROR_RECURSIONLIMIT` 会被当作「没匹配」静默吞掉，表现为「匹配时有时无」。生产代码应当始终传错误回调，把 `CH_ERROR_MATCHLIMIT` 计入监控，并配合 `ch_compile_ext_multi` 显式设置 `match_limit` 与 `match_limit_recursion`。
+
+第四，`CH_MODE_GROUPS` 有实打实的成本。它让每条模式都保留 ovector 并填充捕获组，同时抬高 scratch 的 `maxCaptureGroups`。不需要捕获结果时用 `CH_MODE_NOGROUPS`，能省下这部分开销。
+
+第五，`CH_CALLBACK_SKIP_PATTERN` 的语义是「放弃这条模式后续的所有匹配」，不是「跳过这一次」。它会把 `scanStart` 推到缓冲区末尾，等于本块内该模式不再报告。用它做「首命中即停」时要清楚这是块级而非流级。
+
+第六，`ch_scratch_t` 不能跨线程共享。它内部持有 `hs_scratch_t`，两层都有 `markScratchInUse` 保护，并发会返回 `CH_SCRATCH_IN_USE`。正确模型与 Hyperscan 一致：一线程一 scratch，或用 `ch_clone_scratch` 复制。
+
+第七，`pcre_study` 带 JIT 会申请可执行内存。在某些加固环境（禁用 `PROT_EXEC` 的堆、SELinux 严格策略）里可能失败，表现为 `ch_compile` 抛「PCRE compilation failed」。这类环境需要去掉 JIT 或调整策略，具体行为需对照 PCRE 版本核验。
+
+第八，Chimera 数据库与 Hyperscan 数据库不能互换。`CH_DB_MAGIC` 是 `0xdededede`，Hyperscan 是 `0xdbdbdbdb`，误加载会得到 `CH_INVALID` 或 `HS_INVALID`。分发时不要把两类文件放进同一个目录靠文件名区分。
+
+### 7. 小结与延伸阅读
+
+Chimera 用「Hyperscan 触发 + PCRE 确认」把两种引擎的能力拼在一起：Hyperscan 负责在整块数据上快速排除，PCRE 负责在少量候选位置上做精确判定与捕获。编译期把模式分成 guarded 与 unguarded，并识别出「定宽可免确认」的快速路径；运行期用优先队列保证报告顺序与纯 PCRE 一致。它的收益与命中率强相关，边界是只有块模式、且不改变 PCRE 的最坏情况复杂度。
+
+记住三件事：Hyperscan 在这里只保证「不漏」，多报由 PCRE 收敛；定宽模式是性能关键路径，写规则时应尽量让常用规则落在这一档；没有错误回调时 PCRE 的 match limit 会被静默吞掉，这是最难查的一类「偶发漏报」。
+
+延伸阅读：Chimera 的结构体字段见 05-09，编译与运行时 API 参数见 04-04 与 04-05，部署与链接细节见 03-06 与 02-04，模块职责见 07-11；想理解预过滤为什么会「放宽而不漏报」，回看 06-04 与 06-09。本篇的检索口径统一为（字段见 05-09 ｜ 参数见 04-04 ｜ 模块见 07-11）。

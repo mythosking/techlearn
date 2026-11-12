@@ -1,0 +1,664 @@
+# Hyperscan 技术资料 · 08 运维、性能基准与排障（分片 A）
+
+## 08-01 性能基准方法与 hsbench 实战
+
+### 1. 目标与拓扑
+
+本篇要交付的不是一个「跑得很快」的数字，而是一套能被别人复现、能被自己用来做决策的测量方法。任何一次性能结论都必须同时满足三个条件：可复现，即同一台机器、同一条命令连跑多次，结果落在很窄的带内；可比较，即两次运行之间只改动了一个变量；可归因，即数字变了之后能追到具体原因——是模式集变了、语料变了、扫描模式变了、库版本变了，还是核数变了。缺任何一条，得到的都只是噪音。
+
+在动手之前先把问题写清楚，因为不同问题需要完全不同的语料与参数组合。第一类是「单条模式改写得更好吗」，此时模式集里只放这一条，其余变量全部冻结，属于微基准。第二类是「这套特征库在本机型能跑多快」，模式集必须是生产全量，语料必须是生产流量的代表样本，属于容量基准。第三类是「换了新版本有没有退化」，模式集与语料都要固化成可归档的输入，属于回归基准。三者的语料规模、重复次数、判读门槛都不同，混在一起做就会得出互相矛盾的结论。
+
+`hsbench` 的职责边界必须先划清。它是本仓库 `tools/hsbench/` 下的基准器，做的事很窄：从一个目录读模式文件（`-e`），从一个 SQLite 语料库里读「块」与「流」（`-c`），按指定的扫描模式编译出一个数据库，按指定轮数重复扫描，把耗时折算成 Mbit/sec 打印出来。它不抓包、不做协议解析、不做流重组，语料必须事先由脚本切成块和流。因此基准的第一项工作不是敲命令，而是准备两份合格的输入：模式集与语料库。
+
+整条链路的形状见图 08-01-01。左侧是两份输入，中间是 hsbench 进程（编译一次、扫描多轮），右侧是输出与归档。注意编译只发生一次，且发生在计时开始之前；这一点决定了「编译时间」与「扫描吞吐」是两组互不影响的指标，不能相加成一个「总性能」。
+
+:::figure id=08-01-01 | name=hsbench 基准链路与输入输出拓扑 | dir=LR
+node n1 "模式目录 -e" blue
+node n2 "语料库 -c<br/>SQLite chunk 表" blue
+node n3 "hsbench 主进程" teal
+node n4 "hs_compile_multi<br/>编译一次" amber
+node n5 "扫描线程<br/>重复 n 轮" green
+node n6 "绑核 CPU<br/>-T 或 taskset" gray
+node n7 "stdout 指标块" purple
+node n8 "CSV 或 SQLite 归档" purple
+edge n1 -> n3 "读入模式"
+edge n2 -> n3 "读入块与流"
+edge n3 -> n4 "计时前编译"
+edge n4 -> n5 "数据库只读共享"
+edge n6 -> n5 "独占核心"
+edge n2 -> n5 "块大小决定压力"
+edge n5 -> n7 "汇总一行"
+edge n7 -> n8 "可选落盘"
+:::
+
+图 08-01-01 里有一条容易被忽略的边：语料库同时连到主进程和扫描线程。连到主进程是为了在计时前把块读进内存，连到扫描线程是因为块的切分方式直接决定流式扫描的压力——同样 7200 万字节，切成 6 万块还是切成 600 块，流式模式的固定开销完全不同。这也是为什么语料必须用专门脚本生成，而不是随手把一个大文件喂给 hsbench。
+
+还需要提前明确一条边界：hsbench 的默认扫描模式是**流式**，不是块模式。`main.cpp` 里 `scan_mode` 的初值是 `ScanMode::STREAMING`，只有加 `-N` 才切到 block，加 `-V` 才切到 vectored。很多人第一次跑基准时以为自己在测块模式，其实测的是流式，随后又拿这个数字去和别人的块模式数字比较，结论自然对不上。模式在输出里会体现为 `Hyperscan info` 一行的 `Mode:` 字段，判读的第一步永远是看这一行。
+
+### 2. 前置条件与环境
+
+环境准备的目标只有一个：让「机器状态」成为常量。基准数字对频率、缓存、内存带宽、超线程、NUMA 位置都极其敏感，任何一项在两次运行之间变化，都会让 A/B 对照失去意义。
+
+第一条是构建形态。`main.cpp` 在 `#ifndef NDEBUG` 分支里会打印一行警告：「WARNING: DO NOT BENCHMARK A HYPERSCAN BUILD WITH ASSERTIONS」。带断言的构建在扫描热路径里插入大量检查，数字会明显偏低，而且偏低的比例随模式集变化，无法用系数修正。基准必须用 Release 构建（默认 `CMAKE_BUILD_TYPE` 为 `RELWITHDEBINFO`，`DISABLE_ASSERTS` 在 release 下默认打开），构建变量组合见 04-01。判断方法很简单：启动 hsbench，看不到那行警告就是对的。
+
+第二条是 CPU 状态。要固定 governor 为 performance，关闭或至少记录 turbo 的状态，明确是否启用超线程，并把进程绑到确定的核上。`tools.rst` 明确建议：在多处理器系统上做单线程基准时，用 `taskset` 把 hsbench 锁到一个核，以减少调度器带来的抖动；hsbench 自己也提供了 `-T` 用于「每核一个线程」的绑核方式。两者的语义不同：`-T` 是让 hsbench 起 N 个线程并各自绑核，`taskset` 是限制整个进程的可用核集合。要测单核性能，二者选一，不要叠加。
+
+第三条是大页。`engine_hyperscan.cpp` 在编译完成、取到数据库之后调用 `get_huge(db)`，把数据库复制到大页上以降低 TLB 压力。如果基准机没有预留大页，这一步会退化到普通页，吞吐会受影响，而且不同机器的退化程度不同，导致横向对比失真。基准前应确认大页配置与 `get_huge` 的返回值（该函数失败时 hsbench 会直接返回空引擎并打印「Error: expressions failed to compile.」，这条消息具有误导性，实际原因可能是大页申请失败）。
+
+第四条是输入准备。模式文件是纯文本，一行一条，格式为 `<整数 id>:/<正则>/<标志字符>`，标志字符与 `HS_FLAG_*` 的映射见 04-02，完整格式说明见 04-07。语料库是 SQLite 文件，表名固定为 `chunk`，列为 `id`、`stream_id`、`data`（`tools/hsbench/scripts/CorpusBuilder.py` 的 `SCHEMA` 常量），`data_corpus.cpp` 用 `SELECT id, stream_id, data FROM chunk ORDER BY id` 读取。注意脚本是 Python 2 语法（`print >> sys.stderr`、`dict.has_key`），在 Python 3 下会直接语法错误，这与构建期要求 Python 2.7 是同一套历史包袱。
+
+环境检查项与失败含义见下表，建议每次换机器都过一遍并把结果记进基准记录。
+
+| 检查项 | 检查方式 | 期望结果 | 失败含义 |
+|---|---|---|---|
+| 构建形态 | 启动 hsbench 看首屏 | 无断言警告 | 用了 Debug 构建，数字不可用 |
+| 版本与特性 | 看 `Hyperscan info` 行 | 版本 5.4.2 且 Features 符合预期 | fat runtime 分派到了较低实现 |
+| 频率策略 | `cpupower frequency-info` | governor 为 performance | 频率浮动导致逐轮离散 |
+| 绑核 | `taskset -c 2 hsbench ...` | 进程只在指定核运行 | 迁移导致缓存失效 |
+| 大页 | `grep Huge /proc/meminfo` | 有足够 HugePages_Free | 数据库落普通页，TLB 压力高 |
+| 语料可读 | `sqlite3 corpus.db "select count(*) from chunk"` | 返回大于 0 的块数 | 语料为空或表名不对 |
+| 模式可编译 | `hscheck -e <模式目录>` | 全部 OK | 有模式语法错，基准无法开始 |
+
+表里最后一行值得单独说：先用 `hscheck` 把模式集过一遍，比让 hsbench 在编译阶段报错再回头定位要快得多。hsbench 的编译错误输出形如「Compile error for signature #3: ...」，只给表达式下标，不给文件名与行号，模式多时很难找。
+
+### 3. 分步操作
+
+第一步，准备模式集。建立一个目录，把模式按用途分文件存放，这样后续可以用 `-s` 指定 ID 清单做子集对照，或用 `-z` 单测某一条。下面是一个三文件的最小示例，注意 `s` 表示 DOTALL、`i` 表示大小写不敏感、`L` 表示开启最左起始偏移。
+
+```text
+# /tmp/hsbench/pat/http.txt
+101:/GET\x20[^\x20]+\x20HTTP\/1\.[01]/s
+102:/Host:\x20[^\r\n]+/i
+
+# /tmp/hsbench/pat/dns.txt
+201:/\x03www[\x00-\xff]{2,40}\x03com/s
+202:/example\.(com|net|org)/i
+```
+
+第二步，生成语料库。文本类语料用 `linebasedCorpus.py`，它把每一行做成一个块、全部塞进 `stream_id=0` 的单条流；带块大小与流长度控制的场景用 `gutenbergCorpus.py` 的 `-b`（块大小）与 `-s`（单流最大字节数）；网络流量场景用 `pcapCorpus.py`，按五元组还原 TCP/UDP 流并逐段写入。三条命令的形态如下。
+
+```bash
+python2 tools/hsbench/scripts/linebasedCorpus.py \
+    -i /data/http_sample.txt -o /tmp/hsbench/http.db
+
+python2 tools/hsbench/scripts/gutenbergCorpus.py \
+    -o /tmp/hsbench/text.db -b 4096 -s 262144 1342
+
+python2 tools/hsbench/scripts/pcapCorpus.py \
+    -i /data/capture.pcap -o /tmp/hsbench/pcap.db
+```
+
+第三步，跑基线。第一次不要加任何额外参数，先确认能跑通、能出数。默认是流式模式、重复 20 轮、单线程。
+
+```bash
+hsbench -e /tmp/hsbench/pat -c /tmp/hsbench/pcap.db
+```
+
+在继续之前要说清 hsbench 的计时边界，否则会误读后面所有数字。它并不是从进程启动开始计时，而是让所有线程先在 `thread_barrier` 上对齐，再由 0 号线程启动全局计时器；每一轮扫描单独 `timer.start()`、扫完整个语料后 `timer.complete()` 并把秒数记进该轮的 `ResultEntry`；全部轮次结束后再次对齐，由 0 号线程停止全局计时器，得到 `totalSecs`。因此「单轮秒数」用于看离散度，「总秒数」用于算整体吞吐，两者不能混。计时边界与数据的对应关系见图 08-01-02。
+
+:::figure id=08-01-02 | name=单轮计时与全局计时的边界 | dir=LR
+node n1 "线程屏障 barrier" teal
+node n2 "第 j 轮 timer.start" amber
+node n3 "遍历 corpus_data<br/>逐块 scan" green
+node n4 "第 j 轮 timer.complete" amber
+node n5 "r.seconds 单轮秒数" purple
+node n6 "totalSecs 总秒数" purple
+node n7 "折算 Mbit/sec" blue
+node n8 "逐轮离散度判读" red
+edge n1 -> n2 "对齐起点"
+edge n2 -> n3 "开始计时"
+edge n3 -> n4 "扫完整个语料"
+edge n4 -> n5 "记录单轮"
+edge n5 -> n8 "看抖动"
+edge n1 -> n6 "仅 0 号线程计时"
+edge n6 -> n7 "除以总字节"
+edge n7 -> n8 dashed "总吞吐对照"
+:::
+
+图 08-01-02 中「仅 0 号线程计时」这条边解释了一个常见困惑：多线程运行时，`totalSecs` 覆盖的是从所有线程对齐开始到全部线程结束的墙钟时间，而不是各线程时间之和。因此线程数增加时总吞吐应当接近线性增长，若增长明显低于线程数，说明存在共享资源竞争（内存带宽、末级缓存、NUMA 跨节点），这时再加线程只会让 `totalSecs` 变长。
+
+第四步，做三模式对照。这是最常用的一组组合：同模式集、同语料、只改扫描模式。三次运行之间不要改任何其它参数，尤其是 `-n` 与绑核。
+
+```bash
+hsbench -e /tmp/hsbench/pat -c /tmp/hsbench/pcap.db -N -n 20
+hsbench -e /tmp/hsbench/pat -c /tmp/hsbench/pcap.db -V -n 20
+hsbench -e /tmp/hsbench/pat -c /tmp/hsbench/pcap.db    -n 20
+```
+
+第五步，多核扩展性。`-T` 的语义是「每个 CPU 起一个线程」，线程数等于列表长度，吞吐按所有线程完成的总时间折算。做扩展性曲线时依次测 1、2、4、8 个物理核，并确保这些核不在同一个物理核的两个超线程上，否则曲线会在中途变形。
+
+```bash
+taskset -c 0 hsbench -e /tmp/hsbench/pat -c /tmp/hsbench/pcap.db -T 0 -n 50
+taskset -c 0,1 hsbench -e /tmp/hsbench/pat -c /tmp/hsbench/pcap.db -T 0,1 -n 50
+hsbench -e /tmp/hsbench/pat -c /tmp/hsbench/pcap.db -T 0-3 -n 50
+```
+
+第六步，归档与复用。`-C` 把结果打成一行 CSV，便于脚本汇总；`--sql-out` 写入 SQLite，表结构由 `sqldb.cpp` 的 `CREATE TABLE` 定义（`Compile`、`Scan`、`ScanResults` 三张表）；`-w` 在编译后把数据库存盘，`-i` 跳过编译直接加载。这里有一个必须知道的细节：`-w`/`-i` 的文件名不是模式目录名，而是 `dbSettingsHash` 用 CRC32 对「模式目录路径 + 模式值」算出的 8 位十六进制串（`engine_hyperscan.cpp` 的 `dbFilename`）。因此换一个 `-e` 路径或换扫描模式后，`-i` 会找不到旧文件，表现为加载失败后打印「Error: expressions failed to compile.」。做「编译一次、反复扫描」的对照时，`-e` 路径与 `-N`/`-V` 必须与保存时完全一致。
+
+```bash
+hsbench -e /tmp/hsbench/pat -c /tmp/hsbench/pcap.db -N -C -n 20 \
+    >> /tmp/hsbench/result.csv
+
+hsbench -e /tmp/hsbench/pat -c /tmp/hsbench/pcap.db -N -w /tmp/hsbench/db -n 1
+hsbench -e /tmp/hsbench/pat -c /tmp/hsbench/pcap.db -N -i /tmp/hsbench/db -n 20
+
+hsbench -e /tmp/hsbench/pat -c /tmp/hsbench/pcap.db -N -n 20 \
+    --per-scan --sql-out /tmp/hsbench/run.db -S http_baseline
+```
+
+第七步，按需追加维度。要评估 SOM 精度对状态与吞吐的影响，用 `-d`（只对 stream 模式生效）；要评估近似匹配的代价，用 `-E` 给全库统一加编辑距离；要验证纯字面量路径的上限，用 `--literal-on`；要确认命中位置是否符合预期，用 `--echo-matches` 打印每一次匹配。这些选项的完整清单见 04-07，语义与取值约束见 04-03（字段见 05-03 ｜ 参数见 04-07 ｜ 原理见 06-10 ｜ 模块见 07-09），本篇只讲组合方式：每次只动一个维度，其余全部冻结。
+
+### 4. 验证方法与预期结果
+
+一次成功的基准运行，屏幕上会出现两段输出：编译期统计与扫描期统计。下面这段取自 `doc/dev-reference/tools.rst` 的示例（示例输出，具体格式需对照实际版本核验；数值随机型、模式集、语料与版本变化，不可作为任何机型的性能承诺）。
+
+```text
+Signatures:        /tmp/patterns
+Hyperscan info:    Version: 5.4.2 Features:  AVX2 Mode: STREAM
+Expression count:  200
+Bytecode size:     342,540 bytes
+Database HMAC:     08d71903725bc404d4c618dce02777b9076cefbcea77e7fe075f24e92950dc0f
+Stream state size: 252 bytes
+Scratch size:      18,406 bytes
+Compile time:      0.153 seconds
+Peak heap usage:   78,073,856 bytes
+
+Time spent scanning:     0.600 seconds
+Corpus size:             72,138,183 bytes (63,946 blocks in 8,891 streams)
+Scan matches:            81 (0.001 matches/kilobyte)
+Overall block rate:      2,132,004.45 blocks/sec
+Overall throughput:      19,241.10 Mbit/sec
+```
+
+需要说明一处版本差异：5.4.2 的 `main.cpp` 中 `displayResults` 实际打印的是 `Matches per iteration`、`Mean throughput (overall)` 与 `Max throughput (per core)` 三行，而上面的文档示例写的是 `Scan matches` 与单行 `Overall throughput`。字段名以实际运行输出为准，判读方法不变；这条差异本身也提醒我们，凡是拿文档示例当预期输出做自动化断言，都要先跑一次真实版本对字段。
+
+逐行判读如下。`Hyperscan info` 是 `hs_database_info` 的返回值，格式固定为「Version: 主.次.修订 Features: 特性 Mode: 模式」（`src/database.c` 中的 `snprintf`），它决定了这台机器上 fat runtime 选中了哪套实现——`Features` 显示 AVX2 与显示 AVX512 的两次运行不可直接比较，因为底层扫描循环是两份不同的代码。`Mode` 必须与本次意图一致，显示 STREAM 却以为在测 block，是最常见的一类结论错误。
+
+`Expression count` 是实际参与编译的表达式条数，用 `-s`/`-z` 取子集后它会变小，这是确认「子集是否真的生效」的唯一证据。`Bytecode size` 来自 `hs_database_size`，是数据库本体大小，它决定数据库能否整块留在末级缓存里；同一模式集在改写后这个值明显变大，通常意味着字面量被拆散、Rose 分解质量下降（原理见 06-04）。
+
+`Stream state size` 只在流式模式出现，来自 `hs_stream_size`，其实现是 `rose->stateOffsets.end` 加上 `sizeof(struct hs_stream)`（`src/runtime.c:1097`）。这个数字乘以并发流数就是流状态的总内存，是容量规划的关键输入；块模式下这一行不会打印，看不到是正常的。`Scratch size` 来自 `hs_scratch_size`，是单线程工作区大小，乘以扫描线程数就是 scratch 总量。`Compile time` 与 `Peak heap usage` 描述编译期成本，用于判断「是否值得预编译后分发数据库」（做法见 03-03），与扫描吞吐无关。
+
+`Corpus size` 一行同时给出字节数、块数与流数，这三个数决定了工作负载的形状：块多流少说明是「大流小段」，流多块少说明是「海量短流」，两者对流式引擎的压力完全不同。`Matches per iteration` 与括号里的 matches/kilobyte 是命中率的合理性检查，它最重要的用途不是评估快慢，而是确认两次对照运行跑的是同一个工作负载——命中数不一致就说明模式集、语料或标志至少有一项变了，此时吞吐对比毫无意义。`main.cpp` 在 `displayResults` 里对多线程逐轮命中数做了一致性检查，不一致会打印「WARNING: PER-SCAN MATCH COUNTS ARE INCONSISTENT!」，看到这行必须先停下来排查，而不是继续读吞吐。
+
+`Overall block rate` 与总吞吐是全体线程的总量除以总墙钟时间，`Max throughput (per core)` 则是取最快的一轮按单核折算。两者的比值反映并行效率与抖动：比值接近线程数说明扩展性良好，明显偏低说明存在内存带宽瓶颈、NUMA 跨节点访问或超订。判断一次运行是否可作为基线，标准不是「数字高」，而是「离散度小」：用 `--per-scan` 看逐轮值，最快与中位数相差超过百分之五，就该怀疑频率策略或后台干扰，先把环境修好再谈优化。
+
+`-C` 的输出是给机器读的，字段顺序固定为编译统计若干项加扫描统计若干项，适合直接追加到 CSV 再用表格工具做透视；`--sql-out` 的价值在于把「同一模式集、多组参数」的多次运行写进同一个库，`Scan` 表里有 `bytesPerRun`、`totalBytes`、`matchesPerRun`、`overallTput` 等列，可以事后用 SQL 做 A/B 对照，不必手工抄数。
+
+### 5. 常见失败与排错
+
+第一类失败是参数缺失。`processArgs` 在结束前做三项硬校验：没有 `-e` 且无法从 `-s` 推断出模式目录时报「Must specify an expression path with the -e option.」；没有 `-c` 时报「Must specify a corpus file with the -c option.」；同时给 `-i` 与 `-w` 时报「You cannot both load and save databases.」。这三条都是启动即失败，不会产生任何数字。
+
+第二类失败是语料问题。把普通文本文件当 `-c` 传进去，SQLite 打开会失败并抛出「Corpus data error: Unable to open database ...」；表名不是 `chunk` 或表为空，则在读取结束处抛「Database contains no blocks.」（`data_corpus.cpp` 的 `readCorpus`）。还有一种更隐蔽的情况：`data` 列存的是空 blob，`readRow` 里的 `assert(0)` 在 Release 下被编译掉，随后抛出 `std::domain_error("Invalid blob or bytes from sqlite3.")`；而 `main` 只捕获 `DataCorpusError` 与 `std::runtime_error`，`std::domain_error` 继承自 `std::logic_error`，不在捕获范围内，进程会因未捕获异常直接终止，屏幕上只有一句 `terminate called after throwing an instance of 'std::domain_error'`，没有任何语料相关的提示。
+
+第三类失败是模式编译失败。hsbench 打印「Compile error for signature #N: <消息>」后以退出码 1 结束。这类问题应当先在 hscheck 里定位（`hscheck -e` 会逐条打印 OK/FAIL 与原因），再回到 hsbench。注意 hsbench 用的是 `hs_compile_ext_multi`（Release 构建下），如果模式里带了扩展参数而版本不支持，错误消息会指向具体字段。
+
+第四类失败是模式与扫描方式不匹配。用 `-i` 加载了一个流式数据库，却加 `-N` 去跑块模式，运行期 `hs_scan` 会因 `rose->mode != HS_MODE_BLOCK` 返回 `HS_DB_MODE_ERROR`，而 `EngineHyperscan::scan` 对非 `HS_SUCCESS` 的处理是打印「Fatal error: hs_scan returned error -7」并 `abort()`。进程直接 abort、没有正常汇总输出，是这类错误的典型外观。
+
+第五类失败是平台能力缺失。`-T` 只有在编译期检测到 `pthread_setaffinity_np`（或 Windows）时才会被 getopt 接受，否则会落到未知选项分支，打印「Unrecognised command line argument.」。同理，`-G` 只在非 `RELEASE_BUILD` 下有效，`-H` 与 `-P` 只在 `HS_HYBRID` 构建下有效，缺失时报「Hybrid matcher not enabled in this build」或「PCRE matcher not enabled in this build」。此外 Chimera/PCRE 路径强制要求 `-N`，且不允许与 `-E`、`-i`、`-w` 组合，错误消息分别是「Must specify block mode in Chimera or PCRE with the -N option.」与「No extended options are supported in Chimera or PCRE.」。
+
+第六类失败不报错，但结论无效：数字每次都不一样。按可能性排序依次是频率策略未固定、绑核缺失或绑到了超线程兄弟核、同一台机器上有其它负载、语料被缓存预热程度不同、以及 `-n` 太小导致首轮冷启动占比过高。处置方式是把 `-n` 提到 50 以上、加 `--per-scan` 观察前几轮是否明显偏慢（偏慢属正常的冷启动，取中位数而非平均值）、并用 `taskset` 固定核。
+
+| 现象 | 直接证据 | 根因 | 处置 |
+|---|---|---|---|
+| 启动即退出，无数字 | usage 中的 Must specify 提示 | 缺 `-e` 或 `-c` | 补齐路径，`-s` 需能推断目录 |
+| Corpus data error | sqlite 报错或 no blocks | 非 SQLite 文件、表名错、空表 | 用脚本重新生成语料库 |
+| Fatal error 后 abort | `hs_scan returned error -7` | 数据库模式与调用方式不符 | 统一 `-N`/`-V`/默认与 `-i` 的来源 |
+| 吞吐明显偏低 | 首屏有断言警告 | Debug 构建 | 改用 Release 构建重测 |
+| 逐轮数字跳动大 | `--per-scan` 最快/中位偏差大 | 频率、绑核、后台负载 | 固定 governor，绑核，增大 `-n` |
+| 找不到保存的数据库 | expressions failed to compile | `-e` 路径或模式变了 | 保持路径与模式与 `-w` 时一致 |
+
+### 6. 小结
+
+本篇给出的是一条可以反复执行的流程：固定构建形态与机器状态，用脚本生成形状明确的语料，用 hsbench 编译一次、扫描多轮，然后按「先看 Mode 与 Features，再看尺寸字段，最后看吞吐与离散度」的顺序判读。全部要点可以压成四句话：默认是流式，别忘了 `-N`；命中数不一致就不要比吞吐；`-i` 的文件名由路径与模式算出，改一个字母就失效；数字的可靠性由离散度决定，而离散度由环境决定。
+
+延伸阅读建议按需跳转：参数全量与语料格式见 04-07，SOM 精度与扩展参数见 04-03，Rose 分解为何影响字面量覆盖见 06-04，字面量前端选型见 06-05，工具链整体定位见 07-12。基准拿到数之后如何据此调优，是下一篇 08-02 的主题；数字不达预期时如何按现象分类排查，是 08-03 的主题。
+
+## 08-02 性能调优：数据库、scratch、线程与内存
+
+### 1. 背景与动机
+
+Hyperscan 的性能问题有一个反直觉的特点：它很少表现为「某个 API 调用慢」，而几乎总是表现为「某个结构性选择让引擎走了更贵的路径」。同一个 `hs_scan` 调用，在字面量覆盖良好的模式集上可以只跑一遍 Teddy/FDR 前端加少量确认，在字面量覆盖差的模式集上则要让 NFA 逐字节推进；字节码可能只差几倍，吞吐能差一个数量级。因此调优的第一步不是改代码，而是判断当前落在哪条路径上。
+
+第二个动机来自容量。生产环境的资源约束通常不是 CPU 而是内存：数据库要常驻、每个扫描线程一份 scratch、每条并发流一份流状态。三者相乘之后的量级，往往在压测阶段才暴露——比如 64 线程、20 万并发流，即使每条流只有几百字节，总量也是几十 MB 到上百 MB，且访问模式随机，会持续冲刷缓存。调优如果不把这三块分开算，就会出现「CPU 很闲但吞吐上不去」或「内存一直涨」这类看起来矛盾的现象。
+
+第三个动机是「越调越慢」的普遍存在。Hyperscan 的编译期做了大量优化，手工改写模式、手工拆分数据库、手工缓冲输入这些在其他引擎上有效的做法，在这里经常起反作用。`doc/dev-reference/performance.rst` 开头两节就是两条明确的建议：不要手工优化正则构造，不要手工优化库用法。本篇的任务是把这些结论背后的机制讲清楚，并给出可执行的判读标准。
+
+需要先立一条纪律：本篇不给出任何绝对性能数值。所有结论都是「在这个维度上调整，观察哪个字段，往哪个方向变」，具体收益必须在目标机型上用 08-01 的方法实测。原因很简单——字面量覆盖率、scratch 大小、流状态大小都随模式集与版本变化，任何跨机型抄来的数字都不具备可移植性。
+
+### 2. 核心概念
+
+调优的对象可以归纳为五个瓶颈位置，它们分别位于编译期与运行期，且相互耦合。
+
+**字面量覆盖率。** 这是影响最大的一个。Hyperscan 的扫描主体是「用字面量前端快速跳过无关字节，只在候选位置启动确认」。一个字面量都没有的模式（例如 `/\w\d+\w/`）只能靠 NFA 逐字节推进；含长字面量的模式（例如 `/blah\w*foobar/`）可以让前端一次跳过几十个字节。`performance.rst` 给的判据是：模式「必须匹配」某个字面量才快，仅仅「包含」字面量不够——`/\w(abc)?\d*\w\w\w/` 里的 `abc` 是可选的，不会出现在输入里，等于没有。这一点在流式模式下更敏感，因为流式无法像块模式那样做全局优化，字面量出现得越早越好。
+
+**scratch 大小。** scratch 是扫描工作区，大小由数据库决定。它包含队列数组、块模式状态、瞬时 Rose 状态、未压缩 NFA 状态、anchored literal 日志、delay 槽位、SOM 存储等区域。scratch 越大，单次扫描要触碰的缓存行越多，且多个线程各自的 scratch 会争抢末级缓存。它的量级不由「模式条数」线性决定，而由「同时活跃的队列数与字面量角色数」决定，因此两条看似相似的规则可能带来差异很大的 scratch。
+
+**流数量与流状态。** 每条流的状态大小由 `hs_stream_size` 给出，等于 `rose->stateOffsets.end` 加 `sizeof(struct hs_stream)`（`src/runtime.c:1097`）。它包含 NFA 活跃状态压缩表示、历史缓冲需求（`historyRequired`）、耗尽向量、逻辑组合向量，开启 SOM 后还包括槽位存储。流状态总量是「并发流数 × 单流大小」，这是容量规划里最容易低估的一项。
+
+**块大小。** 块模式每次 `hs_scan` 都有固定开销：校验数据库、校验 scratch、置占用位、填充 `core_info`、清耗尽向量、处理零偏移边界报告。块很小时这些固定开销摊不薄；块很大时又会让工作集超出缓存。`performance.rst` 的判断是：除非流式写入小到每次 1–2 字节，否则没有必要为了「更大块」而额外缓冲。
+
+**SOM 与近似匹配。** 这两项都是「用确定性换能力」的开关。开 `HS_FLAG_SOM_LEFTMOST` 后，引擎要为每个候选匹配维护起点槽位，流式下还要按 horizon 精度决定槽位宽度；近似匹配（编辑距离/汉明距离）则直接削弱字面量的区分度，让前端放过更多候选，把工作推给确认阶段。两者的共同特征是：代价不由模式条数决定，而由「有多少候选需要被记住」决定，因此在小语料上几乎测不出来，在生产流量上可能致命。
+
+把五个瓶颈按「编译期可控 / 运行期可控」分成两组，就得到图 08-02-01 的调优维度图。左侧三项在编译前决定，改一次要重新编译与分发数据库；右侧三项在部署与运行期决定，改一次只需重启进程或调整参数。实践中的顺序应当是先做左侧（收益大、一次到位），再做右侧（收益小、可反复试）。
+
+:::figure id=08-02-01 | name=编译期与运行期两个调优维度 | dir=TD
+node n1 "编译期维度" blue
+node n2 "模式写法<br/>字面量质量" teal
+node n3 "SOM 与<br/>近似匹配" amber
+node n4 "运行期维度" blue
+node n5 "scratch 复用<br/>与池化" green
+node n6 "线程绑核<br/>与块大小" green
+node n7 "流数量<br/>与状态总量" purple
+node n8 "目标机型实测<br/>判定真实瓶颈" red
+edge n1 -> n2 "改写模式"
+edge n1 -> n3 "开关取舍"
+edge n4 -> n5 "每线程一份"
+edge n4 -> n6 "绑定与切块"
+edge n4 -> n7 "并发规模"
+edge n2 -> n8 "覆盖率证据"
+edge n3 -> n8 "状态增量"
+edge n5 -> n8 "缓存压力"
+edge n6 -> n8 "扩展性曲线"
+edge n7 -> n8 "内存核算"
+:::
+
+图 08-02-01 的读法是「从上往下做」：先确认编译期三项是否已经到位，再看运行期三项是否被正确配置，最后一律回到目标机型实测。图上没有「直接优化」这条边——任何调优动作都必须经过实测这一节点，否则就只是猜测。
+
+### 3. 关键数据结构与源码位置
+
+调优要看的字段集中在两个结构里，逐字段定义分别见 05-03 与 05-05，这里只点名与性能直接相关的部分。
+
+`struct hs_scratch`（`src/scratch.h`）中，`queueCount` 与 `activeQueueArraySize` 决定队列数组与活跃队列位图的规模；`bStateSize`、`tStateSize`、`fullStateSize` 分别是块模式状态、瞬时 Rose 状态与未压缩 NFA 状态的大小，三者相加构成 scratch 的主要部分；`anchored_literal_region_len`、`handledKeyFatbitSize`、`delay_fatbit_size` 反映 anchored literal 与 delay 机制的规模；`som_store`、`som_store_count`、`som_fatbit_size` 只在开启 SOM 后非零；`scratchSize` 是最终总大小，也是 `hs_scratch_size` 返回的值；`fdr_conf` 是 FDR/Teddy 前端的确认值暂存。还有一个运行时字段 `in_use`，它由 `markScratchInUse` 置位、`unmarkScratchInUse` 清零，是 `HS_SCRATCH_IN_USE` 的唯一来源。
+
+`struct RoseEngine`（`src/rose/rose_internal.h`）中，与性能判读最相关的是 `mode`（决定可接受的扫描调用）、`minWidth` 与 `minWidthExcludingBoundaries`（小于它的块直接早退）、`maxBiAnchoredWidth`（全双锚定模式的上界，超长块可直接结束）、`smallWriteOffset`（非零表示存在小写入专用引擎）、`runtimeImpl`（运行时分派到 `ROSE_RUNTIME_FULL_ROSE`、`ROSE_RUNTIME_PURE_LITERAL` 或 `ROSE_RUNTIME_SINGLE_OUTFIX`）、`historyRequired`（流式历史缓冲需求）、`somLocationCount` 与 `hasSom`（SOM 记账规模）。这些字段的名字可以直接在 `src/runtime.c` 的 `hs_scan` 与 `hs_scan_stream_internal` 里看到用法。
+
+`struct hs_database`（`src/database.h`）里的 `length` 是数据库总长，`platform` 是编译时的平台摘要。前者决定常驻内存与缓存占用，后者决定跨机分发时是否会被 `HS_DB_PLATFORM_ERROR` 拒绝（字段见 05-02 ｜ 参数见 04-06 ｜ 原理见 06-12 ｜ 模块见 07-10）。
+
+为什么这些字段比「模式条数」更能解释性能？因为 Hyperscan 的运行时成本主要由「活跃状态数」和「候选确认数」决定，而这两个量分别体现在 `fullStateSize`/`queueCount` 与 `scratchSize`/前端确认结构上。同样是 1000 条模式，全是长字面量时 `runtimeImpl` 可能落到纯字面量快路径，scratch 很小；全是 `\w+` 这类宽字符类时，队列数与状态尺寸都会上去，且几乎没有字面量可跳。判读时应当先看这两个结构相关的输出字段，再回头看模式集。
+
+### 4. 关键流程与调用链
+
+块模式的主链路是 `hs_scan`。它在 fat runtime 下是一个 `ifunc`，由 `src/dispatcher.c` 的 `CREATE_DISPATCH` 宏在加载时解析到 `avx512vbmi_`、`avx512_`、`avx2_`、`corei7_`、`core2_` 五套实现之一，都不满足时返回 `HS_ARCH_ERROR`。这一点解释了为什么同一份数据库在不同机器上性能不同：数据库是平台无关的字节码，但执行它的扫描循环是平台相关的。
+
+进入 `src/runtime.c:329` 的 `hs_scan` 后，依次发生：空指针检查；`validDatabase` 校验（magic、版本、平台、HMAC 等，失败分别返回 `HS_INVALID`、`HS_DB_VERSION_ERROR`、`HS_DB_PLATFORM_ERROR`）；取字节码并检查 16 字节对齐；`rose->mode != HS_MODE_BLOCK` 则返回 `HS_DB_MODE_ERROR`；`validScratch` 校验 scratch 容量是否覆盖该库；`markScratchInUse` 置位，已被占用则返回 `HS_SCRATCH_IN_USE`；随后是两处廉价早退——`rose->minWidth > length` 直接成功返回，`minWidthExcludingBoundaries` 与 `maxBiAnchoredWidth` 也各有一条早退；接着 `prefetch_data` 预取输入、`populateCoreInfo` 填充扫描上下文、按需清空耗尽向量与逻辑向量；最后按 `smallWriteOffset` 决定是否走小写入引擎，否则进入 Rose 主程序，按 `runtimeImpl` 分派。
+
+流式链路是 `hs_scan_stream`，它转进 `hs_scan_stream_internal`（`src/runtime.c:909`）。与块模式的关键差别有四点：一是先检查流状态位，已终止或已耗尽的流直接返回 `HS_SCAN_TERMINATED` 或 `HS_SUCCESS`，不再做任何工作；二是用 `getHistoryAmount(rose, id->offset)` 取出需要回看的历史字节，用 `getHistory` 拿到历史缓冲指针，一并填进 `core_info`；三是 `somLocationCount` 非零时先 `loadSomFromStream` 把槽位装进 scratch，扫描后再 `flushStoredSomMatches`；四是结束时把状态写回流并 `setStreamStatus`。vectored 模式的 `hs_scan_vector` 内部同样是逐段调用 `hs_scan_stream_internal`（`src/runtime.c:1198`），也就是说它复用了流状态机，只是把多段数据在一个调用里喂完。
+
+这条链路对调优的含义是：运行期可调的东西其实很少，主要是「谁来分配 scratch、分配几份」「一条流活多久」「块切多大」。真正决定上限的是编译期已经固化进字节码的结构——`minWidth` 早退是否常命中、`smallWriteOffset` 是否存在、`runtimeImpl` 走哪条路、`historyRequired` 有多大。因此调优的动作顺序应当是：先用 08-01 的输出确认 `Bytecode size` 与 `Scratch size` 的量级，再看 `runtimeImpl` 相关的行为（例如纯字面量库是否真的走了快路径），最后才动线程与流。
+
+内存占用的构成可以用一条恒等式表达：常驻内存约等于「数据库字节码 + 线程数 × scratch + 并发流数 × 流状态」，再加上宿主自己的缓冲。四者的关系见图 08-02-02。图上把「线程数」与「并发流数」画成外部输入，是因为它们由业务模型决定，而不是由 Hyperscan 决定；调优能改的是每个乘数的大小，往往改不了乘数本身。
+
+:::figure id=08-02-02 | name=常驻内存的四个组成部分与容量规划 | dir=TD
+node n1 "hs_database_t<br/>只读字节码" amber
+node n2 "hs_scratch_t<br/>每线程一份" green
+node n3 "hs_stream_t<br/>每条流一份" purple
+node n4 "扫描线程数 T" gray
+node n5 "并发流数 S" gray
+node n6 "常驻内存估算<br/>db + T×scratch + S×stream" blue
+node n7 "容量规划与<br/>监控阈值" red
+edge n1 -> n6 "只读共享"
+edge n2 -> n6 "乘以线程数"
+edge n3 -> n6 "乘以流数"
+edge n4 -> n2 "决定份数"
+edge n5 -> n3 "决定份数"
+edge n6 -> n7 "换算与告警"
+:::
+
+图 08-02-02 有一个实践含义：当内存告警时，先看是哪一个乘数在涨。流状态涨通常是并发流泄漏（忘记 `hs_close_stream`）或流生命周期过长；scratch 涨通常是线程数上调或多库共用导致反复扩容；数据库涨则是模式集变大或字面量退化。三者对应的处置完全不同，混为一谈就会去改错地方。
+
+### 5. 配置/命令/代码实例
+
+第一个实例是一段可直接编译的诊断程序，用三个 size API 把「一份数据库、一份 scratch、一条流」的成本打印出来，再按给定的线程数与流数折算总量。这段代码不依赖任何内部头文件，只用公开 API，适合在做容量评估时直接跑在目标机型上。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+
+int main(int argc, char **argv) {
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s <pattern>\n", argv[0]);
+        return 2;
+    }
+
+    hs_database_t *db = NULL;
+    hs_compile_error_t *err = NULL;
+    hs_scratch_t *scratch = NULL;
+    size_t db_size = 0, stream_size = 0, scratch_size = 0;
+
+    if (hs_compile(argv[1], HS_FLAG_DOTALL, HS_MODE_STREAM,
+                   NULL, &db, &err) != HS_SUCCESS) {
+        fprintf(stderr, "compile failed: %s\n", err->message);
+        hs_free_compile_error(err);
+        return 1;
+    }
+    if (hs_alloc_scratch(db, &scratch) != HS_SUCCESS) {
+        fprintf(stderr, "scratch alloc failed\n");
+        hs_free_database(db);
+        return 1;
+    }
+    if (hs_database_size(db, &db_size) != HS_SUCCESS ||
+        hs_stream_size(db, &stream_size) != HS_SUCCESS ||
+        hs_scratch_size(scratch, &scratch_size) != HS_SUCCESS) {
+        fprintf(stderr, "size query failed\n");
+        hs_free_scratch(scratch);
+        hs_free_database(db);
+        return 1;
+    }
+
+    printf("database bytes : %zu\n", db_size);
+    printf("stream bytes   : %zu\n", stream_size);
+    printf("scratch bytes  : %zu\n", scratch_size);
+    printf("64 threads     : %zu\n", scratch_size * 64);
+    printf("20000 streams  : %zu\n", stream_size * 20000);
+    printf("total resident : %zu\n",
+           db_size + scratch_size * 64 + stream_size * 20000);
+
+    hs_free_scratch(scratch);
+    hs_free_database(db);
+    return 0;
+}
+```
+
+编译与运行方式如下。链接参数见 03-02，这里只给最小形态。
+
+```bash
+gcc hsbudget.c -o hsbudget -lhs
+./hsbudget 'foo.*bar' 
+```
+
+第二个实例是用 hsbench 做 SOM 精度对照。`-d` 只影响流式模式，取值为 2、4、8，分别对应 `HS_MODE_SOM_HORIZON_SMALL`、`MEDIUM`、`LARGE`（`main.cpp` 的 `case 'd'`），默认 8。对照方法：同模式集（必须含 `L` 标志的表达式，否则 SOM 不生效）、同语料、同 `-n`，只改 `-d`。
+
+```bash
+hsbench -e /tmp/hsbench/pat_som -c /tmp/hsbench/pcap.db -d 8 -n 50
+hsbench -e /tmp/hsbench/pat_som -c /tmp/hsbench/pcap.db -d 4 -n 50
+hsbench -e /tmp/hsbench/pat_som -c /tmp/hsbench/pcap.db -d 2 -n 50
+```
+
+三次运行的 `Stream state size` 会呈现固定的大小关系：`-d 8`（全精度）最大，`-d 4` 居中，`-d 2` 最小，因为槽位宽度分别按 8、4、2 字节记账。下面这段是官方文档示例中流式运行的输出片段（示例输出，具体格式需对照实际版本核验；字节数随模式集与版本变化，实测以 `hs_stream_size` 返回值为准）。
+
+```text
+Hyperscan info:    Version: 5.4.2 Features:  AVX2 Mode: STREAM
+Expression count:  200
+Bytecode size:     342,540 bytes
+Stream state size: 252 bytes
+Scratch size:      18,406 bytes
+```
+
+逐行判读：`Mode: STREAM` 说明这确实是流式运行，`-d` 才会生效；如果这里显示 BLOCK，那么三次 `-d` 对照的结果必然完全相同，容易误判为「SOM 精度不影响状态」。`Stream state size` 是判断 SOM 代价的主字段，它与并发流数相乘就是 SOM 带来的额外内存；在 20 万并发流的规模下，单流几十字节的差异就是数 MB 到十几 MB。`Scratch size` 与 SOM 也相关（`som_store`、`som_fatbit_size` 都在 scratch 里），如果 `-d` 变化时 scratch 完全不动，要怀疑模式集里根本没有 `L` 标志的表达式，此时对照是空转。`Bytecode size` 在同一模式集下不应随 `-d` 变化，若变化则说明编译路径发生了别的分叉，需要单独排查。判读的正确姿势是把三个字段放在一起看：只有 `Stream state size`（可能还有 `Scratch size`）变化、而 `Bytecode size` 与上一次完全一致，才是一次干净的 SOM 精度对照。
+
+第三个实例是 scratch 池化的正确写法。要点有三：`hs_alloc_scratch` 对同一个指针反复调用可以「长大」以兼容多个数据库；每个并发线程必须各自持有一份；分配应发生在数据库加载之后、进入扫描循环之前。
+
+```c
+static hs_scratch_t *make_scratch(hs_database_t *const *dbs, int n) {
+    hs_scratch_t *s = NULL;
+    for (int i = 0; i < n; i++) {
+        if (hs_alloc_scratch(dbs[i], &s) != HS_SUCCESS) {
+            hs_free_scratch(s);
+            return NULL;
+        }
+    }
+    return s;
+}
+
+static void worker(hs_database_t *db, hs_scratch_t *scratch,
+                   const char *buf, unsigned len) {
+    hs_error_t rc = hs_scan(db, buf, len, 0, scratch, on_match, NULL);
+    if (rc != HS_SUCCESS && rc != HS_SCAN_TERMINATED) {
+        fprintf(stderr, "scan failed: %d\n", rc);
+    }
+}
+```
+
+这段代码里没有任何「每次扫描前重新分配」的动作。`performance.rst` 专门用一节说明原因：`hs_alloc_scratch` 在数据库首次使用时会做校验并分配内存，不是廉价操作，必须放在扫描路径之外。同理，`hs_clone_scratch` 是从已有 scratch 复制一份，适合线程启动时快速铺开，但也不应该放进请求处理路径。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把 scratch 当缓存共享。scratch 内含 `in_use` 标志与大量可变状态，跨线程共享会在 `markScratchInUse` 处直接失败返回 `HS_SCRATCH_IN_USE`，更糟的情况是两个线程交替置位/清零导致状态错乱。正确做法是「一个并发扫描上下文一份 scratch」，用 `hs_clone_scratch` 或对同一指针反复 `hs_alloc_scratch` 铺开。
+
+第二个陷阱是每次扫描前 `hs_alloc_scratch`。这会把校验与分配成本乘进每一次请求，在短请求场景下可能占掉一半时间。表现是「CPU 利用率很高但吞吐很低」，且 profile 里 `hs_alloc_scratch` 占比异常。
+
+第三个陷阱是盲目合并数据库。`performance.rst` 的结论很明确：如果五类流量各有一套特征，应该建五个库分别扫，而不是合成一个大库再按 ID 过滤，即使特征有重叠也是如此；只有当公共子集占比极高（例如九成特征在五类流量里都出现）时才考虑合并。原因是合并会让所有流量都承担全集的状态与候选确认成本，而分流后每类流量只付自己那份。
+
+第四个陷阱是全量开启 SOM。SOM 是逐表达式标志，不是全局开关，应当只给真正需要起始偏移的模式加 `L`。全量开启的后果在块模式下是吞吐下降，在流式模式下还要叠加流状态膨胀，且 `SOM` 与 `SINGLEMATCH`、`PREFILTER` 互斥，会导致部分模式直接编译失败。
+
+第五个陷阱是用流式跑本可以块式的数据。`performance.rst` 明确建议：数据本身就是离散记录，或需要先聚合再处理的，应当用块模式；不必要的流式会减少可应用的优化，让某些模式变慢。典型误用是把每个完整请求体当作一条流，从头到尾只调用一次 `hs_scan_stream` 再关闭。
+
+第六个陷阱是过度缓冲。为了让块「更大」，在应用层攒数据再送进库，这会增加延迟、增加内存，收益却很小——`performance.rst` 的判断是除非流式写入只有 1–2 字节，否则没什么好处。
+
+第七个陷阱是只读总吞吐，不看逐轮与单核。总吞吐受线程数与抖动影响，可能掩盖单核退化；判读时必须同时看 `Max throughput (per core)` 与 `--per-scan` 的离散度，否则会把「线程更多」误当成「引擎更快」。
+
+| 维度 | 观测字段 | 调整手段 | 代价与风险 | 判读门槛 |
+|---|---|---|---|---|
+| 字面量覆盖 | `Bytecode size`、吞吐 | 改写模式使长字面量必需且靠前 | 语义变化，需重新对拍 | 命中集合不变才可比较 |
+| SOM | `Stream state size`、`Scratch size` | 只给必需模式加 `L`，降 `-d` | 起点精度下降，超 horizon 返回哨兵 | 业务能接受精度损失 |
+| 近似匹配 | 吞吐、命中率 | 收窄编辑距离或改用精确模式 | 漏报风险上升 | 需与精确结果对拍 |
+| scratch | `Scratch size` × 线程数 | 池化、避免多库并集膨胀 | 内存占用上升 | 单线程 RSS 与并发数匹配 |
+| 流数量 | 流状态总量 | 缩短流生命周期、及时关闭 | 状态丢失需重放 | 关闭率与打开率平衡 |
+| 块大小 | `Overall block rate` | 按记录边界切块，避免 1–2 字节写 | 延迟与内存上升 | 块均值与 P99 都要看 |
+| 线程与绑核 | 单核与总吞吐比值 | `-T`/`taskset`，避开超线程兄弟 | 核数超订反而下降 | 扩展曲线接近线性 |
+
+表里最后一行值得展开：多线程扩展性不是「线程越多越好」。当线程数超过物理核数，或线程被调度到同一物理核的两个超线程上，吞吐会不升反降；当工作集超过末级缓存，增加线程只会加剧争抢。判断方法是做 1/2/4/8 核曲线，看斜率是否在某个点突然变平或转负，那个点就是这台机器的实际上限。
+
+### 7. 小结与延伸阅读
+
+本篇的结论可以归纳为一条判断链：先看字面量覆盖率决定引擎走哪条路径，再看 scratch 与流状态决定内存与缓存压力，再看块大小与线程模型决定固定开销与并行效率，最后用目标机型实测确认瓶颈位置。任何一步跳过，都会得到「改了但没用」或「越改越慢」的结果。特别要记住三句话：scratch 不是线程安全的，也不是可以每次现分配的；流状态是乘出来的，不是加出来的；手工改写模式与手工合并数据库，通常不会更快。
+
+延伸阅读：模式写法与官方性能建议的原文见 `doc/dev-reference/performance.rst`；scratch 字段与生命周期见 05-03；RoseEngine 字段与 `runtimeImpl` 的语义见 05-05；Rose 分解如何决定字面量覆盖见 06-04；字面量前端 Teddy/FDR 的选型见 06-05 与 07-07；流状态压缩与 horizon 的关系见 06-11；基准方法见 08-01；按现象定位瓶颈见 08-03。
+
+## 08-03 常见故障分类与诊断决策树
+
+### 1. 背景与动机
+
+Hyperscan 的故障有一个共同特征：表面现象与根本原因之间往往隔着两三层。看到「扫描没有命中」，可能是模式写错、可能是标志缺失、可能是数据库跨机加载到了错误的平台、也可能是流被提前终止后再也没有恢复；看到「吞吐只有预期的一成」，可能是模式集退化、可能是绑核失效、也可能只是构建里带着断言。如果没有一套固定的分类与判定顺序，排查就会退化成「凭经验逐个试」，而每一次试错都要重新编译、重新分发、重新压测。
+
+本篇的做法是把故障先分成六类，再给每一类配上「首发证据」与「二次确认」，最后用一棵决策树把顺序固定下来。六类是：编译失败、扫描无命中、命中过多、吞吐低、内存涨、崩溃或返回码异常。这个划分覆盖了从编译期到运行期的全链路，且每一类都有明确的分界：编译失败发生在 `hs_compile` 系列返回之前；扫描无命中与命中过多是语义层问题，进程健康、返回码正常；吞吐低是性能问题，功能正确；内存涨是资源问题，可能长期不表现为故障；崩溃是进程级问题，通常伴随非法返回码或段错误。
+
+分类的价值在于阻断误判。最常见的误判是把「命中过多」当成「扫描无命中」的反面来查——实际上是两套完全不同的原因：前者多半是模式语义太宽（例如 `.*` 在所有位置匹配）、标志开错（漏了锚定、多开了 DOTALL），后者多半是模式根本没进数据库（被 `-s`/`-z` 过滤）、流状态被终止、或 SOM 之外的偏移判断写错。另一类高频误判是把「吞吐低」当「内存涨」来治，于是不停加机器，而真正的原因是每个请求都在重新 `hs_alloc_scratch`。
+
+还有一条方法论上的前提：诊断必须基于证据，而不是基于猜测。Hyperscan 提供了足够多的证据源——返回码、错误消息、`hs_database_info` 的版本/特性/模式三元组、三个 size API、`hsdump` 的字节码转储、`hsbench` 的指标、`hscollider` 的对拍结果。把这些证据按层排列，绝大多数问题可以在十分钟内定位到「编译期 / 加载期 / 运行期」中的某一层，再在该层内细查。
+
+### 2. 核心概念
+
+诊断的第一组概念是三层失败面。编译期由 `hs_compile`、`hs_compile_multi`、`hs_compile_ext_multi`、`hs_compile_lit*` 构成，失败时返回 `HS_COMPILER_ERROR` 并通过 `hs_compile_error_t` 给出表达式下标与消息。加载期由 `hs_deserialize_database*` 与 `hs_database_info` 构成，失败时返回 `HS_DB_VERSION_ERROR`、`HS_DB_PLATFORM_ERROR` 或 `HS_INVALID`（HMAC 不匹配等）。运行期由 `hs_scan`、`hs_scan_vector`、`hs_scan_stream`、`hs_close_stream` 构成，失败时返回 `HS_INVALID`、`HS_DB_MODE_ERROR`、`HS_SCRATCH_IN_USE`、`HS_SCAN_TERMINATED`、`HS_ARCH_ERROR` 等。三层的错误码集合几乎不重叠，这是分类的第一把尺子。
+
+第二组概念是四条判定顺序。第一条：先编译后扫描——任何「扫描不对」的问题，先确认模式集能被 `hscheck` 全部编译通过，否则讨论运行期没有意义。第二条：先单线程后多线程——多线程问题有相当比例是 scratch 共享或数据竞争，用单线程复现一次就能把范围砍掉一半。第三条：先块模式后流模式——流式独有状态、历史、EOD 补报、horizon 四类机制，块模式没有；如果块模式下正确、流式下不正确，问题必然在这四类机制里。第四条：先最小模式集后全量——用 `-z` 单测一条模式，再用 `-s` 逐步放大，能快速定位是「某条模式的语义问题」还是「模式之间的组合问题（例如逻辑组合、SINGLEMATCH 相互影响）」。
+
+第三组概念是证据的强度分级。最强的是可复现的返回码与错误消息，它直接指向失败点；次强的是产品信息（版本、特性、模式、尺寸），它能排除环境不匹配；再次是行为证据（命中偏移、命中数量、逐轮吞吐），它需要与预期对照才能下结论；最弱的是「感觉变慢了」这类主观描述。诊断时应优先采集强证据，避免在弱证据上做长篇推理。
+
+六类故障与判定入口的关系见图 08-03-01。图中把「现象分类」作为唯一根节点，六个叶子是六类故障，每类都对应一条独立的取证路径；这张图刻意不画「修复」节点，因为修复动作取决于根因，而根因必须在叶子之后继续细分。
+
+:::figure id=08-03-01 | name=六类故障的分类入口与取证方向 | dir=TD
+node n1 "现象分类" blue
+node n2 "编译失败" red
+node n3 "扫描无命中" amber
+node n4 "命中过多" amber
+node n5 "吞吐低" purple
+node n6 "内存涨" purple
+node n7 "崩溃或返回码异常" red
+edge n1 -> n2 "编译期取证"
+edge n1 -> n3 "语义层取证"
+edge n1 -> n4 "语义层取证"
+edge n1 -> n5 "性能层取证"
+edge n1 -> n6 "资源层取证"
+edge n1 -> n7 "进程层取证"
+:::
+
+图 08-03-01 的用法是先归类再取证，而不是先猜原因。归类的判据很硬：编译失败一定有 `HS_COMPILER_ERROR`；崩溃一定伴随异常返回码、信号或 `abort`；吞吐低与内存涨则在功能正确的前提下才成立。把类别定错，后面所有取证都会跑偏。
+
+### 3. 关键数据结构与源码位置
+
+编译期证据的载体是 `hs_compile_error_t`。它只有两个有效字段：`message`（人类可读的错误描述）与 `expression`（出错的表达式下标，负数表示与具体表达式无关的全局错误）。`engine_hyperscan.cpp` 在编译失败时的处理正是按这个区分打印的：`expression >= 0` 时打印「Compile error for signature #N: ...」，否则打印「Compile error: ...」。使用完毕后必须 `hs_free_compile_error`，否则每次失败都会泄漏一小块内存（字段见 05-04 ｜ 参数见 04-04）。
+
+加载期与运行期证据的载体是 `hs_database`。它的 `magic` 是数据库魔数（默认 `0xdbdbdbdb`，可由构建期 `-DHS_DB_MAGIC=` 覆盖），`version` 是数据库格式版本，`platform` 是编译时平台摘要，`length` 是字节码长度，`hmac` 与 `hmac_hdr` 分别是全量校验与头部校验的 HMAC。这里有一个非常关键的细节：`src/database.h:138` 的 `validDatabase` 只做两项廉价检查——`magic` 与 `version`，它被每次 `hs_scan` 调用；而完整校验函数 `dbIsValid`（`src/database.c:3123`）还会检查 `platform`、16 字节对齐、头部 HMAC、全量 HMAC 与字节码偏移合法性。因此「`hs_scan` 返回 `HS_SUCCESS`」并不等于「数据库完整可信」，它只说明魔数与版本对得上；平台与完整性是在反序列化路径上把关的（字段见 05-02 ｜ 原理见 06-12 ｜ 模块见 07-10）。
+
+scratch 侧的证据只有两个字段值得关注：`in_use` 与 `scratchSize`。`in_use` 由 `markScratchInUse` 置位、`unmarkScratchInUse` 清零，是 `HS_SCRATCH_IN_USE`（`src/hs_common.h:555`，值 -10）的唯一来源；`scratchSize` 是 `hs_scratch_size` 的返回值，用来判断「这块 scratch 是否真的覆盖了当前数据库」。当一块 scratch 被用于多个数据库时，容量由最大的那个决定，因此「大小看着够、但仍然报 `HS_INVALID`」通常意味着这块 scratch 从未对当前数据库调用过 `hs_alloc_scratch`（字段见 05-03 ｜ 参数见 04-06 ｜ 模块见 07-10）。
+
+还有一个容易被忽略的哨兵值：`HS_OFFSET_PAST_HORIZON` 在 `src/hs_runtime.h:615` 定义为 `~0ULL`。它不是错误码，而是回调 `from` 参数的一个特殊取值，表示这次匹配的起点早于当前 SOM horizon，无法精确给出。把 `~0ULL` 当成普通偏移参与运算（例如算长度 `to - from`），会得到一个巨大的数，进而让上层误判为「命中过多」或「日志异常」。这类问题在诊断时应当优先检查回调里是否对 `from` 做了哨兵判断。
+
+### 4. 关键流程与调用链
+
+编译期的失败点集中在三个阶段：解析（`src/parser/`）、图构造（`src/nfagraph/`）、Rose 分解与代码生成（`src/rose/`）。语法类错误在解析期被拒，消息通常带位置信息，例如缺右括号会提示「Missing close parenthesis for group started at index N」；不支持的构造（反向引用、任意零宽断言、`\K`、`\R` 等）也在这一层或紧随其后的语义检查中被拒；规模类错误（bounded repeat 过大、状态数超限）在图构造与 Rose 阶段被拒，消息形如「Pattern too large」。这三类在 `hs_compile_error_t` 里的表现相同，但处置完全不同：语法错要改模式文本，不支持构造要换写法或改用 Chimera，规模超限要拆模式或改用预过滤标志。
+
+加载期的失败点是一条固定顺序：解码头部（平台 → 版本 → 头部 HMAC）→ 校验长度 → 全量 HMAC → 恢复字节码偏移。顺序很重要，因为它决定了你看到的错误码。跨机分发时最典型的是平台不匹配：编译机支持 AVX512、目标机只有 AVX2，且数据库是用非 fat 的方式编译的，反序列化会返回 `HS_DB_PLATFORM_ERROR`；如果编译机与目标机的 Hyperscan 版本不同，则先撞上 `HS_DB_VERSION_ERROR`。注意这两个错误都发生在反序列化，而不是 `hs_scan`；如果宿主把数据库序列化后落盘、启动时加载失败，日志里应当出现明确的 `hs_deserialize_database` 返回值，而不是一句笼统的「初始化失败」。
+
+运行期的失败点按调用顺序排列：`hs_scan` 先查空指针，再 `validDatabase`（magic、version），再取字节码查 16 字节对齐，再查 `rose->mode` 是否等于 `HS_MODE_BLOCK`，再 `validScratch`，再 `markScratchInUse`。这条顺序解释了几种典型现象：模式不符返回 `HS_DB_MODE_ERROR`（-7）而不是 `HS_INVALID`；scratch 容量不足返回 `HS_INVALID` 而不是 `HS_NOMEM`；同一 scratch 被两个线程同时进入返回 `HS_SCRATCH_IN_USE`（-10）。流式路径多两步：先检查流状态位，`STATUS_TERMINATED` 返回 `HS_SCAN_TERMINATED`、`STATUS_EXHAUSTED` 返回 `HS_SUCCESS`，以及结束时把状态写回。这解释了一个高频疑问——「流已经终止了，为什么后续 `hs_scan_stream` 不报错而是静默返回成功」：因为耗尽是一种正常终态，不是错误。
+
+把上述证据源按「采集 → 对照 → 定位」串起来，得到图 08-03-02。左侧是五类证据，右侧是唯一的结论节点；中间的边表示该证据主要覆盖哪一段链路。实践中最省时的路径是「返回码 → 产品信息 → 行为证据」：先用返回码把范围压到一层，再用版本/特性/模式排除环境因素，最后才用命中与吞吐数据做细查。
+
+:::figure id=08-03-02 | name=诊断证据链与定位顺序 | dir=LR
+node n1 "返回码与错误消息" blue
+node n2 "hs_database_info<br/>版本 特性 模式" teal
+node n3 "hscheck 编译校验" teal
+node n4 "hsdump 字节码结构" amber
+node n5 "hsbench 指标" green
+node n6 "hscollider 对拍" purple
+node n7 "根因定位" red
+edge n3 -> n1 "编译期证据"
+edge n1 -> n7 "分层收敛"
+edge n2 -> n7 "排除环境"
+edge n4 -> n7 "引擎路径"
+edge n5 -> n7 "性能与命中"
+edge n6 -> n7 "语义差异"
+edge n1 -> n5 "运行期复现"
+:::
+
+图 08-03-02 有一条虚线本应存在但没有画：证据之间也会互相矛盾，例如 `hsbench` 显示命中数正常，而业务日志显示没有命中，此时矛盾本身就指向「业务侧偏移判断或流生命周期」而不是引擎。诊断时不要急着消除矛盾，先记录矛盾，矛盾往往比单条证据更有信息量。
+
+### 5. 配置/命令/代码实例
+
+第一个实例是最小复现链。任何编译类问题的第一步都是把模式集从宿主程序里摘出来，用 `hscheck` 单独跑。它的输出已经把「哪条、什么原因」讲清楚了（示例输出，具体格式需对照实际版本核验）。
+
+```bash
+bin/hscheck -e /tmp/pat
+```
+
+```text
+OK: 1:/foo.*bar/
+FAIL (compile): 2:/((foo|bar)/: Missing close parenthesis for group started at index 0.
+SUMMARY: 1 of 2 failed.
+```
+
+逐行判读：第一行 `OK` 说明该模式在当前构建下可编译，注意它只验证「能编译」，不验证「语义是否符合预期」，后者要靠 `hscollider`。第二行给出失败模式的文件内 ID 与完整消息，「Missing close parenthesis for group started at index 0」把根因直接指到第 0 个字符处的分组未闭合，不需要再猜；如果消息是「Pattern too large」或「Could not compile」，则属于规模或构造问题，处置方向完全不同。第三行 `SUMMARY` 给出通过率，它是判断「是否所有模式都进了数据库」的唯一可靠依据——宿主程序里用 `hs_compile_multi` 一次性编译时，只要有任意一条失败，整个数据库都不会生成，返回 `HS_COMPILER_ERROR`，因此「部分模式没生效」这种猜想在实际 API 语义下是不成立的，真正需要查的是「这次编译用的是不是你以为的那份模式集」。
+
+第二个实例是运行期三元组取证。把数据库信息、三个尺寸与一次最小扫描的返回码打在一起，可以在一屏内排除大部分环境问题。下面这段程序只依赖公开 API，适合直接嵌进宿主的自检流程。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+
+static int on_match(unsigned int id, unsigned long long from,
+                    unsigned long long to, unsigned int flags, void *ctx) {
+    (void)flags;
+    (void)ctx;
+    printf("match id=%u from=%llu to=%llu\n", id, from, to);
+    return 0;
+}
+
+static const char *rc_name(hs_error_t rc) {
+    switch (rc) {
+    case HS_SUCCESS:          return "HS_SUCCESS";
+    case HS_INVALID:          return "HS_INVALID";
+    case HS_NOMEM:            return "HS_NOMEM";
+    case HS_SCAN_TERMINATED:  return "HS_SCAN_TERMINATED";
+    case HS_COMPILER_ERROR:   return "HS_COMPILER_ERROR";
+    case HS_DB_VERSION_ERROR: return "HS_DB_VERSION_ERROR";
+    case HS_DB_PLATFORM_ERROR:return "HS_DB_PLATFORM_ERROR";
+    case HS_DB_MODE_ERROR:    return "HS_DB_MODE_ERROR";
+    case HS_BAD_ALIGN:        return "HS_BAD_ALIGN";
+    case HS_BAD_ALLOC:        return "HS_BAD_ALLOC";
+    case HS_SCRATCH_IN_USE:   return "HS_SCRATCH_IN_USE";
+    case HS_ARCH_ERROR:       return "HS_ARCH_ERROR";
+    case HS_INSUFFICIENT_SPACE: return "HS_INSUFFICIENT_SPACE";
+    case HS_UNKNOWN_ERROR:    return "HS_UNKNOWN_ERROR";
+    default:                  return "UNEXPECTED";
+    }
+}
+
+int main(void) {
+    hs_database_t *db = NULL;
+    hs_compile_error_t *err = NULL;
+    hs_scratch_t *scratch = NULL;
+    char *info = NULL;
+    size_t db_size = 0, scratch_size = 0;
+    hs_error_t rc;
+
+    rc = hs_compile("foo.*bar", HS_FLAG_DOTALL, HS_MODE_BLOCK,
+                    NULL, &db, &err);
+    if (rc != HS_SUCCESS) {
+        printf("compile rc=%s expr=%d msg=%s\n", rc_name(rc),
+               err ? err->expression : -1, err ? err->message : "none");
+        hs_free_compile_error(err);
+        return 1;
+    }
+
+    rc = hs_database_info(db, &info);
+    printf("info rc=%s text=%s\n", rc_name(rc), info ? info : "none");
+    free(info);
+
+    rc = hs_alloc_scratch(db, &scratch);
+    printf("scratch alloc rc=%s\n", rc_name(rc));
+    if (rc != HS_SUCCESS) {
+        hs_free_database(db);
+        return 1;
+    }
+
+    hs_database_size(db, &db_size);
+    hs_scratch_size(scratch, &scratch_size);
+    /* 块模式数据库没有流状态，hs_stream_size 在此返回 HS_DB_MODE_ERROR */
+    printf("db=%zu scratch=%zu\n", db_size, scratch_size);
+
+    rc = hs_scan(db, "xxfoobarxx", 10, 0, scratch, on_match, NULL);
+    printf("scan rc=%s\n", rc_name(rc));
+
+    hs_free_scratch(scratch);
+    hs_free_database(db);
+    return 0;
+}
+```
+
+第三个实例是把「不可复现」变成可复现。吞吐类问题的第一步不是猜，而是用最小参数跑一次并保存全部输入：模式集、语料库、数据库文件、两次运行的完整输出。下面的命令序列把一次取证所需的文件全部落盘，便于事后比对与归档。
+
+```bash
+mkdir -p /tmp/case && cp -r /tmp/pat /tmp/case/pat
+cp /tmp/corpus.db /tmp/case/corpus.db
+hsbench -e /tmp/case/pat -c /tmp/case/corpus.db -n 1 -w /tmp/case/db \
+    --per-scan > /tmp/case/run1.txt 2>&1
+hsbench -e /tmp/case/pat -c /tmp/case/corpus.db -n 50 -i /tmp/case/db \
+    --per-scan > /tmp/case/run2.txt 2>&1
+sha256sum /tmp/case/pat/* /tmp/case/corpus.db /tmp/case/db/*.db
+```
+
+逐行判读：`-n 1` 的首跑主要用于生成数据库与拿到「一次干净扫描」的基线，注意它的吞吐数字因冷启动而偏低，不能作为结论。`-i` 的第二跑复用同一份数据库，排除编译差异，`-n 50` 提供足够样本观察离散度。`sha256sum` 是为了证明「两次跑的是同一份输入」——归档时如果模式文件被改动过而没人记录，后续所有对比都会失效。这套流程配合 08-01 的判读方法，可以把「上线后变慢」这类模糊问题收敛成「哪一份输入的哪一个指标变了」。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把 `HS_SCAN_TERMINATED` 当错误。它是回调返回非零后 API 的正常返回值，表示「用户主动终止」，扫描本身没有出错。宿主若把它当失败重试，会得到「每次都在同一位置终止」的假象；正确做法是区分 `HS_SUCCESS` 与 `HS_SCAN_TERMINATED`，只有其余返回码才进错误分支。
+
+第二个陷阱是把 `HS_OFFSET_PAST_HORIZON` 当非法偏移。它是 `from` 的哨兵值 `~0ULL`，表示起点超出 SOM horizon（horizon 与精度见 04-03，语义见 06-10）。正确处理是先比较哨兵再计算长度，否则会得到天文数字的长度并触发业务侧的「异常命中」告警。
+
+第三个陷阱是用 `HS_INVALID` 反推原因。`hs_scan` 的空指针、未对齐字节码、scratch 容量不足都返回 `HS_INVALID`，三者处置完全不同。定位方法是把检查拆开：先确认 `data` 与 `db` 非空，再确认 `hs_database_info` 能正常返回（说明字节码可用），最后用一块「刚对该库 `hs_alloc_scratch` 过」的 scratch 复测。如果换 scratch 就好了，根因就是容量或归属问题。
+
+第四个陷阱是用改模式来治内存涨。内存涨的三种典型来源是流状态泄漏、scratch 随线程数增长、数据库变大，三者与模式语义无关或弱相关。正确顺序是先用 08-02 的恒等式估算，再看哪一项超预期；改模式只在「数据库本身异常大」时才成立。
+
+第五个陷阱是用重启治流泄漏。重启能让内存回到基线，但泄漏速率不变，下一次故障只是时间问题。判断是否泄漏的方法很直接：记录 `hs_open_stream` 与 `hs_close_stream` 的调用计数差，稳定运行时该差值应等于并发流数；若持续增长，就是有路径没有关闭流（包括异常分支与提前返回）。
+
+第六个陷阱是忽略构建形态。带断言的库、`DEBUG_OUTPUT` 打开的库、非 fat runtime 的库，在功能上都正常，性能与行为却有差异。诊断任何「性能不对」的问题前，先确认构建变体与目标机架构，再谈优化。
+
+| 故障类别 | 首发证据 | 二次确认 | 常见根因 | 处置入口 |
+|---|---|---|---|---|
+| 编译失败 | `HS_COMPILER_ERROR` 与消息 | `hscheck` 单条复现 | 语法错、构造不支持、规模超限 | 04-08 与 06-02 |
+| 扫描无命中 | 回调零次、返回码正常 | 块模式最小样例复现 | 标志缺失、流已终止、偏移判断错 | 04-02 与 06-11 |
+| 命中过多 | matches/kilobyte 异常高 | `--echo-matches` 看偏移 | 模式过宽、未锚定、DOTALL 误用 | 04-02 与 08-01 |
+| 吞吐低 | 单核与总吞吐同时偏低 | 与基线 `Bytecode size` 对比 | 字面量退化、SOM 全开、断言构建 | 08-02 与 06-04 |
+| 内存涨 | RSS 单调上升 | 流打开/关闭计数差 | 流未关闭、scratch 按请求分配 | 05-03 与 03-05 |
+| 崩溃或异常码 | `abort`、-7、-10、-11 | 单线程最小复现 | 模式不符、scratch 共享、架构不匹配 | 04-08 与 06-13 |
+
+表里最后一列的「处置入口」是阅读顺序，不是修复顺序。修复顺序永远遵循四条判定：先编译后扫描、先单线程后多线程、先块后流、先最小集后全量。
+
+最后一条最佳实践是保存证据。一份可归档的故障记录应当包含：Hyperscan 版本（来自 `hs_database_info` 或 `hs_version`）、CPU 特性（决定 fat runtime 选中哪套实现）、构建变体（是否 Release、是否 fat runtime、是否 AVX512）、模式集与语料库的哈希、数据库序列化文件、完整输出文本。缺任何一项，事后都无法判断「同一现象是否同一原因」。
+
+### 7. 小结与延伸阅读
+
+本篇给出的是一套固定动作：先把现象归入六类之一，再用返回码把范围压到编译期、加载期或运行期中的一层，然后在层内按「先编译后扫描、先单线程后多线程、先块后流、先最小集后全量」的顺序取证，最后用产品信息排除环境因素。六类故障里，编译失败与崩溃有明确返回码，最容易定位；扫描无命中与命中过多是语义问题，必须靠最小样例与偏移打印；吞吐低与内存涨是资源与结构问题，必须靠尺寸字段与计数差。四个陷阱要反复提醒自己：`HS_SCAN_TERMINATED` 不是错误，`HS_OFFSET_PAST_HORIZON` 不是非法值，`HS_INVALID` 不是单一原因，重启不是修复。
+
+延伸阅读：错误码与语法支持的逐条说明见 04-08；`hs_compile_error_t` 与平台结构字段见 05-04；`hs_database` 头部与 HMAC 校验顺序见 05-02 与 06-12；scratch 占用位与生命周期见 05-03；fat runtime 分派与 `HS_ARCH_ERROR` 见 06-13；流终止、耗尽与 EOD 语义见 06-11；六个完整案例的复现与修复过程见 08-04；上线前的检查清单见 08-06。

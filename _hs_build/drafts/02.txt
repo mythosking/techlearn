@@ -1,0 +1,912 @@
+# Hyperscan 技术资料 · 02 编译与构建
+
+## 02-01 源码获取、仓库目录结构与依赖矩阵
+
+### 1. 背景与动机
+
+Hyperscan 的交付形态是一个链接进宿主程序的库，因此本套资料的第一道实操门槛不是 API 怎么调，而是「能不能把它编出来」。这件事在 Hyperscan 上比在多数 C 库上更麻烦，原因有三层。
+
+第一层，构建期依赖显著多于运行期依赖。运行期只需要 libc、libcrypto 和一个支持 SSSE3 的 x86 处理器；构建期却需要 CMake、Ragel、Python、Boost 头文件，缺任何一个都会在配置阶段直接 `FATAL_ERROR` 退出，连一行库代码都编不出来。第二层，许多决定运行行为的属性在构建期就被固定下来：是否生成 fat runtime、是否把 AVX-512 变体编进库里、断言是否参与编译、dump 支持是否存在、数据库 HMAC 密钥是哪一个，全部由 cmake 命令行决定，运行期没有任何开关能改回来。第三层，仓库没有 autotools、没有包管理清单，顶层 `CMakeLists.txt` 是唯一装配点，所有源文件清单、所有目标定义、所有安装规则都集中在这一个文件里——截至 5.4.2，`src/` 目录下并不存在 `CMakeLists.txt`，这一点与多数「每个目录一个 CMakeLists」的项目完全不同。
+
+理解这三层，才能理解为什么本册要用一篇专门讲目录与依赖：后面四篇的每一个构建失败，最终都会落到「某个目录的文件没被编进去」或「某个依赖没被找到」这两类原因上。同时，`src/` 下的十个子目录就是 07 册的模块划分依据，先建立目录地图，读 07 册时才不会把「逻辑模块」误当成「构建单元」。
+
+### 2. 核心概念
+
+**源码树与构建树分离。** 上游强制 out-of-source 构建：`CMakeLists.txt` 第 40 至 41 行把 `BINDIR` 与 `LIBDIR` 定义为 `${PROJECT_BINARY_DIR}/bin` 与 `${PROJECT_BINARY_DIR}/lib`，随后第 46 至 55 行把它们写进 `CMAKE_RUNTIME_OUTPUT_DIRECTORY`、`CMAKE_LIBRARY_OUTPUT_DIRECTORY`、`CMAKE_ARCHIVE_OUTPUT_DIRECTORY`，并对多配置生成器逐个 `CMAKE_CONFIGURATION_TYPES` 重复一遍。这意味着产物永远落在构建目录的 `bin/` 与 `lib/` 下，与 `CMAKE_INSTALL_PREFIX` 无关；安装前缀只在 `make install` 阶段起作用。在源码树里直接 `cmake .` 会把这些目录创建在源码根下，与 `src/`、`tools/` 混在一起，后续 `git status` 会一片狼藉，这是最常见的自伤操作。
+
+**唯一装配点。** 顶层文件按顺序完成五件事：定义版本号（第 4 至 7 行）、导入本地 CMake 模块（第 20 至 21 行 `platform.cmake` 与 `ragel.cmake`，`CMAKE_MODULE_PATH` 在第 9 行被设为 `${PROJECT_SOURCE_DIR}/cmake`）、探测依赖、定义库目标（第 1188 至 1444 行）、安装与打包（第 1358 至 1433 行）。`src/`、`tools/`、`chimera/`、`unit/`、`examples/`、`util/` 只有部分带自己的 `CMakeLists.txt`，且这些子文件只负责「把已有源文件挂成 target」，不负责依赖探测。
+
+**两类代码生成。** 一类是 Ragel 状态机生成：`Parser.rl` 生成 `Parser.cpp`、`control_verbs.rl` 生成 `control_verbs.cpp`（顶层第 579 与 586 行两次调用 `ragelmaker`），工具侧 `util/ExpressionParser.rl` 生成 `ExpressionParser.cpp`。生成物落在构建树，`ragelmaker` 函数在 `cmake/ragel.cmake` 里定义为「`add_custom_command` + `add_custom_target(ragel_<name>)`」，因此 `hs` 目标显式依赖 `ragel_Parser`（第 1388 行）。另一类是 `configure_file`：`config.h`、`hs_version.h`、`libhs.pc`（第 518 至 531 行），它们把 cmake 变量固化成 C 宏或 pkg-config 文本。
+
+**依赖三分类。** 构建期工具（CMake、Ragel、Python 解释器）只在配置与生成阶段用；构建期头文件（Boost）只被 `#include`；链接期库（OpenSSL libcrypto 必需，PCRE 与 sqlite3 与 libpcap 可选）决定哪些附加目标能生成。把这三类混为一谈，就会出现「装了 Boost 却仍然报找不到 Ragel」这类误判。
+
+**构建单元不等于逻辑模块。** 这是读本册最容易混淆的一点。顶层只定义三个库目标：`hs_exec`（运行时对象集合）、`hs_compile`（编译期对象集合）、以及由两者拼出的 `hs`；关闭静态库时 `hs` 变成 `hs_shared` 的别名（第 1436 至 1439 行）。`src/parser/`、`src/rose/` 这些目录并不产生独立库，它们的 `.cpp` 全部倒进同一个 `hs_compile` 目标里。因此「parser 模块编不过」在构建日志里的表现是「`hs_compile` 目标里某个 `.o` 报错」，而不是「某个子项目失败」。同理，`src/nfa/` 下 137 个文件按「运行期 `.c`」与「编译期 `*compile.cpp`」被切成两半，分别进入 `hs_exec` 与 `hs_compile` 两个目标，这条切分线在第 605 至 746 行与第 754 至 1134 行的两个源文件清单里体现得非常清楚。想确认某个文件属于哪一侧，直接在这两个 `set()` 块里搜文件名即可。
+
+**树内 Boost 是官方约定。** `cmake/boost.cmake` 先把 `BOOST_INCLUDEDIR` 指向 `<源码根>/include` 试查一次，这正是 `getting_started.rst` 里 `ln -s boost_1_59_0/boost <源码根>/include/boost` 那条建议的来源。快照的 `include/` 目录里只有 `boost-patched/`（Boost 1.62 的补丁头），并没有 `boost/`，所以默认走系统查找；若在离线环境构建，把 Boost 头解压到 `include/boost` 是最省事的方式，不需要 `-DBOOST_ROOT`。
+
+### 3. 关键数据结构与源码位置
+
+`src/` 下的十个子目录构成编译流水线与运行时的全部实现，文件数量差异极大，直接反映复杂度分布。各目录职责与文件规模见下表（文件数为 5.4.2 快照实测，含头文件）。
+
+| 目录 | 文件数 | 职责 | 关键入口 |
+|---|---:|---|---|
+| `src/parser/` | 64 | PCRE 语法解析、组件树构造、UTF-8 校验 | `Parser.cpp`、`Component*` |
+| `src/nfagraph/` | 107 | Glushkov 图构造与各类化简 pass | `ng.cpp`、`ng_builder.cpp` |
+| `src/rose/` | 77 | 分解为 literal/anchored/floating 并生成字节码 | `rose_build.h`、`rose_build_compile.cpp` |
+| `src/compiler/` | 7 | 装配流水线、断言处理、错误封装 | `compiler.cpp` |
+| `src/nfa/` | 137 | LimEx、Castle、Sheng、加速器、Teddy 运行时 | `limex_native.c`、`accel.c` |
+| `src/fdr/` | 28 | FDR 与 Teddy 字面量引擎的编译与运行 | `fdr_compile.cpp`、`fdr.c` |
+| `src/hwlm/` | 17 | HWLM 与 noodle 字面量匹配 | `hwlm_build.cpp` |
+| `src/smallwrite/` | 5 | 大小写不敏感匹配的小写化表 | `smallwrite_build.cpp` |
+| `src/som/` | 11 | SOM 槽位分配与流式 SOM | `slot_manager.cpp` |
+| `src/util/` | 88 | 容器、位运算、字符类、平台适配 | `charreach.h`、`ue2_graph.h` |
+
+`src/` 顶层另有 39 个文件，其中与构建关系最紧的是 `hs.h`、`hs_common.h`、`hs_compile.h`、`hs_runtime.h` 四个公开头（第 588 至 594 行被列为 `hs_HEADERS` 并安装到 `${CMAKE_INSTALL_INCLUDEDIR}/hs`），以及 `database.h`、`scratch.h`、`runtime.c`、`dispatcher.c`、`database.c`、`hs.cpp`。`src/` 之外的顶层文件承担分发职责：`hs.def` 与 `hs_runtime.def` 是 Windows DLL 导出清单，`libhs.pc.in` 是 pkg-config 模板，`include/` 是 Boost 的树内约定位置（详见 02-01 第 6 节），`cmake/` 下九个模块分别处理架构探测、编译器属性、Boost、PCRE、Ragel、sqlite3、版本日期与 fat runtime 的符号重命名。
+
+`cmake/` 各模块的真实职责见下表，后面四篇会反复回到这些文件。
+
+| 模块 | 作用 | 失败表现 |
+|---|---|---|
+| `platform.cmake` | 用 `CHECK_C_SOURCE_COMPILES` 判定 32/64 位 | 交叉编译时误判 IA32 |
+| `arch.cmake` | SSSE3/AVX2/AVX512/VBMI 探测与下限校验 | `A minimum of SSSE3 ... is required` |
+| `attrib.cmake` | 探测 `ifunc` 属性是否可用 | fat runtime 静默降级 |
+| `boost.cmake` | Boost 查找、1.57/1.61 下限、1.62 补丁检测 | `Boost 1.57.0 or later not found` |
+| `ragel.cmake` | 定义 `ragelmaker()` 生成函数 | 生成文件缺失导致编译报错 |
+| `pcre.cmake` | PCRE 8.41+ 检测，优先树内源码 | Chimera 与 hscollider 不生成 |
+| `sqlite3.cmake` | sqlite3 检测 | hsbench 不生成 |
+| `build_wrapper.sh` | fat runtime 的符号前缀重命名 | 链接期多重定义 |
+| `keep.syms.in` | 重命名时保留的符号模式 | 链接期多重定义 |
+
+安装布局是另一张必须记住的地图。第 594 行把四个公开头装到 `${CMAKE_INSTALL_INCLUDEDIR}/hs`，因此宿主程序写 `#include <hs/hs.h>` 而不是 `#include <hs.h>`；`chimera/CMakeLists.txt` 第 9 至 15 行把 `ch.h`、`ch_common.h`、`ch_compile.h`、`ch_runtime.h` 装到同一个 `hs/` 目录，所以 Chimera 的头也是 `<hs/ch.h>`。库文件装到 `${CMAKE_INSTALL_LIBDIR}`，pkg-config 文件装到 `${CMAKE_INSTALL_LIBDIR}/pkgconfig`，示例源码装到 `${CMAKE_INSTALL_DOCDIR}/examples`（`examples/CMakeLists.txt` 第 26 至 27 行）。`libhs.pc.in` 的四个变量——`prefix`、`libdir`、`includedir`、`Version`——全部由 `configure_file` 在配置期替换，其中 `Cflags` 是 `-I${includedir}/hs`，这意味着 `pkg-config --cflags libhs` 给出的路径已经包含了 `hs` 这一级，与安装布局自洽。
+
+### 4. 关键流程与调用链
+
+配置阶段的执行顺序由 `CMakeLists.txt` 的行序决定，且存在硬性先后依赖：`platform.cmake` 与 `ragel.cmake` 必须在任何 `add_subdirectory` 之前 include（第 20 至 21 行），因为 `ragelmaker()` 函数要在 `util/` 与顶层目标定义时被调用；`boost.cmake` 必须在第 460 行 `include_directories(SYSTEM ${Boost_INCLUDE_DIRS})` 之前完成查找；`FAT_RUNTIME` 的 `CMAKE_DEPENDENT_OPTION`（第 346 行）必须在 `arch.cmake`（第 349 行）之前求值，因为 `arch.cmake` 内部会按 `FAT_RUNTIME` 分支选择不同的探测 flag 组合；而 `FAT_RUNTIME_REQUISITES` 又依赖第 338 行 include 的 `attrib.cmake` 给出的 `HAS_C_ATTR_IFUNC`。整条依赖与产物关系见图 02-01-01。
+
+:::figure id=02-01-01 | name=源码树、构建期依赖与产物的对应关系 | dir=TD
+node n1 "源码树 upstream_src" blue
+node n2 "顶层 CMakeLists.txt" blue
+node n3 "cmake 模块目录" gray
+node n4 "Ragel 6.9" gray
+node n5 "Boost 头文件" gray
+node n6 "OpenSSL libcrypto" gray
+node n7 "build/lib 库文件" amber
+node n8 "build/bin 工具" amber
+node n9 "include/hs 公开头" amber
+edge n1 -> n2 "唯一装配点"
+edge n2 -> n3 "include 模块"
+edge n3 -> n4 dashed "查找可执行"
+edge n3 -> n5 "头文件探测"
+edge n3 -> n6 "必需链接库"
+edge n4 -> n2 dashed "生成 Parser.cpp"
+edge n2 -> n7 "编译产物"
+edge n2 -> n8 "工具产物"
+edge n2 -> n9 "安装头文件"
+:::
+
+图中虚线表示「被查找、被调用」的辅助关系，实线表示产物或包含关系。可以看出 Ragel 处于一个回环位置：它由 cmake 模块查找，它的输出又回到 cmake 的目标定义里成为源文件。
+
+运行时按行号可把配置过程切成七段：版本与模块导入（1 至 23 行）、构建类型判定（25 至 38 行）、输出目录与头文件路径（40 至 70 行）、依赖探测（72 至 102 行）、选项与编译器分支（104 至 298 行）、能力探测（300 至 487 行）、目标装配（489 至 1444 行）。排错时先看 `CMake Error at CMakeLists.txt:NNN`，行号落在哪一段，就知道是依赖问题还是编译期能力问题——例如第 73 行的 `find_package(OpenSSL REQUIRED)` 失败只可能是 libcrypto 的头或库缺失；而 `A minimum of SSSE3 compiler support is required` 虽然也会打印在配置日志里，却来自 `cmake/arch.cmake` 的 intrinsic 编译测试，与装没装包无关，改任何 `apt-get install` 都不会有帮助。
+
+子目录进入顺序也值得单独记住，因为它决定了哪些目标在 `make` 时存在：第 489 行 `add_subdirectory(util)` 先建出 `expressionutil`、`corpusomatic`、`databaseutil`、`crosscompileutil` 四个静态库，工具与单测都要链它们；第 490 行进 `doc/dev-reference`（生成文档目标，不影响库）；第 508 与 509 行进 `unit` 与 `tools`，两者的前提是 `hs` 目标已经定义；第 512 行才在 `BUILD_CHIMERA` 为真时进 `chimera`，因为 `chimera/CMakeLists.txt` 第 31 至 32 行要 `add_dependencies(chimera hs pcre)`；第 1441 至 1444 行最后处理 `examples`，且用 `BUILD_EXAMPLES` 选项与 `NOT WIN32` 双重保护。这个顺序解释了为什么 `-DBUILD_EXAMPLES=OFF` 能省掉 `simplegrep`，却不影响 `hscheck`——后者属于 `tools/`，由 `tools/CMakeLists.txt` 用 `file(GLOB)` 遍历子目录自动纳入，没有开关。
+
+### 5. 配置/命令/代码实例
+
+最小可用的源码获取与依赖自检流程如下。快照解压出来的目录可直接当作源码树使用，与 `git clone` 得到的树结构一致，区别只是没有 `.git`。
+
+```bash
+# 1) 获取源码：任选其一
+git clone https://github.com/intel/hyperscan.git hyperscan
+# 或者解压已下发的快照
+tar xf hyperscan-5.4.2-snapshot.tar.gz
+
+# 2) 安装构建依赖（Debian/Ubuntu 系）
+sudo apt-get install -y build-essential cmake ragel python2.7 \
+    libboost-dev libssl-dev libpcap-dev
+
+# 3) 版本自检
+cmake --version | head -1
+ragel -v
+python2.7 --version
+```
+
+三条自检命令的典型输出如下（示例输出，具体格式需对照实际版本核验）。
+
+```text
+$ cmake --version | head -1
+cmake version 3.22.1
+
+$ ragel -v
+Ragel State Machine Compiler version 6.9 [Jan 2017]
+Copyright (c) 2001-2009 by Adrian Thurston
+
+$ python2.7 --version
+Python 2.7.18
+```
+
+逐行判读：`cmake version 3.22.1` 的第一段是主版本，Hyperscan 只要求 2.8.11 以上，3.x 全系可用，但要注意 `-S/-B` 这种新写法在 3.13 以下不存在，脚本里若用会直接语法错误；`Ragel State Machine Compiler version 6.9` 中的 6.9 是硬要求而非「6.9 以上」，7.x 生成的代码与 `Parser.rl` 里的 action 写法不兼容，若这一行显示 7.0 则需要降级；`Python 2.7.18` 说明 `python2.7` 可执行文件存在，但 CMake 的 `find_package(PythonInterp)` 默认找的是 `python`，在只有 `python3` 的新发行版上会解析成 3.x，进而让 `cmake/formatdate.py` 在 `SOURCE_DATE_EPOCH` 存在时以语法错误中止——判读这一行的意义在于确认「有 2.7」而不是「CMake 会用 2.7」。
+
+这三条命令构成一个最小判据集：CMake 决定能不能开始配置，Ragel 决定 `Parser.cpp` 能否生成，Python 2.7 决定可复现构建是否成立。三者都通过时，后续 `cmake` 仍可能因 Boost 或 OpenSSL 失败，但那时错误信息会直接点名包名，定位成本远低于在生成代码里找语法错误。建议把这三条写进 Dockerfile 的 `RUN` 层，让镜像构建阶段就暴露版本偏差，而不是留给使用者。
+
+配置阶段实际发生的探测可以用 cmake 缓存反查，不必猜：
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release .
+grep -E "^(FAT_RUNTIME|BUILD_SHARED_LIBS|BUILD_STATIC_AND_SHARED|Boost_INCLUDE_DIR)" \
+     build/CMakeCache.txt
+```
+
+源码中与该行为直接对应的片段是下面这几行（`CMakeLists.txt` 第 138 至 150 行，原样摘录）：
+
+```cmake
+CMAKE_DEPENDENT_OPTION(DUMP_SUPPORT "Dump code support; normally on, except in release builds" ON "NOT RELEASE_BUILD" OFF)
+CMAKE_DEPENDENT_OPTION(DISABLE_ASSERTS "Disable assert(); Asserts are enabled in debug builds, disabled in release builds" OFF "NOT RELEASE_BUILD" ON)
+option(BUILD_AVX512 "Experimental: support avx512 in the fat runtime" OFF)
+option(BUILD_AVX512VBMI "Experimental: support avx512vbmi in the fat runtime" OFF)
+if (BUILD_AVX512VBMI)
+    set(BUILD_AVX512 ON)
+endif ()
+```
+
+这段是本册后续所有讨论的根：`CMAKE_DEPENDENT_OPTION` 的第四个参数是「生效条件」，第五个是「条件不成立时的值」，所以 `DUMP_SUPPORT` 在 release 构建下被强制为 OFF，而 `DISABLE_ASSERTS` 被强制为 ON——这不是默认值，是条件覆盖，命令行显式 `-DDUMP_SUPPORT=ON` 仍然能覆盖它，因为 CACHE 变量已存在时 `CMAKE_DEPENDENT_OPTION` 不再改写。组合语义的完整推导见 02-02，变量全集见 04-01。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，不要在源码树内构建。`cmake .` 会把 `bin/`、`lib/`、`CMakeCache.txt`、`config.h` 写进仓库根目录，而 `config.h` 与 `src/hs_version.h.in` 是同名不同物，极易让人误改生成物。
+
+第二，Boost 的三种供给方式有优先级。`cmake/boost.cmake` 第 14 至 25 行的顺序是：先 `unset(Boost_INCLUDE_DIR CACHE)` 并把 `BOOST_INCLUDEDIR` 指向 `${PROJECT_SOURCE_DIR}/include` 试一次（这是「树内 Boost」约定），失败后清空该变量再走系统查找。因此把 Boost 头目录软链到 `<源码根>/include/boost` 是官方支持的做法，而 `-DBOOST_ROOT=` 只影响第二次查找。另外 `HAVE_LIBCPP` 为真时下限从 1.57 抬到 1.61，Boost 1.62 还会额外跑一段 `reverse_graph` 编译测试，失败信息是 `Something is wrong with this copy of boost::reverse_graph`。
+
+第三，Python 只用于构建期脚本（`formatdate.py`），不参与运行期。但 `find_package(PythonInterp)` 找不到解释器时是 `FATAL_ERROR: No python interpreter found`，找到 3.x 时却不会报错，问题会推迟到 `SOURCE_DATE_EPOCH` 被设置的那一刻——CI 里做可复现构建时最容易踩。
+
+第四，OpenSSL 是硬依赖，不是可选项。第 73 行是 `REQUIRED`，且第 1354 至 1356 行把 `OpenSSL::Crypto` 链到 `hs_runtime` 与 `hs`。静态链接宿主程序时必须自己再补 `-lcrypto`，`getting_started.rst` 明确写了这一点；`libhs.pc.in` 的 `Libs.private` 也会通过第 529 行追加 `-lcrypto`。
+
+第五，可选依赖决定「少生成了什么」而不是「构建失败」。libpcap 缺失只是 `examples/pcapscan` 与 `patbench` 不生成（`examples/CMakeLists.txt` 第 1 至 5 行），sqlite3 缺失只是 hsbench 不生成，PCRE 缺失只是 Chimera 与 hscollider 不生成。真正的判据是构建末尾 `build/bin/` 里有没有对应可执行文件。
+
+第六，Ragel 的版本必须精确。`cmake/ragel.cmake` 只做 `find_program(RAGEL ragel)`，不校验版本；版本不符时错误出现在编译生成的 `Parser.cpp` 上，报错位置在构建树里，看起来像源码 bug。
+
+第七，`-march=native` 是默认行为（第 263 至 269 行），意味着在一台机器上编出的非 fat 库换机器可能 `SIGILL`。分发包必须显式指定 `-march=` 或启用 fat runtime，详见 02-05。
+
+第八，确认手上的源码到底是哪个版本，只看一个地方不够。`CMakeLists.txt` 第 4 至 6 行的 `HS_MAJOR_VERSION`/`HS_MINOR_VERSION`/`HS_PATCH_VERSION` 决定库版本与 `libhs.pc` 的 `Version`；`CHANGELOG.md` 的首个条目反映最后一次发版；而 `src/hs_version.h.in` 里 `HS_VERSION_STRING` 由 `@HS_VERSION@ @BUILD_DATE@` 拼出，`BUILD_DATE` 来自配置当天的日期或 `SOURCE_DATE_EPOCH`。三者不一致的典型情形是从 master 分支取的快照：版本号仍是 5.4.2，但代码已经包含发版后的改动，此时任何「5.4.2 的行为是这样」的判断都要打折，涉及具体行为时以 `git log` 或快照日期为准。
+
+第九，源码树里不要手改生成物。`Parser.cpp`、`control_verbs.cpp`、`config.h`、`hs_version.h` 全部在构建树中生成，改了会在下一次 `make` 时被覆盖；真正的输入是 `src/parser/Parser.rl`、`src/parser/control_verbs.rl` 与 `cmake/config.h.in`。反过来，如果发现构建树里的 `Parser.cpp` 行为异常，第一步应是删掉它并重跑 `make ragel_Parser`，而不是去读生成代码找 bug。
+
+### 7. 小结与延伸阅读
+
+本册的起点是三个判断：产物位置由 `${PROJECT_BINARY_DIR}` 决定，配置能力集中在唯一一个 `CMakeLists.txt`，依赖分为工具、头文件、链接库三类且失败表现各不相同。记住 `cmake/` 下九个模块的职责，后面每一个配置报错都能直接定位到模块而不是靠猜。更进一步，凡是「编译通过了但功能缺失」的现象，先到第 1184 至 1186 行、第 504 至 506 行这类条件块里找开关，再怀疑代码，这条经验能省掉大量无效排查。
+
+配置变量的组合语义与三种典型变体见 02-02；Linux 上的完整可复现流程见 02-03；Windows 与 Chimera 的特殊依赖见 02-04；fat runtime 与指令集分派见 02-05。编译流水线本身的原理见 06-01，`src/` 各模块的功能细节见 07-01 至 07-13。（字段见 05-02 ｜ 参数见 04-01 ｜ 原理见 06-01 ｜ 模块见 07-03）
+
+## 02-02 CMake 配置项与构建变体全解
+
+### 1. 背景与动机
+
+Hyperscan 没有配置文件、没有环境变量表、没有启动参数，它的「配置」全部收敛到 cmake 命令行。这件事带来一个反直觉的后果：理解构建配置的正确方式不是背一张变量清单，而是理解变量之间的派生关系。因为清单里的每一行都在别处被引用、被条件覆盖、被翻译成 C 宏，孤立地记「某变量默认是什么」几乎必然出错——例如 `DUMP_SUPPORT` 的默认值并不是 OFF，而是「release 构建下为 OFF、非 release 构建下为 ON」，把它记成 OFF 的人在 Debug 构建里会奇怪为什么 dump 代码被编了进去。
+
+更麻烦的是误配的暴露时机。库形态配错，链接期立刻报错，容易发现；断言配错，只有在崩溃现场才会发现「本该 abort 的地方静默越界」；dump 支持配错，只有在想用 `hsdump` 或 `grey` 调参时才发现功能不存在；fat runtime 配错，编译机上一切正常，换到客户机器才 `SIGILL`。因此本篇的组织方式是「先讲三条正交维度和五条派生规则，再讲三种典型变体」，把变量放回它们的因果链里。单个变量的默认值、取值与误配后果以 04-01 为准（完整变量见 04-01），本篇不重列全集。
+
+三类误配的代价可以具体化。库形态误配表现为链接错误：宿主程序按静态库写的 `-lhs -lcrypto`，在只有 `libhs.so` 的机器上会得到 `cannot find -lhs`；反过来，在只装了 `.a` 的机器上用 `dlopen("libhs.so.5")` 会得到 `file not found`。诊断能力误配最隐蔽：release 下 `DUMP_SUPPORT` 默认为 OFF，`hsdump` 虽然能被编出来，但对不含 dump 段的数据库只能打印概要，此时 `src/rose/rose_build_dump.cpp` 那类代码根本没进库，现象是「工具能跑但看不出东西」。指令集误配最贵：非 fat 构建把 `-march=native` 编进库里，在编译机上一切正常，部署到老 Xeon 上第一条 `hs_scan` 就 `SIGILL`，而且崩溃点在第三方库里，宿主程序侧看不出与构建选项有关。
+
+### 2. 核心概念
+
+**维度一：库形态。** 三个开关参与：`BUILD_SHARED_LIBS`、`BUILD_STATIC_AND_SHARED`、`BUILD_STATIC_LIBS`。派生规则是：当 `BUILD_SHARED_LIBS` 为 OFF 时，第 127 至 131 行强制把 `BUILD_STATIC_LIBS` 置 ON 并 `mark_as_advanced`；`BUILD_STATIC_AND_SHARED` 本身不打开静态库，它只是在第 121 行与第 1362 行让「shared 分支」也执行。所以真正决定「有没有 .a」的是 `BUILD_STATIC_LIBS`，而它只由 `BUILD_SHARED_LIBS` 的取值间接决定。这条链的实践含义是：`-DBUILD_STATIC_AND_SHARED=ON` 必须与默认的 `BUILD_SHARED_LIBS=OFF` 搭配才产出两种库；若同时写 `-DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_AND_SHARED=ON`，静态侧根本不建。
+
+还有一个易误导的细节：第 121 至 125 行的 `message(STATUS "Building shared libraries")` 在 `BUILD_STATIC_AND_SHARED` 为真时也会打印，所以控制台出现这句话并不代表「只有动态库」。同理，`BUILD_STATIC_LIBS` 被 `mark_as_advanced` 隐藏，`cmake-gui` 与 `cmake -L`（不带 `-LA`）都看不到它，只能从 `CMakeCache.txt` 里读到；这解释了为什么很多人误以为「静态库不由变量控制」。真正可靠的判断是构建结束后看 `build/lib/` 下有 `.a` 还是 `.so`，而不是读配置日志。
+
+**维度二：优化与诊断。** 这条链最长，也最容易被误解。第 25 至 31 行先确定 `CMAKE_BUILD_TYPE`（未指定时强制 `RELWITHDEBINFO`，指定时 `string(TOUPPER ...)` 统一大写，所以 `-DCMAKE_BUILD_TYPE=debug` 也能用）；第 33 至 38 行由此派生布尔量 `RELEASE_BUILD`，判据是 `MATCHES RELEASE|RELWITHDEBINFO|MINSIZEREL`；第 138 与 140 行两个 `CMAKE_DEPENDENT_OPTION` 再以 `NOT RELEASE_BUILD` 为条件翻转 `DUMP_SUPPORT` 与 `DISABLE_ASSERTS` 的默认值。
+
+这里有一个必须点明的细节：CMake 自带的 `CMAKE_C_FLAGS_RELWITHDEBINFO` 含 `-O2 -g`，但第 189 至 192 行用 `string(REGEX REPLACE "-O[^ ]*" "" ...)` 把 `-O` 系列从各配置的 flags 里全部删掉，随后由第 234 至 245 行按 `OPTIMISE` 重新给出 `-O3`（C）与 `-O2`（C++），`MINSIZEREL` 时改用 `-Os`，`OPTIMISE=FALSE` 时一律 `-O0`。换言之，`CMAKE_BUILD_TYPE` 只决定「有没有 -g、有没有 NDEBUG、dump 与断言在不在」，真正的优化级别由 `OPTIMISE` 单独控制；`-g` 因为是 `CMAKE_C_FLAGS_RELWITHDEBINFO` 里除 `-O` 之外的部分，被保留下来。
+
+**维度三：指令集与分派。** `FAT_RUNTIME` 是唯一带「平台可用性」判定的选项：只有 `CMAKE_SYSTEM_NAME` 匹配 Linux（第 325 行）、generator 是 Unix Makefiles 或 3.0 以上的 Ninja（第 333 行）、编译器支持 `ifunc` 属性（第 339 行）三条同时成立，`FAT_RUNTIME_REQUISITES` 才为真，第 346 行的 `CMAKE_DEPENDENT_OPTION` 才会把默认值设为 `RELEASE_BUILD`。`BUILD_AVX512` 与 `BUILD_AVX512VBMI` 是两个独立 option，后者在第 148 至 150 行隐含打开前者；它们只在 fat runtime 分支里生效，非 fat 构建下即使打开也只是多两个缓存变量，实际代码路径不变。
+
+`FAT_RUNTIME` 与 `-march` 是互斥的两条路，这一点在第 479 至 487 行写得很直白：`if (NOT FAT_RUNTIME)` 时把 `ARCH_C_FLAGS`（默认 `-march=native -mtune=<探测值>`）追加到 `CMAKE_C_FLAGS`，`else` 分支什么都不加，注释是「为多个微架构构建运行时」。因此判断一个构建「有没有指令集绑定」只需看 `CMAKE_C_FLAGS` 里有没有 `-march=`：有就是绑定本机，没有就是 fat。这也意味着在 fat 构建下手动追加 `-march=native` 是有害的——所有微架构变体会被编成同一个指令集，`ifunc` 解析形同虚设。
+
+**派生规则小结。** 除上述三条主线，还有两条横切规则：`DEBUG_OUTPUT=ON` 会 `add_definitions(-DDEBUG)` 并把 `OPTIMISE` 强制置 FALSE（第 109 至 112 行），所以「要详细日志」和「要最高优化」不可兼得；`-Werror` 只在 `NOT RELEASE_BUILD` 时加入 `EXTRA_C_FLAGS` 与 `EXTRA_CXX_FLAGS`（第 251 至 256 行），因此 Debug 构建对警告零容忍，release 构建宽容——这与很多项目的直觉相反。
+
+### 3. 关键数据结构与源码位置
+
+配置项的最终归宿是生成的 `config.h`。`cmake/config.h.in` 用 `#cmakedefine` 声明了三十余个宏，其中与构建变体直接相关的有 `FAT_RUNTIME`、`BUILD_AVX512`、`BUILD_AVX512VBMI`、`DUMP_SUPPORT`、`RELEASE_BUILD`、`HS_OPTIMIZE`、`ARCH_64_BIT`、`ARCH_IA32`、`HAVE_AVX2`、`HAVE_SSSE3`。`config.h` 在构建树根目录生成，被 `src/dispatcher.c`、`src/hs.cpp`、`tools/hscheck/main.cpp` 等源文件 `#include`，因此「改了开关但代码行为没变」通常意味着没重新生成 `config.h`（缓存未失效）。
+
+`HS_OPTIMIZE` 是另一个容易忽略的点：第 134 至 136 行只在 `OPTIMISE` 为真时 `set(HS_OPTIMIZE ON)`，这个变量进入 `config.h` 后被 `src/util/` 下的内联函数用来决定是否展开关键路径。也就是说 `OPTIMISE=FALSE` 不只是「优化级别降到 O0」，还会改变部分代码的写法，两者叠加使 Debug 构建的扫描速度比 release 低一个数量级以上，这也是官方文档强调「Debug 仅供开发」的实质原因。
+
+与变体相关的目标名也需要记住，排错时按名字找日志最快：非 fat 静态构建产生对象库 `hs_exec`、`hs_compile` 与归档库 `hs_runtime`、`hs`；fat 静态构建把运行时拆成 `hs_exec_core2`、`hs_exec_corei7`、`hs_exec_avx2`，可选再加 `hs_exec_avx512`、`hs_exec_avx512vbmi`，再由 `hs_exec_common` 汇总；共享构建对应 `hs_exec_shared*`、`hs_compile_shared`、`hs_runtime_shared`、`hs_shared`。目标名与开关的对应关系见下表。
+
+`hs_runtime` 与 `hs` 的区别值得单独说明，因为它直接决定部署形态。`hs_runtime` 只链 `src/hs_version.c`、`src/hs_valid_platform.c` 与 `hs_exec` 的对象（第 1205 行），不含 `hs_compile`，因此能扫描但不能编译；`hs` 在它之上再加 `$<TARGET_OBJECTS:hs_compile>`（第 1210 至 1214 行）。这正好对应「编译机产出序列化数据库、运行机只加载」的生产模型：运行机只需装 `libhs_runtime`，编译相关的大半个库（parser、nfagraph、rose 的构建侧）都不在二进制里，既省体积也缩小攻击面。省体积的量化效果与数据库分发流程见 03-03。
+
+| 变体 | 关键开关 | 主要产物 | 适用场景 |
+|---|---|---|---|
+| 生产静态 | 默认值（不改） | `libhs.a`、`libhs_runtime.a` | 嵌入宿主二进制，最简部署 |
+| 生产动态 | `-DBUILD_SHARED_LIBS=ON` | `libhs.so.5.4.2` | 多进程共享，独立升级 |
+| 静态加动态 | `-DBUILD_STATIC_AND_SHARED=ON` | 两套库同时生成 | 开发包与运行时包分离 |
+| 调试可转储 | `-DCMAKE_BUILD_TYPE=Debug` | 带断言与 dump 的库 | 读字节码、调 grey 参数 |
+
+动态库的版本号也由构建配置派生，值得在此一并记住：第 1191 至 1192 行把 `LIB_VERSION` 设为 `HS_VERSION`、把 `LIB_SOVERSION` 设为 `HS_MAJOR_VERSION`，于是产物是 `libhs.so.5.4.2`、soname 为 `libhs.so.5`。这意味着小版本升级不破坏 ABI 约定，但 5 到 6 需要重编宿主程序。
+
+### 4. 关键流程与调用链
+
+构建类型的派生链见图 02-02-01，图中每个箭头都对应源码里的一次赋值或条件判定。
+
+:::figure id=02-02-01 | name=构建类型到宏与编译标志的派生链 | dir=TD
+node n1 "CMAKE_BUILD_TYPE" blue
+node n2 "RELEASE_BUILD" teal
+node n3 "DUMP_SUPPORT" amber
+node n4 "DISABLE_ASSERTS" amber
+node n5 "OPTIMISE" amber
+node n6 "hs_dump_SRCS 编入" purple
+node n7 "NDEBUG 与 -O 级别" purple
+node n8 "DEBUG_OUTPUT" gray
+edge n1 -> n2 "三类视为 release"
+edge n2 -> n3 "条件默认 OFF"
+edge n2 -> n4 "条件默认 ON"
+edge n3 -> n6 "为真才加入"
+edge n4 -> n7 "附加 -DNDEBUG"
+edge n5 -> n7 "决定 -O3 或 -O0"
+edge n8 -> n5 dashed "强制关闭优化"
+edge n1 -> n5 "Debug 下仍为 TRUE"
+:::
+
+注意 `n1 -> n5` 这条边：`CMAKE_BUILD_TYPE=Debug` 并不会自动关掉 `OPTIMISE`，`OPTIMISE` 的默认值恒为 TRUE，只有在 `DEBUG_OUTPUT` 打开时才被强制置 FALSE。这解释了一个常见困惑——为什么 Debug 构建的库仍然带 `-O3`。答案是：Debug 只加了断言和 `-g`、去掉了 NDEBUG 与 dump 的默认值，优化级别纹丝不动，想真正得到无优化构建必须同时给 `-DOPTIMISE=FALSE`。
+
+三种典型变体在目标层面的差异见图 02-02-02。图中把「产物」与「安装布局」分成两列，是因为库形态的选择会连带影响 `make install` 装什么。
+
+:::figure id=02-02-02 | name=三种构建变体的目标组合与安装产物 | dir=LR
+node m1 "cmake 变体选择" blue
+node m2 "生产静态" teal
+node m3 "生产动态" teal
+node m4 "调试可转储" teal
+node m5 "libhs.a 与 libhs_runtime.a" amber
+node m6 "libhs.so 带 soname" amber
+node m7 "断言与 dump 生效" red
+node m8 "include/hs 与 libhs.pc" gray
+edge m1 -> m2 "默认值"
+edge m1 -> m3 "共享库开关"
+edge m1 -> m4 "Debug 类型"
+edge m2 -> m5 "归档输出"
+edge m3 -> m6 "符号导出"
+edge m4 -> m7 "诊断能力"
+edge m7 -> m5 "同样产出静态库"
+edge m5 -> m8 "安装规则"
+edge m6 -> m8 "安装规则"
+:::
+
+图 02-02-02 揭示了一个非对称：静态与动态两条路都走 `install(TARGETS ...)`，但安装条件不同。第 1358 至 1360 行的 `hs_runtime` 与第 1391 至 1393 行的 `hs` 都包在 `if (NOT BUILD_SHARED_LIBS)` 里，而第 1381 与 1429 行的共享库安装不带这个条件。结论是：纯动态构建（`BUILD_SHARED_LIBS=ON` 且未开 `BUILD_STATIC_AND_SHARED`）不会安装任何 `.a`，包括 `libhs_runtime.a`。若下游需要「动态库 + 静态 runtime 库」这种组合，必须显式用 `BUILD_STATIC_AND_SHARED=ON`。
+
+### 5. 配置/命令/代码实例
+
+三条命令覆盖三种变体，注意每条都使用独立的构建目录，避免缓存串味。
+
+```bash
+# 变体 A：生产静态（全部默认）
+cmake -B build-static -DCMAKE_BUILD_TYPE=Release ../hyperscan
+cmake --build build-static -j"$(nproc)"
+
+# 变体 B：生产动态
+cmake -B build-shared -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_SHARED_LIBS=ON ../hyperscan
+cmake --build build-shared -j"$(nproc)"
+
+# 变体 C：调试可转储（断言 + dump，且真正关掉优化）
+cmake -B build-debug -DCMAKE_BUILD_TYPE=Debug \
+      -DOPTIMISE=FALSE ../hyperscan
+cmake --build build-debug -j"$(nproc)"
+```
+
+变体 A 的配置输出片段如下（示例输出，具体格式需对照实际版本核验）。
+
+```text
+-- The C compiler identification is GNU 11.4.0
+-- The CXX compiler identification is GNU 11.4.0
+-- Default build type 'Release with debug info'
+-- using release build
+-- Found OpenSSL: /usr/lib/x86_64-linux-gnu/libcrypto.so (found version "3.0.2")
+-- Boost version: 1.74.0
+-- Build date: 2026-11-12
+-- Building static libraries
+-- gcc version 11.4.0
+-- g++ version 11.4.0
+-- Building runtime for multiple microarchitectures
+-- Configuring done
+-- Generating done
+```
+
+逐行判读：前两行确认 C 与 C++ 编译器同源同版本，若两者不一致（例如 cc 是 gcc、c++ 是 clang），`cmake/boost.cmake` 的 `CHECK_CXX_SOURCE_COMPILES` 与 C 侧探测会得出矛盾结论，随后链接期才炸；`Default build type 'Release with debug info'` 说明没传 `CMAKE_BUILD_TYPE`，此时 `RELEASE_BUILD` 为真，`DUMP_SUPPORT` 被置 OFF、`DISABLE_ASSERTS` 被置 ON；`Found OpenSSL ... found version "3.0.2"` 是硬依赖满足的证据，版本号本身不敏感，但若这行缺失且没有 `REQUIRED` 报错，说明命中了缓存的旧结果；`Boost version: 1.74.0` 低于 1.57 才会失败，1.6x 至 1.8x 均可用；`Building runtime for multiple microarchitectures` 是 `FAT_RUNTIME` 生效的标志，看到它说明当前是 Linux + Makefiles + ifunc 三条都满足，若期望 fat runtime 却看到 `Building for current host CPU: -march=native`，就要按 02-05 的三条前提逐项排查。
+
+库形态的全部逻辑其实只有十几行，摘录如下（`CMakeLists.txt` 第 118 至 131 行）：
+
+```cmake
+option(BUILD_SHARED_LIBS "Build shared libs instead of static" OFF)
+option(BUILD_STATIC_AND_SHARED "Build shared libs as well as static" OFF)
+
+if (BUILD_STATIC_AND_SHARED OR BUILD_SHARED_LIBS)
+        message(STATUS "Building shared libraries")
+else()
+        message(STATUS "Building static libraries")
+endif()
+
+if (NOT BUILD_SHARED_LIBS)
+    # build static libs
+    set(BUILD_STATIC_LIBS ON)
+    mark_as_advanced(BUILD_STATIC_LIBS)
+endif ()
+```
+
+这十行解释了三件事：`BUILD_STATIC_LIBS` 不是用户选项而是派生量；`BUILD_STATIC_AND_SHARED` 只影响 `message` 与后文的两处 `if`，不影响静态库的创建；`mark_as_advanced` 让派生的静态库开关从常规变量列表里消失。读构建日志时若只看到 `Building static libraries`，说明两个开关都关着；看到 `Building shared libraries` 则要再看 `build/lib/` 才能确定是「只有 so」还是「so 与 a 都有」。
+
+把配置结果落成宏的过程可以直接读构建树里的 `config.h`：
+
+```text
+/* 摘自 build-static/config.h，示例输出 */
+#define ARCH_64_BIT
+#define ARCH_X86_64
+#define FAT_RUNTIME
+#define RELEASE_BUILD
+#define HS_OPTIMIZE
+#define HS_VERSION 5.4.2
+#define BUILD_DATE 2026-11-12
+/* #undef DUMP_SUPPORT */
+/* #undef BUILD_AVX512 */
+```
+
+判读要点：`FAT_RUNTIME` 与 `RELEASE_BUILD` 同时被定义，说明这是 release 下的 fat 构建；`HS_OPTIMIZE` 存在说明 `OPTIMISE` 仍为 TRUE；`DUMP_SUPPORT` 是 `#undef` 状态，与第 138 行的条件默认值一致，想在 release 下用 `hsdump` 必须显式 `-DDUMP_SUPPORT=ON`；`BUILD_AVX512` 未定义说明分派表里不会出现 `avx512_` 前缀的实现，`src/dispatcher.c` 第 46 至 82 行的宏展开会相应缩短。这份文件是判断「我的开关到底生效没有」的唯一可靠证据，比看 cmake 的 `--` 输出更准。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，改 `CMAKE_BUILD_TYPE` 必须换构建目录或删缓存。`CMAKE_DEPENDENT_OPTION` 在变量已存在于缓存时不会重新计算默认值，因此从 Debug 切到 Release 后 `DUMP_SUPPORT` 会停留在 ON，产物与预期不符。删掉 `CMakeCache.txt` 或用新目录是唯一稳妥做法。
+
+第二，`BUILD_STATIC_AND_SHARED` 的语义容易被名字误导。它不打开静态库，只打开共享分支；静态库是否存在由 `BUILD_STATIC_LIBS` 决定，而后者由 `BUILD_SHARED_LIBS=OFF` 间接置位。写 `-DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_AND_SHARED=ON` 得到的仍然只有动态库。
+
+第三，纯动态构建不安装 `libhs_runtime.a`，且 `hs_runtime` 目标在 `BUILD_SHARED_LIBS=ON` 时根本不会被创建（第 1202 与 1236 行都在 `if (BUILD_STATIC_LIBS)` 内）。依赖「用 runtime 库缩小攻击面」的部署方案必须走静态或两者兼有。
+
+第四，Debug 构建会带 `-Werror`。新编译器（尤其 GCC 12 以上、Clang 15 以上）对老代码新增的警告会直接让构建失败，这不是配置错误，而是「非 release 零容忍」策略的副作用。临时绕法是把 `CMAKE_BUILD_TYPE` 设为 `RelWithDebInfo` 再单独 `-DOPTIMISE=FALSE`，既保留调试信息又不触发 `-Werror`。
+
+第五，`DEBUG_OUTPUT=ON` 与 `OPTIMISE=TRUE` 不能共存，前者会强制后者为 FALSE；同时 `-DDEBUG` 会让大量内联断言与日志进入热路径，扫描吞吐可能下降一个数量级。它适合定位编译期问题，不适合任何性能测量。
+
+第六，HMAC 密钥覆盖必须同时写进 `CMAKE_C_FLAGS` 与 `CMAKE_CXX_FLAGS`。`getting_started.rst` 的 HMAC Key Override 小节明确要求两处都给 `-DHS_DB_HMAC_KEY_OVERRIDE=`，因为该宏同时被 C 与 C++ 源使用；只给一处的结果是编译期「重定义」或运行期校验失败，后者表现为 `hs_deserialize_database` 返回 `HS_INVALID`。
+
+第七，`MINSIZEREL` 会把 `OPT_C_FLAG` 与 `OPT_CXX_FLAG` 一起改成 `-Os`，同时仍是 release 语义（断言关、dump 关）。它适合体积敏感的嵌入场景，但 Hyperscan 的扫描循环对指令排布敏感，`-Os` 的吞吐通常低于 `-O3`，选型时要实测而非假设。
+
+第八，想覆盖 `-march` 必须自己写进 `CMAKE_C_FLAGS`，而且要两处都写。第 263 至 269 行的判据是「`CMAKE_C_FLAGS` 里已有 `march` 或 `mtune` 就不再追加」，所以 `-DCMAKE_C_FLAGS="-march=corei7"` 会同时压制自动探测的 `-march=native` 与 `-mtune=`（`mtune` 也因同一正则而跳过）；但 `CMAKE_CXX_FLAGS` 只匹配 `march`/`mtune` 中的 `march` 部分时同样会被跳过，两侧不对称就会得到 C 与 C++ 指令集不一致的库。`getting_started.rst` 的 Target Architecture 一节因此建议两个变量一起给，并在同一条命令里同时写 `-march` 与 `-mtune`，避免 C 侧被 `mtune` 命中而 C++ 侧没有。
+
+### 7. 小结与延伸阅读
+
+把本篇压缩成三句话：库形态只看「`BUILD_SHARED_LIBS` 是否 OFF」以及「要不要同时产出」，优化级别只看 `OPTIMISE`（`CMAKE_BUILD_TYPE` 只管 `-g`、`NDEBUG`、dump 与断言），指令集分派只看 `FAT_RUNTIME` 及其三个前提。其余的开关都是这三条主线的附属。
+
+每个变量的完整语义与误配后果见 04-01；Linux 上的完整构建流程见 02-03；fat runtime 与 AVX-512 的机制见 02-05 与 06-13；`config.h` 宏如何影响运行时分派见 07-10。（字段见 05-04 ｜ 参数见 04-01 ｜ 原理见 06-13 ｜ 模块见 07-10）
+
+若想验证自己对组合语义的理解，有三个不依赖文档的自检办法：`grep -E "FAT_RUNTIME|NDEBUG|O3" build/CMakeCache.txt build/CMakeFiles/*/flags.make` 看最终编译行；`nm -C build/lib/libhs.a | grep -c "core2_"` 看 fat 变体是否真的进库；`nm -D build/lib/libhs.so.5 | grep hs_compile` 确认动态库里编译侧符号是否存在。三者分别对应「优化与诊断」「指令集分派」「库形态」三条主线，能覆盖本篇的全部结论。
+
+## 02-03 从零构建实战：Linux 上编译、测试与安装
+
+### 1. 目标与拓扑
+
+本篇的目标是「在一台干净的 Linux 机器上，从解压源码到验证库可用」，全过程可复制、每步有判据。最终要拿到四样东西：`build/lib/libhs.a` 与 `build/lib/libhs_runtime.a` 两个静态库、`build/bin/` 下的工具集、通过的单测、以及安装到前缀目录后能被 `pkg-config` 与 `hscheck` 正常使用的开发环境。选择静态构建是因为它是默认路径，也是本套资料后续 03 册集成示例的基准形态；动态构建的差异只在 `-DBUILD_SHARED_LIBS=ON` 与运行期 `LD_LIBRARY_PATH`，其余步骤完全一致。
+
+整条链路与每步的产物见图 02-03-01。图中把「失败回流」画成虚线，是因为前四步的失败几乎都会回到依赖安装或配置这两步，而不是继续往下走。
+
+:::figure id=02-03-01 | name=Linux 从零构建的六步链路与产物 | dir=TD
+node s1 "干净 Linux 系统" blue
+node s2 "安装构建依赖" teal
+node s3 "cmake 配置" teal
+node s4 "make 并行编译" purple
+node s5 "运行单元测试" amber
+node s6 "make install" amber
+node s7 "hscheck 验活" green
+node s8 "依赖缺失或版本不符" red
+edge s1 -> s2 "apt 安装"
+edge s2 -> s3 "依赖齐备才继续"
+edge s3 -> s4 "生成 Makefile"
+edge s4 -> s5 "产出库与工具"
+edge s4 -> s6 "安装到前缀"
+edge s5 -> s7 "测试通过"
+edge s8 -> s2 dashed "补装后重试"
+edge s3 -> s8 dashed "FATAL_ERROR"
+:::
+
+需要提前说明一个与本篇流程直接相关的事实：这个仓库**没有注册 CTest 用例**。全文检索 `add_test`、`enable_testing`、`include(CTest)` 均无命中，测试入口是 `unit/CMakeLists.txt` 第 174 至 211 行定义的自定义目标 `unit`，它按顺序执行 `bin/unit-hyperscan`（以及非 release 时的 `bin/unit-internal`、Chimera 可用时的 `bin/unit-chimera`）。因此 `ctest` 这一步会返回「未找到测试」，这是**正常现象而非故障**；真正跑测试要用 `make unit` 或直接执行二进制。下文第 3 节的第 5 步会把两种方式都给出，并说明如何判断哪一种才是有效验证。
+
+三个产物的用途要分清，否则验活会验错对象。`libhs.a` 是完整库，既能编译也能扫描，供宿主程序直接链接；`libhs_runtime.a` 只含扫描侧，用于「编译机与运行机分离」的部署；`build/bin/` 下的工具是开发期辅助，其中 `hscheck` 验证模式可编译性、`hsdump` 读字节码、`hscollider` 与 PCRE 对拍、`hsbench` 测吞吐。本篇的验活只依赖 `libhs.a` 与 `hscheck`，其余工具是否生成取决于可选依赖，不影响「构建成功」这个结论。
+
+### 2. 前置条件与环境
+
+硬件与系统：x86-64 处理器（必须支持 SSSE3，2010 年后的 CPU 基本都有）、4 GB 以上内存、10 GB 以上磁盘。内存这一条不是虚的：`hs_compile` 目标含 380 余个源文件，`make -j$(nproc)` 在 8 核机器上的峰值内存可以到 3 GB 以上，容器里限内存时最容易在链接 `hs_compile` 时被 OOM killer 杀掉，表现为 `c++: fatal error: Killed signal terminated program cc1plus`。
+
+软件：GCC 4.8.1 以上或 Clang 3.4 以上（`getting_started.rst` 的 Software 一节），CMake 2.8.11 以上，Ragel 6.9，Python 2.7，Boost 头文件 1.57 以上，OpenSSL 的 libcrypto 与开发头。可选依赖中 libpcap 只影响示例、sqlite3 只影响 hsbench、PCRE 8.41 以上只影响 Chimera 与 hscollider。
+
+在容器里构建时有三个额外注意点。第一，基础镜像不要用 `alpine`，musl libc 下 `cmake/build_wrapper.sh` 里依赖 `nm` 与 `objcopy` 的符号重命名流程会失败，fat runtime 直接不可用；用 `ubuntu:22.04` 或 `debian:12` 这类 glibc 镜像最稳。第二，`make -j` 的并发度要按容器内存上限设，8 GB 上限配 `-j4` 比较安全，因为 `hs_compile` 的单个翻译单元在 GCC 下峰值可到 300 MB 以上。第三，若在镜像层里做可复现构建，`SOURCE_DATE_EPOCH` 必须配合 Python 2.7 显式路径，否则会踩到第 5 节列出的 `SyntaxError`。
+
+最后一条环境建议与成败无关但与效率强相关：把 `build/` 排除在备份与同步目录之外。fat runtime 构建的中间产物常在 2 GB 以上，落在网盘同步目录里会让每次 `make` 都触发全量上传，症状是编译速度忽快忽慢、磁盘 IO 长期满载。
+
+依赖一次性装齐的命令与版本自检如下：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential cmake ragel python2.7 \
+    libboost-dev libssl-dev libpcap-dev libsqlite3-dev
+
+cmake --version | head -1
+ragel -v | head -1
+python2.7 --version
+dpkg -l | grep -E "libssl-dev|libboost-dev" | awk '{print $2, $3}'
+```
+
+示例输出（具体格式需对照实际版本核验）：
+
+```text
+cmake version 3.22.1
+Ragel State Machine Compiler version 6.9 [Jan 2017]
+Python 2.7.18
+libboost-dev:amd64 1.74.0.3ubuntu7
+libssl-dev:amd64 3.0.2-0ubuntu1.10
+```
+
+逐行判读：第一行只取主版本即可，3.22 满足「≥2.8.11」，但要注意 3.20 起 CMake 对 `CMAKE_C_FLAGS` 的空格处理更严格，若你在 flags 里塞了带引号的宏定义（例如 HMAC 密钥），必须按 `getting_started.rst` 的写法加内层转义引号 `\"`，否则 `make` 在 Fedora/RHEL 上会因 bash 展开花括号而报「宏重定义」。第二行确认 Ragel 是 6.9，这一步必须精确匹配，7.x 生成的 `Parser.cpp` 会与 `Parser.rl` 的 action 不兼容，而错误会出现在构建树里的生成文件上。第三行说明 `python2.7` 存在，但 `find_package(PythonInterp)` 找的是 `python`，若系统只有 `python3`，配置仍会成功、只在设置了 `SOURCE_DATE_EPOCH` 时才炸，因此稳妥做法是配置时显式传 `-DPYTHON_EXECUTABLE=$(which python2.7)`。第四、五行给出 Boost 与 OpenSSL 的实际版本，Boost 1.74 高于下限 1.57，OpenSSL 3.0 提供 `libcrypto.so`，两者都满足 `find_package` 的要求；若这里看到 `libssl-dev` 缺失，配置阶段会在 `CMakeLists.txt` 第 73 行的 `find_package(OpenSSL REQUIRED)` 直接失败。
+
+### 3. 分步操作
+
+**第 1 步，获取源码并建立独立的构建目录。** 源码树与构建树必须分离，产物才会落到 `build/lib` 与 `build/bin`。
+
+```bash
+mkdir -p ~/work && cd ~/work
+git clone https://github.com/intel/hyperscan.git
+cd hyperscan
+git log -1 --format='%H %ad %s' --date=short
+mkdir -p build && cd build
+```
+
+**第 2 步，配置。** 用 `Release` 而非默认的 `RelWithDebInfo`，能省掉调试符号带来的体积；需要排查崩溃时再换回默认值。`-DPYTHON_EXECUTABLE` 显式指定 2.7 是防御性写法。
+
+```bash
+cmake -DCMAKE_BUILD_TYPE=Release \
+      -DPYTHON_EXECUTABLE="$(command -v python2.7)" \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      .. 2>&1 | tee cmake.log
+```
+
+配置成功的标志是最后两行 `-- Configuring done` 与 `-- Generating done`，以及 `build/Makefile` 存在。若失败，`cmake.log` 里的第一条 `CMake Error` 就是根因，按第 5 节对照处理。
+
+配置日志里有四行值得逐一看：`-- Build type RELEASE`（或 `Default build type ...`）确认构建类型被正确解析；`Boost version: X.Y.Z` 确认 Boost 被找到且版本达标；`Building static libraries` 或 `Building shared libraries` 确认库形态；`Building runtime for multiple microarchitectures` 与 `Building for current host CPU:` 二选一，前者说明 fat runtime 生效、可以让产物跨机器迁移，后者说明已被钉死在本机指令集上。这四行之后若还有 `-- Could NOT find ...`（PCAP、SQLite3、PCRE），只代表对应工具不生成，不影响库本身。
+
+**第 3 步，并行编译。** 核数用 `nproc`，内存紧张时降到核数的一半。
+
+```bash
+make -j"$(nproc)" 2>&1 | tee build.log
+echo "exit=$?"
+ls -1 lib/ bin/ | head -20
+```
+
+编译阶段有两个值得观察的现象。其一是 `ragel_Parser` 会先于任何 C++ 编译执行，日志开头出现 `[  1%] Generating src/parser/Parser.cpp`；若这一行缺失而直接开始编译，说明构建树里已有旧的生成文件，`make` 认为它是最新的，此时改过 `.rl` 却没有重生成会让调试陷入僵局，处置是 `rm -f src/parser/Parser.cpp && make ragel_Parser`。其二是 fat runtime 构建会对同一批运行时源文件编五遍（core2、corei7、avx2，可选 avx512、avx512vbmi），日志里会看到同一个 `.c` 反复出现、每次带不同的 `-march`，因此总编译量约为非 fat 构建的三倍，这是正常的。
+
+**第 4 步，确认产物清单。** 默认 release + fat runtime 下应当看到 `libhs.a`、`libhs_runtime.a`，以及 `hscheck`、`hsdump`、`hscollider`、`hsbench`、`unit-hyperscan`、`simplegrep`（有 pcap 时还有 `pcapscan`、`patbench`）。缺哪个就回到第 2 步看对应依赖是否满足。
+
+确认库「是不是全量」有两个不看文档也能做的检查：`ar t build/lib/libhs.a | wc -l` 给出归档里的对象数，非 fat 静态构建通常在数百量级，数量明显偏少说明大量源文件因条件判断没进目标；`nm -g --defined-only build/lib/libhs.a | grep -c " T hs_"` 统计公开符号，正常情况下应覆盖 `hs.def` 里的大部分条目（Windows 导出清单共 38 项，包含编译、扫描、scratch、序列化、分配器与版本查询）。这两个数字不必记具体值，只需与上一次成功构建对比，突变就是线索。
+
+**第 5 步，跑测试。** 先按常规习惯跑 `ctest`，再跑真正的测试目标：
+
+```bash
+ctest --output-on-failure
+make unit
+```
+
+`ctest` 的输出是 `No tests were found!!!`——如前所述，仓库未注册 CTest 用例。`make unit` 才会执行 `bin/unit-hyperscan`，其末尾的 `[  PASSED  ] N tests.` 是唯一有效的通过判据。单测耗时通常在数分钟量级，其中 `som`、`stream_op`、`serialize` 三组最慢。如果 `make unit` 立刻返回 0 却没有任何输出，说明自定义目标没有真正依赖到二进制（例如在别的目录里执行了 `make unit`），这时应当直接运行 `./bin/unit-hyperscan` 确认。
+
+**第 6 步，安装并验活。** 安装需要写 `/usr/local`，非 root 用户加 `sudo` 或改用 `-DCMAKE_INSTALL_PREFIX=$HOME/.local`。
+
+```bash
+sudo make install
+sudo ldconfig
+pkg-config --modversion libhs
+pkg-config --cflags --libs libhs
+```
+
+安装布局是：库到 `${CMAKE_INSTALL_LIBDIR}`（通常 `lib/`），四个公开头到 `include/hs/`，pkg-config 文件到 `lib/pkgconfig/libhs.pc`，示例源码到 `share/doc/hyperscan/examples/`。`pkg-config --cflags` 应当输出 `-I/usr/local/include/hs`，注意末尾的 `hs` 一级目录，这是宿主程序写 `#include <hs/hs.h>` 的原因。打包时不要直接装进暂存根，用 `DESTDIR=/tmp/stage make install` 把前缀整体偏移，产物会落在 `/tmp/stage/usr/local/` 下，既不改 `CMAKE_INSTALL_PREFIX` 也不污染宿主。
+
+### 4. 验证方法与预期结果
+
+用 `hscheck` 做端到端验活，因为它同时覆盖「库能链接」「编译 API 可用」「运行时能分配 scratch 并扫描」三件事。准备一个模式文件，每行格式为 `ID:/正则/标志`：
+
+```bash
+cat > /tmp/regex.txt <<'EOF'
+1:/foo.*bar/s
+2:/hatstand|teakettle|badgerbrush/
+3:/(\w+)\1/
+EOF
+./bin/hscheck -N -e /tmp/regex.txt
+```
+
+示例输出（具体格式需对照实际版本核验）：
+
+```text
+OK: 1:/foo.*bar/s
+OK: 2:/hatstand|teakettle|badgerbrush/
+FAIL (compile): 3:/(\w+)\1/: Backreferences and capturing subexpressions are not supported.
+SUMMARY: 1 of 3 failed.
+```
+
+逐行判读：前两行的 `OK:` 前缀由 `printExpressionId()` 在编译成功分支写出，后面紧跟原始 `ID:正则`，说明这两条模式在 block 模式下都通过了 `hs_compile` 与随后的 scratch 分配、扫描自检；第三行 `FAIL (compile)` 是失败分支的固定格式，冒号后是编译器返回的错误文本，`Backreferences and capturing subexpressions are not supported` 正是反向引用被拒绝的标准消息，属于能力边界而非构建问题——这条模式在 PCRE 里合法，在 Hyperscan 里永远编不过，需要改用 Chimera。末行 `SUMMARY: 1 of 3 failed.` 是汇总计数，正常构建下这个数字应当只由「故意写的非法模式」贡献；如果连前两条都失败，说明库本身有问题而不是模式问题。`-N` 表示 block 模式，去掉它是默认的 streaming 模式，两者对同一批模式的编译结果可能不同（streaming 下部分构造受更多限制），验活时两种都跑一遍更稳。
+
+各步骤的判据汇总见下表，行内给出「通过」与「失败」的可观察信号。
+
+| 步骤 | 通过信号 | 失败信号 |
+|---|---|---|
+| 依赖安装 | `ragel -v` 显示 6.9，`python2.7 --version` 有输出 | `command not found` 或 Ragel 7.x |
+| cmake 配置 | `Configuring done` 与 `Generating done` | `CMake Error at CMakeLists.txt:NNN` |
+| make 编译 | `exit=0`，`lib/libhs.a` 存在 | `cc1plus: Killed`，或 `undefined reference` |
+| ctest | 预期为 `No tests were found!!!` | 出现真实测试却失败（说明有额外注册） |
+| make unit | `[  PASSED  ] N tests.` | `[  FAILED  ]` 或进程 abort |
+| make install | `-- Installing: /usr/local/lib/libhs.a` | 权限拒绝 |
+| hscheck | `OK:` 行数等于合法模式数 | 合法模式也 `FAIL (compile)` |
+
+`make install` 的典型输出片段是逐文件的 `-- Installing:` 与 `-- Up-to-date:`，看到 `libhs.pc` 被安装即说明 pkg-config 集成完成；若只装了 `.a` 而没有 `.pc`，几乎一定是构建时处于 `WIN32` 分支（不可能在 Linux 上）或 `CMAKE_INSTALL_LIBDIR` 被改成了绝对路径。
+
+除了 `hscheck`，单测本身也能给出可判读的证据。`bin/unit-hyperscan` 是 gtest 套件，输出末尾固定为三段：`[==========] N tests from M test suites ran.`、`[  PASSED  ] N tests.`，失败时多出 `[  FAILED  ]` 与失败用例的断言信息。判读要点有三：`N` 必须与本次构建的用例数一致，若 `N` 明显偏小说明部分用例被条件编译排除（例如 `BUILD_CHIMERA` 未开时 `unit-chimera` 根本不生成）；`M` 是测试套件数，`som`、`serialize`、`scratch_in_use` 这些套件名能反查出被测特性；出现 `[  FAILED  ]` 时优先看失败用例名，`scratch_in_use` 失败通常意味着并发相关代码被错误改动，`serialize` 失败则多半是 HMAC 密钥不一致。CI 里应当把 `make unit` 的退出码作为门禁，而不是把 `ctest` 的退出码当门禁——后者在无用例时返回 0，属于典型的假阳性。
+
+### 5. 常见失败与排错
+
+**Ragel 缺失或版本不符。** 现象：配置阶段报 `Ragel state machine compiler not found`（第 101 行），或配置通过但编译时报 `Parser.cpp: No such file`。前者是 `find_program(RAGEL ragel)` 失败，后者是 `ragel_Parser` 目标没跑成。处置：装 6.9 版本，必要时从源码编译并 `make install` 到 `/usr/local/bin`，确保 `which ragel` 指向它。
+
+**Boost 找不到。** 现象：`Boost 1.57.0 or later not found. Either install system packages ...`。`cmake/boost.cmake` 会先用 `<源码根>/include` 作为提示查一次，失败后清空再查系统路径。处置三种：装 `libboost-dev`；把 Boost 头解压/软链到 `<源码根>/include/boost`；或 `-DBOOST_ROOT=/opt/boost_1_74_0`。注意 libc++ 环境下下限抬到 1.61。
+
+**OpenSSL 头缺失。** 现象：`Could NOT find OpenSSL, try to set the path to OpenSSL root folder`。这是 `REQUIRED` 硬失败。装了运行时库 `libssl3` 但没装 `libssl-dev` 时最常见。处置：装开发包，或在非标准路径下 `-DOPENSSL_ROOT_DIR=/opt/openssl`。
+
+**Python 3 被误选。** 现象：配置成功，但设置 `SOURCE_DATE_EPOCH` 后报 `SyntaxError: invalid syntax` 于 `cmake/formatdate.py`。这是 Python 2 专有语法（`print` 语句）在 3.x 下失败。处置：`-DPYTHON_EXECUTABLE=$(command -v python2.7)`，或干脆不设 `SOURCE_DATE_EPOCH`（此时走 `string(TIMESTAMP ...)` 分支，不调用脚本）。
+
+**Debug 构建被 `-Werror` 打断。** 现象：报某个 `-Wunused-but-set-variable` 或 `-Wstringop-overflow` 为 error。第 251 至 256 行只对非 release 加 `-Werror`，新编译器的新警告会直接变成错误。处置：改用 `RelWithDebInfo`，或给 `CMAKE_CXX_FLAGS` 追加对应的 `-Wno-` 开关。
+
+**并行编译被 OOM。** 现象：`c++: fatal error: Killed signal terminated program cc1plus`，无其他信息。处置：`make -j4` 降并发，或给容器加内存；`dmesg | tail` 能看到 oom-killer 的记录可确认。
+
+**安装后运行期找不到库。** 仅动态构建会遇到：`error while loading shared libraries: libhs.so.5`。处置：`sudo ldconfig` 刷新缓存，或临时 `LD_LIBRARY_PATH=/usr/local/lib`，或在链接期用 `-Wl,-rpath,/usr/local/lib`。静态构建没有这个问题，但宿主程序必须自己补 `-lcrypto`。
+
+**可选依赖缺失导致工具缺席。** 现象：库编出来了，`build/bin/` 里却没有 `pcapscan`、`patbench` 或 `hsbench`。`examples/CMakeLists.txt` 第 1 至 5 行在找不到 pcap 时只打印 `Could not find libpcap - some examples will not be built`，不是错误；`tools/hsbench/CMakeLists.txt` 第 1 至 5 行在找不到 sqlite3 时直接 `return()`，连提示都很少。处置：装 `libpcap-dev` 与 `libsqlite3-dev` 后重新配置；无需删除构建目录，但要让 `find_library` 重新执行，改动前先 `rm -rf CMakeCache.txt` 更稳。
+
+**`-march=native` 导致产物换机崩溃。** 现象：编译机运行正常，部署到另一台机器第一条 `hs_scan` 就 `Illegal instruction (core dumped)`。根因是配置日志里那行 `Building for current host CPU: -march=native -mtune=...`。处置：改用 fat runtime（默认已开时检查是否被 `-DFAT_RUNTIME=OFF` 关掉），或显式 `-DCMAKE_C_FLAGS="-march=corei7" -DCMAKE_CXX_FLAGS="-march=corei7"` 把指令集降到基线。这一条在虚拟化与混合机群里出现频率最高。
+
+**磁盘或 inode 耗尽。** 现象：编译到一半报 `No space left on device`，且 `df -h` 显示还有空间时，要查 `df -i`。fat runtime 构建会在 `CMakeFiles/` 下保留五套对象文件，中间产物可达数 GB。处置：清理旧构建目录，或对 `build/CMakeFiles` 单独挂载大容量卷。
+
+### 6. 小结
+
+这条链路的六个步骤里，真正容易出错的只有两个点：依赖的版本精确性（Ragel 6.9、Python 2.7、Boost ≥1.57）和「`ctest` 没有用例」这一事实。前者决定配置能否通过，后者决定你有没有真的跑过测试——把 `No tests were found!!!` 当成通过是最常见的假阳性。验收标准应当固定为三条：`build/lib/libhs.a` 存在、`make unit` 打印 `[  PASSED  ]`、`hscheck` 对合法模式全部输出 `OK:`。
+
+流程本身值得固化成脚本：把第 1 至 6 步写成 `build.sh`，在干净容器里从零执行一遍，并且刻意用一份「含一条反向引用」的模式文件跑 `hscheck`。这样脚本的预期输出就同时包含成功行与失败行，任何人拿到脚本都能一眼看出「构建成功但模式被拒」与「构建失败」是两件事。这个习惯在升级编译器或 Boost 时尤其有价值，因为绝大多数回归是「配置仍成功、产物却少了一块」。
+
+构建变量的组合语义见 02-02，Windows 与 Chimera 的特殊步骤见 02-04，fat runtime 与库形态的取舍见 02-05；把编出来的库链进宿主程序的第一步见 03-01，`hscheck` 与 `hsbench` 的完整参数见 04-07。（字段见 05-02 ｜ 参数见 04-01 ｜ 原理见 06-01 ｜ 模块见 07-12）
+
+## 02-04 Windows / MSVC、交叉编译与 Chimera 构建
+
+### 1. 背景与动机
+
+上三篇讨论的都是「Linux + GCC + 默认路径」。本篇处理三条非默认路径，它们看起来互不相关，实则共享同一个特征：都不在 `CMakeLists.txt` 的主干上，而是被条件判断包裹，因此任何一条出问题，报错信息都不会指向真正的开关。
+
+Windows 支持是实验性的。`getting_started.rst` 的原话是「We currently have experimental support for Windows using Intel C++ Compiler or Visual Studio 2017」，`docs` 里同时把 Windows 8 以上列为「已知可用」但不作保证。这意味着 Windows 构建更像是「有人跑通过」而不是「持续验证过的产品形态」，遇到问题时对照源码比对照文档更有效。
+
+交叉编译在开源版里没有官方支持。上游只承诺 x86 的 64 位与 32 位模式（`getting_started.rst` 的 Hardware 一节），ARM 等平台的支持在 Vectorscan 这个社区分支里，二者 API 兼容但引擎支持矩阵不同。因此「在 x86 上交叉编译到 ARM」这件事，用上游源码只能得到「能编过但未验证」的结果，本篇只讲机制与边界，不给承诺。
+
+Chimera 是第三条路径里最容易被误判的一个。它需要 PCRE，但「装了 PCRE」远远不够——`CMakeLists.txt` 第 504 行的条件是 `CORRECT_PCRE_VERSION AND PCRE_BUILD_SOURCE AND BUILD_STATIC_LIBS` 三者同时成立，缺一不可。很多人装了 `libpcre3-dev` 却始终看不到 `libchimera.a`，根因就在这里。
+
+把这三条路径放在一篇里，还有一个现实理由：它们共同构成了「构建矩阵」的边界。默认路径（Linux + GCC + 静态 + fat runtime）覆盖绝大多数使用场景，剩下的组合——Windows、交叉工具链、带 PCRE 的混合引擎——每多一个维度，可用的自动化验证就少一层。本篇因此不追求「每一步都能照抄成功」，而是把每条路径的判定条件、必然产物与失败特征写清楚，让人在无法验证的环境里也能判断「这个失败是预期的还是异常的」。
+
+### 2. 核心概念
+
+**MSVC 分支的实质。** 第 157 至 184 行是整份 CMake 里唯一按编译器 ID 分叉出整套 flag 的地方。判据是 `MSVC OR MSVC_IDE`：先检查 `MSVC_VERSION LESS 1700`，低于 VS2012 直接 `FATAL_ERROR: The project requires C++11 features.`；然后按 `WINDOWS_ICC` 二选一——打开时用 `/QxHost /Qstd=c99 /Qstd=c++11 /O2` 等 ICC 专有开关，关闭时用 `/O2` 加一长串 `/wd` 抑制（`/wd4101`、`/wd4146`、`/wd4244`、`/wd4267`、`/wd4800`、`/wd4996` 等），并加 `-D_CRT_SECURE_NO_WARNINGS` 与 `-DBOOST_DETAIL_NO_CONTAINER_FWD`。之后用 `string(REPLACE "/RTC1" "" ...)` 把调试运行期检查从 `CMAKE_C_FLAGS_DEBUG` 与 `CMAKE_CXX_FLAGS_DEBUG` 里删掉——这一步是必须的，因为 `/RTC1` 与 `-O2` 在 MSVC 下冲突，会报 `Command line error D8016`。最后若 `DISABLE_ASSERTS` 为真，往 Debug flags 前置 ` /DNDEBUG`。另有两个只给 Hyperscan 库自身用的 `HS_C_FLAGS` 与 `HS_CXX_FLAGS`，值为 `/Gv`（栈对齐检查）。
+
+**Windows 上没有 fat runtime。** 第 325 行的 `if (CMAKE_SYSTEM_NAME MATCHES "Linux")` 是 `FAT_RUNTIME` 这个 option 的定义域，非 Linux 平台上它根本不被 `option()` 或 `CMAKE_DEPENDENT_OPTION` 声明，因此在后续 `if (FAT_RUNTIME)` 处表现为空值、走「当前主机指令集」分支。这带来两个后果：Windows 产物只能用编译机支持的指令集；`dispatcher.c` 那套 `ifunc` 机制在 MSVC 下无从谈起，因为 `ifunc` 是 ELF/GCC 的扩展。
+
+**`.def` 文件是 Windows 的 ABI 契约。** MSVC 构建共享库时，若不显式导出，只有带 `__declspec(dllexport)` 的符号可见；上游选择用模块定义文件集中声明，`hs.def` 与 `hs_runtime.def` 分别对应 `hs.dll` 与 `hs_runtime.dll`（第 1366 与 1372 行、第 1419 行在 `add_library` 里直接引用）。两者的差异就是「运行机最小面」：`hs_runtime.def` 去掉了全部编译类 API，只保留扫描、scratch、序列化与分配器。
+
+**Chimera 的三个前提。** `cmake/pcre.cmake` 先找树内源码（`pcre-<version>` 或 `pcre` 子目录），找到才置 `PCRE_BUILD_SOURCE`，并 `add_subdirectory(... EXCLUDE_FROM_ALL)` 静态编译 PCRE；找不到才退回 `pkg_check_modules(PCRE libpcre>=8.41)`。第 504 行再叠加 `BUILD_STATIC_LIBS`，因为 `chimera/CMakeLists.txt` 第 30 行是 `add_library(chimera STATIC ...)`，动态 Hyperscan 与静态 Chimera 混链会出现符号可见性问题。这也解释了官方注释「we need static libs for Chimera - too much deep magic for shared libs」。
+
+**交叉编译的两条硬约束。** 一是 `-march=native` 必须被覆盖：第 263 至 269 行在 `CMAKE_C_FLAGS` 未含 `march`/`mtune` 时自动加 `-march=native`，交叉场景下 host 编译器对目标架构没有 native 概念，轻则退化为通用指令集、重则直接报未知选项。二是 `cmake/platform.cmake` 用 `CHECK_C_SOURCE_COMPILES` 判定 32/64 位，这个检查只编译不运行，交叉时能正确反映目标位宽，但如果 toolchain 文件里没设 `CMAKE_SYSTEM_NAME`，CMake 会按 host 推断，得到与目标不符的 `ARCH_IA32`/`ARCH_X86_64`。
+
+**MSVC 与 GCC 的语义差异。** Hyperscan 的源码按 C99 与 C++11 写，MSVC 对这两者的支持是「足够但不完整」：`/Qstd=c99` 只在 ICC 分支出现，纯 MSVC 分支没有对应的 `/std:c99`（MSVC 从未支持过完整的 C99），因此 C 侧代码依赖的是 MSVC 默认的 C89 加若干扩展。这解释了为什么 MSVC 分支需要一长串 `/wd` 抑制：`/wd4244`（`size_t` 到 `unsigned` 的截断）、`/wd4267`（`size_t` 到 `int` 的转换）、`/wd4800`（`bool` 强制转换）都是 C99 代码在 MSVC 下的常态告警。同时也解释了 `HS_C_FLAGS=/Gv` 的作用：它让编译器在每次函数调用前检查栈指针对齐，是 MSVC 上替代 GCC `-mstackrealign` 的手段，只在库目标上开启，避免影响宿主程序。
+
+**`.def` 与头文件的同步责任。** 在 Linux 上，`-fvisibility=hidden` 只在 release 构建时加入（第 316 至 323 行），且 `HS_PUBLIC_API` 宏会给公开函数加 `default` 可见性，因此「头文件里声明了就能被链接」基本成立。Windows 上这条通道不存在，可见性完全由 `.def` 决定，于是「头文件声明了但 `.def` 没列」就直接表现为链接失败。这是两套平台在 ABI 管理上的根本差异，也是本篇要单列一节讲导出的原因。
+
+### 3. 关键数据结构与源码位置
+
+三份「契约文件」决定了非默认路径的边界，它们的差异见下表。
+
+| 符号组 | `hs.def` | `hs_runtime.def` | 说明 |
+|---|---|---|---|
+| 编译类 | 有 | 无 | `hs_compile`、`hs_compile_multi`、`hs_expression_info` 等 |
+| 扫描类 | 有 | 有 | `hs_scan`、`hs_scan_vector`、`hs_scan_stream` |
+| scratch 类 | 有 | 有 | `hs_alloc_scratch`、`hs_clone_scratch`、`hs_scratch_size` |
+| 序列化类 | 有 | 有 | `hs_serialize_database`、`hs_deserialize_database` |
+| 分配器类 | 有 | 有 | `hs_set_allocator` 家族五个 |
+| 版本与平台 | 有 | 有 | `hs_version`、`hs_valid_platform` |
+
+`hs.def` 共 38 条导出、`hs_runtime.def` 共 31 条，差值正好是编译侧七个符号。需要留意的是，`hs.def` 中**没有** `hs_compile_lit` 与 `hs_compile_lit_multi`（纯字面量 API），也没有 `hs_free_compile_error` 之外的错误处理入口；若要在 Windows 共享库上使用纯字面量 API，必须自行补充导出条目，这一点需对照实际版本核验，因为导出清单随版本演进而非严格同步。
+
+Chimera 侧的文件与链接关系集中在 `chimera/CMakeLists.txt`：头文件四个（`ch.h`、`ch_common.h`、`ch_compile.h`、`ch_runtime.h`）装到 `include/hs`，源文件六个（`ch_alloc.c`、`ch_compile.cpp`、`ch_database.c`、`ch_runtime.c`、`ch_scratch.c` 及内部头），目标类型固定为 `STATIC`，并且 `add_dependencies(chimera hs pcre)` 与 `target_link_libraries(chimera hs pcre)` 同时声明——前者保证构建顺序，后者保证链接时的传递依赖。第 44 行还往 `PRIVATE_LIBS` 追加 `-L${LIBDIR} -lpcre`，用于生成 `libch.pc`。
+
+Windows 分支还有一个容易忽略的结构差异：第 545 至 568 行把「PCRE 检测 + `add_subdirectory(unit)` + `add_subdirectory(tools)` + `add_subdirectory(chimera)`」整段又写了一遍，与非 Windows 的第 492 至 515 行几乎重复。原因是 Windows 上这些子目录必须在 MSVC flag 设定完成之后才进入，而 Linux 分支的位置在 flag 汇总之前。改这两段中的任何一段时都要同步另一段，否则会出现「Linux 有 hsbench、Windows 没有」的诡异差异。
+
+交叉编译的 toolchain 文件不在仓库里，需要自己写。最小可用版本只需要四行赋值加一个 `set(CMAKE_FIND_ROOT_PATH_MODE_*)` 组合，其中 `CMAKE_SYSTEM_NAME` 必须显式写成 `Linux`（而不是留空），否则第 325 行的判断不成立、第 479 行会走 `-march=native` 分支。另一个常被忽略的点是 sysroot：`cmake/arch.cmake` 的 intrinsic 探测需要目标平台的 `x86intrin.h`，这个头来自编译器而非 libc，所以 sysroot 里没有它不影响，但如果工具链用的是精简过的 GCC 交叉包（只有 `cc1` 没有完整 include），探测会以 `No intrinsics header found` 失败，看起来像架构问题。
+
+### 4. 关键流程与调用链
+
+Windows 构建的决策链见图 02-04-01，重点看 `WINDOWS_ICC` 那个分叉：它不是「用 ICC 替换 MSVC」，而是「在同一套 MSVC 生成器下换一组编译开关」。源码第 154 行的注释也承认了这一点——CMake 在 Windows 上总是先生成 MSVC 工程，再靠替换 flags 来切换编译器前端，所以 `WINDOWS_ICC` 只是「改用 ICC 的开关集」，生成器仍然是 Visual Studio。
+
+:::figure id=02-04-01 | name=Windows 构建的分支与导出契约 | dir=TD
+node w1 "Visual Studio 生成器" blue
+node w2 "MSVC 编译器分支" teal
+node w3 "WINDOWS_ICC 取值" teal
+node w4 "MSVC 默认开关集" amber
+node w5 "ICC 专用开关集" amber
+node w6 "hs.def 导出清单" purple
+node w7 "hs.dll 与导入库" green
+node w8 "Chimera 条件判定" gray
+edge w1 -> w2 "生成器固定 msvc"
+edge w2 -> w3 "读取选项"
+edge w3 -> w5 "ON 走 ICC"
+edge w2 -> w4 "OFF 走默认"
+edge w4 -> w6 "编译并链接"
+edge w5 -> w6 "编译并链接"
+edge w6 -> w7 "决定可见符号"
+edge w2 -> w8 dashed "检查 PCRE 三条件"
+edge w8 -> w7 dashed "齐备才额外产出"
+:::
+
+这张图解释了一个常见困惑：为什么在 Windows 上 `-DBUILD_AVX512=ON` 毫无效果。因为 `BUILD_AVX512` 只在 `FAT_RUNTIME` 分支里被消费，而 `FAT_RUNTIME` 在非 Linux 平台上连定义都没有。同理，`-DBUILD_STATIC_AND_SHARED=ON` 在 Windows 上会同时生成 `hs.lib`（静态）与 `hs.dll` + 导入库，但工具目标需要额外把 `$<TARGET_OBJECTS:hs_compile_shared>` 与 `$<TARGET_OBJECTS:hs_exec_shared>` 塞进 `add_executable`（见 `tools/hscheck/CMakeLists.txt` 第 19 至 21 行），否则在 DLL 导入符号与静态对象之间会出现重复定义。
+
+交叉编译的调用链与 Linux 原生构建同构，差异只在工具链文件。一个最小 toolchain 需要设四个变量：`CMAKE_SYSTEM_NAME`（决定 `CMAKE_SYSTEM_NAME MATCHES "Linux"` 是否成立，从而决定 fat runtime 是否存在）、`CMAKE_SYSTEM_PROCESSOR`、`CMAKE_C_COMPILER`、`CMAKE_CXX_COMPILER`。配置时再显式给 `-DCMAKE_C_FLAGS="-march=<目标基线>"`。剩下的探测（SSSE3、AVX2）都由 `cmake/arch.cmake` 用「编译一段含 intrinsic 的代码」完成，只编译不运行，因此交叉环境下结果可信，前提是目标 toolchain 的 sysroot 里有 `x86intrin.h` 或 `intrin.h`。
+
+### 5. 配置/命令/代码实例
+
+Windows 上的配置与构建命令（PowerShell，使用 VS2017 生成器）：
+
+```powershell
+mkdir C:\build\hs
+cd C:\build\hs
+cmake -G "Visual Studio 15 2017 Win64" `
+      -DCMAKE_BUILD_TYPE=Release `
+      -DBOOST_ROOT=C:\deps\boost_1_74_0 `
+      -DPYTHON_EXECUTABLE=C:\Python27\python.exe `
+      C:\src\hyperscan
+cmake --build . --config Release -- /m
+```
+
+示例输出（具体格式需对照实际版本核验）：
+
+```text
+-- Building for Windows
+-- The C compiler identification is MSVC 19.16.27045.0
+-- The CXX compiler identification is MSVC 19.16.27045.0
+-- Boost version: 1.74.0
+-- Build date: 2026-11-12
+-- Building static libraries
+-- Configuring done
+-- Generating done
+```
+
+逐行判读：`-- Building for Windows` 来自第 158 行的 `message(STATUS "Building for Windows")`，是进入 MSVC 分支的直接证据，若这行缺失说明生成器被识别成其他类型（例如误用了 MinGW Makefiles）；两行 MSVC 版本号必须一致，`19.16` 对应 VS2017 15.9，低于 `19.00` 会在 `MSVC_VERSION LESS 1700` 处被拒绝；`Boost version: 1.74.0` 说明 `-DBOOST_ROOT` 生效，Windows 上没有系统 Boost 路径，这个变量几乎是必填项；`Building static libraries` 表明只产静态库，若目标是 DLL 需要显式 `-DBUILD_SHARED_LIBS=ON`；最后没有出现 `Building runtime for multiple microarchitectures`，正是「Windows 无 fat runtime」的体现。
+
+`hs.def` 的内容形态如下（节选，完整 38 条见文件）：
+
+```text
+; Hyperscan DLL export definitions
+
+LIBRARY hs
+
+EXPORTS
+   hs_alloc_scratch
+   hs_clone_scratch
+   hs_compile
+   hs_compile_ext_multi
+   hs_compile_multi
+   hs_scan
+   hs_scan_stream
+   hs_serialize_database
+   hs_version
+```
+
+判读要点：分号开头是 `LIBRARY` 段之外的注释；`LIBRARY hs` 指定输出模块名，与 `add_library(hs_shared ...)` 的 `OUTPUT_NAME hs` 呼应；`EXPORTS` 之后每行一个符号，不带序号也不带 `@N`，说明 ABI 不依赖固定序号，新增符号不会打乱既有调用；若在这里漏掉某个函数，宿主程序在链接期报 `unresolved external symbol`，而在 Linux 上同样的遗漏只会表现为「动态库里没有这个符号」，两者的排查路径完全不同。
+
+Chimera 的构建与链接只需要下面几行，前提是 PCRE 源码树已就位：
+
+```bash
+# 1) 把 PCRE 8.41+ 源码放到源码根下的 pcre/ 目录
+tar xf pcre-8.45.tar.gz && mv pcre-8.45 hyperscan/pcre
+# 2) 配置时必须同时满足静态库与树内源码两个条件
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_STATIC_AND_SHARED=ON ../hyperscan
+# 3) 宿主程序链接顺序：chimera 依赖 hs 与 pcre
+gcc myapp.c -o myapp -lchimera -lhs -lpcre -lcrypto
+```
+
+第 2 步里 `BUILD_STATIC_AND_SHARED=ON` 既打开了静态库（从而满足 `BUILD_STATIC_LIBS`），又不妨碍后续需要动态库的场景；如果只需要 Chimera 且不需要动态库，用默认值即可。第 3 步的链接顺序不能颠倒：`chimera` 引用 `hs` 与 `pcre` 的符号，静态链接时被依赖者必须写在依赖者之后，顺序写反会得到大量 `undefined reference`。
+
+还有一个细节：Chimera 的头文件装在 `include/hs` 下，所以应用侧的包含写法是 `#include <hs/ch.h>` 而不是 `#include <ch.h>`；`ch.h` 内部会包含 `ch_compile.h`、`ch_runtime.h` 与 `ch_common.h`，一般只需包含 `ch.h` 一个。`pkg-config --libs libch` 的 `Libs.private` 里会带上 `-L<libdir> -lpcre`，静态链接时必须加 `--static` 才会展开这些私有依赖，否则只得到 `-lch` 一项，随后在 `ch_compile` 处报找不到 PCRE 符号。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，Windows 上缺 Ragel 与 Python 2.7，必须自备。`getting_started.rst` 的建议是用 Cygwin 从源码编译 Ragel，产物是 `ragel.exe`，把它的目录加进 `PATH` 即可；Python 2.7 用官方安装包，并通过 `-DPYTHON_EXECUTABLE` 指到 `python.exe`，不要指望 `find_package(PythonInterp)` 在 Windows 上自动分辨 2 与 3。
+
+第二，`/Gv` 只加在库目标上，不加在工具与单测上。`HS_C_FLAGS` 与 `HS_CXX_FLAGS` 在第 182 至 183 行定义，第 538 至 542 行只在非 fat 分支把它们拼进全局 flags；`unit/CMakeLists.txt` 第 4 至 9 行则显式把 `/Gv` 从 `CMAKE_C_FLAGS` 与 `CMAKE_CXX_FLAGS` 里删掉。这是为了避免单测里的可变参数调用与 `/Gv` 的栈检查冲突。
+
+第三，不要假设 `.def` 与头文件同步。头文件里声明的每个 `HS_PUBLIC_API` 函数都应当在 `.def` 里有对应条目，但实际是否齐备需要核对。判定方法是拿 `hs_compile.h` 与 `hs_runtime.h` 里的函数名与 `.def` 逐条比对；发现缺失时，要么补 `.def`，要么在应用侧改用其他 API。
+
+第四，Chimera 不能与共享库形态混用。第 504 行的条件里 `BUILD_STATIC_LIBS` 是硬性要求，因此纯 `-DBUILD_SHARED_LIBS=ON` 的构建不会产生 `libchimera.a`。若既要 `libhs.so` 又要 Chimera，用 `BUILD_STATIC_AND_SHARED=ON`。
+
+第五，交叉编译到 ARM 请改用 Vectorscan。上游的 `src/nfa/` 大量使用 x86 intrinsic（`_mm_*`、`_mm256_*`、`_mm512_*`），`cmake/arch.cmake` 在非 fat 分支下也会对 SSSE3 做硬校验（第 107 至 109 行 `A minimum of SSSE3 compiler support is required`），在 ARM 工具链上直接失败。Vectorscan 分支把引擎层替换为 NEON/SVE 实现，API 与本套资料描述的一致，但引擎支持矩阵不同，不能把本篇的结论直接套用。
+
+第六，Windows 上 `BUILD_STATIC_AND_SHARED` 会让工具目标出现重复符号，必须在 `add_executable` 里显式带上共享对象。这一点 `tools/hscheck/CMakeLists.txt`、`tools/hsbench/CMakeLists.txt`、`unit/CMakeLists.txt` 三处都做了处理，自行新增工具时容易漏。
+
+第七，交叉编译时 `cmake/arch.cmake` 的探测会失败在与「指令集」无关的地方。它先用 `HAVE_C_X86INTRIN_H` 或 `HAVE_C_INTRIN_H` 选择头文件名（第 5 至 11 行），二者都没有时直接 `FATAL_ERROR: No intrinsics header found`。交叉到非 x86 架构时这条必然触发，且信息看起来像「头文件缺失」，实际是「架构不支持」。看到这条错误不要再去找 `x86intrin.h`，先确认目标架构。顺带一提，`cmake/platform.cmake` 的 32/64 位探测用的是 `__x86_64__` 与 `__i386__` 这两个宏，非 x86 目标上两者都不成立，于是 `ARCH_X86_64` 与 `ARCH_IA32` 同时为假；第 286 行那个「32 位 release 构建不加 `-fno-omit-frame-pointer`」的特判因此永远不生效，产物会多带一个不影响正确性的编译选项。这类「探测失败但构建继续」的情形，比直接报错更难查。
+
+第八，Windows 上不要混用 `/MT` 与 `/MD`。CMake 默认 `MSVC_RUNTIME_LIBRARY` 为 `MultiThreadedDLL`，若宿主程序用 `/MT` 静态运行期，与 `hs.lib` 的 `/MD` 混链会出现 `LIBCMT` 与 `MSVCRT` 冲突的 `LNK2005`。处置是在配置时统一 `-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded`，或在应用侧也用 `/MD`。这条与 Hyperscan 无关，但它在 Windows 构建的失败列表里出现频率很高，且报错完全指向运行期库而不指向构建配置。
+
+### 7. 小结与延伸阅读
+
+三条非默认路径的共同教训是：报错位置与根因位置往往不在一处。Windows 的问题多半出在 `.def` 与 flag 分叉，交叉编译的问题多半出在 `CMAKE_SYSTEM_NAME` 与 `-march`，Chimera 的问题几乎总是出在那三个前提中的某一个。判断方法很统一——回到 `CMakeLists.txt` 找到包裹该特性的 `if`，看它的条件变量在本次配置里究竟是真是假。
+
+Windows 与 Linux 的产物差异、库形态选择的进一步讨论见 02-05；Chimera 的运行期行为与性能模型见 06-14 与 07-11；Chimera 的集成步骤见 03-06。Vectorscan 与上游的能力差异见 01-02。（字段见 05-09 ｜ 参数见 04-01 ｜ 原理见 06-14 ｜ 模块见 07-11）
+
+## 02-05 fat runtime、AVX-512 变体与库形态选择
+
+### 1. 背景与动机
+
+「编译机与运行机不是同一台」是 C 库分发的常态，而 Hyperscan 把这个矛盾放大到了极致：它的运行时大量使用 SSSE3、SSE4.2、POPCNT、AVX2 乃至 AVX-512 的 intrinsic，性能与指令集强绑定。两种朴素做法都不可接受。第一种是在编译时用 `-march=native`（这也是项目的默认行为，第 263 至 269 行），代价是产物只能在同代或更新的 CPU 上跑，换到老机器直接 `SIGILL`。第二种是统一按基线 `-march=core2` 编译，代价是新机器上的 AVX2/AVX-512 通道全部闲置，扫描吞吐可能只有峰值的几分之一。
+
+fat runtime 是第三条路：把同一份运行时源码按不同指令集编译多遍，用符号重命名避免冲突，再用 ELF 的 `ifunc` 机制在**加载时**选择正确的那一份。`getting_started.rst` 的 Fat Runtime 一节说明了它的来龙去脉——v4.4 引入、v4.5 增加 AVX-512（`AVX512BW`）、v5.3 增加 AVX512VBMI，并且明确限定「只在 Linux 上可用，release 构建在支持时默认开启」。
+
+这条机制与库形态的选择紧密耦合，不能分开决策。静态库同样包含多份实现，因此 fat 静态库的体积是非 fat 的三倍左右；而数据库的跨机分发又受另一个约束——`hs_platform_info_t` 在编译数据库时被写进 `hs_database` 的 `platform` 字段，与运行机的实际能力不匹配时 `hs_deserialize_database` 返回 `HS_DB_PLATFORM_ERROR`。换言之，fat runtime 解决的是「库能不能在这台机器上跑」，解决不了「这份数据库能不能在这台机器上用」。
+
+### 2. 核心概念
+
+**多份编译与符号重命名。** `CMakeLists.txt` 第 1236 至 1272 行在 `BUILD_STATIC_LIBS` 下依次创建 `hs_exec_core2`、`hs_exec_corei7`、`hs_exec_avx2` 三个对象库，并可选追加 `hs_exec_avx512`、`hs_exec_avx512vbmi`；每个目标用各自的 `COMPILE_FLAGS`（`-march=core2`、`-march=corei7`、`-march=core-avx2`，AVX-512 用 `${SKYLAKE_FLAG}`、VBMI 用 `${ICELAKE_FLAG}`），并设置 `RULE_LAUNCH_COMPILE` 为 `build_wrapper.sh <前缀> keep.syms.in`。这个 wrapper 在真正编译前后各做一件事：编译前把 libc 与 libcrypto 的全部动态符号整理成「不要重命名」的名单，编译后用 `nm` 取出该对象的所有全局符号，剔除名单内的，剩下的用 `objcopy --redefine-syms` 批量加上 `<前缀>_`。于是同一个 `limexNative32` 会变成 `core2_limexNative32`、`avx2_limexNative32` 等五个不同符号，链接时互不冲突。
+
+白名单的意义在这里显现：并非所有符号都该加前缀。对 libc 的调用（`memcpy`、`malloc`）、对 libcrypto 的调用（HMAC 相关）必须保持原名，否则对象里会出现 `core2_memcpy` 这样的未定义引用，链接期直接失败。`build_wrapper.sh` 因此先从 `${CMAKE_C_COMPILER} --print-file-name=libc.so.6` 与 `libcrypto.so` 取路径，用 `nm -D` 导出全部动态符号并转成正则，再与 `cmake/keep.syms.in` 合并成「保持原名」的名单。`keep.syms.in` 里放的是项目自身需要跨变体共享的少量符号，其余全部前缀化。这套流程依赖 `nm`、`objcopy`、`sed` 三个 binutils 工具，这也是为什么 fat runtime 对工具链有额外要求，而不仅是编译器。
+
+**ifunc 与分派表。** `src/dispatcher.c` 第 46 至 82 行的 `CREATE_DISPATCH` 宏是整套机制的核心。对每个公开运行时 API（`hs_scan`、`hs_open_stream`、`hs_scan_stream`、`hs_database_size` 等），它展开出五段代码：五个外部声明（`avx512vbmi_<name>`、`avx512_<name>`、`avx2_<name>`、`corei7_<name>`、`core2_<name>`）、一个 `error_<name>` 桩函数、一个 `resolve_<name>` 解析函数、以及带 `__attribute__((ifunc("resolve_" #NAME)))` 的公开函数本体。解析顺序是「能力从高到低」：VBMI → AVX-512 → AVX2 →（SSE4.2 且 POPCNT）→ SSSE3 → 错误桩。这个函数在**动态链接器加载时**被调用一次，之后所有调用都直接跳到选中的实现，因此没有每次调用的分支开销。
+
+**编译期裁剪未启用的变体。** 若 `BUILD_AVX512` 为假，第 1227 至 1234 行会给 `dispatcher.c` 加 `-DDISABLE_AVX512_DISPATCH`；`dispatcher.c` 第 36 至 44 行随即把 `avx512_` 宏定义成 `disabled_`、把 `check_avx512()` 定义成恒返回 0。这样解析函数里那两级判断被编译掉，链接器也不会去找根本不存在的 `avx512_hs_scan`。`BUILD_AVX512VBMI` 同理。这是「开关必须在编译期一致」的根本原因：库与 `dispatcher.c` 必须用同一组开关编译，否则会出现「解析函数引用了不存在的符号」这种链接错误。
+
+**平台能力的判定与错误码。** `src/hs_valid_platform.c` 只有十几行：`check_ssse3()` 为真返回 `HS_SUCCESS`，否则返回 `HS_ARCH_ERROR`。也就是说「平台可用」的下限是 SSSE3，AVX2 与 AVX-512 只是加速项。当 CPU 连 SSSE3 都没有时，`resolve_*` 返回 `error_*` 桩，所有运行时 API 都返回 `HS_ARCH_ERROR` 而不是执行非法指令——这是「优雅降级」而不是「崩溃」，也是官方建议应用启动时先调 `hs_valid_platform()` 的原因。
+
+**库形态与 fat 的交互。** 四种组合都成立，但代价不同：非 fat 静态（最小、绑定本机）、非 fat 动态（绑定本机、可共享）、fat 静态（体积约三倍、可跨机、无加载器开销）、fat 动态（体积约三倍、可跨机、多进程共享内存页）。fat 只影响运行时的 `hs_exec` 侧，编译侧的 `hs_compile` 只编一份，因此「编译机」与「运行机」的形态可以不对称：编译机用非 fat 库产出数据库，运行机用 fat 库加载，这是生产环境最常见的组合。
+
+### 3. 关键数据结构与源码位置
+
+五个微架构变体的编译参数与能力要求见下表，`getting_started.rst` 的 Fat Runtime 一节给出了同样的对应关系。
+
+| 变体 | 编译 flag | 必需 CPU 特性 | 启用条件 |
+|---|---|---|---|
+| Core 2 | `-march=core2` | SSSE3 | fat runtime 恒启用 |
+| Core i7 | `-march=corei7` | SSE4.2 与 POPCNT | fat runtime 恒启用 |
+| AVX2 | `-march=core-avx2` | AVX2 | fat runtime 恒启用 |
+| AVX-512 | `-march=skylake-avx512` | AVX512BW | `BUILD_AVX512=ON` |
+| AVX512VBMI | `-march=icelake-server` | AVX512VBMI | `BUILD_AVX512VBMI=ON` |
+
+前三个变体是 fat runtime 的必备项，第四个与第五个是可选加速项。这与表外的另一个事实呼应：`cmake/arch.cmake` 第 84 至 96 行在 fat 模式下强制要求 `HAVE_SSSE3` 与 `HAVE_AVX2`，缺任一即 `FATAL_ERROR`；而 `HAVE_AVX512` 与 `HAVE_AVX512VBMI` 只在对应开关打开时才强制。换句话说，**没有 AVX2 的机器无法构建 fat runtime**（因为它要编 AVX2 变体），但可以构建非 fat 库。
+
+与开关相关的源码位置需要串起来看：`CMakeLists.txt` 第 325 至 347 行决定 `FAT_RUNTIME` 是否存在及其默认值，第 349 行进入 `cmake/arch.cmake` 做能力探测，第 1194 至 1350 行按 `FAT_RUNTIME` 分叉出两套目标定义，第 1227 至 1234 行生成 `DISPATCHER_DEFINE`。`cmake/config.h.in` 第 21 至 28 行把 `FAT_RUNTIME`、`BUILD_AVX512`、`BUILD_AVX512VBMI` 写成 `#cmakedefine`，因此运行时源码里可以用 `#ifdef FAT_RUNTIME` 判断当前构建形态。`cmake/keep.syms.in` 是重命名时的白名单，`cmake/build_wrapper.sh` 是执行者，两者必须成对维护。
+
+目标名的汇总关系也值得记住：五份对象先进 `RUNTIME_LIBS`（第 1238、1245、1252、1259、1267 行逐个 `list(APPEND)`），再与 `hs_exec_common` 一起拼进 `hs_runtime` 与 `hs`（第 1282 至 1292 行）。共享侧的变量叫 `RUNTIME_SHLIBS`，拼接方式相同但每个对象都带 `POSITION_INDEPENDENT_CODE TRUE`。因此排查「变体有没有进库」时，看 `RUNTIME_LIBS` 的长度比看最终 `.a` 的大小更快：`make VERBOSE=1` 的链接命令里，`libhs.a` 的目标文件列表会把所有变体列出来，一眼能数清是 3 份还是 5 份。
+
+### 4. 关键流程与调用链
+
+构建期发生的事见图 02-05-01。注意「同一批源文件」这个起点：五份对象编译的是完全相同的文件清单，差异只在 `COMPILE_FLAGS`，这也是为什么 fat 构建的编译时间是三到五倍。
+
+:::figure id=02-05-01 | name=fat runtime 的多份编译与符号重命名 | dir=TD
+node b1 "同一批运行时源文件" blue
+node b2 "core2 对象" teal
+node b3 "corei7 对象" teal
+node b4 "avx2 对象" teal
+node b5 "avx512 可选对象" purple
+node b6 "符号加前缀重命名" amber
+node b7 "合并为一份库" amber
+edge b1 -> b2 "march=core2"
+edge b1 -> b3 "march=corei7"
+edge b1 -> b4 "march=core-avx2"
+edge b1 -> b5 "skylake 或 icelake"
+edge b2 -> b6 "objcopy 改名"
+edge b3 -> b6 "objcopy 改名"
+edge b4 -> b6 "objcopy 改名"
+edge b5 -> b6 "objcopy 改名"
+edge b6 -> b7 "归档或链接"
+:::
+
+重命名这一步的必要性可以从反面理解：若不加前缀，五个对象里的同名全局符号会在归档或链接时被合并，最终只有一份实现进库，`ifunc` 解析出的五个名字里四个是未定义符号。`build_wrapper.sh` 用 `nm -f p -g` 取全局符号、用 `grep -v -f ${KEEPSYMS}` 剔除 libc/libcrypto 与 `keep.syms.in` 里的名字，再用 `objcopy --redefine-syms` 批量改写，整个过程对每个对象执行一次。它同时还会改写 COMDAT 组键符号（`nm` 类型为 `n`），否则链接器会把不同变体的同名字段去重，导致代码串味——这个细节在第 31 至 33 行的注释里写明了。
+
+运行期的解析过程见图 02-05-02。图中五个分支对应 `resolve_*` 里的五级判断，失败时的落点是错误桩而不是崩溃。
+
+:::figure id=02-05-02 | name=加载时的 ifunc 解析与能力降级顺序 | dir=TD
+node r1 "进程加载 libhs" blue
+node r2 "ifunc 解析器" teal
+node r3 "AVX512VBMI 变体" purple
+node r4 "AVX2 变体" purple
+node r5 "Core i7 变体" purple
+node r6 "Core 2 变体" purple
+node r7 "error 桩函数" red
+node r8 "返回 HS_ARCH_ERROR" red
+edge r1 -> r2 "ELF 加载时一次"
+edge r2 -> r3 "VBMI 可用"
+edge r2 -> r4 "AVX2 可用"
+edge r2 -> r5 "SSE4.2 与 POPCNT"
+edge r2 -> r6 "仅 SSSE3"
+edge r2 -> r7 "都不满足"
+edge r7 -> r8 "不执行非法指令"
+:::
+
+解析顺序里有一个容易忽略的细节：Core i7 变体的条件是 `check_sse42() && check_popcnt()` 两个都真，而不是只看 SSE4.2。这两条指令集在 Nehalem 之后一般同时存在，但在某些虚拟化环境中 CPUID 会被屏蔽其中一项，此时会降到 Core 2 变体，性能下降但仍正确。另外，`r3` 与 `r4` 两条边在未启用对应变体时会被预处理掉（前面提到的 `DISABLE_*_DISPATCH`），所以「关闭 AVX-512」并不会让解析多一次失败判断，而是彻底移除这一级。
+
+### 5. 配置/命令/代码实例
+
+启用 AVX-512 变体的配置命令如下。前提是工具链支持 `-march=skylake-avx512`，否则 `cmake/arch.cmake` 第 13 至 18 行会直接 `FATAL_ERROR: AVX512 not supported by compiler`。
+
+```bash
+cmake -B build-avx512 -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_AVX512=ON \
+      -DBUILD_AVX512VBMI=ON \
+      ../hyperscan
+cmake --build build-avx512 -j"$(nproc)"
+```
+
+对应的配置输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+-- using release build
+-- Building runtime for multiple microarchitectures
+-- Performing Test HAS_ARCH_SKYLAKE
+-- Performing Test HAS_ARCH_SKYLAKE - Success
+-- Performing Test HAS_ARCH_ICELAKE
+-- Performing Test HAS_ARCH_ICELAKE - Success
+-- Configuring done
+```
+
+逐行判读：`Building runtime for multiple microarchitectures` 确认 fat 分支生效，若这行变成 `Building for current host CPU: -march=native`，说明 `FAT_RUNTIME` 被关掉了（可能是 `-DFAT_RUNTIME=OFF`，也可能是不满足 Linux/Makefiles/ifunc 三前提）。两行 `Performing Test HAS_ARCH_*` 是 `cmake/arch.cmake` 第 13 至 25 行在验证编译器是否认识 `${SKYLAKE_FLAG}` 与 `${ICELAKE_FLAG}`，`Success` 说明工具链支持；若显示 `Failed` 且随后出现 `AVX512 not supported by compiler`，说明 GCC 版本太老（`-march=icelake-server` 需要 GCC 8 以上），此时降低目标或升级工具链，不要试图改 flag 绕过去，因为 `arch.cmake` 后面还会用同一组 flag 做 intrinsic 编译测试。
+
+构建完成后可以验证多份实现是否真的进了库：
+
+```bash
+nm -g --defined-only build-avx512/lib/libhs_runtime.a | grep -c "^.* T core2_"
+nm -g --defined-only build-avx512/lib/libhs_runtime.a | grep -c "^.* T avx2_"
+nm -g --defined-only build-avx512/lib/libhs_runtime.a | grep " T avx512_" | head -3
+```
+
+示例输出（具体格式需对照实际版本核验）：
+
+```text
+$ nm -g --defined-only lib/libhs_runtime.a | grep -c " T core2_"
+214
+$ nm -g --defined-only lib/libhs_runtime.a | grep -c " T avx2_"
+214
+$ nm -g --defined-only lib/libhs_runtime.a | grep " T avx512_"
+0000000000000000 T avx512_hs_scan
+0000000000000000 T avx512_hs_open_stream
+0000000000000000 T avx512_hs_close_stream
+```
+
+判读要点：`core2_` 与 `avx2_` 的计数应当相同，因为两者编的是同一批源文件，差异只在编译选项；若 `avx2_` 明显偏少，说明 `hs_exec_avx2` 目标额外包含的 `teddy_avx2.c` 与 `masked_move.c` 没被正确加入（第 1251 行）。第三个命令出现的 `avx512_hs_scan` 等符号证明 `BUILD_AVX512=ON` 真的产生了变体，若为空则说明开关没生效或 `DISABLE_AVX512_DISPATCH` 被误加。注意所有符号的地址都显示为 `0000000000000000`，这是归档成员未重定位的正常表现，用 `nm` 看最终 `.so` 才会给出真实偏移。
+
+想确认运行期实际选中的是哪一份，`hs_valid_platform()` 帮不上忙——它只回答「有没有 SSSE3」。可用的手段有两个：其一是 `LD_DEBUG=bindings` 运行程序，动态链接器会打印 `binding file libhs.so.5 to libhs.so.5: normal symbol 'hs_scan'` 之类的记录，配合 `ifunc` 的解析日志（`LD_DEBUG=all` 下可见）能看出最终绑定到哪个实现；其二是用调试器在 `resolve_hs_scan` 上设断点，命中后单步返回，看返回值落在哪个前缀的函数里。两种手段都只适合研发阶段，生产环境更实用的做法是「按机型分别用 `hsbench` 测一遍」，用吞吐反推变体——AVX2 与 AVX-512 在同一批模式上的差距通常足够明显。
+
+四种库形态的取舍见下表，选择依据是部署形态而不是性能偏好。
+
+| 形态 | 体积 | 跨机可用 | 适用场景 |
+|---|---|---|---|
+| 非 fat 静态 | 最小 | 否 | 单机嵌入式，CPU 型号固定 |
+| 非 fat 动态 | 小 | 否 | 同构机群，统一镜像 |
+| fat 静态 | 约三倍 | 是 | 单体二进制分发，要求零依赖 |
+| fat 动态 | 约三倍 | 是 | 多进程/多服务共享，独立升级 |
+
+选择时还有一条隐含约束：数据库的 `platform` 字段。用 `hs_populate_platform()` 或显式填 `hs_platform_info_t` 编译出的数据库会绑定目标平台，换机器加载时若 `platform` 不匹配，`hs_deserialize_database` 返回 `HS_DB_PLATFORM_ERROR`。想让数据库跨机通用，编译时就要用 `HS_PLATFORM_ALL`（或与运行机一致的最小公倍数），这属于编译 API 的用法，参数见 04-04，机制的完整描述见 06-12。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，不要在 fat 构建上再手动加 `-march`。第 479 至 487 行的 `else` 分支刻意不给 `CMAKE_C_FLAGS` 追加任何架构 flag，手动加的后果是五份变体被编成同一个指令集，`ifunc` 解析形同虚设，体积却仍是三倍。
+
+第二，fat runtime 的三前提要逐项确认：Linux（第 325 行）、Unix Makefiles 或 CMake 3.0 以上的 Ninja（第 333 行）、编译器支持 `ifunc`（第 339 行）。Clang 低于 3.9 会被明确拒绝（第 329 至 332 行）。三者任一不满足，`FAT_RUNTIME` 的默认值就是 OFF，且不会有醒目警告，只在配置日志里留一行 `cannot build fat runtime`。
+
+第三，AVX-512 变体不是「开了就更快」。它带来两个副作用：编译时间增加约一倍（多编两份全量运行时），以及在某些 Intel 处理器上触发频率下降（heavy instruction downclocking），短包、低负载场景下反而可能慢于 AVX2 变体。是否启用应当用 `hsbench` 在目标机型上实测，而不是按「指令集越新越好」推断。
+
+第四，静态库与 fat runtime 的组合会让产物显著变大。三到五份运行时对象同时进归档，`libhs.a` 从十几 MB 涨到数十 MB 量级（具体数值随编译器与优化级别变化，需实测）。若宿主程序对体积敏感，可以考虑「非 fat 静态 + 明确的最低指令集」这条更可控的路线。
+
+第五，跨机分发时库与数据库要分别检查。前者由 `hs_valid_platform()` 判定（下限 SSSE3），后者由 `hs_deserialize_database` 的返回码判定（`HS_DB_PLATFORM_ERROR`）。两者失败原因完全不同：前者是 CPU 太老，后者是数据库编译时绑定的平台与当前机器不符，即使当前机器更强也会失败。
+
+第六，`BUILD_AVX512VBMI=ON` 会隐含打开 `BUILD_AVX512`（第 148 至 150 行），但反过来不成立。只想要 VBMI 而不想要 AVX-512 变体是不可能的，因为 VBMI 的编译目标（`icelake-server`）本身就包含 AVX-512 全套。
+
+第七，交叉编译时不要指望 fat runtime 能工作。它硬性依赖 `ifunc` 与 Linux 的动态链接器行为，交叉到其他架构时 `CMAKE_SYSTEM_NAME` 一改，`FAT_RUNTIME` 的默认值就是 OFF，配置日志里只会多一行提示。此时要么接受「按目标基线编译」的非 fat 产物，要么改用目标平台的工具链在目标机上原生构建。把这个判断写进构建脚本，比事后在目标机上排查 `SIGILL` 便宜得多。
+
+### 7. 小结与延伸阅读
+
+fat runtime 的本质是「用编译期重复换取运行期自适应」：五份实现、符号前缀隔离、加载时一次 `ifunc` 解析。它解决跨机可用性，不解决数据库平台绑定；它让库可以分发，代价是体积与编译时间。库形态的选择则是另一条正交轴，两者组合出四种产物，选择依据是部署形态（单机/机群、单进程/多进程、体积敏感度）而非性能偏好。
+
+变量的完整语义见 04-01，fat runtime 的运行时分派原理见 06-13，`hs_platform_info_t` 与数据库 `platform` 字段见 05-04 与 06-12，运行时模块的组织见 07-10。基准对比方法与「开了 AVX-512 反而变慢」的实测判据见 08-01 与 08-02。（字段见 05-04 ｜ 参数见 04-01 ｜ 原理见 06-13 ｜ 模块见 07-10）

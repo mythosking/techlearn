@@ -1,0 +1,634 @@
+# Hyperscan 技术资料 · 01 基础与概述
+
+## 01-01 Hyperscan 是什么：定位、能力矩阵与适用边界
+
+### 1. 背景与动机
+
+在需要「一条数据流上同时命中成千上万条规则」的场合，正则表达式长期是一种尴尬的工具。它表达力足够，写起来也足够直观，但传统实现方式是把每条规则单独执行一次：N 条规则、M 字节数据，就是 N 次独立的正则匹配。以入侵检测系统为例，一个中等规模的规则集动辄两三万条表达式，如果每条都调用一次 `pcre_exec`，即使单条规则只需几微秒，乘上规则数也已经远超单包的处理预算。更麻烦的是，PCRE 采用回溯实现，遇到 `(a+)+b` 这类结构时最坏情况会退化成指数级，攻击者只要构造一段精心设计的输入，就能让检测引擎自己先瘫掉。
+
+工程上曾经有两种应对办法。第一种是「能不用正则就不用」：把规则手工改写成多模式字符串匹配（Aho-Corasick），遇到复杂规则再回退到正则。第二种是「先粗筛再精匹配」：用一组关键字做预过滤，只有命中的报文才交给完整正则确认。这两种办法都有效，但都需要应用自己搭一套调度逻辑，而且粗筛与精匹配之间的边界、状态、误报率全由应用承担，实际落地时非常容易写错。
+
+Hyperscan 的出发点正是把上面这套「预过滤 + 精确匹配」的工程经验固化成库。它把「多模式」当作一等公民：编译期对整组表达式做统一分析，把能提取的字面量提取出来、能合并的状态合并起来，最终生成一份不可变的数据库；扫描期一次遍历数据，同时推进所有模式的状态机。这样做的直接后果是成本模型发生了倒转——编译很贵，扫描很便宜。一份上万条规则的数据库可能需要数秒甚至数十秒才能编译完成，但扫描吞吐可以达到每秒数 GB，而且与规则条数的关系被大幅削弱。
+
+这也解释了 Hyperscan 在真实系统中的位置。它不是防火墙，不是 IDS 产品，也不是协议解析器；它是被嵌进这些系统里的一个匹配内核。`README.md` 的定位写得很克制：高性能多正则匹配库，语法跟随 libpcre，但拥有独立的 C API，典型用于 DPI 库栈。理解这句话里「库」和「典型用于」两个词，比记住任何 API 都重要——Hyperscan 的边界从第一天起就是清晰的。
+
+### 2. 核心概念
+
+**多正则匹配库**。Hyperscan 对外只有两组能力：编译（把一组表达式变成数据库）与扫描（在数据上跑数据库）。它不持有线程、不开端口、不读配置文件，所有资源生命周期都由宿主程序控制。这种「无状态库」的形态使它可以被放进用户态转发面、内核旁路程序、容器 sidecar，甚至嵌进日志采集 Agent，而不引入额外的运维对象。
+
+**混合自动机**。官方文档用 hybrid automata 描述自己的技术路线，这个词容易被误解成「某种叫混合自动机的单一模型」。实际含义是：Hyperscan 在编译期把正则图切分成若干子图，再为每个子图挑选最合适的执行单元。字面量片段交给 Teddy、Fat Teddy 或 FDR 这类位并行多串匹配器；规则的「骨架」用 LimEx NFA 或 Castle 推进；状态规模可控的部分编译成 Sheng32、Sheng64、McSheng64 这类压缩 DFA；首字符、字符类、重复前缀再叠加 `accel`、`shufti`、`truffle`、`vermicelli` 等加速器。所谓「混合」，是多种自动机技术在同一个数据库里协同工作，而不是一种新数学结构。这一层的实现细节属于 `src/nfa/`，本套资料在 06-05 至 06-09 展开（模块见 07-05）。
+
+**数据库（database）**。编译产物是 `hs_database_t`，一份自带头部、HMAC 校验与字节码的只读内存块，内部首结构是 `RoseEngine`。它不可变：扫描期间不会写入，也不会因为输入不同而膨胀。不可变带来两个好处，一是可以安全地被多线程共享，二是可以序列化后落盘或跨机分发，用 `hs_deserialize_database` 直接加载，从而把昂贵的编译成本从生产路径上挪走。
+
+**三种扫描模式**。`HS_MODE_BLOCK` 面向一次性给出的连续内存块；`HS_MODE_VECTORED` 面向分散在多个缓冲区的同一逻辑数据；`HS_MODE_STREAM` 面向按序到达的分块数据，需要显式 `hs_open_stream` / `hs_scan_stream` / `hs_close_stream`，块边界不会影响匹配结果。三者编译出的数据库互不通用，模式在编译期就写进了数据库，用错模式会得到 `HS_DB_MODE_ERROR`（参数见 04-03）。
+
+**匹配事件与偏移**。命中通过回调 `match_event_handler` 同步投递，参数为 `id`、`from`、`to`、`flags`、`context`。这里有一条必须刻进肌肉记忆的规则：默认只有 `to` 有效，它是匹配结束位置之后那个字节的偏移；`from` 默认为 0。要拿到起始偏移，必须对该条模式开启 `HS_FLAG_SOM_LEFTMOST`，代价是更多流状态、更高开销，以及部分模式直接编译失败。流式模式下起点的可追溯范围还受 SOM horizon 限制，超出 horizon 时 `from` 返回 `HS_OFFSET_PAST_HORIZON`（即 `~0ULL`）。
+
+**scratch**。扫描期的临时工作区，用 `hs_alloc_scratch` 分配。它不是缓存池，也不是线程安全对象：每个并发扫描者必须持有自己的一份，跨线程共享会撞上 `HS_SCRATCH_IN_USE` 或产生未定义行为。这一点在 03-04 与 05-03 反复展开，因为它是生产事故的高发点。
+
+**能力矩阵**。把「能做」与「不能做」并排列出，比读十页 API 更能避免误用。下表按使用频率组织了这张矩阵，依据来自 `doc/dev-reference/compilation.rst` 与 `src/hs_compile.h`。
+
+| 能力项 | 支持情况 | 说明与依据 |
+|---|---|---|
+| 单次扫描匹配上万条模式 | 支持 | 混合自动机与多引擎协同，`README.md` 明确「up to tens of thousands」 |
+| block / vectored / stream | 支持 | 三种 `HS_MODE_*`，编译期绑定，不可混用 |
+| 匹配结束偏移 | 默认支持 | 回调 `to`，语义为「最后一个匹配字节 + 1」 |
+| 匹配起始偏移 | 需开标志 | `HS_FLAG_SOM_LEFTMOST`，流式受 horizon 限制 |
+| 捕获组内容 | 不支持 | 仅支持非捕获分组 `(?:...)`，捕获子表达式被拒 |
+| 反向引用 | 不支持 | `compilation.rst` 的 Unsupported Constructs 首条 |
+| 递归、条件模式、子程序引用 | 不支持 | 在解析或图构造期报错，属 Unsupported Constructs |
+| `\C`、`\R`、`\K`、原子分组、占有量词 | 不支持 | 与 PCRE 语义冲突，编译期一律拒绝 |
+| UTF-8 与 Unicode 字符类 | 支持 | `HS_FLAG_UTF8` 与 `HS_FLAG_UCP` |
+| 近似匹配（编辑距离/汉明距离） | 支持 | `hs_expr_ext_t` 的 `EDIT_DISTANCE` / `HAMMING_DISTANCE` |
+| 抓包、协议解析、流重组 | 不做 | 属宿主职责，`examples/pcapscan.cc` 只是读取 PCAP 的示例 |
+| 一份 scratch 跨线程共享 | 禁止 | 非线程安全，会返回 `HS_SCRATCH_IN_USE` |
+| 运行期修改规则集 | 不支持 | 数据库不可变，换规则必须重新编译或换库 |
+
+需要强调的是「不支持捕获组」不是实现偷懒，而是模型决定的。Hyperscan 的扫描过程是并行推进所有模式的状态集合，没有「某一条模式独占执行栈」的概念，因此也就不存在回溯意义上的「第 N 个捕获组刚刚吃了哪些字节」。需要捕获内容时，正确做法是让 Hyperscan 做高速预过滤，命中后再用 PCRE 对候选区间做一次确认，这正是 Chimera 的设计（见 01-02 与 06-14）。
+
+把「谁做什么」画成一张职责划分图更清楚：宿主负责取数、重组与后续处置，Hyperscan 只负责在给定的字节块上产出命中事件。图 01-01-01 中红色节点是常见误判为「库应该负责」的部分，实际全部属于宿主或需要显式开标志。
+
+:::figure id=01-01-01 | name=Hyperscan 与宿主的职责边界 | dir=TD
+node n1 "宿主程序（IDS/WAF/DLP）" blue
+node n2 "hs_database 只读字节码" amber
+node n3 "混合自动机扫描内核" purple
+node n4 "match_event_handler 回调" green
+node n5 "抓包 / 协议解析 / 重组" red
+node n6 "捕获组 / 反向引用" red
+node n7 "起始偏移（SOM）" teal
+edge n1 -> n2 "编译一次"
+edge n1 -> n3 "送入数据块"
+edge n2 -> n3 "加载"
+edge n3 -> n4 "命中事件"
+edge n1 -> n5 "宿主职责"
+edge n3 -> n6 "不支持"
+edge n3 -> n7 "需开标志"
+:::
+
+图中最值得记住的是 n6 与 n7 两条边：它们不是「还没实现」，而是「要么不支持、要么必须显式付费」。把这两点讲清楚，能挡掉后续集成阶段大约一半的返工。
+
+### 3. 关键数据结构与源码位置
+
+第一个对象是数据库。`src/database.h` 中 `struct hs_database` 的布局是：`magic`、`version`、`length`、`platform`、`bytecode`（相对数据库起始的字节码偏移）、`hmac[32]`、`hmac_hdr[32]`、`padding[25]`、柔性数组 `bytes[]`。注释明确说明 `padding` 的作用是让 `bytes[]` 从偏移 192 开始，并保证字节码起点不会因为 cacheline 对齐而落进 HMAC 字段区域。`HS_DB_MAGIC` 默认 `0xdbdbdbdb`，可以在构建期用 `-DHS_DB_MAGIC=` 覆盖；`HS_DB_VERSION` 等于 `HS_VERSION_32BIT`，由主次修订号移位拼成。这两个字段构成了 `validDatabase()` 里最廉价的两道校验：magic 不符返回 `HS_INVALID`，version 不符返回 `HS_DB_VERSION_ERROR`（字段见 05-02）。
+
+第二个对象是字节码首结构 `RoseEngine`，定义在 `src/rose/rose_internal.h`。它的前九个字节是一组布尔标记：`pureLiteral` 表示数据库由纯字面量 API 生成，`noFloatingRoots` 表示只需在锚定表命中后才需要跑锚定表之外的逻辑，`requiresEodCheck` 表示存在需要在数据末尾补做的匹配，`hasOutfixesInSmallBlock`、`runtimeImpl`、`mpvTriggeredByLeaf`、`canExhaust`、`hasSom`、`somHorizon` 各自控制一条运行时捷径。随后是 `mode`、`historyRequired`、各类 key 计数（`ekeyCount`、`lkeyCount`、`lopCount`、`ckeyCount`、`dkeyCount`）、SOM 相关的 `somLocationCount` 与 `somLocationFatbitSize`，以及一堆以 `Offset` 结尾的字段，指向锚定字面量表、浮动字面量表、EOD 表、小块表等子结构。读这份结构的意义在于：运行时的分支几乎全部由这些编译期算好的标记决定，而不是在扫描时现场判断。
+
+第三个对象是 scratch。`src/scratch.h` 的 `struct hs_scratch` 里，`magic` 与 `in_use` 是并发保护，`queueCount`、`activeQueueArraySize`、`bStateSize`、`tStateSize`、`fullStateSize` 描述容量，`bstate`、`tstate`、`fullState` 是三块状态区，`queues`、`aqa`、`delay_slots`、`al_log`、`catchup_pq` 是匹配队列与延迟匹配所需的结构，`core_info` 保存用户回调与上下文，`deduper` 负责去重，`som_store`、`som_attempted_store`、`som_set_now`、`som_fatbit_size` 服务于 SOM，末尾的 `scratchSize`、`scratch_alloc`、`fdr_conf`、`fdr_conf_offset` 记录自身大小与字面量前端的确认槽位。`markScratchInUse` 置位、`unmarkScratchInUse` 清零，这就是 `HS_SCRATCH_IN_USE` 的全部来源（字段见 05-03）。
+
+第四个对象是流。`hs_stream_t` 对使用者是不透明句柄，内部由 `historyRequired` 决定需要保留多少历史字节，由 SOM 精度决定需要多少槽位。它的生命周期只有四个动作：开、扫、重置或复制、关。第五个对象是编译期错误结构 `hs_compile_error_t`，只在对外的错误路径出现，`message` 是给人看的文本，`expression` 指向出错的那条模式。
+
+### 4. 关键流程与调用链
+
+编译侧入口在 `src/hs.cpp`。`hs_compile` 只做参数检查，随后把单条表达式包装成数组，转调内部的 `hs_compile_multi_int`；后者与 `hs_compile_multi`、`hs_compile_ext_multi` 共用工厂函数。工厂函数依次完成：标志合法性检查（`src/compiler/compiler.cpp` 中会拒绝未识别标志、拒绝 `SINGLEMATCH` 与 `SOM_LEFTMOST` 组合、拒绝 `PREFILTER` 与 `SOM_LEFTMOST` 组合）、`Parser::parse` 生成组件树、`addExpression` 把组件树接入 `NG` 图、图级化简、`RoseBuild` 分解与选型、`generateRoseEngine` 产出字节码、`dbCreate` 拼装 `hs_database`。这条链路的关键节点在 `src/compiler/compiler.cpp` 的 `build()`：它先取 `RoseEngine`，写入 `pureLiteral`，再用 `dbCreate` 计算平台并完成头部与 HMAC。任何一步抛出的 `CompileError`、`ParseError`、`ResourceLimitError` 都会被统一转换成 `HS_COMPILER_ERROR` 加一个错误结构。
+
+扫描侧的入口在 `src/dispatcher.c`。这个文件用 `CREATE_DISPATCH` 宏为 `hs_scan`、`hs_scan_stream`、`hs_open_stream`、`hs_close_stream`、`hs_scan_vector`、`hs_database_size`、`hs_database_info` 等函数各生成五份实现，分别对应 AVX-512 VBMI、AVX-512、AVX2、SSE4.2 + POPCNT（corei7）、SSSE3（core2），并通过 `__attribute__((ifunc(...)))` 让动态链接器在加载时选定其中一份。若 CPU 连 SSSE3 都不满足，解析器返回 `error_` 版本，调用即得 `HS_ARCH_ERROR`。这就是 fat runtime 的落地方式：同一份 `.so` 里有多套微架构代码，进程启动时一次性绑定（原理见 06-13）。
+
+绑定之后，真正的扫描在 `src/runtime.c` 与 Rose 运行时完成：校验数据库与 scratch、按 `RoseEngine->runtimeImpl` 选择「只跑浮动表」「只跑单个 outfix」或「完整 Rose 程序」，按 `mode` 决定走块状态还是流状态，命中后通过 `core_info.userCallback` 回到用户函数。回调返回非零即置 `STATUS_TERMINATED`，扫描提前结束并返回 `HS_SCAN_TERMINATED`；流式模式下该流后续的写调用也会直接返回终止状态。
+
+### 5. 配置/命令/代码实例
+
+最小可用路径仍然是「编译 → 分配 scratch → 扫描 → 释放」。下面这段 C 代码完整覆盖四步，不做省略，可直接对照 `examples/simplegrep.c` 阅读。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <string.h>
+
+static int on_match(unsigned int id, unsigned long long from,
+                    unsigned long long to, unsigned int flags, void *ctx)
+{
+    (void)from; (void)flags; (void)ctx;
+    /* 未开 SOM 时 from 恒为 0；to 是匹配结束后的第一个字节偏移 */
+    printf("pattern %u matched, end offset = %llu\n", id, to);
+    return 0; /* 返回非 0 会终止扫描，API 返回 HS_SCAN_TERMINATED */
+}
+
+int main(void)
+{
+    const char *pattern = "alert\\s*=\\s*\\d+";
+    hs_database_t *db = NULL;
+    hs_compile_error_t *err = NULL;
+    hs_scratch_t *scratch = NULL;
+
+    if (hs_compile(pattern, HS_FLAG_CASELESS, HS_MODE_BLOCK, NULL,
+                   &db, &err) != HS_SUCCESS) {
+        fprintf(stderr, "compile failed: %s\n", err->message);
+        hs_free_compile_error(err);
+        return 1;
+    }
+    if (hs_alloc_scratch(db, &scratch) != HS_SUCCESS) {
+        fprintf(stderr, "scratch alloc failed\n");
+        hs_free_database(db);
+        return 1;
+    }
+
+    const char *data = "GET /x HTTP/1.1\r\nALERT = 42\r\n\r\n";
+    if (hs_scan(db, data, (unsigned)strlen(data), 0, scratch,
+                on_match, NULL) != HS_SUCCESS) {
+        fprintf(stderr, "scan failed\n");
+    }
+
+    hs_free_scratch(scratch);
+    hs_free_database(db);
+    return 0;
+}
+```
+
+用 `gcc -O2 scan.c -lhs -o scan` 编译（静态库时链接 `libhs.a` 并补 `-lstdc++ -lpthread`），对一个内联构造的 30 字节请求执行一次 block 扫描，典型输出如下。
+
+```text
+pattern 0 matched, end offset = 27
+```
+
+示例输出，具体格式需对照实际版本核验。逐项判读：`pattern 0` 中的 0 是匹配 ID，`hs_compile` 对单条表达式固定使用 0，多模式场景应由调用方通过 `hs_compile_multi` 的 `ids` 数组自行分配，ID 只用于区分规则，不携带语义。`end offset = 27` 表示匹配覆盖 `[17, 27)` 这段字节，即 `ALERT = 42`：字符串前缀 `GET /x HTTP/1.1\r\n` 正好 17 字节，模式本身 10 字节，所以结束偏移是 27；如果输出是 17 或 26，说明模式里 `\s*` 的贪婪语义或偏移口径被理解错了。示例里没有打印 `from`，因为未开 `HS_FLAG_SOM_LEFTMOST` 时它一定是 0，打印出来只会误导；若改成 `HS_FLAG_CASELESS | HS_FLAG_SOM_LEFTMOST` 重新编译，同样的输入应输出 `from = 17, to = 27`。最后一点，回调返回 0 是「继续扫描」，返回任何非零值都会让 `hs_scan` 返回 `HS_SCAN_TERMINATED`，这不是错误，而是使用者主动中止的正常路径。
+
+工具侧可以用 `hscheck` 在写代码之前先确认一组模式能否编译。它接受表达式目录或签名文件，默认 streaming 模式，`-N` 切 block，`-L` 为全部模式打开 SOM，`-8` 强制 UTF-8。
+
+```bash
+mkdir -p rules && printf 'alert\\s*=\\s*\\d+\n' > rules/rule1
+./bin/hscheck -e rules -N
+```
+
+若规则里含反向引用，例如 `(\\w+)\\s+\\1`，`hscheck` 会以非零状态退出并打印不支持构造的提示，这就是把错误挡在集成之前的最便宜办法。完整工具参数见 04-07。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类陷阱是偏移语义。把 Hyperscan 当成「返回起止位置的正则引擎」是最常见的误读。默认只给结束偏移，而且这个偏移是「结尾后一字节」，用于切片时必须写 `data[from, to)`。需要起点就开 SOM，但要接受三件事：部分有界重复会编译失败、流式起点可能落到 horizon 之外、吞吐与流状态都会变差。SOM 还不能与 `HS_FLAG_SINGLEMATCH`、`HS_FLAG_PREFILTER` 组合，`src/compiler/compiler.cpp` 会直接抛 `CompileError`，错误信息里写明「not supported in combination」。
+
+第二类陷阱是线程模型。scratch 里既有可复用的队列，也有 `in_use` 这样的布尔状态，它天生不能被两个线程同时持有。正确姿势是「每线程一份」或「池化后按需借出」，并且当进程同时持有多个数据库时，要对每个数据库都调用一次 `hs_alloc_scratch`，传入同一个 scratch 指针，直到返回 `HS_SUCCESS`——该函数会在现有 scratch 不够大时释放旧块、分配新块，最终得到的块对之前所有数据库都适用。5.4.2 的 CHANGELOG 特别提到回退了 issue #350 的快速校验改动，并再次强调「用为另一个数据库分配的更大 scratch 来跑当前数据库」是允许的，但超出这个范围的行为未定义。
+
+第三类陷阱是成本模型。数据库不可变，编译昂贵。生产环境应当在构建流水线里编译一次、序列化、随包分发，启动时 `hs_deserialize_database` 反序列化；每次进程启动都重新编译几十秒，是把 Hyperscan 用成性能反模式的典型方式。同时要接受「规则热更新 = 换库」这个事实：旧库要等所有在跑的扫描结束才能释放，流式场景还要决定旧流是继续用旧库跑完还是丢弃。
+
+第四类陷阱是能力边界。Hyperscan 不做抓包、不做协议解析、不做 TCP 重组，`examples/pcapscan.cc` 只是演示如何把 PCAP 里的包载荷喂给 `hs_scan`，重组逻辑要宿主自己实现。它也不支持捕获组、反向引用、递归、条件模式、`\C`、`\R`、`\K`、原子分组与占有量词；遇到这些需求，要么改写模式，要么上 Chimera。
+
+那么什么时候不该用 Hyperscan？规则只有几条、数据量很小、调用频率极低的场景，引入编译期开销与构建依赖并不划算，直接 PCRE 更简单。需要精确捕获每一个子串、需要回溯语义（例如「最左最长」之外的贪婪/懒惰细节）、需要反向引用做结构化校验的场景，Hyperscan 无法单独胜任。规则集需要每秒变更的场景也不适合，因为每次变更都意味着一次完整编译。反过来，规则数千条以上、吞吐要求高、模式可以改写成无捕获形式、数据是持续流，这四个条件同时成立时，Hyperscan 的优势才真正显现。
+
+### 7. 小结与延伸阅读
+
+Hyperscan 是一个把「多模式预过滤 + 精确匹配」工程经验产品化的匹配内核。它用混合自动机在编译期完成模式分解与引擎选型，把成本集中到编译，把扫描做成一次遍历、状态并进；它用不可变数据库换取线程安全与可分发；它用 scratch 与流状态把运行期内存固定下来，从而做到「编译期决定内存、运行期零分配」（除两块预分配结构外）。理解这四点，就理解了它的全部设计取向。
+
+同时要记住它的四个硬边界：只报结束偏移、无捕获与反向引用、scratch 非线程安全、数据库不可变且编译昂贵。这四条不是待改进的缺陷，而是模型自洽的代价；绕过它们的方法不是「想办法让 Hyperscan 支持」，而是换工具或分层（Chimera、宿主预过滤、PCRE 确认）。
+
+延伸阅读建议按此顺序：先读 `doc/dev-reference/intro.rst` 建立编译与扫描两分的印象；再读 `README.md` 校准定位表述；然后进入 01-02 做引擎横向对比，01-03 看两层架构如何落地；需要动手时转 03-01 跑通最小集成，需要查参数时直接用 04-02、04-03、04-05。字段细节见 05-02 与 05-03，原理细节见 06-01（参数见 04-02 ｜ 字段见 05-02 ｜ 原理见 06-01 ｜ 模块见 07-10）。
+
+## 01-02 与 PCRE / RE2 / Vectorscan / Chimera 的引擎对比
+
+### 1. 背景与动机
+
+选型讨论里最容易出现的错误，是把几个正则引擎放在「谁更快」这一个维度上比较。实际上它们回答的是不同的问题。PCRE 回答「你能不能完整实现 Perl 正则语义」；RE2 回答「你能不能在保证最坏情况有界的前提下实现大部分语义」；Hyperscan 回答「你能不能在一条流上同时跑几万条模式还保持线速」；Chimera 回答「你能不能先用便宜的方式筛掉绝大多数流量，再对少数候选付出昂贵代价」。这四个问题不重叠，所以「谁更快」本身没有意义，必须先确定约束。
+
+约束通常来自三处。第一是输入可信度：如果正则由外部用户提交，回溯引擎的指数级风险就是安全问题，必须优先考虑最坏情况界。第二是模式数量：几十条规则和几万条规则对应完全不同的数据结构，前者用逐条执行毫无问题，后者必须有全局索引。第三是结果需求：只要「命中与否」和「命中位置」，与需要「每个捕获组的内容」，导出的架构完全不同。把这三处想清楚，剩下的比较才有意义。
+
+本节先横向铺开五种选择——PCRE、RE2、Hyperscan、Vectorscan、Chimera——再给一张覆盖八个维度的对照表，最后落到选型决策。需要提前说明的是，Hyperscan 并不保证最坏情况线性时间：它的 DFA 类引擎有状态上限，NFA 类引擎的状态集合也会随模式规模增长，所谓「线性」只是相对回溯引擎而言的工程近似，不能写成数学保证。
+
+### 2. 核心概念
+
+**回溯引擎（PCRE）**。执行模型是深度优先地在模式图上试探，遇到分支就保存现场，失败就回退。优点是语义完整：捕获组、反向引用、递归、条件、原子分组、占有量词、`\K`、callout 全部支持，且与 Perl 行为高度一致。缺点是复杂度没有上界，`(a+)+$` 对 `aaaa...X` 这类输入会触发灾难性回溯；即使是常见模式，每条模式也要独立扫描一遍数据，多模式场景下成本线性叠加。PCRE 的内存模型是「每次匹配一份栈 + 一份匹配数据」，可以复用但本质上仍是逐次执行。
+
+**惰性 DFA 与记忆化（RE2）**。RE2 把正则编译成程序，用 DFA 或 NFA 模拟执行，并在 NFA 路径上做状态去重，因此最坏情况是 O(n·m)（n 为输入长度，m 为程序规模），不会指数爆炸。代价是语义裁剪：不支持反向引用与任意环视，捕获组支持但需要额外机制。RE2 是「单模式、单次调用」的库，多模式要靠调用方循环或把模式合并成一个大 alternation，后者会显著放大自动机规模。它的定位是「安全的正则」，不是「高吞吐多模式匹配」。
+
+**混合自动机（Hyperscan）**。编译期把图拆成字面量部分与状态机部分，字面量交给位并行多串匹配器，状态部分交给 NFA/DFA，再叠加字符类加速器。因为字面量前端一次能推进几百条模式，规则数量的边际成本被压得很低。它的语义是「匹配集合」而非「单次匹配过程」，因此没有捕获组，也没有回溯意义上的贪婪细节；默认只报结束偏移。内存模型是「一份不可变数据库 + 每线程 scratch + 每流状态」，全部尺寸在编译期确定。
+
+**同源分支（Vectorscan）**。Vectorscan 是社区维护的 Hyperscan 分支，重点是把同一套 API 与编译流水线移植到 ARM（AArch64）等非 x86 平台，并对 NEON/SVE 做适配。二者 API 兼容，源码结构同源，但引擎支持矩阵不同：x86 上依赖 AVX2、AVX-512、AVX-512 VBMI 的 Sheng、McSheng、Fat Teddy 等实现，在 ARM 上没有一一对应的等价物，性能特征与可用的编译选项也不同。因此不能把 Vectorscan 的平台结论、基准数字、甚至某些编译失败原因直接当成上游 Hyperscan 的结论。凡是涉及平台能力，必须写明「以该分支对应版本为准，需对照实际版本核验」。
+
+**两段式（Chimera）**。Chimera 是 Hyperscan 仓库内附的混合引擎，思路是「Hyperscan 预过滤 + PCRE 确认」：编译期同时生成一份 Hyperscan 数据库和一份 PCRE 程序，扫描时先用 Hyperscan 快速排除绝大多数位置，只在候选命中处调用 PCRE 做完整匹配并返回捕获组。它的 API 是独立的一套（`ch_compile`、`ch_alloc_scratch`、`ch_scan` 等），链接时需要 `-lchimera -lhs -lpcre`。收益完全取决于命中率：命中稀少时接近 Hyperscan 的速度，命中密集时退化为 PCRE 的速度甚至更慢。
+
+### 3. 关键数据结构与源码位置
+
+PCRE 侧的核心是编译后的 `pcre` / `pcre2_code` 与执行时的 `match_data`，匹配入口 `pcre_exec` 内部维护回溯栈。这些不在本仓库内，本套资料只把它作为语法与语义参照，版本基线取 PCRE 8.41 及以上。
+
+RE2 侧的核心是 `re2::Prog`（编译后的指令序列）与 `re2::RE2`（对外对象），执行时用 `DFA` 或 `NFA` 两种模拟器，捕获由 `PODArray` 管理的位向量完成。同样不在本仓库内。
+
+Hyperscan 侧的可定位对象全部在 `src/` 下。编译产物是 `src/database.h` 的 `struct hs_database`，字节码首结构是 `src/rose/rose_internal.h` 的 `struct RoseEngine`；NFA 引擎族在 `src/nfa/`，其中 `limex_*.c` 是 LimEx NFA 的执行体，`castle.c` 是可压缩 NFA，`sheng*.c`、`mcsheng*.c` 是压缩 DFA；字面量前端在 `src/fdr/` 与 `src/hwlm/`；加速器是 `accel.c`、`shufti.c`、`truffle.c`、`vermicelli.c`；平台分派在 `src/dispatcher.c`。这些文件的职责边界见 07-05 与 07-07，字段细节见 05-06、05-07（字段见 05-06 ｜ 模块见 07-05）。
+
+Chimera 侧的结构在 `chimera/ch_database.h`、`chimera/ch_scratch.h`。`ch_database_t` 同时持有 Hyperscan 数据库与 PCRE 程序，`ch_scratch_t` 则包住 Hyperscan scratch 与 PCRE 的匹配数据；这解释了为什么 Chimera 的内存占用与分配次数都高于纯 Hyperscan。
+
+### 4. 关键流程与调用链
+
+Hyperscan 的内部流程可以概括为「三段式」：字面量前端负责在字节流上快速找到「可能命中」的位置，报告给 Rose 的队列；Rose 程序根据这些候选推进锚定/浮动/后缀状态；NFA 或 DFA 只在候选处做确认并产生最终报告。三段的分工由编译期决定，`RoseEngine` 里那些 `*matcherOffset` 字段就是各段的入口偏移。这种设计使得「几万条模式」的常态成本接近「几百条字面量的扫描成本」，因为字面量前端是位并行的，而昂贵的状态机只在候选处启动。
+
+Chimera 的流程是两段：`ch_scan` 先跑 Hyperscan 部分，得到候选结束偏移；对每个候选，用 PCRE 在「候选附近的一个窗口」上重新执行，窗口的起点由 Hyperscan 的报告与 SOM 信息决定；PCRE 成功后把捕获组通过 `ch_match_event_handler` 返回。窗口大小与起点策略直接决定漏报风险，这是 Chimera 调优的核心，也是它不适合「模式本身没有可靠字面量锚点」的原因。
+
+PCRE 的流程是单段回溯，RE2 的流程是单段自动机模拟。把四者放在一张图上，差异一目了然：PCRE 是深度优先、可能回退；RE2 是宽度优先、状态去重；Hyperscan 是「便宜前端 + 昂贵确认」的分层；Chimera 是「Hyperscan 前端 + PCRE 确认」的两级流水。图 01-02-01 用同一套输入与同一个输出箭头把这四种路径并排画出，可以直观看出「成本放在哪一段」。
+
+:::figure id=01-02-01 | name=四类正则引擎的执行路径对比 | dir=LR
+node n1 "输入字节流" blue
+node n2 "PCRE：深度优先回溯" red
+node n3 "RE2：自动机 + 状态去重" teal
+node n4 "Hyperscan：混合自动机" purple
+node n5 "Chimera：预过滤 + 确认" green
+node n6 "选型结论" amber
+edge n1 -> n2 "逐条执行"
+edge n1 -> n3 "单模式调用"
+edge n1 -> n4 "多模式并进"
+edge n4 -> n5 "给出候选区间"
+edge n2 -> n6 "功能优先"
+edge n3 -> n6 "安全优先"
+edge n5 -> n6 "兼顾捕获与吞吐"
+:::
+
+图 01-02-01 的关键读法是看「箭头数量」：PCRE 与 RE2 都是每个模式一条独立路径，Hyperscan 把入口合并成一条，Chimera 在合并入口之后又分叉出一次确认。这也解释了为什么 Hyperscan 的规则数增加时吞吐下降缓慢，而 PCRE 会近似线性下降。
+
+### 5. 配置/命令/代码实例
+
+同一条规则「关键字 `passwd` 后跟 1 到 32 个非空白字符」在三种引擎里的写法差异，能直观说明「功能完整度」的代价。PCRE 版本可以顺手加捕获组：
+
+```c
+#include <pcre.h>
+#include <stdio.h>
+#include <string.h>
+
+int main(void)
+{
+    const char *pat = "passwd\\s*=\\s*(\\S{1,32})";
+    const char *errmsg = NULL;
+    int erroff = 0;
+    pcre *re = pcre_compile(pat, PCRE_CASELESS, &errmsg, &erroff, NULL);
+    if (!re) {
+        fprintf(stderr, "pcre compile failed at %d: %s\n", erroff, errmsg);
+        return 1;
+    }
+    const char *line = "PASSWD = s3cr3t-value";
+    int ov[6];
+    int rc = pcre_exec(re, NULL, line, (int)strlen(line), 0, 0, ov, 6);
+    if (rc > 0) {
+        printf("match [%d,%d), group1=[%d,%d)\n",
+               ov[0], ov[1], ov[2], ov[3]);
+    }
+    pcre_free(re);
+    return 0;
+}
+```
+
+同一需求在 Hyperscan 里必须去掉捕获组，改成非捕获形式，并且默认只能拿到结束位置：
+
+```c
+const char *pat = "passwd\\s*=\\s*\\S{1,32}";
+hs_compile(pat, HS_FLAG_CASELESS, HS_MODE_BLOCK, NULL, &db, &err);
+```
+
+如果确实需要捕获内容，正确做法是 Chimera：用 `ch_compile` 编译带捕获组的模式，`ch_scan` 的回调里直接取分组。命令行侧可以用 `hsbench` 做吞吐对照：默认 streaming，`-N` 切 block，`-V` 切 vectored，`-n` 指定重复次数，`-T` 绑核；若构建时开了 `HS_HYBRID`，还会多出 `-H`（Chimera）与 `-P`（PCRE）两个基准选项。
+
+```bash
+./bin/hsbench -e rules -c corpus.txt -N -n 20
+```
+
+典型输出如下，字段名来自 `tools/hsbench/engine_hyperscan.cpp` 与 `tools/hsbench/main.cpp` 的打印语句，具体数值随规则集与语料变化。
+
+```text
+Signature set:     rules
+Signatures:        18642
+Hyperscan info:    Version: 5.4.2 Features: AVX2 Mode: BLOCK
+Expression count:  18642
+Bytecode size:     3,428,352 bytes
+Database HMAC:     9f3c1a7b5d2e8f04c6b91a3d7e5f2084ab6c9d1e3f75082b4c6d9e1a3b5c7d9f
+Scratch size:      1,286,144 bytes
+Compile time:      12.480 seconds
+Peak heap usage:   148,930,560 bytes
+Matches per iteration:     37 (0.412 matches/kilobyte)
+Overall block rate:        20,480.00 blocks/sec
+Mean throughput (overall): 8,142.37 Mbit/sec
+Max throughput (per core): 9,015.62 Mbit/sec
+```
+
+示例输出，具体格式需对照实际版本核验。判读时看四组关系：第一，`Expression count` 与 `Bytecode size` 的比值反映压缩效率，18642 条规则压到 3.4 MB 属于共享前缀较多的良好情形，若同样规则数膨胀到几十 MB，通常是大量模式缺少公共字面量、被迫落进 NFA。第二，`Compile time` 12.5 秒对应 `Mean throughput` 8.1 Gbit/s，这个数量级的反差就是「编译重、扫描轻」的量化体现，也说明绝不能把编译放进请求路径。第三，`Scratch size` 1.28 MB 是每线程的固定开销，乘上并发线程数才是真实内存占用，评估容量时容易漏掉这一项。第四，`Matches per iteration` 只有 37 次、每 KB 0.4 次，说明语料命中稀疏；若这个数字飙升到每 KB 数十次，`Mean throughput` 会明显下降，因为每次命中都要走回调与去重。做 A/B 对照时，应保持语料、规则集、`-n` 与绑核一致，只改一个变量。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**不要把 Hyperscan 描述成「线性时间」。** 它的 DFA 引擎有状态上限，超过上限会回退到 NFA 或拆分成多个引擎；NFA 的状态集合规模与模式复杂度相关。官方从未承诺严格的最坏情况线性界，工程上观察到的是「相对稳定、与输入内容弱相关」，这与「数学上 O(n)」是两回事。写文档、做容量评估时必须区分。
+
+**不要用 PCRE 的功能清单去要求 Hyperscan。** 捕获组、反向引用、递归、条件、原子分组、占有量词、`\C`、`\R`、`\K` 全部不支持。把带捕获组的规则直接喂给 `hs_compile` 会得到 `HS_COMPILER_ERROR`，错误结构里会给出具体位置。改写策略是：能去掉捕获就去掉，不能去掉就上 Chimera，或者把「结构校验」这一步交给宿主代码。
+
+**不要忽略 SOM 的连锁代价。** 开 `HS_FLAG_SOM_LEFTMOST` 不只是「多返回一个字段」，它会减少可编译的模式集合、增加流状态、降低吞吐，并且与 `SINGLEMATCH`、`PREFILTER` 互斥。很多「Hyperscan 编译不了这条规则」的案例，根因是顺手开了 SOM。
+
+**不要把 Vectorscan 的数字当上游数字。** 两者 API 兼容但引擎矩阵不同。在 ARM 上讨论 Sheng、McSheng、AVX-512 VBMI 相关收益没有意义；反过来，在 x86 上用 Vectorscan 的编译失败结论去推断上游也会出错。涉及平台时必须写明分支与版本。
+
+**不要忽略编译时间这一项成本。** 对比表里通常只列扫描吞吐，但 Hyperscan 的编译开销比 PCRE 高两到四个数量级：一条模式在 PCRE 里是毫秒级，在上万条规则的 Hyperscan 数据库里可能是数秒到数十秒，且内存峰值远高于数据库最终大小。这决定了它只能出现在构建流水线或离线阶段，不能出现在请求路径上。若业务要求「规则秒级生效」，要么接受预编译的多个数据库热切换，要么改用逐条执行的引擎。
+
+**不要忘记近似匹配的能力差异。** Hyperscan 通过 `hs_expr_ext_t` 支持编辑距离与汉明距离，这是 PCRE 与 RE2 都不原生具备的能力，在敏感信息检测、拼写变形绕过等场景很有价值。但它只在编译期生效，且会显著放大状态空间，开启后编译时间与数据库体积都会上升；同时近似匹配与 SOM、部分标志的组合有额外限制。把它当成「默认开启的增值项」是常见误判，应当按规则逐条评估。
+
+**不要用单条模式的基准推断多模式表现。** Hyperscan 的优势来自模式间的共享与位并行，单条模式的吞吐往往不如优化良好的 PCRE JIT；规则数上升到数百条以后曲线才反过来。选型基准必须用真实规则集与真实语料。
+
+关于选型，可以按下面的顺序判断：输入是否不可信 → 若是且不能接受回溯风险，排除 PCRE 单用；是否需要捕获组或反向引用 → 若需要且流量大，选 Chimera，若流量小直接 PCRE；模式数量是否超过数百 → 若否则 RE2 或 PCRE 都够用，若是则 Hyperscan；是否要求跨块流式 → 若要求，Hyperscan 的 stream 模式是现成的，RE2 需要自己做窗口重叠；最后看平台，非 x86 且必须用 Hyperscan API 时评估 Vectorscan。
+
+下表把八个关键维度并排放在一起，便于在评审会上直接引用。表中「典型吞吐量级」是工程经验区间，强依赖规则集、语料与硬件，不可当作承诺值。
+
+| 维度 | PCRE | RE2 | Hyperscan | Chimera |
+|---|---|---|---|---|
+| 功能完整度 | 最完整，含捕获与反向引用 | 较完整，无反向引用与任意环视 | 裁剪明显，无捕获与反向引用 | 接近 PCRE，另加 Hyperscan 前端 |
+| 最坏时间复杂度 | 无上界，可指数退化 | O(n·m)，有界 | 无严格线性保证，受状态上限约束 | 前端有界，确认段仍是回溯 |
+| 流式能力 | 需应用自行维护窗口与状态 | 需应用自行维护窗口 | 原生 stream 模式，跨块无缝 | 支持，但确认窗口需谨慎设定 |
+| 起始偏移 | 天然提供 | 天然提供 | 需 SOM 标志，流式受 horizon 限制 | 由 PCRE 确认段提供 |
+| 捕获组 | 完整支持 | 支持，需额外机制 | 不支持 | 支持 |
+| 内存模型 | 每次匹配一份栈与匹配数据 | 程序 + DFA/NFA 状态缓存 | 不可变数据库 + 每线程 scratch + 每流状态 | Hyperscan 对象 + PCRE 程序与匹配数据 |
+| 典型吞吐量级 | 数 MB/s 到数百 MB/s，随模式与输入波动 | 数十 MB/s 到数百 MB/s | 数百 Mb/s 到数十 Gb/s，随规则集变化 | 命中稀疏时接近 Hyperscan，命中密集时接近 PCRE |
+| 适用场景 | 单条复杂规则、需要捕获、离线处理 | 不可信模式、需要安全上界 | 多模式、高吞吐、流式检测 | 需要捕获但流量大、可接受两段开销 |
+
+### 7. 小结与延伸阅读
+
+五种选择的本质区别不在「快慢」，而在「把成本放在哪里」。PCRE 把成本放在每次执行的回溯上，换来语义完整；RE2 把成本放在自动机构造与状态缓存上，换来最坏情况有界；Hyperscan 把成本前移到编译期，换来扫描期的多模式并进与流式能力；Chimera 把成本分成两段，用便宜的 Hyperscan 承担绝大多数流量，用昂贵的 PCRE 只处理候选；Vectorscan 则是同一设计在非 x86 平台上的再实现，API 相同、引擎矩阵不同。
+
+实践中最稳的组合往往是「Hyperscan 粗筛 + 需要时 Chimera 确认 + 离线分析用 PCRE」。把三者当成分层工具而不是互斥选项，比争论谁更强更有价值。
+
+延伸阅读：`README.md` 的定位段与 `doc/dev-reference/intro.rst` 的能力承诺；`doc/dev-reference/compilation.rst` 的 Pattern Support 与 Unsupported Constructs；`chimera/ch_compile.h` 与 `chimera/ch_runtime.h` 的接口；本套资料的 01-03（架构）、06-14（Chimera 原理）、07-11（chimera 模块）、04-07（工具参数）。基准方法学见 08-01，排障见 08-03（参数见 04-07 ｜ 字段见 05-09 ｜ 原理见 06-14 ｜ 模块见 07-11）。
+
+## 01-03 整体架构：编译期流水线与运行时分派两层
+
+### 1. 背景与动机
+
+理解 Hyperscan 最有效的一刀，是把它切成「编译期」与「运行期」两层，并且承认这两层的性格完全相反。编译期可以做任意昂贵的全局分析：它看得到全部模式、看得到模式之间的公共前缀、可以为了省一个字节的状态而多花一毫秒的 CPU。运行期则被死死约束在「每个字节只能看常数次」的预算里：它不能分配内存、不能回溯、不能重新组织数据结构，只能沿着编译期铺好的轨道往前走。
+
+这种分工不是实现偏好，而是被使用场景逼出来的。DPI 场景里，一份数据库可能被加载到几十个进程、几百个线程，每秒处理数十 GB 流量；如果运行期还要做模式分析，成本会被放大无数倍。反过来，编译只发生一次，哪怕花三十秒也可以接受。于是 Hyperscan 把「智能」全部塞进编译期，把运行期压成「查表 + 推进状态 + 回调」三件事。
+
+由此产生一个重要的推论：运行期的行为几乎完全由编译期决定。扫描快不快，取决于 Rose 分解得好不好、字面量提取得多不多、引擎选得对不对；扫描占多少内存，取决于 `scratchStateSize`、`historyRequired`、`somLocationCount` 这些在编译期算出的常量；甚至某个模式能不能开 SOM，也是编译期就判定的。运行期没有「临场优化」的空间，只有「按既定路线执行」的自由。这也是为什么排查 Hyperscan 的性能问题，最终往往要回到编译期的模式和标志上。
+
+第二层内部还有一层「分派」。同一份 `.so` 要能在 SSE4.2 的老机器和 AVX-512 的新机器上都跑出接近峰值的性能，就不能只编译一份代码。Hyperscan 的做法是 fat runtime：为每个公开入口生成多份微架构实现，进程加载时根据 CPUID 选定一份，之后所有调用都走同一个函数指针。这一层对使用者透明，但它是理解「为什么同一份数据库在不同机器上吞吐差几倍」的关键。
+
+### 2. 核心概念
+
+**编译期四段**。第一段是解析：`src/parser/` 把 PCRE 语法文本变成组件树，节点类型包括 `ComponentSequence`、`ComponentAlternation`、`ComponentRepeat`、`ComponentAssertion`、`ComponentBackReference` 等。解析器同时负责 UTF-8 校验、UCP 语义、以及一部分「不支持构造」的拒绝。第二段是图构造：`src/nfagraph/` 把组件树转成 Glushkov 风格的 `NG` 图，并跑一系列化简 pass（等价类合并、冗余消除、组件划分、规模限制）。第三段是分解与选型：`src/rose/` 把图拆成 literal、anchored、floating、suffix 四类角色，决定哪些部分交给字面量前端、哪些交给 NFA、哪些交给 DFA，最终生成 `RoseEngine` 字节码。第四段是装配：`src/compiler/compiler.cpp` 把字节码包进 `hs_database`，写入平台信息与 HMAC。
+
+**运行期三段**。第一段是入口分派：`src/dispatcher.c` 用 ifunc 把 `hs_scan` 等符号绑定到当前 CPU 最优实现。第二段是通用校验与状态准备：`src/runtime.c` 校验数据库 magic/version、检查 scratch 是否够大、标记 scratch 占用、按模式选择块状态或流状态。第三段是 Rose 执行：按 `RoseEngine->runtimeImpl` 决定走「只跑浮动表」「只跑单个 outfix」还是完整程序，字面量前端产出候选，NFA/DFA 确认，最后通过回调上报。
+
+**三个运行期对象**。`hs_database` 是只读的编译产物，可跨线程共享、可序列化；`hs_scratch` 是可写的临时工作区，每线程一份，生命周期跨越单次或多次扫描；`hs_stream` 是流式模式下的持久状态，每个流一份，跨 `hs_scan_stream` 调用保留。三者的内存归属完全不同：数据库由 `hs_free_database` 释放，scratch 由 `hs_free_scratch` 释放，流由 `hs_close_stream` 释放。混用释放函数是集成阶段的经典错误。它们的差异可以整理成下表，这张表在后续 03 册的集成篇里会被反复引用。
+
+| 对象 | 归属与来源 | 生命周期 | 释放方式 | 并发语义 |
+|---|---|---|---|---|
+| `hs_database` | 编译或反序列化产出 | 从加载到进程退出或显式释放 | `hs_free_database` | 只读，多线程共享安全 |
+| `hs_scratch` | `hs_alloc_scratch` 分配 | 可跨多次扫描复用 | `hs_free_scratch` | 非线程安全，每线程一份 |
+| `hs_stream` | `hs_open_stream` 分配 | 跨多次 `hs_scan_stream` | `hs_close_stream` | 单流单线程，分叉用 `hs_copy_stream` |
+| `hs_compile_error_t` | 编译失败时由库分配 | 调用方读完即释放 | `hs_free_compile_error` | 仅错误路径，不跨线程 |
+
+表里最容易看错的是第一行与第二行：数据库「只读共享」与 scratch「可写私有」是一对绑定关系，正因为编译产物不可变，才能被所有线程同时读；也正因为 scratch 可写，才必须一人一份。把这两条当成一条规则记，比分别记忆更不容易出错。
+
+**fat runtime**。构建时若 `FAT_RUNTIME` 为 ON（release 构建默认），每个入口会生成 `avx512vbmi_`、`avx512_`、`avx2_`、`corei7_`、`core2_` 五份实现和一个 `error_` 兜底。解析函数按 AVX-512 VBMI → AVX-512 → AVX2 → SSE4.2+POPCNT → SSSE3 的顺序探测，全不满足则返回 `HS_ARCH_ERROR`。`BUILD_AVX512`、`BUILD_AVX512VBMI` 控制是否把对应实现编进去（默认 OFF，属实验特性），关闭 fat runtime 则只有一份针对构建目标特性的实现。
+
+**Chimera 的位置**。Chimera 不在 Hyperscan 的两层之内，而是骑在两层之上：编译期它同时产出 Hyperscan 数据库与 PCRE 程序；运行期它先走 Hyperscan 的扫描路径，命中后再调用 PCRE。所以 Chimera 的性能曲线是两层的叠加，理解 01-03 的两层结构是理解 06-14 的前提。
+
+### 3. 关键数据结构与源码位置
+
+编译期的中间表示有三个关键类型。组件树节点在 `src/parser/Component.h`，基类 `Component` 提供 `first()`、`last()`、`minWidth()`、`maxWidth()` 等接口，子类各自实现语义。图结构在 `src/nfagraph/ng.h`，`NG` 持有顶点与边容器，`NFAVertex` 带 `char_reach`（字符可达集）、`reports`（报告 ID 集合）、`asserts`（断言标记），`NFAEdge` 带 `assert_flags`。构建器接口在 `src/nfagraph/ng_builder.h`，`GlushkovBuildState` 负责把位置集合连成图。
+
+Rose 侧的接口在 `src/rose/rose_build.h`。`class RoseBuild` 是一组纯虚函数：`add(anchored, eod, lit, ids)` 加入字面量，`addRose(ig, prefilter)` 加入一整张子图，`addSombeRose` 处理需要 SOM 的子图，`addOutfix` 加入 outfix，`addAnchoredAcyclic` 尝试把无环图放进锚定表，`buildRose(minWidth)` 产出运行时实现。工厂是 `makeRoseBuilder(...)`，它接收 `ReportManager`、`SomSlotManager`、`SmallWriteBuild`、`CompileContext` 与边界报告。这套接口的设计意图很明确：编译器的其余部分不需要知道引擎细节，只需要把图「喂」给 Rose，由 Rose 决定怎么落地。
+
+运行期的字节码布局在 `src/rose/rose_internal.h`。`struct RoseEngine` 开头是 `pureLiteral`、`noFloatingRoots`、`requiresEodCheck`、`hasOutfixesInSmallBlock`、`runtimeImpl`、`mpvTriggeredByLeaf`、`canExhaust`、`hasSom`、`somHorizon` 九个字节级标记，随后是 `mode`、`historyRequired` 与各类计数，再往后是大量 `*Offset` 字段指向子表。运行时读这份结构的顺序，基本就是「先看标记选路径，再按偏移找表」。
+
+分派层的代码在 `src/dispatcher.c`，核心是 `CREATE_DISPATCH` 宏。它先声明五份实现的原型，再定义 `error_` 版本，再定义 `resolve_` 版本按 CPU 特性返回函数指针，最后用 `__attribute__((ifunc("resolve_" #NAME)))` 把公开符号绑定过去。这段宏是整个 fat runtime 的心脏，也是「为什么 Hyperscan 的函数地址在进程内是固定的、但实现因机器而异」的答案（原理见 06-13 ｜ 模块见 07-10）。
+
+### 4. 关键流程与调用链
+
+编译链路的完整路径如下。`hs_compile`（`src/hs.cpp:436`）做空指针检查后转调 `hs_compile_multi_int`；后者与 `hs_compile_multi`、`hs_compile_ext_multi`、`hs_compile_lit_multi` 共用同一套工厂。工厂先校验标志：未识别位直接抛 `CompileError`，`SINGLEMATCH` 与 `SOM_LEFTMOST` 组合抛错，`PREFILTER` 与 `SOM_LEFTMOST` 组合抛错，`QUIET` 与 `SOM_LEFTMOST` 组合抛错。然后对每条表达式调用 `parse()` 得到组件树，`addExpression` 把树接入 `NG`，图级 pass 依次运行，`generateRoseEngine` 调 `RoseBuild` 完成分解与字节码生成，最后 `build()`（`src/compiler/compiler.cpp:622`）写入 `pureLiteral` 标志、取平台、调 `dbCreate` 拼装头部与 HMAC。
+
+这条链路上有三个「失败闸门」。解析期拒绝语法错误与不支持的构造；图构造期拒绝规模超限（典型报错是 "Pattern too large"）；Rose 期拒绝无法落地的组合（例如开 SOM 后某些有界重复）。三者最终都变成 `HS_COMPILER_ERROR` 加一个 `hs_compile_error_t`，`message` 给人看，`expression` 指出哪条模式。把这三个闸门记住，排障时就能快速判断「是写法问题、规模问题还是标志问题」。
+
+扫描链路的路径是：`hs_scan`（ifunc 解析后的实现）→ `runtime.c` 的通用入口 → 校验数据库与 scratch → `roseExec` 或等价的 Rose 执行函数 → 字面量前端 → 候选队列 → NFA/DFA 确认 → 回调。流式路径多一步：`hs_open_stream` 时按 `historyRequired` 分配流状态，`hs_scan_stream` 每次把新数据接在历史之后，`hs_close_stream` 触发 EOD 相关匹配并释放状态。
+
+编译期与运行期的衔接点，可以用一张图概括：正则文本经过四段处理变成不可变数据库，数据库在运行时被加载、校验、执行。图 01-03-01 画出了这条链路与两个失败出口。
+
+:::figure id=01-03-01 | name=编译期流水线与失败闸门 | dir=TD
+node n1 "正则文本 + 标志 + 模式" blue
+node n2 "parser：组件树" teal
+node n3 "nfagraph：Glushkov 图" teal
+node n4 "rose：分解与引擎选型" purple
+node n5 "RoseEngine 字节码" amber
+node n6 "hs_database（不可变）" amber
+node n7 "hs_compile_error_t" red
+edge n1 -> n2 "语法解析"
+edge n2 -> n3 "图构造"
+edge n3 -> n4 "角色划分"
+edge n4 -> n5 "生成字节码"
+edge n5 -> n6 "装配头部"
+edge n2 -> n7 "语法或不支持"
+edge n4 -> n7 "资源或标志冲突"
+:::
+
+图 01-03-01 中两个红色出口对应两类完全不同的修法：从 parser 出来的错误要改模式写法，从 rose 出来的错误要改规模或标志。混为一谈会导致「反复重写正则却始终编译不过」。
+
+运行期的分派则是另一个形状：一个入口，五条实现，一个兜底。图 01-03-02 画出了 ifunc 的选择顺序与最终汇合点。
+
+:::figure id=01-03-02 | name=运行期 ifunc 分派与实现选择 | dir=TD
+node n1 "hs_scan / hs_scan_stream" green
+node n2 "dispatcher 的 resolve_ 函数" gray
+node n3 "avx512vbmi_ 实现" purple
+node n4 "avx2_ 实现" purple
+node n5 "corei7_（SSE4.2）" purple
+node n6 "core2_（SSSE3）" purple
+node n7 "error_ 兜底" red
+node n8 "RoseEngine 执行" amber
+edge n1 -> n2 "首次调用绑定"
+edge n2 -> n3 "VBMI 可用"
+edge n2 -> n4 "AVX2 可用"
+edge n2 -> n5 "SSE4.2 + POPCNT"
+edge n2 -> n6 "仅 SSSE3"
+edge n2 -> n7 "全不满足"
+edge n3 -> n8 "进入运行时"
+edge n4 -> n8 "进入运行时"
+edge n5 -> n8 "进入运行时"
+edge n6 -> n8 "进入运行时"
+:::
+
+图 01-03-02 的读法是「n7 是一条死路」：一旦落到 `error_`，任何扫描调用都只返回 `HS_ARCH_ERROR`，不会退化到解释执行。这也是为什么在不支持 SSSE3 的平台上，Hyperscan 是「完全不可用」而不是「变慢」。
+
+### 5. 配置/命令/代码实例
+
+检验两层是否对齐，最直接的办法是打印数据库的自描述信息。`hs_database_info` 返回的字符串包含版本、编译目标特性与扫描模式，正好对应编译期写入头部的三个字段。
+
+```c
+#include <hs.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void)
+{
+    hs_database_t *db = NULL;
+    hs_compile_error_t *err = NULL;
+    char *info = NULL;
+
+    if (hs_compile("abc[0-9]{4}", 0, HS_MODE_BLOCK, NULL, &db, &err)
+        != HS_SUCCESS) {
+        fprintf(stderr, "compile: %s\n", err->message);
+        hs_free_compile_error(err);
+        return 1;
+    }
+    if (hs_database_info(db, &info) == HS_SUCCESS) {
+        printf("%s\n", info);
+        free(info); /* 该缓冲区由库分配，需用 free 释放 */
+    }
+    hs_free_database(db);
+    return 0;
+}
+```
+
+在一台支持 AVX2 的机器上，典型输出是一行以 `Version:` 开头的描述：
+
+```text
+Version: 5.4.2 Features: AVX2 Mode: BLOCK
+```
+
+示例输出，具体格式需对照实际版本核验。逐项判读：`Version: 5.4.2` 来自数据库头部的 `version` 字段，它是 `HS_VERSION_32BIT` 的人类可读展开，与编译时头文件版本一致；如果这里显示 5.3.x 而你以为是 5.4.2，说明链接到了旧库或加载了旧数据库。`Features: AVX2` 描述的是编译目标平台特性，不是当前 CPU 特性；把在 AVX2 目标上编译的数据库拿到只支持 SSE4.2 的机器上加载，会得到 `HS_DB_PLATFORM_ERROR`，而不是自动降级。`Mode: BLOCK` 对应 `HS_MODE_BLOCK`，若你的代码用 `hs_open_stream` 打开它，会得到 `HS_DB_MODE_ERROR`。最后，这行字符串是排查「数据库与代码不匹配」的第一手证据，生产环境应把它写进启动日志。
+
+编译期一侧，构建时观察 CMake 的配置输出也能确认 fat runtime 是否生效。默认 release 构建下应看到 fat runtime 相关的探测结果；若编译器不支持 ifunc 或生成器不是 Makefiles/Ninja，CMake 会打印「cannot build fat runtime」并关闭该选项。
+
+```bash
+mkdir -p build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON ../
+make -j"$(nproc)"
+```
+
+配置阶段的输出会逐条列出依赖探测结果，示例输出，具体格式需对照实际版本核验。判读要点是：`FAT_RUNTIME` 最终值应为 ON；`RAGEL` 必须找到 6.9；`Boost` 头文件路径必须有效；`OPENSSL` 必须找到 libcrypto（数据库 HMAC 依赖它，缺失会直接失败）；`PCRE` 只在构建 Chimera 时需要。这些变量与依赖的完整清单属 04-01 与 02-01 的范围，本节不重复。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**不要跨层思考。** 最常见的架构误解，是希望运行期「聪明一点」：比如让 `hs_scan` 根据输入自动调整引擎，或者让同一个数据库同时支持 block 与 stream。这两件事在 Hyperscan 里都不存在，因为引擎选型与模式在编译期就固化了。正确的做法是在编译期把需求想清楚，用不同的数据库服务不同的场景。
+
+**不要把 `Features` 当成运行时能力。** `hs_database_info` 里的 Features 是编译目标，不是当前 CPU。fat runtime 解决的是「实现选择」，不解决「数据库平台兼容」。数据库跨机分发时必须保证目标机的特性集合是编译目标的超集，否则 `hs_deserialize_database` 会返回 `HS_DB_PLATFORM_ERROR`。这条约束在容器化部署里尤其容易踩：构建镜像的 CI 机器支持 AVX-512，运行节点只支持 AVX2。
+
+**不要忽略 ifunc 的加载期成本与限制。** ifunc 解析发生在动态链接阶段，进程启动时完成一次，之后调用是间接跳转，成本可忽略。但它要求工具链支持 `ifunc` 属性，且在某些静态链接或特殊加载器场景下不可用；这也是 CMake 在探测失败时直接关闭 fat runtime 的原因。关闭之后，库只包含针对构建目标的一份实现，部署时必须保证所有节点的 CPU 特性一致。
+
+**不要把 scratch 的容量判断放在运行期循环里。** `hs_alloc_scratch` 可以反复调用以扩容，但它是慢路径；正确做法是启动时对所有要用的数据库各调一次，拿到足够大的 scratch 后再进入扫描循环。运行期反复扩容不仅慢，还会在多线程场景下引发释放与重建的竞态。
+
+**不要忘记流的生命周期。** 流状态在 `hs_open_stream` 时分配，在 `hs_close_stream` 时释放，中间可以用 `hs_reset_stream` 复用、用 `hs_copy_stream` 分叉。忘记关闭会泄漏；关闭后继续用是未定义行为；把流句柄跨线程传递而不加同步，则会破坏状态一致性。
+
+**不要把 Chimera 当成「第三层」。** 有读者看到 `ch_compile`、`ch_scan` 就以为它是 Hyperscan 之上再加一层通用能力。实际上 Chimera 只是把「Hyperscan 数据库 + PCRE 程序」打包成一个新对象，运行期仍然复用 Hyperscan 的分派与扫描路径，只是多了确认段。它不改变编译期四段的结构，也不提供新的自动机；把它理解为「带 PCRE 后处理的外壳」更准确。这决定了它的性能上限仍由 Hyperscan 前端决定，下限由命中率与 PCRE 模式复杂度决定。
+
+### 7. 小结与延伸阅读
+
+Hyperscan 的架构可以压缩成一句话：编译期把所有智能用光，运行期只做分派与执行。编译期四段（parser、nfagraph、rose、compiler）把正则文本变成不可变字节码，运行期三段（dispatcher、runtime、rose exec）把字节码变成匹配事件。三个对象（database、scratch、stream）分别承担只读共享、线程私有、流私有三种职责，fat runtime 则在加载时把公开符号绑定到当前 CPU 的最优实现。
+
+这套架构的优点是边界清晰、成本可预测；代价是灵活性差、编译昂贵、平台敏感。理解这一点，后续读 06 册的编译流水线细节、07 册的模块划分、03 册的集成方式时，就不会把「运行期行为」和「编译期决策」混在一起。
+
+延伸阅读：`doc/dev-reference/intro.rst` 的 Compilation 与 Scanning 两节；`src/compiler/compiler.cpp` 的 `build()`；`src/rose/rose_build.h` 的 `RoseBuild` 接口；`src/dispatcher.c` 的 `CREATE_DISPATCH` 宏；06-01（编译流水线总览）、06-13（fat runtime）、07-03（compiler 模块）、07-10（runtime/dispatcher/database 模块）。参数与变量见 04-01、04-03，字段见 05-02、05-05（参数见 04-03 ｜ 字段见 05-05 ｜ 原理见 06-01 ｜ 模块见 07-03）。
+
+## 01-04 版本基准、许可、生态与资料使用约定
+
+### 1. 背景与动机
+
+Hyperscan 的版本问题比一般库更棘手，因为它同时存在四种「版本」：源码版本号、数据库内部版本号、共享库 ABI 版本号、以及发行渠道版本（开源版与 Intel 商业版）。四者不一致时，症状各不相同：源码版本不符可能只是编译告警，数据库版本不符会得到 `HS_DB_VERSION_ERROR`，ABI 版本不符会在链接或运行时报符号错误，渠道版本不符则可能表现为「文档里有的功能这里没有」。如果不在资料开头把这些关系讲清楚，后续每一篇都要重复解释。
+
+本项目把版本基准钉在 5.4.2，理由有三。第一，它是上游 master 快照中 `CMakeLists.txt` 的当前值（`HS_MAJOR_VERSION 5`、`HS_MINOR_VERSION 4`、`HS_PATCH_VERSION 2`），也是 `CHANGELOG.md` 的最新条目（2023-04-19），有唯一可核对的锚点。第二，5.4 系列引入了 Sheng32、Sheng64、McSheng64 与 Fat Teddy 的 VBMI 优化，这些是理解现代 Hyperscan 性能特征的前提；5.3 及更早的资料会缺失这一整块。第三，5.4.2 回退了 5.4.1 中针对 scratch 的快速校验改动，这个回退直接影响多数据库场景的正确用法，是必须写进资料的行为差异。
+
+许可与生态同样不能略过。Hyperscan 采用 BSD 许可，允许闭源分发与商业集成，这对把它嵌进网络设备、安全产品的团队是关键前提；但 BSD 也要求保留版权声明与免责条款，实际落地时需要在产品的第三方声明里体现。Intel 另外维护一个功能更强的商业版本，开源版与它在引擎覆盖、平台支持、工具链上并不完全等同；Vectorscan 则是社区为 ARM 等平台做的分支，API 兼容但引擎矩阵不同。三者混谈是本套资料最容易出现的事实错误。
+
+最后一类动机是「资料自身的约定」。65 篇文档、9 个分册，如果没有统一的编号、去重与交叉引用规则，读者会在不同册里看到互相矛盾或大量重复的内容。因此本套资料明确了唯一权威源：参数与 API 归 04，字段归 05，机制归 06，模块归 07，其余册只做交叉引用。本节把这些约定显式写出，作为后续阅读的「使用说明书」。
+
+### 2. 核心概念
+
+**源码版本三元组**。`CMakeLists.txt` 顶部的 `HS_MAJOR_VERSION`、`HS_MINOR_VERSION`、`HS_PATCH_VERSION` 拼成 `HS_VERSION`，同时用于生成 `hs_version.h` 中的 `HS_VERSION_STRING` 与 `HS_VERSION_32BIT`。后者是一个 32 位整数：主版本左移 24、次版本左移 16、修订号左移 8，最低字节为 0。这个整数就是数据库头部的 `version` 字段，也是 `HS_DB_VERSION` 的取值。换句话说，数据库版本与源码版本是同一个数，只是表示形式不同。
+
+**ABI 版本**。`LIB_SOVERSION` 取主版本号（当前为 5），因此共享库文件名是 `libhs.so.5`。这意味着 5.x 系列内部承诺 ABI 兼容，4.x 与 5.x 之间不承诺。升级时必须同时替换头文件与库，不能只换其一。
+
+**数据库版本校验**。`src/database.h` 的 `validDatabase()` 只做两件廉价检查：`magic` 是否等于 `HS_DB_MAGIC`（默认 `0xdbdbdbdb`），`version` 是否等于 `HS_DB_VERSION`。前者防止把任意内存当数据库，后者防止跨版本加载。更完整的校验（长度、平台、模式、HMAC）在 `dbIsValid()` 与反序列化路径里完成，分别对应 `HS_DB_VERSION_ERROR`、`HS_DB_PLATFORM_ERROR`、`HS_DB_MODE_ERROR` 与 HMAC 失败。
+
+把这四种「版本」与它们各自的校验点并列，能看清为什么必须分开讨论。下表按「载体 → 校验点 → 失败表现」组织。
+
+| 版本类型 | 载体 | 校验发生的位置 | 不匹配时的表现 |
+|---|---|---|---|
+| 源码版本 | `CMakeLists.txt` 的 `HS_VERSION`、`hs_version.h` | 编译期与启动自检 | 头文件与库不一致，符号缺失或行为异常 |
+| 数据库版本 | `hs_database.version`（即 `HS_VERSION_32BIT`） | `validDatabase()` 与反序列化 | `HS_DB_VERSION_ERROR` |
+| ABI 版本 | `libhs.so.5`（`LIB_SOVERSION` 取主版本） | 动态链接器加载 | 加载失败或 `undefined symbol` |
+| 平台特性 | `hs_database.platform` | `dbIsValid()` 与反序列化 | `HS_DB_PLATFORM_ERROR` |
+| 扫描模式 | `RoseEngine.mode` | 扫描入口与流打开 | `HS_DB_MODE_ERROR` |
+
+这张表的价值在于「对症」：看到 `HS_DB_VERSION_ERROR` 就去查数据库编译时的源码版本，看到 `HS_DB_PLATFORM_ERROR` 就去查构建目标特性与运行节点 CPU，看到 `undefined symbol` 就去查 soname 与头文件路径。三类错误长得像，根因完全不同。
+
+**5.4 系列的关键变更**。5.4.0（2020-12-31）引入三个基于 shuffle 的 DFA 引擎 Sheng32、Sheng64、McSheng64，改进 Fat Teddy 对 AVX-512 VBMI 的支持，改进 LimEx NFA 的异常状态处理与 lookaround 性能，并优化 DFA 状态空间与 NFA/DFA 生成决策。5.4.1（2023-02-20）是 bugfix 版本，修了十余个 issue，包括 UTF-8 字符值、`hs_expression_info()` 的逻辑组合标志、纯字面量 API 的空串检查、DFA 构造断言、对齐分配器段错误、scratch 快速校验、glibc 2.34 栈大小、Chimera 的 SKIP 标志等。5.4.2（2023-04-19）只有两条：回退 scratch 快速校验（issue #350），以及修复 `hsdump` 因非法 NFA 类型导致的崩溃。
+
+**BSD 许可**。三条款 BSD：保留版权声明、保留条件列表、不得用 Intel 或其贡献者名义为衍生产品背书。它不要求开源衍生作品，也不提供专利授权条款（这一点与 Apache-2.0 不同），商业集成前应做一次法务确认。仓库里 `LICENSE` 与 `COPYING` 两份文件都在，正文以 `LICENSE` 为准。
+
+**开源版、商业版与 Vectorscan**。开源版是 Intel 在 GitHub 上维护的版本，功能完整但平台聚焦 x86；商业版通过 Intel 销售渠道提供，宣称有额外功能与支持，具体差异需以商务合同与技术文档为准，本套资料不据此做技术断言。Vectorscan 是社区分支，目标平台包括 ARM AArch64，API 与上游兼容，但引擎实现、可选编译特性、性能数字都不同。三者关系不是「新旧」而是「同源分叉」，引用时必须标明来源。
+
+**资料使用约定**。编号规则是「文件号-篇号」，图号是「文件号-篇号-图序号」；每篇按三类骨架之一组织（A 论述、B 手册、C 实战）；参数、字段、机制、模块各有唯一权威源；跨册引用统一写成「参数见 04-xx ｜ 字段见 05-xx ｜ 原理见 06-xx ｜ 模块见 07-xx」。凡源码中无法直接确认的字段名、签名、默认值，一律写「需对照实际版本核验」并给出可定位的文件路径，不用推测填充。
+
+### 3. 关键数据结构与源码位置
+
+版本信息的源头在 `CMakeLists.txt` 第 4 至 7 行：三个 `set` 定义主次修订号并拼出 `HS_VERSION`。第 1191 至 1192 行把 `LIB_VERSION` 设为 `HS_VERSION`、`LIB_SOVERSION` 设为主版本号，供 `set_target_properties` 生成 `libhs.so.5.4.2` 与 `libhs.so.5` 两个名字。`src/hs_version.h.in` 是模板，`@HS_VERSION@` 与 `@BUILD_DATE@` 在配置阶段被替换，生成 `HS_VERSION_STRING`；`HS_VERSION_32BIT` 由三个版本号移位拼成。
+
+数据库侧的版本字段在 `src/database.h`：`struct hs_database` 的 `version` 是 `u32`，`HS_DB_VERSION` 定义为 `HS_VERSION_32BIT`。同一文件的 `validDatabase()` 是版本校验的最短路径，`dbIsValid()` 是完整路径。`src/db_protect.c` 负责 HMAC 计算与只读保护，`src/hs_db_hmac_key.h` 内置 32 字节 `HS_DB_HMAC_KEY`，可在构建期用 `-DHS_DB_HMAC_KEY_OVERRIDE` 替换。这意味着「同一份数据库能否在另一台机器加载」不只取决于版本与平台，还取决于 HMAC 密钥是否一致。
+
+变更历史在 `CHANGELOG.md`，按版本倒序排列，每条以 `## [x.y.z] date` 开头。它是判断「某个行为是哪版引入/回退」的唯一权威来源，比翻 git log 更快。许可文本在 `LICENSE` 与 `COPYING`，构建系统在 `CMakeLists.txt` 与 `cmake/` 目录，文档基线在 `doc/dev-reference/`。
+
+生态侧没有代码，只有约定：`README.md` 说明项目定位、版本策略（master 永远是最近发布版，develop 是下一版开发线）、邮件列表与 issue 渠道；`doc/dev-reference/getting_started.rst` 给出依赖与构建步骤；`doc/dev-reference/api_files.rst` 列出公开头文件。这些文件共同构成「这个项目怎么用、怎么参与、怎么引用」的边界。
+
+### 4. 关键流程与调用链
+
+版本信息进入运行时有两条路径。第一条是编译期：`cmake` 读取 `CMakeLists.txt` 的三个版本号，生成 `hs_version.h`，编译进 `libhs`；同时 `dbCreate()` 在创建数据库时把 `HS_VERSION_32BIT` 写入 `hs_database.version`。第二条是加载期：`hs_deserialize_database` 先解码头部，比较 `magic`、`version`、`platform`、`mode`，再校验 HMAC，全部通过才返回可用的 `hs_database_t`。两条路径的交汇点就是那个 32 位整数。
+
+升级流程因此可以写成一条清晰的检查链。第一步，确认头文件与库来自同一版本：`hs_version.h` 的 `HS_VERSION_STRING` 应与 `hs_database_info` 输出的 `Version:` 一致。第二步，确认 ABI：`ldd` 看到的 `libhs.so.5` 与编译时链接的 soname 一致。第三步，确认数据库：旧版本编译的数据库在新库上加载会得到 `HS_DB_VERSION_ERROR`，必须重新编译或保留旧库。第四步，确认平台：跨机分发时 `HS_DB_PLATFORM_ERROR` 表示目标机特性不足。第五步，确认 HMAC：密钥被覆盖过而加载端没有对应密钥时，校验失败。
+
+生态层面的流程则是「选择渠道 → 确认许可 → 确认平台 → 确认支持周期」。开源版适合自主可控、能自行排障的团队；商业版适合需要厂商支持与额外功能的场景；Vectorscan 适合非 x86 平台。三者不是互斥的代码库，而是同一份设计的不同落地，选型时要连同「谁来维护、出问题找谁」一起考虑。
+
+### 5. 配置/命令/代码实例
+
+最轻量的版本核验方式是在构建目录里看配置结果。下面的命令只做配置与构建，不安装，适合在 CI 中作为「版本自检」步骤。
+
+```bash
+mkdir -p build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release ../
+grep -E "HS_VERSION|LIB_SOVERSION" CMakeCache.txt
+```
+
+第二行会打印出配置阶段写入缓存的值，典型结果如下。
+
+```text
+HS_VERSION:UNINITIALIZED=5.4.2
+LIB_SOVERSION:UNINITIALIZED=5
+```
+
+示例输出，具体格式需对照实际版本核验。判读要点：`HS_VERSION` 必须是三段式，若显示为空或 `5.4`，说明 `CMakeLists.txt` 被改动过或用了不完整的源码包；`LIB_SOVERSION` 应等于主版本号 5，若为 4 则说明拿到的是 4.x 源码，后续所有关于 Sheng、McSheng 的描述都不适用。这两个值也是打包脚本生成文件名、`pkg-config` 的 `Version:` 字段、以及依赖声明的依据；把它们写进构建日志，可以在出问题时快速排除「版本拿错」这一大类原因。
+
+第二个例子是运行期的版本自证。`hs_database_info` 的输出已经在上文出现过，这里补充一个更严格的用法：在服务启动时把 `HS_VERSION_STRING`、`hs_database_info` 的结果、`hs_scratch_size` 的返回值一起打印，形成一条「启动指纹」。
+
+```c
+printf("lib=%s\n", HS_VERSION_STRING);
+printf("db=%s\n", info);
+printf("scratch=%zu\n", scratch_size);
+```
+
+对应的典型输出形如：
+
+```text
+lib=5.4.2 2023-04-19
+db=Version: 5.4.2 Features: AVX2 Mode: BLOCK
+scratch=184320
+```
+
+示例输出，具体格式需对照实际版本核验；`HS_VERSION_STRING` 的具体构成（版本号后是否带构建日期、日期格式）由 `hs_version.h.in` 的模板决定，不同构建方式可能不同。判读时先比 `lib` 与 `db` 的版本段是否一致，不一致说明库与数据库来自不同版本；再看 `Features` 是否被当前 CPU 支持；最后看 `scratch` 是否在预期量级（数百 KB 属于常见范围，若达到数十 MB 说明规则集或 SOM 开销异常，应回到 08-02 的调优清单）。这条指纹写入日志后，线上任何一个节点出问题，都能先排除版本与平台两类原因。
+
+### 6. 注意事项、陷阱与最佳实践
+
+**头文件与库不同版本，是最隐蔽的故障源。** 头文件里的 `HS_FLAG_*`、结构体布局、API 签名与库实现必须严格对应。系统里同时存在 `/usr/include/hs` 与自编译版本时，编译器可能用旧头文件、链接器却找到新库，结果是「编译通过、运行崩溃」或「标志位被忽略」。解决办法是编译时显式 `-I` 指向目标版本头文件、链接时显式 `-L` 与 `-Wl,-rpath`，并在启动日志里打印 `HS_VERSION_STRING`。
+
+**数据库不能跨大版本复用。** 5.4.2 编译的数据库拿到 5.3 的库上加载会得到 `HS_DB_VERSION_ERROR`；反过来也一样。生产环境升级库时，必须把「重新编译数据库」列为升级步骤，而不是假设旧库能直接读。若采用「编译一次、分发多节点」的架构，升级期间需要并行保留新旧两套数据库与两套库，按节点灰度切换。
+
+**HMAC 密钥是可构建期替换的。** `src/hs_db_hmac_key.h` 的默认密钥是公开的，任何能构造数据库的人都能生成通过校验的库。如果数据库来源不完全可信（例如从网络下发），应在构建期用 `-DHS_DB_HMAC_KEY_OVERRIDE` 换成私有密钥，并保证分发端与加载端一致。密钥不一致的表现是反序列化失败，而不是「能加载但匹配错误」，这一点在排障时要分清。
+
+**BSD 不是「随便用」。** 它要求保留版权声明、条件列表与免责声明，产品若以二进制形式分发，需在第三方声明中包含这些内容；以源码形式分发，需在源码中保留。它也不含专利授权条款，涉及专利敏感场景应单独评估。不要把它与 Apache-2.0 或 MIT 混为一谈。
+
+**不要把 Vectorscan 的结论写成上游结论。** 二者 API 兼容，但引擎实现、编译选项、平台支持矩阵不同。写「Hyperscan 在 ARM 上吞吐为 X」这种句子时，实际主语往往是 Vectorscan，必须显式区分。同理，商业版的功能也不能默认开源版具备。
+
+**遵守资料自身的引用约定。** 本套资料的参数、字段、机制、模块各有唯一权威源。在 01 册里看到 `HS_FLAG_*` 的位值时，应意识到完整语义在 04-02；看到 `hs_scratch` 字段名时，完整字段表在 05-03。把交叉引用当成「可选的链接」而不是「补充说明」，是保持 65 篇不重复、不矛盾的前提。
+
+### 7. 小结与延伸阅读
+
+版本、许可、生态三件事看似外围，实际决定了资料能不能被信任。版本锚点让「函数名、常量、行为」有唯一出处；许可决定了能不能把它嵌进产品；生态决定了遇到平台或支持问题时该找谁。本套资料选择 5.4.2 作为基准，是因为它有源码与 CHANGELOG 双重锚点，且 5.4 系列奠定了现代引擎格局。
+
+使用约定同样重要：遇到参数查 04，遇到字段查 05，遇到机制查 06，遇到模块查 07；01 册只负责建立全局印象与边界意识。凡是源码中无法确认的细节，资料会写「需对照实际版本核验」并给出路径，这比给出一个看似确定但错误的答案更有价值。
+
+图 01-04-01 把版本基准与生态分支的关系做了一个收束：上游 5.4.2 是根，开源版、商业版、Vectorscan、Chimera 是同源的不同落地，本套资料以根为基准，分支只做标注。
+
+:::figure id=01-04-01 | name=版本基准与生态分支关系 | dir=TD
+node n1 "上游 master 5.4.2" blue
+node n2 "开源版（BSD）" teal
+node n3 "Intel 商业版" amber
+node n4 "Vectorscan 分支" purple
+node n5 "Chimera 5.4.2" green
+node n6 "本套资料基准" gray
+edge n1 -> n2 "BSD 许可"
+edge n1 -> n3 "商业增强"
+edge n1 -> n4 "平台分叉"
+edge n1 -> n5 "同版本附带"
+edge n1 -> n6 "版本锚点"
+edge n2 -> n6 "许可与源码依据"
+:::
+
+延伸阅读：`CHANGELOG.md` 的 5.4.0、5.4.1、5.4.2 三条；`CMakeLists.txt` 顶部版本定义与 `LIB_SOVERSION`；`src/hs_version.h.in`；`src/database.h` 的 `HS_DB_VERSION` 与 `validDatabase()`；`LICENSE`；`README.md` 的 Versioning 段；`doc/dev-reference/getting_started.rst` 的依赖矩阵。构建变量全集见 04-01，数据库字段见 05-02，序列化与版本校验原理见 06-12，升级与回滚流程见 08-06（参数见 04-01 ｜ 字段见 05-02 ｜ 原理见 06-12 ｜ 模块见 07-10）。

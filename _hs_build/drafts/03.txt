@@ -1,0 +1,1376 @@
+# Hyperscan 技术资料 · 03 集成与部署
+
+## 03-01 最小可用集成：编译一个数据库并扫描第一块数据
+
+### 1. 目标与拓扑
+
+本篇的目标非常具体：用一个不超过六十行的 C 程序，把一条正则编译成 Hyperscan 数据库，分配一块 scratch，扫描一段内存，拿到匹配回调，然后按相反顺序把三样东西全部释放。做完这一步，后面五篇的复杂度（链接形态、数据库分发、线程池、流式状态、Chimera）才有落脚点。如果这一步没有一次跑通，后面所有排错都会失去基准。
+
+需要先建立的一个认知是：Hyperscan 没有守护进程、没有配置文件、没有监听端口。它的「部署」完全等价于「把 libhs 链进宿主程序，并在宿主程序的线程模型里正确摆放三个对象」。这三个对象分别是 `hs_database_t`（不可变、编译产物、可跨线程共享、可序列化）、`hs_scratch_t`（可变、扫描工作区、非线程安全、每个并发调用者一份）、以及宿主提供的回调函数（在 `hs_scan` 内部同步调用）。三者的生命周期并不一致：数据库最长，scratch 次之，回调上下文完全由宿主管理。把这三条生命周期画在同一条时间轴上，就得到图 03-01-01。
+
+:::figure id=03-01-01 | name=最小集成链路的对象与调用顺序 | dir=LR
+node n1 "模式字符串 pattern" blue
+node n2 "hs_compile 编译" teal
+node n3 "hs_database_t 数据库" amber
+node n4 "hs_alloc_scratch" teal
+node n5 "hs_scratch_t 工作区" green
+node n6 "hs_scan 扫描缓冲区" green
+node n7 "match_event_handler" purple
+node n8 "hs_free_scratch" gray
+node n9 "hs_free_database" gray
+edge n1 -> n2 "输入"
+edge n2 -> n3 "成功返回 HS_SUCCESS"
+edge n3 -> n4 "按库定容"
+edge n4 -> n5 "容量足够"
+edge n3 -> n6 "库只读共享"
+edge n5 -> n6 "单线程独占"
+edge n6 -> n7 "命中即回调"
+edge n5 -> n8 "先释放工作区"
+edge n3 -> n9 "最后释放数据库"
+:::
+
+图 03-01-01 中有一条容易看漏的边：`hs_database_t` 直接连到 `hs_scan`，而 `hs_scratch_t` 也连到 `hs_scan`。这条双入边正是 Hyperscan 运行时模型的核心——数据库提供「匹配什么」，scratch 提供「在哪里记账」。数据库可以被任意多个线程同时读，scratch 不能。第 03-04 篇会把这条边展开成线程模型。
+
+还需要提前说清一条能力边界：默认情况下回调只拿到**匹配结束偏移**（`to`），`from` 在没有开启 `HS_FLAG_SOM_LEFTMOST` 时是 0，不代表起始位置。第一次跑通时若看到 `from=0`、`to=7`，不要误以为模式从 0 开始匹配。SOM 的语义、horizon 限制与互斥规则见 06-10，本篇只用默认行为。
+
+本篇刻意选择 block 模式（`HS_MODE_BLOCK`），原因是它没有流状态、没有跨块语义、没有 EOD 补报，出错面最小。流式接入放在 03-05，两者共用同一套编译与 scratch 逻辑，差别只在扫描入口。
+
+### 2. 前置条件与环境
+
+前置条件可以压到很低：一台能编译 C 的 Linux 主机、一份已经构建完成的 Hyperscan、一个可写的临时目录。构建本身不在本篇范围内，完整依赖矩阵与构建变体见 02-01 与 02-02；如果还没有库，先按 02-03 走一遍 `cmake` 与 `make`，产物会落在 `build/lib` 与 `build/bin`。
+
+环境检查按三步做，任何一步失败都不要往下走。第一步确认库文件存在，第二步确认头文件存在且是聚合头 `hs.h`，第三步确认 `pkg-config` 能取到编译参数。三项的检查方式与失败含义见下表。
+
+| 检查项 | 检查命令 | 期望结果 | 失败含义 |
+|---|---|---|---|
+| 库产物 | `ls build/lib/libhs.*` | 看到 `libhs.a` 或 `libhs.so` | 未构建或构建中断 |
+| 聚合头 | `ls build/../include/hs/hs.h` | 文件存在 | 头文件未安装或路径错 |
+| pkg-config | `pkg-config --cflags --libs libhs` | 输出 `-I.../hs -L... -lhs` | `.pc` 未安装或路径未导出 |
+| 编译器 | `gcc --version` | GCC 4.8.1 及以上 | 低于下限，C99 特性可能缺失 |
+
+表里第三行的 `libhs.pc` 由 `libhs.pc.in` 生成，内容包含 `Cflags: -I${includedir}/hs`，这解释了为什么源码里写的是 `#include <hs.h>` 而不是 `<hs/hs.h>`：安装时头文件被直接铺进 `include/hs` 目录，编译参数已经把该目录加进搜索路径。这一点在手工指定 `-I` 时最容易搞错，写成 `-I/usr/local/include` 就会找不到 `hs.h`。
+
+聚合头 `hs.h` 本身不定义任何符号，它只按顺序包含三个公开头：`hs_compile.h` 放编译 API 与编译标志，`hs_runtime.h` 放扫描、流、scratch API，`hs_common.h` 放数据库生命周期、序列化、分配器与错误码。理解这个拆分有实际价值：当编译报「某个类型未定义」时，先看是不是只包含了 `hs_runtime.h` 而漏了 `hs_compile.h`；当链接报「某个函数未定义」时，先确认该函数属于哪个头，再去查对应章节。三个头的职责划分与 04 册的分篇方式一致，04-04 对应编译、04-05 对应扫描、04-06 对应数据库与 scratch。
+
+安装前缀的选择也值得先说清。用 `/usr/local` 时头文件落在 `/usr/local/include/hs`，库落在 `/usr/local/lib`，多数发行版需要额外配置 `ldconfig` 才能在运行期找到 `.so`；用自定义前缀（如 `/opt/hs`）时三者都在同一棵树下，便于打包与卸载。本篇示例统一用自定义前缀，原因是它不污染系统目录，容器化时可以直接整目录拷贝。前缀只影响路径，不影响任何 API 行为。
+
+如果不想依赖 `pkg-config`，直接给路径同样可行：`-I<prefix>/include/hs -L<prefix>/lib -lhs`。本篇的示例统一给出两种写法，实际项目中建议固定一种，避免同一工程里两套路径各自漂移。
+
+还有一条环境层面的隐性要求：动态链接时运行期要能找到 `libhs.so`。源码树内直接运行需要 `LD_LIBRARY_PATH`，安装到系统目录后由 `ldconfig` 缓存接管，容器里则通常靠 RPATH 或同目录放置。这三种方式在 03-02 展开，本篇先用 `LD_LIBRARY_PATH` 把第一次跑通，不引入额外变量。
+
+### 3. 分步操作
+
+第一步，写源文件。下面这份 `demo.c` 是可直接编译的完整程序，包含编译、分配、扫描、释放四个阶段，并刻意保留了错误分支，便于观察失败路径。代码里没有省略行，所有分支都写了释放逻辑。
+
+```c
+#include <stdio.h>
+#include <string.h>
+#include <hs.h>
+
+static int on_match(unsigned int id, unsigned long long from,
+                    unsigned long long to, unsigned int flags, void *ctx) {
+    int *hits = (int *)ctx;
+    (void)from;
+    (void)flags;
+    (*hits)++;
+    printf("hit id=%u end=%llu\n", id, to);
+    return 0;
+}
+
+int main(void) {
+    const char *pattern = "ab+c";
+    const char *data = "xxabbbcyy abcyy";
+    hs_database_t *db = NULL;
+    hs_compile_error_t *err = NULL;
+    hs_scratch_t *scratch = NULL;
+    int hits = 0;
+
+    if (hs_compile(pattern, HS_FLAG_DOTALL, HS_MODE_BLOCK, NULL,
+                   &db, &err) != HS_SUCCESS) {
+        fprintf(stderr, "compile failed: %s\n", err->message);
+        hs_free_compile_error(err);
+        return 1;
+    }
+
+    if (hs_alloc_scratch(db, &scratch) != HS_SUCCESS) {
+        fprintf(stderr, "scratch alloc failed\n");
+        hs_free_database(db);
+        return 1;
+    }
+
+    hs_error_t rc = hs_scan(db, data, (unsigned int)strlen(data), 0,
+                            scratch, on_match, &hits);
+    printf("scan rc=%d hits=%d\n", rc, hits);
+
+    hs_free_scratch(scratch);
+    hs_free_database(db);
+    return rc == HS_SUCCESS ? 0 : 1;
+}
+```
+
+第二步，编译。库装在系统路径时用第一条命令；库还在构建目录时用第二条，把前缀换成自己的路径。两条命令的差别只有搜索路径，链接库名都是 `-lhs`。
+
+```bash
+gcc demo.c -o demo -lhs
+
+gcc demo.c -o demo \
+    -I"$HOME/hyperscan/include/hs" \
+    -L"$HOME/hyperscan/lib" -lhs
+
+export LD_LIBRARY_PATH="$HOME/hyperscan/lib:$LD_LIBRARY_PATH"
+./demo
+```
+
+第三步，运行并观察输出。程序会打印两条命中记录和一行汇总，最后一行是 `hs_scan` 的返回码。如果使用的是静态库，`LD_LIBRARY_PATH` 这一行可以省略，程序不依赖外部 `.so`。
+
+第四步，改一处再看一遍。把 `pattern` 换成 `ab?c`，重新编译运行，命中条数仍然是两条，但结束偏移不变——这验证了「`to` 是结束偏移」而不是「匹配长度」。再把 `pattern` 换成 `(ab)+c`，观察输出是否仍然只有两条：Hyperscan 对每个结束位置报告一次匹配，不会为同一结束位置的不同起点重复报告（除非开启 SOM，语义另见 06-10）。这种「改一处、看一次」的对照，比读十页文档更快建立直觉。
+
+第五步，把单模式换成多模式，确认 `id` 的作用。把 `hs_compile` 换成 `hs_compile_multi`，传入两个表达式、两个 flags、两个 id，回调里根据 `id` 分发。这一步是后面所有工程化集成的最小原型：真实系统里模式集永远是多条，`id` 就是模式与业务规则的唯一映射键。`hs_compile_multi` 的参数含义与错误处理细节见 04-04，本篇不重列。
+
+第六步，故意制造一次编译失败，观察错误对象。把 `pattern` 改成 `ab(c`，缺少右括号，重新编译运行。程序会进入失败分支并打印 `err->message`，随后调用 `hs_free_compile_error` 释放。这一步的目的不是学会写错正则，而是确认失败路径的三个事实：`hs_compile` 返回 `HS_COMPILER_ERROR`、`err` 指向可读消息、消息里带有出错位置或原因。把这三个事实记住，后面遇到任何模式问题都能第一时间定位到具体表达式，而不是在一堆模式里逐个猜。
+
+第七步，用 `hs_expression_info` 做编译前预检。这个 API 不产生数据库，只返回模式的最小宽度、最大宽度、是否可能匹配空串、是否只在末尾匹配等信息。对批量导入模式的系统，先跑一遍预检可以筛掉明显有问题的表达式，避免整批编译被一条坏模式拖垮。返回结构 `hs_expr_info_t` 的字段含义见 05-04，调用签名见 04-04。
+
+### 4. 验证方法与预期结果
+
+程序的完整输出如下。这段是示例输出，具体格式需对照实际版本核验；偏移值与命中数是确定的，`rc` 的取值由错误码定义决定。
+
+```text
+hit id=0 end=7
+hit id=0 end=13
+scan rc=0 hits=2
+```
+
+逐行判读如下。第一行 `hit id=0 end=7`：`id=0` 是单表达式编译时的固定标识，`hs_compile` 只编译一条模式，所以 id 恒为 0，只有用 `hs_compile_multi` 指定 ids 数组才会出现其他值；`end=7` 表示匹配在输入的第 7 个字节处结束，输入 `xxabbbcyy abcyy` 的下标 0 到 6 是 `xxabbbc`，下标 7 是第一个 `y`，由于结束偏移是「最后一个匹配字符的下标加一」，`abbbc` 占 2 到 6，结束偏移正好是 7。第二行 `end=13`：第二段 `abc` 从下标 10 开始、下标 12 结束，结束偏移 13，说明扫描是持续到缓冲区末尾的，不会在第一次命中后停下。第三行 `scan rc=0 hits=2`：`rc=0` 就是 `HS_SUCCESS`，表示扫描正常走完；`hits=2` 是宿主自己在回调里累加的计数，和库无关，用它可以交叉验证回调次数与预期一致。如果只看到一行命中，先怀疑模式写错而不是库有问题；如果 `rc` 是 `-3`，说明回调返回了非零值提前终止，检查回调里是否有 `return 1` 的分支。
+
+返回码的判读需要一个固定参照，本篇涉及的三个值见下表。完整错误码表见 04-08，这里只列最小集。
+
+| 返回值 | 数值 | 触发条件 | 本示例预期 |
+|---|---|---|---|
+| `HS_SUCCESS` | 0 | 扫描完整执行 | 是 |
+| `HS_SCAN_TERMINATED` | -3 | 回调返回非零 | 否 |
+| `HS_COMPILER_ERROR` | -4 | 模式非法或标志冲突 | 否 |
+| `HS_SCRATCH_IN_USE` | -10 | 同一 scratch 被并发使用 | 否 |
+
+除了看 stdout，还应该做两项独立验证。第一项是内存泄漏检查：用 `valgrind --leak-check=full ./demo` 跑一遍，正常情况下「definitely lost」应为 0 字节，因为数据库、scratch、编译错误结构都已按路径释放。如果出现 still reachable 且指向 `hs_compile` 内部，通常是 `err` 非空却没有调用 `hs_free_compile_error`——注意编译成功时 `err` 的值是未定义的，不能无条件释放，只能在失败分支里释放。第二项是模式可编译性预检：用 `hscheck` 单独验证模式，命令形如 `hscheck 'ab+c'`，返回成功说明语法没问题，可以把「模式错」从排错清单里划掉。工具参数见 04-07。
+
+判读还要区分「库报错」与「宿主逻辑错」。`hs_scan` 返回 0 但命中数为 0，几乎总是模式语义问题（大小写、锚点、`.` 是否跨行），而不是 API 用法问题；反过来，命中数正确但进程在退出时崩溃，几乎总是释放顺序或重复释放的问题。把这两类现象分开，排错效率会高一个数量级。
+
+偏移判读还有一个必须建立的坐标感：`to` 的取值范围是 1 到 `length`，最小不会是 0，因为空匹配在默认标志下不产生报告。若模式可能匹配空串（例如 `a*`），必须显式加 `HS_FLAG_ALLOWEMPTY` 才会产生零宽匹配，否则该模式对空串位置静默。这一点在写「可选前缀」类模式时经常踩到：模式本身合法，编译成功，扫描也返回成功，但空串位置永远没有回调。是否需要空匹配由业务决定，标志语义见 04-02。
+
+如果怀疑偏移算错，最直接的交叉验证是用外部工具对同一份数据做一次定位。命令 `grep -b -o 'ab+c' sample.txt` 会输出「字节偏移:匹配文本」，把它的偏移加上匹配长度，应当等于回调里的 `to`。注意 `grep` 的偏移是从 0 开始的行内字节位置，与 Hyperscan 的结束偏移口径不同，换算时不要直接比较数字，要比「匹配文本的最后一个字节下标加一」。这种交叉验证在数据含多字节字符时尤其有用，因为 Hyperscan 默认按字节扫描，UTF-8 模式下才按字符处理。
+
+### 5. 常见失败与排错
+
+第一次集成能遇到的失败高度集中，按现象归类后只有六种。下表给出「现象 → 根因 → 处置」的对应关系，处置列只写动作，参数细节查 04-04 与 04-08。
+
+| 现象 | 根因 | 处置 |
+|---|---|---|
+| `hs.h: No such file` | 头文件路径未加或加了上级目录 | 加 `-I<prefix>/include/hs` |
+| `undefined reference to hs_compile` | 未链接 `-lhs` 或库路径不对 | 补 `-lhs` 与 `-L`，确认库架构匹配 |
+| 编译失败且 message 提到标志 | 标志组合非法，如 SOM 与 SINGLEMATCH | 去掉其一，见 04-02 互斥表 |
+| 运行即段错误 | `scratch` 仍为 NULL 就调用扫描 | 检查 `hs_alloc_scratch` 返回值 |
+| 命中数为 0 | 模式语义与数据不符 | 先用 `hscheck` 验证，再查大小写与换行 |
+| 退出时段错误 | 重复释放或释放顺序错乱 | 每个指针只释放一次，先 scratch 后库 |
+
+第一类错误的迷惑性在于报错位置。`#include <hs.h>` 失败时编译器只说找不到文件，不会提示「你应该加 `/hs` 后缀」。判断方法很简单：`find <prefix> -name hs.h` 看真实路径，把该文件所在目录原样填进 `-I`。
+
+第二类错误常出现在交叉编译或 32/64 位混用场景。`undefined reference` 有两种成因：链接器根本没找到库，或者找到了但架构不匹配。前者补 `-L`，后者用 `file libhs.a` 确认目标架构。还有一种是 C++ 符号问题——`libhs` 的编译部分由 C++ 实现，静态链接时若用 `gcc` 驱动，可能缺少 `-lstdc++`，此时改用 `g++` 驱动或显式补链接项，具体依赖形态见 03-02。
+
+第三类错误值得单独强调：`HS_COMPILER_ERROR` 返回时 `err` 指针一定有效，且 `err->message` 是可读字符串，直接打印即可定位。但要注意 `err` 的所有权在调用方，必须 `hs_free_compile_error`，否则每次失败都泄漏一小块内存。反过来，成功时不要碰 `err`。
+
+第四类错误是最常见的「看起来像库崩溃」的情况：`hs_scan` 内部会通过 scratch 读写大量状态，scratch 为 NULL 时必然访问非法地址。防御性写法是把 `hs_alloc_scratch` 的返回值当硬性检查点，失败就直接退出，不要继续。
+
+第五类错误不是错误，是预期不符。典型例子是用 `^foo` 扫一段多行文本却只得到一行命中，因为默认 `.` 不跨行、`^` 只在缓冲区开头生效，需要 `HS_FLAG_MULTILINE`。这类问题用 `hscheck` 加小样本对照最快，不要在大流量上盲调。
+
+第六类错误只在退出路径上暴露，容易被忽略。规则只有一条：`hs_alloc_scratch` 拿到的指针归 `hs_free_scratch`，`hs_compile` 或 `hs_deserialize_database` 拿到的指针归 `hs_free_database`，`hs_deserialize_database_at` 写进用户内存的指针**不能**用 `hs_free_database` 释放。三者混用就是堆破坏。对象归属关系见 05-02 与 05-03。
+
+如果六类现象都对不上，用 AddressSanitizer 重编一次是最快的兜底手段。命令是在编译与链接时都加 `-fsanitize=address -g`，然后直接运行。ASAN 会在第一次非法访问时打印完整调用栈，把「退出时偶发崩溃」变成「确定的行号」。使用 ASAN 要注意两点：它与某些自定义分配器冲突，若宿主调用了 `hs_set_allocator`，先临时去掉；它会让内存占用成倍增长，大缓冲区扫描时可能触发 OOM，验证阶段用小样本即可。ASAN 报出的栈顶若在 `hs_scan` 内部，八成还是 scratch 或缓冲区长度问题，不要第一时间怀疑库。
+
+### 6. 小结
+
+本篇跑通的链路是 `hs_compile` → `hs_alloc_scratch` → `hs_scan` → `hs_free_scratch` / `hs_free_database`，四步加一次回调，构成了后面所有集成形态的最小骨架。三个判据要记住：`hs_scan` 返回 `HS_SUCCESS` 表示扫描完整走完；回调的 `to` 是结束偏移且默认 `from` 无意义；scratch 与数据库的释放顺序与分配顺序相反。
+
+这一篇还建立了两个后续会反复用到的判断习惯。第一，把「库返回码」与「业务命中数」分开看，前者判断 API 用法，后者判断模式语义。第二，把「编译期失败」与「运行期失败」分开看，前者一定带有 `hs_compile_error_t` 可读消息，后者通常体现为返回码或崩溃，两者的排查入口完全不同。
+
+下一步有三条自然延伸。需要把程序交付到别的机器，读 03-02 解决链接形态与运行期依赖；需要避免每次启动重编译，读 03-03 把数据库序列化后分发；需要多线程并发扫描，读 03-04 处理 scratch 的独占性。流式接入见 03-05，需要捕获组时见 03-06。本册只给最小必要调用，完整 API 签名与参数见 04-04 ~ 04-06，结构体字段见 05-02 与 05-03，编译链路原理见 06-01，API 入口层模块见 07-10。
+
+## 03-02 库部署与链接：静态/动态、符号可见性与包管理
+
+### 1. 目标与拓扑
+
+本篇要解决的是「编译通过之后，程序怎么交付到目标机器上还能跑」。同一份 `demo.c`，静态链接产出一个自包含的可执行文件，动态链接产出一个依赖 `libhs.so.5` 的可执行文件，两者在部署、升级、镜像体积、故障表现上完全不同。目标是把两种形态都产出一遍，用工具确认各自的依赖闭包，再决定什么场景用哪一种。
+
+先看产物拓扑。Hyperscan 的构建系统会产出不止一个库：`hs` 是完整库（编译器 + 运行时），`hs_runtime` 是仅运行时库（不含编译 API，因此不依赖 C++ 标准库）。开启动态构建后还会得到对应的 `.so`。这四个产物加上 C++ 运行库、`libm`、`libpthread`，构成完整的依赖图，如图 03-02-01。
+
+:::figure id=03-02-01 | name=静态与动态两种交付形态的依赖闭包 | dir=TD
+node a "demo.c 宿主源码" blue
+node b "libhs.a 静态库" amber
+node c "libhs.so.5 动态库" amber
+node d "libstdc++ 与 libm" gray
+node e "ld.so 运行时装载" gray
+node f "最小运行镜像" green
+edge a -> b "静态链接"
+edge a -> c "动态链接"
+edge b -> d "仍需 C++ 运行库"
+edge c -> e "启动期解析 SONAME"
+edge e -> f "只带 so 与依赖"
+edge b -> f "单文件交付"
+:::
+
+图 03-02-01 揭示了一个常见误解：静态链接 `libhs.a` 不等于「零依赖」。因为 `libhs` 的编译部分由 C++ 实现，静态链接时 `libstdc++` 仍需参与链接（可以静态链进可执行文件，也可以动态依赖）；只有 `libhs_runtime` 才是真正不依赖 C++ 标准库的那一个。这条差异决定了嵌入式与容器场景的选型。
+
+第二个要建立的概念是 SONAME。Hyperscan 的 `CMakeLists.txt` 里 `LIB_SOVERSION` 取主版本号，因此 5.4.2 产出的动态库文件名是 `libhs.so.5.4.2`，SONAME 是 `libhs.so.5`，开发用软链是 `libhs.so`。运行期装载器只认 SONAME，这意味着升级到 5.4.3 时不需要改任何调用方，而升级到 6.0 时 SONAME 变化，必须重新链接。这是 ABI 兼容承诺的物理体现，比任何文档声明都可靠。
+
+第三个概念是符号可见性。Hyperscan 在 Windows 上用 `hs.def` 显式列出导出符号，在类 Unix 上依赖默认可见性加内部命名约定。`hs.def` 里的清单就是公开 ABI 的白名单，任何不在清单里的符号都不应被宿主引用。理解这一点，才能在遇到「符号找不到」或「符号冲突」时判断是版本问题还是用法问题。
+
+这里要专门说明 `libhs` 与 `libhs_runtime` 的拆分动机，因为它是部署形态选择的分水岭。`libhs` 同时包含编译器与运行时，编译器用 C++ 写成，因此整个库带 C++ 链接依赖；很多嵌入式与边缘场景只需要「加载现成数据库并扫描」，模式在生产环境之外编译，这时引入 C++ 标准库纯属负担。`libhs_runtime` 正是为此提供的仅运行时版本，它不依赖 C++ 标准库，提供除编译以外的一切函数。`doc/dev-reference/serialization.rst` 的「The Runtime Library」一节明确写了这个定位，源码侧的对应目标是 `CMakeLists.txt` 里的 `add_library(hs_runtime STATIC ...)`。选型的判断标准很简单：宿主代码里是否出现 `hs_compile`、`hs_compile_multi`、`hs_compile_ext_multi`、`hs_expression_info` 这四个入口，出现就必须用 `libhs`，不出现就优先用 `libhs_runtime`。
+
+第四个概念是包管理契约。`libhs.pc` 不是装饰品，它是宿主构建系统与 Hyperscan 之间的稳定接口。文件里 `prefix`、`libdir`、`includedir` 三个变量描述安装布局，`Libs: -L${libdir} -lhs` 给出链接参数，`Libs.private: @PRIVATE_LIBS@` 给出静态链接时才需要的附加库，`Cflags: -I${includedir}/hs` 给出编译参数。`PRIVATE_LIBS` 在构建时由 CMake 计算，内容随工具链变化，因此不要手写死；需要看实际值时用 `pkg-config --static --libs libhs` 打印。这个文件在 `chimera/CMakeLists.txt` 里还有一份对应物 `libch.pc`，供 Chimera 使用，两者的生成逻辑一致。
+
+### 2. 前置条件与环境
+
+需要一份已经构建好的源码树，以及 `pkg-config`、`readelf`、`ldd`、`nm` 四个工具。前两个通常随系统安装，后两个属于 binutils 与 glibc 工具集。如果目标是把程序塞进容器，还需要一个可用的容器运行时；本篇只给镜像构建的关键步骤，不展开完整 Dockerfile 语法。
+
+构建两种形态的最小命令如下。默认 `BUILD_SHARED_LIBS=OFF`，只出静态库；`BUILD_STATIC_AND_SHARED=ON` 会同时产出静态与动态两套。完整构建变量清单见 04-01，本篇只用到这两个。
+
+```bash
+cmake -S . -B build-both \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_STATIC_AND_SHARED=ON \
+      -DCMAKE_INSTALL_PREFIX=/opt/hs
+cmake --build build-both -j"$(nproc)"
+cmake --install build-both
+```
+
+安装完成后，`/opt/hs` 下应有 `include/hs/*.h`、`lib/libhs.a`、`lib/libhs.so*`、`lib/pkgconfig/libhs.pc`，Chimera 开启时还会有 `libchimera.a` 与 `libch.pc`。目录结构与安装规则由顶层 `CMakeLists.txt` 的 `install(TARGETS ...)` 与 `install(FILES ...)` 决定，头文件统一进 `include/hs`。
+
+环境变量只需一个：让 `pkg-config` 找到私有的 `.pc` 文件。系统级安装可以跳过，前缀安装必须显式导出。
+
+```bash
+export PKG_CONFIG_PATH=/opt/hs/lib/pkgconfig:$PKG_CONFIG_PATH
+pkg-config --modversion libhs
+pkg-config --cflags --libs libhs
+```
+
+第一条命令输出 `5.4.2`，说明 `.pc` 被正确解析；第二条输出编译与链接参数。如果第一条就失败，说明 `PKG_CONFIG_PATH` 没生效或 `.pc` 文件名不是 `libhs.pc`，先解决这个再谈链接。
+
+### 3. 分步操作
+
+第一步，用 `pkg-config` 编译动态版本。这是最省事的方式，参数由 `.pc` 给出，不写死路径。
+
+```bash
+gcc demo.c -o demo_dynamic $(pkg-config --cflags --libs libhs)
+readelf -d demo_dynamic | grep -E 'NEEDED|RPATH|RUNPATH'
+```
+
+第二步，编译静态版本。注意要用 `g++` 驱动或显式补 C++ 运行库，否则会在链接阶段报 `undefined reference to std::__throw_length_error` 一类符号。这里用 `-Wl,-Bstatic` 只对 `libhs` 生效，其余库仍动态链接，属于折中做法。
+
+```bash
+gcc -c demo.c -o demo.o $(pkg-config --cflags libhs)
+g++ demo.o -o demo_static \
+    -Wl,-Bstatic -lhs -Wl,-Bdynamic \
+    -lstdc++ -lm -lpthread
+```
+
+第三步，给动态版本设置运行期搜索路径。三种方式按优先级从高到低是：`LD_LIBRARY_PATH`、可执行文件的 `RUNPATH`/`RPATH`、系统缓存。生产环境推荐 `RUNPATH` 加相对路径 `$ORIGIN`，这样整个目录可以整体搬移。
+
+```bash
+gcc demo.c -o demo_rpath $(pkg-config --cflags --libs libhs) \
+    -Wl,-rpath,'$ORIGIN/../lib' -Wl,--enable-new-dtags
+```
+
+第四步，确认动态库导出的符号。用 `nm -D` 看动态符号表，确认 `hs_compile`、`hs_scan`、`hs_alloc_scratch` 都是 `T`（文本段、全局），而不是 `U`（未定义）或小写（局部）。
+
+```bash
+nm -D --defined-only /opt/hs/lib/libhs.so.5 | grep -E ' hs_(compile|scan|alloc_scratch)$'
+```
+
+第五步，做最小化部署。把可执行文件、`libhs.so.5`、以及 `ldd` 报出的其余非系统库一起拷进镜像，用 `ldd` 复验没有 `not found`。如果用的是 `libhs_runtime`，还要确认宿主没有调用任何编译 API，否则链接期就会失败——这属于「编译期发现」的好失败。
+
+第六步，处理版本升级。把新的 `libhs.so.5.x.y` 放进目录，改软链指向它，重启进程即可，不需要重新编译宿主。若新版本主版本号变了，SONAME 也随之变化，此时必须重新链接，不能靠改软链蒙混。
+
+第七步，做容器化交付。最小镜像不需要编译工具链，只需要运行库与可执行文件。关键动作是三层拷贝：可执行文件放 `/app/`，`libhs.so.5` 放 `/app/lib/`，其余非系统依赖按 `ldd` 结果补齐；`RUNPATH` 设为 `$ORIGIN/lib`，启动时就不会依赖 `LD_LIBRARY_PATH`。判断镜像是否完整的唯一标准是在镜像内跑 `ldd /app/demo | grep 'not found'`，输出为空才算通过。注意不要在镜像里保留 `.a` 与头文件，它们只对构建阶段有意义，留在运行镜像里既增大体积又扩大攻击面。
+
+第八步，建立升级前的兼容性检查。用 `readelf -d libhs.so.5.4.2 | grep SONAME` 记录当前 SONAME，用 `hs_database_info` 记录现有数据库的版本串与特性串，两者一起写进发布说明。升级后先在小流量节点验证「旧数据库能否被新库加载」，再全量替换。数据库跨版本的兼容规则见 03-03 与 06-12，不要凭经验假设向后兼容。
+
+第九步，写一个探针程序，把「运行期实际链接到哪个版本」变成可观测的输出。这个程序在部署后第一时间跑，比任何静态检查都直接。
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <hs.h>
+
+int main(void) {
+    printf("runtime version: %s\n", hs_version());
+    printf("platform check: %d\n", hs_valid_platform());
+
+    hs_database_t *db = NULL;
+    hs_compile_error_t *err = NULL;
+    if (hs_compile("ab+c", HS_FLAG_DOTALL, HS_MODE_BLOCK, NULL,
+                   &db, &err) != HS_SUCCESS) {
+        printf("compile failed: %s\n", err->message);
+        hs_free_compile_error(err);
+        return 1;
+    }
+
+    char *info = NULL;
+    if (hs_database_info(db, &info) == HS_SUCCESS) {
+        printf("db info: %s\n", info);
+        free(info);
+    }
+    hs_free_database(db);
+    return 0;
+}
+```
+
+```bash
+gcc probe.c -o probe $(pkg-config --cflags --libs libhs)
+./probe
+```
+
+### 4. 验证方法与预期结果
+
+动态版本的依赖闭包用 `ldd` 查看，典型输出如下。这是示例输出，具体格式需对照实际版本核验；路径与行序会随发行版变化，关注点是「有没有 not found」和「libhs 解析到哪个路径」。
+
+```text
+	linux-vdso.so.1 (0x00007ffd9c3f4000)
+	libhs.so.5 => /opt/hs/lib/libhs.so.5 (0x00007f2c1a200000)
+	libstdc++.so.6 => /usr/lib/x86_64-linux-gnu/libstdc++.so.6 (0x00007f2c19e00000)
+	libm.so.6 => /lib/x86_64-linux-gnu/libm.so.6 (0x00007f2c19c00000)
+	libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f2c19a00000)
+	/lib64/ld-linux-x86-64.so.2 (0x00007f2c1a400000)
+```
+
+逐行判读：第一行 `linux-vdso.so.1` 是内核提供的虚拟动态库，任何动态程序都有，不占磁盘，可以忽略。第二行 `libhs.so.5 => /opt/hs/lib/libhs.so.5` 是关键，箭头右侧必须是真实存在的绝对路径；如果显示 `not found`，说明 SONAME 找不到对应文件，程序会在启动阶段直接失败而不是运行到扫描阶段。第三、四行是 C++ 运行库与数学库，它们的存在证明 `libhs` 的动态版本仍带 C++ 依赖，这也是为什么纯运行时场景要换 `libhs_runtime`。第五行 `libc.so.6` 是基础依赖，正常。最后一行的 `ld-linux` 是装载器自身，不是普通依赖。整段输出里如果出现任何 `not found`，都不必往下看业务逻辑，先把依赖补齐。
+
+静态版本的验证方式不同：`ldd demo_static` 应显示 `not a dynamic executable`，`file demo_static` 会标注 `statically linked` 或 `dynamically linked` 但无 `libhs` 依赖。此时程序体积会明显变大（通常从几十 KB 涨到数 MB），这是把库代码搬进可执行文件的代价。体积换来的好处是部署面收敛为一个文件，适合边缘设备与不可控的运行环境。
+
+符号可见性的验证用 `nm -D`，正常输出形如 `00000000000a1b20 T hs_compile`。如果 `hs_compile` 出现在 `U` 行，说明它是被引用而非被定义，通常意味着链接到了错误的库（比如把 `libhs_runtime` 当完整库用）。如果出现 `W`（弱符号），要警惕同名符号被其他库覆盖，这类问题在多库混链时偶发。
+
+`pkg-config` 的输出也要判读，正常应包含 `-I/opt/hs/include/hs` 与 `-L/opt/hs/lib -lhs`。如果 `--libs` 只给出 `-lhs` 而没有 `-L`，说明 `.pc` 里的 `libdir` 展开成了系统默认路径，前缀配置有误；如果 `--cflags` 给的是 `-I/opt/hs/include`（少了 `/hs`），编译会找不到 `hs.h`，这是 `libhs.pc.in` 被错误修改的典型症状。
+
+体积与启动开销也需要量化比较，否则「静态还是动态」会变成口味之争。用 `ls -lh demo_static demo_dynamic` 与 `size demo_static` 看真实数字：静态版本通常把 `libhs.a` 中被引用到的目标文件全部搬进可执行文件，体积落在数 MB 量级；动态版本的可执行文件通常只有几十 KB，但运行期要额外映射 `libhs.so.5` 的代码段。进程数多时动态版本占优，因为代码段在进程间共享物理页；进程数少、部署环境不可控时静态版本占优，因为不存在「库找不到」这一类故障。判断时不要只看单机，要按「节点数 × 进程数 × 升级频率」三个维度一起算。
+
+还有一个容易忽略的验证点：确认链接到的库与运行时加载的库是同一份。做法是用 `ldd` 看解析路径，再用 `strings libhs.so.5 | grep -m1 'Hyperscan'` 看库内标识，必要时调用 `hs_version()` 打印版本串，与 `pkg-config --modversion libhs` 比对。三者不一致，说明系统里存在多份 Hyperscan，构建期与运行期各自命中了一份，这类问题在同时装了发行版包与自编译版本的主机上非常常见，表现是「本地能跑、换机器就崩」。
+
+探针程序的典型输出如下。这是示例输出，具体格式需对照实际版本核验；版本号后的日期是构建日期，不是发布版本日期。
+
+```text
+runtime version: 5.4.2 2026-11-12
+platform check: 0
+db info: Version: 5.4.2 Features: AVX2 Mode: BLOCK
+```
+
+逐行判读：第一行的前半段 `5.4.2` 来自编译期注入的 `HS_VERSION_STRING`，后半段是构建日期，两者都由 `hs_version()` 直接返回；如果这里显示的不是你期望的版本，说明进程装载的是另一份 `libhs`，后续所有行为都不可信，应先解决库路径再谈其他。第二行 `platform check: 0` 是 `hs_valid_platform()` 的返回值，`0` 即 `HS_SUCCESS`，表示当前 CPU 支持这份库的运行时要求；如果返回 `-11`（`HS_ARCH_ERROR`），说明库要求的指令集在这台机器上不可用，常见于把 AVX2 版本部署到老 CPU 上，此时不需要改代码，换库或换机器即可。第三行是 `hs_database_info` 的输出，三段分别是版本、平台特性、扫描模式，它与第一行应当版本一致；若第一行是 5.4.2 而这里是 5.4.1，说明数据库是旧版本编译的，反序列化时会报 `HS_DB_VERSION_ERROR`。把这三行放在一起看，就能在启动阶段一次性排除「库版本错、平台不支持、数据库过期」三类问题，比等到扫描阶段看返回码高效得多。
+
+两种形态的取舍可以归纳成一张表，按场景选而不是按偏好选。
+
+| 场景 | 推荐形态 | 理由 | 主要风险 |
+|---|---|---|---|
+| 边缘设备单文件交付 | 静态 `libhs.a` | 无运行期搜索路径问题 | 体积大，升级需重发 |
+| 容器内多进程共享 | 动态 `libhs.so` | 内存共享，升级只换文件 | 需保证 SONAME 可见 |
+| 只扫描不编译 | `libhs_runtime` | 去掉 C++ 运行库依赖 | 无编译 API，需预置数据库 |
+| 插件式热加载 | 动态 + `RUNPATH` | 目录可整体搬移 | 路径写错即启动失败 |
+| 调试与转储 | 动态 Debug 构建 | 可替换库快速验证 | 性能不代表生产 |
+
+### 5. 常见失败与排错
+
+链接与部署阶段的失败有五类高发情形，每一类的证据来源都不同，判定顺序建议按「先静态后动态、先链接期后运行期」推进。
+
+第一类是 `cannot open shared object file: No such file or directory`。这条消息来自装载器，不是编译器，说明可执行文件本身没问题，只是运行期找不到 SONAME。排查顺序是 `ldd` 看哪一行 `not found`，`readelf -d` 看 `RUNPATH` 是否如预期，`find / -name 'libhs.so.5*'` 确认真实位置。三者对齐后，要么补 `LD_LIBRARY_PATH`，要么修 `RUNPATH`，要么把库放进 `/etc/ld.so.conf.d/` 后跑 `ldconfig`。
+
+第二类是 `version 'GLIBCXX_3.4.21' not found`。这不是 Hyperscan 的版本问题，是构建机的 GCC 比运行机新，`libstdc++` 符号版本对不上。处置方式有三种：在运行机升级 `libstdc++`、在更老的工具链上重建、或把 `libstdc++` 静态链进可执行文件（`-static-libstdc++`）。第三种最省事但会增大体积，且要注意许可证与安全更新的连带责任。
+
+第三类是静态链接时的 C++ 符号未定义。根因是用 `gcc` 而非 `g++` 驱动，链接器没有自动带入 `libstdc++`。处置是改用 `g++`，或显式补 `-lstdc++ -lm -lpthread`。如果补了还报错，检查是不是 `-Wl,-Bstatic` 把 `libstdc++` 也带成静态了，顺序敏感。
+
+第四类是 `pkg-config` 返回空或报 `Package libhs was not found`。根因是 `PKG_CONFIG_PATH` 未导出，或 `.pc` 文件名被改。注意 `pkg-config` 只认 `libhs.pc` 这个文件名，不认 `hyperscan.pc`；`--modversion libhs` 能验证这一点。另一个隐蔽原因是交叉编译时用了宿主机的 `pkg-config`，需要设置 `PKG_CONFIG_SYSROOT_DIR` 与 `PKG_CONFIG_LIBDIR`。
+
+第五类是升级后行为异常但不报错。典型场景是把 `libhs.so.5` 软链指到了不同 minor 版本的库，ABI 兼容所以能跑，但字节码格式或默认行为可能变化。防御手段是升级前用 `hs_database_info` 记录数据库的版本与特性串，升级后比对，不一致就重新编译数据库而不是继续用旧的。序列化与版本校验见 03-03，原理见 06-12。
+
+还有一类不算失败但经常被问：为什么 `nm -D` 看不到 `hs_compile_multi` 之外的内部符号。这是设计使然，`hs.def` 与内部命名约定共同构成了导出白名单，宿主不应依赖任何未导出符号。想确认某个函数是否属于公开 API，查 `src/hs_compile.h`、`src/hs_runtime.h`、`src/hs_common.h` 三个头文件即可，头文件里声明且带 `HS_PUBLIC_API` 的才是承诺。
+
+符号冲突是另一类低频但难查的问题。当宿主同时链接了另一份自带 Hyperscan 的第三方库（例如某个 DPI 框架），链接器可能把两份 `libhs` 都拉进来，最终符号解析到哪一份取决于链接顺序。表现是行为诡异但不崩溃，例如同一个模式在两处调用得到不同命中数。诊断方法是用 `nm -D demo | grep hs_compile` 看 `hs_compile` 是 `T` 还是 `U`，再用 `ldd` 确认只解析到一个 `libhs`；如果确实有两份，用 `-Wl,--exclude-libs` 或调整链接顺序收敛，最彻底的办法是让第三方库改为动态链接并共用同一份 `libhs`。
+
+容器场景还有一个专属陷阱：基础镜像自带的 `libstdc++` 版本可能低于构建机。表现是启动时报 `GLIBCXX_3.4.2x not found`，但 `ldd` 显示依赖都在。处置方式是在镜像里显式安装匹配版本的运行库，或在构建阶段就使用与运行镜像同源的工具链。这个问题的根因不在 Hyperscan，而在「构建环境与运行环境异构」，把它记在部署检查单里比事后排查划算得多。
+
+### 6. 小结
+
+本篇把「能编译」推进到「能交付」。核心结论有三条：静态链接不等于零依赖，因为编译部分需要 C++ 运行库；动态链接的稳定锚点是 SONAME `libhs.so.5`，主版本不变即可原地升级；只扫描不编译的场景应该换 `libhs_runtime`，它才是真正无 C++ 依赖的产物。
+
+工程上建议固定一套路径策略并写进构建脚本：要么全用 `pkg-config`，要么全用显式 `-I/-L`，不要混用；容器镜像统一用 `RUNPATH=$ORIGIN/../lib`，避免依赖外部环境变量；升级流程把「换库文件」与「重编数据库」分开评估，前者看 SONAME，后者看版本串。
+
+下一步，若要把编译产物从构建机搬到运行机，读 03-03；若要解决多线程下 scratch 的独占问题，读 03-04。链接变量全集见 04-01，错误码见 04-08，动态库与平台分派的原理见 06-13，`runtime` / `dispatcher` / `database` 模块见 07-10。本册只给最小必要命令，完整构建变量与安装布局以 04-01 为准，完整 API 见 04-04 ~ 04-06。
+
+## 03-03 数据库的序列化、分发与加载
+
+### 1. 目标与拓扑
+
+本篇要解决的是「编译一次、处处加载」。典型的生产形态是：构建机上用完整模式集编译一次，把结果序列化成文件，随版本发布到几十上百台运行机；运行机只做加载与扫描，不引入编译器，也不在启动时重新编译。这样做的收益不只是省时间，还包括统一了所有节点的匹配行为、把编译期的内存峰值挪出生产环境、让运行镜像可以只带 `libhs_runtime`。
+
+先要说清一个物理事实：编译出来的 `hs_database_t` **不是**一块可以直接拷贝的内存。它内部含指针，并且有特定的对齐要求，`doc/dev-reference/serialization.rst` 开篇就写明「databases are not completely flat in memory: they contain pointers and have specific alignment requirements」，因此不能 `memcpy`、不能 `mmap` 后直接当数据库用、不能通过共享内存传递。要在机器之间搬它，必须先转成「扁平、可重定位的字节流」，这就是序列化；到了目标机再转回带指针的数据库，这就是反序列化。
+
+整条链路的拓扑如图 03-03-01。左半段发生在构建机，右半段发生在运行机，中间的制品库是唯一的交接点。
+
+:::figure id=03-03-01 | name=数据库从构建机到运行机的序列化链路 | dir=LR
+node a "构建机 hs_compile" blue
+node b "hs_database_t 内存对象" amber
+node c "hs_serialize_database" teal
+node d "扁平字节流 .db 文件" amber
+node e "制品库与校验和" gray
+node f "运行机读取文件" green
+node g "hs_deserialize_database" teal
+node h "hs_alloc_scratch 后扫描" green
+edge a -> b "编译产出"
+edge b -> c "导出"
+edge c -> d "可落盘可传输"
+edge d -> e "签名与版本号"
+edge e -> f "分发"
+edge f -> g "校验 magic 版本 平台 HMAC"
+edge g -> h "恢复为可用对象"
+edge b -> h dashed "不可直接拷贝"
+:::
+
+图 03-03-01 里那条虚线是关键提醒：从 `hs_database_t` 直接到「扫描」的捷径在跨进程、跨机器时不存在，唯一合法的搬运方式是实线路径。很多「共享内存里放数据库」的设计失败，就是忽略了这条虚线。
+
+第二个要建立的认知是绑定关系。序列化字节流并不通用，它与三样东西绑定：Hyperscan 的版本、编译时指定的目标平台特性、以及构建期的 HMAC 密钥。任一不匹配，反序列化都会失败并给出不同的错误码。这个设计是刻意的：字节码布局随版本变化，指令集随平台变化，完整性校验随密钥变化，强行加载只会得到未定义行为，不如在入口处拒绝。
+
+第三个认知是「校验强度分级」。这是最容易被误解的地方：`hs_serialized_database_size` 与 `hs_serialized_database_info` 只读序列化头部的字段，**不校验任何摘要**；`hs_database_size` 与 `hs_database_info` 校验头部摘要但**不校验字节码摘要**；只有 `hs_deserialize_database`、`hs_deserialize_database_at`、`hs_serialize_database` 与 `hs_alloc_scratch` 会完整校验头部与字节码两份 HMAC-SHA256。所以「info 能打印出来」不等于「数据库完好」，这个结论必须记住，否则会把损坏的数据库当成好的放进生产。
+
+### 2. 前置条件与环境
+
+序列化链路对环境的敏感度比单机集成高，因为两侧必须对齐。对齐项与检查方式见下表。
+
+| 对齐项 | 为什么必须一致 | 检查方式 |
+|---|---|---|
+| Hyperscan 版本 | 字节码布局随版本变化 | `hs_version()` 与 `hs_database_info` 比对 |
+| 平台特性 | 字节码可能含特定指令集假设 | `hs_database_info` 的 Features 字段 |
+| HMAC 密钥 | 摘要用同一密钥计算 | 构建时是否定义 `HS_DB_HMAC_KEY_OVERRIDE` |
+| 指针宽度 | 数据库布局与字长相关 | 两侧同为 64 位或同为 32 位 |
+| 扫描模式 | block 与 stream 数据库不通用 | `hs_database_info` 的 Mode 字段 |
+
+第一行与第三行最容易出事。版本不一致时错误码是 `HS_DB_VERSION_ERROR`，提示明确；密钥不一致时错误码是 `HS_INVALID`，提示含糊，容易被误判为文件损坏。判断方法是拿构建机的 `hs_database_info` 输出与运行机的比对，若版本与平台都一致却仍报 `HS_INVALID`，基本可以锁定密钥差异。
+
+平台特性这一项需要额外解释。编译时 `hs_compile` 的 `platform` 参数若传 NULL，会按当前主机生成「适合本机」的数据库；若显式传入 `hs_platform_info_t`，则按指定目标生成。前者在异构集群里会踩坑：构建机支持 AVX-512，生成的数据库可能带 AVX-512 假设，运行机只有 AVX2 就会报 `HS_DB_PLATFORM_ERROR`。稳妥做法是在构建时显式指定一个保守的目标平台，让数据库能在整个集群上跑，代价是放弃构建机上的部分优化。`hs_platform_info_t` 的字段见 05-04，`hs_populate_platform` 的用法见 04-04，平台分派原理见 06-13。
+
+磁盘与权限也要提前规划。数据库文件通常几 MB 到几百 MB，取决于模式数量与复杂度；分发目录应设为只读，写权限只留给发布流程；文件名建议带版本号与构建时间，避免「同名覆盖、回滚无据」。如果走网络分发，还要在应用层做签名校验，原因见本节末尾的安全说明。
+
+### 3. 分步操作
+
+第一步，写构建机侧的导出程序。它编译模式、序列化、落盘、打印信息，四件事一次做完。代码里对每个返回值都做了检查，失败时打印可读原因而不是静默退出。
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <hs.h>
+
+int main(int argc, char **argv) {
+    if (argc != 3) {
+        fprintf(stderr, "usage: %s <pattern> <out.db>\n", argv[0]);
+        return 1;
+    }
+
+    hs_database_t *db = NULL;
+    hs_compile_error_t *cerr = NULL;
+    if (hs_compile(argv[1], HS_FLAG_DOTALL, HS_MODE_BLOCK, NULL,
+                   &db, &cerr) != HS_SUCCESS) {
+        fprintf(stderr, "compile failed: %s\n", cerr->message);
+        hs_free_compile_error(cerr);
+        return 1;
+    }
+
+    char *info = NULL;
+    if (hs_database_info(db, &info) == HS_SUCCESS) {
+        printf("db info: %s\n", info);
+        free(info);
+    }
+
+    char *bytes = NULL;
+    size_t len = 0;
+    if (hs_serialize_database(db, &bytes, &len) != HS_SUCCESS) {
+        fprintf(stderr, "serialize failed\n");
+        hs_free_database(db);
+        return 1;
+    }
+
+    FILE *f = fopen(argv[2], "wb");
+    if (!f) {
+        fprintf(stderr, "cannot open output\n");
+        free(bytes);
+        hs_free_database(db);
+        return 1;
+    }
+    size_t written = fwrite(bytes, 1, len, f);
+    fclose(f);
+    printf("serialized %zu bytes, written %zu\n", len, written);
+
+    free(bytes);
+    hs_free_database(db);
+    return written == len ? 0 : 1;
+}
+```
+
+第二步，编译并运行导出程序。`-lhs` 必须链完整库，因为用到了编译 API；序列化本身属于运行时能力，但编译在同一进程里，所以 `libhs_runtime` 不够用。
+
+```bash
+gcc export_db.c -o export_db -lhs
+./export_db 'ab+c' rules.db
+ls -l rules.db
+```
+
+第三步，检查序列化文件的基本信息。这一步不反序列化，只读头部，因此可以在没有目标平台的环境里做，适合放进发布流水线做前置校验。
+
+```bash
+./db_info rules.db
+```
+
+如果没有现成工具，用下面这段最小程序代替，它调用 `hs_serialized_database_info` 与 `hs_serialized_database_size`，两个都是只读头部的轻量调用。
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <hs.h>
+
+int main(int argc, char **argv) {
+    if (argc != 2) {
+        return 1;
+    }
+    FILE *f = fopen(argv[1], "rb");
+    if (!f) {
+        return 1;
+    }
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = (char *)malloc((size_t)n);
+    if (!buf || fread(buf, 1, (size_t)n, f) != (size_t)n) {
+        fclose(f);
+        free(buf);
+        return 1;
+    }
+    fclose(f);
+
+    char *info = NULL;
+    if (hs_serialized_database_info(buf, (size_t)n, &info) == HS_SUCCESS) {
+        printf("serialized info: %s\n", info);
+        free(info);
+    }
+    size_t need = 0;
+    if (hs_serialized_database_size(buf, (size_t)n, &need) == HS_SUCCESS) {
+        printf("deserialized size: %zu\n", need);
+    }
+    free(buf);
+    return 0;
+}
+```
+
+第四步，写运行机侧的加载程序。核心是 `hs_deserialize_database`，成功后得到普通的 `hs_database_t`，后续用法与编译出来的完全一致：分配 scratch、扫描、释放。
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <hs.h>
+
+static int on_match(unsigned int id, unsigned long long from,
+                    unsigned long long to, unsigned int flags, void *ctx) {
+    (void)from; (void)flags;
+    printf("hit id=%u end=%llu\n", id, to);
+    (*(int *)ctx)++;
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 3) {
+        return 1;
+    }
+    FILE *f = fopen(argv[1], "rb");
+    if (!f) {
+        return 1;
+    }
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = (char *)malloc((size_t)n);
+    if (!buf || fread(buf, 1, (size_t)n, f) != (size_t)n) {
+        fclose(f);
+        free(buf);
+        return 1;
+    }
+    fclose(f);
+
+    hs_database_t *db = NULL;
+    hs_error_t rc = hs_deserialize_database(buf, (size_t)n, &db);
+    if (rc != HS_SUCCESS) {
+        fprintf(stderr, "deserialize rc=%d\n", rc);
+        free(buf);
+        return 1;
+    }
+
+    hs_scratch_t *scratch = NULL;
+    if (hs_alloc_scratch(db, &scratch) != HS_SUCCESS) {
+        hs_free_database(db);
+        free(buf);
+        return 1;
+    }
+
+    int hits = 0;
+    const char *data = argv[2];
+    hs_scan(db, data, (unsigned int)strlen(data), 0, scratch,
+            on_match, &hits);
+    printf("hits=%d\n", hits);
+
+    hs_free_scratch(scratch);
+    hs_free_database(db);
+    free(buf);
+    return 0;
+}
+```
+
+第五步，改成零拷贝加载。当数据库很大、又需要常驻时，把文件 `mmap` 进来，用 `hs_deserialize_database_at` 直接写进一块 8 字节对齐的内存，省掉一次分配与一次拷贝。注意这块内存的所有权归宿主，**不能**用 `hs_free_database` 释放，只能 `munmap` 或 `free` 自己申请的那块。
+
+```c
+size_t need = 0;
+if (hs_serialized_database_size(buf, (size_t)n, &need) != HS_SUCCESS) {
+    return 1;
+}
+void *mem = NULL;
+if (posix_memalign(&mem, 8, need) != 0) {
+    return 1;
+}
+hs_database_t *db_at = (hs_database_t *)mem;
+if (hs_deserialize_database_at(buf, (size_t)n, db_at) != HS_SUCCESS) {
+    free(mem);
+    return 1;
+}
+```
+
+第六步，规划分发目录与流程。推荐布局是 `rules/<version>/rules.db` 加一份 `rules/<version>/manifest.txt`，manifest 里记录 `hs_version`、Features、Mode、文件 SHA-256 与构建时间。发布时先传文件、再校验 SHA-256、最后原子改名切换软链，回滚只需把软链指回上一个版本。目录权限设为 `0555`，只有发布账号有写权限。
+
+第七步，做一次端到端一致性验证。用同一段样本数据，分别在构建机上用编译出的数据库扫描、在运行机上用加载的数据库扫描，比较命中条数与每个 `to` 偏移。两者必须逐条一致，任何差异都说明加载链路有问题，而不是模式有问题。
+
+### 4. 验证方法与预期结果
+
+构建机侧的输出形如下面这段。这是示例输出，具体格式需对照实际版本核验；`Features` 与 `Mode` 的取值由编译参数决定，`bytes` 数量随模式复杂度变化。
+
+```text
+db info: Version: 5.4.2 Features: AVX2 Mode: BLOCK
+serialized 1274 bytes, written 1274
+serialized info: Version: 5.4.2 Features: AVX2 Mode: BLOCK
+deserialized size: 2368
+```
+
+逐行判读：第一行来自 `hs_database_info`，格式固定为 `Version: 主.次.修订 Features: 特性 Mode: 模式`。版本必须是 5.4.2，若显示其他值说明链到了别的库；`Features: AVX2` 表示这份数据库要求 AVX2，运行机不支持就会在反序列化时报平台错误；`Mode: BLOCK` 表示这是块模式数据库，用它调 `hs_open_stream` 会失败。第二行是序列化结果，两个数字相等说明写盘完整，不相等就是磁盘满或写入被中断。第三行来自 `hs_serialized_database_info`，正常情况下应与第一行完全相同；如果不同，说明读的文件不是刚写的那个，或者头部被改过。第四行的 `deserialized size` 通常大于序列化长度，因为反序列化后要恢复指针对齐与运行时结构，这个数字是 `hs_deserialize_database_at` 需要的内存大小，规划常驻内存时按它算而不是按文件大小算。
+
+这里要强调一个判读陷阱：`hs_serialized_database_info` 能成功返回，只证明头部字段可读，不证明字节码完好。上面第三行打印成功而第四行失败，是「头部正常、字节码损坏」的典型组合。反过来，第三行就失败，通常是文件截断或 magic 不对。把这两行当成两个独立信号，不要合并成一个「能打开」。
+
+运行机侧的预期输出是一段命中记录加一行汇总。判据有两条：命中条数与构建机一致；每条 `to` 偏移与构建机逐字节一致。如果条数一致但偏移整体偏移了某个常数，检查样本数据是否多了 BOM 或换行；如果条数少，检查是否用了 `HS_MODE_STREAM` 的数据库去做 `hs_scan`（模式不匹配会直接报错而不是少报，所以这种情况更多是模式集版本不一致）。
+
+API 的校验强度差异用一张表固定下来，避免记忆漂移。
+
+| API | 读取对象 | 校验头部摘要 | 校验字节码摘要 |
+|---|---|---|---|
+| `hs_serialized_database_info` | 序列化字节 | 否 | 否 |
+| `hs_serialized_database_size` | 序列化字节 | 否 | 否 |
+| `hs_database_info` | 内存数据库 | 是 | 否 |
+| `hs_database_size` | 内存数据库 | 是 | 否 |
+| `hs_deserialize_database` | 序列化字节 | 是 | 是 |
+| `hs_alloc_scratch` | 内存数据库 | 是 | 是 |
+
+表的读法是「越往下越可信」。发布流水线里的前置校验用最上面两行足够快，但只能筛掉明显损坏；真正的完整性确认必须走到反序列化或分配 scratch 那一步。这也解释了一个常见疑问：为什么 `info` 通过之后 `hs_alloc_scratch` 还会报 `HS_INVALID`——因为前者不查字节码。
+
+最后一条验证是安全性。默认 HMAC 密钥是公开常量，定义在 `src/hs_db_hmac_key.h`，随源码一起发布，因此默认配置下的摘要只能发现「意外损坏」，不能证明「来源可信」。如果数据库文件经过任何可能被第三方改写的通道（对象存储、共享缓存、升级包），必须在应用层另行签名验签，再交给 `hs_deserialize_database`。反序列化一个精心构造的数据库可能导致越界读或崩溃，这一点在 `serialization.rst` 的警告段落里写得很直白。
+
+### 5. 常见失败与排错
+
+序列化链路的失败都能用返回码区分，且每个码对应一个明确的对齐项。对照关系见下表。
+
+| 返回码 | 数值 | 根因 | 处置 |
+|---|---|---|---|
+| `HS_DB_VERSION_ERROR` | -5 | 两侧 Hyperscan 版本不同 | 统一版本后重新导出 |
+| `HS_DB_PLATFORM_ERROR` | -6 | 目标机缺少数据库要求的指令集 | 用保守平台重编或换机器 |
+| `HS_DB_MODE_ERROR` | -7 | 用块库开流或反之 | 按用途导出对应模式 |
+| `HS_INVALID` | -1 | magic 错、长度不符、HMAC 不符 | 先查截断，再查密钥 |
+| `HS_NOMEM` | -2 | 反序列化内存不足 | 按 `deserialized size` 预留 |
+| `HS_BAD_ALIGN` | -8 | `at` 版本内存未 8 字节对齐 | 用 `posix_memalign` |
+
+第一类错误的处置不是「换个版本试试」，而是把构建机与运行机的 `hs_version()` 都打印出来比对。若版本确实一致却仍报错，检查是否有一侧静态链接了旧版 `libhs`，`ldd` 与 `nm` 组合可以确认。
+
+第二类错误在异构集群里最常见。判定方法是看 `hs_database_info` 的 Features 字段，再对照运行机 CPU 标志（`grep -o 'avx2\|avx512f' /proc/cpuinfo | sort -u`）。若构建机是 AVX-512 而运行机只有 AVX2，两条路：把构建机换成 AVX2 机器重编，或在 `hs_compile` 时显式传入目标平台结构。后者更可控，因为构建机硬件不再影响产物。
+
+第三类错误属于「产物用错地方」，不是数据损坏。块模式数据库不能开流，流模式数据库不能做 `hs_scan`，向量模式又要求 `hs_scan_vector`。三者的 `Mode` 字段在 info 里可见，发布清单里应明确标注每个文件的用途，避免运维拿错。
+
+第四类错误的排查要分两步。先看文件长度是否与导出时打印的 `serialized ... bytes` 一致，不一致就是传输截断，常见于没有校验长度的对象存储上传或 HTTP 分块传输中断。长度一致再查密钥：如果构建时定义了 `HS_DB_HMAC_KEY_OVERRIDE`，运行库必须用同一个宏构建，否则摘要必然对不上，而错误码只会说 `HS_INVALID`。
+
+第五类与第六类都属于「内存规划」问题。`hs_deserialize_database` 自己分配，失败通常是物理内存不足；`hs_deserialize_database_at` 要求宿主提供 8 字节对齐的块，用 `malloc` 拿到的指针在多数平台恰好对齐但不保证，规范做法是 `posix_memalign` 或 `aligned_alloc`。还有一个衍生错误：把 `hs_deserialize_database_at` 写入的指针传给 `hs_free_database`，会造成堆破坏，因为那块内存不是库分配的。这条规则的记忆方式是「谁分配谁释放」：库分配的给库函数，宿主分配的给宿主函数。
+
+最后是一类不发错误码但很危险的情况：数据库文件被替换成另一份合法数据库。摘要校验会通过，因为它是用同一密钥算的；扫描也能跑，只是匹配的是另一套规则。防御只能靠应用层：发布清单里记录每个文件的 SHA-256，加载前比对，不匹配就拒绝启动。这不是 Hyperscan 的职责，但必须在集成方案里明确。
+
+### 6. 小结
+
+本篇的核心是一条链：`hs_compile` 产出的数据库不能直接搬，必须 `hs_serialize_database` 成扁平字节流，落到制品库，到目标机再 `hs_deserialize_database` 或 `hs_deserialize_database_at` 恢复。链路上有三个绑定项（版本、平台、密钥）和两个内存归属规则（库分配的归库、宿主分配的归宿主）。
+
+工程上有四条建议值得写进规范。第一，构建时显式指定目标平台，不要让构建机硬件决定产物。第二，发布清单里同时记录版本串、Features、Mode、文件长度与 SHA-256，缺一不可。第三，把 `hs_serialized_database_info` 作为流水线前置检查、把完整反序列化作为上线前检查，两级校验各司其职。第四，数据库文件走只读目录加原子软链切换，回滚不依赖备份恢复。
+
+需要强调的是安全边界：默认 HMAC 密钥公开，摘要只防意外损坏，不防恶意构造。数据库来自不可信通道时，必须在应用层签名验签。这条结论在 08-05 会从资源耗尽与不可信模式的角度再展开一次。
+
+下一步，如果运行机是多线程服务，读 03-04 解决 scratch 的独占与池化；如果要把数据库分发给流式服务，读 03-05 理解流状态与块边界。序列化 API 全集见 04-06，`hs_database` 字段与 192 字节头布局见 05-02，序列化格式与校验顺序见 06-12，数据库模块见 07-10。完整 API 见 04-04 ~ 04-06。
+
+## 03-04 多线程服务集成与 scratch 池化部署
+
+### 1. 目标与拓扑
+
+本篇要解决的是「一个数据库、多个线程、怎么摆放 scratch」。这是 Hyperscan 集成里最容易出错、也最容易出现「压测正常、上线崩」的地方。先把结论摆在前面：`hs_database_t` 是只读的，可以被任意多个线程同时使用；`hs_scratch_t` 是可变的，**同一时刻只能被一个线程使用**。库本身是可重入的，但 scratch 不是，`doc/dev-reference/runtime.rst` 的原话是「While the Hyperscan library is re-entrant, the use of scratch spaces is not」。
+
+线程与 scratch 的关系如图 03-04-01。数据库只有一份，从主线程传给所有 worker；scratch 有多份，每个 worker 独占一份，互不交叉。
+
+:::figure id=03-04-01 | name=单数据库多线程下的 scratch 独占关系 | dir=TD
+node a "主线程 编译数据库" blue
+node b "scratch 原型" amber
+node c "hs_clone_scratch 复制" teal
+node d "worker 1 与 scratch A" green
+node e "worker 2 与 scratch B" green
+node f "worker N 与 scratch N" green
+node g "共享只读 hs_database_t" purple
+edge a -> b "按最大库集定容"
+edge b -> c "一次复制一份"
+edge c -> d "独占"
+edge c -> e "独占"
+edge c -> f "独占"
+edge g -> d "只读共享"
+edge g -> e "只读共享"
+edge g -> f "只读共享"
+:::
+
+图 03-04-01 里有两种截然不同的箭头：紫色节点出发的三条边是「共享读」，可以任意并发；amber 节点经复制产生的三条边是「独占写」，不能交叉。把这两类箭头混为一谈，就会写出「全局一个 scratch」的代码，然后在并发上升时收到 `HS_SCRATCH_IN_USE`。
+
+第二个要理解的对象是 scratch 的容量语义。`hs_alloc_scratch` 不是「按库分配一块固定大小的内存」，而是「确保这块 scratch 至少能支撑这个库」。传入已有 scratch 时，如果它够大就直接返回原指针，不够大就释放旧的、分配更大的、返回新指针。这个语义带来两个后果：一是对多个库要反复调用直到全部覆盖，二是调用后必须使用返回的新指针，不能继续用旧变量。`pcre2` 之类的库没有这个设计，从那里迁过来的人经常在这里踩坑。
+
+第三个要理解的是池化的动机。每线程一份 scratch 最简单，但 scratch 可能不小（复杂模式集下从几十 KB 到几 MB），线程数一多，内存就被 scratch 吃掉；而且很多服务的线程是「短任务、高并发」，线程数与并发请求数不是一一对应。池化把 scratch 从「线程私有」变成「请求借用」，用较少的 scratch 支撑较多的并发，代价是需要一个可靠的借还协议。
+
+池内一次借还的生命周期如图 03-04-02。关键状态只有两个：空闲与占用；关键动作只有四个：取、标记、扫描、归还。
+
+:::figure id=03-04-02 | name=scratch 池的借还与扩容路径 | dir=LR
+node a "空闲队列 idle" blue
+node b "worker 取用 checkout" teal
+node c "标记 in_use" amber
+node d "hs_scan 扫描" green
+node e "归还 checkin" teal
+node f "池空 新建或阻塞" red
+edge a -> b "有可用项"
+edge b -> c "出队即独占"
+edge c -> d "扫描期间不共享"
+edge d -> e "异常路径也要归还"
+edge e -> a "回到队尾"
+edge b -> f dashed "队列为空"
+:::
+
+图 03-04-02 的红色节点是需要策略选择的地方：池空时可以新建一块（弹性扩容，风险是内存无上限），也可以阻塞等待（容量可控，风险是尾延迟），还可以返回错误让上层降级。三种策略没有优劣，只有适用场景，后面在方案对比里展开。
+
+### 2. 前置条件与环境
+
+需要 pthread 或等价的线程库，以及一个能复现并发的压测入口。单线程跑一万次看不出 scratch 冲突，必须有多线程同时进入 `hs_scan` 才能触发。编译时加 `-pthread`，链接时也加，二者缺一不可。
+
+需要先量出 scratch 的真实大小，才能决定池容量。`hs_scratch_size` 返回字节数，建议在启动时打印一次，写进容量规划。这个值与数据库复杂度、模式数量、是否开 SOM 都相关，不能凭经验估。字段层面的构成见 05-03。
+
+还需要明确线程模型。三种常见形态的差别很大：固定线程池（线程数等于 CPU 核数，长期存活）、每请求一线程（线程数随并发涨落）、事件循环加工作线程（少量线程处理大量连接）。第一种适合「每线程一份」，第二种必须池化，第三种要区分「扫描是否阻塞」——若扫描在工作线程里同步执行，仍按工作线程数配 scratch。
+
+最后要确认一件事：宿主是否会在回调里再次调用 `hs_scan`。这种「嵌套扫描」在解析嵌套协议时偶有出现，它需要**额外**一块 scratch，因为外层扫描正在占用当前这块。`runtime.rst` 明确写了这一点。如果确实需要，最稳妥的做法是给嵌套路径单独准备一块，而不是从池里再借一块——池可能在此时正好为空，导致死锁。
+
+### 3. 分步操作
+
+第一步，先复现错误，建立直觉。写一个最小程序：一个 scratch，两个线程，同时 `hs_scan`。多跑几次，会看到 `HS_SCRATCH_IN_USE`（-10），或者更糟——没有报错但命中数不对。后者是未定义行为，因为两个线程同时改同一块状态区，库内部的「使用中」标记本身也可能被竞争覆盖。这个实验的目的不是修 bug，而是确认「共用 scratch」在你们的机器上表现为何种形态，有人看到返回码，有人看到脏数据。
+
+第二步，实现方案 A：每线程一份。做法是先按「所有会用到的数据库」构造一块原型 scratch，再对每个 worker 调 `hs_clone_scratch`。原型本身可以释放，因为 clone 是深拷贝，不共享内部缓冲。
+
+```c
+hs_scratch_t *prototype = NULL;
+if (hs_alloc_scratch(db_block, &prototype) != HS_SUCCESS) {
+    return 1;
+}
+if (hs_alloc_scratch(db_stream, &prototype) != HS_SUCCESS) {
+    hs_free_scratch(prototype);
+    return 1;
+}
+
+hs_scratch_t *per_thread[MAX_WORKERS];
+for (int i = 0; i < workers; i++) {
+    per_thread[i] = NULL;
+    if (hs_clone_scratch(prototype, &per_thread[i]) != HS_SUCCESS) {
+        return 1;
+    }
+}
+hs_free_scratch(prototype);
+```
+
+注意第二次 `hs_alloc_scratch` 的写法：它传入的还是 `&prototype`，如果原块不够大，库会释放旧的并写回新指针；如果够大，原样返回。这正是「对多库反复调用直到 `HS_SUCCESS`」的机制，也是为什么不能写成两个独立变量再取较大者——你无法从外部判断哪块更大，只能让库自己扩。
+
+第三步，实现方案 B：一库一 scratch。这个方案的准确含义是「每个数据库配一块 scratch，所有线程串行复用它」。它在「单线程处理多库」的场景下是对的，例如一个线程轮流用规则库 A 和 B 扫描；但在多线程下它等价于共用一块，必然冲突。判断标准是「这块 scratch 的生命周期内，是否可能有第二个线程进入」——只要答案是「可能」，就不能用。
+
+第四步，实现方案 C：池化。池里存的是 `hs_scratch_t *`，取用时出队并标记，归还时清标记并回队。取用与归还都必须用互斥量保护，标记本身不需要原子操作，因为它在锁内完成。下面是一份可用的最小实现，省略了日志与统计，保留完整借还路径。
+
+```c
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <hs.h>
+
+#define POOL_MAX 16
+
+typedef struct {
+    hs_scratch_t *items[POOL_MAX];
+    int count;
+    pthread_mutex_t lock;
+    pthread_cond_t avail;
+    const hs_database_t *db;
+} scratch_pool;
+
+static int pool_init(scratch_pool *p, const hs_database_t *db, int n) {
+    p->count = 0;
+    p->db = db;
+    pthread_mutex_init(&p->lock, NULL);
+    pthread_cond_init(&p->avail, NULL);
+    for (int i = 0; i < n && i < POOL_MAX; i++) {
+        hs_scratch_t *s = NULL;
+        if (hs_alloc_scratch(db, &s) != HS_SUCCESS) {
+            return -1;
+        }
+        p->items[p->count++] = s;
+    }
+    return 0;
+}
+
+static hs_scratch_t *pool_get(scratch_pool *p) {
+    pthread_mutex_lock(&p->lock);
+    while (p->count == 0) {
+        pthread_cond_wait(&p->avail, &p->lock);
+    }
+    hs_scratch_t *s = p->items[--p->count];
+    pthread_mutex_unlock(&p->lock);
+    return s;
+}
+
+static void pool_put(scratch_pool *p, hs_scratch_t *s) {
+    pthread_mutex_lock(&p->lock);
+    p->items[p->count++] = s;
+    pthread_cond_signal(&p->avail);
+    pthread_mutex_unlock(&p->lock);
+}
+
+static int on_match(unsigned int id, unsigned long long from,
+                    unsigned long long to, unsigned int flags, void *ctx) {
+    (void)id; (void)from; (void)to; (void)flags;
+    (*(unsigned long *)ctx)++;
+    return 0;
+}
+
+static void *worker(void *arg) {
+    scratch_pool *p = (scratch_pool *)arg;
+    const char *data = "xxabbbcyy abcyy";
+    unsigned long hits = 0;
+    for (int i = 0; i < 1000; i++) {
+        hs_scratch_t *s = pool_get(p);
+        hs_error_t rc = hs_scan(p->db, data, (unsigned int)strlen(data), 0,
+                                s, on_match, &hits);
+        pool_put(p, s);
+        if (rc != HS_SUCCESS) {
+            fprintf(stderr, "scan rc=%d\n", rc);
+            break;
+        }
+    }
+    return (void *)hits;
+}
+```
+
+第五步，给池加扩容策略。上面的实现是「池空即阻塞」，简单但尾延迟不可控。生产上更常见的是「池空时新建，但设上限」：上限之内新建，超过上限再阻塞。新建时仍然走 `hs_alloc_scratch(db, &fresh)`，保证容量与库匹配。若宿主有多个数据库，新建时要对每个库都调一次，直到全部返回 `HS_SUCCESS`。
+
+第六步，接线程绑定。把 worker 绑到固定 CPU 核可以减少迁移带来的缓存失效，尤其是 scratch 较大时。绑定方式依平台而异，Linux 上用 `pthread_setaffinity_np`。绑核不是必须的，但在高吞吐场景下通常能带来可测量的提升，且让性能数据更稳定。
+
+第七步，做容量核算。总内存约等于「池内 scratch 数 × 单块大小 + 数据库大小 + 流状态总量」。单块大小用 `hs_scratch_size` 实测，不要估算。如果池上限是 16、单块 512 KB，光 scratch 就是 8 MB，这在容器内存限制下需要写进 requests/limits，否则会被 OOM kill。
+
+### 4. 验证方法与预期结果
+
+验证的核心是「并发下命中数守恒」。构造一段确定的数据与模式，让每个 worker 跑固定轮次，汇总所有 worker 的命中数，应当等于「单线程轮次 × 每轮命中数 × worker 数」。任何短缺都说明有扫描被跳过或提前终止，任何超出都说明有重复计数。
+
+```text
+scratch size = 524288 bytes
+worker 0 hits = 2000
+worker 1 hits = 2000
+worker 2 hits = 2000
+worker 3 hits = 2000
+total hits = 8000
+elapsed = 0.42 s
+```
+
+这是示例输出，具体格式需对照实际版本核验；`scratch size` 随数据库复杂度与平台变化，命中数与轮次由测试参数决定。逐行判读：第一行的 `scratch size` 是单块 scratch 的字节数，用它乘池容量得到 scratch 总占用，这是容量规划的唯一可靠输入；中间四行是每个 worker 的累计命中，四个值必须完全相等，若某个偏低，检查该 worker 是否提前 `break`、是否拿到了未初始化的 scratch、是否被信号中断；`total hits` 必须是单 worker 的四倍，不等就说明有共享状态被竞争，最常见的是把 `hits` 放在了共享结构里而没有原子保护；最后一行的 `elapsed` 用于算吞吐，但要注意它包含线程创建与销毁，真正的稳态吞吐应在线程池预热后再测。
+
+如果验证时看到 `scan rc=-10`，说明 `HS_SCRATCH_IN_USE`，即同一块 scratch 被两个线程同时使用。定位方法是给每块 scratch 打上所有者标记（在调试构建里用一个 `int owner` 字段记录线程 id），冲突时打印两块的所有者。生产环境不要保留这种调试字段，用池化本身就能从结构上杜绝。
+
+如果看到命中数正确但进程 RSS 持续上涨，检查是否在池空时无上限新建、以及归还路径是否被异常分支跳过。C 代码里最常见的泄漏是「扫描失败直接 return，忘了 pool_put」，把归还放进 `goto cleanup` 或统一出口能避免绝大多数。
+
+三种方案的取舍用一张表固定下来，选型时按「并发形态 + 内存预算 + 实现成本」三列打分。
+
+| 方案 | 内存占用 | 并发安全 | 典型失败表现 | 适用场景 |
+|---|---|---|---|---|
+| 每线程一份 | 线程数 × 单块 | 安全 | clone 后忘记释放，缓慢泄漏 | 固定线程池，线程长期存活 |
+| 一库一 scratch | 库数 × 单块 | 仅串行安全 | 并发时 `HS_SCRATCH_IN_USE` | 单线程轮询多库 |
+| 池化 + clone/新建 | 池容量 × 单块 | 安全 | 池空阻塞导致尾延迟 | 短任务高并发服务 |
+| 池化 + 每线程缓存 | 介于两者之间 | 安全 | 缓存与池边界不清，重复借用 | 线程池加突发流量 |
+
+表的第三行与第四行需要区分：纯池化是「每次扫描都借还」，开销在锁竞争；线程本地缓存是「线程首次借用后长期持有，空闲超时再归还」，开销低但内存回收慢。后者实现复杂度明显更高，只有在锁竞争成为瓶颈时才值得。
+
+### 5. 常见失败与排错
+
+第一类失败是 `HS_SCRATCH_IN_USE`。这个返回码的含义是「这块 scratch 的 `in_use` 标记已被置位」，源码侧的对应是 `src/scratch.h` 里的 `markScratchInUse` 与 `unmarkScratchInUse`。它不是「库检测到数据竞争」，而是「库发现有人正在用」，所以它只能捕获「同一时刻进入」的情况，捕获不了「上一个刚走、状态还没清干净」的时序问题。看到这个码，处置只有一个方向：确保每个并发路径有独立 scratch，而不是加重试。
+
+第二类失败是命中数不稳定。压测时总数对，但每次分布不同，或者偶尔少几条。这类问题的根因通常不是 scratch，而是回调里写了共享状态：多个线程同时 `hits++`，非原子操作会丢更新。排查方法是在回调里只做「写线程本地变量」，汇总放到线程结束后。回调本身应当是短小的、无锁的、不做 I/O 的，这既是正确性要求也是性能要求。
+
+第三类失败是池饥饿。表现为吞吐上不去、延迟长尾、`pool_get` 长时间阻塞。根因有三种：池容量小于实际并发、某条路径借了不还、扫描耗时远超预期导致借还比失衡。诊断方法是给 `pool_get` 加等待计时，若 P99 等待时间与扫描时间同量级，说明容量不足；若等待时间无限增长，说明有泄漏。
+
+第四类失败是嵌套扫描死锁。回调里再次 `hs_scan` 并从同一个池借 scratch，外层占着一块、内层等一块，池容量为 1 时必然死锁。处置是给嵌套路径准备专用 scratch，或在设计上禁止回调内扫描。这条限制在 `runtime.rst` 里有明确说明，不是实现缺陷。
+
+第五类失败是 `hs_clone_scratch` 之后忘记 `hs_free_scratch`。clone 是深拷贝，会分配新内存，不释放就是稳定泄漏，表现是进程运行几天后 RSS 翻倍。排查用 valgrind 或 heaptrack，看分配栈是否落在 `hs_clone_scratch`。还有一种变体是「clone 了但从未使用」，属于设计冗余，删掉即可。
+
+第六类失败是扩容路径写错。典型写法是 `hs_alloc_scratch(db2, &scratch)` 之后继续用旧变量，忽略了库可能已经释放旧块并返回新指针。正确写法永远是使用 `&scratch` 让库回写，然后只用 `scratch` 这个变量。这个坑在「先分配 A 库、再分配 B 库」时必现，因为 B 库更大时一定会触发重新分配。
+
+最后是一类性能问题而非错误：线程数与吞吐不是线性关系。加线程到一定程度后，瓶颈转移到内存带宽或数据库的共享读竞争，吞吐不再上涨，延迟反而上升。判断方法是画「线程数 → 吞吐」曲线，找拐点，把工作线程数定在拐点之前。这个拐点与模式集、数据特征、NUMA 拓扑都相关，必须实测，不能照抄别人的配置。
+
+### 6. 小结
+
+本篇的结论可以压缩成三句话：数据库共享读，scratch 独占写；`hs_alloc_scratch` 对多库要反复调用并接受回写的新指针；池化把 scratch 从线程私有变成请求借用，用借还协议换取内存效率。
+
+三种方案的适用边界要记牢。每线程一份最简单，适合固定线程池；一库一 scratch 只适合串行轮询多库，多线程下必错；池化适合短任务高并发，但要额外设计扩容与归还保证。无论哪种方案，回调都应当无锁、无 I/O、只写本地状态，这是并发正确性的前提。
+
+排错时按「返回码 → 命中数 → 内存曲线」三步走：`HS_SCRATCH_IN_USE` 查独占，命中数不稳查共享状态，RSS 上涨查 clone 与归还路径。这三步能覆盖绝大多数线上问题。
+
+下一步，如果服务是流式的，读 03-05，那里会引入第三种可变对象——流状态，它与 scratch 的独占规则相同但生命周期更长。scratch API 全集见 04-06，`hs_scratch` 字段与 `in_use` 语义见 05-03，运行时 API 的线程约定见 04-05，`runtime` 模块见 07-10。完整 API 见 04-04 ~ 04-06。
+
+## 03-05 流式接入：TCP/文件流的分块与状态管理
+
+### 1. 目标与拓扑
+
+前四篇扫描的都是「一块完整内存」，数据在扫描开始前已经全部就绪。真实网络服务不是这样：TCP 字节流按段到达，文件按块读入，一条模式可能横跨两个甚至十几个块。流式模式要解决的就是这个问题——把「跨块」变成库的内部状态，让调用方只需按到达顺序把数据喂进去。
+
+本篇的目标是跑通一条完整的流：编译流式数据库、开流、分三块写入、在第三块观察到跨块匹配、关流触发 EOD、再用 `hs_reset_stream` 复用同一个流对象扫第二遍。做完这一步，应该能回答三个问题：块边界为什么不需要调用方处理、匹配偏移是相对于什么的、关流时为什么还可能产生新匹配。
+
+流对象的生命周期与状态迁移如图 03-05-01。与 block 模式最大的差别是多了「打开」与「关闭」两个端点，以及从「扫描中」分出的三条支路：重置、分叉、压缩。
+
+:::figure id=03-05-01 | name=流对象的打开扫描关闭与三条管理支路 | dir=TD
+node n1 "hs_open_stream 开流" blue
+node n2 "逐块 hs_scan_stream" green
+node n3 "跨块状态累积" teal
+node n4 "hs_close_stream 补报 EOD" amber
+node n5 "hs_reset_stream 原地复用" teal
+node n6 "hs_copy_stream 分叉" purple
+node n7 "hs_compress_stream 压缩" gray
+node n8 "关闭后句柄失效" red
+edge n1 -> n2 "返回流句柄"
+edge n2 -> n3 "状态随块推进"
+edge n3 -> n2 "下一块继续"
+edge n2 -> n4 "数据写完"
+edge n3 -> n5 "清空状态"
+edge n3 -> n6 "复制当前状态"
+edge n3 -> n7 "降内存占用"
+edge n4 -> n8 "不可再用"
+edge n5 -> n2 "重新开始"
+:::
+
+图 03-05-01 里有一条回边（`n3` 回到 `n2`），它代表「块可以有很多个」；这条回边是流式与 block 的本质区别，也是状态必须存在的理由。另一条容易忽略的边是 `n3` 到 `n7`：压缩不是为了加速，而是为了在内存紧张时把「暂时不活跃的流」缩小，活跃流压缩反而更慢。
+
+需要预先纠正一个常见误解：流式模式并不会「自动处理乱序」。它假定调用方按字节顺序投递数据，第 N 块的第 0 个字节紧接在第 N-1 块的最后一个字节之后。如果实际到达顺序乱了，库无法察觉，只会基于错误的历史推出错误的匹配。重传、去重、重组都是宿主或 TCP 栈的职责，`examples/pcapscan.cc` 里的五元组到流 id 的映射就是宿主侧做重组的一个示例，它本身不提供重组能力。
+
+第二个要理解的点是偏移语义。流式回调里的 `to` 是「相对于流开始」的绝对偏移，不是相对于当前块。第一块 100 字节、第二块 50 字节，那么第二块里命中的 `to` 落在 100 到 150 之间。这个设计让宿主不必自己累加偏移，但也意味着不能把不同流的偏移混在一起比较。若开启了 SOM，`from` 同样相对于流开始，且受 horizon 限制，超出范围返回 `HS_OFFSET_PAST_HORIZON`。
+
+第三个点是 EOD。`hs_close_stream` 不只是释放内存，它还会「补报」依赖流结束才能确定的匹配，例如以 `$` 结尾的模式、`\b` 在流末尾的断言、以及某些只在输入结束时才能确认的构造。这意味着关流时回调可能再次被调用，命中数可能增加。不理解这一点，就会把「关流后多了一条命中」当成 bug。`runtime.rst` 明确写了零宽断言可能导致「最后字符上的匹配延迟到下一次写入或关流」。
+
+还有一个工程细节值得提前说明：`hs_scan_stream` 的长度参数是 `unsigned int`，单次写入的上限是 4 GiB 减一。这对逐段到达的 TCP 流量几乎不可能触发，但对「按文件块读取」的场景要留意——不要一次 `read` 整个大文件再传入，既会溢出长度参数，也会让单次调用长时间占用 scratch。合理做法是固定 64 KB 到 1 MB 的块大小，与操作系统的页大小和网络 MTU 配合。块越小，单次调用开销占比越高；块越大，内存峰值越高，需要在压测里找平衡点。
+
+第四个点是「流不是缓冲区」。Hyperscan 不保存原始数据，只保存推导匹配所需的状态；因此不能从流里「读回」历史字节，也不能把流当作环形缓冲使用。需要保留原文的场景（例如命中后要展示上下文），必须在宿主侧另存一份滑动窗口。这个窗口的大小由业务决定，与库无关；库只需要按序收到数据，不关心宿主是否另存。
+
+### 2. 前置条件与环境
+
+第一位的条件是数据库必须是流模式。用 `HS_MODE_BLOCK` 编译的数据库调 `hs_open_stream` 会返回 `HS_DB_MODE_ERROR`，这是编译期就该定好的选择，不能运行期切换。如果同一套模式既要支持块扫描又要支持流扫描，就编译两个数据库，分别用各自的 API 扫描——`examples/pcapscan.cc` 正是这么做的，它同时构建 `db_streaming` 与 `db_block`，再用一块能覆盖两者的 scratch 服务两条路径。
+
+第二位是内存预算。每个流对象占一块固定大小的内存，大小由 `hs_stream_size` 给出。这个值在编译期就确定，运行期不随数据量增长（这是「无扫描期分配」的设计目标）。十万并发流乘以单流大小，就是流状态的总内存，必须提前算进容量规划。压缩可以把不活跃流变小，但压缩表示不能直接扫描，必须先展开。
+
+第三位是 scratch。流式扫描同样需要 scratch，规则与 03-04 完全一致：每个并发调用者一份，不能共享。一个线程可以同时持有多个流，但同一时刻只能用一块 scratch 扫描其中一个；如果要在回调里扫描另一个流，需要额外一块。
+
+第四位是线程与流的绑定关系。`hs_stream_t *` 本身不是线程安全的，同一个流不能被两个线程同时 `hs_scan_stream`。常见的正确模型是「一个连接固定在一个工作线程上」，连接的整个生命周期内只由该线程操作。若必须迁移线程（例如负载均衡重分配），要先确保原线程不再触碰该流，再移交指针。
+
+最后确认一件事：宿主是否需要在流上做「预读」或「回放」。Hyperscan 不支持回放已经扫描过的数据，`hs_reset_stream` 只能把流清空重来，不能回到某个历史位置。需要「从某个点重放」的场景，只能在宿主侧缓存原始字节并重新开流。
+
+### 3. 分步操作
+
+第一步，编译流式数据库。与 block 版本唯一的差别是第三个参数传 `HS_MODE_STREAM`。如果模式需要起始偏移，还要叠加 `HS_MODE_SOM_HORIZON_*`，本篇不涉及。
+
+第二步，量流大小并分配 scratch。`hs_stream_size` 接收数据库指针，返回单流字节数；`hs_alloc_scratch` 的用法与 block 完全一致。
+
+```c
+size_t stream_size = 0;
+if (hs_stream_size(db, &stream_size) != HS_SUCCESS) {
+    return 1;
+}
+printf("stream size = %zu bytes\n", stream_size);
+
+hs_scratch_t *scratch = NULL;
+if (hs_alloc_scratch(db, &scratch) != HS_SUCCESS) {
+    return 1;
+}
+```
+
+第三步，开流并分块写入。下面这份程序把 `xxabbbcyy` 拆成 `xxab`、`bb`、`cyy` 三块，模式 `ab+c` 横跨第二块与第三块。程序在每次写入后打印当前命中数，可以直观看到匹配是在第三块才出现的。
+
+```c
+#include <stdio.h>
+#include <string.h>
+#include <hs.h>
+
+static int on_match(unsigned int id, unsigned long long from,
+                    unsigned long long to, unsigned int flags, void *ctx) {
+    (void)id; (void)from; (void)flags;
+    printf("match end=%llu\n", to);
+    (*(int *)ctx)++;
+    return 0;
+}
+
+int main(void) {
+    const char *pattern = "ab+c";
+    hs_database_t *db = NULL;
+    hs_compile_error_t *err = NULL;
+    if (hs_compile(pattern, HS_FLAG_DOTALL, HS_MODE_STREAM, NULL,
+                   &db, &err) != HS_SUCCESS) {
+        fprintf(stderr, "compile failed: %s\n", err->message);
+        hs_free_compile_error(err);
+        return 1;
+    }
+
+    size_t stream_size = 0;
+    hs_stream_size(db, &stream_size);
+    printf("stream size = %zu bytes\n", stream_size);
+
+    hs_scratch_t *scratch = NULL;
+    if (hs_alloc_scratch(db, &scratch) != HS_SUCCESS) {
+        hs_free_database(db);
+        return 1;
+    }
+
+    hs_stream_t *stream = NULL;
+    if (hs_open_stream(db, 0, &stream) != HS_SUCCESS) {
+        hs_free_scratch(scratch);
+        hs_free_database(db);
+        return 1;
+    }
+
+    int hits = 0;
+    const char *c1 = "xxab";
+    const char *c2 = "bb";
+    const char *c3 = "cyy";
+
+    hs_scan_stream(stream, c1, (unsigned int)strlen(c1), 0, scratch,
+                   on_match, &hits);
+    printf("after chunk 1 hits=%d\n", hits);
+    hs_scan_stream(stream, c2, (unsigned int)strlen(c2), 0, scratch,
+                   on_match, &hits);
+    printf("after chunk 2 hits=%d\n", hits);
+    hs_scan_stream(stream, c3, (unsigned int)strlen(c3), 0, scratch,
+                   on_match, &hits);
+    printf("after chunk 3 hits=%d\n", hits);
+
+    hs_close_stream(stream, scratch, on_match, &hits);
+    printf("after close hits=%d\n", hits);
+
+    hs_free_scratch(scratch);
+    hs_free_database(db);
+    return 0;
+}
+```
+
+第四步，复用流做第二遍扫描。不要 `close` 再 `open`，而是 `hs_reset_stream`，它把状态清空但保留内存，等价于关流但不释放。这个差别在高频短连接场景下很可观：省掉一次分配与一次释放。
+
+```c
+hs_reset_stream(stream, scratch, on_match, &hits);
+hs_scan_stream(stream, "abbbc", 5, 0, scratch, on_match, &hits);
+```
+
+第五步，做分叉。协议解析里有「同一条流按两种假设分别推进」的需求，例如同时按 HTTP 与按裸 TCP 解析。`hs_copy_stream` 复制当前状态到新流，两条流之后各自独立推进，互不影响。若目标流已存在，用 `hs_reset_and_copy_stream` 把复制与重置合并，避免一次分配。
+
+第六步，做状态持久化。长连接可能空闲很久，把流压缩后存到堆外或磁盘，需要时再展开，可以显著降低常驻内存。`hs_compress_stream` 需要调用方提供缓冲区，空间不足时返回 `HS_INSUFFICIENT_SPACE` 并回写所需大小；拿到大小后重新分配再压一次即可。恢复时用 `hs_expand_stream`，或对已有流用 `hs_reset_and_expand_stream`。
+
+```c
+size_t need = 0;
+hs_error_t rc = hs_compress_stream(stream, NULL, 0, &need);
+if (rc == HS_INSUFFICIENT_SPACE) {
+    char *buf = (char *)malloc(need);
+    size_t used = 0;
+    if (hs_compress_stream(stream, buf, need, &used) == HS_SUCCESS) {
+        printf("compressed %zu bytes\n", used);
+    }
+    free(buf);
+}
+```
+
+第七步，接真实数据源。TCP 场景下每次 `recv` 返回一块，直接把缓冲区与长度传给 `hs_scan_stream`，不要自己攒包，也不要按行切分——块边界不影响匹配是这套 API 的核心承诺。文件场景按固定大小读块，最后一块可能短于块大小，正常传入即可。连接关闭时调 `hs_close_stream`，不要只 `free` 指针。
+
+### 4. 验证方法与预期结果
+
+上面程序的输出如下。这是示例输出，具体格式需对照实际版本核验；`stream size` 随数据库与平台变化，命中数与偏移是确定的。
+
+```text
+stream size = 4096 bytes
+after chunk 1 hits=0
+after chunk 2 hits=0
+match end=7
+after chunk 3 hits=1
+after close hits=1
+```
+
+逐行判读：第一行的 `stream size` 是单流常驻内存，多头并发时用它乘流数估算总量；这个值不含 scratch，也不含数据库本身。第二、三行都是 0，说明前两块单独看都不构成完整匹配——`xxab` 与 `xxabbb` 都缺结尾的 `c`，这正是「跨块状态被保留」的证据；如果这里就出现命中，说明模式写错或块切分与预期不符。第四行的 `match end=7` 出现在第三块写入期间，`7` 是相对于流开始的绝对偏移，不是相对于第三块（第三块只有 3 字节，相对偏移最大是 3），这一条是判读流式偏移的关键。第五行 `after chunk 3 hits=1` 确认匹配只报一次，没有因为跨块而重复。最后一行 `after close hits=1` 说明本例没有 EOD 匹配；若模式以 `$` 结尾，这里会变成 2，那是正常行为而不是重复上报。
+
+为了验证 EOD 语义，把模式换成 `cyy$` 再跑一遍。预期是前三块都没有命中，`after close` 时才出现一条 `end=9`。这个对照能直接把「关流会补报」从文档结论变成观察事实。注意 `$` 在流式下默认匹配流末尾，若加了 `HS_FLAG_MULTILINE` 则语义变为匹配行尾，两者结果不同。
+
+流式 API 的分工与失败表现见下表，排错时按「哪一步失败」定位。
+
+| API | 作用 | 典型失败 | 失败含义 |
+|---|---|---|---|
+| `hs_open_stream` | 创建流状态 | `HS_DB_MODE_ERROR` | 数据库不是流模式 |
+| `hs_scan_stream` | 写入一块数据 | `HS_SCAN_TERMINATED` | 回调返回非零 |
+| `hs_close_stream` | 补 EOD 并释放 | 无专属错误码 | 句柄用错会崩溃 |
+| `hs_reset_stream` | 清空复用 | 无专属错误码 | 流未打开 |
+| `hs_copy_stream` | 复制分叉 | `HS_NOMEM` | 流状态内存不足 |
+| `hs_compress_stream` | 压缩表示 | `HS_INSUFFICIENT_SPACE` | 缓冲区不够，需扩容 |
+
+压缩效果也要实测，不能假设。典型情况下，刚打开的空流压缩后非常小，活跃流压缩后接近原大小，甚至因为头部开销略大。所以压缩的适用对象是「长时间不活跃但还不能关」的流，不是所有流。`runtime.rst` 明确不建议在每次扫描前后都压缩，因为转换本身有成本。
+
+最后一项验证是顺序性。把三块故意按 `c1`、`c3`、`c2` 的顺序喂进去，观察结果。预期是零命中或错误命中，且库不会报错。这个实验说明「库不检测乱序」，从而把顺序保证明确划归宿主责任。
+
+### 5. 常见失败与排错
+
+第一类失败是 `HS_DB_MODE_ERROR`。原因只有一种：拿 block 或 vectored 数据库去开流。处置不是重试，而是回到编译处，确认第三个参数是 `HS_MODE_STREAM`。如果同一套模式两种模式都要，就编译两份，别想着共用。
+
+第二类失败是「跨块漏匹配」。现象是整块扫描能命中，分块后不命中。根因通常不是库，而是调用方在块之间做了「重置」或「重新开流」。检查点有三个：是否每块都用了同一个 `hs_stream_t *`；是否在块之间误调了 `hs_reset_stream`；是否把 `hs_close_stream` 放在了循环里。还有一种隐蔽原因是块指针指向的缓冲区在下次 `recv` 时被覆盖，而库并不复制数据——`hs_scan_stream` 是同步的，返回后就可以复用缓冲区，但在返回前不能改。
+
+第三类失败是「关流时多出命中」。这不是失败，是 EOD 语义。判据是看模式是否含 `$`、`\b`、`\z` 一类依赖末尾的构造，以及是否含只在输入结束才能确认的有界重复。如果业务不希望这类匹配，改写模式而不是改调用方式。
+
+第四类失败是流泄漏。现象是长跑服务 RSS 缓慢上涨，连接数下降但内存不降。根因是异常路径忘了 `hs_close_stream`，或者只 `free` 了宿主自己的连接结构而没关流。排查方法是在连接结构里放一个「流已关闭」标志，析构时断言；或用分配器钩子统计 `hs_open_stream` 与 `hs_close_stream` 的配对次数。
+
+第五类失败是「终止后继续写」。回调返回非零会让 `hs_scan_stream` 返回 `HS_SCAN_TERMINATED`，此时流进入「不可再写」状态，后续任何 `hs_scan_stream` 都立即返回同一个码。正确处理是停止写入并调用 `hs_close_stream` 完成清理；`runtime.rst` 明确写了「调用方仍必须调用 `hs_close_stream`」。忽略这一点会泄漏流状态。
+
+第六类失败是 SOM 相关。开了 `HS_FLAG_SOM_LEFTMOST` 后，若匹配起点早于 horizon，回调里的 `from` 是 `HS_OFFSET_PAST_HORIZON`（全 1 值），不是真实偏移。很多代码直接把它当偏移用，算出巨大的负数或越界。判据是「`from` 等于 `(unsigned long long)-1`」，处置是业务上放弃该条命中的起始位置，或改用更大的 horizon（代价是流状态变大）。horizon 常量与状态大小的关系见 04-03，原理见 06-10。
+
+第七类问题不是错误，而是调度不公平。一个线程管理上万条流时，如果按「来一块扫一块」的顺序处理，某条高频流会长期占用 scratch，低频流的 EOD 迟迟不触发，表现为「连接关了但匹配迟到」。解决办法是给每条流设一个待处理队列，按轮转或时间片调度，并在连接关闭时优先处理关流。流状态本身不要求实时推进，只要求同一流内严格有序；跨流的处理顺序完全由宿主决定，库不提供任何公平性保证。
+
+### 6. 小结
+
+流式接入的骨架是 `hs_open_stream` → 多次 `hs_scan_stream` → `hs_close_stream`，三条管理支路是重置、分叉、压缩。四个必须记住的事实：块边界不影响匹配；偏移是相对于流开始的绝对值；关流会补报 EOD 匹配；库不检测乱序，顺序由宿主保证。
+
+工程建议有四条。第一，流与连接同生命周期、同线程，不要跨线程共享流指针。第二，异常路径统一走「关流」出口，用配对计数或断言防泄漏。第三，压缩只用于不活跃流，且要按「压缩—存储—展开」的完整路径做压测。第四，容量规划用 `hs_stream_size` 实测值乘并发流数，不要用平均值估算。
+
+下一步，如果需要捕获组或反向引用，纯 Hyperscan 做不到，读 03-06 用 Chimera 落地。流式 API 全集见 04-05，`hs_stream` 的组成与压缩表示见 05-09，流状态压缩原理见 06-11，SOM 槽位与 horizon 见 06-10。完整 API 见 04-04 ~ 04-06。
+
+## 03-06 Chimera 部署与 PCRE 依赖落地
+
+### 1. 目标与拓扑
+
+前五篇用的都是纯 Hyperscan。它有一条硬边界：不支持捕获子表达式、不支持反向引用、不支持递归与条件模式。这些不是实现偷懒，而是自动机模型的必然——DFA/NFA 没有「记住第 N 组匹配了什么再拿来比较」的机制。当业务确实需要「取出用户名与域名」「匹配重复单词」这类能力时，纯 Hyperscan 只能做到「定位候选」，做不到「给出结构」。
+
+Chimera 就是为这条边界准备的。它的设计是两段式：Hyperscan 负责快速排除绝大多数位置，PCRE 负责在候选位置上做完整匹配并返回捕获组。因为 PCRE 只在前者命中时才运行，平均成本远低于「对所有位置跑 PCRE」；但因为每次候选都要进一次回溯引擎，命中率高的场景收益会迅速下降。
+
+两段式的链路如图 03-06-01。上半段是 Hyperscan 的预过滤库，下半段是 PCRE 编译出来的程序，两者在 `ch_compile` 时一起生成，在 `ch_scan` 时协同工作。
+
+:::figure id=03-06-01 | name=Chimera 的预过滤与 PCRE 确认两段式链路 | dir=TD
+node a "正则 含捕获组或反向引用" blue
+node b "ch_compile 编译" teal
+node c "Hyperscan 预过滤库" amber
+node d "PCRE 编译程序" amber
+node e "ch_scan 扫描缓冲区" green
+node f "候选位置 粗筛结果" purple
+node g "PCRE 确认并取捕获组" purple
+node h "ch_capture_t 回调" green
+edge a -> b "输入"
+edge b -> c "生成"
+edge b -> d "生成"
+edge c -> e "快速排除"
+edge d -> e "参与确认"
+edge e -> f "少量候选"
+edge f -> g "逐候选回溯"
+edge g -> h "带 from 与 to"
+:::
+
+图 03-06-01 里 `c` 与 `d` 同时指向 `e`，容易被误读为「两个引擎并行扫描」。实际关系是串联：Hyperscan 先跑，命中一个位置才唤醒 PCRE 在该位置做确认。图中合并到 `e` 只是为了表达「同一次 `ch_scan` 调用内部完成两段」，不是两个独立扫描。
+
+串联模型决定了性能曲线的形状。设单字节的预过滤成本为 a，单次 PCRE 确认成本为 b，候选率为 r（每字节触发多少次确认），则总成本约等于 `a + r × b`。当 r 接近 0 时，Chimera 的成本与纯 Hyperscan 几乎相同，这是它最舒服的工作区；当 r 接近 1（几乎每个位置都命中）时，成本被 `b` 主导，可能比「直接跑 PCRE」还慢，因为多了预过滤的开销。所以选型时不能只看「模式是否复杂」，要看「在真实语料上候选率有多高」。候选率高的规则，要么改写模式提高前缀特异性，要么从 Chimera 里移出去单独处理。
+
+这也解释了一个常见现象：同一套 Chimera 规则，在测试语料上很快，在生产流量上慢十倍。不是库退化，是候选率变了。测试语料往往是「精心挑选的命中样本」，候选率天然高；生产流量里大部分是不命中数据，候选率低。做容量评估必须用生产抽样，不能用命中样本集。
+
+第二个要理解的点是模式语法的分配。Chimera 的表达式先交给 PCRE 解析，再由 Hyperscan 提取可预过滤的部分。这意味着反向引用、捕获组、前后瞻等构造在 Chimera 里是合法的，而在纯 Hyperscan 里会被拒绝。代价是这些构造无法被 Hyperscan 高效预过滤，只能退化成「用较弱的字面前缀做粗筛，再让 PCRE 确认」，性能取决于模式里有多少可提取的字面量。
+
+第三个点是模式标志的差异。Chimera 有自己的 `CH_FLAG_*`，语义与 `HS_FLAG_*` 相似但不完全相同：`CH_FLAG_CASELESS`、`CH_FLAG_DOTALL`、`CH_FLAG_MULTILINE`、`CH_FLAG_SINGLEMATCH`、`CH_FLAG_UTF8`、`CH_FLAG_UCP` 是常用的一组，没有 `SOM_LEFTMOST`、`PREFILTER`、`COMBINATION` 这些 Hyperscan 专属项。因为 PCRE 确认阶段天然知道起点，Chimera 不需要 SOM 标志就能给出 `from`。完整标志表见 04-02 的 Chimera 小节。
+
+第四个点是模式（mode）参数。Chimera 的 `mode` 不是 block/stream 的选择，而是「是否捕获子表达式」：`CH_MODE_NOGROUPS` 与 `CH_MODE_GROUPS` 二选一。这是一个极易混淆的设计——它复用了 `mode` 这个参数名，但语义与 Hyperscan 的 `HS_MODE_*` 完全不同。传错会导致「编译成功但回调里 `size` 只有 1」，即只有整体匹配没有分组。
+
+### 2. 前置条件与环境
+
+Chimera 不是默认构建产物，需要 PCRE 开发库并在 CMake 阶段被找到。依赖与检查方式见下表。
+
+| 依赖 | 用途 | 检查方式 |
+|---|---|---|
+| PCRE 8.41+ | 确认阶段的正则引擎 | `pcre-config --version` |
+| `libhs` | 预过滤与数据库 | `pkg-config --modversion libhs` |
+| C++ 运行库 | `ch_compile.cpp` 用 C++ 实现 | `g++ --version` |
+| `libchimera.a` | Chimera 静态库 | `ls <prefix>/lib/libchimera.a` |
+| `libch.pc` | pkg-config 元数据 | `pkg-config --libs libch` |
+
+第一行要注意版本。Chimera 的 PCRE 依赖是 8.x 系列，不是 PCRE2；两者 API 不兼容，装错会在链接期报 `pcre_compile` 未定义。源码侧的证据是 `chimera/CMakeLists.txt` 里 `include_directories(${PCRE_INCLUDE_DIRS})` 与 `target_link_libraries(chimera hs pcre)`，链接的是 `pcre` 而不是 `pcre2-8`。
+
+第二个要注意的是 Chimera 只构建静态库。`chimera/CMakeLists.txt` 第 30 行是 `add_library(chimera STATIC ${chimera_SRCS})`，没有 `BUILD_SHARED_LIBS` 分支。这意味着宿主必须静态链接 `libchimera.a`，同时把它的两个依赖 `libhs` 与 `libpcre` 也链上，顺序是 `-lchimera -lhs -lpcre`。顺序错了会报大量未定义符号，因为静态库的解析是单遍从左到右。
+
+第三个要注意的是 C++ 链接。`ch_compile.cpp` 是 C++ 实现，即使宿主是纯 C 程序，最终链接也要带 `libstdc++`。最省事的做法是用 `g++` 驱动链接，或在 `gcc` 命令后补 `-lstdc++ -lm`。这一点与 03-02 里静态链接 `libhs` 的情形相同，根因都是「C API 背后有 C++ 实现」。
+
+第四个要注意的是头文件路径。Chimera 的头在安装时进 `include/hs`，但源码树里在 `chimera/` 目录，且内部包含写作 `#include "hs_common.h"`。用安装版时直接 `#include <chimera/ch.h>` 或 `#include <ch.h>` 取决于安装布局，需对照实际版本核验；稳妥做法是看 `chimera/CMakeLists.txt` 的 `install(FILES ${chimera_HEADERS} DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/hs")`，它把 `ch.h`、`ch_compile.h`、`ch_runtime.h`、`ch_common.h` 都铺进 `include/hs`，因此代码里应写 `#include <ch.h>` 并加 `-I<prefix>/include/hs`。
+
+### 3. 分步操作
+
+第一步，确认 Chimera 已随主库构建。构建时若 PCRE 未找到，`chimera` 目标会被跳过而不报错（取决于 CMake 配置），所以必须显式检查产物。没有产物就先装 PCRE 开发包再重跑 `cmake`。
+
+```bash
+pcre-config --version
+ls /opt/hs/lib/libchimera.a
+pkg-config --cflags --libs libch
+```
+
+如果第二条命令报文件不存在，说明 Chimera 没构建。重跑配置时观察 CMake 输出里是否有 `PCRE` 相关行，多数情况下是 `PCRE_INCLUDE_DIRS` 或 `PCRE_LIBRARIES` 没找到。装好开发包后不需要改任何代码，重新 `cmake` 与 `make` 即可；如果仍旧跳过，检查是否用了 `-DBUILD_CHIMERA=OFF` 一类选项，具体变量名需对照实际版本的 `CMakeLists.txt` 核验，因为不同发行版打包时可能改名。
+
+第二步，写扫描程序。下面的例子用 `(\w+)@(\w+)\.com` 从一段文本里取用户名与域名，开启了大小写不敏感与捕获组模式。回调里遍历 `captured` 数组，按 `CH_CAPTURE_FLAG_ACTIVE` 过滤未参与匹配的组。
+
+```c
+#include <stdio.h>
+#include <string.h>
+#include <ch.h>
+
+static int on_match(unsigned int id, unsigned long long from,
+                    unsigned long long to, unsigned int flags,
+                    unsigned int size, const ch_capture_t *captured,
+                    void *ctx) {
+    (void)flags;
+    printf("id=%u [%llu,%llu) groups=%u\n", id, from, to, size);
+    for (unsigned int i = 0; i < size; i++) {
+        if (captured[i].flags == CH_CAPTURE_FLAG_ACTIVE) {
+            printf("  group %u = [%llu,%llu)\n",
+                   i, captured[i].from, captured[i].to);
+        }
+    }
+    (*(int *)ctx)++;
+    return CH_CALLBACK_CONTINUE;
+}
+
+int main(void) {
+    const char *pattern = "(\\w+)@(\\w+)\\.com";
+    const char *data = "mail bob@example.com now";
+    ch_database_t *db = NULL;
+    ch_compile_error_t *cerr = NULL;
+    ch_scratch_t *scratch = NULL;
+    int hits = 0;
+
+    ch_error_t rc = ch_compile(pattern, CH_FLAG_CASELESS, CH_MODE_GROUPS,
+                               NULL, &db, &cerr);
+    if (rc != CH_SUCCESS) {
+        fprintf(stderr, "ch_compile failed: %s\n", cerr->message);
+        ch_free_compile_error(cerr);
+        return 1;
+    }
+
+    if (ch_alloc_scratch(db, &scratch) != CH_SUCCESS) {
+        ch_free_database(db);
+        return 1;
+    }
+
+    rc = ch_scan(db, data, (unsigned int)strlen(data), 0, scratch,
+                 on_match, NULL, &hits);
+    printf("scan rc=%d hits=%d\n", rc, hits);
+
+    ch_free_scratch(scratch);
+    ch_free_database(db);
+    return rc == CH_SUCCESS ? 0 : 1;
+}
+```
+
+第三步，编译链接。动手前先确认一件事：宿主是否真的需要 C++ 链接。纯 C 项目用 `gcc` 加 `-lstdc++` 可以工作，但更稳妥的是用 `g++` 驱动整个链接步骤，它会自动带入正确的运行库与启动文件。用 `gcc` 时若看到 `undefined reference to __gxx_personality_v0`，就是漏了 `-lstdc++` 的典型症状，而不是 Chimera 的问题。Chimera 是静态库，三个 `-l` 的顺序不能乱；`-lstdc++` 与 `-lm` 补在最后。用 `pkg-config` 可以省掉手写参数，但要确认 `libch.pc` 已安装。
+
+```bash
+gcc chimera_demo.c -o chimera_demo \
+    -I/opt/hs/include/hs \
+    -L/opt/hs/lib -lchimera -lhs -lpcre -lstdc++ -lm
+
+export LD_LIBRARY_PATH=/opt/hs/lib:$LD_LIBRARY_PATH
+./chimera_demo
+```
+
+第四步，验证捕获组。运行后应看到一组整体匹配加两个分组。如果只看到 `groups=1`，说明 `mode` 传成了 `CH_MODE_NOGROUPS`，回到编译处改。如果分组边界不对，检查正则里的括号是否被转义、以及是否误用了非捕获组 `(?:...)`。
+
+第五步，验证反向引用。把模式换成 `(\w+) \1`，数据换成 `the the end`，这是纯 Hyperscan 无法编译的构造。Chimera 应当编译成功并命中 `the the`。这一步是判断「是否真的需要 Chimera」的最短实验：如果所有模式都能在纯 Hyperscan 编译，就不该引入 PCRE 依赖。
+
+第六步，设置错误回调。`ch_scan` 的 `onError` 参数用于接收 `CH_ERROR_MATCHLIMIT` 与 `CH_ERROR_RECURSIONLIMIT`，分别对应 PCRE 的回溯次数超限与递归深度超限。传 NULL 表示忽略这些错误并继续匹配，代价是可能漏报。生产上建议传入并记录，因为它们是「模式写得太贪婪」的早期信号。
+
+第七步，做混合部署。真实系统很少把所有规则都交给 Chimera，常见做法是分两层：第一层用纯 Hyperscan 扫全量规则做粗筛，命中后再把候选片段交给 Chimera 做结构化确认。这样大部分流量只走第一层，只有少量候选进入 PCRE。分层的关键是两层用同一套 `id` 映射，避免确认阶段找不到对应规则。
+
+第八步，量出候选率。这是决定 Chimera 是否值得的唯一数据。做法是在纯 Hyperscan 那一层统计「每字节命中次数」，再除以总字节数；也可以在同一批语料上分别跑纯 Hyperscan 与 Chimera，比较总耗时。若候选率低于千分之一，Chimera 的额外成本通常可忽略；若高于百分之一，就要重新审视模式写法。测量脚本建议固定语料、固定重复次数、固定 CPU 绑核，方法学与 `hsbench` 的用法见 08-01。
+
+### 4. 验证方法与预期结果
+
+上面的程序输出如下。这是示例输出，具体格式需对照实际版本核验；偏移是确定的，`groups` 数量由模式里捕获组个数决定。
+
+```text
+id=0 [5,20) groups=3
+  group 0 = [5,20)
+  group 1 = [5,8)
+  group 2 = [9,16)
+scan rc=0 hits=1
+```
+
+逐行判读：第一行 `id=0 [5,20) groups=3` 说明整体匹配从第 5 字节到第 20 字节（左闭右开），`groups=3` 表示捕获数组有三个元素，包含整体匹配与两个子组。注意 Chimera 的 `from` 是真实起点，这一点与纯 Hyperscan 默认不给起点不同，因为 PCRE 确认时天然知道起点。第二行 `group 0` 是整体匹配，起止与第一行相同，这是 PCRE 的约定：第 0 组永远是整个模式。第三行 `group 1 = [5,8)` 是 `(\w+)` 捕获到的 `bob`，三个字节，边界正确。第四行 `group 2 = [9,16)` 是 `(\w+)` 捕获到的 `example`，从 `@` 之后开始、到 `.` 之前结束，长度七字节。最后一行 `scan rc=0 hits=1` 表示扫描正常完成且只命中一次；如果 `rc` 是 `-3`，说明回调返回了 `CH_CALLBACK_TERMINATE`；如果 `rc` 是 `-4`，是编译错误而非扫描错误，应看 `cerr->message`。
+
+判读时最常犯的错是把 `size` 当成「匹配到的子组个数」而不含整体匹配。`size` 是 `captured` 数组的有效长度，恒等于「捕获组数 + 1」，所以模式里有两个括号时 `size` 是 3。业务代码遍历时应从 0 开始并检查 `flags`，不要假设每个组都活跃——可选组未参与匹配时 `flags` 是 `CH_CAPTURE_FLAG_INACTIVE`，此时 `from` 与 `to` 的值不可用。
+
+反向引用实验的预期输出是一条覆盖 `the the` 的匹配，`groups=2`（整体加一个分组），两个分组的边界都是 `[0,3)` 与 `[0,7)` 之类。这个实验的价值在于确认「PCRE 真的在跑」，因为纯 Hyperscan 对 `\1` 会直接编译失败。
+
+三种引擎形态的适用边界用一张表对照，选型时按「是否需要捕获/反向引用」和「命中率」两个维度判断。
+
+| 场景 | 纯 Hyperscan | Chimera | 说明 |
+|---|---|---|---|
+| 只需要是否命中 | 适用 | 过度设计 | 无捕获组时不必引入 PCRE |
+| 需要子串定位 | 开 SOM 即可 | 可用但更慢 | SOM 有 horizon 限制 |
+| 需要捕获组内容 | 不支持 | 适用 | 必须 `CH_MODE_GROUPS` |
+| 需要反向引用 | 不支持 | 适用 | PCRE 确认阶段处理 |
+| 命中率极高 | 适用 | 明显变慢 | 每个候选都要回溯 |
+| 模式含大量字面量 | 适用 | 适用 | 预过滤能提取有效前缀 |
+
+表的第五行是性能判断的核心：Chimera 的收益来自「粗筛掉绝大多数位置」，命中率越高，PCRE 被唤醒的次数越多，优势越小。经验阈值需要在真实语料上测，不能照搬别人的数字；测试方法与 `hsbench` 的对照见 08-01。
+
+### 5. 常见失败与排错
+
+第一类失败是链接期 `undefined reference to pcre_compile`。根因有三种：没装 PCRE 开发库、链接顺序错、装的是 PCRE2。判断方法是用 `pcre-config --version` 确认 8.x，用 `-lchimera -lhs -lpcre` 的顺序重链。若仍有未定义，检查 `libpcre.a` 或 `libpcre.so` 是否在 `-L` 路径下。
+
+第二类失败是 `undefined reference to ch_compile`。根因是没链 `libchimera.a` 或路径不对。注意 Chimera 只出静态库，没有 `.so`，所以运行期不存在「找不到 libchimera.so」的问题，但链接期必须给对路径。
+
+第三类失败是编译成功但 `size=1`。根因是 `CH_MODE_NOGROUPS`。这个参数名极易与 `HS_MODE_*` 混淆，记住规则：Chimera 的 `mode` 只控制捕获组，不控制块/流；Chimera 只有块模式扫描入口 `ch_scan`，没有流式 API。
+
+第四类失败是 `CH_COMPILER_ERROR`。Chimera 的编译错误结构里有 `message` 与 `expression`，先打印消息再看是哪条表达式。常见原因是 PCRE 语法错（括号不配对、转义错误），以及 Hyperscan 侧无法为某条模式提取任何可预过滤的字面量——后者在极短模式或纯字符类模式上会出现，处置是改写模式让前缀更具体。
+
+第五类失败是运行期 `CH_ERROR_MATCHLIMIT`。这说明某条模式在某个位置上回溯次数超过上限，通常是嵌套量词（如 `(a+)+b`）遇到长串不匹配数据。处置不是简单调大上限，而是改写模式消除灾难性回溯。Chimera 提供 `ch_compile_ext_multi` 的 `match_limit` 与 `match_limit_recursion` 参数来设上限，但上限只是护栏，不是解药。
+
+第六类失败是内存归属错误。Chimera 的对象释放函数是 `ch_free_database` 与 `ch_free_scratch`，不要与 Hyperscan 的 `hs_free_*` 混用；`ch_compile_error_t` 用 `ch_free_compile_error` 释放。混用的后果是堆破坏，且往往在进程退出时才暴露。对象关系见 05-09。
+
+第七类失败是并发下的 scratch 冲突。Chimera 的 scratch 规则与 Hyperscan 完全一致：每个并发调用者一份，不能共享；`ch_alloc_scratch` 对多库要反复调用，`ch_clone_scratch` 用于批量复刻。区别在于 Chimera 的 scratch 里还包含 PCRE 的工作区，单块更大，池化时容量要按实测值算。如果宿主同时用纯 Hyperscan 与 Chimera，两套 scratch 是独立的，不能互相顶替——`hs_scratch_t` 与 `ch_scratch_t` 是不同类型，混用会直接编译失败，这算是幸运的失败方式。
+
+最后是一类架构层面的误用：把所有规则都迁到 Chimera。这会让每条规则都带一份 PCRE 程序，编译时间与内存成倍增长，而收益只在少数需要捕获的模式上。正确做法是分层：纯 Hyperscan 承担绝大多数规则，Chimera 只承担必须结构化的少数规则，两层通过 `id` 对齐。
+
+### 6. 小结
+
+Chimera 解决的是「自动机给不出捕获组」这条硬边界，代价是引入 PCRE 依赖与回溯成本。落地要点有四个：`ch_compile` 的 `mode` 是 `CH_MODE_GROUPS` 而非块流选择；链接顺序是 `-lchimera -lhs -lpcre` 并补 `-lstdc++`；回调的 `size` 含整体匹配，遍历时要检查 `flags`；`onError` 要接，否则回溯超限会静默漏报。
+
+选型上坚持一条原则：能用纯 Hyperscan 就不用 Chimera。判断标准是「是否需要捕获内容或反向引用」，而不是「哪个更强」。需要时优先考虑分层部署，让大部分流量走纯 Hyperscan，只有候选进入 Chimera。
+
+排错按「链接期 → 编译期 → 扫描期」三段定位：链接期看 `-l` 顺序与 PCRE 版本，编译期看 `cerr->message` 与 `mode`，扫描期看 `rc` 与 `onError` 事件。三段各有明确的证据来源，不要混在一起猜。
+
+Chimera API 的完整签名见 04-04 与 04-05 的 Chimera 小节，`ch_database_t` 与 `ch_scratch_t` 字段见 05-09，两段式设计原理见 06-14，`chimera` 模块的文件组织见 07-11，构建依赖见 02-04。完整 API 见 04-04 ~ 04-06。
+
