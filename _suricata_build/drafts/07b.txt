@@ -1,0 +1,707 @@
+# Suricata 技术资料 · 07 模块与特性介绍（分片 B）
+## 07-06 source-* 抓包源模块
+
+### 1. 背景与动机
+
+引擎要检测威胁，第一步是「拿到报文」。但「拿到报文」这件事在真实部署里从来不是单一形态：生产 IDS 常在 Linux 上用 AF_PACKET 的 mmap 环形缓冲区从网卡直接收帧，高速场景可能改用 DPDK 轮询独占网卡，虚拟化或新内核环境可能上 AF_XDP，FreeBSD 环境依赖 Netmap，IPS 内联场景的报文来自内核 NFQUEUE 队列，Windows 平台则经由 WinDivert 内核过滤驱动；离线分析、回归测试与规则验证又要读 pcap 文件或 ERF 采集卡录制文件。这些来源的编程接口、内存归属、线程模型、所需特权、卸载能力乃至失败语义都截然不同：有的是内核主动把帧写进共享 ring，有的是用户态主动轮询 PMD，有的是读文件描述符，有的还必须把「放行还是丢弃」的判定回写给内核。若让解码、流管理、检测、输出各模块分别适配每一种来源，整个代码库会迅速被条件编译与平台分支淹没。
+
+于是 Suricata 在 `src/` 下设立了 `source-*` 一族模块，把「按某种方式把原始字节取进来、包装成统一的 `Packet`、必要时把 verdict 送回去」这一职责收敛到边界清晰的一组文件里。每个后端各自实现一组线程模块，通过 `TmModule` 注册表挂到 runmode 拼装的 slot 链上，下游只看统一的 `Packet` 与队列接口，不再关心帧是从哪个 ring、哪个队列、哪个文件里来的。本篇作为分片 B 的开篇，讲的正是这个模块族的文件构成、注册入口、职责边界与选型陷阱。
+
+先立住本册的定位与全集的去重纪律。07 册是全集的「模块能力与特性」唯一权威源，严格按 `src/` 真实目录划分章节，`source-*` 对应 `src/source-*.c/.h` 一整族以及与之配对的 `src/runmode-*.c`；本篇讲「这个模块由哪些文件组成、每个文件注册了什么、关键入口在哪、如何挂到流水线上」，而不重复展开 06 册已经讲透的抓包机制（TPACKET 环形缓冲、fanout 分流、DPDK 的 EAL 与 PMD 轮询、RSS 与流亲和等，原理见 06-02）。结构体逐字段定义归 05 全册（字段见 05-07、05-02），`af-packet`、`dpdk`、`pfring`、`threading` 等配置参数全集归 04 全册（参数见 04-03），运维场景与基准方法归 08 全册。交叉引用统一写「字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx」。版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验；下文所有文件名、注册名与函数名均以 `upstream_src/suricata/suricata-main/` 内的真实文件为锚点。
+
+能力边界必须落在最前面。Suricata 是 IDS / IPS / NSM 引擎，不是防火墙，不做 IP 转发，不做路由；在旁路 IDS 模式下它只对镜像、分光或网卡副本做收包与告警，内联 IPS 模式下才依靠 NFQUEUE 或 AF_PACKET 桥接的 verdict 决定单个报文的放行与丢弃，真正执行转发的是内核协议栈或桥接对端（原理见 06-12）。因此 `source-nfq.c`、`source-ipfw.c`、`source-windivert.c` 里出现的 `Verdict` 槽位，含义是「把检测结论回写给内核」，绝不能读成「Suricata 自己转发数据」。可见性方面，引擎只对自身解码并重组到的流量做检测，TLS 等加密载荷的明文正文不可见（模块见 07-03、原理见 06-05）。把抓包源误写成「转发平面」是阅读这一模块时最常见的偏差。
+
+从工程价值看，建立 `source-*` 的模块地图有三个直接收益。其一是排障收敛：`stats.log` 里收包计数不增时，有经验的工程师会先确认 `runmode` 是否选中了预期后端、对应 `TmModule` 是否真的注册、特权是否足够、网卡名是否正确，而不是先去改规则；`ThreadExitPrintStats` 在线程退出时打印的正是这一段的收包与丢包计数。其二是选型：AF_PACKET、DPDK、AF_XDP、Netmap、pcap 的能力与环境要求差异极大，DPDK 需独占网卡、大页与 EAL 参数，AF_XDP / Netmap 有内核版本与驱动要求，pcap 多用于离线或低速率场景（参数见 04-03、原理见 06-02），理解模块边界才能做出可落地的部署决策。其三是扩展：新增一种抓包方式时，开发者知道该往哪个文件族里加、要注册哪几类槽位、要声明哪些 `cap_flags`。以下各节按「概念 → 文件与结构 → 组件协作 → 实例 → 陷阱 → 小结」展开。
+
+### 2. 核心概念
+
+先把术语固定下来。`TmModule` 是线程模块的统一描述结构，全局注册表为 `tmm_modules[]`，按枚举下标索引；本族文件在各自的 `TmModuleXxxRegister` 函数里往这张表填 `name`、`Func`、`PktAcqLoop`、`ThreadInit`、`ThreadDeinit`、`ThreadExitPrintStats`、`cap_flags`、`flags` 等成员（字段见 05-07）。每个后端通常注册两到三类槽位：`RECEIVE` 负责取帧，`DECODE` 负责把帧交给解码入口，内联后端额外注册 `VERDICT` 负责回写判定。`flags` 用 `TM_FLAG_RECEIVE_TM`、`TM_FLAG_DECODE_TM`、`TM_FLAG_VERDICT_TM` 区分槽位类型，`cap_flags` 声明该线程所需的 Linux capability，例如 `source-pcap.c` 声明 `SC_CAP_NET_RAW`、`source-nfq.c` 的接收与 verdict 槽位声明 `SC_CAP_NET_ADMIN`（字段见 05-07）。
+
+`PktAcqLoop` 与 `Func` 的区别是理解这个模块的关键。在线后端的收包线程往往自己持有一个循环，按后端语义批量取帧、填 `Packet`、推入队列，这类入口注册在 `PktAcqLoop` 上，例如 `source-af-packet.c` 的 `ReceiveAFPLoop`、`source-dpdk.c` 的 `ReceiveDPDKLoop`、`source-pcap.c` 的 `ReceivePcapLoop`；解码槽位则是逐包回调，注册在 `Func` 上，例如 `DecodeAFP`、`DecodeDPDK`、`DecodePcap`。换句话说，`PktAcqLoop` 是「主动拉取」，`Func` 是「被流水线逐包调用」，二者在 `src/tm-threads.c` 的线程主体里被区别对待（字段见 05-07、原理见 06-13）。离线文件后端同样用 `PktAcqLoop`，例如 `source-pcap-file.c` 的 `ReceivePcapFileLoop`，它读的是文件而非网卡。
+
+按来源可把后端分成三组，这个分类也就是本篇第 3 节文件清单的组织依据。第一组是高性能在线后端：`source-af-packet.c`（Linux AF_PACKET / TPACKET）、`source-af-xdp.c`（AF_XDP）、`source-dpdk.c`（DPDK 轮询）、`source-netmap.c`（Netmap）、`source-nflog.c`（NFLOG 日志组）。第二组是离线与专用采集后端：`source-pcap.c`（libpcap 在线抓包，也常用于低速率）、`source-pcap-file.c` 与 `source-pcap-file-helper.c`、`source-pcap-file-directory-helper.c`（pcap 文件与目录批量回放）、`source-erf-file.c` 与 `source-erf-dag.c`（Endace ERF 文件与 DAG 采集卡）、`source-lib.c`（库模式，仅注册 `DecodeLib`）。第三组是内联与 verdict 后端：`source-nfq.c`（Linux NFQUEUE）、`source-ipfw.c`（FreeBSD ipfw）、`source-windivert.c`（Windows WinDivert），它们比前两组多一个 `VERDICT` 槽位。以上文件在本快照中均已确认存在，另有 `source-nfq-prototypes.h`、`source-windivert-prototypes.h` 两个原型头与各族配套 `.h` 头文件。
+
+一个必须点破的事实核验结论是：本快照的 `src/source-*` 族中**不存在 `source-pfring.c`**。PF_RING 在不少历史资料里被列为受支持后端，但在这份上游 main 快照里既没有对应源文件，也没有对应的 `runmode-pfring.c`；它是否仍为受支持后端、对应启用方式与 `configure.ac` 开关，一律「需对照实际版本核验」，可定位 `configure.ac` 与 `src/source-*.c`（能力边界见 SPEC 第 2.1 节第 7 条）。同理，SPEC 与大纲里提到的 `source-erf-*.c` 在本快照里具体落地为 `source-erf-file.c` 与 `source-erf-dag.c` 两个文件。凡大纲用了通配写法而本快照有确切文件名的，本篇一律按真实文件名书写。
+
+最后说明边界与配对关系。`source-*` 与 `src/runmode-*.c` 一一配对，本快照已确认存在的有 `runmode-af-packet.c`、`runmode-af-xdp.c`、`runmode-dpdk.c`、`runmode-netmap.c`、`runmode-nflog.c`、`runmode-nfq.c`、`runmode-pcap.c`、`runmode-pcap-file.c`、`runmode-erf-file.c`、`runmode-erf-dag.c`、`runmode-ipfw.c`、`runmode-windivert.c`、`runmode-lib.c`，另有 `runmode-unix-socket.c`、`runmode-unittests.c` 属控制面与测试范畴（模块见 07-12、07-13）。`source-*` 不做协议解码的字节解析（模块见 07-01）、不做流聚合（模块见 07-02）、不做重组（模块见 07-08）、不做规则匹配（模块见 07-04），它的输出边界是一个填好原始字节、链路类型、时间戳并绑定好队列边的 `Packet`。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，不重列任何字段。07 全册禁止出现完整结构体字段表，逐字段定义、类型、读写时机与生命周期由 05 全册统一承担（字段见 05-07、05-02）。
+
+- `TmModule_`、`ThreadVars_`：前者的注册项在 `src/tm-modules.h`、`src/tm-threads.h`，后者在 `src/threadvars.h`；本族各文件只是往 `tmm_modules[TMM_XXX]` 填值（字段见 05-07）。
+- `Packet_`：定义见 `src/decode.h`，抓包线程从包池取用它、填写原始帧与元信息后交出（字段见 05-02）。
+- 各后端私有上下文：`source-af-packet.c` 的 AF_PACKET 线程变量、`source-dpdk.c` 的 `DPDKThreadVars`、`source-nfq.c` 的 `NFQThreadVars` / `NFQQueueVars`、`source-windivert.c` 的 WinDivert 上下文等，均在各自 `.c` 文件内定义；字段名与成员构成需对照实际版本核验（字段见 05-07）。
+- 解码异常与统计计数：由 `src/decode-events.h` 与 `src/decode.c` 的计数登记机制承载，抓包线程通过 `ThreadExitPrintStats` 汇报收包与丢弃统计（模块见 07-01）。
+
+下面是本快照中 `src/source-*` 族的真实文件清单，按上一节的三组分类组织；族内命名规律清晰，完整枚举可用 `ls src/source-*` 在快照根目录复核。
+
+```tree
+src/
+├── source-af-packet.c/.h          AF_PACKET：ReceiveAFP / DecodeAFP
+├── source-af-xdp.c/.h             AF_XDP：ReceiveAFXDP / DecodeAFXDP
+├── source-dpdk.c/.h               DPDK：ReceiveDPDK / DecodeDPDK
+├── source-netmap.c/.h             Netmap：ReceiveNetmap / DecodeNetmap
+├── source-nflog.c/.h              NFLOG：ReceiveNFLOG / DecodeNFLOG
+├── source-pcap.c/.h               libpcap：ReceivePcap / DecodePcap
+├── source-pcap-file.c/.h          pcap 文件回放：ReceivePcapFile
+├── source-pcap-file-helper.c/.h          pcap 文件读取辅助
+├── source-pcap-file-directory-helper.c/.h  目录批量回放辅助
+├── source-erf-file.c/.h           ERF 文件：ReceiveErfFile / DecodeErfFile
+├── source-erf-dag.c/.h            DAG 采集卡：ReceiveErfDag / DecodeErfDag
+├── source-lib.c/.h                库模式：DecodeLib（仅解码槽位）
+├── source-nfq.c/.h                NFQUEUE：ReceiveNFQ / VerdictNFQ / DecodeNFQ
+├── source-nfq-prototypes.h        NFQ 原型声明
+├── source-ipfw.c/.h               ipfw：ReceiveIPFW / VerdictIPFW / DecodeIPFW
+├── source-windivert.c/.h          WinDivert：ReceiveWinDivert / VerdictWinDivert
+├── source-windivert-prototypes.h  WinDivert 原型声明
+└── tests/source-pcap.c、tests/source-netmap.c   该族单元测试
+```
+
+关键入口函数在真实源码中的位置如下，均已逐一核对：`source-af-packet.c` 的 `void TmModuleReceiveAFPRegister (void)`（第 125 行声明、第 379 行实现）、`void TmModuleDecodeAFPRegister (void)`（第 139、601 行），收包循环 `static TmEcode ReceiveAFPLoop(ThreadVars *tv, void *data, void *slot)`（第 362 行声明、第 1308 行实现）与解码入口 `TmEcode DecodeAFP(ThreadVars *tv, Packet *p, void *data)`（第 2749 行）；`source-dpdk.c` 的 `TmModuleReceiveDPDKRegister`（第 51、252 行）、`TmModuleDecodeDPDKRegister`（第 65、269 行）、`ReceiveDPDKLoopInit`（第 349 行）、`ReceiveDPDKLoop`（第 569 行）、`DecodeDPDK`（第 806 行）；`source-nfq.c` 的 `TmModuleReceiveNFQRegister`（第 61、170 行）、`TmModuleVerdictNFQRegister`（第 71、185 行）、`TmModuleDecodeNFQRegister`（第 81、194 行），以及 `static void NFQRecvPkt(NFQQueueVars *t, NFQThreadVars *tv)`（第 976 行）、`static TmEcode NFQSetVerdict(Packet *p, const uint32_t mark_value, const bool mark_modified)`（第 1105 行）；`source-pcap.c` 的 `ReceivePcapLoop`、`ReceivePcapBreakLoop`。函数签名、参数与返回值一律需对照实际版本核验，本篇不复刻完整实现。交叉引用：字段见 05-07 ｜ 参数见 04-03 ｜ 原理见 06-02、06-12 ｜ 模块见 07-01。
+
+一个阅读时容易忽略的细节是：多个后端文件里同一注册函数出现了两次。例如 `source-nfq.c` 第 61 行与第 170 行各有一份 `TmModuleReceiveNFQRegister`，前者在编译期未启用 NFQUEUE 时把槽位指向 `NoNFQSupportExit` 一类退出桩，后者才是带 `ReceiveNFQLoop`、`ReceiveNFQThreadInit` 的真实实现；`source-ipfw.c`、`source-nflog.c`、`source-af-xdp.c` 也有同样的成对结构。这不是重复定义，而是条件编译下的两套分支，判读时若只看到前一份就断言「该后端没有实现」会得出错误结论。另一个细节是 `source-lib.c` 只注册 `TMM_DECODELIB` 一个 `DecodeLib` 槽位，因为库模式下报文由调用方送进来，引擎不需要自己收包；把库模式误当成「缺了接收槽位」同样是没读懂模块边界。
+
+### 4. 关键流程与调用链
+
+本节从模块视角描述 `source-*` 族内部文件如何协作、以及它如何挂到流水线上，重点在「注册与职责划分」，不重复展开 06 册已经讲透的抓包机制与状态机（原理见 06-02、06-01、06-13）。可以把整个模块拆成三条相互配合的线：注册装配线、在线与离线收包线、内联 verdict 回写线。
+
+注册装配线发生在启动早期。runmode（见 `src/runmodes.c` 与对应 `src/runmode-*.c`）根据用户指定的接口、队列号或 pcap 文件选定后端，随后调用该后端的 `TmModuleXxxRegister` 系列函数往 `tmm_modules[]` 填表，再由 `TmThreadSpawn` 一类机制把 `RECEIVE`、`DECODE`、必要时 `VERDICT` 槽位拼成 slot 链并拉起线程（字段见 05-07、原理见 06-13）。`cap_flags` 在这里参与权限收敛：进程若不具备 `SC_CAP_NET_RAW` 或 `SC_CAP_NET_ADMIN`，对应后端会在初始化阶段失败，这一点在容器化部署里尤其常见（模块见 03-06、参数见 04-03）。本篇不展开 runmode 如何拼装 slot 链，只指出「注册函数是模块与流水线的接口」这一事实。
+
+在线与离线收包线是每帧的主路径。在线后端的 `PktAcqLoop` 从 ring、PMD、套接字或 pcap 句柄取出原始字节，填入 `Packet` 的帧指针、长度、链路类型与时间戳，推入队列；`DECODE` 槽位的 `Func` 被逐包调用，把帧交给 `decode` 模块的链路层入口（模块见 07-01），并在解码完成后把 `Packet` 交给 `flow-worker`（模块见 07-02）。离线文件后端的差别只在数据来源：`ReceivePcapFileLoop` 从文件读帧，`source-pcap-file-directory-helper.c` 负责按目录枚举待回放文件，`source-pcap-file-helper.c` 负责单文件的读取与状态维护，回放结束后线程按 `ThreadExitPrintStats` 汇总计数并退出。三条线的公共终点是一致的：一个字段齐备的 `Packet` 与一条交给下游的队列边。
+
+内联 verdict 回写线是 IPS 后端独有的支线。`source-nfq.c` 的 `NFQRecvPkt` 从 NFQUEUE 队列收包，报文经解码、流重组、检测后由 `VerdictNFQ` 槽位调用 `NFQSetVerdict`，最终落到 `nfq_set_verdict`、`nfq_set_verdict2` 或 `nfq_set_verdict_batch` 一类内核接口，把 `NF_ACCEPT` 或丢弃判定连 mark 一起回写（原理见 06-12）；`source-ipfw.c` 与 `source-windivert.c` 各有对应的 `VerdictIPFW`、`VerdictWinDivert` 槽位。必须再次强调，这条线只是「回写判定」，Suricata 不因此变成防火墙，也不做转发。整个模块的槽位分类、后端分组与队列边见图 07-06-01。
+
+:::figure id=07-06-01 | name=source-* 模块三类线程槽位与 runmode 配对 | dir=TD
+node s1 "runmode-*<br/>选择后端拼装" blue
+node s2 "接收槽位<br/>PktAcqLoop" teal
+node s3 "解码槽位<br/>Func 逐包" teal
+node s4 "verdict 槽位<br/>仅内联后端" purple
+node s5 "Packet 交下游<br/>flow-worker" green
+node s6 "在线后端<br/>AFP/DPDK/AFXDP" blue
+node s7 "离线后端<br/>pcap-file/erf" gray
+node s8 "内联后端<br/>NFQ/IPFW/WinDivert" purple
+edge s1 -> s2 "注册 TmModule"
+edge s1 -> s3 "注册 TmModule"
+edge s1 -> s4 "注册 TmModule"
+edge s6 -> s2 "在线帧"
+edge s7 -> s2 "离线帧"
+edge s8 -> s2 "队列报文"
+edge s2 -> s3 "原始字节"
+edge s3 -> s5 "解码后 Packet"
+edge s8 -> s4 "NFQUEUE 判定"
+edge s4 -> s5 "verdict 回写"
+:::
+
+图 07-06-01 中实线是每帧的主路径，紫色节点标出只有内联后端才有的 verdict 支线。需要强调这张图描述的是模块内部的文件协作与槽位关系，不是 06-01 那条从收包到落盘的全流水线；把它和全流水线混为一谈，就会误以为抓包源还负责流表或告警。各后端 ring 的组织方式、fanout 分流、DPDK 的 EAL 参数与轮询模型属于机制范畴（原理见 06-02），本篇只点名文件与入口。
+
+### 5. 配置/命令/代码实例
+
+本节只给最小必要实例，并显式指向权威源：`suricata.yaml` 全段、全部命令行与返回码见 04 全册（参数见 04-03、04-07、04-08），此处不重列参数全集；07 全册每篇代码段最多给 3–5 个本模块最典型的调用，其余写「完整 API 见 04-xx」。下面这段是按真实注册名书写的槽位登记摘录，仅示意模块内部的装配关系，不构成完整实现。
+
+```c
+/* source-* 模块槽位登记关系摘录，符号均为真实名称，见 src/source-*.c */
+void TmModuleReceiveAFPRegister(void);   /* AF_PACKET 接收槽位，见 source-af-packet.c */
+void TmModuleDecodeAFPRegister(void);    /* AF_PACKET 解码槽位，见 source-af-packet.c */
+void TmModuleReceiveNFQRegister(void);   /* NFQUEUE 接收槽位，见 source-nfq.c */
+void TmModuleVerdictNFQRegister(void);   /* NFQUEUE 判定槽位，见 source-nfq.c */
+void TmModuleDecodeNFQRegister(void);    /* NFQUEUE 解码槽位，见 source-nfq.c */
+```
+
+上面五个注册函数代表了本模块最典型的一组入口：普通后端是「接收 + 解码」成对出现，内联后端多出「verdict」一类。注册函数内部把 `tmm_modules[TMM_RECEIVEAFP].PktAcqLoop = ReceiveAFPLoop`、`.Func = DecodeAFP`、`.flags = TM_FLAG_RECEIVE_TM` 一类值填进表；具体成员名、枚举值与函数签名需对照 `src/tm-modules.h`、`src/tm-threads.h` 与对应后端文件核验（字段见 05-07）。完整命令行与配置参数见 04-03、04-07，机制原理见 06-02、06-13，此处不再追加调用。
+
+下面给一组按「前置检查 → 执行 → 验证输出 → 清理」组织的源码核验命令，用来在拿到任意一份上游快照后快速确认本模块有哪些后端、各自注册了哪些槽位。它不改变运行状态，适合作为选型或核查版本差异的第一步。
+
+```bash
+# 前置：进入真实仓库根（注意归档多一层 suricata-main/）
+cd upstream_src/suricata/suricata-main
+
+# 执行：列出所有抓包源文件，确认 PF_RING 是否有对应实现
+ls src/source-*.c
+
+# 验证：抽取各后端注册的 TmModule 槽位名与行号
+grep -n "tmm_modules\[TMM_.*\].name" src/source-*.c
+
+# 清理：退出查阅目录
+cd -
+```
+
+典型输出如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+src/source-af-packet.c:381:    tmm_modules[TMM_RECEIVEAFP].name = "ReceiveAFP";
+src/source-af-packet.c:603:    tmm_modules[TMM_DECODEAFP].name = "DecodeAFP";
+src/source-dpdk.c:254:    tmm_modules[TMM_RECEIVEDPDK].name = "ReceiveDPDK";
+src/source-nfq.c:187:    tmm_modules[TMM_VERDICTNFQ].name = "VerdictNFQ";
+src/source-pcap.c:135:    tmm_modules[TMM_RECEIVEPCAP].name = "ReceivePcap";
+```
+
+逐行判读如下。第 381 行与第 603 行同属 `source-af-packet.c`，分别把 `TMM_RECEIVEAFP` 与 `TMM_DECODEAFP` 命名为 `ReceiveAFP`、`DecodeAFP`，说明 AF_PACKET 是标准的「接收 + 解码」双槽位后端；两行行号相距较远，是因为注册函数与实现函数分处文件不同段落，判读时不要误以为是两套后端。第 254 行 `source-dpdk.c` 的 `ReceiveDPDK` 确认 DPDK 在本快照里是受支持的独立后端，但「文件存在」只说明编译进了槽位注册，是否真正可用还取决于 `configure.ac` 的构建开关、EAL 参数与大页配置（参数见 04-03）。第 187 行 `VerdictNFQ` 是全组输出里最关键的一行：它证明 NFQUEUE 后端除接收与解码外还注册了 `TMM_VERDICTNFQ` 这一判定槽位，对应 `VerdictNFQ` 与 `NFQSetVerdict`，是 IPS 内联能力在模块层面的落点（原理见 06-12）。第 135 行 `ReceivePcap` 说明 libpcap 在线抓包仍保留独立后端。最后要特别看 `ls src/source-*.c` 的完整结果：本快照里没有 `source-pfring.c`，若某份资料据此断言 PF_RING 后端必有同名源文件，就与事实不符，应回到 `configure.ac` 与 `src/source-*.c` 复核其支持状态（需对照实际版本核验）。整组输出共同验证了「在线、离线、内联三类后端都以 `TmModule` 槽位形式登记，且内联后端多一条 verdict 支线」。
+
+按后端分组整理的职责对照见下表，便于按部署现象反查应该先读哪个文件。
+
+| 分组 | 代表文件 | 注册槽位 | 环境与特权要点 |
+|---|---|---|---|
+| 高性能在线 | `source-af-packet.c`、`source-dpdk.c` | 接收 + 解码 | DPDK 需独占网卡、大页与 EAL 参数（参数见 04-03） |
+| 新内核在线 | `source-af-xdp.c`、`source-netmap.c` | 接收 + 解码 | 有内核版本与驱动要求，需对照实际版本核验 |
+| 日志组在线 | `source-nflog.c` | 接收 + 解码 | 依赖 NFLOG 组配置，需对照实际版本核验 |
+| 离线与采集 | `source-pcap-file.c`、`source-erf-file.c` | 接收 + 解码 | 用于回放、回归与规则验证，无网卡特权要求 |
+| 内联判定 | `source-nfq.c`、`source-ipfw.c` | 接收、解码、verdict | 需 `SC_CAP_NET_ADMIN` 一类特权（字段见 05-07） |
+| 库模式 | `source-lib.c` | 仅解码 `DecodeLib` | 报文由调用方送入，引擎不自行收包 |
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一组陷阱围绕「后端能力差异被抹平」。把 AF_PACKET、DPDK、AF_XDP、Netmap、pcap 当成只是「换个配置文件键」的等价选项，是最常见的误判。DPDK 需要独占网卡、预留大页并给出 EAL 参数，网卡一旦被 PMD 接管就不能再被内核协议栈或其他实例使用；AF_XDP 与 Netmap 对内核版本、驱动与零拷贝模式有要求；pcap 走 libpcap，多用于离线或低速率场景，不适合作为高吞吐生产抓包的默认选择（原理见 06-02、参数见 04-03）。部署前应先确认目标机型的内核、驱动、大页与网卡绑定状态，再决定后端，而不是先写配置再排错。所有关于吞吐、pps、丢包率的结论一律标注「需在目标机型实测」，不给绝对值、不给跨机型通用数字。
+
+第二组陷阱是特权与条件编译。容器或最小权限环境里，缺 `CAP_NET_RAW` 会让 `source-pcap.c` / `source-af-packet.c` 在 `ThreadInit` 阶段失败，缺 `CAP_NET_ADMIN` 会让 NFQUEUE 后端起不来；现象往往是「进程能启动但收包计数为零」或「启动即报错退出」，排查时应先看 `suricata.log` 与 `cap_flags` 声明（字段见 05-07、参数见 04-03）。另一个隐蔽陷阱是前文提到的成对注册函数：编译期未启用某后端时，注册的是 `NoNFQSupportExit`、`NoNFLOGSupportExit` 一类退出桩，`--build-info` 才会显示该后端是否被编进来（参数见 04-07）。看到源码里「有注册函数」就断言「运行时可用」，是忽略条件编译的典型错误。
+
+第三组陷阱与流亲和及负载均衡有关。AF_PACKET 的 fanout / cluster-id / cluster-type 与网卡 RSS 队列共同决定同一条流是否始终落到同一线程；配置不当会让 TCP 双向报文分散到不同检测线程，表现为重组失败、应用层解析缺失与告警漏报（原理见 06-02、06-13、参数见 04-03）。这类问题的证据在 `stats.log` 与 `suricatasc dump-counters` 的计数里，而不是规则文本里；排查顺序建议固定为「收包计数 → 解码计数 → 流计数 → 应用协议计数 → 告警计数」逐段收敛，这套顺序属于运维诊断树（原理见 08-03、08-01），本篇不展开运维步骤。多线程下「加线程不等于线性提速」，队列锁竞争、绑核与 NUMA 都会影响结果（原理见 06-13、08-02）。
+
+最佳实践可以归纳为四条。其一，选型前用 `suricata --build-info` 确认目标后端确实被编入，再核对 `ls src/source-*.c` 与 `configure.ac` 的开关，避免把历史资料里的 PF_RING 后端当成必然存在（需对照实际版本核验）。其二，离线回放优先用 `source-pcap-file.c` 一路，配合 `suricata -T` 做规则自检，把后端问题与规则问题分开（工具链见 07-13）。其三，给每个在线实例固定 `cluster-id`、明确 `threads` 与绑核策略，并纳入日常监控基线，关注相对变化而非绝对数值（参数见 04-03、08-02）。其四，始终记住能力边界：抓包源不做转发、不做解密，IDS 旁路只告警不丢弃，内联 drop 依赖 NFQUEUE / 桥接对端的 verdict（原理见 06-12），TLS 明文正文不可见。
+
+### 7. 小结与延伸阅读
+
+`source-*` 模块把「按各种方式把原始字节取进来并包装成统一 `Packet`」收敛到 `src/source-*.c/.h` 一族以及与之一一配对的 `src/runmode-*.c` 中：在线高性能后端、离线与采集后端、内联 verdict 后端三组，各自通过 `TmModuleXxxRegister` 往 `tmm_modules[]` 登记 `RECEIVE`、`DECODE`，内联后端额外登记 `VERDICT`；`PktAcqLoop` 负责主动收包，`Func` 负责逐包解码，`cap_flags` 声明所需特权，`ThreadExitPrintStats` 汇报收包与丢弃计数。它的输出边界是一个字段齐备、已绑定队列边的 `Packet`，下游由 `decode`（模块见 07-01）与 `flow`（模块见 07-02）接手；它不做协议字节解析、不做流聚合、不做重组、不做规则匹配，更不做转发与解密。本快照中最需要记住的两条事实是：`source-nfq.c` 的 `VerdictNFQ` / `NFQSetVerdict` 是 IPS verdict 在模块层的落点，而 `source-pfring.c` 并不存在，PF_RING 支持状态需对照 `configure.ac` 与 `src/source-*.c` 实际版本核验。
+
+需要继续深入时，建议按四条路径展开。想理解 TPACKET ring、fanout、DPDK 的 EAL 与 PMD 轮询、RSS 与流亲和的完整机制，读 06-02，线程与 slot 链拼装读 06-13；想查 `TmModule`、`ThreadVars`、`Packet` 的逐字段定义，读 05-07、05-02；想核对 `af-packet`、`dpdk`、`threading` 的参数全集与命令行，读 04-03、04-07、04-08；想按目录继续了解相邻模块，读 07-01（decode）、07-08（stream-tcp）、07-12（控制面）与 07-13（工具链与测试）。IPS 内联的 verdict 语义见 06-12，性能基准方法与诊断决策树见 08-01、08-03。所有性能与容量结论均需在目标机型实测，版本差异一律以 `configure.ac`、`ChangeLog` 与本快照实际文件为准，需对照实际版本核验。
+
+## 07-07 output / log-* 输出模块
+
+### 1. 背景与动机
+
+检测引擎算出结论之后，必须把结论变成可持久化、可检索、可对接外部系统的记录。这条「最后一公里」的需求比看上去复杂得多：告警要写 `fast.log` 那样的单行文本，也要写 EVE JSON 那样的结构化事件；同一条流上会同时产生 alert、http、dns、tls、flow、file、drop、stats、anomaly 等多种事件类型；事件既要能落本地文件，也要能发到 syslog、Redis、Unix 域套接字或空设备；文件要能按时间或大小轮转，要能在不重启进程的前提下重开日志句柄；pcap 原始报文、TLS 证书、HTTP 正文、统计计数各有各的写出时机与格式。若让检测引擎在每个判定点直接 `fwrite`，代码会被输出格式、轮转策略与线程同步彻底绑死。
+
+于是 Suricata 把「事件注册、构造、写出、轮转」收敛成 `src/output*.c/.h` 与 `src/log-*.c/.h` 两族模块。前者是通用输出框架与 EVE 事件族，后者是若干具体日志器实现。所有输出能力都以 `OutputModule` 的形式注册进一张全局链表，检测与流水线上各阶段只按事件类型调用已注册的 logger，不关心事件最终落到哪里。本篇按 07 册惯例，讨论这两族的文件构成、注册接口、职责边界与使用陷阱，不重复展开 06 册已经讲透的 EVE 事件聚合与日志管线机制（原理见 06-11）。
+
+去重纪律照旧：07 是全集的模块功能唯一权威源，`output` 与 `log-*` 的结构体逐字段定义归 05-08，配置参数全集归 04-04，机制与调用链归 06-11、06-14，运维排障归 08 全册。本篇只讲「这个模块有哪些文件、每个文件注册什么、关键入口在哪、如何挂到流水线」，交叉引用统一写「字段见 05-08 ｜ 参数见 04-04 ｜ 原理见 06-11 ｜ 模块见 07-xx」。版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验；下文所有文件名与函数名均以 `upstream_src/suricata/suricata-main/` 内真实文件为锚点，凡未逐一核实的取值一律标注「需对照实际版本核验」。
+
+能力边界同样要先立住。EVE JSON 是 Suricata 的主要输出，`fast.log` / `stats.log` / `pcap-log` 等为辅助输出（能力边界见 SPEC 第 2.1 节第 4 条）；输出模块只记录引擎「看得见」的东西，TLS 等加密载荷的明文正文不可见，`src/output-json-tls.c` 与 `src/log-tlsstore.c` 能记录的是握手元数据、证书、SNI、JA3 一类信息，不能宣称能输出 HTTPS 明文正文（原理见 06-05、模块见 07-03）。Suricata 是 IDS / IPS / NSM 引擎，不是防火墙、不做转发；输出里的 `drop` 事件只是对 verdict 结论的记录，不代表输出模块参与了丢弃决策（原理见 06-12）。此外，本快照的 EVE 事件构造大量使用带 `SC` 前缀的 `SCJsonBuilder`，JSON 构造的底层设施在 `rust/src/jsonbuilder.rs` 一侧（具体路径需对照实际版本核验），这再次说明 Suricata 不是纯 C 项目，`rust/` 与 Cargo 是构建的一部分（模块见 07-10）。
+
+从工程价值看，建立输出模块的地图有三个直接收益。其一是排障：当 `eve.json` 迟迟不出现 `alert` 事件时，理解注册关系的人会先查 `outputs` 段是否启用了对应 `types`、父模块与子模块是否都成功注册、日志目录是否可写、轮转是否把句柄换掉，而不是先怀疑规则没命中。其二是集成：接 Filebeat / Logstash 管道、配置轮转、做日志重开，都要知道哪些文件负责 `LogFileCtx` 与 `rotate-interval`（参数见 04-04、原理见 06-11）。其三是扩展：新增一种事件类型或输出目标时，开发者知道该用哪一个 `OutputRegister*` 变体、要不要挂成 `eve-log` 的子模块（原理见 06-14）。以下各节按「概念 → 文件与结构 → 组件协作 → 实例 → 陷阱 → 小结」展开。
+
+### 2. 核心概念
+
+先把术语固定下来。`OutputModule_` 是输出模块的统一描述结构，在 `src/output.h` 中以 `typedef struct OutputModule_` 定义，含 `logger_id` 等成员，全局链表为 `OutputModuleList output_modules`（字段见 05-08）。`OutputInitResult_` 是模块初始化返回结构，`OutputInitFunc`、`OutputInitSubFunc` 是初始化回调类型，后者多接收一个父模块 `OutputCtx *`（字段见 05-08，函数签名需对照实际版本核验）。`RootLogger_` 是根日志器描述结构，`src/output.c` 里维护 `registered_loggers` 与 `active_loggers` 两个 TAILQ 队列，用来区分「已注册」与「已激活」的日志线程（字段见 05-08）。`LogFileCtx` 则是文件日志的上下文，承载文件句柄、轮转与缓冲策略（字段见 05-08）。
+
+注册接口是理解这个模块的核心。`src/output.c` 提供一整族 `OutputRegister*` 函数，按事件粒度分工：`OutputRegisterModule` 注册顶层模块，`OutputRegisterPacketModule` / `OutputRegisterPacketSubModule` 注册逐包日志器，`OutputRegisterTxModule` 及其 `WithCondition` / `WithProgress` / `WithProgressSubState` 变体注册应用层事务日志器，`OutputRegisterTxSubModule` 系列注册事务子模块，`OutputRegisterFileSubModule`、`OutputRegisterFiledataModule`、`OutputRegisterFlowSubModule`、`OutputRegisterStreamingModule`、`OutputRegisterStatsModule` / `OutputRegisterStatsSubModule` 分别对应文件、文件数据、流、流式数据与统计日志器，`OutputRegisterRootLogger` 注册根日志器，`OutputGetModuleByConfName` 按配置名反查模块，`OutputRegisterFileRotationFlag` 登记轮转标志（字段见 05-08）。这些接口都在 `src/output.h` 中声明，函数名已逐一核对；参数清单与完整签名需对照实际版本核验，本篇不重列 API 全集（完整 API 见 04-04）。
+
+「父模块 + 子模块」是 EVE 输出的关键组织方式。`src/output-json.c` 第 82 行以 `OutputRegisterModule(MODULE_NAME, "eve-log", OutputJsonInitCtx)` 把 `eve-log` 注册为顶层模块，`OutputJsonInitCtx(SCConfNode *conf)` 负责读取 `outputs.eve-log` 段并建好共享上下文；各事件文件再把自己挂成子模块，例如 `src/output-json-alert.c` 第 1185 行以 `OutputRegisterPacketSubModule(LOGGER_JSON_ALERT, "eve-log", MODULE_NAME, "eve-log.alert", ...)` 注册 alert 事件，`MODULE_NAME` 定义为 `JsonAlertLog`。这样一来，`types` 列表里勾掉 `alert`，对应的子模块就不会被激活，而父模块的文件目标、轮转、线程上下文仍由 `output-json.c` 统一管理（参数见 04-04、原理见 06-11）。
+
+事件构造侧也有几个必须记住的符号。`src/output-json.c` 里 `CreateEveHeader`、`CreateEveHeaderWithTxId` 负责生成事件公共头，`CreateEveFlowId`、`CreateEveCommunityFlowId` 负责 `flow_id` 与 community id 一类的聚合标识，`EveAddMetadata`、`EvePacket`、`EveTcpFlags`、`EveFileInfo` 负责往事件里追加元数据、报文、TCP 标志与文件信息，`OutputJsonBuilderBuffer` 负责把构造好的 `SCJsonBuilder` 缓冲写出（字段见 05-08、原理见 06-11）。注意本快照的 JSON 构造类型带 `SC` 前缀（`SCJsonBuilder`、`SCJbNewObject`、`SCOutputJsonLogDirection`），与历史资料里不带前缀的写法不同，需对照实际版本核验。
+
+本快照还有一个容易被忽略的分工：`src/output-eve.c/.h`、`src/output-eve-stream.c/.h`、`src/output-eve-syslog.c/.h`、`src/output-eve-null.c/.h` 这一族提供 EVE 输出目标的文件类型抽象，`output-eve.c` 里已核对到 `SCEveRegisterCallback`、`SCEveRunCallbacks`、`SCEveFindFileType`、`SCRegisterEveFileType` 以及 `SCEveFileType_` 结构，说明输出目标可以按 filetype 插件方式扩展（原理见 06-14）。它与 `output-json*.c` 的事件构造族并存，二者的精确边界与启用方式需对照实际版本核验，本篇只点名真实存在的文件与符号，不做超出核验范围的断言。最后说明边界：`output` / `log-*` 的上游是 `detect`（模块见 07-04）、`flow`（模块见 07-02）、`app-layer`（模块见 07-03）与 `stream-tcp`（模块见 07-08），它不产生检测结论、不做解码、不做重组，只负责把已有结论结构化并写出。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，不重列字段。07 全册禁止完整结构体字段表，逐字段定义、内存布局与生命周期归 05-08。
+
+- `OutputModule_`、`OutputInitResult_`、`OutputInitFunc`、`OutputInitSubFunc`、`OutputModuleList`：定义与声明集中在 `src/output.h`，`output_modules` 全局链表在 `src/output.c` 第 116 行初始化（字段见 05-08）。
+- `RootLogger_` 与 `registered_loggers` / `active_loggers`：定义在 `src/output.c` 第 86 行起，两个队列分别在第 98、103 行初始化（字段见 05-08）。
+- `LogFileCtx`、`EveJson` 相关上下文：前者见 `src/util-logopenfile.h` 与 `src/output*.c` 的引用，后者与 `SCJsonBuilder` 一同用于 EVE 事件构造；`rust/src/jsonbuilder.rs` 为底层设施，具体路径与结构名需对照实际版本核验（字段见 05-08、模块见 07-10）。
+- 各事件私有上下文：`AlertJsonOutputCtx_`、`JsonAlertLogThread_` 在 `src/output-json-alert.c` 第 98、107 行定义；其余事件文件各有对应上下文，字段名需对照实际版本核验（字段见 05-08）。
+
+下面是本快照中 `src/output*` 与 `src/log-*` 两族的真实文件清单节选，按职责分组；族内文件命名规律清晰，完整枚举可用 `ls src/output* src/log-*` 复核。
+
+```tree
+src/
+├── output.c / output.h              框架：模块注册、根日志器、轮转标志
+├── output-json.c / .h               EVE 父模块 eve-log、公共头与事件写出
+├── output-json-alert.c / .h         alert 事件（JsonAlertLog）
+├── output-json-anomaly.c / .h       anomaly 异常事件
+├── output-json-arp.c / .h           arp 事件
+├── output-json-dns.c / .h           dns 事件
+├── output-json-http.c / .h          http 事件
+├── output-json-tls.c / .h           tls 握手与证书元数据
+├── output-json-flow.c / .h          flow 事件
+├── output-json-file.c / .h          file 事件
+├── output-json-drop.c / .h          drop 事件
+├── output-json-stats.c / .h         stats 事件
+├── output-json-common.c             EVE 公共辅助
+├── output-json-dhcp.c / .h          dhcp 事件
+├── output-json-dnp3.c / .h          dnp3 事件与 dnp3-objects 辅助
+├── output-json-dcerpc.c / .h        dcerpc 事件
+├── output-json-email-common.c/.h    SMTP 等邮件类公共字段
+├── output-json-frame.c / .h         frame 事件
+├── output-json-ftp.c / .h           ftp 事件
+├── output-json-ike.c / .h           ike 事件
+├── output-json-llmnr.c / .h         llmnr 事件
+├── output-json-mdns.c / .h          mdns 事件
+├── output-json-metadata.c / .h      metadata 事件
+├── output-json-mqtt.c / .h          mqtt 事件
+├── output-json-netflow.c / .h       netflow 事件
+├── output-json-nfs.c / .h           nfs 事件
+├── output-json-pgsql.c / .h         pgsql 事件
+├── output-json-smb.c / .h           smb 事件
+├── output-json-smtp.c / .h          smtp 事件
+├── output-eve.c / .h                EVE 输出目标 filetype 抽象
+├── output-eve-stream.c / .h         stream 输出目标
+├── output-eve-syslog.c / .h         syslog 输出目标
+├── output-eve-null.c / .h           null 输出目标
+├── output-file.c / .h               file 输出辅助
+├── output-filedata.c / .h           filedata 输出辅助
+├── output-filestore.c / .h          file-store 落盘（OutputFilestore）
+├── output-flow.c / .h               flow 输出辅助
+├── output-lua.c / .h                lua 输出扩展
+├── output-packet.c / .h             packet 输出辅助
+├── output-stats.c / .h              stats 输出辅助
+├── output-streaming.c / .h          streaming 输出辅助
+├── output-tx.c / .h                 tx 事务输出辅助
+├── log-pcap.c / .h                  pcap-log 原始报文日志
+├── log-stats.c / .h                 stats.log 统计日志
+├── log-tcp-data.c / .h              tcp-data / http-body-data 流式日志
+├── log-tlsstore.c / .h              tls-store 证书存储
+└── log-maintenance.c / .h           日志刷新后台线程
+```
+
+关键入口在真实源码中的位置如下，均已逐一核对：`src/output.c` 的 `void OutputRegisterModule(const char *name, const char *conf_name, ...)`（第 165 行）、`void OutputRegisterPacketModule(...)`（第 193 行）、`void OutputRegisterPacketSubModule(...)`（第 230 行）、`void OutputRegisterTxModule(...)`（第 403 行）、`void OutputRegisterStatsModule(...)`（第 575 行）、`void OutputRegisterRootLogger(...)`（第 865 行）、`OutputModule *OutputGetModuleByConfName(const char *conf_name)`（第 646 行）、`void OutputRegisterFileRotationFlag(int *flag)`（第 698 行）；`src/output-json.c` 的 `OutputRegisterModule(MODULE_NAME, "eve-log", OutputJsonInitCtx)`（第 82 行）、`OutputInitResult OutputJsonInitCtx(SCConfNode *conf)`（第 1146 行）、`SCJsonBuilder *CreateEveHeader(...)`（第 816 行）、`void OutputJsonBuilderBuffer(...)`（第 1020 行）；`src/output-json-alert.c` 的 `#define MODULE_NAME "JsonAlertLog"`（第 70 行）与 `OutputRegisterPacketSubModule(LOGGER_JSON_ALERT, "eve-log", ...)`（第 1185 行）；`src/log-stats.c` 的 `OutputRegisterStatsModule(LOGGER_STATS, MODULE_NAME, "stats", LogStatsLogInitCtx, ...)`（第 285 行）；`src/log-pcap.c` 的 `OutputRegisterPacketModule(`（第 228 行）；`src/log-tcp-data.c` 的两处 `OutputRegisterStreamingModule`（第 47、50 行）；`src/log-tlsstore.c` 的两处 `OutputRegisterTxModuleWithCondition`（第 498、502 行）；`src/output-filestore.c` 的 `OutputRegisterFiledataModule(LOGGER_FILE_STORE, MODULE_NAME, "file-store", ...)`（第 543 行）；`src/log-maintenance.c` 的 `int OutputFlushInterval(void)`（第 33 行）、`static void *LogMaintenanceThread(void *arg)`（第 47 行）、`void LogMaintenanceThreadSpawn(void)`（第 126 行）。函数签名与参数需对照实际版本核验。交叉引用：字段见 05-08 ｜ 参数见 04-04 ｜ 原理见 06-11 ｜ 模块见 07-04。
+
+一个值得记住的细节是：大纲里写的「filestore 路径需对照实际版本核验」在本快照里有确切答案——没有 `log-filestore.c`，文件落盘在 `src/output-filestore.c`，以 `OutputRegisterFiledataModule` 注册；而 `src/log-maintenance.c` 承担的是日志刷新后台线程，由 `LogMaintenanceThreadSpawn` 经 `TmThreadCreateMgmtThread` 拉起，与「文件存储」不是一回事。另一个细节是 `output-json-*` 族在本快照里有三十余个事件文件，覆盖从 alert、dns、http、tls 到 dnp3、mqtt、pgsql、smb 等协议，说明 EVE 的事件类型是「一协议一文件」地扩展出来的；把这些文件误当成「可选插件、默认都没有」会低估 EVE 的覆盖面。
+
+### 4. 关键流程与调用链
+
+本节按模块视角描述 `output` / `log-*` 两族内部组件如何协作、以及它如何挂到流水线上，不重复展开 06 册的 EVE 事件聚合算法与日志管线状态机（原理见 06-11、06-01）。可以把整个模块拆成三条线：注册装配线、事件构造与写出线、轮转与维护线。
+
+注册装配线发生在启动阶段。`src/output.c` 先由 `OutputRegisterRootLoggers`、`OutputRegisterLoggers` 把各日志器登记进 `registered_loggers`；每个 `OutputRegister*` 函数用 `SCCalloc` 分配一个 `OutputModule` 并挂进 `output_modules` 链表，随后读取 `outputs` 配置段决定哪些模块进入 `active_loggers`（字段见 05-08、参数见 04-04）。父模块与子模块在这里形成层次：`output-json.c` 注册 `eve-log`，`output-json-alert.c` 等以 `parent_name = "eve-log"` 挂成其子模块，`OutputInitSubFunc` 因此能拿到父模块的 `OutputCtx *` 共享文件目标与线程上下文。注册失败会走到 `FatalError`（`src/output.c` 第 182 行可见），所以配置里写错模块名往往表现为启动期致命错误，而非静默忽略（参数见 04-08）。
+
+事件构造与写出线是每条事件的主路径。检测引擎在判定点按事件类型触发已激活的 logger：`output-json-alert.c` 的 `AlertJsonHeader` 往 `SCJsonBuilder` 里写 `action`、`gid`、`sid`、`rev`、`signature`、`category`、`severity` 等字段，`AlertJsonSourceTarget`、`AlertJsonReference`、`AlertJsonMetadata`、`AlertJsonTunnel`、`AlertAddPayload` 分别补充源目的、引用、元数据、隧道与 payload（字段见 05-08）；公共头由 `output-json.c` 的 `CreateEveHeader` 统一生成，`CreateEveFlowId` 把同一条流上的多个事件用 `flow_id` 串起来，最终 `OutputJsonBuilderBuffer` 把缓冲写出到 `eve-log` 配置的文件目标（原理见 06-11）。辅助日志器走各自的注册类型：`log-pcap.c` 以 packet 模块写原始报文，`log-stats.c` 以 stats 模块周期性写 `stats.log`，`log-tcp-data.c` 以 streaming 模块写 `tcp-data` / `http-body-data`，`log-tlsstore.c` 以带条件的 tx 模块存证书，`output-filestore.c` 以 filedata 模块落 `file-store`。
+
+轮转与维护线保证长稳运行。`OutputRegisterFileRotationFlag` 把各日志器的轮转标志集中登记，`suricatasc` 的 `reopen-log-files` 触发重开句柄，`etc/suricata.logrotate.in` 负责外部轮转（参数见 04-04、04-07、原理见 06-11）；`log-maintenance.c` 的 `LogMaintenanceThread` 是后台管理线程，`OutputFlushInterval` 决定刷新周期，它不处理单个报文而是按时间轴维护缓冲与句柄（字段见 05-08、原理见 06-13）。整个模块的注册层次、事件族与写出落点见图 07-07-01。
+
+:::figure id=07-07-01 | name=output / log-* 模块注册层次与 EVE 事件落盘 | dir=TD
+node o1 "模块注册<br/>OutputRegister*" blue
+node o2 "根日志器<br/>RootLogger" teal
+node o3 "EVE 父模块<br/>eve-log" purple
+node o4 "事件子模块<br/>output-json-*" purple
+node o5 "辅助日志<br/>log-pcap/stats" teal
+node o6 "输出目标<br/>output-eve-*" gray
+node o7 "SCJsonBuilder<br/>构造事件" green
+node o8 "落盘与轮转<br/>eve.json" green
+edge o1 -> o2 "登记根日志器"
+edge o1 -> o3 "注册父模块"
+edge o1 -> o5 "注册 packet/stats"
+edge o3 -> o4 "子模块挂接"
+edge o4 -> o7 "CreateEveHeader"
+edge o5 -> o8 "fast/stats/pcap"
+edge o6 -> o8 "filetype 目标"
+edge o7 -> o8 "OutputJsonBuilderBuffer"
+:::
+
+图 07-07-01 中实线是注册与事件写出的主路径。需要强调这张图描述的是模块内部的文件协作关系，不是 06-01 那条从收包到落盘的全流水线；把它和全流水线混为一谈，就会误以为输出模块还负责收包或检测。EVE 事件的字段判读、`community_id` 的生成与 `rotate-interval` 的取值属于机制与参数范畴（原理见 06-11、参数见 04-04），本篇只点名文件与入口。
+
+### 5. 配置/命令/代码实例
+
+本节只给最小必要实例，并显式指向权威源：`suricata.yaml` 的 `outputs` 全段、全部命令行与 `suricatasc` RPC 见 04 全册（参数见 04-04、04-07），此处不重列参数全集；07 全册每篇代码段最多给 3–5 个本模块最典型的调用，其余写「完整 API 见 04-04」。下面这段是按真实符号书写的注册关系摘录，仅示意模块内部的层次，不构成完整实现。
+
+```c
+/* output / log-* 模块注册关系摘录，符号均为真实名称，见 src/output*.c、src/log-*.c */
+OutputRegisterModule(MODULE_NAME, "eve-log", OutputJsonInitCtx);
+OutputRegisterPacketSubModule(LOGGER_JSON_ALERT, "eve-log", MODULE_NAME, "eve-log.alert", /* 其余参数需对照实际版本核验 */);
+OutputRegisterStatsModule(LOGGER_STATS, MODULE_NAME, "stats", LogStatsLogInitCtx, /* 其余参数需对照实际版本核验 */);
+OutputRegisterPacketModule(/* pcap-log 参数需对照实际版本核验 */);
+OutputRegisterFiledataModule(LOGGER_FILE_STORE, MODULE_NAME, "file-store", /* 其余参数需对照实际版本核验 */);
+```
+
+上面五个调用分别代表顶层父模块、事件子模块、统计模块、逐包模块与文件数据模块五类注册方式，是本模块最典型的一组入口；其中第一个来自 `output-json.c` 第 82 行，第二个来自 `output-json-alert.c` 第 1185 行，第三个来自 `log-stats.c` 第 285 行，第四个来自 `log-pcap.c` 第 228 行，第五个来自 `output-filestore.c` 第 543 行。各函数的完整参数、回调签名与 `LoggerId` 取值需对照 `src/output.h` 与对应实现核验（字段见 05-08）。完整参数与命令见 04-04、04-07，机制原理见 06-11，此处不再追加调用。
+
+下面给一组按「前置检查 → 执行 → 验证输出 → 清理」组织的源码核验命令，用来在拿到任意一份上游快照后快速确认输出模块的注册层次。它不改变运行状态，适合作为对接日志管道或核查版本差异的第一步。
+
+```bash
+# 前置：进入真实仓库根（注意归档多一层 suricata-main/）
+cd upstream_src/suricata/suricata-main
+
+# 执行：抽取五个代表性模块的注册调用
+grep -n "OutputRegister" src/output-json.c src/output-json-alert.c src/log-stats.c src/log-pcap.c src/output-filestore.c
+
+# 验证：确认 EVE 事件文件族规模
+ls src/output-json-*.c | wc -l
+
+# 清理：退出查阅目录
+cd -
+```
+
+典型输出如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+src/output-json.c:82:    OutputRegisterModule(MODULE_NAME, "eve-log", OutputJsonInitCtx);
+src/output-json-alert.c:1185:    OutputRegisterPacketSubModule(LOGGER_JSON_ALERT, "eve-log", MODULE_NAME, "eve-log.alert",
+src/log-stats.c:285:    OutputRegisterStatsModule(LOGGER_STATS, MODULE_NAME, "stats", LogStatsLogInitCtx,
+src/log-pcap.c:228:    OutputRegisterPacketModule(
+src/output-filestore.c:543:    OutputRegisterFiledataModule(LOGGER_FILE_STORE, MODULE_NAME, "file-store",
+```
+
+逐行判读如下。第 82 行是 EVE 的顶层注册，`OutputRegisterModule` 的三个实参依次是模块名、配置名 `eve-log` 与初始化回调 `OutputJsonInitCtx`，说明整个 EVE 输出以单一父模块统一管理配置与目标；这里的 `eve-log` 正对应 `suricata.yaml` 的 `outputs.eve-log` 段（参数见 04-04）。第 1185 行 `OutputRegisterPacketSubModule` 的第一个实参 `LOGGER_JSON_ALERT` 是事件类别标识，第二个实参 `"eve-log"` 明确写出父模块名，第四个实参 `"eve-log.alert"` 是子模块配置路径，这一行是「父模块 + 子模块」层次最直接的证据：alert 事件没有独立的文件目标，而是挂在 `eve-log` 之下，所以 `types` 里勾掉 alert 只会停用子模块，不会动父模块（原理见 06-11）。第 285 行 `OutputRegisterStatsModule` 用 `LOGGER_STATS` 与配置名 `stats` 注册统计日志，对应 `stats.log`，它与 EVE 是并列关系而非子模块。第 228 行 `OutputRegisterPacketModule` 是逐包日志器的注册起点，对应 `pcap-log`，调用跨多行所以 grep 只命中首行，判读时不要误以为参数缺失。第 543 行 `OutputRegisterFiledataModule` 与 `LOGGER_FILE_STORE`、`file-store` 一起说明文件落盘归 `output-filestore.c` 而非 `log-filestore.c`，这正好回答了大纲里「filestore 路径需对照实际版本核验」的疑问。最后 `ls src/output-json-*.c | wc -l` 的计数若明显偏少，说明拿到的不是完整上游快照或归档层级不对，应回到 SPEC 第 0.1 节确认 `suricata-main/` 前缀。整组输出共同验证了「注册按事件粒度分层、EVE 为父、其余日志器按类别并列」这一模块结构。
+
+按职责整理的输出子族对照见下表，便于按现象反查应该先读哪个文件。
+
+| 子族 | 代表文件 | 注册接口 | 产出 |
+|---|---|---|---|
+| 框架与根日志器 | `src/output.c`、`src/output.h` | `OutputRegisterRootLogger` | 模块链表与激活队列 |
+| EVE 父模块 | `src/output-json.c` | `OutputRegisterModule` | `eve-log` 配置与公共头 |
+| EVE 事件族 | `src/output-json-alert.c` 等三十余文件 | `OutputRegisterPacketSubModule` 等 | `eve.json` 各类事件 |
+| 输出目标 | `src/output-eve*.c` | `SCRegisterEveFileType` | stream、syslog、null 等目标 |
+| 辅助日志 | `src/log-pcap.c`、`src/log-stats.c` | `OutputRegisterPacketModule`、`OutputRegisterStatsModule` | `pcap-log`、`stats.log` |
+| 流式与存储 | `src/log-tcp-data.c`、`src/log-tlsstore.c` | `OutputRegisterStreamingModule`、`OutputRegisterTxModuleWithCondition` | tcp-data、证书存储 |
+| 文件落盘 | `src/output-filestore.c` | `OutputRegisterFiledataModule` | `file-store` |
+| 维护线程 | `src/log-maintenance.c` | `LogMaintenanceThreadSpawn` | 刷新与句柄维护 |
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一组陷阱围绕「配置启用」与「模块注册」的错配。`outputs.eve-log.types` 里没勾 `alert`，`eve.json` 就不会有 alert 事件，但 `output-json-alert.c` 仍然被编译、仍然注册了子模块，只是没进入 `active_loggers`；反过来，若父模块 `eve-log` 整体被禁用，所有子模块一并失效。排查「有告警但 `eve.json` 无事件」时，应按「父模块是否启用 → `types` 是否含该事件 → 日志目录是否可写 → 轮转是否换了句柄 → `suricatasc` 是否能重开」逐段收敛，而不是一上来改规则（参数见 04-04、原理见 08-03）。另一个常见误判是把 `fast.log`、`stats.log`、`pcap-log` 当成 EVE 的一部分：它们是并列注册的辅助日志器，各自有独立的 `OutputRegister*` 类型与目标（模块见 07-07 本节第 3 节）。
+
+第二组陷阱是统计与事件的判读。`stats.log` 的计数项不等于告警数，EVE 的 `stats` 事件也不等于丢包数；`capture`、`decoder`、`detect`、`tcp.reassembly_memuse` 一类计数项名需对照实际版本核验（参数见 04-04、原理见 08-01）。把某个计数项的绝对值直接读成「性能达标」或「攻击发生」都是误用，正确做法是关注相对变化并结合 `suricatasc dump-counters` 交叉验证。此外，`drop` 事件只记录 verdict 结论，`anomaly` 事件只提示异常，二者都不等于「引擎丢弃了多少报文」（原理见 06-12、08-01）。任何关于写出速率、日志吞吐、磁盘占用的结论一律标注「需在目标机型实测」，不给绝对值。
+
+第三组陷阱与轮转、扩展和可见性有关。轮转配置不当会造成句柄失效后事件写入失败或旧文件被继续占用，`etc/suricata.logrotate.in` 与 `suricatasc reopen-log-files` 要配套使用（参数见 04-04、04-07）；自定义输出目标时应沿 `output-eve*.c` 的 filetype 抽象走 `SCRegisterEveFileType` 一类接口，而不是直接改 `output-json.c` 的写出路径，否则会破坏父子模块的上下文共享（原理见 06-14）。可见性方面，必须反复强调 TLS 明文正文不可见：`output-json-tls.c` 与 `log-tlsstore.c` 输出的是握手元数据、证书、SNI、JA3 一类信息，不能因为配了 `tls-store` 就宣称能还原 HTTPS 正文（能力边界见 SPEC 第 2.1 节第 3 条）。同理，`file-store` 落盘的是引擎从重组流里提取到的文件，受 `stream.reassembly.depth` 影响，超出重组深度的内容不会被写出（原理见 06-10、模块见 07-08）。
+
+最佳实践可以归纳为四条。其一，把 `eve.json` 作为主要输出、其余日志器按需精简，避免同时开过多高开销目标拖慢检测线程；具体开销需在目标机型实测（参数见 04-04、08-02）。其二，上线前用 `suricata -T` 验证配置与规则，再检查 `eve-log` 的 `types` 清单与轮转策略，把「配置问题」与「检测问题」分开（工具链见 07-13、参数见 04-08）。其三，把 `event_type`、`flow_id` 与 `community_id` 纳入日志管道的解析基线，用 `flow_id` 把 alert、http、dns、tls、file 串成一条会话（原理见 06-11）。其四，始终记住能力边界：输出模块不产生检测结论、不解密、不参与转发决策，Rust 侧的 `jsonbuilder` 等设施是构建的一部分，不能把 Suricata 写成纯 C 项目（模块见 07-10）。
+
+### 7. 小结与延伸阅读
+
+`output` / `log-*` 模块把「事件注册、构造、写出、轮转」收敛到 `src/output.c/.h`、`src/output-json*.c` 事件族、`src/output-eve*.c` 输出目标族与 `src/log-*.c` 辅助日志族中：`OutputRegister*` 一族按事件粒度把模块挂进 `output_modules` 链表，`eve-log` 作为父模块、各 `output-json-*` 作为子模块，`RootLogger` 区分已注册与已激活，`CreateEveHeader` 与 `SCJsonBuilder` 负责公共头与事件构造，`OutputJsonBuilderBuffer` 负责写出，`log-maintenance.c` 的后台线程负责刷新与句柄维护。它的输入是检测、流、应用解析与重组阶段产生的结论，输出是 `eve.json` 为主、辅助日志为辅的可检索记录；它不产生检测结论、不做解码、不做重组、不做转发，更不解密 TLS 明文。本快照里最需要记住的三条事实是：alert 以 `OutputRegisterPacketSubModule(..., "eve-log", ...)` 挂在父模块之下，文件落盘在 `output-filestore.c` 而非 `log-filestore.c`，且事件构造使用带 `SC` 前缀的 `SCJsonBuilder`。
+
+需要继续深入时，建议按四条路径展开。想理解 EVE 事件聚合、`flow_id` 与 `community_id` 生成、`rotate-interval` 轮转与日志管线的完整机制，读 06-11，输出扩展点读 06-14；想查 `OutputModule`、`LogFileCtx`、`EveJson` 上下文的逐字段定义，读 05-08；想核对 `outputs` 全段参数、`types` 子项与 `suricatasc` 命令，读 04-04、04-07；想按目录继续了解相邻模块，读 07-04（detect）、07-02（flow）、07-03（app-layer）、07-08（stream-tcp）与 07-10（rust/）。日志管道接入与轮转实战见 03-04，统计判读与性能基准见 08-01、08-02。所有性能与容量结论均需在目标机型实测，版本差异一律以 `configure.ac`、`ChangeLog` 与本快照实际文件为准，需对照实际版本核验。
+
+## 07-08 stream-tcp 与重组模块
+
+### 1. 背景与动机
+
+TCP 对上层承诺的是一条有序、可靠、双向的字节流，但 IP 层实际交付给引擎的却是一串可能乱序、重复、重叠、被截断、带不同窗口与选项的报文段。一个 HTTP 请求行可能被拆进两个段，一个文件可能横跨几十个段，重传段与原始段内容相同而序号交叠，SACK 块会报告非连续的已接收区间，半关闭与 RST 又会在流中间插入状态跳变。如果检测引擎直接在单个 `Packet` 的 payload 上跑 `content` 匹配，跨段的特征必然漏报；如果应用层解析器拿到的是断裂的字节，HTTP、DNS over TCP、SMB、TLS 记录解析都无法进行。因此必须有一层把「段」还原成「连续、方向正确、带状态」的流缓冲，并且这层还要顺带回答「连接现在处于什么状态」「哪些字节已经可以被检测」「重组内存还剩多少」这些问题。
+
+`src/stream-tcp*.c/.h` 这一族模块承担的正是这件事。它维护 TCP 会话状态机、把乱序段插入重组队列、按 ACK 推进已确认数据、把连续字节供给应用层解析与检测，并在资源触顶或内联模式下做出相应的策略处理。本篇按 07 册惯例，讨论这个模块族的文件构成、组件分工与关键入口，不重复展开 06 册已经讲透的流表哈希、滑动窗口与重组状态机算法（原理见 06-04）。
+
+去重纪律照旧：07 是全集的模块功能唯一权威源，`stream-tcp` 的结构体逐字段定义归 05 全册（`Flow` 侧字段见 05-03，`TcpSession` / `TcpStream` 字段名需对照 `src/stream-tcp.h` 实际版本核验），`stream.reassembly.depth`、`stream.inline`、各类 `memcap` 等参数全集归 04 全册（参数见 04-02、04-03），机制与调用链归 06-04、06-12，运维排障归 08 全册。本篇只讲「这个模块有哪些文件、每个文件做什么、关键入口在哪、如何挂到流水线」，交叉引用统一写「字段见 05-03 ｜ 参数见 04-02 ｜ 原理见 06-04 ｜ 模块见 07-xx」。版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验。
+
+能力边界要先立住。Suricata 是 IDS / IPS / NSM 引擎，不是防火墙、不做 IP 转发；`stream-tcp-inline.c` 里的内联逻辑只是配合 NFQUEUE / AF_PACKET 桥接的 verdict 决定已重组数据是否可被放行，真正转发的是内核或桥接对端（原理见 06-12、模块见 07-06）。可见性方面，引擎只对自身解码并重组到的流量做检测；`stream.reassembly.depth` 之外的字节不再进入重组与检测，TLS 等加密载荷的明文正文更不可见，重组再完整也只能拿到密文记录与握手元数据（原理见 06-05、模块见 07-03）。把「重组」写成「能还原任意长度明文」是阅读这个模块时最常见的偏差。
+
+从工程价值看，建立 `stream-tcp` 的模块地图有三个直接收益。其一是排障：「有收包无告警」「某条流只告警一次」「文件提取不全」「吞吐随连接数上涨而骤降」这几类现象，根因大多能落到重组深度、memcap 触顶、会话状态异常或乱序处理这四处（原理见 08-03、08-04）。其二是调优：`stream.reassembly.depth`、`stream.reassembly.memcap`、`stream.inline`、会话池预分配是一组相互牵制的量，理解组件边界才能做 A/B 对照（参数见 04-02、08-02）。其三是扩展：新增应用层协议时，开发者知道连续字节由哪个入口供给、Frame 与事务该挂在哪一层，而不会试图自己去解析乱序段（模块见 07-03）。以下各节按「概念 → 文件与结构 → 组件协作 → 实例 → 陷阱 → 小结」展开。
+
+### 2. 核心概念
+
+先把术语固定下来。`TcpSession` 是一条 TCP 连接在 Suricata 内的会话对象，挂在 `Flow` 之上；`TcpStream` 描述其中一个方向的数据流状态；`TcpSegment` 是进入重组队列的段节点。三者及配套的重组队列结构定义在 `src/stream-tcp.h`、`src/stream-tcp-private.h` 与 `src/stream-tcp-reassemble.h`，字段名、类型与锁粒度需对照实际版本核验（流侧字段见 05-03）。`StreamTcpThread` 是每线程的流处理上下文，`TcpReassemblyThreadCtx` 是重组线程的每线程上下文，二者分别出现在 `src/stream-tcp.c` 与 `src/stream-tcp-reassemble.c` 的函数签名里（字段见 05-07、05-03）。
+
+会话状态机是这个模块的第一条主线。`src/stream-tcp.c` 里 `StreamTcpStateDispatch` 按当前状态分派到 `StreamTcpPacketStateNone`、`StreamTcpPacketStateSynSent`、`StreamTcpPacketStateSynRecv`、`StreamTcpPacketStateEstablished` 等处理函数，`StreamTcp3whs*` 一族负责三次握手的 SYN / SYN-ACK 排队与应用，`StreamTcpHandleFin` 处理 FIN 半关闭，`StreamTcpSetOSPolicy` 与目标操作系统的重组策略相关，`StreamTcpPacketSetState` 把状态写回会话，`StreamTcpNewSession` 在首次见到 SYN 时新建会话（函数名已核对，状态枚举取值需对照实际版本核验，原理见 06-04）。这里只点名组件与职责，握手超时、midstream 建会话、时间戳与 RST 校验的完整算法属于机制范畴，本篇不展开。
+
+重组是第二条主线。`StreamTcpReassembleHandleSegment` 是段进入重组的入口，`StreamTcpReassembleHandleSegmentHandleData` 处理数据段，`StreamTcpReassembleAppLayer` 把连续字节供给应用层解析，`StreamTcpReassembleTriggerRawInspection` 触发 raw 检测，`StreamTcpReassembleCheckDepth` 判定是否超过重组深度，`StreamTcpReassembleRawCheckLimit` 做 raw 侧上限检查（函数名与行号均已核对，签名需对照实际版本核验）。乱序、重复与 SACK 由 `src/stream-tcp-sack.c` 与段链表协作处理，段容器由 `src/stream-tcp-list.c` 提供，`src/stream-tcp-util.c` 放辅助函数，`src/stream-tcp-cache.c` 承担会话与段的缓存池化，`src/stream-tcp-inline.c` 承担内联模式下的重组边界处理。这些文件加起来才是一个完整的重组模块，把它们误当成「`stream-tcp-reassemble.c` 一个文件」会让人在排障时找不到北。
+
+资源与策略是第三条主线。`StreamTcpInitMemuse` / `StreamTcpIncrMemuse` / `StreamTcpDecrMemuse` 与 `StreamTcpCheckMemcap` / `StreamTcpSetMemcap` 维护会话内存账本，`StreamTcpReassembleInitMemuse` / `IncrMemuse` / `DecrMemuse` 与 `StreamTcpReassembleCheckMemcap` / `SetMemcap` / `Realloc` 维护重组缓冲的内存账本，`StreamTcpSessionPoolAlloc` / `Init` / `Cleanup` 与 `StreamTcpSessionClear` / `StreamTcpSessionCleanup` 负责会话对象池的分配与回收（函数名已核对，键名与取值需对照实际版本核验，参数见 04-02）。`StreamTcpInitConfig(bool quiet)` 与 `StreamTcpFreeConfig(bool quiet)` 负责配置的读取与释放，`StreamTcpReassembleInit(bool quiet)` / `Free(bool quiet)` 同理，`quiet` 参数用于自检等不打印详细日志的场景（签名需对照实际版本核验）。
+
+最后说明边界。`stream-tcp` 的上游是 `flow`（模块见 07-02）与 `decode`（模块见 07-01），`FlowWorker` 把带 `Flow` 的 TCP 报文交给它；下游是 `app-layer`（模块见 07-03）与 `detect`（模块见 07-04），它供给的是连续 stream buffer 与会话状态，不做协议识别、不构造事务、不做规则匹配、不写 EVE 日志（模块见 07-07）。它也不负责抓包与转发（模块见 07-06、原理见 06-12）。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，不重列字段。07 全册禁止完整结构体字段表，逐字段定义、内存布局与生命周期归 05 全册（字段见 05-03、05-07）。
+
+- `TcpSession`、`TcpStream`、`TcpSegment` 与重组队列结构：声明集中在 `src/stream-tcp.h`，内部共享声明在 `src/stream-tcp-private.h`，重组相关声明在 `src/stream-tcp-reassemble.h`；字段名与类型需对照实际版本核验（字段见 05-03）。
+- `StreamTcpThread`、`TcpReassemblyThreadCtx`：分别在 `src/stream-tcp.c`、`src/stream-tcp-reassemble.c` 中使用，每线程一份（字段见 05-07、05-03）。
+- `Flow` 与 `Packet`：本模块的输入载体，定义见 `src/flow.h`、`src/decode.h`（字段见 05-03、05-02）。
+- 会话池与段缓存：`src/stream-tcp-cache.c`、`src/stream-tcp-list.c` 提供底层容器，本模块用 `SCCalloc` 一类分配器申请对象（模块见 07-09）。
+
+下面是本快照中 `src/stream-tcp*` 族的真实文件清单，按职责分组；族内命名规律清晰，完整枚举可用 `ls src/stream-tcp*` 复核。
+
+```tree
+src/
+├── stream-tcp.c                 模块主体：状态机、每包入口、线程上下文
+├── stream-tcp.h                 TcpSession / TcpStream 等核心声明
+├── stream-tcp-private.h          模块内部共享声明
+├── stream-tcp-reassemble.c      重组：段入队、连续字节供给、内存账本
+├── stream-tcp-reassemble.h      重组侧声明
+├── stream-tcp-inline.c/.h       内联模式下的重组边界与 drop 配合
+├── stream-tcp-list.c/.h         段链表与容器
+├── stream-tcp-sack.c/.h         SACK / 乱序 / 重复段处理
+├── stream-tcp-util.c/.h         辅助函数
+├── stream-tcp-cache.c/.h        会话与段缓存池化
+└── tests/stream-tcp.c、tests/stream-tcp-reassemble.c、
+    tests/stream-tcp-inline.c、tests/stream-tcp-list.c   该族单元测试
+```
+
+关键入口函数在真实源码中的位置如下，均已逐一核对。`src/stream-tcp.c`：`void StreamTcpInitConfig(bool)` 前置声明第 207 行、定义第 496 行，`void StreamTcpFreeConfig(bool quiet)` 第 864 行，`void StreamTcpInitMemuse(void)` 第 231 行，`void StreamTcpIncrMemuse(uint64_t size)` 第 236 行，`void StreamTcpDecrMemuse(uint64_t size)` 第 242 行，`int StreamTcpCheckMemcap(uint64_t size)` 第 274 行，`int StreamTcpSetMemcap(uint64_t size)` 第 287 行，`void StreamTcpSessionCleanup(TcpSession *ssn)` 第 335 行，`void StreamTcpSessionClear(void *ssnptr)` 第 359 行，`static void *StreamTcpSessionPoolAlloc(void)` 第 405 行，`static int StreamTcpSessionPoolInit(void *data)` 第 419 行，`static TcpSession *StreamTcpNewSession(ThreadVars *tv, StreamTcpThread *stt, Packet *p, int id)` 第 928 行，`void StreamTcpSetOSPolicy(TcpStream *stream, Packet *p)` 第 1028 行，`static int StreamTcpPacketStateNone(...)` 第 1218 行，`static int StreamTcpPacketStateSynSent(...)` 第 2167 行，`static int StreamTcpPacketStateSynRecv(...)` 第 2508 行，`static int StreamTcpPacketStateEstablished(...)` 第 3436 行，`static int StreamTcpHandleFin(ThreadVars *tv, StreamTcpThread *stt, TcpSession *ssn, Packet *p)` 第 3640 行，`int StreamTcpPacket (ThreadVars *tv, Packet *p, StreamTcpThread *stt, ...)` 第 5703 行，`TmEcode StreamTcpThreadInit(ThreadVars *tv, void *initdata, void **data)` 第 6178 行，`void StreamTcpDetectLogFlush(...)` 第 7124 行。`src/stream-tcp-reassemble.c`：`void StreamTcpReassembleInitMemuse(void)` 第 105 行，`int StreamTcpReassembleCheckMemcap(uint64_t size)` 第 164 行，`int StreamTcpReassembleSetMemcap(uint64_t size)` 第 185 行，`void *StreamTcpReassembleRealloc(void *optr, size_t orig_size, size_t size)` 第 229 行，`int StreamTcpReassembleInit(bool quiet)` 第 535 行，`void StreamTcpReassembleFree(bool quiet)` 第 551 行，`static uint32_t StreamTcpReassembleCheckDepth(...)` 第 662 行，`int StreamTcpReassembleHandleSegmentHandleData(...)` 第 755 行，`int StreamTcpReassembleAppLayer(...)` 第 1400 行，`int StreamTcpReassembleHandleSegment(...)` 第 2013 行，`void StreamTcpReassembleTriggerRawInspection(TcpSession *ssn, int direction)` 第 2168 行，`void StreamTcpReassembleRegisterTests(void)` 第 3848 行。函数签名、参数与返回值一律需对照实际版本核验，本篇不复刻完整实现。交叉引用：字段见 05-03 ｜ 参数见 04-02 ｜ 原理见 06-04、06-12 ｜ 模块见 07-02。
+
+一个阅读时容易忽略的细节是 `src/stream-tcp-private.h` 的存在：它把「只在本模块内部共享、不对外暴露」的声明单独收拢，说明 `stream-tcp` 是一个有明确内外边界的模块族，而不是若干散落函数的集合。另一个细节是 `src/stream-tcp-reassemble.c` 文件末尾带了 `StreamTcpReassembleInlineTest01` 到 `StreamTcpReassembleTestMemusePcapHdrStorage` 等大量内联与内存账本单测，以及 `src/tests/stream-tcp-reassemble.c` 独立测试文件；改动乱序或 memcap 逻辑后，这些测试就是最直接的回归基线（工具链见 07-13）。
+
+### 4. 关键流程与调用链
+
+本节按模块视角描述 `stream-tcp` 族内部组件如何协作、以及它如何挂到流水线上，不重复展开 06 册的流表哈希、滑动窗口与超时状态机算法（原理见 06-04、06-01）。可以把整个模块拆成三条相互配合的线：会话状态线、重组数据线、资源与内联线。
+
+会话状态线从 `FlowWorker` 交付报文开始。`src/flow-worker.c` 把绑定好 `Flow` 的 TCP 报文送入本模块，`StreamTcpPacket` 作为每包主入口（第 5703 行），经 `StreamTcpStateDispatch` 分派到对应状态的处理函数；首次 SYN 由 `StreamTcpNewSession` 建会话并取用会话池对象，`StreamTcp3whs*` 一族处理三次握手中的 SYN / SYN-ACK 排队，`StreamTcpPacketSetState` 推进状态，`StreamTcpHandleFin` 处理正常关闭，`StreamTcpSessionCleanup` 与 `StreamTcpSessionClear` 负责回收（字段见 05-03、原理见 06-04）。`StreamTcpThreadInit` 在线程启动时用 `SCCalloc` 分配 `StreamTcpThread`，这就是每线程上下文的来源（字段见 05-07、模块见 07-09）。本篇不展开状态迁移的完整条件，只指出「状态机在 `stream-tcp.c`、会话挂在 `Flow` 上」这一模块边界。
+
+重组数据线是字节流的主路径。有效数据段进入 `StreamTcpReassembleHandleSegment`，由 `StreamTcpReassembleHandleSegmentHandleData` 插入段链表；`src/stream-tcp-list.c` 维护段容器，`src/stream-tcp-sack.c` 处理 SACK 块与乱序、重复段，`StreamTcpReassembleCheckDepth` 判定是否越过 `stream.reassembly.depth`，`StreamTcpReassembleAppLayer` 把连续字节按方向供给 `app-layer` 解析，`StreamTcpReassembleTriggerRawInspection` 触发 raw 侧检测（模块见 07-03、07-04、原理见 06-08）。这条线的输出边界非常清楚：一段方向正确、连续、已确认可被消费的 stream buffer，以及随流推进的应用层事务。换句话说，`stream-tcp` 不解析 HTTP 语义，它只保证「HTTP 解析器拿到的是不断裂的字节」。
+
+资源与内联线贯穿前两条线。`StreamTcpIncrMemuse` / `DecrMemuse` 与 `StreamTcpReassembleIncrMemuse` / `DecrMemuse` 在分配与释放时更新账本，`StreamTcpCheckMemcap` / `StreamTcpReassembleCheckMemcap` 在触顶时按异常策略处理，`StreamTcpReassembleRealloc` 负责缓冲扩容，`StreamTcpSessionPoolAlloc` / `Init` / `Cleanup` 让会话对象走池化而非频繁 `malloc`（模块见 07-09、参数见 04-02）。内联模式下 `src/stream-tcp-inline.c` 参与判定重组边界与已放行数据，`StreamTcpInlineDropInvalid`、`StreamTcpInlineDropUrg` 一类辅助处理异常段（原理见 06-12）。整个模块的状态推进、重组供给与资源约束见图 07-08-01。
+
+:::figure id=07-08-01 | name=stream-tcp 模块状态推进与重组数据供给 | dir=TD
+node t1 "FlowWorker 交付<br/>TCP 报文" blue
+node t2 "StreamTcpPacket<br/>会话分派" teal
+node t3 "三次握手状态<br/>SynSent/SynRecv" purple
+node t4 "Established<br/>数据段处理" purple
+node t5 "HandleSegment<br/>重组队列" teal
+node t6 "AppLayer 供给<br/>stream buffer" green
+node t7 "SACK 与乱序<br/>stream-tcp-sack" gray
+node t8 "memcap 与 depth<br/>资源上限" red
+edge t1 -> t2 "带 Flow 的 Packet"
+edge t2 -> t3 "SYN 建会话"
+edge t3 -> t4 "握手完成"
+edge t4 -> t5 "有效数据段"
+edge t7 -> t5 dashed "乱序归并"
+edge t5 -> t6 "ReassembleAppLayer"
+edge t5 -> t8 "IncrMemuse"
+edge t8 -> t5 dashed "超限回收"
+:::
+
+图 07-08-01 中实线是每包与每段的主路径，虚线是乱序归并和资源回收的辅助关系。需要强调这张图描述的是模块内部的文件协作关系，不是 06-01 那条从收包到落盘的全流水线；把它和全流水线混为一谈，就会误以为重组模块还负责抓包或写日志。滑动窗口、ACK / SACK 推进、重组紧急度与 memcap 回收策略属于机制范畴（原理见 06-04），本篇只点名文件与入口。
+
+### 5. 配置/命令/代码实例
+
+本节只给最小必要实例，并显式指向权威源：`suricata.yaml` 的 `stream` 全段、全部命令行与返回码见 04 全册（参数见 04-02、04-03、04-07），此处不重列参数全集；07 全册每篇代码段最多给 3–5 个本模块最典型的调用，其余写「完整 API 见 04-xx」。下面这段是按真实函数名书写的主干入口摘录，仅示意模块内部的先后关系，不构成完整实现。
+
+```c
+/* stream-tcp 模块主干入口摘录，符号均为真实名称，见 src/stream-tcp*.c */
+void StreamTcpInitConfig(bool quiet);                 /* 读取 stream 段配置 */
+int StreamTcpPacket(ThreadVars *tv, Packet *p, StreamTcpThread *stt, PacketQueue *pq);
+int StreamTcpReassembleHandleSegment(ThreadVars *tv, TcpReassemblyThreadCtx *ra_ctx, TcpSession *ssn, TcpStream *stream, Packet *p);
+int StreamTcpReassembleAppLayer(ThreadVars *tv, TcpReassemblyThreadCtx *ra_ctx, TcpSession *ssn, TcpStream *stream, Packet *p);
+```
+
+上面四个调用分别代表配置初始化、每包状态分派、段入队重组、连续字节供给应用层四个环节，是本模块最典型的一组入口；`StreamTcpPacket` 的完整签名在 `src/stream-tcp.c` 第 5703 行跨多行书写，`StreamTcpReassembleHandleSegment` 与 `StreamTcpReassembleAppLayer` 的参数在 `src/stream-tcp-reassemble.c` 第 2013、1400 行同样跨行，函数签名与返回值需对照实际版本核验。完整参数与命令行见 04-02、04-07，机制原理见 06-04、06-08，此处不再追加调用。
+
+下面给一组按「前置检查 → 执行 → 验证输出 → 清理」组织的源码核验命令，用来在拿到任意一份上游快照后快速定位重组模块的主干入口。它不改变运行状态，适合作为阅读源码或核查版本差异的第一步。
+
+```bash
+# 前置：进入真实仓库根（注意归档多一层 suricata-main/）
+cd upstream_src/suricata/suricata-main
+
+# 执行：定位状态机、每包入口与重组供给四处主干
+grep -n "StreamTcpInitConfig\|StreamTcpPacket\|StreamTcpReassembleHandleSegment\|StreamTcpReassembleAppLayer" src/stream-tcp.c src/stream-tcp-reassemble.c
+
+# 验证：确认 stream-tcp 族文件齐全
+ls src/stream-tcp*.c | wc -l
+
+# 清理：退出查阅目录
+cd -
+```
+
+典型输出如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+src/stream-tcp.c:207:void StreamTcpInitConfig(bool);
+src/stream-tcp.c:496:void StreamTcpInitConfig(bool quiet)
+src/stream-tcp.c:5703:int StreamTcpPacket (ThreadVars *tv, Packet *p, StreamTcpThread *stt,
+src/stream-tcp-reassemble.c:1400:int StreamTcpReassembleAppLayer(ThreadVars *tv, TcpReassemblyThreadCtx *ra_ctx, TcpSession *ssn,
+src/stream-tcp-reassemble.c:2013:int StreamTcpReassembleHandleSegment(ThreadVars *tv, TcpReassemblyThreadCtx *ra_ctx,
+```
+
+逐行判读如下。第 207 行是 `StreamTcpInitConfig` 的前置声明，第 496 行是同一函数的定义体起始并带 `quiet` 形参名，两行同时出现是 C 文件里先声明后定义的常见写法，不要误读成两个不同函数；这个函数决定了 `stream.reassembly.depth`、`stream.inline`、各类 `memcap` 的读取结果，是配置落地的入口（参数见 04-02）。第 5703 行 `StreamTcpPacket` 的参数里出现 `ThreadVars *`、`Packet *`、`StreamTcpThread *`，正好对应「每线程上下文 + 包载体 + 流处理上下文」三要素，它是每包进入状态机的唯一主入口，判读时若发现某个新分支没有走到这里，通常意味着报文被提前旁路。第 1400 行 `StreamTcpReassembleAppLayer` 的参数含 `TcpReassemblyThreadCtx *`、`TcpSession *`、`TcpStream *`，说明重组完成后按会话与方向把连续字节交给应用层解析，这就是 `app-layer` 拿到 stream buffer 的位置（模块见 07-03）。第 2013 行 `StreamTcpReassembleHandleSegment` 是段入队的入口，行号排在 `AppLayer` 之后并不意味着调用顺序在后，而是源码布局如此；两行共同说明「段先入队、连续后供给」的双重职责都落在 `stream-tcp-reassemble.c` 一个文件里。最后 `ls src/stream-tcp*.c | wc -l` 的计数应包含 `stream-tcp.c`、`stream-tcp-reassemble.c`、`stream-tcp-inline.c`、`stream-tcp-list.c`、`stream-tcp-sack.c`、`stream-tcp-util.c`、`stream-tcp-cache.c` 等，若明显偏少，说明归档层级不对，应回到 SPEC 第 0.1 节确认 `suricata-main/` 前缀。整组输出共同验证了「状态机在 `stream-tcp.c`、重组在 `stream-tcp-reassemble.c`」这一模块分工。
+
+按职责整理的 stream-tcp 子族对照见下表，便于按现象反查应该先读哪个文件。
+
+| 子族 | 代表文件 | 主要职责 | 典型入口 |
+|---|---|---|---|
+| 模块主体与状态机 | `src/stream-tcp.c`、`.h` | 会话状态推进、每包分派、线程上下文 | `StreamTcpPacket`、`StreamTcpStateDispatch` |
+| 重组与供给 | `src/stream-tcp-reassemble.c`、`.h` | 段入队、连续字节供给、内存账本 | `StreamTcpReassembleHandleSegment` |
+| 段容器 | `src/stream-tcp-list.c`、`.h` | 段链表与容器操作 | 需对照实际版本核验 |
+| 乱序与 SACK | `src/stream-tcp-sack.c`、`.h` | SACK 块、乱序与重复段 | 需对照实际版本核验 |
+| 内联边界 | `src/stream-tcp-inline.c`、`.h` | inline 模式的重组与 verdict 配合 | 需对照实际版本核验 |
+| 缓存池化 | `src/stream-tcp-cache.c`、`.h` | 会话与段缓存池 | 需对照实际版本核验 |
+| 辅助函数 | `src/stream-tcp-util.c`、`.h` | 通用辅助 | 需对照实际版本核验 |
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一组陷阱围绕重组深度与可见性。`stream.reassembly.depth` 之外的字节不再进入重组与检测，因此「大文件提取不全」「长连接后段内容不再告警」往往不是规则写错，而是字节根本没被重组装进来（参数见 04-02、原理见 06-10）。同理，TLS 等加密载荷的明文正文不可见，重组再完整也只能拿到密文记录，能记录的是握手元数据、证书、SNI 一类信息（模块见 07-03、原理见 06-05）。把「调大 depth」当成「能读到 HTTPS 明文」是能力边界上的根本误判。排查这类问题时应先确认 `eve.json` 里对应 `flow` 事件与应用层事件是否齐全，再决定是否调整深度，而不是先改规则。
+
+第二组陷阱是 memcap 与会话池。`stream.reassembly.memcap`、`flow.memcap` 一类上限触顶时会按异常策略回收或跳过重组，现象是「连接数一上来告警骤减」「重组内存计数不再增长」，具体键名与异常策略取值需对照实际版本核验（参数见 04-02、原理见 06-04、08-05）。另一个隐蔽点是把 memcap 一味调大：重组缓冲按连接累积，调大上限等于允许更多内存被占用，在多实例或容器里可能先触发 OOM，正确做法是把会话数、depth、memcap 三者一起做容量评估（原理见 08-02、08-05）。会话池与段缓存由 `stream-tcp-cache.c` 承担，池化不足会在高并发下表现为分配开销上升，任何关于吞吐、内存占用、连接容量的结论一律标注「需在目标机型实测」，不给绝对值。
+
+第三组陷阱与状态和内联模式有关。`flow` 层面的生命周期标志与 `TcpSession` 的握手 / 重组状态相关但不等价，把「流已建立」读成「TCP 已完成三次握手」会误判 midstream 场景（原理见 06-04、字段见 05-03）；乱序、重传、零窗口探测、RST 注入都会让状态机走非常规分支，判读 `stats.log` 时要把重组类计数与告警计数分开看（原理见 08-01）。内联模式下 `stream.inline`、`fail-open` 与 verdict 策略共同决定已重组数据的放行边界，配置不一致会表现为「IPS 不 drop」或「重组边界异常」（原理见 06-12、参数见 04-02、案例见 08-04）。这里的诊断顺序建议固定为「收包计数 → 解码计数 → 流计数 → 重组计数 → 应用协议计数 → 告警计数」逐段收敛（原理见 08-03），本篇不展开运维步骤。
+
+最佳实践可以归纳为四条。其一，改动状态机、乱序或 memcap 逻辑后，务必跑 `src/stream-tcp-reassemble.c` 内联单测与 `src/tests/stream-tcp-reassemble.c` 等测试文件，把它们作为回归基线（工具链见 07-13）。其二，把 `tcp.reassembly_memuse` 一类重组内存计数纳入监控基线，关注相对变化而非绝对数值；计数项名需对照实际版本核验（参数见 04-04、原理见 08-01）。其三，调优时按「会话数 → depth → memcap → 绑核」的顺序做 A/B 对照，避免同时改多个量导致结论不可复现（原理见 08-02）。其四，始终记住能力边界：重组模块不做转发、不解密、不做协议识别与规则匹配，IDS 旁路只告警不丢弃，内联 drop 依赖 NFQUEUE / 桥接对端的 verdict（原理见 06-12）。
+
+### 7. 小结与延伸阅读
+
+`stream-tcp` 模块把「把乱序的 TCP 段还原成连续、方向正确、带状态的流缓冲」收敛到 `src/stream-tcp.c/.h` 与 `src/stream-tcp-reassemble.c/.h` 等一族文件中：`StreamTcpPacket` 作为每包主入口经 `StreamTcpStateDispatch` 推进会话状态，`StreamTcp3whs*` 处理三次握手，`StreamTcpNewSession` 建会话；`StreamTcpReassembleHandleSegment` 把段入队，`stream-tcp-list.c` 与 `stream-tcp-sack.c` 处理容器、乱序与 SACK，`StreamTcpReassembleAppLayer` 把连续字节供给应用层，`stream-tcp-inline.c` 处理内联边界，`stream-tcp-cache.c` 承担池化，memcap 与 depth 由一组 `IncrMemuse` / `CheckMemcap` / `CheckDepth` 函数共同约束。它的输出边界是连续 stream buffer 与会话状态，下游由 `app-layer`（模块见 07-03）与 `detect`（模块见 07-04）接手；它不做抓包、不做协议识别、不做规则匹配、不写日志，更不做转发与解密。
+
+需要继续深入时，建议按四条路径展开。想理解流表哈希、滑动窗口、ACK / SACK 推进、重组紧急度与超时状态机的完整机制，读 06-04，内联 verdict 读 06-12；想查 `Flow`、`TcpSession`、`TcpStream` 的逐字段定义，读 05-03 并对照 `src/stream-tcp.h` 实际版本核验；想核对 `stream` 段参数与命令行，读 04-02、04-07、04-08；想按目录继续了解相邻模块，读 07-02（flow）、07-03（app-layer）、07-06（source-*）与 07-13（工具链与测试）。文件提取与 `file.data` 见 06-10，重组相关的故障案例与容量评估见 08-04、08-02、08-05。所有性能与容量结论均需在目标机型实测，版本差异一律以 `configure.ac`、`ChangeLog` 与本快照实际文件为准，需对照实际版本核验。
+
+## 07-09 util-* 基础设施与 conf 配置模块
+
+### 1. 背景与动机
+
+一个能同时跑抓包、解码、流重组、应用解析、规则编译、检测与多线程输出的引擎，背后必然压着大量与业务无关、却被每个模块反复使用的通用能力：哈希表与基数树、字节序转换与校验和、时间戳与单调时钟、内存分配与对象池、日志与调试级别、CPU 亲和与原子操作、文件路径与权限收敛、YAML 解析与配置树查询、单模式与多模式匹配的底层容器、Lua 绑定、DPDK 与 eBPF 辅助，等等。若每个业务模块各自实现一遍，代码会迅速碎片化；若不给这些能力划清边界，又会变成一个谁都能往里塞东西的「杂物间」。`src/util-*.c/.h` 承担的正是前一类基础设施，`src/conf.c/.h` 与 `src/conf-yaml-loader.c/.h` 承担的则是贯穿全局的配置中枢。
+
+配置中枢的重要性尤其容易被低估。Suricata 几乎一切行为都由 `suricata.yaml` 驱动：抓包后端与线程数、规则路径、输出目标、memcap、绑核、IPS 策略，全都在启动时被读进一棵配置树，再由各模块按名字查询。命令行 `--set` 覆盖、YAML 的 `include`、规则热加载前后的配置备份与恢复、`--dump-config` 的最终配置打印，也都落在这套机制上。换句话说，`conf` 是「把用户意图翻译成模块参数」的唯一通道，理解它就理解了为什么某个键写错会静默取默认值或启动期报错。本篇按 07 册惯例，讨论这两族的文件构成、关键接口、职责边界与使用陷阱。
+
+去重纪律照旧：07 是全集的模块功能唯一权威源，`util-*` 与 `conf` 的结构体逐字段定义归 05-09，配置参数全集归 04 全册（参数见 04-01、04-02），机制与调用链归 06 全册，运维排障归 08 全册。本篇只讲「这个模块有哪些文件、每个文件做什么、关键入口在哪」，交叉引用统一写「字段见 05-09 ｜ 参数见 04-02 ｜ 原理见 06-xx ｜ 模块见 07-xx」。版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验。
+
+这里必须先给出一个经过核验的关键结论：本快照中配置相关的符号**带 `SC` 前缀**。`src/conf.h` 里是 `typedef struct SCConfNode_ { ... } SCConfNode`，查询函数是 `SCConfGet`、`SCConfGetInt`、`SCConfGetBool`、`SCConfGetNode`、`SCConfGetChildValueWithDefault`，设置函数是 `SCConfSet`、`SCConfSetFinal`，加载函数是 `SCConfYamlLoadFile`、`SCConfYamlLoadString`，打印函数是 `SCConfDump`。大纲与不少历史资料里写的「`ConfNode` 树与 ConfGet 系列」是较早版本的命名习惯，在本快照中已改为 `SCConfNode` / `SCConf*` 系列，具体差异需对照 `src/conf.h`、`src/conf.c` 实际版本核验。这不是笔误，而是本套资料坚持「先查再写」的直接体现：凡未能逐一核实的字段名、函数名、配置项键名，一律标注「需对照实际版本核验」并给出可定位目录。
+
+能力边界也要立住。`util-*` 与 `conf` 是基础设施，不产生检测结论、不抓包、不重组、不写业务日志；它们被所有模块调用，但不能因此把 Suricata 写成纯 C 项目——`rust/` 与 Cargo 是构建的一部分，JSON 构造、大量应用层解析器都在 Rust 侧，`util-ja3.h`、`util-hyperscan.h` 一类头文件只是 C / Rust 与外部库的分界（模块见 07-10）。Suricata 是 IDS / IPS / NSM 引擎，不是防火墙、不做转发；配置里出现 `host-mode`、`stream.inline` 一类键也不改变这一定位（能力边界见 SPEC 第 2.1 节）。此外，Hyperscan 只是可选 MPM 加速，`util-hyperscan.h` 的存在不代表它是必需依赖（模块见 07-05、参数见 04-01）。
+
+从工程价值看，建立 `util-*` 与 `conf` 的地图有三个直接收益。其一是排障：「YAML 缩进错」「某个键改了不生效」「`--set` 覆盖没起作用」「内存持续上涨」分别对应配置解析、查询路径、备份恢复与池化四处，理解组件边界才能快速定位（原理见 08-03、08-04）。其二是调优：包池、流备用池、会话池的预分配与扩容都由 `util-pool*` 提供，`max-pending-packets`、`memcap` 一类上限要与池容量一起考虑（参数见 04-02、原理见 08-02）。其三是扩展：新增模块读配置时知道该用哪一族 `SCConfGet*`，需要池化对象时知道该用 `Pool` 还是 `PoolThread`（字段见 05-09）。以下各节按「概念 → 文件与结构 → 组件协作 → 实例 → 陷阱 → 小结」展开。
+
+### 2. 核心概念
+
+先把配置侧术语固定下来。`SCConfNode` 是配置树的节点，含 `name`、`val`、`is_seq`、`final`、`parent`、子节点队列 `head` 与兄弟链 `next` 等成员；`is_seq` 标识序列节点，`final` 标识该值不可被后续 `SCConfSet` 覆盖（字段名与类型见 `src/conf.h`，需对照实际版本核验，字段见 05-09）。整棵树由 `SCConfInit` 建立、`SCConfDeInit` 释放，`SCConfGetRootNode` 返回根，`SCConfGetNode` 按路径查节点，`SCConfNodeLookupChild` / `SCConfNodeLookupChildValue` 在节点内查子键，`SCConfGetFirstNode` / `SCConfGetNextNode` 遍历序列，`SCConfNodeNew` / `SCConfNodeFree` / `SCConfNodeRemove` / `SCConfNodePrune` 管理节点生命周期（函数名已核对，签名需对照实际版本核验）。
+
+查询与设置是两套对称接口。`SCConfGet` 取字符串值，`SCConfGetNonNull` 保证非空，`SCConfGetInt` / `SCConfGetBool` / `SCConfGetDouble` / `SCConfGetFloat` / `SCConfGetTime` 做类型转换，`SCConfGetChildValue` / `SCConfGetChildValueInt` / `SCConfGetChildValueBool` 及各自的 `WithDefault` 变体支持「在指定父节点下取值、取不到用默认值」，`SCConfValIsTrue` / `SCConfValIsFalse`、`SCConfNodeChildValueIsTrue` 一类做布尔语义判定，`SCConfNodeHasChildren`、`SCConfNodeIsSequence` 判断节点形态（声明见 `src/conf.h`，实现见 `src/conf.c`，需对照实际版本核验）。设置侧 `SCConfSet` 写值、`SCConfSetFinal` 写不可覆盖值、`SCConfSetFromString` 从字符串解析、`SCConfRemove` 删除、`SCConfNodeGetNodeOrCreate` 按路径创建节点、`SCConfSetIfaceNode` 与 `SCConfSetRootAndDefaultNodes` 处理「按接口覆盖」这一 Suricata 特有的配置模式（参数见 04-02、字段见 05-09）。
+
+加载与备份是容易被忽略的两组能力。`src/conf-yaml-loader.c` 里 `ConfYamlParse` 是静态解析主体，`SCConfYamlLoadFile` 从文件加载、`SCConfYamlLoadString` 从字符串加载、`SCConfYamlLoadFileWithPrefix` 带前缀加载、`SCConfYamlHandleInclude` 处理 YAML 里的 `include` 指令，`SCConfYamlRegisterTests` 登记该族单测（函数名与行号已核对）。`src/conf.c` 里 `SCConfCreateContextBackup` / `SCConfRestoreContextBackup` 在规则重载、Unix socket 控制面操作前后保存与恢复整棵配置树，`SCConfDump` 与 `SCConfNodeDump` 打印配置；`src/suricata.c` 第 3141 行在 `--dump-config` 分支调用 `SCConfDump()`，第 761 行的帮助文本、第 1480 行的 `{"dump-config", 0, &dump_config, 1}` 选项登记也已核对（参数见 04-07、原理见 06-xx 对应的配置加载环节）。
+
+内存与池化是 `util-*` 侧最核心的一组概念。`src/util-mem.h` 把分配器统一成 `SCMalloc`、`SCCalloc`、`SCRealloc`、`SCFree`、`SCStrdup`、`SCStrndup`、`SCMallocAligned`、`SCFreeAligned` 一族宏，并对应 `SCMallocFunc`、`SCCallocFunc`、`SCReallocFunc`、`SCStrdupFunc`、`SCMallocAlignedFunc`、`SCFreeAlignedFunc` 等函数实现，实现在 `src/util-mem.c`；`src/util-memcmp.h/.c` 与 `src/util-memcpy.h` 提供字节比较与拷贝的封装（宏定义与函数名已核对，签名需对照实际版本核验）。`src/util-pool.h` 定义 `PoolBucket_` 与 `Pool_`，`PoolInit` 建池、`PoolGet` 取对象、`PoolReturn` 归还、`PoolFree` 释放、`PoolRegisterTests` 登记单测，池内用 `alloc_stack`、`empty_stack`、`pb_buffer` 等成员管理预分配块（字段见 05-09）。`src/util-pool-thread.h/.c` 在其上提供每线程一份的 `PoolThread`：`PoolThreadInit`、`PoolThreadExpand`、`PoolThreadGetById`、`PoolThreadReturn`、`PoolThreadLock` / `PoolThreadUnlock`、`PoolThreadReturnRaw`、`PoolThreadSize`、`PoolThreadFree`，让高并发路径避开全局锁（函数名已核对，字段见 05-09）。
+
+`util-*` 家族按职责可分成若干组，这个分类也是第 3 节文件清单的组织依据：容器与哈希（`util-hash.h`、`util-hashlist.h`、`util-hash-string.h`、`util-thash.h`、`util-rohash.h`、`util-radix4-tree.h`、`util-radix6-tree.h`、`util-macset.h`、`util-port-interval-tree.h`）、字节与校验和（`util-byte.h`、`util-checksum.h`、`util-fix_checksum.h`、`util-cidr.h`、`util-ip.h`）、时间与缓冲（`util-time.h`、`util-clock.h`、`util-buffer.h`、`util-streaming-buffer.h`）、日志与调试（`util-debug.h`、`util-debug-filters.h`、`util-error.h`、`util-logopenfile.h`、`util-syslog.h`、`util-log-redis.h`、`util-print.h`）、线程与 CPU（`util-affinity.h`、`util-cpu.h`、`util-atomic.h`、`util-signal.h`、`util-profiling.h`、`util-profiling-locks.h`）、设备与平台（`util-device.h`、`util-ioctl.h`、`util-datalink.h`、`util-hugepages.h`、`util-dpdk.h`、`util-dpdk-rss.h`、`util-ebpf.h`、`util-bpf.h`、`util-privs.h`、`util-landlock.h`、`util-systemd.h`）、配置与规则辅助（`util-conf.h`、`util-config.h`、`util-classification-config.h`、`util-reference-config.h`、`util-threshold-config.h`、`util-rule-vars.h`）、匹配容器（`util-mpm.h`、`util-mpm-ac.h`、`util-mpm-hs.h`、`util-spm.h`、`util-spm-bm.h`、`util-hyperscan.h`，能力归 07-05）、Lua 绑定（`util-lua*.h` 一族，原理见 06-14）以及杂项（`util-misc.h`、`util-path.h`、`util-random.h`、`util-storage.h`、`util-var.h`、`util-enum.h`、`util-validate.h`、`util-optimize.h`、`util-plugin.h`、`util-exception-policy.h`、`util-magic.h`、`util-file.h`、`util-proto-name.h`、`util-unittest.h` 等）。以上头文件在本快照中均已确认存在；`util-*.c` 的具体对应文件因数量众多，需对照 `src/util-*.c` 实际版本核验。
+
+最后说明边界与分工。`util-*` 与 `conf` 被 07-01 至 07-08 各模块共同调用，但不承载任何业务逻辑；`rust/` 侧承担 JSON 构造与大量应用层解析，`util-*` 中的 `SC` 前缀与 `rust/cbindgen.toml` 的 FFI 边界共同说明 Suricata 是 C 与 Rust 混合工程（模块见 07-10）。规则关键字、命令行、yaml 全段的参数语义归 04 全册（参数见 04-01、04-02），本篇不复述。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，不重列字段。07 全册禁止完整结构体字段表，逐字段定义、内存布局与生命周期归 05-09。
+
+- `SCConfNode_`（`SCConfNode`）：定义见 `src/conf.h` 第 37 行起，至 `} SCConfNode;` 收尾（字段见 05-09）。
+- `PoolBucket_`、`Pool_`：定义见 `src/util-pool.h` 第 36、43 行起；`PoolThreadElement_`、`PoolThread_`、`PoolThreadId` 定义见 `src/util-pool-thread.h` 第 45、53、60 行（字段见 05-09）。
+- 分配器宏与函数：`src/util-mem.h` 第 35 行起的 `SCMalloc` 一组宏与第 46 行起的函数声明，实现在 `src/util-mem.c`（字段见 05-09）。
+- 运行时上下文 `SCInstance`、`ConfNode` 相关的跨文档索引：见 `src/suricata.c` 与 05-09（字段见 05-09）。
+
+下面是本快照中 `conf` 与 `util-*` 重点文件的真实清单节选；`util-*.h` 在本快照里有百余个，此处按组列代表，完整枚举可用 `ls src/util-*` 复核。
+
+```tree
+src/
+├── conf.c / conf.h                  配置树：SCConfNode 与 SCConfGet / Set 系列
+├── conf-yaml-loader.c / .h          YAML 解析：SCConfYamlLoadFile 与 include 处理
+├── tests/fuzz/confyaml.c            配置解析 fuzz target
+├── util-mem.c / util-mem.h          分配器：SCMalloc / SCCalloc / SCFree
+├── util-memcmp.c / util-memcmp.h    字节比较封装
+├── util-memcpy.h                    字节拷贝封装
+├── util-pool.c / util-pool.h        对象池：PoolInit / PoolGet / PoolReturn
+├── util-pool-thread.c / .h          每线程对象池：PoolThreadInit / GetById
+├── util-hash.h / util-hashlist.h    哈希表与哈希链表
+├── util-hash-string.h / util-hash-lookup3.h   字符串与 lookup3 哈希
+├── util-thash.h / util-rohash.h     线程化哈希与只读哈希
+├── util-radix4-tree.h / util-radix6-tree.h / util-radix-tree-common.h   基数树
+├── util-byte.h / util-checksum.h / util-fix_checksum.h   字节与校验和
+├── util-cidr.h / util-ip.h          CIDR 与 IP 处理
+├── util-time.h / util-clock.h       时间与时种
+├── util-buffer.h / util-streaming-buffer.h    缓冲与流式缓冲
+├── util-debug.h / util-debug-filters.h / util-error.h   日志与调试
+├── util-logopenfile.h / util-syslog.h / util-log-redis.h   日志输出目标
+├── util-affinity.h / util-cpu.h / util-atomic.h   绑核、CPU 与原子操作
+├── util-profiling.h / util-profiling-locks.h      性能剖析
+├── util-device.h / util-ioctl.h / util-datalink.h   网卡与链路
+├── util-hugepages.h / util-dpdk.h / util-dpdk-rss.h   大页与 DPDK 辅助
+├── util-ebpf.h / util-bpf.h         eBPF 辅助
+├── util-conf.h / util-config.h / util-classification-config.h   配置辅助
+├── util-reference-config.h / util-threshold-config.h / util-rule-vars.h   规则辅助
+├── util-mpm.h / util-mpm-ac.h / util-mpm-hs.h    MPM 容器（能力见 07-05）
+├── util-spm.h / util-spm-bm.h / util-hyperscan.h   单模式匹配与外部加速
+├── util-lua.h / util-lua-common.h / util-lua-*.h   Lua 绑定族
+├── util-privs.h / util-landlock.h / util-daemon.h   权限与沙箱
+├── util-path.h / util-random.h / util-storage.h / util-var.h   通用杂项
+├── util-exception-policy.h / util-exception-policy-types.h   异常策略
+├── util-magic.h / util-file.h / util-file-decompression.h   文件与 magic
+├── util-plugin.h / util-enum.h / util-validate.h / util-optimize.h   插件与工具
+└── util-unittest.h / util-unittest-helper.h / util-proto-name.h / util-misc.h   测试与杂项
+```
+
+关键函数在真实源码中的位置如下，均已逐一核对。`src/conf.c`：`void SCConfInit(void)` 第 120 行，`int SCConfSet(const char *name, const char *val)` 第 241 行，`int SCConfSetFinal(const char *name, const char *val)` 第 320 行，`int SCConfGet(const char *name, const char **vptr)` 第 352 行，`int SCConfGetInt(const char *name, intmax_t *val)` 第 440 行，`int SCConfGetBool(const char *name, int *val)` 第 523 行，`void SCConfNodeRemove(SCConfNode *node)` 第 709 行，`void SCConfCreateContextBackup(void)` 第 740 行，`void SCConfDeInit(void)` 第 759 行，`void SCConfDump(void)` 第 817 行。`src/conf-yaml-loader.c`：`static int ConfYamlParse(` 第 50、167 行，`int SCConfYamlHandleInclude(SCConfNode *parent, const char *filename)` 第 114 行，`int SCConfYamlLoadFile(const char *filename)` 第 489 行，`int SCConfYamlLoadString(const char *string, size_t len)` 第 535 行，`int SCConfYamlLoadFileWithPrefix(const char *filename, const char *prefix)` 第 565 行，`void SCConfYamlRegisterTests(void)` 第 1068 行。`src/util-pool.h`：`Pool *PoolInit(...)` 第 73 行，`void *PoolGet(Pool *)` 第 77 行，`void PoolReturn(Pool *, void *)` 第 78 行，`void PoolFree(Pool *)` 第 75 行。`src/util-pool-thread.h`：`PoolThread *PoolThreadInit(...)` 第 68 行，`int PoolThreadExpand(PoolThread *pt)` 第 75 行，`void *PoolThreadGetById(PoolThread *pt, uint16_t id)` 第 87 行，`void PoolThreadReturn(PoolThread *pt, void *data)` 第 93 行，`int PoolThreadSize(PoolThread *pt)` 第 102 行。`src/util-mem.h`：`#define SCMalloc malloc` 第 35 行，`void *SCMallocFunc(const size_t sz)` 第 46 行，`void *SCCallocFunc(const size_t nm, const size_t sz)` 第 52 行，`void *SCMallocAlignedFunc(const size_t size, const size_t align)` 第 67 行。`src/suricata.c`：第 761 行 `--dump-config` 帮助文本、第 1480 行选项登记、第 3141 行 `SCConfDump();`。函数签名与参数需对照实际版本核验。交叉引用：字段见 05-09 ｜ 参数见 04-01、04-02 ｜ 原理见 06-xx ｜ 模块见 07-10。
+
+一个值得记住的细节是 `src/conf.h` 里 `SCConfNode_` 的 `final` 成员：它把「命令行 `--set` 或 `SCConfSetFinal` 写入的值不可被 YAML 后续覆盖」这一语义固化在节点上，这正是 `--set` 能稳定覆盖配置的底层依据（参数见 04-07，字段见 05-09）。另一个细节是 `src/tests/fuzz/confyaml.c` 的存在：配置解析器是少数被单独做成 fuzz target 的组件，说明 YAML 输入被视为不可信边界，改动 `conf-yaml-loader.c` 时应把它纳入回归（工具链见 07-13、原理见 08-05）。
+
+### 4. 关键流程与调用链
+
+本节按模块视角描述 `conf` 与 `util-*` 内部组件如何协作，不重复展开 06 册的流水线机制（原理见 06-01）。可以把整个模块拆成三条线：配置加载线、配置查询与备份线、基础设施供给线。
+
+配置加载线发生在启动早期。`src/suricata.c` 解析命令行后确定配置文件路径，交由 `src/conf-yaml-loader.c` 的 `SCConfYamlLoadFile` 读取；后者用 libyaml 的事件回调驱动 `ConfYamlParse`，把映射、序列、标量逐层构造成 `SCConfNode` 树，遇到 `include` 指令时递归调用 `SCConfYamlHandleInclude` 合并子文件，最后所有节点挂在 `SCConfGetRootNode` 返回的根下（字段见 05-09、参数见 04-02）。命令行 `--set` 一类覆盖通过 `SCConfSet` / `SCConfSetFinal` 在树建好之后写入，`final` 标志保证它们不被回滚或后续设置冲掉（参数见 04-07）。YAML 缩进错误、类型不符、`include` 路径不存在都会在这一段暴露，且往往表现为启动期错误文本（参数见 04-08、原理见 08-03）。
+
+配置查询与备份线贯穿整个生命周期。各模块在自己的 `InitConfig` 函数里用 `SCConfGet`、`SCConfGetInt`、`SCConfGetBool`、`SCConfGetChildValueWithDefault` 一族按路径取值，例如 `StreamTcpInitConfig` 读 `stream` 段（模块见 07-08）、`OutputJsonInitCtx` 读 `outputs.eve-log` 段（模块见 07-07）、runmode 读 `af-packet` / `dpdk` 段（模块见 07-06）；查不到时用默认值或按模块策略处理，具体取值需对照实际版本核验（参数见 04-02、04-03、04-04）。规则热加载与 Unix socket 控制面操作前后由 `SCConfCreateContextBackup` / `SCConfRestoreContextBackup` 保护配置树，`suricata --dump-config` 触发 `SCConfDump` 打印「合并命令行覆盖之后」的最终配置，因此它是核对某个键是否生效的首选手段（参数见 04-07、模块见 07-12）。
+
+基础设施供给线被所有模块共用。`util-mem.*` 的 `SCMalloc` / `SCCalloc` / `SCFree` 是几乎所有对象分配的统一入口，`util-pool.*` 的 `PoolInit` / `PoolGet` / `PoolReturn` 为包池、流备用池提供预分配与复用，`util-pool-thread.*` 的 `PoolThreadGetById` / `PoolThreadReturn` 让每线程路径避开全局锁，`util-hash*`、`util-radix*`、`util-byte.h`、`util-time.h`、`util-debug.h` 等分别支撑流表、地址匹配、报文解析、时间戳与日志（模块见 07-02、07-01、07-07，字段见 05-09）。`rust/` 侧通过 cbindgen 生成的 FFI 头与这些 C 设施交互，`SC` 前缀的命名正是为了降低符号冲突风险（模块见 07-10）。配置树、加载器与各模块消费关系见图 07-09-01。
+
+:::figure id=07-09-01 | name=conf 配置树加载与 util 基础设施支撑关系 | dir=TD
+node u1 "suricata.yaml<br/>配置文件" blue
+node u2 "conf-yaml-loader<br/>解析与 include" teal
+node u3 "SCConfNode 树<br/>全局配置上下文" teal
+node u4 "SCConfGet 系列<br/>模块读取参数" purple
+node u5 "各功能模块<br/>source/output/stream" green
+node u6 "util-mem / pool<br/>分配与池化" gray
+node u7 "util-hash / byte<br/>容器与字节" gray
+node u8 "SCConfDump<br/>--dump-config" blue
+edge u1 -> u2 "SCConfYamlLoadFile"
+edge u2 -> u3 "构建节点树"
+edge u3 -> u4 "按名查值"
+edge u4 -> u5 "初始化模块"
+edge u6 -> u5 "对象与包池"
+edge u7 -> u5 "哈希与编解码"
+edge u3 -> u8 "遍历输出"
+:::
+
+图 07-09-01 中实线是配置从文件到模块的主路径，灰色节点是贯穿全局的基础设施供给。需要强调这张图描述的是模块间的支撑关系，不是 06-01 那条从收包到落盘的全流水线；把 `util-*` 画进业务流水线会误以为它参与检测。配置段的完整参数语义归 04 全册（参数见 04-02），结构体逐字段定义归 05-09，本篇只点名文件与入口。
+
+### 5. 配置/命令/代码实例
+
+本节只给最小必要实例，并显式指向权威源：`suricata.yaml` 全段、`configure` 选项、命令行与返回码见 04 全册（参数见 04-01、04-02、04-07、04-08），此处不重列参数全集；07 全册每篇代码段最多给 3–5 个本模块最典型的调用，其余写「完整 API 见 04-xx」。下面这段是按真实函数名书写的配置查询与池化摘录，仅示意调用关系，不构成完整实现。
+
+```c
+/* conf 查询与 util 池化摘录，符号均为真实名称，见 src/conf.h、src/util-pool.h */
+const char *val = NULL;
+intmax_t threads = 0;
+int enabled = 0;
+if (SCConfGet("af-packet.threads", &val) == 1) { /* 取字符串值 */ }
+if (SCConfGetInt("af-packet.threads", &threads) == 1) { /* 取整型值 */ }
+if (SCConfGetBool("threading.set-cpu-affinity", &enabled) == 1) { /* 取布尔值 */ }
+Pool *pool = PoolInit(0, 0, 0, NULL, NULL, NULL);
+```
+
+上面五个调用展示了本模块最典型的一组用法：前三个按路径取字符串、整型、布尔值，返回值为 `1` 表示命中（返回语义需对照 `src/conf.c` 实际版本核验），最后一个从预分配池取用对象；`PoolInit` 的完整形参含池大小、预分配量、元素大小与分配 / 初始化回调，签名需对照 `src/util-pool.h` 第 73 行核验（字段见 05-09）。示例里的键名 `af-packet.threads`、`threading.set-cpu-affinity` 仅作路径示意，键名与默认值一律以 `suricata.yaml.in` 为准，需对照实际版本核验（参数见 04-02、04-03）。完整参数与命令见 04-01、04-02、04-07，此处不再追加调用。
+
+下面给一组按「前置检查 → 执行 → 验证输出 → 清理」组织的源码核验命令，用来在拿到任意一份上游快照后快速确认配置模块的真实命名与入口。它不改变运行状态，适合作为核查版本差异的第一步。
+
+```bash
+# 前置：进入真实仓库根（注意归档多一层 suricata-main/）
+cd upstream_src/suricata/suricata-main
+
+# 执行：确认配置查询、加载与打印三类入口的真实名称
+grep -n "SCConfGet\|SCConfYamlLoadFile\|SCConfDump" src/conf.c src/conf.h src/conf-yaml-loader.c src/suricata.c
+
+# 验证：确认 util 基础设施头文件规模
+ls src/util-*.h | wc -l
+
+# 清理：退出查阅目录
+cd -
+```
+
+典型输出如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+src/conf.c:352:int SCConfGet(const char *name, const char **vptr)
+src/conf.c:440:int SCConfGetInt(const char *name, intmax_t *val)
+src/conf.c:817:void SCConfDump(void)
+src/conf-yaml-loader.c:489:int SCConfYamlLoadFile(const char *filename)
+src/suricata.c:3141:        SCConfDump();
+```
+
+逐行判读如下。第 352 行 `SCConfGet` 的两个实参是配置路径与 `const char **` 出参，说明配置值以字符串形式存放在 `SCConfNode` 的 `val` 成员里，查询命中与否由返回值表达；第 440 行 `SCConfGetInt` 把出参换成 `intmax_t *`，是同一棵树上的类型转换封装，二者配合覆盖了「取原文」与「取数值」两类需求（字段见 05-09）。这两行最值得注意的其实是前缀：本快照里是 `SCConfGet` 而不是历史资料常写的 `ConfGet`，若照旧名字去 grep 会一无所获，这正是大纲要求「函数名需对照实际版本核验」的原因。第 817 行 `SCConfDump` 无参，负责遍历整棵树并按缩进打印；第 3141 行 `src/suricata.c` 里对它的调用带 8 个空格缩进，说明它处在 `--dump-config` 的条件分支内部，因此命令行加上该选项后看到的是「YAML 与命令行覆盖合并后的最终配置」，可用来验证某个键是否真的生效（参数见 04-07）。第 489 行 `SCConfYamlLoadFile(const char *filename)` 只有一个文件路径实参，是 YAML 加载的对外入口，include 的递归合并与节点构造都在它内部完成（原理见本篇第 4 节）。最后 `ls src/util-*.h | wc -l` 的计数在本快照里是三位数，若明显偏少，说明归档层级不对或拿到的不是完整上游快照，应回到 SPEC 第 0.1 节确认 `suricata-main/` 前缀。整组输出共同验证了「配置树以 `SCConf*` 系列对外服务、YAML 由 `conf-yaml-loader.c` 加载、`--dump-config` 由 `SCConfDump` 落地」这一模块结构。
+
+按职责整理的 conf 与 util 子族对照见下表，便于按现象反查应该先读哪个文件。
+
+| 子族 | 代表文件 | 关键接口 | 解决的问题 |
+|---|---|---|---|
+| 配置树 | `src/conf.c`、`src/conf.h` | `SCConfGet`、`SCConfSet`、`SCConfDump` | 按路径读写与打印最终配置 |
+| YAML 加载 | `src/conf-yaml-loader.c`、`.h` | `SCConfYamlLoadFile`、`SCConfYamlHandleInclude` | 解析文件与合并 include |
+| 分配器 | `src/util-mem.c`、`src/util-mem.h` | `SCMalloc`、`SCCalloc`、`SCFree` | 统一内存分配与对齐分配 |
+| 对象池 | `src/util-pool.c`、`src/util-pool.h` | `PoolInit`、`PoolGet`、`PoolReturn` | 包池与备用池的预分配复用 |
+| 每线程池 | `src/util-pool-thread.c`、`.h` | `PoolThreadGetById`、`PoolThreadReturn` | 高并发路径避开全局锁 |
+| 容器与哈希 | `src/util-hash.h`、`src/util-thash.h`、`util-radix*.h` | 需对照实际版本核验 | 流表、地址匹配与只读表 |
+| 字节与时间 | `src/util-byte.h`、`util-checksum.h`、`util-time.h` | 需对照实际版本核验 | 编解码、校验和与时间戳 |
+| 日志与权限 | `src/util-debug.h`、`util-logopenfile.h`、`util-privs.h` | 需对照实际版本核验 | 日志级别、落盘与降权 |
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一组陷阱就是命名差异本身。本快照用 `SCConfNode` / `SCConfGet` / `SCConfSet` / `SCConfYamlLoadFile` / `SCConfDump`，而不少教程、旧版脚本与第三方集成代码仍写 `ConfNode` / `ConfGet` / `ConfGetNode`；照旧名字去检索源码、写补丁或做 FFI 绑定，会得到「符号不存在」的结论。同理，输出侧的 `SCJsonBuilder`、EVE 侧的 `SCEveFileType` 也带 `SC` 前缀（模块见 07-07）。正确做法是始终以 `src/conf.h`、`src/conf.c` 与 `src/*.h` 的真实声明为准，凡涉及符号名一律标注「需对照实际版本核验」，不凭印象补值。这条纪律不只适用于 conf，也适用于全册所有函数名与字段名。
+
+第二组陷阱围绕配置生效与覆盖。`SCConfNode` 的 `final` 标志意味着 `SCConfSetFinal` 或命令行 `--set` 写入的值不会被后续 YAML 或普通 `SCConfSet` 覆盖；反过来，YAML 里某个键缩进错了、放错了层级，`SCConfGet` 会查不到而模块取默认值，现象是「改了配置却没生效」（字段见 05-09、参数见 04-02、原理见 08-03）。`include` 合并顺序、`SCConfCreateContextBackup` / `SCConfRestoreContextBackup` 在热加载前后的边界，以及 `suricata --dump-config` 打印的是合并后的最终树，这三点决定了排查顺序应是「先 dump-config 看最终值 → 再看 YAML 层级与缩进 → 再看是否被 final 覆盖」，而不是直接改模块代码。另外 `src/tests/fuzz/confyaml.c` 的存在提醒我们：YAML 属于不可信输入，第三方或自动生成配置应经过校验后再投喂（原理见 08-05、工具链见 07-13）。
+
+第三组陷阱与池化和资源有关。`PoolInit` 的预分配量、扩容策略与 `PoolThread` 的每线程数组共同决定内存占用与锁竞争；预分配过大浪费内存，过小则在高并发下频繁扩容，`max-pending-packets`、`flow.memcap`、`stream.reassembly.memcap` 一类上限必须与池容量一起评估（字段见 05-09、参数见 04-02、原理见 08-02、08-05）。`SCMallocAligned` 一类对齐分配要用配套的 `SCFreeAligned` 释放，混用普通 `SCFree` 属于典型的内存错误。分配失败、池耗尽、memcap 触顶在统计上都可能表现为「计数不增」或「事件缺失」，但处理方向完全不同：前者查资源与配置，后者查流量特征。任何关于吞吐、内存占用、配置加载耗时的结论一律标注「需在目标机型实测」，不给绝对值。
+
+最佳实践可以归纳为四条。其一，读配置的模块统一走 `SCConfGet*` 一族并显式处理「未命中」分支，避免把未初始化的局部变量当默认值用（字段见 05-09）。其二，新增基础设施优先复用既有 `util-*` 文件，新增源文件时同步登记到 `src/Makefile.am` 的清单，并补 `util-unittest.h` 一类单测骨架（工具链见 07-13）。其三，把 `suricata --dump-config`、`suricata -T`、`suricata --build-info` 作为配置变更的闭环验证手段，形成「改配置 → 验最终树 → 验规则 → 验构建特性」的固定动作（参数见 04-07、04-08）。其四，始终记住能力边界：`util-*` 与 `conf` 不产生检测结论、不抓包、不重组，Suricata 不是纯 C 项目（`rust/` 与 Cargo 是构建的一部分，模块见 07-10），也不是防火墙、不做转发，Hyperscan 只是可选 MPM 加速而非必需依赖（模块见 07-05）。
+
+### 7. 小结与延伸阅读
+
+`util-*` 与 `conf` 模块把「配置驱动」与「通用基础设施」两件底座工作收敛到 `src/conf.c/.h`、`src/conf-yaml-loader.c/.h` 与上百个 `src/util-*.c/.h` 文件中：配置树以 `SCConfNode` 为节点，由 `SCConfYamlLoadFile` 加载并合并 include，由 `SCConfGet` / `SCConfGetInt` / `SCConfGetBool` / `SCConfGetChildValueWithDefault` 一族按路径查询，由 `SCConfSet` / `SCConfSetFinal` 写入覆盖，`SCConfCreateContextBackup` / `SCConfRestoreContextBackup` 保护热加载，`SCConfDump` 支撑 `--dump-config`；基础设施侧 `util-mem.*` 统一分配器，`util-pool.*` 与 `util-pool-thread.*` 提供对象池与每线程池，`util-hash*`、`util-radix*`、`util-byte.h`、`util-time.h`、`util-debug.h` 等按组支撑各业务模块。本篇最重要的核验结论是：本快照的配置符号带 `SC` 前缀，写作 `SCConfNode` / `SCConf*`，与历史资料里的 `ConfNode` / `ConfGet` 不同，需对照 `src/conf.h`、`src/conf.c` 实际版本核验。
+
+需要继续深入时，建议按四条路径展开。想查 `SCConfNode`、`SCInstance`、`Pool` 的逐字段定义与内存布局，读 05-09；想核对 `configure` 选项、yaml 全段参数、命令行与返回码，读 04-01、04-02、04-07、04-08；想按目录继续了解相邻模块，读 07-05（util-mpm 与 Hyperscan）、07-06（source-*）、07-07（output）、07-08（stream-tcp）与 07-10（rust/）；想理解配置加载在整条流水线中的位置，读 06-01。配置相关的故障案例、加固与上线清单见 08-04、08-05、08-06，工具链与 fuzz 见 07-13。所有性能与容量结论均需在目标机型实测，版本差异一律以 `configure.ac`、`ChangeLog` 与本快照实际文件为准，需对照实际版本核验。
+

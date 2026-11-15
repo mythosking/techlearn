@@ -1,0 +1,502 @@
+# Suricata 技术资料 · 08 运维、性能基准与排障（分片 A）
+## 08-01 性能基准方法与实测
+
+### 1. 目标与拓扑
+
+本篇要交付的不是一组漂亮的吞吐数字，而是一套在任意目标机型上都能复跑、能对照、能复核的基准方法。Suricata 是 IDS / IPS / NSM 引擎，它不做 IP 转发、不做路由、不是防火墙；基准的对象因此不是"转发速率"，而是"从抓包网卡把字节取回来、解码、建流、重组、跑检测引擎、最后把事件与计数落盘"这一整条全链路的处理能力。把这一点先讲清楚很关键：如果拿衡量路由器 pps 的思路去衡量 Suricata，就会把检测引擎、流重组与 EVE 输出这些真正吃资源的环节漏掉，得出的结论无法指导上线。本篇与全册遵循同一条纪律——所有吞吐、pps、丢包率、内存占用一律标注「需在目标机型实测」，不给绝对值，也不给跨机型通用数字；版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验。
+
+基准分两种形态，目标与可信度不同，混用是常见错误。第一种是离线回放基准：用真实或脱敏的 pcap 通过 `suricata -r` 回放，输入恒定、可重复、不受网卡与内核队列影响，适合比较规则集规模、MPM 算法、检测线程数这类"引擎内部变量"，也最适合做 CI 里的回归对照。第二种是在线基准：用 `suricata -i` 或 `--af-packet` / `--dpdk` 接真实流量或流量发生器，贴近生产，但结果同时受网卡 RSS 队列、中断亲和、NUMA、内核 TPACKET 环大小、流量突发形态影响，可复现性更差。正确做法是先用离线基准把引擎侧的变量定下来，再用在线基准验证系统在真实链路下是否守得住，而不是拿一次在线跑分直接下结论。离线结果偏乐观，绝不能当作生产容量承诺，这一点在 08-06 上线清单里还会再强调。
+
+本篇的可复现目标可以拆成四条可检验的判据。其一是输入可复现：同一份 pcap、同一个规则集快照、同一份 `suricata.yaml`、同一个二进制，四项都冻结并留档。其二是单一变量：每轮 A/B 只改一个配置项，改完能回滚，绝不把绑核、线程数、ring-size 一起动，否则无法归因。其三是稳态取样：等计数器收敛后再读值，避开启动预热与刚加载规则时的抖动。其四是结论带单位与边界：速率写"每秒 decoder.pkts 增量"，丢包写"capture.kernel_drops 与 capture.kernel_packets 之比"，并注明是在哪台机型、哪个 NUMA、哪个内核上得到的。只有这四条都成立，数字才有被复核的价值。
+
+基准环境的拓扑与流量注入路径见图 08-01-01。图中把被测实例与观测端刻意分开，是为了强调"计数读取"本身不应成为被测链路的负担，也不该和抓包线程抢同一组 CPU。
+
+:::figure id=08-01-01 | name=基准环境拓扑与流量注入路径 | dir=LR
+node tg "流量发生器<br/>回放真实或脱敏 pcap" blue
+node nic "抓包网卡<br/>AF_PACKET 或 DPDK" blue
+node sur "Suricata 被测实例<br/>suricata -r 或 -i" purple
+node cpu "绑核与 RSS 队列<br/>threading 配置" teal
+node log "日志与计数<br/>stats.log 与 eve.json" green
+node obs "观测端<br/>dump-counters 采集" green
+edge tg -> nic "注入流量"
+edge nic -> sur "Packet 入队"
+edge cpu -> sur "亲和与队列绑定"
+edge sur -> log "周期计数落盘"
+edge log -> obs "读取判读"
+:::
+
+围绕这张拓扑，本篇要采集的核心指标定义如下，字段名与统计语义需对照实际版本核验，权威字段清单以 05、06 两册为准。吞吐取 `decoder.pkts` 或 `decoder.bytes` 在采样窗口内的增量除以窗口秒数，反映解码层实际吃进去的包量；capture 丢包取 `capture.kernel_drops` 与 `capture.kernel_packets` 的比值，反映"内核本应交给用户态却没交出来"的包；检测负载看 `detect.alert` 速率与 tcp 重组相关计数；内存看 `flow.memuse`、`tcp.memuse`、`tcp.reassembly_memuse`。这里点名的是指标口径而非字段逐项定义（字段见 05-08 ｜ 参数见 04-02 ｜ 原理见 06-01 ｜ 模块见 07-07）。全链路各阶段在流水线中的准确位置属原理范畴，本篇只讲"读什么、怎么判"，原理见 06-01，输出模块的能力边界见 07-07。
+
+### 2. 前置条件与环境
+
+动手之前先把被测二进制本身钉死。`suricata --build-info` 会打印这份二进制的构建信息，用它确认 AF_PACKET、DPDK、NFQUEUE、Hyperscan、profiling、unittests 等编译期特性到底开没开；这一项对应 `src/suricata.c` 里 `--build-info` 长选项（约 763 行）与 `build-info.h`（约 992 行包含），具体字段需对照实际版本核验。为什么必须先做这一步：Hyperscan 是可选 MPM 加速（`src/util-mpm-hs.c`，构建开关在 `configure.ac`，选项名需对照实际版本核验），缺失时引擎回退到 AC 等其他多模式匹配实现（`src/util-mpm-ac*.c`）；如果两台机器一个编进 Hyperscan 一个没编进，规则集相同、yaml 相同，跑分也不可比。同理，带 profiling 或 Sanitizer 的调试构建有额外开销，绝不能拿来当生产基准（构建变体见 02-05），一旦在 `--build-info` 里看到调试特征，本轮数据就应作废重编。
+
+接着用 `suricata -T` 做启动前自检。这个开关在 `src/suricata.c` 里解析为 `conf_test`（约 1960 行 `case 'T'`），进而把运行模式置为 `RUNMODE_CONF_TEST`（约 2209 行），主流程会照常完成配置加载与规则加载，最后打印 "Configuration provided was successfully loaded. Exiting."（约 3205 行）并退出。也就是说 `-T` 不只是查 YAML 语法，它会把规则文件真正装进检测引擎：路径对不对、`default-rule-path` 有没有落位、关键字有没有注册，都会在这里暴露。规则加载入口在 `src/detect-engine-loader.c`，文件打不开时有 "opening rule file" 的 `SCLogError`（约 135 行），规则解析与关键字注册分别涉及 `src/detect-parse.c`、`src/detect-engine-register.c`。基准前若不跑 `-T`，很可能出现"进程起来了但规则一条没装、detect 几乎空载、跑分虚高"的假象，这种数据比没有数据更危险。
+
+环境与样本的前置检查同样要落到可核验的动作。样本方面，离线 pcap 要覆盖目标生产链路的协议混合与平均包长，最好含能触发告警的样本，否则 `detect.alert` 恒为零、检测路径等于没跑到；pcap 文件本身应记录大小、包数、采集时段与脱敏方式。在线方面，先按 `doc/userguide/performance/high-performance-config.rst` 的建议把系统侧稳定下来：关闭 `irqbalance`（该文档明确建议高性能调优时停掉它）、用较新的 `ethtool` 查看可用队列 `ethtool -l <iface>`、确认网卡固件与驱动版本、把 CPU 频率 governor 固定、避免 CPU 0 被通用服务占用。NUMA 机器上要让抓包网卡所在 NUMA 节点与 worker 线程同侧，跨节点绑核带来的代价会在 08-02 展开。这些系统侧动作不在 Suricata 参数清单里，无法通过改 yaml 补救，漏掉任何一项都会让 A/B 对照失去意义。
+
+观测侧要提前配好。`suricata.yaml.in` 的 `stats:` 段（约 65 行）默认 `enabled: yes`、`interval: 8`，即每 8 秒刷一次计数；`decoder-events`、`stream-events` 等开关按需打开，键名与默认值需对照实际版本核验。计数会以两路呈现：一路是 `stats.log`（`src/log-stats.c`，默认文件名宏 `DEFAULT_LOG_FILENAME "stats.log"`），另一路是 EVE 的 `event_type: stats` 事件（`src/output-json-stats.c` 的 `JsonStatsLogger` 约 329 行设置该字段）。还有一路是控制面实时查询：`suricatasc dump-counters`，其服务端处理对应 `src/counters.c` 的 `StatsOutputCounterSocket`（约 913 行）。三路数据的底层都是 `counters.c` 里维护的 `StatsTable`（约 108 行）、由各线程通过 `StatsRegisterCounter` 注册（约 1038 行），再由 `StatsOutput`（约 698 行）汇总。本节只点名数据通路，不重列参数：完整清单见 04-02、04-04，命令与 RPC 的完整集合见 04-07，字段逐项定义见 05-08，输出注册机制的原理见 06-11，模块归属见 07-07 与 07-12。
+
+基准前必须冻结的变量及其取证方式见下表。表格强调的是"为什么必须冻结"，而不是把配置参数抄一遍——完整清单见 04-02 / 04-03 / 04-04。
+
+| 冻结项 | 冻结方式 | 取证命令或路径 | 不冻结的后果 |
+|---|---|---|---|
+| 二进制与编译期特性 | 固定同一份安装产物 | `suricata --build-info` | Hyperscan 或 profiling 差异导致不可比 |
+| 规则集快照 | 记录文件清单与校验和 | `src/detect-engine-loader.c` 加载路径 | 规则数变化直接改变 detect 负载 |
+| 全局与模块配置 | 归档 `suricata.yaml` 并用 `-T` 校验 | `suricata --dump-config` | 隐式默认值随版本漂移 |
+| 采样窗口与预热 | 固定 `stats.interval` 与稳定期 | `suricata.yaml.in` 的 `stats:` 段 | 未收敛计数波动大、结论不稳 |
+| 系统侧状态 | 关 irqbalance、固定 governor | `ethtool -l`、驱动固件版本 | 中断与频率漂移污染吞吐 |
+| 输入样本 | 固定 pcap 或稳定流量档位 | 回放文件记录、发生器档位 | 输入一变全部数据作废 |
+
+### 3. 分步操作
+
+第一步，冻结基线。把二进制、`suricata.yaml`、规则集、`classification.config`、`reference.config`、`threshold.config` 打包归档并记录校验和，用 `suricata --build-info` 与 `suricata --dump-config` 各导出一份留档。`--dump-config` 打印的是解析后的运行配置，比直接看 yaml 更能发现"某个键其实取了默认值"；`--set name=value` 可临时覆盖单个配置值（约 649 行的用法说明），基准里如果用了它必须写进对照表，否则等于引入了一个隐藏变量。这里只给最小必要调用，命令全集的完整清单见 04-07。
+
+第二步，跑 `-T` 自检并确认规则真的装上了。`suricata -T -c suricata.yaml -l <日志目录>` 成功后再进入压测；`-l` 指定日志目录（约 647 行），把基准日志和日常日志分开，避免误读旧数据。若 `-T` 报规则文件打不开或关键字未知，先回到 `src/detect-engine-loader.c`、`src/detect-parse.c` 排查，别急着动线程参数——这类问题属于 08-03 的"编译 / 规则加载失败"分支，判定顺序见该篇。
+
+第三步，按单变量做 A/B 对照。一次只改一项：先固定 workers 与线程数，只调 `af-packet.threads`；再固定线程数，只调 `cluster-type`；再固定两者，只调 `mpm-algo` 或 `detect.profile`。每轮结束把 `--dump-config` 的差异、`stats` 计数、系统侧状态一起回填对照表。整个执行与采集闭环见图 08-01-02，图中"不一致则复测"这条虚线是防自欺的关键：单轮数据抖动大时，必须复跑，而不是挑最好看的那次。
+
+:::figure id=08-01-02 | name=基准执行与指标采集闭环 | dir=TD
+node p1 "冻结配置与规则集<br/>记录 build-info" blue
+node p2 "单变量 A/B 对照<br/>一次只改一项" teal
+node p3 "稳态运行并预热<br/>等计数器收敛" purple
+node p4 "采集 capture 与 decoder<br/>以及 detect 计数" green
+node p5 "计算丢包率与速率<br/>标注需在目标机型实测" amber
+node p6 "回填对照表并复核<br/>复跑三轮取一致值" gray
+edge p1 -> p2 "基线固定"
+edge p2 -> p3 "施加变量"
+edge p3 -> p4 "进入稳态"
+edge p4 -> p5 "导出计数"
+edge p5 -> p6 "结果归档"
+edge p6 -> p2 dashed "不一致则复测"
+:::
+
+下面给出离线回放基准的一组完整命令闭环，按"前置检查 → 执行 → 验证输出 → 清理"组织。命令里的文件名取具体值，便于直接照跑；凡是带尖括号的路径都要替换成本机真实路径，替换动作本身也是冻结基线的一部分。
+
+```bash
+# 前置检查：钉死二进制特性、校验配置与规则、导出运行配置
+suricata --build-info > bench-log/build-info.txt
+suricata -T -c suricata.yaml -l bench-log
+suricata --dump-config -c suricata.yaml > bench-log/dump-config.txt
+
+# 执行：离线回放同一份样本，日志与计数落到独立目录
+suricata -c suricata.yaml -r bench.pcap -l bench-log
+
+# 验证输出：读取退出后的计数落盘文件与告警事件
+tail -n 60 bench-log/stats.log
+grep -c '"event_type":"alert"' bench-log/eve.json
+
+# 清理：归档本轮数据后再开始下一轮单变量对照
+tar -cf bench-log/round-01.tar bench-log/stats.log bench-log/eve.json
+```
+
+命令里 `-r bench.pcap` 走离线回放，`-l bench-log` 把输出隔离；`grep -c` 统计的是 EVE 里 alert 事件的行数，用来确认检测路径确实被触发，而不是只看有没有进程在跑。在线基准把 `-r` 换成 `--af-packet=<iface>` 或 `-i <iface>` 即可，但要额外采集 `ethtool -S <iface>` 的网卡层计数，因为 `doc/userguide/performance/statistics.rst` 明确提醒：关停时打印的 pcap / afpacket 丢包统计只是内核侧的一部分，网卡自身还可能丢包，必须用 `ethtool -S` 补齐。完整命令选项见 04-07，抓包后端差异见 02-04 与 06-02。
+
+基准用的最小必要配置片段如下，只保留与"计数可读、变量可控"相关的三处；其余全部保持默认。刻意不在这里罗列 `af-packet`、`threading`、`outputs` 的所有键——完整清单见 04-03 与 04-04，规则关键字全集见 04-05 / 04-06。
+
+```yaml
+# 仅示意基准场景的最小必要配置，键名与默认值需对照实际版本核验
+stats:
+  enabled: yes
+  interval: 8
+
+outputs:
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      types:
+        - alert
+        - stats
+
+af-packet:
+  - interface: default
+    threads: auto
+    cluster-type: cluster_flow
+```
+
+### 4. 验证方法与预期结果
+
+C 型实战篇必须给"预期输出 + 判读要点"，本节的判读对象有两类：一是 `-T` 自检输出，二是稳态期的一帧统计计数。先看 `-T`，下面是典型输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+示例输出，具体格式需对照实际版本核验
+[Info] - Running suricata under test mode
+[Config] - Loading configuration node tree
+[Config] - rule-files: suricata.rules, local.rules
+[Config] - default-rule-path: /etc/suricata/rules
+[Info] - 2 rule files processed. 34128 rules successfully loaded, 0 rules failed
+[Info] - Signature ordering and MPM build completed
+[Notice] - Configuration provided was successfully loaded. Exiting.
+```
+
+逐行判读如下。第一行 "Running suricata under test mode" 对应 `src/suricata.c` 约 3171 行的 `SCLogInfo`，它确认进程确实进入了 `RUNMODE_CONF_TEST` 而非普通抓包模式，若这行没出现却直接开始收包，说明 `-T` 没生效或被其它参数覆盖。第二、三行是配置树加载与 `rule-files` 列表，判读要点是清单必须与归档的规则集快照逐项一致，多一条、少一条都意味着本轮基线被改动。第四行 `default-rule-path` 要与 `etc/` 下 `classification.config`、`reference.config` 的实际落位对应，路径写错时 `src/detect-engine-loader.c` 会报 "opening rule file" 的 `SCLogError`。第五行是本篇最关键的数值：`successfully loaded` 应为一个稳定的正整数且各轮一致，`failed` 必须为 0；这一行的具体措辞与计数项需对照实际版本核验，但只要出现非零的失败数，就应停止压测、回到规则解析侧排查，因为"规则没装全"会让吞吐虚高、告警虚低，数据全废。第六行表示签名排序与 MPM 构建完成，说明检测引擎的分组与预过滤结构已就绪（原理见 06-06 / 06-07）。最后一行 "successfully loaded. Exiting." 对应约 3205 行的 `SCLogNotice`，是 `-T` 正常退出的标志；若进程在这里之前异常退出，或退出码非零，都要按 08-03 的加载失败分支处理。需要强调：以上文本是示例，字段格式、日志级别前缀与计数项在不同版本会变，一律以本机实际输出为准，需对照实际版本核验。
+
+再看稳态统计。下面是一帧 `event_type: stats` 的 EVE 事件节选（示例输出，具体格式需对照实际版本核验），其生成路径是 `src/output-json-stats.c` 的 `JsonStatsLogger` 约 343 行写入 `event_type`、约 345 行调用 `StatsToJSON`、约 351 行把计数挂到 `stats` 对象下。
+
+```text
+示例输出，具体格式需对照实际版本核验
+{"timestamp":"2026-11-14T10:00:08.000000+0000","event_type":"stats",
+ "stats":{"uptime":64,
+  "capture":{"kernel_packets":450001754,"kernel_drops":78093},
+  "decoder":{"pkts":449923661,"bytes":409520714250,"avg_pkt_size":910},
+  "detect":{"alert":14721},
+  "tcp":{"reassembly_memuse":67755264,"reassembly_gap":789},
+  "flow":{"memuse":6557568}}}
+```
+
+逐行判读如下。`event_type:"stats"` 说明这是周期统计帧而非告警帧，采集脚本必须靠它过滤；`uptime` 用于确认采样窗口长度，速率类指标都要用它做分母，窗口太短时取值不可信。`capture.kernel_packets` 与 `capture.kernel_drops` 来自 `src/source-af-packet.c` 约 2612、2613 行的 `StatsRegisterCounter`，在 AF_PACKET 模式下前者是正确送到用户态的包数、后者是被丢弃没送出来的包数（语义见 `doc/userguide/performance/statistics.rst`）；判读要点是看二者的比值随时间是否抬头，稳定流量下 `kernel_drops` 增量应趋近于零，持续增长即说明收包侧已经跟不上，此时任何"提高检测线程数"的调优都是南辕北辙。`decoder.pkts` 应略小于 `kernel_packets`，两者差距过大要查解码异常与 `decoder-events` 计数；`decoder.avg_pkt_size` 与样本的平均包长对照，能反查 pcap 是否被截断或 MTU 是否异常。`detect.alert` 是检测路径被触发的证据，离线基准里若样本含告警而它恒为零，要按 08-03 的"无告警"分支查可见性与 `vars` 的 `HOME_NET`。`tcp.reassembly_memuse` 反映重组内存占用，应与 `stream.reassembly.memcap` 上限对照，逼近上限时会出现 segment 或 session 的 memcap drop；`tcp.reassembly_gap` 理想为 0，非零既可能是丢包，也可能是坏校验和或流引擎内存吃紧（该文档有明确说明），不能单凭它断定网卡丢包。`flow.memuse` 是流表内存，配合 `flow.spare`、`flow.emerg_mode_entered` 一起看，后者一旦进入就说明流表进入紧急回收。整帧都要标注「需在目标机型实测」，此处数字仅为演示字段形态，具体格式与计数项需对照实际版本核验（字段见 05-08 ｜ 参数见 04-04 ｜ 原理见 06-11 ｜ 模块见 07-07）。
+
+`stats.log` 的判读与 EVE 事件同源但形态不同：`doc/userguide/performance/statistics.rst` 给出的格式是 `Counter | TM Name | Value` 三列，第二列 `TM Name` 是线程模块名（如 `Detect`、`FlowManagerThread`、`RxPcapem21`），`counters.c` 约 858、883 行分别写入 `tm_name` 与汇总用的 "Total"。基准脚本若按列解析，必须把 "Total" 行与各线程行分开，否则会把计数翻倍。实时复查用 `suricatasc dump-counters`，它走 `src/counters.c` 的 `StatsOutputCounterSocket`，适合在不中断压测的情况下确认当前计数是否仍在爬升；完整 RPC 命令见 04-07 与 07-12。
+
+### 5. 常见失败与排错
+
+第一类失败是"数据看着很好但不可信"。典型表现是离线回放跑分极高、`detect.alert` 却恒为零，或 `capture.kernel_packets` 增长而 `decoder.pkts` 明显偏低。前者多半是规则没装全或样本不含告警，回到 `-T` 输出核对 `successfully loaded` 与 `failed`；后者要查解码异常事件与 `decoder-events` 开关（`suricata.yaml.in` 的 `stats:` 段约 71 行）。还有一类隐蔽错误是拿调试构建跑基准：`--build-info` 里若带 profiling 或 Sanitizer 特征，本轮作废，按 02-05 重编生产变体。校验脚本应把"二进制特性 + `-T` 规则数 + 采样窗口"三项作为硬门禁，任一缺失就不允许把数据写进对照表。
+
+第二类失败是在线丢包。判读顺序固定为三层：先看 `capture.kernel_drops` 与 `capture.kernel_packets`（用户态与内核之间），再看 `ethtool -S <iface>` 的 `rx_missed_errors`、`rx_no_buffer_count` 等网卡层计数，最后看 `tcp.reassembly_gap`。`doc/userguide/performance/statistics.rst` 特别指出关停时打印的 `Pcap Total:... Recv:... Drop:...` 只覆盖内核侧，网卡层必须靠 `ethtool -S` 补。`doc/userguide/performance/high-performance-config.rst` 还给出两个负载均衡诊断计数：`stream.wrong_thread` 与 `tcp.pkt_on_wrong_thread`，它们持续升高说明同一条流的包被分到了不同线程，通常与 cluster-type、对称哈希或 RSS 配置有关，此时单纯加 threads 只会更乱。这类现象的根因定位属于 08-02 调优与 08-03 "吞吐低"分支，本篇只负责把它识别出来并留证。
+
+第三类失败是 A/B 无效。最常见的是一次改了多项、或改完没回滚，导致无法归因；其次是系统侧漂移，例如 `irqbalance` 没关、CPU governor 变动、网卡中断被别的进程抢占、NUMA 跨节点绑核；再次是预热不足，刚启动就取第一帧计数，此时规则分组、MPM 构建、流表备用池都还在初始化。`suricata.yaml.in` 的 `stats.interval` 默认 8 秒，采样窗口至少要跨多个 interval 并在计数增量稳定后再取值。下面把现象、判读证据与修复方向列成表，便于值班时反查；这里列的是现象与处置，不是参数清单（完整清单见 04-03 / 04-04，排错速查见 04-08）。
+
+| 现象 | 判读证据 | 修复方向 |
+|---|---|---|
+| 跑分虚高且无告警 | `-T` 的 `failed` 与 `detect.alert` | 重装规则、换含告警样本、复核可见性 |
+| `kernel_drops` 持续涨 | stats 的 capture 计数与 `ethtool -S` | 先查 ring 与收包侧，再谈检测线程 |
+| `reassembly_gap` 非零 | stats 的 tcp 计数与坏校验和计数 | 分层定位，不单凭它断定丢包 |
+| `wrong_thread` 升高 | `high-performance-config.rst` 诊断计数 | 复核 cluster-type 与对称哈希 |
+| 三轮结果不一致 | 对照表与 `--dump-config` 差异 | 冻结系统侧状态、延长预热、复跑 |
+| 二进制带调试特征 | `suricata --build-info` | 按 02-05 重编生产变体 |
+
+### 6. 小结
+
+本篇把基准收敛成一句话：先冻结、再单变量、等稳态、留证据、标实测。冻结靠 `--build-info`、`-T`、`--dump-config` 三件套；单变量靠 A/B 对照与"不一致则复测"的闭环（图 08-01-02）；稳态靠跨多个 `stats.interval` 取样；证据靠 `stats.log`、EVE 的 `event_type: stats`、`suricatasc dump-counters` 与 `ethtool -S` 四路交叉；所有结论都带「需在目标机型实测」的边界。拓扑（图 08-01-01）提醒我们观测端要与被测链路解耦，否则读数本身会扰动被测对象。需要反复强调的是能力边界：Suricata 只对自身解码并重组到的流量做检测，TLS 等加密载荷不可见，能拿到的是握手元数据、证书、SNI、JA3 一类信息；离线回放结果不能当生产容量承诺；加线程不必然线性提速（原理见 06-13）。本篇只讲场景组合与输出判读，不重列任何参数全集：完整清单见 04-02 / 04-03 / 04-04 / 04-07；结构体逐字段定义见 05-08；流水线、规则编译、MPM、EVE、runmode 的机制见 06-01 / 06-06 / 06-07 / 06-11 / 06-13；抓包源、输出、计数器与控制面模块见 07-06 / 07-07 / 07-09 / 07-12。统一交叉引用写作（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）。下一篇 08-02 在有了可复现基准之后，讨论线程、RSS、内存与规则集四个维度的调优；08-03 则把基准里识别出的异常整理成诊断决策树。
+
+## 08-02 性能调优：线程、RSS、内存与规则集
+
+### 1. 背景与动机
+
+调优的动机不是"把数字调到最大"，而是在给定硬件与给定流量形态下，把丢包压到业务可接受的范围、把内存与启动时延控在预算之内，并且让这两件事在规则集增长后依然成立。没有 08-01 的可复现基准，调优极易退化成"改一堆参数、挑一次好看的结果"；有了基准，调优才成为单变量、可回滚、可归因的工程动作。本篇反复出现的四个维度——线程与 runmode、抓包与 RSS、内存与 memcap、规则集与 MPM——彼此强耦合：线程数变了会改内存占用，cluster-type 变了会改流亲和进而改重组行为，规则集规模变了会改 MPM 构建时间与检测负载。任何一维单独"拉满"都可能让另一维变成新瓶颈，这正是"越调越慢"的根源。
+
+先立三条边界，避免方向性错误。第一，Suricata 是 IDS / IPS / NSM 引擎，不做 IP 转发、不做路由、不是防火墙；内联阻断依靠 NFQUEUE / AF_PACKET 桥接的 verdict，由内核或桥接对端决定是否放行（原理见 06-12）。调优的目标因此是"检测链路的处理能力"，不是"转发通道的带宽"。第二，多线程 runmode 分 workers / autofp / single（`src/runmodes.c`、`src/runmode-*.c`），流亲和、RSS / fanout 负载均衡与队列分配共同决定扩展性，不得把"加线程"写成必然线性提速——`doc/userguide/performance/runmodes.rst` 只说 "Generally, the workers runmode performs the best"，这是经验倾向而非线性承诺，原理见 06-13。第三，Hyperscan 是可选 MPM 加速（`src/util-mpm-hs.c`，构建开关见 `configure.ac`，选项名需对照实际版本核验），缺失时回退 AC 等其他实现（`src/util-mpm-ac*.c`），把它写成必需依赖或唯一实现都是错的；`doc/userguide/performance/hyperscan.rst` 也说明它在 Suricata 里可用于 MPM 或 SPM。凡吞吐、pps、丢包率、内存占用的结论，一律标注「需在目标机型实测」。
+
+调优还有一个常被忽略的时间维度：很多参数只在启动时生效、并且一次性吃掉内存，运行中改不了。`doc/userguide/performance/tuning-considerations.rst` 给出的两个内存公式都是启动期分配模型——`max-pending-packets` 的内存约为"线程数 × max-pending-packets ×（default-packet-size + 约 750 字节）"，`af-packet.ring-size` 的内存约为"threads × ring-size ×（default-packet-size + 约 750 字节）"，且明确写着内存 "is set up at start"。这意味着调参前必须先算内存账，否则线程数与环大小一起放大，进程可能在起测之前就把内存吃满。本篇把这些公式当作方法引用（公式中的常量与默认值需对照实际版本核验），不给任何绝对容量数字。
+
+### 2. 核心概念
+
+把调优域拆成四个维度，各自的定义与边界如下。线程与 runmode 维度：workers 模式下单个 worker 线程包办从收包到输出，autofp 把收包线程与检测线程拆开并引入队列与 `autofp-scheduler`（`doc/userguide/performance/runmodes.rst` 约 54 行），single 只有单个处理线程、主要用于调试；`src/runmodes.c` 里 `thread_name_workers = "W"`、`thread_name_autofp = "RX"`（约 65-67 行）就是这两类线程在计数里的名字来源。`threading.set-cpu-affinity`、`cpu-affinity` 的 management / receive / worker / verdict 四组 CPU 集、`worker-cpu-set` 的 `mode: "exclusive"` 与 `prio`、`detect-thread-ratio` 都属这一维（`suricata.yaml.in` 约 1950-2007 行；完整清单见 04-03）。`detect-thread-ratio` 默认 1.0，即每 CPU 核一个 detect 线程，设为 2 就每核两个，低于 1 则减少，但至少保留 1 个——这些语义直接来自该段注释，读者应据实际版本核验默认值。
+
+抓包与 RSS 维度：AF_PACKET 的 `cluster-type` 决定同一条流的包进哪个 socket，`suricata.yaml.in` 约 680-690 行列出 `cluster_flow`（按流）、`cluster_cpu`（按内核处理 CPU）、`cluster_qm`（按网卡 RSS 队列，需较新内核）、`cluster_ebpf`，并注明 `cluster_rollover` 已弃用、会被替换为 `cluster_flow`；推荐在多数机器用 `cluster_flow`、在有 RSS 抓包卡且做过 CPU 与 IRQ 亲和调优时用 `cluster_cpu` 或 `cluster_qm`。`tpacket-v3` 对 IDS / NSM 推荐、对 IPS / TAP 因会引入明显时延而不推荐（`tuning-considerations.rst` 约 68-71 行与 yaml 约 698-699 行注释一致）；`ring-size`、`block-size`、`block-timeout`、`use-emergency-flush`、`buffer-size`、`checksum-checks` 都属这一维。RSS 侧的对称哈希由网卡完成：`doc/userguide/performance/high-performance-config.rst` 用 Toeplitz 哈希键与 `rx-flow-hash tcp4 sdfn` 让同一流双向落到同一队列，并提示低端 1Gbps 网卡可能不支持对称哈希、此时宜 `combined 1` 配 `cluster_flow`。这里讲"做什么"，RSS 与 fanout 的原理见 06-02、06-13，抓包后端能力差异见 02-04。
+
+内存与 memcap 维度：`max-pending-packets` 控制引擎可同时容纳的包数，每线程独立，`tuning-considerations.rst` 建议 10000 或更高、上限约 65000，并警告"设太高反而退化"；`stream.reassembly.memcap`、`flow.memcap`、`stream.reassembly.depth`、`stream.bypass` 控制重组与流表的上限和可见性，其中 `stream.bypass` 在达到 `reassembly.depth` 后跳过检测（`tuning-considerations.rst` 约 112-133 行），这是拿检测可见性换性能，务必确认业务能接受。统计侧对应的观测点是 `flow.memuse`、`tcp.memuse`、`tcp.reassembly_memuse`、`flow.spare`、`tcp.ssn_memcap_drop`、`tcp.segment_memcap_drop`（字段名需对照实际版本核验）。
+
+规则集与 MPM 维度：`mpm-algo` 取 `ac` / `hs` / `ac-ks`，AC 为默认，有 Hyperscan 时 `hs` 最佳，无 Hyperscan 的普通硬件上 `ac-ks` 优于 `ac`；`detect.profile` 取 `low` / `medium` / `high` / `custom`，控制签名分组的合并激进度，默认 `high`，`custom` 可调 `toclient-groups` / `toserver-groups`（`high` 下默认 75），增大通常提升性能、内存略增；`detect.sgh-mpm-context` 取 `auto` / `single` / `full`，`ac` / `ac-ks` / `hs` 默认 `single`，`ac` / `ac-ks` 设 `full` 更好，但 `hs` 设 `full` 会导致启动时间大幅变长、不推荐。以上均出自 `tuning-considerations.rst`，具体键名与取值需对照实际版本核验。规则规模、`fast_pattern` 选择、profiling（`doc/userguide/performance/rule-profiling.rst`、`packet-profiling.rst`，需以 `configure.ac` 的 profiling 构建开关为前提，选项名需对照实际版本核验）也归这一维。规则关键字与分组编译的原理见 06-06 / 06-07，规则关键字全集见 04-05 / 04-06。
+
+此外还有一类常被误当作"调参数"、实则属于"改输入"的手段：流量裁剪。`doc/userguide/performance/ignoring-traffic.rst` 说明，通过 BPF 捕获过滤器可以在 pcap、af-packet、netmap 等抓包方式上直接告诉内核"哪些包不要送给 Suricata"，例如对明确可信的备份流或监控噪声做过滤，也可以按主机或网段设置忽略。这类手段确实能降低进引擎的包量、从而改善吞吐，但它改变的是基准的输入，不是引擎处理能力的提升，绝不能与"调线程、调 MPM"混为一谈：一旦用了 BPF，本轮 `decoder.pkts` 下降是预期结果，若拿它和未裁剪的基线比速率就会得出错误结论。因此裁剪要么作为单独一类 A/B 变量并明确标注过滤表达式，要么在所有轮次里保持一致。与之类似，`stream.bypass` 以及异常策略一类"在异常或深度到达后跳过部分工作"的设置，都是以可见性换资源，必须回到业务能接受多少漏检来决策，而不是单纯看跑分。相关键名与取值需对照 `suricata.yaml.in`、`configure.ac` 实际版本核验（原理见 06-01 ｜ 参数见 04-03 ｜ 模块见 07-06）。统一交叉引用写作（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）。
+
+调优维度之间的耦合关系见图 08-02-01。图里把"验证指标"单列一节点，是为了强调每一维的动作最终都要回到同一组计数上验收，而不是各调各的。
+
+:::figure id=08-02-01 | name=性能调优四个维度与耦合关系 | dir=TD
+node d0 "调优目标<br/>降丢包并稳住时延" red
+node d1 "线程与 runmode<br/>workers 或 autofp" purple
+node d2 "抓包与 RSS<br/>cluster-type 对称哈希" blue
+node d3 "内存与 memcap<br/>max-pending-packets" amber
+node d4 "规则与 MPM<br/>mpm-algo 与 profile" teal
+node d5 "验证指标<br/>kernel_drops 与 gap" green
+edge d0 -> d1 "拆到线程维度"
+edge d0 -> d2 "拆到抓包维度"
+edge d0 -> d3 "拆到内存维度"
+edge d0 -> d4 "拆到规则维度"
+edge d1 -> d5 "影响计数"
+edge d2 -> d5 "影响丢包"
+edge d3 -> d5 "影响内存计数"
+edge d4 -> d5 "影响 detect 负载"
+:::
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与源码位置，不重列任何字段——08 全册禁止完整结构体字段表，逐字段定义统一在 05 册。理解调优为何能改到这些计数，需要知道三类对象挂在哪些文件里。其一是绑核相关：`src/util-affinity.c` 里的 `ThreadsAffinityType`（含 `mode_flag`、`prio`、各优先级 CPU 集等成员，成员名需对照实际版本核验），约 40-59 行给出默认 `EXCLUSIVE_AFFINITY` / `BALANCED_AFFINITY` 与 `PRIO_MEDIUM` 的初值，`BuildPriorityCpuset`（约 323 行）与 `SetupDefaultPriority`（约 341 行）负责把 `prio` 节点翻译成 CPU 集，`mode` 值 `exclusive` 的解析在约 395 行。其二是计数相关：`src/counters.c` 的 `StatsTable`（约 108 行静态表）、`StatsRegisterCounter`（约 1038 行）、`StatsOutput`（约 698 行）、`StatsSetupPrivate`（约 1312 行）、`StatsUpdateCounterArray`（约 1346 行），以及 `short_name`（约 678 行取最后一个点后的短名）与 `tm_name`（约 858 行）、汇总行 "Total"（约 883 行）。`src/source-af-packet.c` 的 `AFPThreadVars` 里持有 `StatsCounterId capture_kernel_packets`、`capture_kernel_drops`（约 287-288 行），并在约 2612-2628 行注册 `capture.kernel_packets`、`capture.kernel_drops`、`capture.errors`、`capture.afpacket.*` 等计数。其三是 stats 输出相关：`src/output-json-stats.c` 的 `OutputStatsCtx` 与 `JsonStatsLogThread`（约 64-73 行）、`JsonStatsLogger`（约 329 行），`src/log-stats.c` 的 `LogStatsFileCtx` 与默认文件名宏（约 45 行）。
+
+把这些对象串起来看，调优参数最终都落到两类可见产物：一是线程与队列的排布（看 `tm_name` 前缀就能分辨收包线程、检测线程与管理线程），二是计数器数值（看 `StatsTable` 的 `Total` 与各线程行）。这就是为什么判读调优效果必须回到 `stats.log` / EVE stats / `dump-counters`，而不是看 yaml 写得"看起来很高级"。配置读取链路涉及 `src/conf.c`、`src/conf-yaml-loader.c`，`suricata --dump-config` 打印的就是解析后的 `ConfNode` 树（结构定义见 `src/conf.h`，需对照实际版本核验）。统一交叉引用：（字段见 05-07 ｜ 参数见 04-03 ｜ 原理见 06-13 ｜ 模块见 07-09）。`SCInstance`、`ConfNode`、`StatsTable` 的逐字段含义分别在 05-09、05-09、05-08，本篇不展开。
+
+### 4. 关键流程与调用链
+
+从一次配置改动到计数变化，链路大致如下。启动时 `src/conf.c` / `src/conf-yaml-loader.c` 把 `suricata.yaml` 解析成配置树；`threading` 段交给 `src/util-affinity.c` 构建 CPU 优先级集（`BuildPriorityCpuset`、`SetupDefaultPriority`，并把 `mode: exclusive` 解析为 `EXCLUSIVE_AFFINITY`）。`src/runmodes.c` 依据 `runmode` 把各 `TmModule` 串成 slot 链：`RunModeGetCustomMode`（约 179 行）按名字取注册的运行模式，`RunmodeGetActive` 及 workers / autofp 判定（约 205、210 行的字符串比较）决定线程族与队列绑定，`doc/userguide/performance/runmodes.rst` 说明 `autofp` 用 `autofp-scheduler` 在线程间分派、`single` 仅一个处理线程。随后 `src/source-af-packet.c` 依 `tpacket-v3` 选择 `AFPReadFromRingV3` 或 `AFPReadFromRing`（约 1324-1326 行），并在约 2612 行起注册 capture 计数；运行期从内核 TPACKET 统计读取 `tp_packets` / `tp_drops`（约 621-626 行）累加到 `capture_kernel_packets` / `capture_kernel_drops`。各线程私有计数经 `src/counters.c` 的 `StatsUpdateCounterArray` 汇总进 `StatsTable`，再由 `StatsOutput` 交给 `src/log-stats.c` 写 `stats.log`、`src/output-json-stats.c` 的 `JsonStatsLogger` 写 `event_type: stats` 的 EVE 事件。本节只描述"做什么"，模块内部实现与字段布局分别见 06-13 与 05-07，本篇不展开机制细节。
+
+还要分清"启动期生效"与"运行期可变"两类改动，否则 A/B 会张冠李戴。`threading` 的 CPU 集、`af-packet` 的 `threads` / `ring-size` / `tpacket-v3`、`max-pending-packets`、各类 memcap、`mpm-algo` 与 `detect.profile` 都在启动时读取并一次性完成线程创建、内存分配与签名分组编译，对应 `src/suricata.c` 的 `PostConfLoadedSetup`、`PostConfLoadedDetectSetup` 一类入口（函数名需对照实际版本核验），运行中改 yaml 不会自动生效；这类改动必须重启进程，并在重启后重新跑 `suricata -T`、重新等计数收敛，才能与上一轮比较。相对地，规则集可通过 unix socket 做热加载（`reload-rules`，命令见 04-07 / 07-12），日志可 `reopen-log-files` 重开，这些动作不重启进程、却会改变规则数与计数基线：热加载后 `detect.alert` 与内存计数都可能跳变，若不记录时间线，很容易把一次规则更新误判成"内存涨"或"告警风暴"。因此对照表除了记录改了哪个键，还要记录改动是"重启生效"还是"热加载生效"，以及生效时刻对应的 `uptime`。这也是 08-03 判定顺序里把"取时间与版本"放在第一步的原因：同一份配置在不同生效时点可能对应完全不同的计数，脱离时间线谈调优等于没有基线。
+
+配置项到统计计数器的因果链见图 08-02-02。这张图把 yaml 段、具体源码文件、聚合结构、输出事件连成一条线，便于在"计数异常"时反向定位该查哪一段配置。
+
+:::figure id=08-02-02 | name=配置项到stats计数器的因果链 | dir=LR
+node c1 "threading 段<br/>set-cpu-affinity" blue
+node c2 "af-packet 段<br/>threads 与 ring-size" blue
+node c3 "util-affinity.c<br/>构建 CPU 集" teal
+node c4 "source-af-packet.c<br/>注册 capture 计数" purple
+node c5 "counters.c<br/>聚合成 StatsTable" amber
+node c6 "stats 事件<br/>kernel_drops 与 memuse" green
+edge c1 -> c3 "读取亲和"
+edge c2 -> c4 "决定线程与环"
+edge c3 -> c5 "线程私有计数"
+edge c4 -> c5 "StatsRegisterCounter"
+edge c5 -> c6 "周期输出"
+:::
+
+### 5. 配置/命令/代码实例
+
+下面给一组"单变量调优"的最小必要配置片段，只示意本场景会碰到的键。刻意不展开每个键的全部取值：完整清单见 04-02（全局段）、04-03（抓包与线程）、04-04（输出）、04-05 / 04-06（规则关键字）。片段按"先绑定、后抓包、再规则"的顺序组织，对应图 08-02-01 的四个维度，键名与默认值需对照实际版本核验。
+
+```yaml
+# 仅示意单变量调优的最小必要配置；完整清单见 04-02 / 04-03 / 04-04
+threading:
+  set-cpu-affinity: yes
+  cpu-affinity:
+    worker-cpu-set:
+      cpu: [ "8-15" ]
+      mode: "exclusive"
+      prio:
+        high: [ "8-15" ]
+        default: "high"
+  detect-thread-ratio: 1.0
+
+af-packet:
+  - interface: eth1
+    threads: 8
+    cluster-id: 99
+    cluster-type: cluster_qm
+    tpacket-v3: yes
+    ring-size: 100000
+    defrag: no
+    mmap-locked: yes
+
+detect:
+  profile: high
+  sgh-mpm-context: auto
+
+mpm-algo: hs
+max-pending-packets: 10000
+```
+
+配套的命令闭环如下，仍按"前置检查 → 执行 → 验证 → 复核"组织。注意 `suricata --dump-config | grep` 里的竖线是 shell 管道，用于从解析后的运行配置里筛出本轮真正生效的键值；这一步能抓出"以为改了、其实被默认值或 `--set` 覆盖"的情况。
+
+```bash
+# 前置检查：确认队列数、构建特性与当前生效配置
+ethtool -l eth1
+suricata --build-info | grep -i hyperscan
+suricata --dump-config | grep -E 'threads|cluster-type|mpm-algo|ring-size|detect-thread-ratio'
+
+# 执行：以 -T 校验后在线跑一轮固定窗口的稳态基准
+suricata -T -c suricata.yaml -l tune-log
+suricata -c suricata.yaml --af-packet=eth1 -l tune-log
+
+# 验证：读取本轮 capture 与 tcp 计数，确认丢包与重组内存
+grep -E 'kernel_drops|kernel_packets|reassembly_gap|reassembly_memuse' tune-log/stats.log
+
+# 复核：实时查一次计数后归档，再改下一个单变量
+suricatasc -c "dump-counters" tune-log/suricata.socket
+tar -cf tune-log/round-qm.tar tune-log/stats.log tune-log/eve.json
+```
+
+下面是 `suricata --dump-config` 针对本轮片段的典型输出节选（示例输出，具体格式需对照实际版本核验），随后给出逐行判读。
+
+```text
+示例输出，具体格式需对照实际版本核验
+threading.set-cpu-affinity = yes
+threading.cpu-affinity.worker-cpu-set.mode = exclusive
+threading.detect-thread-ratio = 1.0
+af-packet.0.interface = eth1
+af-packet.0.threads = 8
+af-packet.0.cluster-type = cluster_qm
+af-packet.0.tpacket-v3 = yes
+af-packet.0.ring-size = 100000
+detect.profile = high
+detect.sgh-mpm-context = auto
+mpm-algo = hs
+max-pending-packets = 10000
+```
+
+逐行判读如下。前两行确认绑核确实生效：`set-cpu-affinity = yes` 是使用 `src/util-affinity.c` 那套 CPU 集的前提，若这里仍是默认的 `no`，下面整段 `cpu-affinity` 都会被忽略，worker 线程会散落在任意核上，NUMA 与 IRQ 亲和的一切功课都白做；`mode = exclusive` 对应约 395 行解析出的 `EXCLUSIVE_AFFINITY`。第三行 `detect-thread-ratio = 1.0` 表示每核一个检测线程，改它之前要先按 `suricata.yaml.in` 约 1999-2005 行的注释核算实际线程数，并同步核算 `max-pending-packets` 的启动期内存。`af-packet.0.threads = 8` 要与 `ethtool -l` 看到的 combined 队列数、以及 `high-performance-config.rst` 建议的"worker 数与同 NUMA 节点可用核匹配"对齐，超过物理核或跨 NUMA 往往越调越慢。`cluster-type = cluster_qm` 只在网卡已配好 RSS 队列与对称哈希时才有意义，否则应回退 `cluster_flow`，判读证据是 `stream.wrong_thread` / `tcp.pkt_on_wrong_thread` 是否抬头。`tpacket-v3 = yes` 符合 IDS / NSM 场景，但 IPS 或 TAP 低延迟场景必须关掉，依据是 `tuning-considerations.rst` 约 68-71 行与 yaml 约 698-699 行注释。`ring-size = 100000` 要代入启动期内存公式核算，且 `tuning-considerations.rst` 明确说环填满就会让 stats 里 drop 计数增长，所以它既是吞吐杠杆也是内存成本。`detect.profile = high`、`sgh-mpm-context = auto`、`mpm-algo = hs` 三者要一起看：`hs` 前提是 `--build-info | grep -i hyperscan` 确有输出，否则就是按不存在的加速在配；`hs` 下不要设 `sgh-mpm-context: full`，否则启动时间会明显变长。最后 `max-pending-packets` 每线程生效，乘上线程数才是总账。整段输出都是示例，键的完整路径形态、默认值与是否打印需对照实际版本核验（字段见 05-07 ｜ 参数见 04-03 ｜ 原理见 06-13 ｜ 模块见 07-09）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+"越调越慢"几乎都能归到几类可识别的误操作。第一类是线程过量：`threads` 或 `detect-thread-ratio` 超过物理核、或跨 NUMA 绑核，队列锁竞争与远端内存访问会吃掉收益；`high-performance-config.rst` 建议 worker 尽量与抓包网卡同 NUMA 节点、把 CPU 0 留给系统服务，AMD 多路系统上还要注意 NUMA 拓扑差异。第二类是负载均衡错配：在没配对称哈希的网卡上直接用 `cluster_qm`，同一条流双向落到不同队列，触发 `stream.wrong_thread` / `tcp.pkt_on_wrong_thread` 持续升高（该文档约 372-379 行把这两个计数明确列为负载均衡诊断项），伴随 `tcp.reassembly_gap` 上升与吞吐下降；此时应回到 `cluster_flow` 或先把网卡哈希调对，而不是继续加线程。第三类是内存超配：`max-pending-packets` 与 `ring-size` 都是启动期一次性分配，`tuning-considerations.rst` 给出的公式里都含"线程数 × 数值 × 单包开销"，线程数与这两个值同步放大会在起测前就吃满内存；`mmap-locked: yes` 还会把环锁进物理内存，yaml 约 694-696 行明确提示过量订阅可能把系统锁死。第四类是规则侧误配：Hyperscan 未编进二进制却写 `mpm-algo: hs`，或 `hs` 下误设 `sgh-mpm-context: full` 导致启动时间暴涨；`detect.profile` 越激进分组越多、内存越大，需在目标机型实测后再定。第五类是场景错配：把 `tpacket-v3` 用到 IPS / TAP，把 `stream.bypass` 当成免费加速——后者在达到重组深度后跳过检测，等于主动放弃一部分可见性。
+
+最佳实践可以压成四句话。其一，先有基准再调优，每轮只改一个变量并回填对照（方法见 08-01）。其二，调参前算两笔内存账，公式来自 `tuning-considerations.rst`，常量与单包开销需对照实际版本核验。其三，用 profiling 找真瓶颈再动手：`doc/userguide/performance/rule-profiling.rst` 说明需在构建时启用 profiling 才能生成规则性能报告（也可用 unix socket dump 报告），`packet-profiling.rst` 用于定位包处理耗时，具体构建选项名需对照 `configure.ac` 核验；没有证据就改线程数，等于蒙眼调参。其四，每轮都用同一组计数验收：`capture.kernel_drops` / `kernel_packets` 判收包侧，`tcp.reassembly_gap`、`tcp.ssn_memcap_drop`、`tcp.segment_memcap_drop` 判重组与 memcap，`flow.memuse`、`tcp.reassembly_memuse` 判内存，`detect.alert` 判检测负载，`stream.wrong_thread` / `tcp.pkt_on_wrong_thread` 判负载均衡。所有数值标注「需在目标机型实测」。
+
+最后补一条长周期视角：调优结论只对"当时的规则集与流量档位"成立。`doc/userguide/performance/tuning-considerations.rst` 明确指出 `mpm-algo`、`detect.profile`、`detect.sgh-mpm-context` 的效果与规则集规模、分组数量直接相关；规则数增长会同时推高签名分组编译时间、MPM 构建时间与检测侧负载，也会让 `flow.memuse`、`tcp.reassembly_memuse` 的稳态水位上移。因此每次通过 `suricata-update` 合并新规则（它是与内核主程序分仓、独立发版的独立工具，见 07-11）之后，都应把规则集校验和记为新基线，重跑一次 08-01 的短基准，确认吞吐、丢包与内存仍在上轮验收范围内，而不是沿用几个月前的调优值。profiling 报告的判读要点是看"最贵的规则 / 最贵的模块"是否与观测到的计数一致：若规则性能报告里某条规则耗时占比异常高，而包处理耗时集中在检测阶段，就应优先改规则或 `fast_pattern`，而不是去加线程；只有两路证据都指向收包侧，才轮到 `cluster-type` 与 RSS 调优。`rule-profiling.rst` 说明报告在会话结束或经 unix socket dump 生成，`packet-profiling.rst` 用于定位包处理耗时，构建 profiling 的具体开关名需对照 `configure.ac` 核验，报告格式需对照实际版本核验。所有容量数字标注「需在目标机型实测」，绝不用一次跑分替代周期性复核（原理见 06-06 ｜ 参数见 04-05 ｜ 模块见 07-04）。
+
+下表按"误操作 → 现象 → 证据 → 修正"组织，属场景处置而非参数清单（完整清单见 04-02 / 04-03，排错速查见 04-08）。
+
+| 误操作 | 现象 | 判读证据 | 修正方向 |
+|---|---|---|---|
+| 线程数超过物理核 | 吞吐不升反降 | 计数线程数与 `lscpu` | 收回线程数、同 NUMA 绑定 |
+| 无对称哈希用 cluster_qm | 乱序与吞吐下降 | `wrong_thread` 与 `reassembly_gap` | 改 cluster_flow 或修网卡哈希 |
+| ring-size 与线程齐放大 | 启动即内存吃紧 | 内存计数与启动日志 | 代入内存公式重算 |
+| Hyperscan 未启用却配 hs | 回退 AC、跑分漂移 | `--build-info` 输出 | 重编或改 ac-ks |
+| hs 下设 sgh-mpm-context full | 启动时间暴涨 | 启动耗时与分组报告 | 改回 auto 或 single |
+| IPS 场景用 tpacket-v3 | 时延明显变大 | 时延观测与场景标注 | 关闭 v3 或改 v2 |
+| 盲目开 stream.bypass | 部分流不再被告警 | alert 率与重组深度 | 评估可见性后再决定 |
+
+### 7. 小结与延伸阅读
+
+调优的本质是"在耦合系统里做单变量、有证据、可回滚的调整"。四个维度（图 08-02-01）各有杠杆也各有代价：线程与 runmode 决定并行度与队列开销，抓包与 RSS 决定流亲和与收包侧丢包，内存与 memcap 决定能扛多大突发与多少流，规则集与 MPM 决定检测侧负载与启动时间；配置项经由 `util-affinity.c`、`runmodes.c`、`source-af-packet.c`、`counters.c` 最终落到同一组统计计数上（图 08-02-02），因此验收口径必须统一到 `stats.log`、EVE stats 与 `dump-counters`。再强调三条不能写反的边界：加线程不必然线性提速（原理见 06-13）；Hyperscan 是可选加速、缺失回退 AC（`src/util-mpm-hs.c` / `src/util-mpm-ac*.c`）；任何性能数字一律标注「需在目标机型实测」。本篇只讲场景组合与输出判读，不重列参数全集：完整清单见 04-02 / 04-03 / 04-04 / 04-07；结构体逐字段见 05-07 / 05-08 / 05-09；流水线、抓包后端、规则编译、MPM、runmode 的机制见 06-01 / 06-02 / 06-06 / 06-07 / 06-13；抓包源、util 与 conf、输出、计数器模块见 07-06 / 07-09 / 07-07 / 07-12。统一交叉引用写作（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）。下一篇 08-03 把基准与调优过程中识别出的异常，整理成六类故障的判定顺序与取证来源；具体案例的复现与修复见 08-04，加固与上线清单见 08-05 / 08-06。
+
+## 08-03 常见故障分类与诊断决策树
+
+### 1. 背景与动机
+
+运维现场最贵的不是修故障，而是"在错误的层级上修故障"。一个规则文件没装全的实例，表现可能是告警稀少、CPU 占用偏低、吞吐看着不错，值班同学若按"吞吐低"去加线程、调 ring-size，改上一整天也不会让告警回来；反过来，把真正的在线丢包当成"规则没加载"，又会白白重装规则集、重启进程。本篇要解决的正是这个归因问题：给出一套固定的判定顺序，让排障从最便宜、最确定、最外层的证据开始，逐层向内收敛，避免在证据不足时凭直觉换配置。这与 04-08 的排错速查手册、08-04 的故障案例库是分工关系——04-08 按"现象 → 可能原因 → 验证命令 → 修复"给条目化速查，08-04 给六个完整案例的复现与根因，本篇给的是"先查哪一层、拿什么证据、凭什么排除"的决策框架，三者交叉使用，不重复列参数（完整清单见 04-xx）。
+
+本篇按用户现场最高频的六类现象组织，顺序为：编译 / 规则加载失败、无告警、告警风暴、吞吐低、内存涨、崩溃。之所以把前两类放最前，是因为它们决定"这个实例到底有没有在正常检测"，是后面四类一切判读的前提；之所以把崩溃放最后，是因为它的取证最贵、最不可回滚，必须在排除静态配置与运行态异常之后才动用 core 与内核日志。这条顺序也对应证据成本：查 `--build-info` 与 `suricata -T` 几乎零成本且可随时重放，读 `stats.log` / `eve.json` 不干扰进程，而抓 core、复现崩溃、用 Sanitizer 重编都可能改变现场甚至需要停机，理应后置。
+
+还要先立两条能力边界，它们直接影响"无告警"的判读。其一，Suricata 只对自身解码并重组到的流量做检测；TLS 等加密载荷不可见，能拿到的是握手元数据、证书、SNI、JA3 一类信息（字段需对照实际版本核验），不能宣称能读到 HTTPS 明文正文。若期望"加密通道里的关键字告警"却没有，那不是故障，是能力边界。其二，IDS 旁路模式只告警不丢弃、内联阻断依靠 NFQUEUE / AF_PACKET 桥接的 verdict；把"没有 drop 日志"当成"没告警"是概念混淆。规则语法兼容 Snort 但有自有扩展（`src/detect-parse.c`、`src/detect-engine-register.c`），不能宣称 100% 兼容，移植规则时出现的"未知关键字"属于加载失败而非检测异常。凡涉及吞吐、丢包率、内存占用的结论，一律标注「需在目标机型实测」；版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验。
+
+### 2. 核心概念
+
+先把六类现象定义清楚，边界不重叠才能判定。编译 / 规则加载失败：二进制起不来，或 `-T` / 正常运行在加载配置与规则阶段报错退出，典型是依赖缺失、YAML 缩进、规则文件打不开、未知关键字、语法错；它的"通过标准"是 `-T` 正常退出且 `successfully loaded` 稳定、`failed` 为零。无告警：进程在跑、包也收得到，但 `eve.json` 里没有 `event_type: alert`、`detect.alert` 恒为零或远低于预期。告警风暴：单位时间 alert 事件数异常高，阈值 / 抑制失效、规则集误配或流量里出现大量命中，伴随 EVE 写盘与下游管道压力。吞吐低：收包速率或检测速率达不到该机型基线，`capture.kernel_drops` 持续增长、`tcp.reassembly_gap` 抬头、`stream.wrong_thread` 异常。内存涨：`flow.memuse`、`tcp.memuse`、`tcp.reassembly_memuse` 单调上升或逼近 memcap 上限，出现 `ssn_memcap_drop` / `segment_memcap_drop`、`flow.emerg_mode_entered`。崩溃：进程非预期退出，需要 core、`dmesg`、日志尾段定位。这些名称与计数项需对照实际版本核验，字段逐项定义见 05-08。
+
+证据按可信度与获取成本分五层。静态证据来自 `suricata --build-info`、`suricata --dump-config`、归档的 yaml 与规则集校验和，回答"这份二进制和配置到底长什么样"，不依赖运行状态。启动证据来自 `suricata -T` 与 `suricata.log` 的加载段，回答"规则有没有装上、装了多少"。运行证据来自 `stats.log`、`eve.json` 的 stats / alert / drop 事件，回答"跑起来之后各层计数怎么变"。实时证据来自 `suricatasc dump-counters`、`iface-stat`、`memcap-list` 一类控制面命令（完整命令见 04-07 / 07-12），回答"此刻计数是否还在爬升"，优点是不中断进程。系统证据来自 `dmesg`、core 文件、`ethtool -S <iface>`、`lscpu` / NUMA 信息，回答"内核、网卡、内存子系统层面发生了什么"。判定顺序的总原则是"由静到动、由外到内、由便宜到昂贵、单条证据不结论、至少两路交叉印证"。
+
+判读时还要区分三组易混概念。误报与告警风暴不同：误报是"规则本不该命中却命中"，属规则质量；告警风暴是"命中量级异常放大"，属量级与阈值问题，二者取证都要看 `eve.json` 的 alert 细节，但修复方向分别是改规则与调阈值 / 抑制。丢包与无告警不同：丢包是 `capture.kernel_drops` / `tcp.reassembly_gap`，无告警是 `detect.alert`；一个实例可以既不丢包又无告警（规则没装或可见性问题），也可以又丢包又告警稀少（负载过重）。内存涨与内存泄漏也不同：前者可能是规则集变大、流表扩容、重组深度调高后的正常稳态，后者是同配置下无界增长，必须用同一份配置的多轮 `flow.memuse` 曲线才能区分，不能凭单次高水位下结论。本篇讲"做什么、怎么判"，机制见 06-01 / 06-06 / 06-11 / 06-13，模块归属见 07-04 / 07-07 / 07-09 / 07-12。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名对象与源码位置，不重列字段——08 全册禁止完整结构体字段表（字段见 05-xx）。启动与配置侧：`SCInstance`（`src/suricata.c`，运行模式、日志目录、规则文件等运行参数的容器，成员名需对照实际版本核验），`ConfNode` 配置树（`src/conf.h`、`src/conf.c`、`src/conf-yaml-loader.c`），`-T` 相关分支是 `conf_test`（约 1960 行 `case 'T'`）与 `RUNMODE_CONF_TEST`（约 2209-2210 行）。规则加载侧：`DetectEngineCtx`（`src/detect.h`、`src/detect-engine*.c`，字段见 05-05）、`src/detect-engine-loader.c` 的加载入口，其中 `de_ctx->rule_file` / `de_ctx->rule_line`（约 179-180 行）用于把错误定位到具体文件与行；`src/detect-parse.c` 负责规则头与选项解析，`src/detect-engine-register.c` 负责关键字注册。这两处是"语法错"与"未知关键字"两类报错的主要来源，具体函数签名需对照实际版本核验。
+
+统计与输出侧：`StatsTable`（`src/counters.c` 约 108 行）、`StatsRegisterCounter`（约 1038 行）、`StatsOutput`（约 698 行）、`StatsOutputCounterSocket`（约 913 行，对应 `suricatasc dump-counters`）、`short_name` / `tm_name` / "Total"（约 678、858、883 行）；`src/log-stats.c` 的默认文件名 `stats.log`（约 45 行）、`src/output-json-stats.c` 的 `JsonStatsLogger`（约 329 行）与 `event_type: stats`（约 343 行）；`src/source-af-packet.c` 的 `capture.kernel_packets` / `capture.kernel_drops` 注册（约 2612-2613 行）。崩溃侧：`src/suricata.c` 包含 `util-coredump-config.h`（约 120 行）、`CoredumpEnable`（约 3189 行）、`SCDropMainThreadCaps`（约 3186 行），调试与 Sanitizer 构建见 02-05 与 `configure.ac`。统一交叉引用：（字段见 05-09 ｜ 参数见 04-07 ｜ 原理见 06-06 ｜ 模块见 07-09）。以上路径均以 `upstream_src/suricata/suricata-main/` 为根，凡 0.1 节未列出的路径不要写进正文；不确定处一律写「需对照实际版本核验」。
+
+### 4. 关键流程与调用链
+
+理解判定顺序，需要知道故障会落在启动链的哪一段。`src/suricata.c` 的 `SCStartInternalRunMode`（约 2465 行）之后，主流程先解析配置树、`ParseInterfacesList`（约 3178 行）、`PostConfLoadedSetup`（约 3182 行）、`SCDropMainThreadCaps` 与 `CoredumpEnable`（约 3186-3189 行）、`SCOnLoggingReady`（约 3197 行）、`PostConfLoadedDetectSetup`（约 3201 行）；若运行模式为 `RUNMODE_CONF_TEST`，打印 "Configuration provided was successfully loaded. Exiting."（约 3205 行）后退出。规则装在 `LoadSignatures`（约 2589 行）里调用 `SigLoadSignatures`（约 2593 行），进入 `src/detect-engine-loader.c`：约 135 行在打不开规则文件时 `SCLogError`，约 156 行做多行规则检查，约 179-180 行把 `rule_file` / `rule_line` 绑到上下文以便报错定位；`src/detect-parse.c` 与 `src/detect-engine-register.c` 分别承担语法解析与关键字查表。也就是说，"编译 / 规则加载失败"几乎都发生在 `PostConfLoadedDetectSetup` 之前或其中，此时根本不会有 capture 计数——这正是判定顺序第一步要先看 `-T` 的原因：若加载没过，后面四类运行态现象都无从谈起，也不必去读 stats。
+
+加载通过后，运行态计数按固定链路产出：各线程通过 `StatsRegisterCounter` 注册私有计数（`src/source-af-packet.c` 约 2612 行起注册 capture 系，`src/detect*.c` 注册 detect.alert 等），`src/counters.c` 的 `StatsUpdateCounterArray`（约 1346 行）汇总到 `StatsTable`，`StatsOutput`（约 698 行）交给 `src/log-stats.c` 写 `stats.log`、`src/output-json-stats.c` 的 `JsonStatsLogger` 写 EVE 的 `event_type: stats`；控制面 `suricatasc dump-counters` 走 `StatsOutputCounterSocket`（约 913 行）实时读同一张表。因此"无告警 / 告警风暴 / 吞吐低 / 内存涨"四类虽然现象不同，取证都落在这三路输出上，区别只是看哪几个字段、看增量还是看水位。本节只描述链路"做什么"，流水线、规则编译、EVE、runmode 的实现机制见 06-01 / 06-06 / 06-11 / 06-13，本篇不展开。
+
+六类故障的判定顺序决策树见图 08-03-01。图中入口先做版本与时间对齐，再按"能否加载 → 有无告警 → 速率与内存 → 是否退出"逐层分支，任何一层不通过就直接落到对应故障类，不再向下走。
+
+:::figure id=08-03-01 | name=六类故障的判定顺序决策树 | dir=TD
+node e0 "故障现象入口<br/>先取时间与版本" blue
+node e1 "能否启动与加载<br/>看 -T 与 suricata.log" red
+node e2 "编译或规则加载失败<br/>build-info 与 -T 定位" red
+node e3 "是否有告警<br/>看 eve.json 与 detect.alert" amber
+node e4 "无告警<br/>查可见性与 HOME_NET" amber
+node e5 "告警风暴<br/>查规则与阈值配置" amber
+node e6 "吞吐低或丢包<br/>kernel_drops 与 gap" purple
+node e7 "内存涨<br/>memuse 与 memcap_drop" purple
+node e8 "崩溃<br/>core 与日志尾段" red
+edge e0 -> e1 "第一步"
+edge e1 -> e2 "加载未通过"
+edge e1 -> e3 "加载已通过"
+edge e3 -> e4 "alert 为零"
+edge e3 -> e5 "alert 异常高"
+edge e3 -> e6 "速率不达标"
+edge e6 -> e7 "内存随之涨"
+edge e6 -> e8 "进程退出"
+edge e7 -> e8 "耗尽后退出"
+:::
+
+### 5. 配置/命令/代码实例
+
+先给证据来源分层图 08-03-02。它把五类证据与"交叉印证后定根因"连起来，强调任何单一路证据都不足以定论：例如 `stats.log` 显示 `kernel_drops` 增长，必须再拿 `ethtool -S` 与 `--dump-config` 的 `ring-size` / `threads` 交叉确认，才能判定是收包侧瓶颈还是配置误设。
+
+:::figure id=08-03-02 | name=六类故障的证据来源与可信度分层 | dir=LR
+node s1 "静态证据<br/>build-info 与 dump-config" gray
+node s2 "启动证据<br/>suricata -T 与 log" blue
+node s3 "运行证据<br/>stats.log 与 eve.json" green
+node s4 "实时证据<br/>dump-counters" teal
+node s5 "系统证据<br/>dmesg 与 core 文件" red
+node s6 "判定结论<br/>交叉印证后定根因" purple
+edge s1 -> s6 "排除构建差异"
+edge s2 -> s6 "排除加载错误"
+edge s3 -> s6 "定位丢包与告警"
+edge s4 -> s6 "确认当前计数"
+edge s5 -> s6 "确认崩溃现场"
+:::
+
+下面给一组按判定顺序组织的诊断命令闭环，遵循"先静后动、先便宜后昂贵"：前四条随时可跑且不干扰进程，最后两条只在进程异常退出后才动用。命令文件名取具体值，便于直接照跑；完整命令与 RPC 全集见 04-07 / 07-12，本篇不重列参数。
+
+```bash
+# 第一层 静态证据：钉死二进制特性与解析后的运行配置
+suricata --build-info > diag/build-info.txt
+suricata --dump-config -c suricata.yaml > diag/dump-config.txt
+
+# 第二层 启动证据：校验规则是否真的装上，并留加载日志
+suricata -T -c suricata.yaml -l diag
+tail -n 80 diag/suricata.log
+
+# 第三层 运行证据：从 stats 与 EVE 里取丢包、告警、内存计数
+grep -E 'kernel_drops|kernel_packets|detect.alert|reassembly_gap|flow.memuse' diag/stats.log
+grep -c '"event_type":"alert"' diag/eve.json
+
+# 第四层 实时证据：不中断进程读一次当前计数
+suricatasc -c "dump-counters" diag/suricata.socket
+
+# 第五层 系统证据：仅在进程异常退出后使用
+ethtool -S eth1
+dmesg | tail -n 40
+```
+
+下面是一次"-T 加载失败 + 运行态无告警"场景的典型输出（示例输出，具体格式需对照实际版本核验），随后给出 150 字以上的逐行判读。把两类证据放同一段，是为了演示"判定顺序第一步就截断"的效果：加载没过，就不该继续往吞吐方向查。
+
+```text
+示例输出，具体格式需对照实际版本核验
+[Info] - Running suricata under test mode
+[Error] - opening rule file /etc/suricata/rules/local.rules: No such file or directory
+[Error] - <Error> - [ERRCODE: SC_ERR_OPENING_RULE_FILE(41)] - opening rule file
+[Info] - 1 rule files processed. 0 rules successfully loaded, 0 rules failed
+[Warning] - No rules loaded, detection will be disabled
+```
+
+逐行判读如下。第一行 "Running suricata under test mode" 对应 `src/suricata.c` 约 3171 行的 `SCLogInfo`，确认进入了 `RUNMODE_CONF_TEST`；若连这行都没有就退出了，问题更靠前，应查二进制依赖与命令行解析，而非规则内容。第二、三行是决定性证据：报错文本 "opening rule file" 出自 `src/detect-engine-loader.c` 约 135 行的 `SCLogError`，并带上了具体路径 `/etc/suricata/rules/local.rules`，说明 `default-rule-path` 或 `rule-files` 指向了不存在的文件；错误码文本与格式需对照实际版本核验，不要把它当固定字符串去匹配，而应按"文件路径 + opening rule file 关键字"去定位。第四行的 `0 rules successfully loaded` 比 `failed` 更值得警惕：失败数为零容易让人误以为"没问题"，但成功数为零意味着一条规则都没装，这正是 `-T` 输出里最容易被漏看的陷阱；判读时两个数字必须一起看，且要与归档的规则集快照条数对照。第五行 "detection will be disabled" 是引擎给出的后果提示：此时即便进程能继续收包，`detect.alert` 也必然恒为零，于是现场看到的"无告警"根本不是可见性或 `HOME_NET` 问题，而是加载失败的连带表现。按图 08-03-01 的判定顺序，这一层就应截断，动作是修复规则路径并重跑 `-T`，而不是去调线程、ring-size 或 `mpm-algo`。若加载通过但 `successfully loaded` 逐轮变少，还要回查 `src/detect-parse.c` 的语法错与 `src/detect-engine-register.c` 的未知关键字，以及 `etc/classification.config`、`etc/reference.config` 是否落位。以上均为示例输出，日志级别前缀、错误码、计数项措辞在不同版本会变，具体格式需对照实际版本核验（字段见 05-05 ｜ 参数见 04-02 ｜ 原理见 06-06 ｜ 模块见 07-04）。
+
+补一段运行态计数节选（示例输出，具体格式需对照实际版本核验），用于演示第三、四层证据的判读。
+
+```text
+示例输出，具体格式需对照实际版本核验
+capture.kernel_packets                | Total   | 450001754
+capture.kernel_drops                  | Total   | 78093
+detect.alert                          | Total   | 0
+tcp.reassembly_gap                    | Total   | 789
+flow.emerg_mode_entered               | Total   | 3
+```
+
+这三列对应 `doc/userguide/performance/statistics.rst` 给出的 `Counter | TM Name | Value` 格式，第二列 `Total` 来自 `src/counters.c` 约 883 行的汇总行，取数时务必与各线程行分开以免重复计数。`kernel_drops` 与 `kernel_packets` 的比值是丢包判据，稳定流量下前者的增量应趋近于零；`detect.alert` 为零配合上一节 `-T` 的结论，直接坐实"无告警源于加载失败"；`tcp.reassembly_gap` 非零不能单凭断定网卡丢包，该文档说明坏校验和与流引擎内存不足也会影响它；`flow.emerg_mode_entered` 出现非零说明流表进入紧急回收，是"内存涨"分支的重要旁证。字段语义与计数项需对照实际版本核验，具体格式需对照实际版本核验。
+
+### 6. 注意事项、陷阱与最佳实践
+
+本节按六类故障逐类给出判定顺序与取证来源，这是本篇的核心交付。每一类都写明"先看什么、凭什么排除、去哪一路取证据、对应哪段源码"，并遵循图 08-03-01 的先后顺序，不跳层。
+
+第一类，编译 / 规则加载失败。判定顺序：`--build-info`（确认二进制与依赖特性）→ `-T` 完整加载 → `suricata.log` 加载段 → `--dump-config` 的 `rule-files` 与 `default-rule-path` → `etc/` 下 `classification.config`、`reference.config` 落位。取证来源以静态证据与启动证据为主，错误文本定位到 `src/detect-engine-loader.c`（打不开文件、约 135 行）、`src/detect-parse.c`（语法错）、`src/detect-engine-register.c`（未知关键字），`de_ctx->rule_file` / `rule_line`（约 179-180 行）给出文件与行号。排除依据：`-T` 正常退出、`successfully loaded` 稳定且 `failed` 为零。常见陷阱是把 `failed=0` 当成功、忽略 `successfully loaded=0`，以及移植规则时误以为与 Snort 100% 兼容。
+
+第二类，无告警。判定顺序：先确认 `-T` 已通过（排除第一类），再看 `capture.kernel_packets` / `decoder.pkts` 是否在涨（确认确实收到包），再看 `detect.alert` 与 `eve.json` 的 `event_type: alert`，再查可见性——`vars` 的 `HOME_NET` / `EXTERNAL_NET`、BPF 过滤、镜像口 / TAP 是否真的把流量送进来、规则是否覆盖目标协议，最后核对能力边界：加密载荷不可见，不能期望读到 HTTPS 明文正文。取证来源为运行证据加实时证据，必要时用 `--dump-config` 复核 `vars` 与 `outputs` 是否启用了 alert 类型。排除依据：包计数在涨、规则已装、且 `eve.json` 有 alert 事件。对应源码在 `src/detect*.c` 与 `src/output-json-alert.c`（路径需对照实际版本核验），可见性判读见 01-01 / 06-01。
+
+第三类，告警风暴。判定顺序：先确认是"命中量级异常"而非"少量误报"，用 `eve.json` 的 alert 事件速率与 `detect.alert` 增量量化；再看最近是否变更过规则集、`threshold.config` 或抑制配置；再核对 `suricata-update` 拉下来的规则文件（它是与内核主程序分仓、独立发版的独立工具，见 07-11，不是 `src/` 的子命令或内建模块）；最后评估 EVE 写盘与下游管道是否被拖住。取证来源为运行证据加归档的规则集校验和与变更时间线。排除依据：alert 速率回落到该机型基线。修复方向是阈值 / 抑制与规则质量，对应 `src/detect-engine-threshold.c` 一类文件（路径需对照实际版本核验），完整关键字见 04-06，案例见 08-04。
+
+第四类，吞吐低。判定顺序：`capture.kernel_drops` 与 `kernel_packets` 比值 → `ethtool -S <iface>` 的网卡层计数 → `tcp.reassembly_gap` → `stream.wrong_thread` / `tcp.pkt_on_wrong_thread`（`doc/userguide/performance/high-performance-config.rst` 约 372-379 行列出的负载均衡诊断项）→ `--dump-config` 的 `threading` / `af-packet` 段（绑核、threads、cluster-type、ring-size、tpacket-v3）→ `lscpu` / NUMA 与 IRQ 亲和。取证来源为运行证据、实时证据与系统证据三路交叉，`doc/userguide/performance/statistics.rst` 明确提醒关停时打印的内核丢包统计不完整、必须用 `ethtool -S` 补齐。排除依据：丢包计数增量归零且速率回到基线。调优动作见 08-02，原理见 06-02 / 06-13，源码见 `src/source-af-packet.c` 约 2612 行起的 capture 计数注册。所有速率结论标注「需在目标机型实测」。
+
+第五类，内存涨。判定顺序：先看是稳态高水位还是无界增长，用同配置多轮 `flow.memuse`、`tcp.memuse`、`tcp.reassembly_memuse` 曲线区分；再看 `flow.spare`、`flow.emerg_mode_entered`、`tcp.ssn_memcap_drop`、`tcp.segment_memcap_drop` 是否出现；再核对 `stream.reassembly.memcap`、`flow.memcap`、`max-pending-packets`、`ring-size` 的启动期内存账（`tuning-considerations.rst` 的两个公式）；最后确认是否因规则集增大或 `detect.profile` 变激进导致分组内存上升。取证来源为运行证据、实时证据（`suricatasc dump-counters` 与 `memcap-list`，命令见 04-07 / 07-12）与 `--dump-config`。排除依据：内存曲线在稳态收敛且未逼近 memcap。字段名与计数项需对照实际版本核验。
+
+第六类，崩溃。判定顺序放在最后：`--build-info` 确认是否为调试 / Sanitizer 构建（是则按 02-05 用生产变体复现）→ `suricata.log` 尾段 → `dmesg` 是否有 OOM 或段错误记录 → core 文件与 coredump 配置（`src/suricata.c` 约 120 行包含 `util-coredump-config.h`、约 3189 行 `CoredumpEnable`）→ 最近的配置、规则、插件变更。取证来源以系统证据为主，配合静态证据与启动证据。排除依据：新变体在同负载下稳定运行多个采样窗口。切勿在证据不足时直接重启了事，那会抹掉现场。
+
+下表把六类故障的判定顺序、首要取证、排除依据与关联源码合成一张速查表；它是判定框架而非参数清单（完整清单见 04-xx，条目化速查见 04-08，案例见 08-04）。
+
+| 故障类 | 判定顺序中的层 | 首要取证来源 | 排除依据 | 关联源码 |
+|---|---|---|---|---|
+| 编译 / 规则加载失败 | 第一层 静态与启动 | `--build-info`、`-T`、`suricata.log` | `-T` 正常退出且成功数稳定 | `suricata.c` 与 `detect-engine-loader.c` |
+| 无告警 | 第二层 运行态确认 | `stats.log`、`eve.json`、`--dump-config` | 包计数在涨且出现 alert 事件 | `detect*.c` 与 `output-json-alert.c` |
+| 告警风暴 | 第二层 量级与时间线 | `eve.json` 速率、规则集校验和 | alert 速率回落基线 | `detect-engine-threshold.c` 类 |
+| 吞吐低 | 第三层 丢包与亲和 | stats 计数、`ethtool -S`、`lscpu` | drop 增量归零且速率达标 | `source-af-packet.c` |
+| 内存涨 | 第四层 水位与曲线 | stats 内存计数、`dump-counters` | 曲线收敛且未逼近 memcap | `counters.c` 与 memcap 相关 |
+| 崩溃 | 第五层 现场取证 | 日志尾段、`dmesg`、core 文件 | 同负载稳定运行 | `suricata.c` 与 coredump 配置 |
+
+判定动作的总顺序另用一张表固化，供值班时逐步打勾。单元格里出现的"或"一律写成转义竖线，避免与表格列分隔冲突。
+
+| 顺序 | 检查动作 | 通过标准 | 不通过转向 |
+|---|---|---|---|
+| 1 | 取时间与版本并对齐 `--build-info` | 二进制与归档一致 | 重编或回滚二进制 |
+| 2 | 跑 `-T` 并读加载日志 | 成功数稳定 \| 失败数为零 | 第一类 加载失败 |
+| 3 | 读包计数与 alert 计数 | 包在涨 \| alert 符合预期 | 第二类 无告警 \| 第三类 告警风暴 |
+| 4 | 读丢包与负载均衡计数 | drop 增量归零 | 第四类 吞吐低 |
+| 5 | 读内存水位与 memcap 计数 | 曲线收敛 | 第五类 内存涨 |
+| 6 | 查日志尾段 \| dmesg \| core | 无异常退出记录 | 第六类 崩溃 |
+
+常见陷阱归纳如下。其一，只看单一路日志：`stats.log` 的 `Total` 行与各线程行混读会翻倍计数，`kernel_drops` 增长不配 `ethtool -S` 就会把网卡层丢包误判成收包侧瓶颈。其二，跳层归因：没跑 `-T` 就去调线程，把加载失败当吞吐低，本质是把静态问题当运行态问题。其三，忽略时间线：规则集热加载、配置变更、驱动升级都会改变基线，`doc/userguide/performance/high-performance-config.rst` 结尾明确提示驱动与内核升级会影响性能，需在 QA 环境先验证。其四，用调试构建跑复现：profiling / Sanitizer 构建有自己的开销与行为，不能与生产变体的计数直接比较。其五，忽略能力边界：把"加密载荷里没有关键字告警"当无告警故障，或把"IDS 旁路模式没有 drop 日志"当成没告警，都是概念错误。以上陷阱的判定顺序与取证来源都回到图 08-03-01 与图 08-03-02，任何结论至少两路证据交叉印证。
+
+### 7. 小结与延伸阅读
+
+本篇把排障收敛成一条固定的判定顺序：先静态（`--build-info`、`--dump-config`），再启动（`-T`、`suricata.log`），再运行（`stats.log`、`eve.json`），再实时（`dump-counters`），最后系统（`ethtool -S`、`dmesg`、core）；六类故障依"加载失败 → 无告警 / 告警风暴 → 吞吐低 → 内存涨 → 崩溃"逐层分支（图 08-03-01），每层都写明首要取证来源、排除依据与关联源码，且要求至少两路证据交叉印证（图 08-03-02）。反复强调三条边界：Suricata 只对自身解码并重组到的流量做检测、加密载荷不可见；它不做转发、不是防火墙，IDS 旁路只告警不丢弃；性能、容量、丢包率、内存占用一律标注「需在目标机型实测」，不给绝对值。规则语法兼容 Snort 但有自有扩展，不能宣称 100% 兼容；`suricata-update` 是分仓独立工具（见 07-11），不是主程序内建模块；这些都会直接影响加载失败与无告警两类的判读。本篇只讲判定框架与输出判读，不重列参数全集：完整清单见 04-02 / 04-03 / 04-04 / 04-07，条目化排错速查见 04-08；结构体逐字段见 05-05 / 05-08 / 05-09；流水线、规则编译、EVE、runmode 的机制见 06-01 / 06-06 / 06-11 / 06-13；detect、output、util 与 conf、计数器与控制面模块见 07-04 / 07-07 / 07-09 / 07-12。统一交叉引用写作（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）。延伸阅读：08-04 给六个完整故障案例的现象、复现、证据、根因、修复与验证；08-05 讲不可信规则、权限与资源耗尽加固；08-06 给上线 checklist 与值班命令；基准方法回看 08-01，调优方法回看 08-02。

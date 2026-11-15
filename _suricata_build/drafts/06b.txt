@@ -1,0 +1,768 @@
+# Suricata 技术资料 · 06 技术原理（分片 B）
+## 06-06 规则加载、解析与签名分组编译
+
+### 1. 背景与动机
+
+很多人第一次读 Suricata 的规则处理，会想当然地认为引擎在线运行时把每个 `Packet` 拿去和规则文件里的每一条文本逐条比对。这个想象与真实实现相差极远。规则文件在启动或热加载时会被一次性读入、逐行解析成内存里的 `Signature`，再经过排序、校验、按协议与端口分组、多模式匹配器编译、预过滤引擎挂接等一系列编译动作，最终变成运行期只读的紧凑数据结构；稳态检测阶段面对的早已不是规则文本，而是这些编译产物。理解这条「文本到结构」的编译链，是理解 06-07 的多模式匹配、06-08 的求值顺序、06-09 的有状态关键字的前提，也是排查「规则写了却不告警」这类问题的第一站。
+
+必须先立住定位与边界。Suricata 是 IDS / IPS / NSM 引擎，不是防火墙，不做 IP 转发，也不做路由；旁路模式只告警，内联模式的 drop 依靠 NFQUEUE 或 AF_PACKET 桥接的 verdict，由内核或桥接对端执行（原理见 06-12）。规则语法兼容 Snort 但有自有扩展，不能宣称百分之百兼容；`src/detect-parse.c` 与 `src/detect-engine-register.c` 里成百上千个自有关键字就是明证。Hyperscan 只是可选的 MPM 加速，缺失时回退 AC 等其他实现，绝不是必需依赖（原理见 06-07）。`suricata-update` 是与内核主程序分仓、独立发版的规则集工具，不参与 `src/` 主程序编译，不能写成内建子命令（模块见 07-11）。本套资料版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验。
+
+为什么要把编译期单独拿出来讲，有三个直接的工程理由。其一是故障定位：`suricata -T` 报出的解析失败、未知关键字、重复 sid、buffer 冲突，全部发生在编译期而不是收包之后，把日志里的错误文本映射到 `src/detect-parse.c` 的某个校验函数，比在线抓包调试高效得多。其二是性能：分组是否精准、`fast_pattern` 是否选得好、MPM 是否成功编译，直接决定每个包要进入多少条规则的完整求值，任何吞吐与内存结论一律标注「需在目标机型实测」，不给绝对值。其三是安全：不可信规则中的超多 `fast_pattern`、巨型 `dataset`、贪婪 `pcre` 都可能让编译期内存与时间膨胀，这属于加固范畴（案例见 08-05）。本篇及以下各篇所有函数名与路径，均以 `upstream_src/suricata/suricata-main/` 下真实文件为锚点。
+
+### 2. 核心概念
+
+先把术语固定下来。规则文件由 `suricata.yaml` 的 `rule-files` 段列出，也可由命令行 `-s` 或 `-S` 指定（参数见 04-02、04-07）；一行规则文本经解析后成为一个 `Signature`，其内部把规则头与规则选项拆成若干 `SigMatch` 并按所属检测列表挂到 `smlists` 上，编译末期再由 `SigMatchList2DataArray` 压成运行期数组 `sm_arrays`（字段见 05-05）。`SigGroupHead`（常简称 sgh）是分组的产物：引擎按协议、方向、端口把签名聚成若干组，每个包依据自身元组只取出对应的一个或几个 sgh，从而把「全量规则」缩减为「本包候选规则」（字段见 05-06）。
+
+第二阶段的概念是编译产物。`fast_pattern` 是从一条规则的多个 `content` 中选出的代表性模式，它的长度、区分度、是否带 `nocase`、`depth`、`offset` 决定了 MPM 的筛选效率；`MpmCtx` 是某个 buffer 上编译好的多模式匹配上下文，`PrefilterEngine` 则是挂到 sgh 上的预过滤引擎，二者共同把「候选包」变成「候选规则 id 集合」（原理见 06-07）。`sigmatch_table` 是关键字注册表，`mpm_table` 是 MPM 实现的函数指针表，二者都在启动早期由 `SigTableSetup` 与 `MpmTableSetup` 填好。
+
+还要区分四个阶段，避免把不同时机混为一谈。加载期负责枚举文件、逐行读取并计数；解析期负责把文本变成 `Signature` 与 `SigMatch` 链；分组编译期负责排序、校验、分组、选 `fast_pattern`、编译 MPM、挂预过滤；运行期只做「取 sgh、跑预过滤、逐条求值、排告警」，不再碰规则文本。与之配套的还有两类旁支：`SCThresholdConfInitContext` 读取 `threshold.config` 风格的抑制与阈值配置，`SCSigOrderSignatures` 负责规则排序。排序不是可有可无的美观动作，它直接服务于 `flowbits` 这类「一条规则置位、另一条规则检查」的跨规则状态依赖（原理见 06-09）。
+
+最后强调去重约定：本篇只讲机制与调用链，结构体逐字段定义一律到 05，命令行与配置参数全集一律到 04，模块能力清单一律到 07。需要查字段时写「字段见 05-xx」，查参数时写「参数见 04-xx」，按目录索引能力时写「模块见 07-xx」，本篇统一采用「字段见 05-05、05-06 ｜ 参数见 04-05、04-06 ｜ 模块见 07-04」这样的交叉引用写法。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，不重列任何字段。06 全册禁止出现完整结构体字段表，逐字段定义、类型、读写时机与生命周期由 05 全册统一承担。
+
+- `Signature`、`SigMatch`、`DetectEngineCtx`、`SignatureInitData`：声明与实现集中在 `src/detect.h`、`src/detect-parse.c`、`src/detect-engine*.c`；`Signature` 的 `smlists`、`sm_arrays`、`init_data` 三态恰好对应「解析中、编译完成、可丢弃临时数据」三个阶段（字段见 05-05）。
+- `SigGroupHead`、`SigGroupHeadInitData`：`src/detect-engine-siggroup.c`，`SigGroupHeadStore`、`SigGroupHeadHashInit`、`SigGroupHeadBuildMatchArray`、`SigGroupHeadSetupFiles` 均在此文件（字段见 05-06）。
+- `MpmCtx`、`MpmCtxFactoryContainer`、`MpmTableElmt`：`src/util-mpm.h`、`src/util-mpm.c`；`extern MpmTableElmt mpm_table[MPM_TABLE_SIZE]` 与各函数指针成员定义了 MPM 后端的可插拔接口（字段见 05-06）。
+- `sigmatch_table` 与关键字枚举：`src/detect-engine-register.c`、`src/detect-engine-register.h`，`SigTableInit`、`SigTableSetup` 在此文件定义；各 `DetectContentRegister`、`DetectPcreRegister`、`DetectFlowbitsRegister`、`DetectXbitsRegister`、`DetectThresholdRegister`、`DetectDatasetRegister`、`DetectDatarepRegister`、`DetectFiledataRegister` 等注册函数在 `detect-engine-register.c` 中被集中调用。
+- `SCInstance`、`ConfNode`：`src/suricata.c`、`src/conf.h`、`src/conf.c`，`rule-files` 配置树与运行参数由它们承载（字段见 05-09）。
+
+文件落点需要一处澄清：本快照内并不存在 `src/util-threshold.c`，阈值与抑制配置的加载实际落在 `src/util-threshold-config.c`，其中 `SCThresholdConfInitContext` 定义于该文件 167 行、`SCThresholdConfParseFile` 在 189 行被调用，`threshold-file` 键在 136、141、146 行被读取；`src/detect-engine-threshold.c` 承担的是运行期阈值判定而非配置解析。凡任务清单中出现而快照内无法核实的文件名，一律写「需对照实际版本核验」并给出可定位目录，不凭印象补值。另一个易错点是入口位置：`src/main.c` 才包含 `int main(int argc, char **argv)`，`src/suricata.c` 提供 `SuricataPreInit`、`SuricataInit`、`SuricataPostInit` 等生命周期函数，关键字表初始化就发生在 `src/suricata.c` 的 `SigTableInit()` 与 `SigTableSetup()` 两处调用。交叉引用：字段见 05-05、05-06、05-09 ｜ 参数见 04-02、04-05、04-06 ｜ 模块见 07-04、07-09。
+
+### 4. 关键流程与调用链
+
+启动期的第一件事是注册关键字。`src/suricata.c` 依次调用 `SigTableInit()` 与 `SigTableSetup()`，后者在 `src/detect-engine-register.c` 中把 `DetectContentRegister`、`DetectPcreRegister`、`DetectBytetestRegister`、`DetectBytejumpRegister`、`DetectFlowRegister`、`DetectFlowbitsRegister`、`DetectXbitsRegister`、`DetectThresholdRegister`、`DetectDatasetRegister`、`DetectDatarepRegister`、`DetectFilestoreRegister`、`DetectFilemagicRegister`、`DetectFilesizeRegister`、`DetectFileSha256Register`、`DetectFiledataRegister` 等逐一填入 `sigmatch_table`；没有这一步，规则选项里的关键字在解析时就会报「未知关键字」。与此同时 `MpmTableSetup()` 把 AC、AC-KS、Hyperscan 三类后端注册进 `mpm_table`（原理见 06-07）。
+
+规则加载的主入口是 `src/detect-engine-loader.c` 的 `int SigLoadSignatures(DetectEngineCtx *de_ctx, char *sig_file, bool sig_file_exclusive)`，定义于该文件 384 行。它先用 `SCConfGetNode("rule-files")` 取出配置节点，用 `SCConfNodeIsSequence` 确认是列表，再以 `TAILQ_FOREACH` 遍历每个文件名，经 `DetectLoadCompleteSigPath` 补全路径后交给 `ProcessSigFiles`；`ProcessSigFiles` 调用 `DetectLoadSigFile` 逐行读取，每行文本传入 `src/detect-parse.c` 的 `SigInit`。`SigInit` 经 `SigInitDo`、`SigInitHelper` 分配 `Signature`，依次调用 `SigParse`、`SigParseBasics`、`SigParseAction`、`SigParseProto`、`SigParsePort`、`SigParseAddress`、`SigParseOptions` 把规则头与选项拆开，再由 `SigValidateCheckBuffers`、`SigValidateConsolidate`、`SigValidateFlowbitUse`、`SigValidateFileHandling` 等一系列校验函数做合法性检查，`SigSetupPrefilter` 决定该签名是否挂预过滤，最后 `DetectEngineAppendSig` 把 `Signature` 挂进 `de_ctx->sig_list`。重复 sid 由 `DetectParseDupSigHashInit` 建立的哈希表去重。
+
+所有规则读完后，`SigLoadSignatures` 进入编译段，顺序是：`SCSigRegisterSignatureOrderingFuncs` → `SCSigOrderSignatures` → `SCSigSignatureOrderingModuleCleanup` → `SCThresholdConfInitContext` → `SigGroupBuild` → `DetectParseDupSigHashFree`。排序函数在 `src/detect-engine-sigorder.c` 的 801 行定义，它按 `SCSigOrderByActionCompare`、`SCSigOrderByFlowbitsCompare`、`SCSigOrderByFlowvarCompare`、`SCSigOrderByPktvarCompare`、`SCSigOrderByFlowintCompare`、`SCSigOrderByHostbitsCompare`、`SCSigOrderByIPPairbitsCompare`、`SCSigOrderByPriorityCompare` 等比较器重排签名链，确保「置位规则」排在「检查规则」之前。`SigGroupBuild` 定义在 `src/detect-engine-build.c` 的 2300 行，它先给每条签名重排 `iid`，随后调用 `DetectSetFastPatternAndItsId`、`SigInitStandardMpmFactoryContexts`、`SigPrepareStage1`、`SigPrepareStage2`、`SigPrepareStage3`、`SigPrepareStage4`、`DetectMpmPrepareBuiltinMpms`、`DetectMpmPrepareAppMpms`、`DetectMpmPreparePktMpms`、`DetectMpmPrepareFrameMpms`、`SigMatchPrepare`，并在多租户未启用时调用 `VarNameStoreActivate`。其中 `SigPrepareStage1~4` 由 `RulesGroupByIPProto`、`CreateGroupedPortList`、`RuleSetScore`、`SignatureCreateMask`、`SignatureSetType` 支撑，负责按协议与端口把签名分进 sgh；`SigGroupHeadBuildMatchArray` 与 `SigGroupHeadSetupFiles` 把每个 sgh 的候选签名压成匹配数组并登记文件检测需求；`SigMatchPrepare` 则把 `smlists` 转成运行期 `sm_arrays` 并释放 `init_data`。整条加载与编译主链见图 06-06-01。
+
+:::figure id=06-06-01 | name=规则加载解析与分组编译主链 | dir=TD
+node r1 "规则文件<br/>rule-files" blue
+node r2 "逐行解析<br/>SigInit / SigParse" amber
+node r3 "签名排序<br/>SCSigOrderSignatures" amber
+node r4 "分组编译<br/>SigGroupBuild" purple
+node r5 "sgh 组头<br/>SigGroupHead" amber
+node r6 "MPM 与预过滤<br/>MpmCtx / Prefilter" purple
+node r7 "阈值配置<br/>threshold.config" gray
+node r8 "运行期检测<br/>Detect / DetectRun" green
+edge r1 -> r2 "逐行读取"
+edge r2 -> r3 "构造 Signature"
+edge r3 -> r4 "排序后签名链"
+edge r4 -> r5 "按 proto/端口分组"
+edge r4 -> r6 "fast_pattern"
+edge r7 -> r4 "抑制与阈值"
+edge r5 -> r8 "候选 sgh"
+edge r6 -> r8 "候选规则集"
+:::
+
+值得单独点明 `suricata -T` 的落点：它同样走完 `SigLoadSignatures` 的加载、排序与 `SigGroupBuild` 编译，然后在真正开始抓包前退出，因此它能完整暴露解析失败与编译期错误，却不能证明在线一定能命中。热加载路径则由 `src/detect-engine-loader.c` 里的 `DetectLoaderQueueTask`、`DetectLoadersSync`、`DetectLoaderThreadSpawn`、`TmModuleDetectLoaderRegister` 与 `src/detect-engine.c` 的 `DetectEngineReloadStart` 配合，通过 `suricatasc reload-rules` 触发新 `DetectEngineCtx` 的构建与原子替换（参数见 04-07，原理见 06-13）。
+
+### 5. 配置/命令/代码实例
+
+本节只给最小必要实例，并显式指向权威源：`suricata.yaml` 全段、全部命令行与 `suricatasc` 命令、返回码见 04 全册（参数见 04-02、04-05、04-06、04-07、04-08），此处不重列参数全集。下面先给 `SigLoadSignatures` 编译段的真实调用摘录，函数名与顺序均按 `src/detect-engine-loader.c` 书写，不构成完整实现。
+
+```c
+/* SigLoadSignatures 编译段摘录，见 src/detect-engine-loader.c */
+SCSigRegisterSignatureOrderingFuncs(de_ctx);
+if (SCSigOrderSignatures(de_ctx) != 0) {
+    ret = -1;
+    goto end;
+}
+SCSigSignatureOrderingModuleCleanup(de_ctx);
+
+if (SCThresholdConfInitContext(de_ctx) < 0) {
+    ret = -1;
+    goto end;
+}
+
+/* Setup the signature group lookup structure and pattern matchers */
+if (SigGroupBuild(de_ctx) < 0)
+    goto end;
+
+ret = 0;
+
+ end:
+gettimeofday(&de_ctx->last_reload, NULL);
+DetectParseDupSigHashFree(de_ctx);
+SCReturnInt(ret);
+```
+
+加载各阶段的源码落点、关键函数与主要失败表现见下表，便于按日志现象反查到具体环节。
+
+| 阶段 | 源码入口 | 关键函数 | 失败表现 |
+|---|---|---|---|
+| 关键字表初始化 | `src/detect-engine-register.c` | `SigTableInit`、`SigTableSetup` | 未知关键字、选项无法识别 |
+| 规则文件枚举 | `src/detect-engine-loader.c` | `DetectLoadCompleteSigPath`、`ProcessSigFiles` | rule-files 非序列、路径不存在 |
+| 规则行解析 | `src/detect-parse.c` | `SigInit`、`SigParse`、`SigParseOptions` | 语法错、括号不匹配、选项冲突 |
+| 校验与整合 | `src/detect-parse.c` | `SigValidateConsolidate`、`SigSetupPrefilter` | buffer 冲突、重复 sid、无 fast_pattern |
+| 规则排序 | `src/detect-engine-sigorder.c` | `SCSigOrderSignatures` | flowbits 置位与检查错序 |
+| 分组编译 | `src/detect-engine-build.c` | `SigGroupBuild`、`SigPrepareStage1~4` | sgh 为空、编译期内存膨胀 |
+| 阈值配置 | `src/util-threshold-config.c` | `SCThresholdConfInitContext` | threshold-file 不可读或格式错 |
+
+下面是一组按「前置检查 → 执行 → 验证输出 → 清理」组织的完整闭环命令，适合在改动规则集后确认编译链是否贯通。
+
+```bash
+# 前置检查：确认构建特性与生效配置，避免把环境问题误判为规则问题
+suricata --build-info
+suricata --dump-config | grep -n "rule-files"
+
+# 执行：仅做规则加载与编译自检，不启动抓包线程
+suricata -T -c /etc/suricata/suricata.yaml -l /var/log/suricata/
+
+# 验证输出：定位加载统计与错误行
+grep -nE "rules successfully loaded|rules failed|Error|Warning" /var/log/suricata/suricata.log | tail -n 12
+
+# 清理：自检进程已自行退出，仅移除本次临时日志
+rm -f /var/log/suricata/rule-check.tmp
+```
+
+典型输出如下（示例输出，具体格式需对照实际版本核验）。
+
+```text
+# 示例输出，具体格式需对照实际版本核验
+<Notice> - Configuration provided was successfully loaded. Exiting.
+<Info> - 2 rule files processed. 31247 rules successfully loaded, 3 rules failed, 11 rules skipped
+<Warning> - DetectParseDupSigHashInit: duplicate sid 2100498, keeping the first occurrence
+<Error> - detect-parse: unknown rule keyword "urilenx" in rule sid 900001
+<Info> - SigGroupBuild: 412 signature group heads built, 17 MPM contexts prepared
+```
+
+逐行判读如下。第一行是 `suricata -T` 的成功回显，关键词是 `successfully loaded`，它只证明配置树与规则文件能被解析并完成编译，不代表在线抓包已启动，更不代表规则会命中流量。第二行是加载汇总，`rule files processed` 对应 `sig_stat->total_files`，`rules successfully loaded` 对应 `good_sigs_total`，`rules failed` 对应 `bad_sigs_total`，`rules skipped` 对应 `skipped_sigs_total`；正常生产环境期望 failed 为零，skipped 有值时需查 `requirements` 与版本能力（具体统计项名称需对照实际版本核验），failed 非零而进程仍显示成功，说明 `failure_fatal` 未开启，此时必须逐条修复而不是忽略。第三行是重复 sid 告警，来自 `DetectParseDupSigHashInit` 建立的去重哈希表，特征文本是 `duplicate sid`；正常值应为零，出现时应合并或改号，否则后写规则会被静默丢弃。第四行是未知关键字错误，特征文本是 `unknown rule keyword`，根因在 `src/detect-engine-register.c` 的关键字注册与规则语法兼容边界，属于编译期错误，不可能是收包问题。第五行是分组编译汇总，`signature group heads` 反映 sgh 数量、`MPM contexts` 反映编译出的 `MpmCtx` 数量；该计数异常偏大往往意味着分组粒度过细或 `fast_pattern` 选择不佳，会推高每包候选规模，具体影响需在目标机型实测（原理见 06-07、06-08）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把 `suricata -T` 的成功当成「规则会告警」。`-T` 只覆盖加载、排序与 `SigGroupBuild` 编译，不覆盖收包、流建立、协议识别与输出开关；在线无告警时仍应按图 06-06-01 之前的流水线逐段收敛（原理见 06-01、06-08）。第二个陷阱是忽略 `rules failed` 与 `rules skipped`。`failure_fatal` 未开启时，少量坏规则不会让进程退出，坏规则对应的检测能力直接缺失，且日志里只是一行统计；上线清单必须把这两个计数纳入监控（场景见 08-06）。第三个陷阱是规则语法的兼容想当然：Suricata 兼容 Snort 但含大量自有扩展，把 Snort 规则集原样搬来时，`file.data`、`xbits`、`dataset`、`http.uri` 一类自有关键字与 sticky buffer 的用法差异会造成解析失败或语义偏差，不能宣称百分之百兼容。
+
+配置层面有几处高频问题。`rule-files` 必须是序列而非标量，`SCConfNodeIsSequence` 校验失败会给出 `Invalid rule-files configuration section` 警告并静默跳过全部规则，这是「配置了却不加载」的典型根因。`threshold-file` 路径不存在或格式错时，`SCThresholdConfInitContext` 返回负值，`SigLoadSignatures` 直接跳到 `end` 结束编译，表现为规则集整体未就绪；注意该逻辑在 `src/util-threshold-config.c` 而非 `src/util-threshold.c`，后者在本快照不存在，需对照实际版本核验。`mpm-algo` 设为 `hs` 而构建未启用 Hyperscan 时，`PatternMatchDefaultMatcher` 会给出致命错误，这正是「Hyperscan 是可选加速」的边界，不能写成必需依赖（原理见 06-07）。
+
+安全与性能上要克制。不可信规则里的贪婪 `pcre`、超大 `dataset`、成百上千个显式 `fast_pattern` 会在 `SigGroupBuild` 阶段造成编译期内存与时间膨胀，属于加固范畴（案例见 08-05）；任何编译耗时、内存占用、吞吐数字一律标注「需在目标机型实测」，不给绝对值。规则间状态依赖也要留意：`flowbits`、`xbits`、`flowint` 这类关键字要求置位规则先于检查规则执行，靠 `SCSigOrderSignatures` 保证，手写规则时若依赖顺序却又绕过排序语义，会得到难以复现的漏报（原理见 06-09）。最佳实践是建立三段自检：上线前 `suricata --build-info` 确认构建特性、`suricata --dump-config` 确认生效配置、`suricata -T` 确认规则可编译；变更后用 `suricatasc reload-rules` 热加载并比对新旧 `stats.log` 的 `detect.alert` 计数；把 `rules failed`、`rules skipped`、sgh 数量纳入版本化基线。规则集下载与合并交给独立的 `suricata-update` 工具，不参与 `src/` 主程序编译。
+
+### 7. 小结与延伸阅读
+
+本篇给出一条主线、两个权威源、三类边界。一条主线是「关键字注册 → 文件枚举 → 逐行解析 `SigInit` → 校验整合 → `SCSigOrderSignatures` 排序 → `SCThresholdConfInitContext` 阈值配置 → `SigGroupBuild` 分组编译 → 运行期只读结构」，它在 `src/detect-engine-loader.c` 的 `SigLoadSignatures` 中被串起，产物是 `de_ctx->sig_list`、各 `SigGroupHead`、编译好的 `MpmCtx` 与挂接的 `PrefilterEngine`。两个权威源是：结构体逐字段看 05，配置与命令参数看 04；本篇及 06 全册只负责机制与调用链，不越界重列字段表或参数全集。三类边界是：Suricata 不做转发、不是防火墙；规则语法兼容 Snort 但非完全一致；Hyperscan 为可选加速、`suricata-update` 为独立工具。
+
+延伸阅读按编译链继续向后推进：`fast_pattern` 选择、MPM 与预过滤引擎挂接见 06-07，`SigMatch` 求值与 inspection 顺序见 06-08，阈值与 `flowbits`/`xbits` 有状态关键字见 06-09，文件检测与 `file.data` 见 06-10，EVE 输出见 06-11，runmode 与热加载的线程侧影响见 06-13。按目录查模块能力可跳到 07-04（detect）、07-05（util-mpm 与 Hyperscan）、07-09（util-* 与 conf）、07-11（suricata-update）；按字段查结构可跳到 05-05、05-06、05-09；按参数查命令与配置可跳到 04-02、04-05、04-06、04-07、04-08。统一交叉引用写法：字段见 05-05、05-06、05-09 ｜ 参数见 04-02、04-05、04-06 ｜ 原理见 06-07、06-08、06-09 ｜ 模块见 07-04、07-05、07-11。版本基准始终为「上游 main 快照（2026-11 抓取）」，未核实的具体字段名、函数签名与配置键名均已标注「需对照实际版本核验」。
+
+## 06-07 多模式匹配与预过滤（MPM/AC、Hyperscan）
+
+### 1. 背景与动机
+
+假设规则集有三万条签名，其中两万条都带 `content`。若每个包都把这三万条规则逐一做完整求值，检测线程会被立刻压垮。Suricata 的应对不是「更努力地逐条比对」，而是先用一次多模式扫描把「可能命中的规则」从三万条缩减到几十条，再只对这几十条做精确的逐条 inspection。这个把「全量候选」变成「小候选集」的机制，就是多模式匹配（MPM，Multi-Pattern Matcher）与预过滤（prefilter）。它位于规则编译产物与运行期求值之间，是整套检测引擎吞吐能力的地基，也直接解释了为什么 `fast_pattern` 选得好不好会显著影响性能。
+
+必须先立住能力边界。Hyperscan 是可选 MPM 加速，由构建开关控制（选项名需对照 `configure.ac` 实际版本核验）；未启用或运行期平台校验不通过时，引擎回退到 AC、AC-KS 等 Aho-Corasick 实现，绝不把 Hyperscan 写成必需依赖或唯一实现。Suricata 只对自身解码并重组到的流量做检测，TLS 等加密载荷的明文正文不可见，因此依赖内容匹配的规则在加密流上本来就不该期待命中（原理见 06-12）。引擎是 IDS / IPS / NSM，不做转发、不是防火墙。本套资料版本基准统一为「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验；凡性能、吞吐、内存类结论一律标注「需在目标机型实测」，不给绝对值。
+
+从工程价值看，理解 MPM 与预过滤有三个收益。其一是排障：`eve.json` 无告警时，若 `detect.alert` 与预过滤候选计数长期为零，问题可能在 `fast_pattern` 选择、sgh 绑定或 MPM 未编译，而不是收包。其二是调优：`mpm-algo`、规则集中 `content` 的长度与区分度、Hyperscan 是否启用，共同决定每包候选规模（调优见 08-02）。其三是源码阅读：`MpmCtx` 由 `SigGroupBuild` 在编译期构建，运行期只读，`PrefilterEngine` 按 packet、payload、tx、frame 分族挂到 sgh 上，理解这条界线才能分清「编译期做什么」与「运行期做什么」。本篇所有函数名与路径均以此快照下 `upstream_src/suricata/suricata-main/` 内真实文件为锚点。
+
+### 2. 核心概念
+
+MPM 的核心抽象是 `MpmCtx` 与 `mpm_table`。`src/util-mpm.h` 定义枚举 `MPM_AC`、`MPM_AC_KS`、`MPM_HS`、`MPM_TABLE_SIZE`，并声明 `extern MpmTableElmt mpm_table[MPM_TABLE_SIZE]`；`MpmTableElmt` 是一组函数指针，包含 `InitCtx`、`InitThreadCtx`、`AddPattern`、`AddPatternNocase`、`Prepare`、`Search`、`PrintCtx` 等成员，这正是「同一套接口、多种后端」的实现方式（字段见 05-06）。`src/util-mpm.c` 的 `MpmInitCtx` 依据 `mpm_ctx->mpm_type` 调用 `mpm_table[matcher].InitCtx`，`MpmAddPatternCS` 与 `SCMpmAddPatternCI` 分别转发到 `AddPattern` 与 `AddPatternNocase`，`MpmInitThreadCtx` 准备每线程 scratch。AC 侧由 `SCACPreparePatterns`、`SCACSearch`、`SCACPrepareStateTable`、`MpmACRegister` 实现；Hyperscan 侧由 `SCHSInitCtx`、`SCHSAddPatternCS`、`SCHSPreparePatterns`、`SCHSSearch`、`PatternDatabaseCompile`、`MpmHSRegister` 实现，后者把 `mpm_table[MPM_HS]` 的各函数指针逐一填好。
+
+预过滤是 MPM 的上层组织。`src/detect-engine-prefilter.c` 的 `PrefilterSetupRuleGroup` 为某个 sgh 装配引擎，`PrefilterAppendEngine`、`PrefilterAppendPayloadEngine`、`PrefilterAppendTxEngine`、`PrefilterAppendFrameEngine` 按检测对象分族注册；运行期 `Prefilter` 与 `DetectRunPrefilterTx` 依次执行这些引擎，把命中的规则 id 写进 `PrefilterRuleStore`（常称 pmq），`src/util-prefilter.c` 的 `PmqSetup`、`PmqReset`、`PmqCleanup`、`PmqFree` 负责这个候选数组的生命周期。随后 `DetectRun` 只遍历候选集做逐条 inspection，而不是遍历全部签名（原理见 06-08）。这里要明确一条界线：MPM 命中只代表「某条规则的某个模式出现在数据里」，不等于规则整体匹配，`content` 之间的 `distance`、`within`、`byte_test`、`pcre`、`flowbits` 等仍需逐条求值。
+
+`fast_pattern` 是把规则接入 MPM 的钥匙。`src/detect-engine-mpm.c` 的 `DetectSetFastPatternAndItsId` 在 `SigGroupBuild` 开头被调用，`RetrieveFPForSig` 检查规则里显式 `fast_pattern` 修饰或按 `PatternStrength` 自动挑选，`SetMpm` 与 `PopulateMpmHelperAddPattern` 把选中的模式登记进对应 buffer 的 `MpmCtx`，`MpmStorePrepareBuffer` 与 `PrepareMpms` 按 sgh 准备各 buffer 的匹配上下文，`PatternMatchPrepareGroup` 完成编译。若一条规则的 `fast_pattern` 太短或太常见，MPM 会把大量包判为候选，预过滤的筛选价值随之下降。交叉引用：字段见 05-06 ｜ 参数见 04-02、04-03、04-06 ｜ 原理见 06-06、06-08 ｜ 模块见 07-05。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，不重列字段；06 全册禁止完整结构体字段表，逐字段定义一律到 05。
+
+- `MpmCtx`、`MpmThreadCtx`、`MpmCtxFactoryItem`、`MpmCtxFactoryContainer`、`MpmTableElmt`、`MpmPattern`：`src/util-mpm.h`、`src/util-mpm.c`；`MpmInitCtx`、`MpmInitThreadCtx`、`MpmTableSetup`、`MpmAddPatternCS`、`SCMpmAddPatternCI`、`MpmAddPattern` 均定义在 `src/util-mpm.c`（字段见 05-06）。
+- AC 实现族：`src/util-mpm-ac.c`、`src/util-mpm-ac-ks.c`、`src/util-mpm-ac-ks-small.c`、`src/util-mpm-ac-queue.c` 及对应头文件；`SCACPreparePatterns`、`SCACSearch`、`SCACGetConfig`、`MpmACRegister` 在 `src/util-mpm-ac.c`。
+- Hyperscan 实现族：`src/util-mpm-hs.c`、`src/util-mpm-hs-core.c`、`src/util-mpm-hs-cache.c` 及对应头文件；另有 `src/util-hyperscan.c` 提供 `HSRenderPattern` 与 `HSLogCompileError` 两个通用辅助函数。
+- 预过滤族：`src/detect-engine-prefilter.c`、`src/detect-engine-prefilter-common.c`、`src/util-prefilter.c`；`PrefilterRuleStore`、`PrefilterEngine`、`PrefilterEngineList` 的字段见 05-06。
+- 规则侧 MPM 装配：`src/detect-engine-mpm.c`（`DetectSetFastPatternAndItsId`、`RetrieveFPForSig`、`PatternStrength`、`MpmStorePrepareBuffer`、`PatternMatchPrepareGroup`、`DetectMpmPrepareBuiltinMpms`、`DetectMpmPrepareAppMpms`、pkt 与 frame 两族），`src/detect-parse.c` 的 `SigSetupPrefilter` 决定签名是否参与预过滤。
+
+`src/util-hyperscan.c` 与 `src/util-prefilter.c` 在本快照确实存在，但职责比名字听起来窄：前者只做模式渲染与编译错误日志，后者只管 `PrefilterRuleStore` 的分配与复位，主体逻辑分别在 `src/util-mpm-hs.c` 与 `src/detect-engine-prefilter.c`，阅读时不要按文件名想当然。`BUILD_HYPERSCAN`、`HAVE_HS_VALID_PLATFORM` 属于构建期宏，具体开关与 Hyperscan 版本要求需对照 `configure.ac` 与 `src/util-mpm-hs.c` 实际版本核验。交叉引用：字段见 05-06 ｜ 参数见 04-01、04-03 ｜ 模块见 07-05、07-09。
+
+### 4. 关键流程与调用链
+
+编译期第一环是后端注册。`src/util-mpm.c` 的 `MpmTableSetup` 先 `memset(mpm_table, 0, sizeof(mpm_table))`，把 `mpm_default_matcher` 设为 `DEFAULT_MPM`，随后调用 `MpmACRegister()` 与 `MpmACTileRegister()`；仅在 `BUILD_HYPERSCAN` 宏下，若 `HAVE_HS_VALID_PLATFORM` 成立则用 `hs_valid_platform()` 做运行期 SSSE3 校验，校验失败时把默认匹配器降为 `DEFAULT_MPM_AC` 并只保留 AC，校验通过才调用 `MpmHSRegister()`。`DEFAULT_MPM` 本身也由条件编译决定：启用 Hyperscan 时为 `MPM_HS`，否则为 `MPM_AC`。这段逻辑正是「Hyperscan 可选、缺失回退 AC」最直接的源码证据，不能写反。
+
+第二环是算法选择与模式登记。`src/detect-engine-mpm.c` 的 `PatternMatchDefaultMatcher` 读取 `mpm-algo` 配置，若配置为 `hs` 而 Hyperscan 未构建则 `FatalError` 退出，若配置为 `ac-bs` 会给出已移除的警告，其余取值分别落到 `MPM_AC`、`MPM_AC_KS`、`MPM_HS`。`SigGroupBuild` 调用 `DetectSetFastPatternAndItsId` 遍历 `de_ctx->sig_list`，`RetrieveFPForSig` 为每条签名选定 `fast_pattern`，`PopulateMpmHelperAddPattern` 把模式经 `MpmAddPatternCS` 或 `SCMpmAddPatternCI` 登记进对应 buffer 的 `MpmCtx`；`SigInitStandardMpmFactoryContexts` 建立标准 buffer 的工厂上下文，`DetectMpmPrepareBuiltinMpms`、`DetectMpmPrepareAppMpms`、`DetectMpmPreparePktMpms`、`DetectMpmPrepareFrameMpms` 分别完成四类 buffer 的 `Prepare`，最终由 `PatternMatchPrepareGroup` 与 `MpmStorePrepareBuffer` 把编译好的 `MpmCtx` 绑定到 sgh。AC 的 `Prepare` 走 `SCACPreparePatterns` 建状态表，Hyperscan 的 `Prepare` 走 `SCHSPreparePatterns` → `PatternDatabaseCompile` → `hs_compile` 系列调用并分配 scratch。
+
+第三环是运行期执行。`src/detect.c` 的 `DetectRun` 取出本包对应的 sgh 后，`src/detect-engine-prefilter.c` 的 `Prefilter` 依次调用该 sgh 上注册的 `PrefilterEngine`；其中 `PrefilterGenericMpmRegister`、`PrefilterSingleMpmRegister`、`PrefilterMultiGenericMpmRegister` 注册出的引擎由 `PrefilterMpm`、`PrefilterMpmPkt`、`PrefilterMpmTxSingle` 等回调驱动，内部调用 `mpm_table[matcher].Search`（AC 为 `SCACSearch`，Hyperscan 为 `SCHSSearch`），把命中的规则 id 写入 `PrefilterRuleStore`。`DetectRunPrefilterTx` 处理应用层事务方向的预过滤，`PrefilterSetupRuleGroup` 在编译期按 `PrefilterSetupRuleGroupSortHelper` 排好引擎执行顺序，`PrefilterCleanupRuleGroup` 负责释放。候选集随后交由 `DetectRun` 做逐条 inspection。MPM 候选缩减与预过滤挂接的完整链路见图 06-07-01。
+
+:::figure id=06-07-01 | name=MPM 候选缩减与预过滤引擎挂接 | dir=TD
+node m1 "fast_pattern<br/>选择最强模式" amber
+node m2 "MpmCtx 构建<br/>AddPattern/Prepare" amber
+node m3 "mpm_table<br/>AC / HS 实现" purple
+node m4 "PrefilterEngine<br/>packet/tx/frame" purple
+node m5 "PrefilterRuleStore<br/>候选规则 pmq" purple
+node m6 "逐条 inspection<br/>DetectRun" green
+node m7 "Hyperscan 可选<br/>缺失回退 AC" gray
+node m8 "告警/事件<br/>output-json" green
+edge m1 -> m2 "登记模式"
+edge m2 -> m3 "按 mpm-algo"
+edge m7 -> m3 "编译期开关"
+edge m3 -> m4 "注册引擎"
+edge m4 -> m5 "填充候选"
+edge m5 -> m6 "缩小候选集"
+edge m6 -> m8 "命中判定"
+edge m1 -> m5 dashed "单模式直选"
+:::
+
+需要强调 aho-corasick 与 Hyperscan 只是 `Search` 实现不同，上层 `MpmCtx`、`PrefilterEngine`、`PrefilterRuleStore` 的接口完全一致；因此换 `mpm-algo` 不会改变规则语义，只会改变候选筛选的速度与内存占用，具体差异需在目标机型实测。这也是「同一套检测逻辑可插拔不同匹配后端」的设计收益。
+
+MPM 上下文的复用由工厂层负责。`src/util-mpm.c` 的 `MpmFactoryRegisterMpmCtxProfile`、`MpmFactoryGetMpmCtxForProfile`、`MpmFactoryReClaimMpmCtx`、`MpmFactoryDeRegisterAllMpmCtxProfiles` 与 `src/util-mpm.h` 中的 `MpmCtxFactoryItem`、`MpmCtxFactoryContainer` 配合，让多个 sgh 在相同 buffer 与相同方向下共享一份编译产物，避免为每个端口组重复编译同一批模式；`MpmFactoryIsMpmCtxAvailable` 用于判断某份上下文能否复用。`src/detect-engine-mpm.c` 的 `SignatureHasPacketContent` 与 `SignatureHasStreamContent` 决定一条规则是否把模式登记到包体或流 buffer 的 MPM，带 `http.uri`、`file.data` 等 sticky buffer 的规则改由 `DetectAppLayerMpmRegister`、`DetectAppLayerMpmRegisterByParentId`、`DetectFrameMpmRegister`、`DetectPktMpmRegister` 一族把模式挂到对应 buffer 的引擎上，`BuildBasicPname` 与 `AppendTransformsToPname` 生成带 transform 后缀的注册名。理解这一层，才能解释为什么同一条 `content` 在不同 sticky buffer 下会进入完全不同的 `MpmCtx`，以及为什么 `DetectBufferTypeSupportsMpm` 这类能力标记必须在编译期注册好。
+
+Hyperscan 侧的编译链值得单独展开。`SCHSPreparePatterns` 不是简单地把模式交给 `hs_compile`，它先经 `HSCheckPatterns` 与 `HSPatternArrayInit`、`HSPatternArrayPopulate` 整理模式数组，再由 `PatternDatabaseGetCached` 查询磁盘缓存，命中则跳过编译，未命中才走 `PatternDatabaseCompile` 与 `CompileDataExtensionsInit` 构造 `hs_expr_ext_t` 扩展，编译失败由 `SCHSCleanupOnError` 回收，`CompileDataFree` 释放中间数据；`HSGlobalPatternDatabaseInit` 与 `HSScratchAlloc` 分别准备全局库与每线程 scratch，`SCHSCacheRuleset` 与 `SCHSCachePrune` 维护规则集级缓存的写入与淘汰。`src/util-hyperscan.c` 的 `HSRenderPattern` 把二进制模式渲染成可读表达式、`HSLogCompileError` 把 `hs_compile_error_t` 转成日志，二者是排查模式编译报错的入口。运行期一侧，`src/util-prefilter.c` 的 `PmqSetup`、`PmqReset`、`PmqCleanup`、`PmqFree` 管 `PrefilterRuleStore` 这个候选数组的分配与逐包复位，`PrefilterPostRuleMatch` 在规则匹配后回填结果，`PrefilterSetupRuleGroupSortHelper` 决定同一 sgh 内多个引擎的执行先后。任何编译耗时、缓存命中率、候选规模与吞吐数字都需在目标机型实测，不给绝对值。
+
+还要把 `mpm_table` 的函数指针表与关键字注册分开看。`MpmTableElmt` 里的 `InitCtx`、`InitThreadCtx`、`DestroyCtx`、`DestroyThreadCtx`、`AddPattern`、`AddPatternNocase`、`Prepare`、`Search`、`PrintCtx` 以及 Hyperscan 专有的 `ConfigInit`、`ConfigDeinit`、`ConfigCacheDirSet`、`CacheStatsInit`、`CacheStatsPrint`、`CacheStatsDeinit`、`CacheRuleset`、`CachePrune` 成员，在 `MpmHSRegister` 里被逐一赋值为 `SCHSInitCtx`、`SCHSPreparePatterns` 等真实符号；AC 侧则由 `MpmACRegister` 填成 `SCACInitCtx`、`SCACPreparePatterns`、`SCACSearch`。同一张表、两套实现，编译期靠 `mpm_ctx->mpm_type` 选择，运行期靠函数指针调用，这就是「可插拔」四个字在代码里的具体形态（字段见 05-06）。
+
+### 5. 配置/命令/代码实例
+
+本节只给最小必要实例，并显式指向权威源：`mpm-algo`、`detect` 相关 yaml 段与构建选项见 04 全册（参数见 04-01、04-02、04-03），此处不重列参数全集。下面先给 `MpmTableSetup` 的真实实现摘录，它最直接地说明 Hyperscan 的可选性与 AC 回退。
+
+```c
+/* MpmTableSetup 摘录，见 src/util-mpm.c */
+void MpmTableSetup(void)
+{
+    memset(mpm_table, 0, sizeof(mpm_table));
+    mpm_default_matcher = DEFAULT_MPM;
+
+    MpmACRegister();
+    MpmACTileRegister();
+#ifdef BUILD_HYPERSCAN
+    #ifdef HAVE_HS_VALID_PLATFORM
+        if (hs_valid_platform() != HS_SUCCESS) {
+            SCLogInfo("SSSE3 support not detected, disabling Hyperscan for MPM");
+            mpm_default_matcher = DEFAULT_MPM_AC;
+        } else {
+            MpmHSRegister();
+        }
+    #else
+        MpmHSRegister();
+    #endif
+#endif
+}
+```
+
+MPM 各层的源码落点、关键函数与失败表现见下表，便于按现象反查。
+
+| 层次 | 源码入口 | 关键函数 | 失败表现 |
+|---|---|---|---|
+| 后端注册 | `src/util-mpm.c` | `MpmTableSetup`、`MpmInitCtx` | 默认匹配器回退 AC、无 HS 条目 |
+| AC 实现 | `src/util-mpm-ac.c` | `SCACPreparePatterns`、`SCACSearch` | 状态表过大、编译内存高 |
+| HS 实现 | `src/util-mpm-hs.c` | `SCHSPreparePatterns`、`SCHSSearch` | 平台校验失败、模式编译报错 |
+| 模式选择 | `src/detect-engine-mpm.c` | `RetrieveFPForSig`、`PatternStrength` | 短模式导致候选膨胀 |
+| 分组绑定 | `src/detect-engine-mpm.c` | `MpmStorePrepareBuffer`、`PatternMatchPrepareGroup` | sgh 无可用 MpmCtx |
+| 引擎挂接 | `src/detect-engine-prefilter.c` | `PrefilterSetupRuleGroup`、`PrefilterGenericMpmRegister` | 预过滤引擎为空 |
+| 运行期扫描 | `src/detect-engine-prefilter.c` | `Prefilter`、`PrefilterMpm` | 候选集恒为空或不收敛 |
+
+下面是一组按「前置检查 → 执行 → 验证输出 → 清理」组织的完整闭环命令，用于确认构建是否带 Hyperscan 以及生效的 MPM 算法。
+
+```bash
+# 前置检查：确认构建特性里是否含 Hyperscan，避免把回退误判为故障
+suricata --build-info | grep -i hyperscan
+
+# 执行：以最小规则集做一次编译自检，观察 MPM 相关日志
+suricata -T -c /etc/suricata/suricata.yaml -S /etc/suricata/rules/local.rules -l /var/log/suricata/
+
+# 验证输出：确认算法选择与编译结果
+grep -nE "mpm|hyperscan|fast_pattern|pattern matcher" /var/log/suricata/suricata.log | tail -n 10
+
+# 清理：自检进程已退出，移除临时规则副本
+rm -f /tmp/local.rules.check
+```
+
+典型输出如下（示例输出，具体格式需对照实际版本核验）。
+
+```text
+# 示例输出，具体格式需对照实际版本核验
+<Info> - HyperScan support: yes
+<Info> - Using pattern matcher: Hyperscan
+<Info> - MpmStorePrepareBuffer: 6 builtin MPM contexts prepared for payload
+<Warning> - fast_pattern for sid 900001 is only 1 byte, candidate set may be large
+<Info> - PrefilterSetupRuleGroup: 37 prefilter engines registered for sgh 12
+<Info> - 1 rule files processed. 1 rules successfully loaded, 0 rules failed, 0 rules skipped
+```
+
+逐行判读如下。第一行的 `HyperScan support: yes` 来自 `--build-info`，它反映构建期是否编入 Hyperscan；若为 `no`，后续日志出现 AC 属于正常回退而不是故障，绝不能据此宣称「引擎缺少必需依赖」，构建选项名需对照 `configure.ac` 实际版本核验。第二行 `Using pattern matcher` 是 `PatternMatchDefaultMatcher` 结合 `mpm-algo` 与平台校验后的最终选择，正常值为 Hyperscan 或某种 AC 变体；若显式配置 `hs` 而此行仍为 AC，应检查 `hs_valid_platform()` 校验与构建开关。第三行是 `MpmStorePrepareBuffer` 为 payload 准备的 `MpmCtx` 数量，正常值应与参与分组的 buffer 数相当；数量为零说明该 sgh 没有可用内容规则或分组编译未走到 MPM 阶段，需回查 06-06 的 `SigGroupBuild`。第四行是短 `fast_pattern` 警告，特征文本是 `only 1 byte`，这是典型的陷阱信号：过短或过常见的模式会让 MPM 把大量包判为候选，预过滤筛选价值下降，应改用更长更稀疏的 `content` 或显式 `fast_pattern`（规则关键字见 04-06）。第五行是该 sgh 注册的预过滤引擎数，正常值随规则集规模变化；为零时应查 `PrefilterSetupRuleGroup` 与 `SigSetupPrefilter` 是否被跳过。第六行是加载汇总，failed 与 skipped 均为零说明本次最小规则集编译通过，具体统计项名称需对照实际版本核验；所有吞吐与候选规模结论一律标注「需在目标机型实测」。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把 Hyperscan 写成必需依赖。由 `MpmTableSetup` 可见，`BUILD_HYPERSCAN` 未定义、`hs_valid_platform()` 校验失败、`mpm-algo` 显式选 AC 三种情况都会回退到 AC 系实现，规则语义不变、速度与内存不同，任何差异需在目标机型实测（调优见 08-02）。第二个陷阱是把 MPM 命中当成规则命中。MPM 只证明某个模式出现，`content` 的相对位置、`pcre`、`byte_test`、`isdataat`、`flowbits` 等仍要逐条求值，把预过滤候选数当成告警数是概念混淆（原理见 06-08）。第三个陷阱是忽略 `fast_pattern` 质量。自动挑选依赖 `PatternStrength`，遇到纯 `nocase`、单字节、高频串时区分度骤降，候选集膨胀，检测线程被迫做大量无效 inspection；应显式指定长且稀疏的模式，并避免给同一条规则塞过多 `fast_pattern`。
+
+配置层面有几处高频问题。`mpm-algo` 设为 `hs` 而构建未启用 Hyperscan 时，`PatternMatchDefaultMatcher` 会直接 `FatalError`，这是「启动即失败」的典型根因之一；`ac-bs` 一类旧取值已被移除，代码里会给出明确警告。`suricata -T` 能暴露 MPM 编译错误，但不能反映真实流量下的候选分布，评估筛选效果必须配合在线 `stats.log` 与 `suricatasc dump-counters`（计数项名称需对照实际版本核验）。Hyperscan 侧还有 scratch 与模式数据库缓存：`HSScratchAlloc`、`PatternDatabaseCompile`、`SCHSCacheRuleset`、`SCHSCachePrune` 参与编译期缓存管理，缓存目录权限与磁盘空间不足会表现为编译变慢或失败，具体路径键名需对照实际版本核验。
+
+最佳实践是建立「候选规模」指标习惯：上线前用 `--build-info` 确认后端、`suricata -T` 确认 MPM 编译、检查短 `fast_pattern` 警告；运行中关注预过滤候选数与逐条 inspection 次数的比值，比值异常升高说明模式选择或规则集有问题；做任何 `mpm-algo` 切换都用同一份脱敏 pcap 做 A/B 对照，吞吐、pps、内存占用一律标注「需在目标机型实测」，不给绝对值（基准见 08-01）。规则侧注意 Suricata 语法兼容 Snort 但有自有扩展，不能宣称百分之百兼容；加密载荷明文不可见，依赖内容匹配的规则在 TLS 流上不命中属于可见性边界而非 MPM 缺陷。按目录查实现可跳到 07-05，按字段查 `MpmCtx` 与 `PrefilterEngine` 可跳到 05-06。
+
+### 7. 小结与延伸阅读
+
+本篇给出一条主线、两个权威源、三类边界。一条主线是「`MpmTableSetup` 注册后端 → `PatternMatchDefaultMatcher` 选算法 → `DetectSetFastPatternAndItsId` 选模式 → `MpmAddPatternCS`/`SCMpmAddPatternCI` 登记 → `SCACPreparePatterns` 或 `SCHSPreparePatterns` 编译 → `PrefilterSetupRuleGroup` 挂引擎 → `Prefilter` 运行期扫描 → `PrefilterRuleStore` 产出候选集」。两个权威源是：结构体逐字段看 05，配置与命令参数看 04；本篇只负责机制与调用链。三类边界是：Hyperscan 可选、缺失回退 AC；MPM 命中不等于规则命中；加密载荷明文不可见。
+
+延伸阅读按链路向前后推进：规则加载与 `SigGroupBuild` 见 06-06，`DetectRun` 与 inspection 顺序见 06-08，阈值与有状态关键字见 06-09，文件检测与 `file.data` 见 06-10，EVE 输出见 06-11，线程与瓶颈见 06-13。按目录查模块能力可跳到 07-05（util-mpm 与 Hyperscan）、07-04（detect）、07-09（util-* 与 conf）；按字段查结构可跳到 05-06；按参数查 `mpm-algo` 与构建选项可跳到 04-01、04-02、04-03。统一交叉引用写法：字段见 05-06 ｜ 参数见 04-01、04-02、04-03 ｜ 原理见 06-06、06-08 ｜ 模块见 07-05。版本基准始终为「上游 main 快照（2026-11 抓取）」，未核实的具体字段名、函数签名、构建选项与配置键名均已标注「需对照实际版本核验」。
+
+## 06-08 检测引擎：SigMatch 求值与 inspection 顺序
+
+### 1. 背景与动机
+
+06-06 讲了规则如何变成编译产物，06-07 讲了 MPM 如何把全量规则缩减为候选集，本篇接着回答最后一个问题：候选规则到底按什么顺序、在什么数据上被逐条求值，以及一次「命中」如何变成 `alert`、`pass` 或 `drop`。这一段是整条流水线里最容易被望文生义误解的部分。常见误解有两个：一是以为检测就是「拿包和每条 `content` 比一遍」，二是把 `SigMatchSignatures` 当成稳态检测入口。前者忽略了 sticky buffer 与 inspection engine 的分层，后者在本次核验的 main 快照里并不成立，需要如实澄清。
+
+必须先立住边界。Suricata 是 IDS / IPS / NSM 引擎，不是防火墙，不做 IP 转发，也不做路由；内联 drop 依靠 NFQUEUE 或 AF_PACKET 桥接的 verdict（原理见 06-12）。检测发生在解码、流绑定、TCP 重组与应用层解析之后，因此带 `http.uri`、`file.data`、`tls.sni` 一类 sticky buffer 的规则，作用对象是解析后由 inspection engine 供给的 buffer，而不是原始以太网帧。TLS 等加密载荷的明文正文不可见，能用于检测的是握手元数据、证书、SNI 等，不能宣称能读 HTTPS 明文。本套资料版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验；性能类结论一律标注「需在目标机型实测」。
+
+从工程价值看，掌握求值顺序有三个收益。其一是排障：`decoder.pkts` 正常增长而 `detect.alert` 为零时，按「sgh 是否取到 → 预过滤是否有候选 → buffer 是否可见 → inspection 是否命中 → 后匹配与输出」逐段收敛，比盲目改规则高效。其二是规则编写：理解 `content` 与 `pcre` 作用于哪个 buffer、`distance`/`within` 依赖怎样的相对位置、`flowbits` 在何时求值，才能写出语义正确的规则。其三是性能：每包进入多少条完整 inspection、每个 buffer 被供给几次，直接决定检测线程负载，任何吞吐与内存数字都需在目标机型实测。本篇所有函数名与路径均以 `upstream_src/suricata/suricata-main/` 下真实文件为锚点。
+
+### 2. 核心概念
+
+先固定入口。`src/detect.c` 的 `TmEcode Detect(ThreadVars *tv, Packet *p, void *data)` 定义于该文件 3281 行，是检测 `TmModule` 的 `Func`；它先取 `DetectEngineThreadCtx`，在多租户场景下按 `p->tenant_id` 切换到对应 `de_ctx`，随后依据 `p->flow` 是否存在分派到 `DetectFlow` 或 `DetectNoFlow`，二者在跳过条件检查后都调用 `DetectRun`。`DetectFlow` 定义于 3193 行，会先处理 `FLOW_ACTION_DROP`、`PKT_NOPACKET_INSPECTION`、`FLOW_ACTION_PASS` 等跳过条件，并在 pass 场景下用 `AppLayerParserSetTransactionInspectId` 推进事务检查位点。
+
+这里必须澄清一处易错点：`SigMatchSignatures` 确实存在于 `src/detect.c` 的 3360 行，但它被 `#if defined(UNITTESTS) || defined(FUZZ)` 包裹，源码注释明确写着「wrapper for old tests」，函数体只是按 `p->flow` 调用 `DetectFlow` 或 `DetectNoFlow`。也就是说它是单测与 fuzz 的兼容包装，不是稳态检测入口；把 06 册前面几篇沿用的「检测阶段入口是 `SigMatchSignatures`」直接套到本快照会失真，本篇按核实结果写「稳态入口是 `Detect` → `DetectFlow`/`DetectNoFlow` → `DetectRun`」，并保留这一差异说明。
+
+第二个概念是 inspection buffer。`src/detect-engine-inspect-buffer.c` 提供 `SCInspectionBufferGet`、`InspectionBufferSetup`、`SCInspectionBufferSetupAndApplyTransforms`、`InspectionBufferApplyTransforms`、`InspectionBufferInit`、`InspectionBufferFree`、`SCInspectionBufferCheckAndExpand`、`InspectionBufferMultipleForListGet` 等函数；每个 sticky buffer 由注册在 `src/detect-engine.c` 的 inspection engine（`AppendStreamInspectEngine`、`AppendFrameInspectEngine`、`AppendPacketInspectEngine`、`AppendAppInspectEngine`）按需生成数据，`Deferred` 到 `InspectionBuffer` 后再交由内容检查。`src/detect-engine-content-inspection.c` 的 `DetectEngineContentInspection` 与 `DetectEngineContentInspectionBuffer` 是 content 类关键字的核心求值函数，内部由 `DetectEngineContentInspectionInternal` 处理相对位置、否定、`nocase` 与 `isdataat` 等语义。
+
+第三个概念是编译期与运行期的分工。`src/detect-engine-build.c` 的 `SigMatchPrepare` 在编译末期把每条 `Signature` 的 `smlists` 用 `SigMatchList2DataArray` 压成运行期数组 `sm_arrays`，并调用 `DetectEngineAppInspectionEngine2Signature` 与 `DetectEnginePktInspectionSetup` 挂好 inspection engine，随后释放 `init_data`。因此稳态求值面对的是紧凑数组与函数指针，不再遍历链表、不再解析文本（字段见 05-05）。交叉引用：字段见 05-05、05-06 ｜ 参数见 04-05、04-06 ｜ 原理见 06-06、06-07 ｜ 模块见 07-04。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，不重列字段；06 全册禁止完整结构体字段表，逐字段定义一律到 05。
+
+- `Signature`、`SigMatch`、`SigMatchData`、`DetectEngineCtx`、`DetectEngineThreadCtx`：`src/detect.h`、`src/detect-engine*.c`、`src/detect.c`；`smlists` 与 `sm_arrays` 的区别见 05-05（字段见 05-05）。
+- `SigGroupHead`、`PrefilterRuleStore`、`RuleMatchCandidateTx`：`src/detect-engine-siggroup.c`、`src/detect-engine-prefilter.c`、`src/util-prefilter.c`（字段见 05-06）。
+- `InspectionBuffer` 与多实例 buffer：`src/detect-engine-inspect-buffer.c`、`src/detect-engine.c` 的 `DetectBufferTypeRegister`、`DetectEngineBufferTypeRegister`、`DetectBufferTypeSupportsMpm` 等注册接口（字段见 05-05、05-06）。
+- `Packet`、`PacketAlert`、`Flow`：`src/decode.h`、`src/flow.h`，检测阶段读取地址、方向、flow 状态与告警数组（字段见 05-02、05-03）。
+- `AppLayerParserState` 与事务：`src/app-layer-parser.c`、`src/app-layer-parser.h`，`DetectRunTx` 通过它遍历事务与 Frame（字段见 05-04）。
+
+文件落点整理如下：稳态入口与分派在 `src/detect.c`；编译末期数组化在 `src/detect-engine-build.c` 的 `SigMatchPrepare`；内容检查在 `src/detect-engine-content-inspection.c`；buffer 供给在 `src/detect-engine-inspect-buffer.c` 与 `src/detect-engine.c`；payload 与包体检查在 `src/detect-engine-payload.c`；应用层状态检测在 `src/detect-engine-state.c`；告警排队在 `src/detect-engine-alert.c`；关键字注册在 `src/detect-engine-register.c`；规则关键字实现分布在 `src/detect-content.c`、`src/detect-pcre.c`、`src/detect-bytetest.c`、`src/detect-bytejump.c`、`src/detect-byte-extract.c`、`src/detect-flow.c` 等文件。交叉引用：字段见 05-02、05-03、05-04、05-05、05-06 ｜ 参数见 04-05、04-06 ｜ 模块见 07-04、07-03。
+
+### 4. 关键流程与调用链
+
+稳态单包旅程从 `Detect` 开始。`Detect` 确认 `det_ctx` 有效、处理多租户切换后，按 `p->flow` 调用 `DetectFlow` 或 `DetectNoFlow`；`DetectFlow` 检查 `FLOW_ACTION_DROP` 与 `PKT_NOPACKET_INSPECTION`，必要时跳过检测并推进事务检查位点，其余情况进入 `DetectRun`（定义于 `src/detect.c` 105 行）。`DetectRun` 先通过 `SigMatchSignaturesGetSgh`（293 行声明）依据协议、方向、端口取出本包适用的 `SigGroupHead`，再执行 `DetectRunInspectIPOnly`（500 行）处理 IP-only 规则，随后调用预过滤与逐条 inspection。
+
+逐条求值分几条支路。`DetectRunTx`（2614 行）遍历应用层事务，经 `DetectRunTxInspectRule`（1359 行）为每条候选规则取出相应 `InspectionBuffer`；`DetectRunFrames`（3034 行）处理 Frame；`DetectEnginePktInspectionRun`（`src/detect-engine.c` 1999 行）处理包体检查；`DetectEngineInspectRulePacketMatches` 与 `DetectEngineInspectRulePayloadMatches` 分别处理包头与 payload 类匹配。每个 buffer 由 `SCInspectionBufferSetupAndApplyTransforms` 供给数据并应用 `transform`，再由 `DetectEngineContentInspection` 或 `DetectEngineContentInspectionBuffer` 对 `sm_arrays` 中的 `content`、`pcre`、`byte_test`、`byte_jump`、`isdataat` 等 `SigMatchData` 顺序求值；`DetectContentInspectionMatchOnAbsentBuffer` 处理 buffer 缺失时的否定语义。这里的关键是「先 buffer 后检查」：sticky buffer 决定了数据从哪来，`content` 等关键字只在这块数据上匹配。
+
+全部关键字通过后进入后匹配与动作判定。`DetectRunPostMatch`（263 行）处理 `flowbits:set`、`tag`、`threshold`、`detection_filter` 等需要「匹配完成后才生效」的关键字与告警排队；`DetectRunApplyPacketPolicy`（703 行）与 `DetectRulePacketAppendAlert`（754 行）参与动作与告警追加；`DetectRunCleanup`（1203 行）复位每包临时状态，`DetectByteValuesClear`（1180 行）清理 byte 关键字的运行时变量。`alert`、`pass`、`drop` 的最终判定在这一段收束，并由 `src/detect-engine-alert.c` 与输出模块把事件交给 EVE（原理见 06-11、06-12）。完整求值顺序与 buffer 落点见图 06-08-01。
+
+:::figure id=06-08-01 | name=检测求值与 inspection buffer 顺序 | dir=TD
+node d1 "Detect()<br/>TmModule Func" blue
+node d2 "DetectFlow/NoFlow<br/>流与 drop 检查" teal
+node d3 "DetectRun<br/>取 sgh 与候选" purple
+node d4 "IPOnly / 预过滤<br/>候选缩减" purple
+node d5 "InspectionBuffer<br/>payload/stream/tx" teal
+node d6 "ContentInspection<br/>SigMatch 求值" purple
+node d7 "PostMatch<br/>flowbits/tag/阈值" amber
+node d8 "告警排队<br/>alert/pass/drop" green
+edge d1 -> d2 "Packet 入检测"
+edge d2 -> d3 "DetectRun"
+edge d3 -> d4 "sgh 选择"
+edge d4 -> d5 "按 buffer 取数据"
+edge d5 -> d6 "InspectionBuffer"
+edge d6 -> d7 "匹配完成"
+edge d7 -> d8 "动作判定"
+edge d4 -> d6 dashed "无 buffer 关键字"
+:::
+
+图 06-08-01 中虚线表示一类捷径：不含 sticky buffer、只带纯 payload 或包头关键字的规则，可以直接走 `DetectEngineInspectRulePayloadMatches` 一类的检查，而无需为每个应用层 buffer 生成 `InspectionBuffer`。这条捷径与 `SigGroupBuild` 阶段的 `SignatureIsIPOnly`、`SignatureIsInspectingPayload`、`SignatureIsDEOnly` 分类相呼应，后者决定签名被分进哪类 sgh、走哪条检查支路。
+
+顺着这条编译与运行的界线再往下看，编译产物的组织方式决定了求值的粒度。`SigMatchPrepare` 按 `DETECT_SM_LIST_MAX` 逐个 list 调用 `SigMatchList2DataArray`，把链表形式的 `SigMatch` 压成连续 `SigMatchData` 数组存进 `s->sm_arrays[type]`；`DetectEngineAppInspectionEngine2Signature` 为签名挑选应用层 inspection engine，`DetectEnginePktInspectionSetup` 处理包体 engine，二者把「该去哪个 buffer 取数据」的函数指针固化到签名上。`src/detect-engine.c` 的 `DetectBufferTypeRegister`、`DetectEngineBufferTypeRegister`、`DetectBufferTypeSupportsMpm`、`DetectBufferTypeSupportsPacket`、`DetectBufferTypeSupportsFrames`、`DetectBufferTypeSupportsTransformations`、`DetectBufferTypeSetDescriptionByName`、`DetectBufferTypeSetRunAlways` 一族在注册期给每个 buffer 打上能力标记，`DetectBufferTypeGetByName` 与 `DetectEngineBufferTypeGetNameById` 负责名字与 id 互查，`DetectBufferIsPresent` 判断某签名是否用到某 buffer，`DetectEngineBufferRunValidateCallback` 与 `DetectBufferTypeRegisterValidateCallback` 在编译期做合法性校验。也就是说，一个 sticky buffer 能不能参与 MPM、能不能带 transform、能不能作用于 frame，都是注册期就定好的静态属性，运行期只按这些属性走分支，不再做动态推断。
+
+事务级求值的候选管理另有一套结构。`src/detect.c` 的 `RuleMatchCandidateTxArrayInit`、`RuleMatchCandidateTxArrayExpand`、`RuleMatchCandidateTxArrayFree` 负责 `RuleMatchCandidateTx` 数组的初始分配、按需扩容与释放，`DetectRunTxSortHelper` 与 `SortHelper` 按事务 id 与规则优先级排序，`IsOnlyTxInDirection` 判断某事务是否只在一个方向可见，`DetectGetInnerTx` 处理隧道或嵌套协议下的内层事务，`DetectRunTxClearInspected` 与 `DetectRunTxInspectRule` 配合避免同一事务被重复检查。后匹配收尾同样不能忽略：`DetectRunCleanup` 复位每包的 `det_ctx` 临时状态，`DetectByteValuesClear` 清掉 `byte_extract` 一类关键字写入的运行时变量，`DetectRunAppendDefaultAccept` 与 `DetectRunTxFirewallApplyAccept` 在防火墙模式下补齐默认接受动作，`DetectFwBuildLteCoverage`、`DetectFwRetireLteRule`、`DetectTxFirewallNoRulesApplyPolicies` 处理策略覆盖。这些函数说明检测线程上下文是严格逐包复用的：任何「忘了复位」的临时状态都会污染下一个包，因此阅读这段代码时要把「初始化、求值、复位」三段当作一个闭环，而不是只看中间的匹配逻辑。
+
+还有两类求值入口要与上面的主线区分开。`src/detect-engine.c` 的 `DetectEnginePktInspectionRun` 与 `DetectEngineInspectRulePacketMatches`、`DetectEngineInspectRulePayloadMatches` 处理不依赖应用层事务的包头与 payload 检查，`AppendStreamInspectEngine`、`AppendFrameInspectEngine`、`AppendPacketInspectEngine`、`AppendAppInspectEngine` 则是在注册期把这四类 engine 追加到 `de_ctx` 的列表里；`DetectEngineFrameInspectEngineRegister` 与 `DetectFrameInspectEngineCopyListToDetectCtx` 负责 frame 引擎的注册与拷贝。buffer 数据就绪后，`SCInspectionBufferSetupAndApplyTransforms` 会先调用 `InspectionBufferApplyTransforms` 应用 `transform`，`InspectionBufferMultipleForListGet` 处理多实例 buffer，`SCInspectionBufferCheckAndExpand` 在缓冲不足时扩容，`SCInspectionBufferTruncate` 截断到有效长度，`SCInspectionBufferInPlace` 判断是否为零拷贝视图，`InspectionBufferCopy` 做显式拷贝，`InspectionBufferClean` 在每个包结束时复位。`DetectContentInspectionMatchOnAbsentBuffer` 则定义了 buffer 缺失时否定型关键字的语义：buffer 不存在不等于匹配失败，要看关键字是否显式声明了「可作用于缺失 buffer」。把这几类入口记清楚，才能解释为什么同一条 `content` 在 payload、stream、app-layer、frame 四种 buffer 下的匹配结果可能完全不同。
+
+### 5. 配置/命令/代码实例
+
+本节只给最小必要实例，并显式指向权威源：规则关键字全集与 `suricata.yaml` 检测段见 04 全册（参数见 04-02、04-05、04-06），此处不重列参数全集。下面先给稳态入口的真实调用摘录，据此可核对 `Detect` 与单测包装 `SigMatchSignatures` 的区别。
+
+```c
+/* Detect 稳态入口与分派摘录，见 src/detect.c */
+TmEcode Detect(ThreadVars *tv, Packet *p, void *data)
+{
+    DetectEngineThreadCtx *det_ctx = (DetectEngineThreadCtx *)data;
+    if (det_ctx == NULL) {
+        goto error;
+    }
+    DetectEngineCtx *de_ctx = det_ctx->de_ctx;
+    if (p->flow) {
+        DetectFlow(tv, de_ctx, det_ctx, p);
+    } else {
+        DetectNoFlow(tv, de_ctx, det_ctx, p);
+    }
+    return TM_ECODE_OK;
+error:
+    return TM_ECODE_FAILED;
+}
+
+/* 单测兼容包装，仅在 UNITTESTS 或 FUZZ 下编译 */
+#if defined(UNITTESTS) || defined(FUZZ)
+void SigMatchSignatures(
+        ThreadVars *tv, DetectEngineCtx *de_ctx, DetectEngineThreadCtx *det_ctx, Packet *p)
+{
+    if (p->flow) {
+        DetectFlow(tv, de_ctx, det_ctx, p);
+    } else {
+        DetectNoFlow(tv, de_ctx, det_ctx, p);
+    }
+}
+#endif
+```
+
+求值各阶段的源码落点、关键函数与主要失败表现见下表，便于按「无告警」反查。
+
+| 阶段 | 源码入口 | 关键函数 | 失败表现 |
+|---|---|---|---|
+| 入口分派 | `src/detect.c` | `Detect`、`DetectFlow`、`DetectNoFlow` | 无 det_ctx、流被提前跳过 |
+| sgh 选取 | `src/detect.c` | `SigMatchSignaturesGetSgh`、`DetectRunInspectIPOnly` | 端口/方向不匹配导致无 sgh |
+| 预过滤候选 | `src/detect-engine-prefilter.c` | `Prefilter`、`DetectRunPrefilterTx` | 候选集恒空 |
+| buffer 供给 | `src/detect-engine-inspect-buffer.c` | `SCInspectionBufferGet`、`InspectionBufferSetup` | 协议未识别、buffer 为空 |
+| 内容求值 | `src/detect-engine-content-inspection.c` | `DetectEngineContentInspection` | 相对位置、否定或 nocase 不符 |
+| 后匹配 | `src/detect.c` | `DetectRunPostMatch`、`DetectRunApplyPacketPolicy` | flowbits 未置位、阈值抑制 |
+| 告警与输出 | `src/detect-engine-alert.c` | 告警排队与动作判定 | 输出开关未开、事件未落盘 |
+
+下面是一组按「前置检查 → 执行 → 验证输出 → 清理」组织的完整闭环命令，用一条最小规则验证求值链是否贯通。
+
+```bash
+# 前置检查：把最小规则写入独立文件并确认内容
+printf '%s\n' 'alert tcp any any -> any any (msg:"PIPELINE CHECK"; content:"SURICATA-TEST"; sid:9900001; rev:1;)' > /tmp/pipeline.rules
+suricata -T -c /etc/suricata/suricata.yaml -S /tmp/pipeline.rules
+
+# 执行：以离线 pcap 回放触发一次检测，避免依赖在线网卡
+suricata -c /etc/suricata/suricata.yaml -S /tmp/pipeline.rules -r /tmp/test.pcap -l /var/log/suricata/
+
+# 验证输出：查看告警事件与检测计数
+grep -n "PIPELINE CHECK" /var/log/suricata/eve.json
+grep -n "detect.alert" /var/log/suricata/stats.log | tail -n 2
+
+# 清理：移除临时规则与回放产物
+rm -f /tmp/pipeline.rules /tmp/test.pcap /var/log/suricata/eve.json.check
+```
+
+典型输出如下（示例输出，具体格式需对照实际版本核验）。
+
+```text
+# 示例输出，具体格式需对照实际版本核验
+<Notice> - Configuration provided was successfully loaded. Exiting.
+<Info> - 1 rule files processed. 1 rules successfully loaded, 0 rules failed, 0 rules skipped
+{"event_type":"alert","src_ip":"192.0.2.10","dest_ip":"198.51.100.20","alert":{"signature":"PIPELINE CHECK","signature_id":9900001}}
+detect.alert                              | Total                     | 1
+decoder.pkts                              | Total                     | 842
+```
+
+逐行判读如下。第一行是 `suricata -T` 的成功回显，只证明规则能被解析并完成 `SigGroupBuild` 编译，不代表检测会命中。第二行是加载汇总，failed 与 skipped 均为零，说明这条最小规则已进入 `de_ctx->sig_list`；若 failed 非零，应回到 06-06 的解析链查关键字与语法。第三行是 `eve.json` 的一条 `alert` 事件，`event_type` 标明类型，`src_ip` 与 `dest_ip` 标明双向地址，`alert.signature` 与 `signature_id` 标明命中规则；它能出现，说明 `Detect` → `DetectFlow`/`DetectNoFlow` → `DetectRun` → sgh 选取 → 预过滤 → buffer 供给 → `DetectEngineContentInspection` → `DetectRunPostMatch` 整条链路全部走通，且 `outputs` 里对应事件类型已开启（参数见 04-04）。第四行 `detect.alert` 是累计告警数，正常值为 1，若为 0 而第三行却有事件，多半是 `stats.log` 采样窗口或计数项名称差异，需对照实际版本核验；若两处都无告警而 `decoder.pkts` 正常，按图 06-08-01 从前向后查 `HOME_NET`、`flow` 方向、sticky buffer 可见性与输出开关。第五行 `decoder.pkts` 为解码包数，正常值随 pcap 大小增长，它增长而 `detect.alert` 不动，说明问题落在检测段而非抓包与解码段，这类区分是 06 全册排障的共同方法。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是顺序颠倒。检测发生在解码、流绑定、重组与应用解析之后，把带 `http.uri`、`file.data`、`tls.sni` 等 sticky buffer 的规则套到尚未解析的原始帧上，或把 `content` 默认作用对象误认为整个 `Packet`，都会得到稳定漏报（原理见 06-05、06-10）。第二个陷阱是把 MPM 命中当规则命中：预过滤只产出候选，`distance`、`within`、`pcre`、`byte_test`、`flowbits` 仍在逐条 inspection 中求值，把候选计数当告警计数是概念错误（原理见 06-07）。第三个陷阱是把 `SigMatchSignatures` 当稳态入口：本快照里它只在 `UNITTESTS` 或 `FUZZ` 下编译，是单测包装，真实入口是 `Detect`，阅读源码或引用调用链时务必区分。
+
+配置层面有几处高频问题。`FLOW_ACTION_DROP`、`PKT_NOPACKET_INSPECTION`、`FLOW_ACTION_PASS` 会让 `DetectFlow` 提前返回，IPS 场景里 drop 不生效时要连同 `stream.inline`、NFQUEUE 队列号与 fail-open 一起查（原理见 06-12，案例见 08-04）。`HOME_NET` 与规则方向写反、端口组不匹配，会让 `SigMatchSignaturesGetSgh` 取不到覆盖该包的 sgh，表现为「规则加载成功但永不命中」。`flowbits:isset` 一类后置关键字依赖 `DetectRunPostMatch` 之前的置位规则，规则排序由 `SCSigOrderSignatures` 保证，手写规则不能绕过这一语义（原理见 06-09）。加密载荷明文不可见，HTTPS 请求里的 `content` 不命中属于可见性边界，不是求值缺陷。
+
+最佳实践是建立「分段计数 + 最小复现」习惯：用 `suricata -T` 验编译、用离线 pcap 加单条最小规则验求值、用 `stats.log` 的 `decoder`、`flow`、`detect` 分段计数确认断点（计数项名称需对照实际版本核验），配合 `suricatasc dump-counters` 做即时快照。写规则时显式声明 sticky buffer、避免过短的 `content`、谨慎组合 `distance`/`within` 与 `pcre`；任何吞吐、每包 inspection 次数、内存占用结论一律标注「需在目标机型实测」，不给绝对值（基准见 08-01、调优见 08-02）。规则语法兼容 Snort 但有自有扩展，不能宣称百分之百兼容；`suricata-update` 为独立工具，不参与主程序编译。按目录查模块可跳到 07-03、07-04。
+
+### 7. 小结与延伸阅读
+
+本篇给出一条主线、两个权威源、三类边界。一条主线是「`Detect` → `DetectFlow`/`DetectNoFlow` → `DetectRun` → sgh 选取与 IP-only → 预过滤候选 → inspection buffer 供给 → `DetectEngineContentInspection` 逐条求值 → `DetectRunPostMatch` 后匹配 → `alert`/`pass`/`drop` 判定」，其中 `SigMatchSignatures` 仅为单测兼容包装而非稳态入口，这一差异按本快照如实写明。两个权威源是：结构体逐字段看 05，配置与命令参数看 04；本篇只负责机制与调用链。三类边界是：Suricata 不做转发、不是防火墙；加密载荷明文不可见；规则语法兼容 Snort 但非完全一致。
+
+延伸阅读按链路向前后推进：规则编译见 06-06，MPM 与预过滤见 06-07，阈值与 `flowbits`/`xbits` 有状态关键字见 06-09，文件检测见 06-10，EVE 输出与事件聚合见 06-11，IPS verdict 见 06-12，runmode 与线程瓶颈见 06-13。按目录查模块能力可跳到 07-03（app-layer）、07-04（detect）、07-05（util-mpm）、07-08（stream-tcp）；按字段查结构可跳到 05-02、05-03、05-04、05-05、05-06；按参数查规则关键字与配置可跳到 04-05、04-06、04-02。统一交叉引用写法：字段见 05-05、05-06 ｜ 参数见 04-05、04-06 ｜ 原理见 06-06、06-07、06-09 ｜ 模块见 07-04。版本基准始终为「上游 main 快照（2026-11 抓取）」，未核实的具体字段名、函数签名与配置键名均已标注「需对照实际版本核验」。
+
+## 06-09 阈值、抑制、flowbits/xbits 与有状态关键字
+
+### 1. 背景与动机
+
+前面三篇讲的都是「单个包、单条规则」的判定：规则被解析编译、MPM 缩小候选、逐条 inspection 求值。但真实规则集里有一整类关键字天生跨越了这个边界。一条规则可能要求「同一来源在六十秒内命中五次才告警」，另一条规则可能要求「先由规则甲给这条流置一个标记，再由规则乙检查该标记」。前者是阈值与抑制，后者是 `flowbits`、`xbits` 一类有状态关键字。它们让检测引擎从「无状态匹配」升级为「带记忆的判定」，也把规则之间的顺序、共享存储的作用域、过期与清理一并拉进设计范围，复杂度明显高于普通 `content`。
+
+必须先立住边界。Suricata 是 IDS / IPS / NSM 引擎，不是防火墙，不做 IP 转发，也不做路由；阈值与抑制只影响「是否生成告警」，不改变包是否通过、也不参与 verdict，内联 drop 仍依靠 NFQUEUE 或 AF_PACKET 桥接（原理见 06-12）。`threshold.config` 这类规则集配套文件的下载与合并由独立的 `suricata-update` 工具负责，该工具与内核主程序分仓、独立发版，不参与 `src/` 主程序编译，不能写成内建子命令（模块见 07-11）。规则语法兼容 Snort 但有自有扩展，不能宣称百分之百兼容。本套资料版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验；性能与容量类结论一律标注「需在目标机型实测」。
+
+从工程价值看，理解有状态机制有三个收益。其一是正确性：`flowbits:isset` 永远不命中时，根因常常不是匹配逻辑，而是置位规则与检查规则在 `SCSigOrderSignatures` 排序中被错开，或两者根本不在同一个共享作用域。其二是告警质量：`threshold`、`detection_filter`、`suppress` 用得当能压掉风暴式重复告警，用得不当会把真实攻击一并抑制，且现象与「规则不命中」几乎一样。其三是资源：阈值哈希表、`flowbits` 变量名存储、`xbits` 跨流表、`dataset` 大表都是内存与 CPU 的消费者，任何容量、内存、吞吐数字一律标注「需在目标机型实测」，不给绝对值。本篇所有函数名与路径均以 `upstream_src/suricata/suricata-main/` 下真实文件为锚点。
+
+### 2. 核心概念
+
+先区分三个容易混用的词。`threshold` 是规则内关键字，由 `src/detect-threshold.c` 的 `DetectThresholdRegister` 注册，控制「多少时间内、按哪个维度、累计多少次才产生一条告警」；`detection_filter` 是同源的速率型变体，语义是「超过速率才告警」；`suppress` 是抑制，按源、目的或规则直接压掉告警。三者都由 `src/detect-engine-threshold.c` 在运行期支撑，核心是 `ThresholdCache` 与 `ThresholdEntry`：`SetupCache`、`CheckCache`、`ThresholdEntrySet`、`ThresholdDistinctInit`、`ThresholdEntryExpire`、`ThresholdCacheExpire`、`ThresholdsExpire` 分别负责建缓存、查计数、写条目、按维度初始化、过期与全局回收，`ThresholdCacheThreadInit` 为每个检测线程准备私有缓存，`ThresholdInit`、`ThresholdDestroy`、`ThresholdRegisterGlobalCounters` 管全局生命周期（字段见 05-05、05-06）。
+
+第二类是有状态变量。`flowbits` 的作用域是「同一条 Flow」，命令包含 `set`、`isset`、`toggle`、`unset`、`isnotset`，`src/detect-flowbits.c` 里对应 `DetectFlowbitMatchSet`、`DetectFlowbitMatchIsset`、`DetectFlowbitMatchUnset`、`DetectFlowbitMatchIsnotset`，统一入口是 `DetectFlowbitMatch`，解析与校验由 `DetectFlowbitSetup`、`DetectFlowbitParse`、`DetectFlowbitValidate` 承担，`DetectFlowbitsAnalyze` 与 `DetectFlowbitsAnalyzeSignature` 做规则集层面的变量分析。`xbits` 则把作用域扩展到跨流与跨主机，`src/detect-xbits.c` 提供 `DetectXbitMatch`、`DetectXbitTxMatch`、`DetectXbitMatchIPPair`、`DetectIPPairbitMatchSet`、`DetectIPPairbitMatchUnset`、`DetectIPPairbitMatchToggle`、`DetectIPPairbitMatchIsset`、`DetectIPPairbitMatchIsnotset`，并支持 `expire` 过期；`hostbits`、`ippairbits` 是其按主机、按地址对的具体形态。变量名统一经 `VarNameStore` 注册，`SigGroupBuild` 末尾在未启用多租户时调用 `VarNameStoreActivate` 把名字表冻结为只读。
+
+第三类是旁支机制。`tag` 由 `src/detect-engine-tag.c` 的 `TagInitCtx`、`TagDestroyCtx`、`TagFlowAdd`、`TagHashAddTag`、`TagHandlePacket`、`TagHandlePacketFlow`、`TagHandlePacketHost`、`TagTimeoutCheck`、`TagHostHasTag` 支撑，作用在「命中后继续标记并跟踪后续包或会话」。`dataset` 与 `datarep` 由 `src/detect-dataset.c`、`src/detect-datarep.c` 实现，`DetectDatasetSetup`、`DetectDatasetBufferMatch`、`DatasetLookupSubdomain`、`SetupLoadPath`、`SetupSavePath` 支撑大表查询与加载保存。所有这些关键字都在 `src/detect-engine-register.c` 里注册，分别对应 `DetectThresholdRegister`、`DetectFlowbitsRegister`、`DetectXbitsRegister`、`DetectDatasetRegister`、`DetectDatarepRegister`。交叉引用：字段见 05-03、05-05、05-06 ｜ 参数见 04-06、04-02 ｜ 原理见 06-06、06-08 ｜ 模块见 07-02、07-04。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，不重列字段；06 全册禁止完整结构体字段表，逐字段定义一律到 05。
+
+- `DetectThresholdData`、`ThresholdEntry`、`ThresholdCacheItem`、`ThresholdCacheThreadCtx`、`struct Thresholds`：`src/detect-engine-threshold.c`、`src/detect-threshold.c`（字段见 05-05、05-06）。
+- `DetectFlowbitsData`、`DetectXbitsData`、`FlowBit`、`XBit` 及变量容器：`src/detect-flowbits.c`、`src/detect-xbits.c`、`src/flow-bit.c`、`src/flow-var.c`、`src/util-var-name.c` 一类基础设施（具体文件名需对照实际版本核验；字段见 05-03、05-06）。
+- `Flow`、`Host`、`IPPair` 与各自存储 API：`src/flow.h`、`src/flow-storage.c`、`src/host.c`、`src/ippair.c`（字段见 05-03）。
+- `DetectTagDataEntry` 与 tag 上下文：`src/detect-engine-tag.c`（字段见 05-05）。
+- `Dataset`、`DatasetItem`：`src/detect-dataset.c`、`src/util-dataset.c` 一类文件（具体路径需对照实际版本核验；字段见 05-06）。
+
+这里要如实澄清一处路径偏差：任务清单里提到的 `src/util-threshold.c` 在本快照并不存在。阈值与抑制配置的实际加载落在 `src/util-threshold-config.c`，该文件 167 行定义 `SCThresholdConfInitContext`、189 行调用 `SCThresholdConfParseFile`、136 至 146 行读取 `threshold-file` 键、88 与 90 行定义 `THRESHOLD_CONF_DEF_CONF_FILEPATH` 默认路径；`src/detect-engine-threshold.c` 只承担运行期判定，`src/detect-threshold.c` 只承担规则关键字注册。三者职责分明，不可混写。凡快照内无法核实的文件名一律写「需对照实际版本核验」并给出可定位目录。`flow-var`、`pktvar`、`hostbits` 相关的具体存储文件名同样需对照 `src/` 实际版本核验。交叉引用：字段见 05-03、05-05、05-06 ｜ 参数见 04-06 ｜ 模块见 07-02、07-04、07-09。
+
+### 4. 关键流程与调用链
+
+编译期第一环是排序。`src/detect-engine-loader.c` 的 `SigLoadSignatures` 在读取完全部规则后调用 `SCSigRegisterSignatureOrderingFuncs`，随后执行 `src/detect-engine-sigorder.c` 的 `SCSigOrderSignatures`（801 行），再 `SCSigSignatureOrderingModuleCleanup` 收尾。排序器里与本篇直接相关的是 `SCSigOrderByFlowbitsCompare`、`SCSigOrderByFlowvarCompare`、`SCSigOrderByPktvarCompare`、`SCSigOrderByFlowintCompare`、`SCSigOrderByHostbitsCompare`、`SCSigOrderByIPPairbitsCompare`、`SCSigOrderByPriorityCompare`：它们保证「置位规则」排在「检查规则」之前，否则 `flowbits:isset`、`xbits:isset` 会在同流或同主机的后续包上永远读不到标记。紧接着 `SCThresholdConfInitContext` 读取 `threshold-file` 指定的抑制与阈值配置，把条目挂进 `de_ctx`，然后才进入 `SigGroupBuild`。这条顺序说明：有状态依赖是在编译期被静态分析并固定的，不是运行期碰运气。
+
+运行期第一环是阈值与抑制。`src/detect.c` 的 `DetectRunPostMatch` 在一条规则的所有 `SigMatch` 求值通过之后才处理 `threshold`、`detection_filter`、`suppress` 与告警排队；`src/detect-engine-threshold.c` 的 `SetupCache` 与 `CheckCache` 依据 `track by_src` 或 `track by_dst` 取出对应 `ThresholdEntry`，`ThresholdDistinctInit` 处理 `distinct` 型维度，`ThresholdEntryExpire` 与 `ThresholdCacheExpire` 负责时间窗到期，`ThresholdsExpire` 做全局回收。关键语义是：阈值判定发生在「匹配成功之后」，它只决定这条命中是否升级为告警，绝不否定匹配本身，也不影响包是否被放行。因此把抑制后的「无告警」当成「规则不命中」是典型误判。
+
+运行期第二环是有状态变量求值。以 `flowbits` 为例，`DetectFlowbitMatch` 依据命令分派到 `DetectFlowbitMatchSet`、`DetectFlowbitMatchIsset`、`DetectFlowbitMatchUnset`、`DetectFlowbitMatchIsnotset`；`DetectFlowbitIsPostmatch` 判定哪些命令属于后匹配，需要在规则整体匹配后才执行置位，避免「部分匹配就置位」污染状态。`xbits` 侧的 `DetectXbitMatch`、`DetectXbitTxMatch`、`DetectXbitPostMatchTx`、`DetectXbitMatchIPPair` 把同样的语义扩展到事务与地址对作用域。`tag` 由 `TagHandlePacket` 在每个包上驱动 `TagHandlePacketFlow` 与 `TagHandlePacketHost`，`TagTimeoutCheck` 负责过期。整条存储与求值链路见图 06-09-01。
+
+:::figure id=06-09-01 | name=阈值抑制与有状态关键字的存储与求值 | dir=TD
+node t1 "threshold.config<br/>SCThresholdConfInitContext" gray
+node t2 "规则内 threshold<br/>DetectThresholdRegister" amber
+node t3 "ThresholdCache<br/>CheckCache/SetupCache" purple
+node t4 "flowbits<br/>同流跨规则" teal
+node t5 "xbits / hostbits<br/>跨流与主机" teal
+node t6 "规则排序<br/>SCSigOrderSignatures" amber
+node t7 "TagHandlePacket<br/>tag 会话跟踪" green
+node t8 "告警抑制<br/>suppress / rate" red
+edge t1 -> t3 "抑制与阈值项"
+edge t2 -> t3 "规则级阈值"
+edge t3 -> t8 "计数判定"
+edge t4 -> t6 "置位/检查依赖"
+edge t5 -> t6 "置位/检查依赖"
+edge t6 -> t2 "排序后规则链"
+edge t4 -> t7 "flow 状态"
+edge t3 -> t4 dashed "postmatch"
+:::
+
+图 06-09-01 中虚线表示阈值判定与后匹配关键字共用 `DetectRunPostMatch` 时机：`flowbits:set`、`tag` 与 `threshold` 都在「规则已匹配」之后才改变状态或决定是否告警。这也解释了为什么 `SCSigOrderSignatures` 必须把置位规则排在检查规则之前——编译期排序与运行期求值时机共同决定了跨规则状态能否正确传递。
+
+阈值缓存的实现细节也值得一读。`src/detect-engine-threshold.c` 里 `ThresholdEntryHash`、`ThresholdEntryCompare`、`ThresholdCacheTreeCompareFunc`、`ThresholdCacheHashFunc`、`ThresholdCacheHashCompareFunc` 构成两套索引结构，`ThresholdEntrySet` 与 `ThresholdDistinctInit` 分别处理普通计数与 `distinct` 维度，`DumpCacheStats` 与 `ThresholdCacheExpire` 输出统计并回收过期项，`ThresholdForceAllocFail` 是单测用的分配失败注入点，`FlowThresholdEntryListFree` 清理挂在流上的阈值条目。预过滤侧还有一处容易漏掉的联动：`src/detect-flowbits.c` 的 `PrefilterFlowbitIsPrefilterable`、`PrefilterSetupFlowbits`、`PrefilterFlowbitCompare`、`PrefilterFlowbitMatch` 让 `flowbits:isset` 这类检查也能参与预过滤，把「状态不满足」的规则提前从候选集里剔除，而不是等逐条 inspection 才失败。这与 06-07 的 MPM 候选缩减是同一思路的两种形态：一个按内容模式筛，一个按有状态变量筛，二者都服务于「少做无效的完整求值」。
+
+`tag` 与 `dataset` 的生命周期同样要放在这条链里看。`TagInitCtx` 与 `TagDestroyCtx` 建立和释放全局 tag 上下文，命中后 `TagFlowAdd` 或 `TagHashAddTag` 把 `DetectTagDataEntry` 挂到流或主机上，`TagHandlePacketFlow` 与 `TagHandlePacketHost` 在后续每个包上延续标记，`TagHostHasTag` 查询状态，`TagTimeoutCheck` 按时间或包数过期；它不改变规则是否匹配，只扩展「命中之后还跟踪哪些流量」。`dataset` 侧 `DetectDatasetSetup` 解析加载与保存选项后由 `SetupLoadPath`、`SetupSavePath`、`GetDirName` 定位文件，`DatasetLookupSubdomain` 处理子域名型匹配，`DetectDatasetBufferMatch` 与 `DetectDatajsonBufferMatch` 分别在普通 buffer 与 JSON buffer 上查询，`DetectDatasetFree` 负责释放；大表在编译期一次性加载，路径权限与内存占用都要在上线清单里确认（加固见 08-05，参数见 04-06）。
+
+### 5. 配置/命令/代码实例
+
+本节只给最小必要实例，并显式指向权威源：规则关键字全集、`threshold.config` 语法与 `suricata.yaml` 相关段见 04 全册（参数见 04-02、04-06、04-07），此处不重列参数全集。下面先给一条规则片段与配套抑制配置，用来说明「置位规则、检查规则、阈值、抑制」四者如何组合。
+
+```text
+# 置位规则：同流内先标记，供检查规则读取
+alert http any any -> any any (msg:"FLOWBIT SET"; flow:established,to_server; flowbits:set,sc.seen; flowbits:noalert; sid:9900010; rev:1;)
+# 检查规则：读到标记才可能告警，并用 threshold 压掉重复
+alert http any any -> any any (msg:"FLOWBIT CHECK"; flow:established,to_server; flowbits:isset,sc.seen; content:"GET"; threshold:type limit, track by_src, count 1, seconds 60; sid:9900011; rev:1;)
+# threshold.config 抑制：按源直接压掉某条规则
+suppress gen_id 1, sig_id 9900011, track by_src, ip 192.0.2.0/24
+```
+
+关键实现入口摘录如下，函数名与路径均按本快照真实文件书写。
+
+```c
+/* 有状态关键字实现入口摘录 */
+/* src/detect-engine-sigorder.c */
+int SCSigOrderSignatures(DetectEngineCtx *de_ctx);
+/* src/util-threshold-config.c */
+int SCThresholdConfInitContext(DetectEngineCtx *de_ctx);
+/* src/detect-engine-threshold.c */
+void ThresholdInit(void);
+int ThresholdCacheThreadInit(DetectEngineThreadCtx *det_ctx);
+/* src/detect-flowbits.c */
+void DetectFlowbitsRegister(void);
+int DetectFlowbitMatch(DetectEngineThreadCtx *, Packet *, const Signature *, const SigMatchCtx *);
+static int DetectFlowbitMatchSet(Packet *p, const DetectFlowbitsData *fd);
+static int DetectFlowbitMatchIsset(Packet *p, const DetectFlowbitsData *fd);
+/* src/detect-xbits.c */
+void DetectXbitsRegister(void);
+static int DetectXbitMatch(DetectEngineThreadCtx *, Packet *, const Signature *, const SigMatchCtx *);
+/* src/detect-engine-tag.c */
+void TagHandlePacket(const DetectEngineCtx *, DetectEngineThreadCtx *, Packet *p);
+```
+
+阈值与状态机制各环节的源码落点、关键函数与主要失败表现见下表。
+
+| 环节 | 源码入口 | 关键函数 | 失败表现 |
+|---|---|---|---|
+| 规则排序 | `src/detect-engine-sigorder.c` | `SCSigOrderSignatures` | 置位晚于检查、isset 恒假 |
+| 抑制配置加载 | `src/util-threshold-config.c` | `SCThresholdConfInitContext` | threshold-file 不可读、语法错 |
+| 运行期阈值 | `src/detect-engine-threshold.c` | `SetupCache`、`CheckCache`、`ThresholdsExpire` | 告警被抑制、计数不重置 |
+| flowbits | `src/detect-flowbits.c` | `DetectFlowbitMatch`、`DetectFlowbitsAnalyze` | 变量未注册、跨流读取 |
+| xbits / hostbits | `src/detect-xbits.c` | `DetectXbitMatch`、`DetectXbitTxMatch` | 作用域错、expire 过早 |
+| tag 跟踪 | `src/detect-engine-tag.c` | `TagHandlePacket`、`TagTimeoutCheck` | 标记不延续、过期异常 |
+| dataset 大表 | `src/detect-dataset.c` | `DetectDatasetSetup`、`DetectDatasetBufferMatch` | 加载路径错、内存膨胀 |
+
+下面是一组按「前置检查 → 执行 → 验证输出 → 清理」组织的完整闭环命令，用于确认抑制配置与有状态规则能否正确编译。
+
+```bash
+# 前置检查：确认阈值配置路径已生效
+suricata --dump-config | grep -n "threshold-file"
+
+# 执行：把抑制配置与规则一并做编译自检
+printf '%s\n' 'suppress gen_id 1, sig_id 9900011, track by_src, ip 192.0.2.0/24' > /tmp/threshold.config
+suricata -T -c /etc/suricata/suricata.yaml -S /tmp/stateful.rules --set threshold-file=/tmp/threshold.config -l /var/log/suricata/
+
+# 验证输出：确认阈值条目与变量分析结果
+grep -nE "threshold|flowbits|VarNameStore|rules failed" /var/log/suricata/suricata.log | tail -n 10
+
+# 清理：移除本次临时配置与规则副本
+rm -f /tmp/threshold.config /tmp/stateful.rules
+```
+
+典型输出如下（示例输出，具体格式需对照实际版本核验）。
+
+```text
+# 示例输出，具体格式需对照实际版本核验
+<Notice> - Configuration provided was successfully loaded. Exiting.
+<Info> - 1 rule files processed. 2 rules successfully loaded, 0 rules failed, 0 rules skipped
+<Info> - SCThresholdConfInitContext: loaded 1 suppress entry from threshold.config
+<Info> - DetectFlowbitsAnalyze: 1 flowbit variable registered in VarNameStore
+<Warning> - flowbits: rule sid 9900011 checks sc.seen without a setting rule in the same direction
+<Info> - SigGroupBuild: 2 signature group heads built, 2 MPM contexts prepared
+```
+
+逐行判读如下。第一行是 `suricata -T` 的成功回显，只证明配置与规则完成编译，不代表在线会告警。第二行是加载汇总，failed 与 skipped 均为零，说明置位与检查两条规则都进入了 `de_ctx->sig_list`；若 failed 非零，先按 04-06 的规则关键字语法排查，而不是去看收包。第三行是 `SCThresholdConfInitContext` 的加载结果，`loaded 1 suppress entry` 与写入的抑制条目数一致；计数为零说明 `threshold-file` 未生效或路径写错，需对照 `src/util-threshold-config.c` 的键名与 `--set` 覆盖语法核验（参数见 04-07）。第四行是 `DetectFlowbitsAnalyze` 的变量注册结果，`VarNameStore` 中登记的变量数应与规则里用到的变量名数相当；变量未注册时 `flowbits:isset` 会恒假。第五行是本例最值得关注的警告，特征文本是 `checks ... without a setting rule`：它提示检查规则找不到同方向的置位规则，正是 `SCSigOrderSignatures` 与 `DetectFlowbitsAnalyze` 在编译期给出的依赖分析；出现时应补置位规则或修正 `flow` 方向，否则在线会稳定漏报，这类警告必须与「规则不命中」区分开。第六行是分组编译汇总，sgh 与 `MpmCtx` 数量随规则集变化，具体统计项名称需对照实际版本核验；所有计数、内存与告警率结论一律标注「需在目标机型实测」。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把抑制当成漏报。`threshold`、`detection_filter`、`suppress` 都在 `DetectRunPostMatch` 阶段作用于「已经匹配成功」的命中，只压告警、不否定匹配；`eve.json` 里看不到 `alert` 时，应先查 `threshold.config` 与规则内 `threshold`，再怀疑规则本身。第二个陷阱是 `flowbits` 作用域错配。`flowbits` 只在同一条 `Flow` 内有效，跨连接、跨主机要用 `xbits` 的 `by_host`、`by_both` 形态并配 `expire`；把 `flowbits:isset` 用到新连接上必然恒假。第三个陷阱是忽略排序依赖。置位规则必须排在检查规则之前，这由 `SCSigOrderSignatures` 在编译期保证；手写规则时若用 `flowbits:noalert` 让置位规则不告警，又忘了设 `flow:established` 方向，依赖分析会给出警告，不能视而不见。
+
+配置层面有几处高频问题。`threshold-file` 路径写错或格式非法时，`SCThresholdConfInitContext` 返回负值，`SigLoadSignatures` 直接跳到 `end`，表现为规则集整体未就绪；注意该逻辑在 `src/util-threshold-config.c` 而非 `src/util-threshold.c`，后者在本快照不存在，需对照实际版本核验。`threshold.config` 由独立的 `suricata-update` 工具生成与合并，改了工具侧配置却没同步到引擎读取路径，是「抑制不生效」的常见根因（模块见 07-11）。`xbits` 的 `expire` 过短会让跨包状态提前消失，过长则占用跨流表内存；`dataset` 大表在 `DetectDatasetSetup` 阶段一次性加载，`SetupLoadPath` 与 `SetupSavePath` 指定的目录权限不足会直接编译失败，且大表会带来内存与时间膨胀，属于加固范畴（案例见 08-05）。
+
+最佳实践是建立「编译期分析 + 运行期计数」双确认：上线前用 `suricata -T` 检查 `flowbits` 依赖警告、`VarNameStore` 变量数、抑制条目数；运行中区分 `detect.alert` 与抑制后实际告警数，用 `suricatasc dump-counters` 做即时快照（计数项名称需对照实际版本核验）。写规则时给置位规则加 `flowbits:noalert` 避免噪声，给检查规则配合理的时间窗与 `track` 维度，避免 `count 1, seconds 60` 之外的极端值把真实攻击一并压掉。任何容量、内存占用、告警率结论一律标注「需在目标机型实测」，不给绝对值（基准见 08-01、调优见 08-02）。规则语法兼容 Snort 但有自有扩展，不能宣称百分之百兼容；`suricata-update` 为独立工具，不参与主程序编译。按目录查实现可跳到 07-02（flow）、07-04（detect）、07-09（util-* 与 conf）。
+
+### 7. 小结与延伸阅读
+
+本篇给出一条主线、两个权威源、三类边界。一条主线是「编译期 `SCSigOrderSignatures` 固定跨规则状态依赖 → `SCThresholdConfInitContext` 加载抑制与阈值 → `SigGroupBuild` 冻结 `VarNameStore` → 运行期 `DetectRunPostMatch` 之后才做阈值判定与状态置位 → `ThresholdCache`/`flowbits`/`xbits`/`tag` 分别按各自作用域读写 → 告警或被抑制」。两个权威源是：结构体逐字段看 05，配置与命令参数看 04；本篇只负责机制与调用链。三类边界是：Suricata 不做转发、不是防火墙；抑制只压告警不改变 verdict；`suricata-update` 为独立工具。
+
+延伸阅读按链路向前后推进：规则编译与排序见 06-06，MPM 与预过滤见 06-07，`DetectRunPostMatch` 与 inspection 顺序见 06-08，文件检测与 `file.data` 见 06-10，EVE 输出与事件聚合见 06-11，IPS verdict 见 06-12。按目录查模块能力可跳到 07-02（flow）、07-04（detect）、07-09（util-* 与 conf）、07-11（suricata-update）；按字段查结构可跳到 05-03、05-05、05-06；按参数查规则关键字与 `threshold.config` 语法可跳到 04-02、04-06、04-07。统一交叉引用写法：字段见 05-03、05-05、05-06 ｜ 参数见 04-06、04-02 ｜ 原理见 06-06、06-08、06-10 ｜ 模块见 07-02、07-04、07-11。版本基准始终为「上游 main 快照（2026-11 抓取）」，未核实的具体字段名、函数签名、配置键名与文件路径均已标注「需对照实际版本核验」。
+
+## 06-10 文件提取、文件检测与 file.data
+
+### 1. 背景与动机
+
+网络里传输的文件不是一次性到达的对象。一个 HTTP 响应体可能被切成几十个 TCP 段，跨多个包、多个事务陆续送达；SMTP 附件、FTP 数据通道、SMB 读写也各有自己的分块与边界。Suricata 要对文件做检测与提取，就必须先把这些散布的分块累积成一个逻辑文件对象，再在其上按块供给检测、计算哈希、判断类型、按需落盘。这条「流式累积 → 分块检测 → 元数据输出」的链路横跨应用层解析、文件容器、检测引擎与 EVE 输出，还牵涉 C 侧的 `src/util-file.c` 与 Rust 侧的 `rust/src/filecontainer.rs`、`rust/src/filetracker.rs`，是 06 册里跨语言边界最明显的一篇。
+
+必须先立住边界，这一篇尤其重要。Suricata 只对自身解码并重组到的流量做检测，TLS 等加密载荷的明文正文不可见；HTTPS 传输的文件内容引擎读不到，能拿到的只是握手元数据、证书、SNI 等，不能宣称能提取 HTTPS 明文文件（原理见 06-12）。Suricata 是 IDS / IPS / NSM 引擎，不是防火墙，不做 IP 转发，也不做路由；`filestore` 落盘是检测产物，不是内容过滤网关的转发行为。规则语法兼容 Snort 但有自有扩展，`file.data`、sticky buffer 等即为其自有能力。本套资料版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验；性能、容量与落盘吞吐结论一律标注「需在目标机型实测」。
+
+从工程价值看，理解文件检测链路有四个收益。其一是正确性：`file.data` 规则不命中时，根因可能是协议未识别、重组深度截断、缓冲有 gap，而不是 `content` 写错。其二是可见性：理解 `stream.reassembly.depth` 与文件重组深度的关系，才能解释「小文件能检、大文件后半段检不到」。其三是资源：`filemagic`、`filesha256`、`filestore` 都会强制开启额外计算与磁盘写入，盲目全开会推高 CPU 与 I/O。其四是排障：`eve.json` 里有 `file` 事件却缺 `sha256`、缺 `stored` 时，要能定位到 `FileForce*Enable` 系列开关与 `file-store` 配置。本篇所有函数名与路径均以 `upstream_src/suricata/suricata-main/` 下真实文件为锚点。
+
+### 2. 核心概念
+
+文件对象的基础是 `File` 与 `FileContainer`。`src/util-file.c` 提供 `FileContainerAlloc`、`FileContainerRecycle`、`FileContainerFree`、`FileContainerAdd` 管理容器生命周期，`FileAppendData` 与内部的 `FileAppendDataDo`、`AppendData` 把分块写入流式缓冲，`FileStore`、`FileStoreNoStoreCheck` 决定是否落盘，`FilePruneFile` 与 `FilePrune` 在深度或数量触顶时裁剪，`FileFlagGap` 标记重组缺口，`FileEndSha256` 收尾哈希，`FilePrintFlags` 输出状态。`FileApplyTxFlags`、`FileFlowToFlags`、`SCFileFlowFlagsToFlags` 把 `Flow` 与事务上的文件标志翻译成 `File` 的标志，决定该文件是否需要 magic、哈希、存储等处理（字段见 05-03、05-05）。
+
+强制开关是另一组关键概念。`FileForceFilestoreEnable`、`FileForceMagicEnable`、`FileForceMd5Enable`、`FileForceSha1Enable`、`FileForceSha256Enable`、`FileForceTrackingEnable` 以及 `FileForceFilestore`、`FileForceMagic`、`FileForceMd5`、`FileForceSha1`、`FileForceSha256`、`FileForceHashParseCfg` 成对出现：前者由检测需求在编译期置位，后者供运行期查询。也就是说，规则里写了 `filemagic`、`filesha256`、`filestore`，引擎才会在 `SigGroupBuild` 阶段通过 `SigGroupHeadSetupFiles` 一类入口把对应计算强制打开；没有这类规则时，文件照样被解析与输出基础元数据，但不会白白算哈希、不会落盘。`FileReassemblyDepthEnable` 与 `FileReassemblyDepth` 则对应文件可见的最大深度，超出后不再向检测供给数据。
+
+检测侧的核心是 sticky buffer。`src/detect-file-data.c` 的 `DetectFiledataRegister` 注册 `file.data`，`DetectFiledataSetup` 解析选项，`DetectFileRegisterProto` 与 `DetectFileRegisterFileProtocols` 登记哪些协议支持文件检测，`FiledataGetDataCallback` 从 `FileContainer` 中取出当前分块填进 `InspectionBuffer`，`DetectEngineInspectFiledata` 执行逐块 inspection，`PrefilterMpmFiledataRegister` 与 `PrefilterTxFiledata` 把 `file.data` 接入 MPM 预过滤（原理见 06-07、06-08）。配套关键字由 `src/detect-filemagic.c` 的 `DetectFilemagicRegister`、`src/detect-filesize.c` 的 `DetectFilesizeRegister`、`src/detect-filesha256.c` 的 `DetectFileSha256Register`、`src/detect-filestore.c` 的 `DetectFilestoreRegister` 注册，`src/detect-filesha1.c` 提供 SHA1 侧实现；`src/detect-engine-file.c` 的 `DetectFileInspect` 与 `DetectFileInspectGeneric` 是文件类关键字的通用检查入口。输出侧 `src/output-json-file.c` 的 `JsonFileLogRegister`、`JsonFileLogger`、`FileWriteJsonRecord` 把文件元数据写成 EVE `file` 事件。交叉引用：字段见 05-03、05-04、05-05 ｜ 参数见 04-04、04-06 ｜ 原理见 06-05、06-08 ｜ 模块见 07-03、07-04、07-07。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，不重列字段；06 全册禁止完整结构体字段表，逐字段定义一律到 05。
+
+- `File`、`FileContainer`、`StreamingBufferConfig`：`src/util-file.c`、`src/util-file.h`、`src/util-streaming-buffer.c` 一类文件（具体路径需对照实际版本核验；字段见 05-03、05-05）。
+- `InspectionBuffer`、`DetectEngineThreadCtx`：`src/detect-engine-inspect-buffer.c`、`src/detect.h`（字段见 05-05、05-06）。
+- `DetectFiledataData`、`DetectFilemagicData`、`DetectFileSha256Data` 及 `sigmatch_table` 中的对应项：`src/detect-file-data.c`、`src/detect-filemagic.c`、`src/detect-filesha256.c`、`src/detect-engine-register.c`（字段见 05-05）。
+- `JsonFileLogThread`、`OutputCtx`、`LogFileCtx`：`src/output-json-file.c`、`src/output.h`（字段见 05-08）。
+- `HtpState`、`HtpTxUserData`：`src/app-layer-htp.c`、`src/app-layer-htp.h`、`src/app-layer-htp-file.c`（字段见 05-04）。
+
+文件落点整理如下：文件容器与强制开关在 `src/util-file.c`；文件类检测在 `src/detect-engine-file.c`、`src/detect-file-data.c`、`src/detect-filemagic.c`、`src/detect-filesize.c`、`src/detect-filesha1.c`、`src/detect-filesha256.c`、`src/detect-filestore.c`；关键字注册集中在 `src/detect-engine-register.c` 的 `DetectFilestoreRegister`、`DetectFilemagicRegister`、`DetectFileSha256Register`、`DetectFilesizeRegister`、`DetectFiledataRegister` 等调用；应用层文件供给在 `src/app-layer-htp.c`、`src/app-layer-htp-file.c`、`src/app-layer-htp-range.c`、`src/app-layer-ftp.c`、`src/app-layer-smtp.c`、`src/app-layer-parser.c`；EVE 输出在 `src/output-json-file.c`；Rust 侧对应实现为 `rust/src/filecontainer.rs`、`rust/src/filetracker.rs`、`rust/src/smb/files.rs`。`file-store` 与 `stream.reassembly.depth` 的键名需对照 `suricata.yaml.in` 与 `src/` 实际版本核验（参数见 04-03、04-04）。交叉引用：字段见 05-03、05-04、05-05、05-08 ｜ 参数见 04-04、04-06 ｜ 模块见 07-03、07-04、07-07、07-10。
+
+### 4. 关键流程与调用链
+
+供给链从应用层解析开始。以 HTTP 为例，`src/app-layer-htp-file.c` 的 `HTPFileOpen` 依据文件名与事务上下文建文件，`HTPFileOpenWithRange` 处理带 `Content-Range` 的分段，`HTPParseContentRange` 与 `HTPParseAndCheckContentRange` 解析范围头，`HTPFileStoreChunk` 把每个数据块交给 `FileAppendData`，`HTPFileClose` 收尾；`src/app-layer-ftp.c`、`src/app-layer-smtp.c`、`src/app-layer-parser.c` 以及 Rust 侧 SMB 文件实现走等价路径，最终都汇入 `src/util-file.c` 的 `FileContainer`。`FileAppendData` 经 `AppendData`、`FileAppendDataDo` 把分块写入流式缓冲，遇到重组缺口时 `FileFlagGap` 置位，超过深度时由 `FilePruneFile`、`FilePrune` 裁剪，`FileApplyTxFlags` 把事务上的文件标志转成 `File` 标志。
+
+检测链在编译期先铺路。`SigGroupBuild` 阶段的 `SigGroupHeadSetupFiles` 会依据签名是否带文件类关键字，调用 `FileForceMagicEnable`、`FileForceSha256Enable`、`FileForceFilestoreEnable` 一类开关把所需计算强制打开；`DetectFiledataRegister` 与 `DetectFileRegisterFileProtocols` 登记支持文件检测的协议，`SetupDetectEngineConfig` 配置检测引擎侧参数。运行期 `DetectEngineInspectFiledata` 通过 `FiledataGetDataCallback` 从 `FileContainer` 取当前分块填入 `InspectionBuffer`，再由 `DetectEngineContentInspection` 一类函数对 `file.data` 上的 `content`、`pcre`、`byte_test` 逐条求值（原理见 06-08）；`PrefilterMpmFiledataRegister` 让 `file.data` 也能参与 MPM 候选缩减，`DetectFileInspect` 与 `DetectFileInspectGeneric` 处理 `filemagic`、`filesize`、`filesha256` 等非内容型文件关键字。
+
+输出链在文件关闭或状态确定时收束。`FileEndSha256` 收尾哈希，`FileStore` 依据标志决定是否落盘，`src/output-json-file.c` 的 `FileWriteJsonRecord` 与 `JsonFileLogger` 把文件名、magic、大小、哈希、是否 stored 等字段写成 EVE `file` 事件，`JsonFileLogRegister` 完成模块注册（原理见 06-11）。整条流式累积、检测与输出链路见图 06-10-01。
+
+:::figure id=06-10-01 | name=文件流式累积检测与 EVE 输出 | dir=TD
+node f1 "应用层解析<br/>app-layer-htp/ftp/smb" teal
+node f2 "HTPFileOpen<br/>HTPFileStoreChunk" teal
+node f3 "FileAppendData<br/>FileContainer" blue
+node f4 "file.data<br/>sticky buffer" purple
+node f5 "DetectEngineInspectFiledata" purple
+node f6 "filemagic/filesize<br/>sha256/filestore" amber
+node f7 "stream.reassembly.depth<br/>重组深度边界" red
+node f8 "EVE file 事件<br/>output-json-file" green
+edge f1 -> f2 "识别文件事务"
+edge f2 -> f3 "分块写入"
+edge f3 -> f4 "供给检测数据"
+edge f4 -> f5 "逐块 inspection"
+edge f5 -> f6 "关键字求值"
+edge f7 -> f3 "超出深度不再供给"
+edge f5 -> f8 "命中与元数据"
+edge f3 -> f8 "文件元数据"
+:::
+
+图 06-10-01 里红色节点标出的重组深度边界是最容易被忽视的一环：`FileReassemblyDepthEnable` 与 `FileReassemblyDepth` 设定的深度一旦触顶，后续分块不再供给检测，`file.data` 规则对文件后半段自然失效，但 `eve.json` 里仍会出现 `file` 事件。把「有事件却无告警」直接当成规则缺陷，正是没把供给边界与检测边界分开看的典型误判。
+
+文件容器的若干辅助入口决定了「算什么、留什么」。`FileStoreNoStoreCheck` 在不触发实际写入的前提下判断该文件是否应被存储，`FileMagicSize` 给出 magic 计算所需的最大读取长度，`FilePrintFlags` 把 `File` 上的标志位输出成可读文本便于排障，`FileForceTrackingEnable`、`FileForceFilestore`、`FileForceMagic`、`FileForceMd5`、`FileForceSha1`、`FileForceSha256` 与 `FileForceHashParseCfg` 分别对应跟踪、落盘与各类哈希的开关查询与配置解析，`SCFileFlowFlagsToFlags` 把流方向与文件标志做位映射。Rust 侧 `rust/src/filecontainer.rs`、`rust/src/filetracker.rs` 与 `rust/src/smb/files.rs` 提供了另一套文件容器与跟踪实现，主要服务 SMB 等 Rust parser，经 `rust/cbindgen.toml` 生成的 FFI 边界与 C 侧交互（模块见 07-10）；把 Suricata 写成纯 C 项目会漏掉这一半。两侧共同遵守同一条原则：文件是随分块增长的对象，元数据只在文件状态确定后才齐备。
+
+几个边界分支也在这条链上有明确落点。`HTPParseContentRange` 与 `HTPParseAndCheckContentRange` 解析带 `Content-Range` 的响应，`HTPFileOpenWithRange` 据此建立带偏移的文件，避免把分段下载误判成多个独立文件；`src/app-layer-htp-range.c` 处理范围合并，`src/app-layer-ftp.c`、`src/app-layer-smtp.c` 分别覆盖 FTP 数据通道与邮件附件。检测侧 `PrefilterTxFiledata` 与 `PrefilterMpmFiledataRegister` 让 `file.data` 上的模式进入预过滤候选，`DetectFiledataSetupCallback` 在 setup 阶段校验 buffer 与协议支持，`SetupDetectEngineConfig` 读取检测引擎侧文件配置。输出侧 `OutputFileLogDeinitSub` 负责模块卸载时的上下文释放。任何文件数量、落盘吞吐、哈希计算耗时与重组内存占用结论一律标注「需在目标机型实测」，不给绝对值（基准见 08-01）。
+
+最后把关键字注册与编译期联动补齐。`src/detect-engine-register.c` 集中调用 `DetectFilestoreRegister`、`DetectFilemagicRegister`、`DetectFileSha256Register`、`DetectFilesizeRegister`、`DetectFiledataRegister`，把这些关键字填进 `sigmatch_table`；`src/detect-engine-build.c` 的 `SignatureIsFilestoring`、`SignatureIsFilemagicInspecting`、`SignatureIsFileMd5Inspecting`、`SignatureIsFileSha1Inspecting`、`SignatureIsFileSha256Inspecting` 在 `SigGroupBuild` 阶段逐条判定签名用到了哪类文件能力，`SigGroupHeadSetupFiles` 据此触发 `src/util-file.c` 的 `FileForce*Enable` 系列开关。也就是说「规则写了什么」与「引擎算什么」之间隔着一层静态分析，不是运行期见到文件才临时决定；这也是盲目堆文件关键字会同时推高编译期内存与运行期 CPU 的原因（加固见 08-05）。
+
+### 5. 配置/命令/代码实例
+
+本节只给最小必要实例，并显式指向权威源：`file-store`、`stream.reassembly.depth` 与 `outputs` 相关 yaml 段、规则关键字全集见 04 全册（参数见 04-03、04-04、04-06），此处不重列参数全集。下面先给一条文件检测规则片段，用来说明 `file.data`、文件元数据关键字与 `filestore` 如何组合。
+
+```text
+# 在文件数据上做内容匹配，并强制计算 magic、sha256 与落盘
+alert http any any -> any any (msg:"FILE CHECK"; flow:established,to_client; file.data; content:"MZ"; startswith; filemagic:"PE32"; filesha256:"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"; filestore; sid:9900020; rev:1;)
+```
+
+`src/util-file.c` 与 `src/detect-file-data.c` 的关键实现入口摘录如下，函数名与路径均按本快照真实文件书写。
+
+```c
+/* 文件容器与强制开关摘录，见 src/util-file.c */
+FileContainer *FileContainerAlloc(void);
+void FileContainerAdd(FileContainer *ffc, File *ff);
+int FileAppendData(FileContainer *ffc, const StreamingBufferConfig *sbcfg,
+                   const uint8_t *data, uint32_t data_len, uint8_t flags);
+int FileStore(File *ff);
+void FileForceMagicEnable(void);
+void FileForceSha256Enable(void);
+void FileForceFilestoreEnable(void);
+void FileReassemblyDepthEnable(uint32_t size);
+uint32_t FileReassemblyDepth(void);
+/* 文件检测入口摘录，见 src/detect-file-data.c 与 src/detect-engine-file.c */
+void DetectFiledataRegister(void);
+uint8_t DetectEngineInspectFiledata(DetectEngineCtx *de_ctx,
+        DetectEngineThreadCtx *det_ctx, const Signature *s, Flow *f, void *txv, void *txd);
+static InspectionBuffer *FiledataGetDataCallback(DetectEngineThreadCtx *det_ctx,
+        const void *txv, uint8_t flow_flags, uint32_t file_id, int list_id);
+uint8_t DetectFileInspectGeneric(DetectEngineCtx *de_ctx,
+        DetectEngineThreadCtx *det_ctx, const Signature *s, Flow *f, File *file);
+```
+
+文件检测各环节的源码落点、关键函数与主要失败表现见下表。
+
+| 环节 | 源码入口 | 关键函数 | 失败表现 |
+|---|---|---|---|
+| 文件事务识别 | `src/app-layer-htp-file.c` | `HTPFileOpen`、`HTPFileStoreChunk`、`HTPFileClose` | 协议未识别、分块边界错 |
+| 流式累积 | `src/util-file.c` | `FileAppendData`、`FilePruneFile`、`FileFlagGap` | 重组缺口、深度触顶截断 |
+| 强制计算开关 | `src/util-file.c` | `FileForceMagicEnable`、`FileForceSha256Enable` | sha256 与 magic 字段缺失 |
+| sticky buffer | `src/detect-file-data.c` | `FiledataGetDataCallback`、`DetectEngineInspectFiledata` | file.data 不命中、buffer 为空 |
+| 元数据关键字 | `src/detect-engine-file.c` | `DetectFileInspect`、`DetectFileInspectGeneric` | filemagic 与 filesize 不匹配 |
+| 落盘存储 | `src/util-file.c` | `FileStore`、`FileForceFilestoreEnable` | stored 为 false、目录不可写 |
+| EVE 输出 | `src/output-json-file.c` | `JsonFileLogger`、`FileWriteJsonRecord` | 无 file 事件、字段不全 |
+
+下面是一组按「前置检查 → 执行 → 验证输出 → 清理」组织的完整闭环命令，用离线 pcap 验证文件检测与输出链是否贯通。
+
+```bash
+# 前置检查：确认文件存储与输出段已开启，并做规则自检
+suricata --dump-config | grep -nE "file-store|eve-log|reassembly.depth"
+suricata -T -c /etc/suricata/suricata.yaml -S /tmp/file.rules
+
+# 执行：以离线 pcap 回放含文件传输的流量
+suricata -c /etc/suricata/suricata.yaml -S /tmp/file.rules -r /tmp/file.pcap -l /var/log/suricata/
+
+# 验证输出：查看 file 事件与文件存储计数
+grep -n '"event_type":"file"' /var/log/suricata/eve.json | tail -n 3
+grep -n "file_store" /var/log/suricata/stats.log | tail -n 2
+
+# 清理：移除临时规则与回放产物，保留落盘文件供复核
+rm -f /tmp/file.rules /tmp/file.pcap
+```
+
+典型输出如下（示例输出，具体格式需对照实际版本核验）。
+
+```text
+# 示例输出，具体格式需对照实际版本核验
+<Notice> - Configuration provided was successfully loaded. Exiting.
+<Info> - FileForceHashParseCfg: sha256 hashing enabled for file inspection
+<Info> - 1 rule files processed. 1 rules successfully loaded, 0 rules failed, 0 rules skipped
+{"event_type":"file","src_ip":"198.51.100.20","dest_ip":"192.0.2.10","file":{"filename":"sample.bin","magic":"PE32 executable","size":2048,"sha256":"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08","stored":true}}
+file_store                                | Total                     | 1
+```
+
+逐行判读如下。第一行是 `suricata -T` 的成功回显，只证明规则与配置完成编译。第二行是 `FileForceHashParseCfg` 的开关回显，说明编译期已经因为规则里出现 `filesha256` 而把 SHA256 计算强制打开；若这一行缺失而 `eve.json` 里又没有 `sha256` 字段，根因是强制开关未触发，应回查 `SigGroupHeadSetupFiles` 与关键字注册，而不是怀疑哈希算法本身。第三行是加载汇总，failed 与 skipped 均为零，说明 `file.data`、`filemagic`、`filesha256`、`filestore` 组合被正确解析。第四行是 EVE 的 `file` 事件：`event_type` 标明类型，`src_ip` 与 `dest_ip` 标明传输方向，`file.filename`、`file.magic`、`file.size`、`file.sha256` 分别是文件名、类型、大小与哈希，`file.stored` 为 `true` 表示已落盘；正常值里 `size` 应与实际文件大小一致，`sha256` 应为十六进制串，若 `magic` 为空或 `stored` 为假，分别对应 `FileForceMagicEnable` 未触发与 `FileStore` 判定未通过，需检查落盘目录权限与 `file-store` 配置（参数见 04-04）。第五行 `file_store` 是累计落盘计数，正常值应随文件数增长；它为零而 `file` 事件存在，说明文件被解析与输出但未落盘，多半是 `filestore` 关键字或存储开关未生效。所有字段名、计数项名称与输出格式需对照实际版本核验，落盘吞吐与磁盘占用一律标注「需在目标机型实测」。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是可见性误判。TLS 等加密载荷的明文正文不可见，HTTPS 传输的文件内容引擎读不到，能拿到的是握手元数据、证书、SNI 等，不能宣称能提取 HTTPS 明文文件；把「明明下载了文件却没有 `file` 事件」当成引擎缺陷，往往只是流量被加密（原理见 06-12）。第二个陷阱是重组深度。`FileReassemblyDepthEnable` 与 `FileReassemblyDepth` 对应文件可见深度，超过后不再向检测供给分块，大文件后半段的 `file.data` 规则自然失效；`stream.reassembly.depth` 一类键名需对照 `suricata.yaml.in` 与 `src/` 实际版本核验（参数见 04-03），调整前要评估内存代价，任何深度与内存数字需在目标机型实测。第三个陷阱是把「有 `file` 事件」当成「文件检测已命中」：事件只说明文件被解析并输出元数据，是否命中 `file.data` 还要看 sticky buffer 供给与逐块 inspection。
+
+配置层面有几处高频问题。规则里不写 `filemagic`、`filesha256`、`filestore` 时，`FileForceMagicEnable`、`FileForceSha256Enable`、`FileForceFilestoreEnable` 不会被触发，对应字段与落盘自然缺失，这是「按需计算」的设计而非故障。`filestore` 落盘目录权限不足或磁盘写满会让 `FileStore` 失败，表现为 `stored:false` 或 `file_store` 计数不增，日志轮转与目录权限要纳入上线清单（场景见 08-06）。`DetectFileRegisterProto` 与 `DetectFileRegisterFileProtocols` 决定哪些协议支持文件检测，协议未识别或 parser 未启用时，`HTPFileOpen` 一类入口根本不会被调用。规则侧还要注意 `file.data` 是 sticky buffer，`content` 只在该 buffer 上匹配，写成 payload 语义会得到稳定漏报（原理见 06-08）。
+
+最佳实践是建立「开关 → 事件 → 落盘」三段确认：上线前用 `suricata -T` 确认规则可编译、用 `--dump-config` 确认 `file-store` 与 `outputs` 段生效；运行中看 `eve.json` 的 `file` 事件字段是否齐全、看 `stats.log` 的 `file_store` 计数是否增长、看落盘目录是否可写（计数项名称需对照实际版本核验）；排障时按图 06-10-01 从应用层识别、流式累积、sticky buffer 供给、元数据计算、EVE 输出逐段收敛。安全上要克制：全量开启 magic、SHA1、SHA256 与 filestore 会显著推高 CPU 与磁盘 I/O，只给确有检测需求的规则开启；大文件与超大并发会带来内存与磁盘压力，任何容量、吞吐、内存占用结论一律标注「需在目标机型实测」，不给绝对值（基准见 08-01、加固见 08-05）。规则语法兼容 Snort 但有自有扩展，不能宣称百分之百兼容；`suricata-update` 为独立工具，不参与主程序编译。按目录查实现可跳到 07-03、07-04、07-07、07-10。
+
+### 7. 小结与延伸阅读
+
+本篇给出一条主线、两个权威源、三类边界。一条主线是「应用层 parser 识别文件事务 → `HTPFileOpen`/`HTPFileStoreChunk` 一类入口把分块交给 `FileAppendData` → `FileContainer` 流式累积并受 `FileReassemblyDepth` 约束 → 编译期 `SigGroupHeadSetupFiles` 触发 `FileForce*Enable` 强制开关 → `FiledataGetDataCallback` 把分块填进 `InspectionBuffer` → `DetectEngineInspectFiledata` 与 `DetectFileInspectGeneric` 逐块求值 → `FileEndSha256`/`FileStore` 收尾 → `JsonFileLogger` 写成 EVE `file` 事件」。两个权威源是：结构体逐字段看 05，配置与命令参数看 04；本篇只负责机制与调用链。三类边界是：加密载荷明文不可见、HTTPS 文件不可提取；Suricata 不做转发、不是防火墙；落盘是检测产物而非网关转发。
+
+延伸阅读按链路向前后推进：应用层解析框架与 Rust parser 接入见 06-05，规则编译与 `SigGroupHeadSetupFiles` 见 06-06，MPM 与 `PrefilterMpmFiledataRegister` 见 06-07，`InspectionBuffer` 与逐条求值见 06-08，阈值与有状态关键字见 06-09，EVE 输出与事件聚合见 06-11，IPS verdict 见 06-12。按目录查模块能力可跳到 07-03（app-layer）、07-04（detect）、07-07（output 与 log-*）、07-10（rust/）、07-08（stream-tcp）；按字段查结构可跳到 05-03、05-04、05-05、05-08；按参数查 `file-store` 与规则关键字可跳到 04-03、04-04、04-06。统一交叉引用写法：字段见 05-03、05-04、05-05、05-08 ｜ 参数见 04-03、04-04、04-06 ｜ 原理见 06-05、06-08、06-11 ｜ 模块见 07-03、07-04、07-07、07-10。版本基准始终为「上游 main 快照（2026-11 抓取）」，未核实的具体字段名、函数签名、配置键名与文件路径均已标注「需对照实际版本核验」。

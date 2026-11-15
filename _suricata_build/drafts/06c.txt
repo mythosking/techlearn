@@ -1,0 +1,623 @@
+# Suricata 技术资料 · 06 技术原理（分片 C）
+## 06-11 EVE JSON 输出与事件聚合、日志管线
+
+### 1. 背景与动机
+
+一条网络流从网卡进入引擎，到最终能被安全分析平台检索、关联、画图，中间跨越了收包、解码、流重组、应用解析、规则求值等多个环节；而把这条流水线产生的结论固化下来、交给外部系统消费的，正是输出与日志子系统。如果只把输出理解成「把告警打印成一行文本」，就会低估它在整套 IDS / IPS / NSM 体系里的分量：Suricata 的 EVE JSON 不是附带产物，而是主要输出格式，alert、flow、dns、tls、http、file、drop、stats、anomaly 等事件都汇聚到同一条结构化日志管道，由下游的 Filebeat、Logstash、SIEM 或自建数据湖做索引与关联。正因为如此，本套资料把「机制、状态机与调用链」划归 06 全册作为唯一权威源，本篇专门负责把检测结论到 `eve.json` 落盘之间的这段链路讲透。
+
+必须先立住定位与边界。Suricata 是 IDS / IPS / NSM 引擎，不是防火墙，不做 IP 转发，也不做路由；旁路 IDS 模式只对镜像副本做检测并告警，内联 IPS 模式依靠 NFQUEUE 或 AF_PACKET 桥接的 verdict 决定是否放行，真正执行放行动作的是内核或桥接对端（原理见 06-12）。另一个不可回避的边界是可见性：引擎只对自身解码并重组到的流量做检测，TLS 等加密载荷的明文正文不可见，能写进 EVE 的是握手元数据、证书、SNI、JA3 / JA4 一类指纹（相关 Rust 侧实现见 `rust/src/ja4.rs`，具体字段需对照实际版本核验），不能宣称能输出 HTTPS 明文正文。EVE 里 `tls` 事件记录的是握手与证书信息，`alert` 事件记录的是命中规则，二者都不是对明文内容的还原。
+
+从工程价值看，理解输出管线有两个直接收益。其一是排障：当 `eve.json` 迟迟不出现 `alert` 事件时，有经验的工程师会按「收包计数是否增长 → 解码是否正常 → 流是否建立 → 应用协议是否识别 → 检测是否命中 → 输出模块是否启用并落盘」逐段收敛，而不是一上来就改规则；输出段的表现往往是「文件存在但只有 flow 和 stats」，这背后可能是 `outputs` 里对应事件类型没开、日志目录不可写、轮转失败或缓冲过大被丢弃。其二是性能与容量规划：EVE 是逐事件构造 JSON、逐事件写出的，事件量随规则命中率与应用层事务数放大，开启 `metadata`、`community-id`、payload 打印等选项都会增加单条记录体积，进而影响磁盘写入与下游管道压力，任何吞吐、pps、落盘速率与内存占用结论一律标注「需在目标机型实测」，不给绝对值。本套资料的版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验；本篇所有函数名与路径均以此快照下 `upstream_src/suricata/suricata-main/` 内的真实文件为锚点。
+
+### 2. 核心概念
+
+输出的公共抽象是 `OutputModule`。它是一个注册项，把「配置名」与「初始化函数、日志函数、线程上下文」绑定在一起：`src/output.h` 中的 `OutputModule_` 带有 `logger_id`、`name`、`conf_name`、`parent_name`、`InitFunc`、`InitSubFunc`，以及 `PacketLogFunc`、`TxLogFunc`、`FlowLogFunc`、`StatsLogFunc` 等按事件族划分的日志回调（字段见 05-08）。注册入口是 `OutputRegisterModule(const char *, const char *, OutputInitFunc)`，它与 `OutputRegisterPacketModule`、`OutputRegisterTxModule`、`OutputRegisterFlowSubModule`、`OutputRegisterStatsModule` 等一族函数共同构成「根模块 + 子模块」两级结构：根模块负责解析 `eve-log` 这段配置并建立共享的 `OutputJsonCtx`，子模块各自挂上一种事件类型的 logger，例如 alert、flow、drop、stats 都作为 `eve-log` 的子模块登记。运行期由 `OutputRegisterRootLogger` 与 `TmModuleLoggerRegister` 把根日志函数装配成线程模块，检测线程处理完一个 `Packet` 后调用 `OutputLoggerLog(ThreadVars *, Packet *, void *)` 驱动各活跃 logger；`OutputSetupActiveLoggers` 与 `OutputClearActiveLoggers` 负责按生效配置筛选活跃模块。
+
+EVE 事件由「公共头 + 事件体」两部分组成。公共头由 `src/output-json.c` 的 `CreateEveHeader` 构造：先用 `SCJbNewObject` 创建一个 `SCJsonBuilder` 对象，再用 `CreateIsoTimeString` 写入 `timestamp`，用 `CreateEveFlowId` 写入 `flow_id`，随后按需写入 `sensor_id`、`in_iface`、`pcap_cnt`、`event_type`、`vlan` 数组，以及由 `JsonAddrInfoInit` 得到的 `src_ip` / `src_port` / `dest_ip` / `dest_port` / `proto`。`event_type` 是最关键的分发键，取值如 `alert`、`flow`、`dns`、`tls`、`http`、`file`、`drop`、`stats`、`anomaly`，下游按它做索引分表；`flow_id` 把一个双向会话上产生的多个事件聚合起来，使得「同一条流上的 alert 与 flow、http、dns 事件」可以被关联分析。`EveAddCommonOptions` 在此之上按 `OutputJsonCommonSettings` 追加通用选项，其中 `include_community_id` 为真时调用 `CreateEveCommunityFlowId` 生成 `community_id`——这是一个跨厂商、跨工具可复现的流标识，便于把 Suricata 的 EVE 与 Zeek 等其他数据源对齐；`include_metadata` 为真时由 `EveAddMetadata` 把 flowbits、flowvars、flowints 等有状态变量写进 `metadata` 子对象。
+
+构造 JSON 的底层设施在 Rust 侧。`rust/src/jsonbuilder.rs` 定义了 `JsonBuilder`、`JsonBuilderMark` 与 `JsonError`（`InvalidState` / `Utf8Error` / `Memory`），并维护 `Object` / `Array` 状态机；所有以 `#[no_mangle] pub extern "C" fn` 导出的 `SCJbNewObject`、`SCJbSetString`、`SCJbSetUint`、`SCJbOpenObject`、`SCJbOpenArray`、`SCJbAppendUint`、`SCJbClose`、`SCJbLen`、`SCJbPtr` 等函数，经 `rust/cbindgen.toml` 生成 C 头文件后供 `src/output-json*.c` 调用。这里有一个容易困惑的命名细节：C 侧看到的 `SCJsonBuilder` 并非 Rust 侧原名，而是 `rust/cbindgen.toml` 的 `[export.rename]` 里写了 `"JsonBuilder" = "SCJsonBuilder"`、`"JsonBuilderMark" = "SCJsonBuilderMark"`，用前缀避免与 C 命名空间冲突。这也再次印证 Rust 与 Cargo 是构建的一部分，大量 EVE 构造逻辑在 Rust 侧，不能把 Suricata 写成纯 C 项目（模块见 07-10）。
+
+写出目标与生命周期同样需要区分。`src/output-json.c` 的 `FileTypeFromConf` 把 `filetype` 配置映射为 `enum LogFileType`：`file` / `regular` 对应 `LOGFILE_TYPE_FILE`，`unix_dgram`、`unix_stream` 对应各自的 socket 类型，`redis` 对应 `LOGFILE_TYPE_REDIS`（依赖 `HAVE_LIBHIREDIS` 编译开关），而 `LOGFILE_TYPE_FILETYPE` 则交给新式的 EVE filetype 插件。后者由 `src/output-eve.h` 的 `SCEveFileType_` 抽象，提供 `Init`、`ThreadInit`、`Write`、`ThreadDeinit`、`Deinit` 五个钩子，经 `SCRegisterEveFileType` 注册、`SCEveFindFileType` 查找；`src/output-eve-syslog.c` 的 `SyslogInitialize` 与 `src/output-eve-null.c` 的 `NullLogInitialize` 在 `OutputJsonRegister` 中被调用，正是内置 filetype 的实例。此外 `SCEveRegisterCallback` / `SCEveRunCallbacks` 允许在顶层对象关闭前追加自定义字段，`SCOutputEvePreRegisterLogger` 与 `SCEveJsonSimpleGetLogger` 则为简化的 app-layer 事务 logger 提供登记点。日志轮转由 `OutputRegisterFileRotationFlag` 与 `OutputNotifyFileRotation` 配合 `etc/suricata.logrotate.in` 完成，控制面可用 `suricatasc` 的 `reopen-log-files` 触发重开（命令见 04-07，具体命令名需对照实际版本核验）。交叉引用：字段见 05-08 ｜ 参数见 04-04 ｜ 模块见 07-07、07-10。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，不重列任何字段。06 全册禁止出现完整结构体字段表，逐字段定义、类型、读写时机与生命周期由 05 全册统一承担。
+
+- `OutputModule_`、`OutputInitResult_`、`OutputLoggerThreadStore_`、各 `OutputRegister*Module` 声明与实现：`src/output.h`、`src/output.c`，以及 `src/output-packet.h`、`src/output-tx.h`、`src/output-file.h`、`src/output-filedata.h`、`src/output-flow.h`、`src/output-streaming.h`、`src/output-stats.h`（字段见 05-08）。其中 `OutputInitResult` 只有 `ctx` 与 `ok` 两个成员，是所有 InitFunc 的统一返回类型。
+- `OutputJsonCtx_`、`OutputJsonThreadCtx_`、`OutputJsonCommonSettings_`、`JsonAddrInfo_`：`src/output-json.h`。`OutputJsonCtx` 持有 `LogFileCtx *file_ctx`、`enum LogFileType json_out`、`OutputJsonCommonSettings cfg`、`HttpXFFCfg *xff_cfg` 与 `SCEveFileType *filetype`，是根模块初始化后贯穿所有子模块的共享上下文（字段见 05-08）。
+- `SCJsonBuilder` 与 EVE filetype 相关类型：`src/output-eve.h` 定义 `SCEveFileType_`、`EveJsonSimpleAppLayerLogger`、`EveJsonTxLoggerRegistrationData`、`enum SCOutputJsonLogDirection`（`LOG_DIR_PACKET`、`LOG_DIR_FLOW`、`LOG_DIR_FLOW_TOCLIENT`、`LOG_DIR_FLOW_TOSERVER`）与 `SCEveUserCallbackFn`；Rust 侧的 `JsonBuilder` / `JsonBuilderMark` 定义在 `rust/src/jsonbuilder.rs`（字段见 05-08）。
+- 事件子模块上下文：`src/output-json-alert.c` 的 `AlertJsonOutputCtx` 与 `JsonAlertLogThread`、`src/output-json-drop.c` 的 `JsonDropOutputCtx`、`src/output-json-flow.c` 与 `src/output-json-stats.c` 内的线程上下文，均为子模块私有数据，字段名与成员需对照 `src/output-json-*.c` 实际版本核验；通用输出结构仍以「字段见 05-08」为准。
+- 辅助日志：`src/log-stats.c`、`src/log-pcap.c`、`src/log-tlsstore.c`、`src/log-tcp-data.c`、`src/log-maintenance.c`。`src/log-stats.c` 用 `OutputRegisterStatsModule(LOGGER_STATS, MODULE_NAME, "stats", LogStatsLogInitCtx, ...)` 登记独立的 `stats.log`，`src/log-pcap.c` 用 `OutputRegisterPacketModule` 登记 pcap 落盘，它们与 EVE 并行存在，属于辅助输出而非 EVE 子模块。
+
+文件落点整理如下：EVE 主入口与公共头在 `src/output-json.c` / `.h`，新式 filetype 框架在 `src/output-eve.c` / `.h`、`src/output-eve-stream.c`、`src/output-eve-syslog.c`、`src/output-eve-null.c`；事件族在 `src/output-json-alert.c`、`src/output-json-flow.c`、`src/output-json-drop.c`、`src/output-json-stats.c`、`src/output-json-anomaly.c`、`src/output-json-dns.c`、`src/output-json-http.c`、`src/output-json-tls.c`、`src/output-json-file.c`、`src/output-json-smb.c`、`src/output-json-mqtt.c`、`src/output-json-dhcp.c`、`src/output-json-ike.c`、`src/output-json-ftp.c`、`src/output-json-arp.c`、`src/output-json-dnp3.c`、`src/output-json-nfs.c`、`src/output-json-pgsql.c`、`src/output-json-smtp.c`、`src/output-json-frame.c`、`src/output-json-metadata.c`、`src/output-json-netflow.c`、`src/output-json-common.c` 等；输出注册框架在 `src/output.c` / `.h`；JSON 构造在 `rust/src/jsonbuilder.rs`，绑定生成配置在 `rust/cbindgen.toml`。`src/output-json.h` 中 `OutputJsonLogInitSub` 等声明的子模块初始化入口、以及各 `LoggerId` 枚举取值需对照实际版本核验（字段见 05-08）。交叉引用：字段见 05-08 ｜ 参数见 04-04 ｜ 模块见 07-07、07-10。
+
+### 4. 关键流程与调用链
+
+启动期的注册链从 `OutputJsonRegister(void)` 开始，它在 `src/output-json.c` 中调用 `OutputRegisterModule(MODULE_NAME, "eve-log", OutputJsonInitCtx)`，把宏 `MODULE_NAME`（值为 `OutputJSON`）注册为根模块，随后调用 `SyslogInitialize()` 与 `NullLogInitialize()` 登记两个内置 EVE filetype。各事件族在自己的 Register 函数中挂到根模块之下：`JsonAlertLogRegister` 用 `OutputRegisterPacketSubModule(LOGGER_JSON_ALERT, "eve-log", MODULE_NAME, "eve-log.alert", ...)`，`JsonFlowLogRegister` 用 `OutputRegisterFlowSubModule(LOGGER_JSON_FLOW, "eve-log", "JsonFlowLog", "eve-log.flow", ...)`，`JsonStatsLogRegister` 用 `OutputRegisterStatsSubModule(LOGGER_JSON_STATS, "eve-log", MODULE_NAME, "eve-log.stats", ...)`，`JsonDropLogRegister` 用 `OutputRegisterPacketSubModule(LOGGER_JSON_DROP, "eve-log", MODULE_NAME, "eve-log.drop", ...)`。这里 `parent_name` 一律为 `eve-log`，`conf_name` 为 `eve-log.alert` 这类点分路径，正是 `suricata.yaml` 中 `outputs` 段按类型开关的映射依据（参数见 04-04）。
+
+配置生效时，`OutputJsonInitCtx(SCConfNode *conf)` 逐项读取子节点并填充 `OutputJsonCtx`：`filetype` 决定 `log_filetype`，`community-id` 与 `community-id-seed` 控制 `community_id` 生成，`metadata`、`xff`、`sensor-id`、`prefix`、`threaded`、`ethernet`、`suricata-version`、`ipv6-compress`、`pcap-file` 分别对应各自的布尔或字符串开关，其中 `threaded` 为真时置 `file_ctx->threaded`，使输出线程各自持有文件上下文。随后 `FileTypeFromConf` 与 `LogFileTypePrepare` 完成写出目标准备，`OutputJsonBuilderBuffer` 所需的 `MemBuffer` 在线程初始化阶段由 `CreateEveThreadCtx` 分配。这些键名均来自 `SCConfNodeLookupChild` / `SCConfNodeLookupChildValue` 的真实调用，但完整参数清单与默认值属于 04 全册的权威范围（参数见 04-04），此处只给机制所需的最小集合。
+
+稳态下单个事件的写出链如下。检测线程完成 `Packet` 求值后，`OutputLoggerLog` 遍历活跃 logger，按事件类型调用对应子模块的日志函数；以 alert 为例，`src/output-json-alert.c` 的 `JsonAlertLogCondition` 先判断该包是否应产生告警，再由 `JsonAlertLogger` 调 `AlertJson` 与 `AlertJsonHeader` 构造事件体，必要时由 `AlertAddAppLayer`、`AlertAddFiles`、`AlertAddFrame`、`AlertAddPayload` 追加应用层和载荷信息，并由 `EveAddVerdict` 写入 `verdict` 子对象。公共头统一由 `CreateEveHeader` 或 `CreateEveHeaderWithTxId` 生成，事件体与公共头共用同一个 `SCJsonBuilder`。最后 `OutputJsonBuilderBuffer(ThreadVars *tv, const Packet *p, Flow *f, SCJsonBuilder *js, OutputJsonThreadCtx *ctx)` 收口：先按需补 `host`、`pcap_filename`，调用 `SCEveRunCallbacks` 执行用户回调，用 `SCJbClose` 闭合根对象，`MemBufferReset` 复位缓冲，`SCJbLen` 取长度后 `MemBufferWriteRaw` 拷贝，最终 `LogFileWrite(file_ctx, *buffer)` 落盘。若单条记录超出缓冲可扩容上限，该函数打印一次 `Formatted JSON EVE record too large, will be dropped` 告警并丢弃该条，而不是让引擎崩溃——这也是「事件偶发缺失但进程正常」的常见根因。整条注册、构造与落盘链路见图 06-11-01。
+
+:::figure id=06-11-01 | name=EVE 输出模块注册与事件写出链 | dir=TD
+node e1 "OutputRegisterModule<br/>eve-log" blue
+node e2 "子模块注册<br/>alert/flow/drop" amber
+node e3 "CreateEveHeader<br/>组装公共字段" teal
+node e4 "SCJsonBuilder<br/>Rust jsonbuilder" purple
+node e5 "EveAddCommonOptions<br/>community_id" purple
+node e6 "OutputJsonBuilderBuffer<br/>缓冲与落盘" green
+node e7 "LogFileWrite<br/>文件/syslog/插件" green
+node e8 "轮转与 reopen<br/>logrotate/suricatasc" gray
+edge e1 -> e2 "InitFunc 挂接"
+edge e2 -> e3 "事件类型分发"
+edge e3 -> e4 "SCJbNewObject"
+edge e4 -> e5 "公共选项"
+edge e5 -> e6 "SCJbClose"
+edge e6 -> e7 "LogFileWrite"
+edge e7 -> e8 "文件句柄"
+edge e8 -> e7 dashed "重开"
+:::
+
+聚合语义值得单独强调。同一条 `Flow` 上会先后产生 `flow`、`dns`、`http`、`tls`、`alert`、`file` 等多类事件，它们共享由 `CreateEveFlowId` 写入的 `flow_id`；`community_id` 则把这种关联延伸到引擎之外，让不同传感器、不同工具对同一条流的记录能用同一标识对齐。`stats` 事件由 `src/output-json-stats.c` 周期生成，`src/log-stats.c` 另写一份可读的 `stats.log`；`drop` 事件只在内联模式且动作命中 `ACTION_DROP` 时由 `JsonDropLogCondition` 触发（原理见 06-12）。换句话说，EVE 不是「告警日志」的同义词，而是一套以 `event_type` 为分类、`flow_id` 为聚合轴的统一事件总线；把它接进 SIEM 时，应先按 `event_type` 分索引、再按 `flow_id` 做关联，而不是把所有行塞进同一张表。图 06-11-01 中虚线表示轮转后的句柄重开，它与实线的写出链共同构成日志管线的完整闭环。
+
+### 5. 配置/命令/代码实例
+
+本节只给最小必要实例并显式指向权威源：`suricata.yaml` 的 `outputs` 全段、各事件类型开关、轮转参数与 `suricatasc` 命令全集见 04 全册（参数见 04-04、04-07），此处不重列参数全集。下面先给一段按真实源码书写的注册与公共头摘录，函数名与顺序均来自 `src/output-json.c`，不构成完整实现。
+
+```c
+/* EVE 根模块注册与内置 filetype，见 src/output-json.c */
+#define MODULE_NAME "OutputJSON"
+#define DEFAULT_LOG_FILENAME "eve.json"
+
+void OutputJsonRegister(void)
+{
+    OutputRegisterModule(MODULE_NAME, "eve-log", OutputJsonInitCtx);
+    SyslogInitialize();
+    NullLogInitialize();
+}
+
+/* 公共事件头组装摘录，见 src/output-json.c 的 CreateEveHeader */
+SCJsonBuilder *js = SCJbNewObject();
+CreateIsoTimeString(p->ts, timebuf, sizeof(timebuf));
+SCJbSetString(js, "timestamp", timebuf);
+CreateEveFlowId(js, f);
+SCJbSetString(js, "event_type", event_type);
+SCJbSetString(js, "src_ip", addr->src_ip);
+SCJbSetUint(js, "src_port", addr->sp);
+```
+
+EVE 常见事件类型、注册入口与触发条件的对应关系见下表，便于按「文件里缺哪种事件」反查。
+
+| 事件类型 | 注册函数 | 源码入口 | 主要触发条件 |
+|---|---|---|---|
+| alert | `JsonAlertLogRegister` | `src/output-json-alert.c` | 规则命中且包日志条件成立 |
+| flow | `JsonFlowLogRegister` | `src/output-json-flow.c` | 流结束或超时由 flow logger 驱动 |
+| drop | `JsonDropLogRegister` | `src/output-json-drop.c` | 内联模式命中 `ACTION_DROP` |
+| stats | `JsonStatsLogRegister` | `src/output-json-stats.c` | 统计周期到达由 stats logger 驱动 |
+| dns / http / tls | 各 `Json*LogRegister` | `src/output-json-dns.c` 等 | 对应 app-layer 事务完成 |
+
+下面是一组按「前置检查 → 执行 → 验证输出 → 清理」组织的完整闭环命令，适合在旁路 IDS 上验证 EVE 管线是否贯通。
+
+```bash
+# 前置检查：确认配置与规则可加载
+suricata -T -c /etc/suricata/suricata.yaml
+
+# 执行：旁路 IDS 常驻并写出 EVE
+suricata -c /etc/suricata/suricata.yaml -i eth0 -D
+
+# 验证：统计 EVE 事件类型分布，并触发一次日志重开
+grep -o '"event_type":"[a-z]*"' /var/log/suricata/eve.json | sort | uniq -c | sort -rn | head -n 8
+suricatasc -c reopen-log-files
+
+# 清理：经控制面正常关闭
+suricatasc -c shutdown
+```
+
+典型输出如下（示例输出，具体格式需对照实际版本核验）。
+
+```text
+# 示例输出，具体格式需对照实际版本核验
+<Notice> - Configuration provided was successfully loaded. Exiting.
+    342 "event_type":"flow"
+     87 "event_type":"dns"
+     41 "event_type":"tls"
+     19 "event_type":"http"
+      6 "event_type":"alert"
+      2 "event_type":"stats"
+{"timestamp":"2026-11-14T09:31:07.123456+0000","flow_id":2180498311265983,"event_type":"alert","src_ip":"192.0.2.15","src_port":49152,"dest_ip":"198.51.100.7","dest_port":443,"proto":"TCP","community_id":"1:LQU9qZlK+B5F3KDmev6m6PMXn2Jw=","alert":{"signature":"ET TEST","signature_id":2100498}}
+```
+
+逐行判读如下。第一行是 `suricata -T` 的成功回显，关键词 `successfully loaded` 只证明配置与规则能被解析，不代表在线抓包与输出已启动；若这里出现规则解析失败文本，应回到 04-08 的排错速查而不是去查 `eve.json`。第二至第七行是对 `event_type` 的计数统计：`flow` 最多是正常现象，因为每条流结束都会记一条；`dns`、`tls`、`http` 反映应用层解析是否生效，若这三类全为零而 `flow` 正常，优先怀疑协议未启用或流量本身不含这些协议；`alert` 可以很低甚至为零，只有在确认有可命中规则的测试流量时才应上升，它为零而 `decoder.pkts` 增长说明断点在规则加载、协议识别或输出开关，而不是抓包；`stats` 计数应随运行时间稳定增长，若长期不增要查 stats logger 是否启用。第八行是一条完整的 `alert` 事件：`timestamp` 为 ISO 时间，`flow_id` 是与同流其它事件关联的聚合键，`event_type` 标明分类，`src_ip` / `src_port` / `dest_ip` / `dest_port` / `proto` 是五元组，`community_id` 是跨工具流标识，`alert.signature` 与 `signature_id` 标明命中规则。若该文件只有 `flow` 与 `stats` 而完全没有 `alert`，应依次检查规则是否加载、`HOME_NET` 是否覆盖测试地址、`outputs` 里 alert 类型是否开启（参数见 04-02、04-04），字段名需对照实际版本核验。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把「EVE 有文件」等同于「检测全通」。`eve.json` 里只有 `flow` 和 `stats` 是极常见的现场：它可能意味着规则未加载、`HOME_NET` 未覆盖、协议未识别，也可能只是 `outputs` 段里 alert 类型没开。排障时应严格按图 06-11-01 的链路从前向后收敛，先证明「包进来了」，再证明「流建立了」，最后才讨论「为什么没告警」，并用 `stats.log` 的 `capture`、`decoder`、`detect.alert` 分段计数与 `suricatasc dump-counters` 交叉验证（计数项名称需对照实际版本核验）。第二个陷阱是可见性误判：TLS 加密载荷的明文正文不可见，`tls` 事件记录的是握手元数据、证书、SNI 与 JA3 / JA4 指纹，不能把「HTTPS 请求没匹配到 content 规则」当成输出模块丢事件（原理见 06-12）。第三个陷阱是单条记录过大：`OutputJsonBuilderBuffer` 在缓冲无法扩容时会打印 `Formatted JSON EVE record too large, will be dropped` 并丢弃该条，开启 payload 打印、metadata 或超长 HTTP 头部时更容易触发，表现为「事件偶发缺失但进程无异常」，应在 `suricata.log` 中检索这条告警而不是盲目加大磁盘。
+
+配置层面有几处高频问题。`threaded` 为真时每个输出线程各自持有文件上下文，自定义 EVE filetype 必须保证 `Write` 回调线程安全，否则会出现行交错或句柄竞争；`src/output-eve.h` 的注释明确区分了 threaded 与非 threaded 两种生命周期，`SCEveFileTypeThreadInitFunc` 在 threaded 模式下会被多次调用。轮转要与 `etc/suricata.logrotate.in` 以及 `suricatasc reopen-log-files` 配套：只切割文件而没通知引擎重开句柄，会导致事件继续写进被移走的旧 inode，表现为「日志文件不再增长」。`OutputRegisterFileRotationFlag` 与 `OutputNotifyFileRotation` 正是为这类通知准备的注册点。写出目标也要量力而行：`redis`、`unix_stream`、`unix_dgram` 各有编译期与运行期依赖，`filetype` 走 `SCRegisterEveFileType` 的插件路径时还要确认插件已加载，否则 `SCEveFindFileType` 找不到名字会直接导致初始化失败（参数见 04-04，具体键名需对照实际版本核验）。
+
+还要守住几条全册一致的能力边界。Suricata 规则语法兼容 Snort 但有自有扩展，不能宣称 100% 兼容；Hyperscan 只是可选 MPM 加速，缺失时回退 AC 等其他实现，不是必需依赖；`suricata-update` 是分仓独立工具，负责规则集下载与合并，不参与 `src/` 主程序编译，别把它写成主程序内建子命令（模块见 07-11）。EVE 是主要输出，但 `fast.log`、`stats.log`、`pcap-log`、`tls-store` 等辅助输出仍有各自用途，不要为了统一而全部关掉。性能方面，事件量、单条体积与落盘速率的关系高度依赖规则集、流量构成与磁盘类型，任何吞吐、pps、内存占用数字一律标注「需在目标机型实测」，不给绝对值（基准方法见 08-01，调优见 08-02）。最佳实践是上线前用 `suricata --build-info` 确认构建特性、`suricata --dump-config` 确认生效的 `outputs` 配置、`suricata -T` 确认规则可加载，运行中盯住 `eve.json` 的事件类型分布与 `suricata.log` 的告警，并把日志目录权限、磁盘余量与轮转策略写进上线清单，避免检测全通却因写满磁盘而丢事件。
+
+### 7. 小结与延伸阅读
+
+本篇给出一条主线、两个权威源、三类边界。一条主线是「根模块注册 → 子模块登记 → 公共头构造 → Rust `SCJsonBuilder` 追加字段 → `OutputJsonBuilderBuffer` 收口 → `LogFileWrite` 落盘 → 轮转重开」，它由 `src/output.c` / `.h` 的 `OutputModule` 框架承载，在 `src/output-json.c` 的 `OutputJsonRegister`、`CreateEveHeader`、`EveAddCommonOptions`、`OutputJsonBuilderBuffer` 中被逐段执行，最终以 `event_type` 分类、`flow_id` 聚合、`community_id` 跨工具对齐的形式落到 `eve.json`。两个权威源是：结构体逐字段看 05，配置与命令参数看 04；本篇及 06 全册只负责机制与调用链，不越界重列字段表或参数全集。三类边界是：Suricata 不做转发、不是防火墙；加密载荷明文不可见；规则语法兼容 Snort 但非完全一致。把这三点记住，能避免大半望文生义的误判。
+
+延伸阅读按流水线向两侧展开：检测求值顺序见 06-08，阈值与有状态关键字见 06-09，文件提取与 `file.data` 见 06-10，IPS verdict 与 drop 事件见 06-12，runmode 与多线程负载均衡见 06-13，Lua / Rust 扩展与输出扩展点见 06-14。按目录查模块能力可跳到 07-07（output 与 log-*）、07-10（rust/ 与 Rust 解析器生态）；按字段查结构可跳到 05-08；按参数查配置与命令可跳到 04-04、04-07、04-08。统一交叉引用写法：字段见 05-08 ｜ 参数见 04-04、04-07 ｜ 原理见 06-12 至 06-14 ｜ 模块见 07-07、07-10。本篇所有未核实的具体字段名、函数签名与配置键名均标注「需对照实际版本核验」，版本基准始终为「上游 main 快照（2026-11 抓取）」。
+
+## 06-12 IPS verdict、丢包与内联模式
+
+### 1. 背景与动机
+
+IDS 与 IPS 的分水岭不在规则写得严不严，而在「引擎有没有权力让一个报文停下来」。旁路 IDS 拿的是镜像或分光副本，检测到攻击也只能告警，原始报文早已沿原路径转发完毕；内联 IPS 则把引擎串进转发路径，由它对每个经手的报文给出放行或丢弃的裁决，这个裁决在 Suricata 里就叫 verdict。理解 verdict，是理解「为什么规则写了 `drop` 却没有真正拦住流量」的关键，也是把 03-05 的 IPS 部署从「能启动」推进到「能阻断」的前提。本篇把动作位标志、判定函数、内核下发与事件记录串成一条完整链路，并明确它与普通告警输出的区别。
+
+必须先立住能力边界，且这条边界在本篇比任何一篇都重要。Suricata 是 IDS / IPS / NSM 引擎，不是防火墙，不做 IP 转发，也不做路由。内联阻断依靠 NFQUEUE 或 AF_PACKET 桥接的 verdict：NFQUEUE 模式下内核把报文暂存进队列，等 Suricata 通过 `nfq_set_verdict` 系列函数给出 `NF_ACCEPT` 或 `NF_DROP` 后，才由内核 netfilter 决定放行还是丢弃；AF_PACKET 桥接模式下报文从一个网卡收进来、经检测后由桥接对端写出到另一个网卡，丢弃就是不再写出。真正执行转发与丢弃动作的是内核或桥接对端，而不是 Suricata 自己去转发报文。IDS 旁路模式只告警不丢弃，这一点必须与 IPS 内联严格区分。另一个边界同样适用：引擎只对自身解码并重组到的流量做检测，TLS 等加密载荷的明文正文不可见，能用于阻断判定的仍是握手元数据、证书、SNI、JA3 / JA4 等，不能宣称能读到 HTTPS 明文（原理见 06-11）。
+
+从工程价值看，把 verdict 链路拆清楚有两个直接收益。其一是排障：IPS「不 drop」是最高频的现场问题，可能的原因包括队列号不一致、规则动作写成 `alert` 而非 `drop`、`stream.inline` 与重组配置不匹配、fail-open 打开后引擎异常时一律放行、以及 NFQUEUE 模式被误设成 repeat 或 route；只有知道动作从哪里来、在哪里被翻译成内核常量，才能按段收敛。其二是可靠性：内联模式把引擎变成了转发路径上的一环，引擎崩溃、队列拥塞或 verdict 超时都可能影响业务连通性，因此 fail-open、批量 verdict 缓存与计数器监控不是可选项。任何吞吐、pps、丢包率与内存占用结论一律标注「需在目标机型实测」，不给绝对值。本套资料版本基准统一为「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验；本篇所有常量、函数名与路径均以此快照下 `upstream_src/suricata/suricata-main/` 内的真实文件为锚点。
+
+### 2. 核心概念
+
+动作的公共表示是一组位标志，定义在 `src/action-globals.h`。`ACTION_ALERT` 为 `0x01`、`ACTION_DROP` 为 `0x02`、`ACTION_REJECT` 为 `0x04`、`ACTION_REJECT_DST` 为 `0x08`、`ACTION_REJECT_BOTH` 为 `0x10`、`ACTION_PASS` 为 `0x20`、`ACTION_CONFIG` 为 `0x40`、`ACTION_ACCEPT` 为 `0x80`；另有组合掩码 `ACTION_REJECT_ANY` 聚合三种 reject 变体，`ACTION_DROP_REJECT` 再把 `ACTION_DROP` 并入。用位标志而非枚举的设计意图在源码注释里写得很直白：一个包可以同时「被告警」又「被丢弃」，多个规则命中后动作按位或合并，最终由 `PacketCheckAction` 一族宏/函数查询。`enum ActionScope` 进一步给出 `ACTION_SCOPE_AUTO`、`ACTION_SCOPE_PACKET`、`ACTION_SCOPE_FLOW`、`ACTION_SCOPE_HOOK`、`ACTION_SCOPE_TX`，说明动作可以作用于单包、整条流、当前 hook 或当前事务，而不只是「这个包丢不丢」。这里要点名但不重列字段：动作最终挂在 `Packet` 上（字段见 05-02），规则侧的 `Signature` 动作来源见 05-05，完整动作位定义以 `src/action-globals.h` 为准。
+
+NFQUEUE 的判定与执行集中在 `src/source-nfq.c`。`TmModuleVerdictNFQRegister(void)` 把 `tmm_modules[TMM_VERDICTNFQ]` 注册为名为 `VerdictNFQ` 的线程模块，其 `Func` 为 `VerdictNFQ`、`ThreadInit` 为 `VerdictNFQThreadInit`、`ThreadDeinit` 为 `VerdictNFQThreadDeinit`；收包侧由 `nfq_create_queue(q->h, q->queue_num, &NFQCallBack, (void *)t)` 建立队列并挂上 `NFQCallBack` 回调。真正把动作翻译成内核常量的是 `static inline uint32_t GetVerdict(const Packet *p)`：默认 `verdict = NF_ACCEPT`，若 `PacketCheckAction(p, ACTION_DROP)` 成立则改为 `NF_DROP`，否则按 `nfq_config.mode` 分支——`NFQ_ACCEPT_MODE` 给 `NF_ACCEPT`，`NFQ_REPEAT_MODE` 给 `NF_REPEAT`，`NFQ_ROUTE_MODE` 则把 `NF_QUEUE` 与 `nfq_config.next_queue` 组合成下一个队列号。下发动作的是 `NFQSetVerdict(Packet *p, const uint32_t mark_value, const bool mark_modified)`，它按编译期能力选择 `nfq_set_verdict`、`nfq_set_verdict2`、`nfq_set_verdict_mark` 之一；为减少系统调用，`NFQVerdictCacheAdd`、`NFQVerdictCacheFlush`、`NFQVerdictCacheLen` 维护批量 verdict 缓存，配合 `nfq_set_verdict_batch` / `nfq_set_verdict_batch2` 一次刷出多个裁决，其中 `NF_DROP` 或 `PKT_STREAM_MODIFIED` 的包会立即触发 flush。
+
+拒绝对端与统计也在这条链上。`UpdateCounters` 按 `PacketCheckAction(p, ACTION_DROP)` 递增 `nq->dropped`，否则在 `PKT_STREAM_MODIFIED`（流被 inline 改写）时递增 `nq->replaced`，再递增 `nq->accepted`；线程退出时 `SCLogNotice` 打印 `(%s) Verdict: Accepted ..., Dropped ..., Replaced ...`，这是判读 IPS 是否真在干活最直接的证据。可靠性方面，`SCConfGetBool("nfq.fail-open", &boolval)` 读取 fail-open 开关，开启后队列在引擎侧异常时不再无限期扣留报文，代价是异常窗口内可能放行本应丢弃的流量。`reject` 动作比 `drop` 多一步：`src/output-json-alert.c` 的 `EveAddVerdict` 会按 `p->proto` 往 `reject` 数组里写 `icmp-prohib`（UDP / ICMP / ICMPV6）或 `tcp-reset`（TCP），并给出 `reject_target` 为 `to_client`、`to_server` 或 `both`；`src/stream-tcp-inline.c` 的 `StreamTcpInlineSegmentCompare` 与 `StreamTcpInlineSegmentReplacePacket` 则支撑内联模式下对重组段的替换与改写。交叉引用：字段见 05-02、05-05 ｜ 参数见 04-03、04-05 ｜ 模块见 07-06、07-08。
+
+AF_PACKET 桥接是另一条内联路径。`src/source-af-packet.c` 用 `AFPPeer` 表示 IPS 对端，`AFPPeersList peerslist` 维护成对的两张网卡，`AFPRefSocket` / `AFPDerefSocket` 管理套接字引用，`AFPGetIfnumByDev` 解析网卡索引；`src/runmode-af-packet.c` 用 `SCConfGetChildValueWithDefault` 读 `copy-mode` 与 `copy-iface`，把 `tap` 映射为 `AFP_COPY_MODE_TAP`、`ips` 映射为 `AFP_COPY_MODE_IPS`，未配置时为 `AFP_COPY_MODE_NONE`（旁路），并对 `copy-iface` 与入接口相同、或 `AFP_TPACKET_V3` 与 copy 模式组合不当给出告警。也就是说，桥接模式下「丢弃」体现为不把报文写到对端网卡，而不是调用 `nfq_set_verdict`。两条路径殊途同归：都把动作位翻译成「放不放行」的结果，都不由 Suricata 自己做 IP 转发。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，不重列字段；06 全册禁止完整结构体字段表，逐字段定义一律到 05。
+
+- 动作位与作用域：`src/action-globals.h` 的 `ACTION_*` 宏与 `enum ActionScope`（字段见 05-02、05-05）。这些常量被 `PacketCheckAction`、`PacketGetAction`、`EveAddVerdict`、`JsonDropLogCondition`、`GetVerdict` 等广泛使用，是全篇的语义原点。
+- `Packet` 与动作存储：`src/decode.h` / `src/decode.c`，`Packet` 上既挂动作位，也挂 `p->flow`、`p->proto`、`p->flags`（如 `PKT_STREAM_MODIFIED`）、`p->nfq_v.id`、`p->nfq_v.mark` 等 NFQ 相关成员（字段见 05-02；`nfq_v` 具体成员需对照 `src/source-nfq.h` 与 `src/decode.h` 实际版本核验）。
+- NFQ 线程与队列上下文：`src/source-nfq.c` / `.h`、`src/source-nfq-prototypes.h` 中的 `NFQQueueVars`、`NFQGlobalVars`、`nfq_config` 等，`tmm_modules[TMM_VERDICTNFQ]` 属 `TmModule` 注册表（字段见 05-07）。`struct nfq_q_handle`、`struct nfgenmsg` 来自 libnetfilter_queue 而非 Suricata 自身，其布局需对照实际依赖版本核验。
+- 规则侧动作来源：`src/detect-engine-iponly.c` 处理只检查 IP 地址的签名，以 `IPOnlyCIDRItemNew`、`IPOnlyCIDRItemParseSingle`、`IPOnlyCIDRItemCompare`、`IPOnlyCIDRListQSort` 等把地址规则组织成 CIDR 表；这类规则命中后同样把签名动作合并到 `Packet`，因此 ip-only 的 `drop` 规则也会进入 verdict 判定（字段见 05-05、05-06，具体合并入口函数名需对照实际版本核验）。
+- 输出上下文：`src/output-json-alert.c` 的 `AlertJsonOutputCtx`、`src/output-json-drop.c` 的 `JsonDropOutputCtx`，以及 `src/output-json.h` 的 `OutputJsonCtx`（字段见 05-08）。
+
+文件落点整理如下：动作常量在 `src/action-globals.h`；NFQ 收包与 verdict 在 `src/source-nfq.c` / `.h`、`src/runmode-nfq.c`；AF_PACKET 桥接在 `src/source-af-packet.c` 与 `src/runmode-af-packet.c`；内联重组在 `src/stream-tcp-inline.c` / `.h`；规则动作与告警在 `src/detect-engine-iponly.c`、`src/detect-engine-alert.c`（路径需对照实际版本核验）；事件输出在 `src/output-json-alert.c`、`src/output-json-drop.c`。`stream.inline`、`nfq.fail-open`、`copy-mode` 等配置键名与取值需对照 `suricata.yaml.in` 与 `src/` 实际版本核验（参数见 04-03、04-04）。交叉引用：字段见 05-02、05-05、05-07、05-08 ｜ 参数见 04-03、04-05 ｜ 模块见 07-06、07-08。
+
+### 4. 关键流程与调用链
+
+把动作从规则变成内核裁决，可以拆成四步。第一步是动作产生：规则命中后由检测引擎把 `Signature` 上的动作按位或累积到 `Packet`，其中 ip-only 规则走 `src/detect-engine-iponly.c` 的 CIDR 表，普通规则走 `SigMatch` 求值链（原理见 06-08）。第二步是动作聚合与告警构造：`EveAddVerdict(SCJsonBuilder *jb, const Packet *p, const uint8_t alert_action)` 用 `PacketGetAction(p)` 取当前动作，按优先级写 `verdict.action`——命中 `ACTION_REJECT_ANY` 时依 `EngineModeIsIPS()` 写 `drop` 或 `alert` 并附 `reject_target` 与 `reject` 数组；否则 `ACTION_DROP` 且为 IPS 写 `drop`，`ACTION_ACCEPT` 写 `accept`，`ACTION_PASS` 写 `pass`，其余写 `alert`。注意这里的 `verdict` 是 EVE 事件里的描述性字段，与内核 `nfq_set_verdict` 的裁决值不是同一个对象，但取值来自同一组动作位。
+
+第三步是裁决翻译与下发。NFQUEUE 路径中 `VerdictNFQ` 模块取出 `Packet`，`GetVerdict` 把 `ACTION_DROP` 翻译成 `NF_DROP`、把 repeat / route 模式翻译成 `NF_REPEAT` 或下一个队列号，其余为 `NF_ACCEPT`；`NFQSetVerdict` 先尝试 `NFQVerdictCacheAdd` 入缓存，缓存满或遇到必须立即下发的包时调用 `NFQVerdictCacheFlush`，最终落到 `nfq_set_verdict` / `nfq_set_verdict2` / `nfq_set_verdict_mark`。隧道场景下注释特别说明传入的是 tunnel root packet，避免对内层包重复下发。AF_PACKET 桥接路径则由 `AFPPeer` 决定写出对端，`copy-mode` 为 `ips` 时未丢弃的报文才被写到 `copy-iface` 指向的网卡。第四步是事件记录：`src/output-json-drop.c` 的 `JsonDropLogRegister` 用 `OutputRegisterPacketSubModule(LOGGER_JSON_DROP, "eve-log", MODULE_NAME, "eve-log.drop", ...)` 登记 drop logger，`JsonDropLogCondition` 以 `PacketCheckAction(p, ACTION_DROP)` 或 `p->flow->flags & FLOW_ACTION_DROP` 为条件，`DropLogJSON` 与 `JsonDropLogger` 写出 `event_type` 为 `drop` 的 EVE 记录。整条动作到裁决的链路见图 06-12-01。
+
+:::figure id=06-12-01 | name=IPS 动作聚合与 NFQUEUE 桥接 verdict 链 | dir=TD
+node v1 "规则命中<br/>ACTION_* 位标志" amber
+node v2 "PacketCheckAction<br/>动作聚合" purple
+node v3 "GetVerdict<br/>NF_ACCEPT/DROP" red
+node v4 "NFQSetVerdict<br/>nfq_set_verdict" red
+node v5 "内核 NFQUEUE<br/>放行或丢弃" blue
+node v6 "AFPPeer 桥接<br/>copy-mode ips" teal
+node v7 "EveAddVerdict<br/>写入 verdict" green
+node v8 "drop 事件<br/>eve-log.drop" green
+edge v1 -> v2 "位或合并"
+edge v2 -> v3 "查询动作"
+edge v3 -> v4 "批量缓存"
+edge v4 -> v5 "下发裁决"
+edge v1 -> v6 "桥接路径"
+edge v6 -> v5 "对端转发"
+edge v2 -> v7 "告警构造"
+edge v7 -> v8 "事件落盘"
+edge v3 -> v5 dashed "fail-open"
+:::
+
+还有一个容易混淆的对照：`alert` 动作的 EVE `verdict.action` 在 IDS 模式下是 `alert`，在 IPS 模式下即便规则只写 `alert` 也不会变成 `drop`，只有 `ACTION_DROP` 或 `ACTION_REJECT` 才会触发丢弃；反过来，规则写了 `drop` 但引擎跑在旁路 IDS 模式下，`EngineModeIsIPS()` 为假，`EveAddVerdict` 也不会把它写成 `drop`，`GetVerdict` 更不会被调用，因为没有 NFQUEUE 队列在等裁决。这就是「规则、运行模式、队列配置三者必须一致」的由来。图 06-12-01 中虚线表示 fail-open 对裁决路径的影响：它不改写动作位，而是在引擎无法及时给出裁决时让内核侧倾向放行，属于可靠性兜底而非检测逻辑，判读 drop 计数时必须把它纳入考虑。
+
+### 5. 配置/命令/代码实例
+
+本节只给最小必要实例并显式指向权威源：`suricata.yaml` 的 NFQ / af-packet 段、规则动作关键字、`suricata` 命令行与 `suricatasc` 命令全集见 04 全册（参数见 04-03、04-05、04-07），此处不重列参数全集。下面先给一段按 `src/source-nfq.c` 真实源码书写的裁决摘录，函数名与分支均来自该文件，不构成完整实现。
+
+```c
+/* NFQUEUE verdict 判定，见 src/source-nfq.c 的 GetVerdict */
+static inline uint32_t GetVerdict(const Packet *p)
+{
+    uint32_t verdict = NF_ACCEPT;
+    if (PacketCheckAction(p, ACTION_DROP)) {
+        verdict = NF_DROP;
+    } else {
+        switch (nfq_config.mode) {
+            default:
+            case NFQ_ACCEPT_MODE:
+                verdict = NF_ACCEPT;
+                break;
+            case NFQ_REPEAT_MODE:
+                verdict = NF_REPEAT;
+                break;
+            case NFQ_ROUTE_MODE:
+                verdict = ((uint32_t) NF_QUEUE) | nfq_config.next_queue;
+                break;
+        }
+    }
+    return verdict;
+}
+```
+
+动作常量的位标志定义与语义见下表（`src/action-globals.h`），便于按 `verdict.action` 反查来源。
+
+| 动作常量 | 位值 | 语义与 IPS 行为 |
+|---|---|---|
+| `ACTION_ALERT` | `0x01` | 仅产生告警，旁路 IDS 的主要结果 |
+| `ACTION_DROP` | `0x02` | 内联模式命中后由 verdict 丢弃该包 |
+| `ACTION_REJECT` | `0x04` | 丢弃并回送 tcp-reset 或 icmp-prohib |
+| `ACTION_PASS` | `0x20` | 放行并跳过同包后续规则求值 |
+| `ACTION_ACCEPT` | `0x80` | 防火墙式接受，用于显式放行 |
+| `ACTION_REJECT_ANY` | 组合掩码 | `ACTION_REJECT`\|`ACTION_REJECT_DST`\|`ACTION_REJECT_BOTH` |
+
+下面是一组按「前置检查 → 执行 → 验证输出 → 清理」组织的完整闭环命令，适合在测试环境验证 NFQUEUE 内联阻断是否生效。
+
+```bash
+# 前置检查：确认转发链上已有 NFQUEUE 规则且队列号一致
+iptables -L FORWARD -n --line-numbers | grep NFQUEUE
+
+# 执行：把转发流量送入 0 号队列并启动 NFQ 内联模式
+iptables -I FORWARD -j NFQUEUE --queue-num 0
+suricata -c /etc/suricata/suricata.yaml -q 0 -D
+
+# 验证：统计 drop 事件数并查看 verdict 汇总计数
+grep -o '"event_type":"drop"' /var/log/suricata/eve.json | wc -l
+grep -n "Verdict:" /var/log/suricata/suricata.log | tail -n 2
+
+# 清理：先停引擎再撤 iptables 规则，避免队列悬空
+suricatasc -c shutdown
+iptables -D FORWARD -j NFQUEUE --queue-num 0
+```
+
+典型输出如下（示例输出，具体格式需对照实际版本核验）。
+
+```text
+# 示例输出，具体格式需对照实际版本核验
+Chain FORWARD (policy ACCEPT)
+num  target     prot opt source      destination
+1    NFQUEUE    all  --  0.0.0.0/0   0.0.0.0/0    NFQUEUE num 0
+3
+<Notice> - (VerdictNFQ#01) Verdict: Accepted 184201, Dropped 3, Replaced 0
+{"event_type":"drop","src_ip":"192.0.2.15","dest_ip":"198.51.100.7","alert":{"signature":"ET DROP TEST","signature_id":2100498},"verdict":{"action":"drop"}}
+```
+
+逐行判读如下。前三行是 `iptables -L FORWARD -n --line-numbers` 的回显，`target` 为 `NFQUEUE`、`NFQUEUE num 0` 表明队列号为 0，必须与 `suricata -q 0` 完全一致；若这里队列号是 1 而引擎监听 0，报文会在内核队列里堆积，业务表现为延迟或中断，这是 IPS「不生效」最常见的根因之一。第四行的 `3` 是 `eve.json` 中 `drop` 事件的条数，它应当与测试发出的攻击报文数量同量级；若为零而规则确实命中，优先检查规则动作是否写成 `drop`、`EngineModeIsIPS()` 是否为真、以及 `outputs` 里 drop 类型是否开启（参数见 04-04、04-05）。第五行是 `VerdictNFQ` 线程退出或周期性汇总时打印的计数：`Accepted` 是放行数，`Dropped` 是丢弃数，`Replaced` 是 `PKT_STREAM_MODIFIED` 即流被 inline 改写的包数；`Dropped` 与上一行的 drop 事件数应能对应上，`Accepted` 远大于 `Dropped` 是正常生产特征，若 `Dropped` 恒为零则说明动作根本没传到 `GetVerdict`。第六行是一条 `drop` 事件，`event_type` 标明分类，`alert.signature` 与 `signature_id` 标明命中规则，`verdict.action` 为 `drop` 与前述动作位一致；若这里出现 `alert` 而 `EngineModeIsIPS()` 为真，要回头查规则动作与运行模式。字段名需对照实际版本核验。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把「写了 drop 规则」等同于「一定阻断」。drop 生效需要四个条件同时成立：规则动作确为 `drop` 或 `reject`、引擎运行在内联 IPS 模式（`EngineModeIsIPS()` 为真）、NFQUEUE 队列号与 `-q` 参数及 iptables / nftables 规则三方一致、以及 `outputs` 里 drop 事件类型开启以便观测。任一环节错位都会表现为「有告警但不拦」，应按 08-04 的案例逐项排查，而不是反复改规则。第二个陷阱是 fail-open 的语义误读：`nfq.fail-open` 打开后，引擎或队列异常时内核倾向放行，这是为了避免引擎故障拖垮业务，代价是异常窗口内本应丢弃的流量可能被放行；在对阻断确定性要求高的场景必须评估这一取舍，并配合监控告警，不能把它当成「提升吞吐的开关」。第三个陷阱是把 `NFQ_REPEAT_MODE` 与 `NFQ_ROUTE_MODE` 当成常规配置：前者让报文重入队列、后者把报文导向下一个队列，用错会造成重复检测或环路，生产环境通常以 `NFQ_ACCEPT_MODE` 配合 `ACTION_DROP` 使用（取值需对照 `src/source-nfq.c` 与 `suricata.yaml.in` 实际版本核验）。
+
+内联模式还带来几处与重组相关的约束。`stream.inline` 与重组深度配置决定引擎能对多少字节做改写与判定；`src/stream-tcp-inline.c` 的 `StreamTcpInlineSegmentCompare` 与 `StreamTcpInlineSegmentReplacePacket` 只在内联上下文里生效，`PKT_STREAM_MODIFIED` 会触发 verdict 缓存立即 flush 并递增 `replaced` 计数，若看到 `Replaced` 异常偏高，应检查是否有大量流改写或规则触发了不必要的 inline 处理。AF_PACKET 桥接路径要额外注意 `copy-mode` 与 `copy-iface`：`ips` 模式才具备阻断语义，`tap` 只做复制，`copy-iface` 与入接口相同会被 `src/runmode-af-packet.c` 直接判为非法配置；`AFP_TPACKET_V3` 与 copy 模式的组合也有专门告警，配置前需对照实际版本核验。此外要再次强调，Suricata 不做 IP 转发、不是防火墙，桥接写出与 NFQUEUE 放行都由内核或对端完成，把 IPS 当成「会自己路由的防火墙」会直接导致拓扑设计错误。
+
+最佳实践是建立「动作—裁决—事件」三点对账习惯：上线前用 `suricata --build-info` 确认 NFQUEUE / AF_PACKET 支持已编入、`suricata -T` 确认 `drop` 规则可加载、`suricata --dump-config` 确认 `stream.inline` 与 `nfq` 段生效；运行中用 `suricata.log` 的 `Verdict: Accepted/Dropped/Replaced` 汇总、`eve.json` 的 `drop` 事件与 `verdict.action`、`suricatasc dump-counters` 的即时快照三者交叉验证，任何一侧对不上都说明链路有断点。规则侧注意 Suricata 语法兼容 Snort 但有自有扩展，不能宣称 100% 兼容；`reject` 比 `drop` 多回送报文，在 UDP / ICMP 与 TCP 上分别对应 `icmp-prohib` 与 `tcp-reset`，对端网络可能因此对扫描行为产生额外响应。性能方面，批量 verdict 缓存减少了系统调用但会增加队列占用，队列拥塞、丢包率与内存占用的关系高度依赖机型与流量，任何数字一律标注「需在目标机型实测」，不给绝对值（基准方法见 08-01，调优见 08-02）。最后把回滚方案写进上线清单：内联模式一旦异常会影响业务连通性，必须能快速把流量切回旁路或撤掉 NFQUEUE 规则。
+
+### 7. 小结与延伸阅读
+
+本篇给出一条主线、两个权威源、三类边界。一条主线是「规则动作位 → `PacketCheckAction` 聚合 → `EveAddVerdict` 记录 → `GetVerdict` 翻译成 `NF_ACCEPT` / `NF_DROP` / `NF_REPEAT` → `NFQSetVerdict` 与批量缓存下发 → 内核或桥接对端执行」，AF_PACKET 桥接则以 `AFPPeer` 与 `copy-mode ips` 走「不写出即丢弃」的等价路径；`JsonDropLogRegister` 与 `JsonDropLogCondition` 把结果写成 `event_type` 为 `drop` 的 EVE 记录，`Verdict: Accepted/Dropped/Replaced` 汇总提供对账证据。两个权威源是：结构体逐字段看 05，配置与命令参数看 04；本篇及 06 全册只负责机制与调用链，不越界重列字段表或参数全集。三类边界是：Suricata 不做转发、不是防火墙，阻断由内核或对端执行；IDS 旁路只告警不丢弃，IPS 内联才具备 drop 能力；加密载荷明文不可见，阻断判定仍基于可见元数据与重组后的流。
+
+延伸阅读按链路向前后展开：检测求值与动作产生见 06-08，EVE 事件构造与 `verdict` 字段落盘见 06-11，runmode 与线程拓扑见 06-13，Lua / Rust 扩展能力边界见 06-14，抓包后端与 RSS 差异见 06-02。按目录查模块能力可跳到 07-06（source-* 抓包源）、07-08（stream-tcp 与重组）；按字段查结构可跳到 05-02、05-05、05-07、05-08；按参数查配置与命令可跳到 04-03、04-05、04-07、04-08。统一交叉引用写法：字段见 05-02、05-05、05-07 ｜ 参数见 04-03、04-05 ｜ 原理见 06-11、06-13 ｜ 模块见 07-06、07-08。本篇所有未核实的具体字段名、函数签名与配置键名均标注「需对照实际版本核验」，版本基准始终为「上游 main 快照（2026-11 抓取）」。
+
+## 06-13 runmode（workers/autofp/single）与多线程负载均衡
+
+### 1. 背景与动机
+
+把 Suricata 从「单线程离线分析器」变成「常驻的多线程在线引擎」，靠的不是简单地多开几个线程，而是由 runmode 决定静态的 `TmModule` 表被装配成怎样的线程与队列拓扑。同样一条「收包 → 解码 → 流与重组 → 应用解析 → 检测 → 输出」流水线，在 `workers` 模式下可能全部压在同一个线程内顺序执行，在 `autofp` 模式下则被拆成收包线程与多个检测线程、靠中间队列解耦，在 `single` 模式下又退回单线程用于调试。三种模式的队列数量、锁竞争位置、绑核方式与扩展上限截然不同，选错模式或只改线程数而不动配套配置，正是「加了线程反而更慢」「吞吐到某个点就饱和」这类现场问题的根源。本篇把三种 runmode 的队列与线程拓扑差异逐项拆开，并落到 `src/util-runmodes.c`、`src/runmodes.c`、`src/tm-threads.c` 的真实函数上。
+
+必须先立住能力边界。Suricata 是 IDS / IPS / NSM 引擎，不是防火墙，不做 IP 转发，也不做路由；旁路 IDS 只收副本告警，内联 IPS 的阻断依靠 NFQUEUE 或 AF_PACKET 桥接的 verdict（原理见 06-12）。多线程运行模式分 `workers` / `autofp` / `single` 三种（见 `src/runmodes.c`、`src/runmode-*.c`），流亲和（flow affinity）、RSS / fanout 负载均衡与队列分配共同决定扩展性，绝不能把「加线程」写成必然线性提速。另一个不可回避的边界是可见性：引擎只对自身解码并重组到的流量做检测，TLS 等加密载荷明文不可见，能拿到的是握手元数据、证书、SNI、JA3 / JA4 等，不能宣称能读到 HTTPS 明文正文。抓包后端的能力与环境要求差异也大：DPDK 需独占网卡、大页与 EAL 参数，AF_XDP / Netmap 有内核与驱动要求，pcap 多用于离线或低速率（模块见 07-06）。
+
+从工程价值看，理解 runmode 有两个直接收益。其一是排障：`autofp` 下队列没有配对的 reader 与 writer 会在启动时被 `TmValidateQueueState` 拦下，`workers` 下 RSS 队列数与 threads 不匹配会让部分线程空转，二者表现都是「CPU 没跑满但吞吐上不去」，但根因一个在队列装配、一个在分流亲和。其二是容量规划：只有知道包在哪些队列间搬运、在哪里发生 `SCMutexLock` 与 `SCCondWait`，才能理解为什么扩展曲线会提前饱和，以及为什么绑核、NUMA、对称哈希必须与 threads 一起调。任何吞吐、pps、丢包率与内存占用结论一律标注「需在目标机型实测」，不给绝对值。本套资料版本基准统一为「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验；本篇所有函数名、队列名与路径均以此快照下 `upstream_src/suricata/suricata-main/` 内的真实文件为锚点。
+
+### 2. 核心概念
+
+runmode 的公共抽象是注册表。`src/runmodes.c` 定义 `static RunModes runmodes[RUNMODE_USER_MAX]`，其中每个 `RunMode` 带一个 `int (*RunModeFunc)(void)` 回调与描述字符串；`RunModeRegisterRunModes(void)` 在启动期依次调用 `RunModeIdsPcapRegister`、`RunModeIdsAFPRegister`、`RunModeIdsAFXDPRegister`、`RunModeIdsNetmapRegister`、`RunModeIdsNflogRegister`、`RunModeDpdkRegister` 等把各后端的自定义模式填进表。`RunModeDispatch(int runmode, const char *custom_mode, const char *capture_plugin_name, ...)` 是装配入口：它先用 `RunModeGetConfOrDefault(int capture_mode, const char *capture_plugin_name)` 决定默认模式，再用 `RunModeGetCustomMode(enum SCRunModes, const char *custom_mode)` 按名字取出目标 `RunMode`，最后执行 `mode->RunModeFunc()`。`RunmodeGetActive()` 返回当前生效的模式名，源码里用 `strcmp(RunmodeGetActive(), "workers") == 0` 与 `strcmp(RunmodeGetActive(), "autofp") == 0` 做分支判断。以 AF_PACKET 为例，`src/runmode-af-packet.c` 的 `RunModeIdsAFPRegister(void)` 通过 `RunModeRegisterNewRunMode(RUNMODE_AFP_DEV, "single" / "workers" / "autofp", ..., RunModeIdsAFPSingle / RunModeIdsAFPWorkers / RunModeIdsAFPAutoFp, AFPRunModeEnableIPS)` 登记三个模式，默认由 `RunModeIdsAFPGetDefaultMode()` 返回 `workers`。
+
+三种模式的差别，本质在「收包与检测是否拆到不同线程」以及「中间用什么队列」。线程名常量在 `src/runmodes.c` 里写得很直白：`thread_name_autofp = "RX"`、`thread_name_workers = "W"`、`thread_name_single = "W"`，即 autofp 的收包线程叫 RX、检测线程叫 W，而 workers 与 single 都是 W。装配逻辑集中在 `src/util-runmodes.c` 的三个函数：`RunModeSetLiveCaptureAutoFp`（第 85 行）、`RunModeSetLiveCaptureWorkers`（第 329 行）、`RunModeSetLiveCaptureSingle`（第 353 行），它们共用底层的 `RunModeSetLiveCaptureWorkersForDevice`（第 244 行）。每个线程由 `TmThreadCreatePacketHandler` 创建，其参数依次是线程名、输入队列名、输入队列 handler、输出队列名、输出队列 handler、线程循环类型；slot 链由 `TmSlotSetFuncAppend(ThreadVars *, TmModule *, const void *)` 按序挂接，`TmModuleGetByName` 按字符串取模块，`TmThreadSpawn` 启动，`TmThreadSetCPU` 绑核，最后由 `TmThreadWaitOnThreadInit` 等待就绪。
+
+队列 handler 是另一半。`src/tmqh-flow.c` 的 `TmqhFlowRegister(void)` 把 `tmqh_table[TMQH_FLOW].name` 设为 `"flow"`，`InHandler` 设为 `TmqhInputFlow`，`OutHandler` 由 `SCConfGetNonNull("autofp-scheduler", &scheduler)` 决定：`hash` 用 `TmqhOutputFlowHash`，`ippair` 用 `TmqhOutputFlowIPPair`，`ftp-hash` 用 `TmqhOutputFlowFTPHash`，而 `round-robin` 与 `active-packets` 会打印「using flow hash instead of ...」并回退到 `TmqhOutputFlowHash`，未配置时同样默认 Hash。`TmqhInputFlow(ThreadVars *tv)` 从 `tv->inq->pq` 取包，空队列时 `SCMutexLock(&q->mutex_q)` 后 `SCCondWait(&q->cond_q, &q->mutex_q)` 等待——这正是 autofp 模式锁竞争与上下文切换的落点。`src/tm-queues.c` 的 `q->is_packet_pool = (strcmp(q->name, "packetpool") == 0)` 说明 `packetpool` 是特殊队列：它既是包的来源也是回池目的地，不构成跨线程搬运。`threading.detect-thread-ratio` 由 `src/runmodes.c` 用 `SCConfGetFloat` 读取，用于换算检测线程规模（参数见 04-03，具体取值需对照实际版本核验）。交叉引用：字段见 05-07 ｜ 参数见 04-03 ｜ 模块见 07-06、07-09。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，不重列字段；06 全册禁止完整结构体字段表，逐字段定义一律到 05。
+
+- `RunMode`、`RunModes`、注册表 `runmodes[RUNMODE_USER_MAX]`、`enum SCRunModes`（`RUNMODE_PCAP_DEV`、`RUNMODE_AFP_DEV`、`RUNMODE_AFXDP_DEV`、`RUNMODE_NFQ`、`RUNMODE_NETMAP`、`RUNMODE_DPDK`、`RUNMODE_PLUGIN`、`RUNMODE_UNIX_SOCKET` 等）：`src/runmodes.c` / `.h`（字段见 05-07、05-09）。`RunModeRegisterNewRunMode` 的签名带 `RunModeFunc` 与 `RunModeIsIPSEnabled` 两个回调，是各后端登记模式的统一入口。
+- `ThreadVars`、`TmModule`、`TmSlot`、`PacketQueue`：`src/threadvars.h`、`src/tm-modules.h`、`src/tm-threads.h`、`src/tm-queues.h` 与 `src/tm-threads.c`（字段见 05-07）。`tmm_modules[TMM_FLOWWORKER]`、`tmm_modules[TMM_RECEIVEAFP]` 这类注册表项正是 runmode 拼装 slot 链的素材。
+- `tmqh_table[TMQH_FLOW]` 与 flow 队列上下文：`src/tmqh-flow.c`、`src/tm-queuehandlers.c` / `.h`、`src/tmqh-packetpool.c`（字段见 05-07）。`TMQH_FLOW` 的 `OutHandlerCtxSetup` 为 `TmqhOutputFlowSetupCtx`、`OutHandlerCtxFree` 为 `TmqhOutputFlowFreeCtx`。
+- 绑核上下文：`src/util-affinity.c` / `.h` 的 `ThreadsAffinityType thread_affinity[MAX_CPU_SET]`，以及 `src/tm-threads.c` 的 `SetCPUAffinity(uint16_t)`、`SetCPUAffinitySet(cpu_set_t *)`、`TmThreadSetCPUAffinity`、`TmThreadSetCPU(ThreadVars *, uint8_t)`、`TmThreadSetupOptions`（字段见 05-07）。`RECEIVE_CPU_SET` 与 `WORKER_CPU_SET` 是装配时传给 `TmThreadSetCPU` 的绑核类型常量。
+- 配置与运行实例：`SCInstance` 保存 `runmode` 相关运行选择，`src/suricata.c` 的生命周期函数调用 `RunModeRegisterRunModes` 与 `RunModeDispatch`（字段见 05-09）。
+
+文件落点整理如下：模式注册与分派在 `src/runmodes.c` / `.h`；各后端模式在 `src/runmode-af-packet.c`、`src/runmode-af-xdp.c`、`src/runmode-dpdk.c`、`src/runmode-netmap.c`、`src/runmode-nfq.c`、`src/runmode-pcap.c`、`src/runmode-pcap-file.c`、`src/runmode-nflog.c`、`src/runmode-unix-socket.c` 等；三种拓扑的公共装配在 `src/util-runmodes.c` / `.h`；线程创建、slot 链与绑核在 `src/tm-threads.c` / `.h`、`src/tm-modules.c` / `.h`；队列与校验在 `src/tm-queues.c` / `.h`、`src/tm-queuehandlers.c`、`src/tmqh-flow.c`、`src/tmqh-packetpool.c`；亲和配置在 `src/util-affinity.c` / `.h`。`autofp-scheduler`、`threading.detect-thread-ratio`、`threading.set-cpu-affinity` 等键名需对照 `suricata.yaml.in` 与 `src/` 实际版本核验（参数见 04-03）。交叉引用：字段见 05-07、05-09 ｜ 参数见 04-03 ｜ 模块见 07-06、07-09。
+
+### 4. 关键流程与调用链
+
+先看 `workers`。`RunModeSetLiveCaptureWorkers` 遍历 `LiveGetDeviceCount()` 个设备，对每个设备调用 `RunModeSetLiveCaptureWorkersForDevice(..., 0)`；后者把 `threads_count` 设为 `MIN(ModThreadsCount(aconf), thread_max)`，其中 `thread_max = TmThreadsGetWorkerThreadMax()`。每个线程用 `TmThreadCreatePacketHandler(tname, "packetpool", "packetpool", "packetpool", "packetpool", "pktacqloop")` 创建——输入队列与输出队列都是 `packetpool`、handler 也都是 `packetpool`，意味着没有跨线程中间队列；随后 `TmSlotSetFuncAppend` 按序挂上 `recv_mod_name`（如 `ReceiveAFP`）、`decode_mod_name`（如 `DecodeAFP`）、`FlowWorker`、`RespondReject` 四段，`TmThreadSetCPU(tv, WORKER_CPU_SET)` 绑核后 `TmThreadSpawn`。也就是说，workers 的一个 W 线程包办从收包到输出再到回池的全流程，扩展性来自「多条这样的线程各管一路 RSS / fanout 队列」，流亲和由内核对称哈希保证同一条双向流稳定落到同一线程，TCP 重组与应用解析才不会看到断裂片段。
+
+再看 `single`。`RunModeSetLiveCaptureSingle` 在 `nlive > 1` 时直接 `FatalError("Can't use the 'single' runmode with multiple devices")`，然后同样调用 `RunModeSetLiveCaptureWorkersForDevice`，但把最后一个参数 `single_mode` 置为 1；底层函数据此把 `threads_count` 强制为 1，线程名格式化为 `W#01-<dev>`，slot 链与 workers 完全相同、同样无中间队列。single 的价值不在性能，而在调试与离线回放：单线程让调用栈、断点与计数都线性可追，代价是没有并行能力，不能用作生产基准。
+
+`autofp` 是唯一引入中间队列的模式，拓扑差异最值得逐行对照。`RunModeSetLiveCaptureAutoFp` 先用 `RunmodeAutoFpCreatePickupQueuesString(thread_max)` 生成一组 `pickup%u` 队列名串。收包侧每个线程用 `TmThreadCreatePacketHandler(tname, "packetpool", "packetpool", queues, "flow", "pktacqloop")` 创建：输入来自 `packetpool`，输出写到 `queues` 这组 pickup 队列、输出 handler 为 `"flow"`，slot 链只挂 `ReceiveXXX` 与 `DecodeXXX` 两段，`TmThreadSetCPU(tv_receive, RECEIVE_CPU_SET)` 绑到接收核。检测侧按 `thread_max` 循环，用 `snprintf(qname, sizeof(qname), "pickup%u", thread_id)` 得到队列名，再以 `TmThreadCreatePacketHandler(tname, qname, "flow", "packetpool", "packetpool", "varslot")` 创建：输入是对应的 pickup 队列、输入 handler 为 `"flow"`，输出回到 `packetpool`，slot 链挂 `FlowWorker` 与 `RespondReject`，`TmThreadSetCPU(tv_detect_ncpu, WORKER_CPU_SET)` 绑到工作核。收包线程把解码后的包经 `TmqhOutputFlowHash` 按流哈希投进某个 pickup 队列，检测线程从自己那一个 pickup 队列取包，二者数量可以不等——这正是 `detect-thread-ratio` 与 `autofp-scheduler` 起作用的地方。autofp 的完整拓扑见图 06-13-01，workers 与 single 的单线程 slot 链见图 06-13-02。
+
+:::figure id=06-13-01 | name=autofp 模式的收包与检测线程队列拓扑 | dir=TD
+node a1 "网卡 / RSS 队列" blue
+node a2 "收包线程 RX#<br/>ReceiveAFP+Decode" teal
+node a3 "flow 队列 handler<br/>TmqhOutputFlowHash" amber
+node a4 "pickup1 到 N 队列<br/>按流哈希分发" purple
+node a5 "检测线程 W#<br/>FlowWorker+Reject" purple
+node a6 "packetpool<br/>回池" gray
+edge a1 -> a2 "原始帧"
+edge a2 -> a3 "解码后入队"
+edge a3 -> a4 "哈希选队列"
+edge a4 -> a5 "varslot 取包"
+edge a5 -> a6 "处理完成"
+edge a6 -> a2 dashed "包池复用"
+:::
+
+图 06-13-02 把 workers 与 single 两种 runmode 的单线程 slot 链单独展开，逐槽位对照线程内模块的调用次序，便于定位队列与锁竞争瓶颈。
+
+:::figure id=06-13-02 | name=workers 与 single 模式的单线程 slot 链 | dir=TD
+node w1 "网卡 / 单队列" blue
+node w2 "单一 W# 线程<br/>pktacqloop" teal
+node w3 "ReceiveXXX<br/>收包模块" teal
+node w4 "DecodeXXX<br/>解码模块" teal
+node w5 "FlowWorker<br/>流与检测" purple
+node w6 "RespondReject<br/>与输出" green
+node w7 "packetpool<br/>同进同出" gray
+edge w1 -> w2 "帧入队"
+edge w2 -> w3 "slot 1"
+edge w3 -> w4 "slot 2"
+edge w4 -> w5 "slot 3"
+edge w5 -> w6 "slot 4"
+edge w6 -> w7 "回池"
+edge w7 -> w2 dashed "无中间队列"
+:::
+
+装配收尾同样关键。`src/runmodes.c` 的 `RunModeDispatch` 在 `mode->RunModeFunc()` 之后调用 `TmValidateQueueState()`（实现在 `src/tm-queues.c` 第 105 行）校验每个队列至少有一读一写，再拉起流管理、统计、日志维护等管理线程，最后 `TmThreadsSealThreads()`（实现在 `src/tm-threads.c` 第 2161 行）封板；自定义 runmode 或队列 handler 配对写错时会在这里直接报错退出。还要记住两条硬约束：`src/runmodes.c` 里 DPDK 分支强制把模式设为 `workers` 并提示修改配置，`src/runmode-af-packet.c` 里明确写着 `tpacket v3 is only implemented for 'workers' runmode`，即 TPACKET_V3 只在 workers 下可用。三种模式的拓扑对照汇总见第 5 节表格，图 06-13-01 的虚线表示 packetpool 的包复用回环，图 06-13-02 的虚线强调 workers 与 single 的队列同进同出、没有跨线程搬运。
+
+### 5. 配置/命令/代码实例
+
+本节只给最小必要实例并显式指向权威源：`suricata.yaml` 的 `threading`、`af-packet`、`runmode` 全段与命令行、`suricatasc` 命令全集见 04 全册（参数见 04-03、04-07），此处不重列参数全集。下面先给一段按真实源码书写的注册与装配摘录，函数名与队列名均来自 `src/runmode-af-packet.c` 与 `src/util-runmodes.c`，不构成完整实现。
+
+```c
+/* 三种 runmode 登记，见 src/runmode-af-packet.c */
+void RunModeIdsAFPRegister(void)
+{
+    RunModeRegisterNewRunMode(RUNMODE_AFP_DEV, "single",
+            "Single threaded af-packet mode",
+            RunModeIdsAFPSingle, AFPRunModeEnableIPS);
+    RunModeRegisterNewRunMode(RUNMODE_AFP_DEV, "workers",
+            "Workers af-packet mode",
+            RunModeIdsAFPWorkers, AFPRunModeEnableIPS);
+    RunModeRegisterNewRunMode(RUNMODE_AFP_DEV, "autofp",
+            "Autofp with flow based load balancing",
+            RunModeIdsAFPAutoFp, AFPRunModeEnableIPS);
+}
+
+/* autofp 收包线程与检测线程的队列配对，见 src/util-runmodes.c */
+ThreadVars *tv_receive = TmThreadCreatePacketHandler(tname,
+        "packetpool", "packetpool", queues, "flow", "pktacqloop");
+ThreadVars *tv_detect = TmThreadCreatePacketHandler(tname,
+        qname, "flow", "packetpool", "packetpool", "varslot");
+```
+
+三种 runmode 在队列、线程与 slot 链上的差异见下表，是选型与排障时最该先对照的一张表。
+
+| 维度 | workers | autofp | single |
+|---|---|---|---|
+| 线程数 | 每设备 `threads_count` 个 | 收包线程加检测线程两组 | 固定 1 个 |
+| 输入队列 | `packetpool` | 收包 `packetpool`、检测 `pickup%u` | `packetpool` |
+| 输出 handler | `packetpool` | 收包用 `flow`、检测用 `packetpool` | `packetpool` |
+| slot 链 | 单线程内四段全包 | 收包两段、检测两段分离 | 单线程内四段全包 |
+| 中间队列 | 无 | 有，`flow` 队列按哈希分发 | 无 |
+| 典型用途 | 生产默认、配 RSS 亲和 | 收包与检测能力解耦 | 调试与离线回放 |
+
+下面是一组按「前置检查 → 执行 → 验证输出 → 清理」组织的完整闭环命令，适合确认当前生效的 runmode 与线程规模。
+
+```bash
+# 前置检查：列出构建支持的 runmode，并确认配置可加载
+suricata --list-runmodes
+suricata -T -c /etc/suricata/suricata.yaml
+
+# 执行：显式指定 workers 模式在 eth0 上常驻运行
+suricata -c /etc/suricata/suricata.yaml -i eth0 --set runmode=workers -D
+
+# 验证：确认生效配置与线程计数，再看解码统计是否增长
+suricata --dump-config | grep -n "runmode\|threading" | head -n 10
+grep -n "decoder.pkts" /var/log/suricata/stats.log | tail -n 2
+
+# 清理：经控制面正常关闭
+suricatasc -c shutdown
+```
+
+典型输出如下（示例输出，具体格式需对照实际版本核验）。
+
+```text
+# 示例输出，具体格式需对照实际版本核验
+<Notice> - Configuration provided was successfully loaded. Exiting.
+runmode: workers
+threading.set-cpu-affinity: false
+threading.detect-thread-ratio: 1.0
+af-packet.0.threads: 8
+decoder.pkts                              | Total                     | 184233
+decoder.pkts                              | Total                     | 190877
+```
+
+逐行判读如下。第一行是 `suricata -T` 的成功回显，`successfully loaded` 只证明配置与规则能被解析，不代表线程已按预期拉起；`--list-runmodes` 的输出用于确认该构建确实编译进了 `workers`、`autofp`、`single` 等模式，若缺少目标模式要回到 02-02 检查 configure 选项。第二行 `runmode: workers` 是 `--dump-config` 打印的生效值，必须与命令行 `--set runmode=workers` 或 yaml 中的配置一致，若这里显示 `autofp` 而预期是 `workers`，说明配置被更高优先级来源覆盖。第三、四行是线程相关配置：`threading.set-cpu-affinity` 为 `false` 表示未启用绑核，此时线程由操作系统调度、跨 NUMA 访问可能拉低扩展性；`threading.detect-thread-ratio` 为 `1.0` 表示检测线程与工作线程按一比一换算（具体语义需对照 `src/runmodes.c` 实际版本核验）。第五行 `af-packet.0.threads: 8` 是收包线程数，它要与网卡 RSS 队列数、CPU 核数一起看，单独调大而不改分流亲和通常不会线性提速。第六、七行是两次采样的 `decoder.pkts`：只要在线运行时该计数持续单调上升，就说明收包、解码与主流水线是通的；若两次完全相同而 `capture` 也不动，优先怀疑网卡名、权限或队列没有配对 reader 与 writer，若 `capture` 增长而 `decoder.pkts` 停滞，则怀疑解码异常或包池耗尽。字段名与计数项名称需对照实际版本核验。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把「加线程」当成必然线性提速。workers 模式下把 `af-packet.threads` 从 4 调到 8，若网卡 RSS 队列只有 4 路、或 fanout 没有用对称哈希，新增线程可能拿不到包或让同一条流被拆到不同线程，TCP 重组看到缺口、应用解析出现 gap，告警反而失真；autofp 模式下检测线程多于收包线程时，pickup 队列的 `SCMutexLock` / `SCCondWait` 与跨核缓存失效可能抵消并行收益。队列锁竞争、跨 NUMA 访问与包池争用都会让扩展曲线提前饱和，任何吞吐、pps、丢包率与内存占用结论一律标注「需在目标机型实测」，不给绝对值（调优见 08-02）。第二个陷阱是流亲和被破坏：同一条双向流必须稳定落到同一个收包线程，否则重组断裂，`PACKET_FANOUT_HASH` 一类对称哈希与 RSS 配置必须配套检查，这正是 autofp 默认用 `TmqhOutputFlowHash` 而非朴素 round-robin 的原因。第三个陷阱是把 single 当成生产模式：它固定单线程、多设备直接报错，只适合调试与离线回放，用它测出的吞吐不能作为容量依据。
+
+配置层面有几处高频问题。`RunModeDispatch` 末尾的 `TmValidateQueueState()` 会检查每个队列至少有一读一写，自定义 runmode 或队列 handler 配对写错时会直接报错退出，这是「启动即失败」的典型根因之一；`TmThreadsSealThreads()` 之后再改线程拓扑已无意义。绑核要与 `src/util-affinity.c` 的配置一起规划：该文件用 `AffinitySetupLoadFromConfig(void)` 读取配置，经 `AffinitySetupInit`、`GetAffinityTypeForNameAndIface`、`GetOrAllocAffinityTypeForIfaceOfName`、`SetupCpuSets`、`BuildPriorityCpuset`、`SetupAffinityPriority`、`SetupAffinityMode`、`SetupAffinityThreads` 等构造 `ThreadsAffinityType`，装配时再由 `TmThreadSetCPU(tv, RECEIVE_CPU_SET / WORKER_CPU_SET)` 落到具体线程；只开 `set-cpu-affinity` 而不给 cpu-affinity 段，或把收包核与检测核重叠，都会引入不必要的争用（键名需对照 `suricata.yaml.in` 与 `src/util-affinity.c` 实际版本核验）。`autofp-scheduler` 的 `round-robin` 与 `active-packets` 会被回退成 Hash 并打印提示，若日志里出现「using flow hash instead of ...」不要误以为配置没生效。
+
+还要守住几条全册一致的能力边界。Suricata 不做转发、不是防火墙，内联阻断依靠 NFQUEUE 或 AF_PACKET 桥接的 verdict（原理见 06-12）；规则语法兼容 Snort 但有自有扩展，不能宣称 100% 兼容；Hyperscan 只是可选 MPM 加速，缺失时回退 AC 等其他实现，不是必需依赖；`suricata-update` 是分仓独立工具，不参与 `src/` 主程序编译（模块见 07-11）。抓包后端差异也不能忘：DPDK 需独占网卡、大页与 EAL 参数，且 `src/runmodes.c` 会强制把它设为 workers；AF_XDP / Netmap 有内核与驱动要求；PF_RING 在当前 main 快照是否仍为受支持后端、对应源文件与启用方式，需对照 `configure.ac` 与 `src/source-*.c`、`plugins/` 实际版本核验，不得凭印象补出一个 `src/source-pfring.c`。最佳实践是建立 A/B 对照习惯：固定 pcap 或稳定流量，分别测 workers 与 autofp、不同 threads 与绑核组合，用 `stats.log` 的 `capture`、`decoder`、`flow`、`detect` 分段计数与 `suricatasc dump-counters` 的快照做判据（计数项名称需对照实际版本核验），每次只改一个变量，并把「RSS 队列数、threads、绑核、cluster-type」四项一起记录，避免得出「加线程有效」这类无法复现的结论。性能基准方法见 08-01，故障案例见 08-04。
+
+### 7. 小结与延伸阅读
+
+本篇给出一条主线、两个权威源、三类边界。一条主线是「`RunModeRegisterRunModes` 登记 → `RunModeDispatch` 分派 → `mode->RunModeFunc()` 装配 → `TmThreadCreatePacketHandler` 建线程 → `TmSlotSetFuncAppend` 挂 slot → `TmValidateQueueState` 校验 → `TmThreadsSealThreads` 封板」；三种 runmode 的分水岭在于收包与检测是否拆线程、以及中间是否存在 `flow` 队列：workers 与 single 都是单线程内 `ReceiveXXX → DecodeXXX → FlowWorker → RespondReject`、队列同进同出 `packetpool`，区别只在线程数与多设备约束；autofp 则把收包线程的输出接到 `pickup%u` 队列、由 `TmqhOutputFlowHash` 按流哈希分发给独立的检测线程。两个权威源是：结构体逐字段看 05，配置与命令参数看 04；本篇及 06 全册只负责机制与调用链，不越界重列字段表或参数全集。三类边界是：Suricata 不做转发、不是防火墙；加线程不必然线性提速，扩展性由流亲和、RSS / fanout 与队列分配共同决定；加密载荷明文不可见。
+
+延伸阅读按流水线向两侧展开：抓包后端差异与 RSS / fanout 见 06-02，包处理流水线总览见 06-01，输出与日志管线见 06-11，IPS verdict 与内联见 06-12，Lua / Rust 扩展能力边界见 06-14。按目录查模块能力可跳到 07-06（source-* 抓包源）、07-09（util-* 与 conf）；按字段查结构可跳到 05-07、05-09；按参数查配置与命令可跳到 04-03、04-07、04-08。统一交叉引用写法：字段见 05-07、05-09 ｜ 参数见 04-03、04-07 ｜ 原理见 06-01、06-02、06-12、06-14 ｜ 模块见 07-06、07-09、07-11。本篇所有未核实的具体字段名、函数签名与配置键名均标注「需对照实际版本核验」，版本基准始终为「上游 main 快照（2026-11 抓取）」。
+
+## 06-14 Lua/Rust 扩展、插件与输出扩展机制
+
+### 1. 背景与动机
+
+一套成熟的 IDS / IPS / NSM 引擎不可能把所有检测逻辑与输出格式都写死在 C 主程序里：规则表达能力需要脚本化的逃生口，新协议解析器需要更安全的实现语言，第三方抓包硬件需要可插拔的接入方式，日志落点也需要从「写本地文件」扩展到 syslog、数据库或自建管道。Suricata 为此提供了几类彼此独立又共享注册总线的扩展机制——Lua 规则关键字与 Lua 输出脚本、经 cbindgen 暴露的 Rust FFI、动态加载的捕获插件、以及 EVE filetype 输出扩展。理解它们的接入点与能力边界，是判断「某个需求该改配置、写脚本、写 Rust parser，还是必须动主程序源码」的前提，也是避免把扩展点用错地方的关键。
+
+必须先立住能力边界。Suricata 是 IDS / IPS / NSM 引擎，不是防火墙，不做 IP 转发，也不做路由；内联阻断依靠 NFQUEUE 或 AF_PACKET 桥接的 verdict（原理见 06-12）。扩展机制同样受基础边界约束：引擎只对自身解码并重组到的流量做检测，TLS 等加密载荷明文不可见，Lua 脚本能看到的是解析后的包、流、事务与握手元数据、证书、SNI、JA3 / JA4 一类指纹，不能宣称脚本能读到 HTTPS 明文正文。`rust/` 与 Cargo 是构建的一部分（`rust/Cargo.toml.in`、`rust/cbindgen.toml`、`rust/src/`），大量应用层解析器与 EVE 构造在 Rust 侧，不能把 Suricata 写成纯 C 项目，也不能把 Rust 扩展写成「运行时动态加载的解释器」。规则语法兼容 Snort 但有自有扩展，不能宣称 100% 兼容（模块见 07-10）。
+
+从工程价值看，把扩展点拆清楚有两个直接收益。其一选型：想对某个已有协议加一条自定义断言，写 Lua 规则关键字最轻；想支持一个全新应用层协议，走 Rust parser 注册更稳；想把 EVE 写到自定义存储，实现 `SCEveFileType` 即可，不必改 `src/output-json.c`；想接入专用抓包硬件，才需要捕获插件。其二稳定性：Lua 脚本运行在主进程内、受沙箱约束，一个写法不当的脚本可能拖慢检测线程或触发错误；Rust parser 的 FFI 边界与插件的 ABI 版本一旦不匹配，轻则编译失败、重则运行期崩溃，因此「扩展点在哪里」与「哪些东西不能改」必须一起讲。任何吞吐、pps、丢包率与内存占用结论一律标注「需在目标机型实测」，不给绝对值。本套资料版本基准统一为「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验；本篇所有函数名、结构体名与路径均以此快照下 `upstream_src/suricata/suricata-main/` 内的真实文件为锚点。
+
+### 2. 核心概念
+
+Lua 侧有两个彼此独立的接入点。第一个是规则关键字 `lua`，由 `src/detect-lua.c` 的 `DetectLuaRegister(void)` 注册：`sigmatch_table[DETECT_LUA].name = "lua"`、`desc = "match via a lua script"`、`url = "/rules/lua-detection.html"`，并把 `Match` 设为 `DetectLuaMatch`、`AppLayerTxMatch` 设为 `DetectLuaAppTxMatch`、`Setup` 设为 `DetectLuaSetup`、`Free` 设为 `DetectLuaFree`、`RegisterTests` 设为 `DetectLuaRegisterTests`。同一函数里还用 `DetectBufferTypeRegister("ja3.lua")` 与 `("ja3s.lua")` 注册两个 sticky buffer，并通过 `DetectAppLayerInspectEngineRegister` 把它们分别挂到 `ALPROTO_TLS` 与 `ALPROTO_QUIC` 的 `SIG_FLAG_TOSERVER` / `SIG_FLAG_TOCLIENT` 方向，`DetectionEngineInspectGenericList` 作为检视回调。也就是说，Lua 关键字既能做包级匹配，也能做带应用层事务上下文的匹配，能力来自 `sigmatch_table` 注册与 `DetectEngineInspectGenericList` 这条检视链（原理见 06-08）。
+
+第二个是 Lua 输出，由 `src/output-lua.c` 的 `LuaLogRegister(void)` 注册：`OutputRegisterModule(MODULE_NAME, "lua", OutputLuaLogInit)`，其中 `MODULE_NAME` 为 `LuaLog`；子模块初始化入口是 `OutputLuaLogInitSub(SCConfNode *conf, OutputCtx *parent_ctx)`，代码里把 `om->name = MODULE_NAME` 与 `om->InitSubFunc = OutputLuaLogInitSub` 写进注册项。它同时提供 TX logger 与 Streaming logger：前者在调用脚本前用 `LuaStateSetThreadVars`、`LuaStateSetPacket`、`LuaStateSetTX`、`LuaStateSetFlow` 把上下文塞进 `lua_State`，再 `lua_getglobal(luastate, "log")`、`lua_newtable`、`LuaPushTableKeyValueInt(luastate, "tx_id", ...)` 构造参数表，最后 `lua_pcall(luastate, 1, 0, 0)` 执行；`SCMutexLock(&td->lua_ctx->m)` 保护脚本状态，说明同一脚本的 `lua_State` 在线程间共享、并非每线程独立。为让脚本能拿到应用层事务，`OutputLuaLogInitSub` 还会按 `needs` 调用 `SCAppLayerParserRegisterLogger(IPPROTO_TCP, ALPROTO_HTTP1)`、`ALPROTO_TLS`、`ALPROTO_DNS`、`ALPROTO_SSH`、`ALPROTO_SMTP` 以及 `IPPROTO_UDP` 下的 `ALPROTO_DNS`、`ALPROTO_NTP` 等注册项。
+
+Lua 运行时基础设施在 `src/util-lua.c` 与一整族 `src/util-lua-*.c` 中。`LuaGetState(void)` 与 `LuaReturnState(lua_State *)` 管理状态机，`SCLuaRegValue_` 配合 `LuaStateSetReg` / `LuaStateGetReg` 把 C 侧指针以注册表 userdata 的形式挂到 `lua_State` 上；`LuaStateSetThreadVars`、`LuaStateSetInvocationGen`、`LuaStateSetPacket`、`LuaStateGetTX`、`LuaStateSetTX`、`LuaStateSetFlow`、`LuaStateSetPacketAlert`、`LuaStateSetSignature`、`LuaStateSetFile`、`LuaStateSetDetCtx`、`LuaStateSetDetectLuaData` 分别暴露线程、包、事务、流、告警、签名、文件与检测上下文。`src/util-lua-builtins.c`、`util-lua-sandbox.c`、`util-lua-common.c`、`util-lua-packetlib.c`、`util-lua-flowlib.c`、`util-lua-dns.c`、`util-lua-http.c`、`util-lua-tls.c`、`util-lua-ja3.c`、`util-lua-hashlib.c`、`util-lua-base64lib.c`、`util-lua-dataset.c`、`util-lua-filelib.c`、`util-lua-rule.c`、`util-lua-log.c` 等各自提供一类库函数，`src/detect-lua-extensions.c` 的 `LuaExtensionsMatchSetup(lua_State *lua_state, DetectLuaData *ld, ...)` 负责把扩展库装配进脚本环境。`util-lua-sandbox.c` 的名字直接点明了边界：脚本在受限环境中运行，只能访问被显式暴露的对象与库，不能任意改写引擎核心数据结构。
+
+Rust 侧的扩展走的是另一条路：编译期 FFI。Rust 侧的类型与函数经 `rust/cbindgen.toml` 生成 C 头文件后供 `src/` 调用，该文件里 `language = "C"`、`include_guard = "__RUST_BINDINGS_GEN_H_"`、`item_types = ["enums","structs","opaque","functions","constants"]`、`[parse.expand] features = ["cbindgen"]`，并用 `[export.rename]` 把 `"JsonBuilder"` 改名为 `"SCJsonBuilder"`、`"JsonBuilderMark"` 改名为 `"SCJsonBuilderMark"`、`"CLuaState"` 改名为 `"lua_State"`，`[export] exclude` 里还排除了 `CLuaState` 与 `DETECT_BYTEMATH_ENDIAN_DEFAULT`。`rust/src/jsonbuilder.rs` 中所有 `#[no_mangle] pub extern "C" fn SCJb*` 正是这一机制的产物；`rust/src/lua.rs` 则用 `pub enum CLuaState {}` 作占位、`pub struct LuaState { pub lua: *mut CLuaState }` 封装，通过 `extern "C"` 声明 `lua_createtable`、`lua_settable`、`lua_pushlstring`、`lua_pushinteger`、`lua_pushnil` 并提供 `newtable`、`settable`、`pushstring`、`pushbytes`、`pushinteger`，标了 `/// cbindgen:ignore` 以避免被导出。应用层 parser 的注册在 `rust/src/applayer.rs`：`pub struct RustParser` 持有 `name`、`parse_ts: ParseFn`、`parse_tc: ParseFn`、`get_tx_count`、`get_tx`、`get_tx_files`、`get_tx_iterator`、`get_tx_data`、`get_frame_id_by_name`、`get_frame_name_by_id` 等回调，`pub fn AppLayerRegisterParser(parser: &RustParser, alproto: AppProto) -> c_int` 把它们装进 `AppLayerParser` 结构后调用 `SCAppLayerRegisterParser(&det, alproto)`；`AppLayerFrameType` trait 与 `#[derive(AppLayerFrameType)]` 则用于 Frame 类型派生（原理见 06-05）。
+
+插件与输出扩展是第三类。`src/suricata-plugin.h` 定义 `SCPlugin_`（含 `version`、`suricata_version`、`plugin_version`、`author`、`license`、`Init`）、`SCPluginRegisterFunc`、`SCCapturePlugin_`（含 `name`、`Init(const char *args, int plugin_slot, int receive_slot, int decode_slot)`、`ThreadInit` 与 `TAILQ_ENTRY`），并提供 `SCPluginRegisterCapture(SCCapturePlugin *)`、`SCPluginRegisterAppLayer(SCAppLayerPlugin *)`。`plugins/pfring/plugin.c` 的 `SCPluginInit(void)` 分配一个 `SCCapturePlugin`，设 `plugin->name = "pfring"`、`plugin->Init = InitCapturePlugin`、`plugin->GetDefaultMode = RunModeIdsPfringGetDefaultMode`，再 `SCPluginRegisterCapture(plugin)`；`InitCapturePlugin` 里 `LiveBuildDeviceList("plugin")` 与 `RunModeIdsPfringRegister(plugin_slot)` 完成设备与 runmode 注册；文件底部导出 `const SCPlugin PluginRegistration` 与 `const SCPlugin *SCPluginRegister(void)`。EVE 输出扩展则由 `src/output-eve.h` 的 `SCEveFileType_` 承担，提供 `Init`、`ThreadInit`、`Write`、`ThreadDeinit`、`Deinit` 五钩子，经 `SCRegisterEveFileType` 注册、`SCEveFindFileType` 查找，`SyslogInitialize` 与 `NullLogInitialize` 是内置实例，`SCEveRegisterCallback` / `SCEveRunCallbacks` 允许在事件顶层对象闭合前追加字段（原理见 06-11）。交叉引用：字段见 05-04、05-08 ｜ 参数见 04-01、04-04 ｜ 模块见 07-10、07-03。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，不重列字段；06 全册禁止完整结构体字段表，逐字段定义一律到 05。
+
+- `sigmatch_table[DETECT_LUA]`、`DetectLuaData`、`DetectEngineThreadCtx`：`src/detect-lua.c` / `.h`、`src/detect.h`、`src/detect-engine*.c`（字段见 05-05）。Lua 关键字作为 `SigMatch` 类型挂进 `sigmatch_table`，其 `Match` / `AppLayerTxMatch` / `Setup` / `Free` 回调构成生命周期。
+- `OutputModule_`、`LogLuaCtx`、`LogLuaThreadCtx`：`src/output.h`、`src/output-lua.c`（字段见 05-08）。`LogLuaCtx` 持有 `script_dir[PATH_MAX]` 与 `lua_State *luastate`，`LogLuaThreadCtx` 指向共享的 `lua_ctx`；二者是 Lua 输出脚本的私有上下文，具体成员需对照 `src/output-lua.c` 实际版本核验。
+- Lua 状态注册项 `SCLuaRegValue_` 与 `lua_State` 占位：`src/util-lua.c` / `.h`、`rust/src/lua.rs` 的 `CLuaState` 与 `LuaState`（字段见 05-08）。C 侧的 `lua_State` 来自 Lua / LuaJIT 依赖，其布局需对照实际依赖版本核验。
+- Rust 侧 `RustParser`、`ParseFn`、`StateGetTxFn`、`AppLayerParser`、`AppLayerFrameType`：`rust/src/applayer.rs` 与 `suricata_sys::sys` 暴露的绑定（字段见 05-04）。`rust/src/jsonbuilder.rs` 的 `JsonBuilder`、`JsonBuilderMark`、`JsonError` 同属这一 FFI 族（字段见 05-08）。
+- 插件与 EVE filetype：`src/suricata-plugin.h` 的 `SCPlugin_`、`SCCapturePlugin_`、`SCAppLayerPlugin_`，`src/output-eve.h` 的 `SCEveFileType_`、`EveJsonTxLoggerRegistrationData`、`EveJsonSimpleAppLayerLogger`（字段见 05-08）。`SCPlugin.version` 用于主程序与插件的 API 兼容性检查。
+
+文件落点整理如下：Lua 规则在 `src/detect-lua.c` / `.h`、`src/detect-lua-extensions.c` / `.h`；Lua 输出在 `src/output-lua.c` / `.h`；Lua 运行时与库在 `src/util-lua.c` / `.h` 及 `src/util-lua-*.c` 族（含 `util-lua-builtins.c`、`util-lua-sandbox.c`、`util-lua-common.c`、`util-lua-config.c`、`util-lua-packetlib.c`、`util-lua-flowlib.c`、`util-lua-flowvarlib.c`、`util-lua-flowintlib.c`、`util-lua-bytevarlib.c`、`util-lua-dns.c`、`util-lua-http.c`、`util-lua-tls.c`、`util-lua-ja3.c`、`util-lua-ssh.c`、`util-lua-smtp.c`、`util-lua-ntp.c`、`util-lua-dnp3.c`、`util-lua-dnp3-objects.c`、`util-lua-dataset.c`、`util-lua-hashlib.c`、`util-lua-base64lib.c`、`util-lua-filelib.c`、`util-lua-rule.c`、`util-lua-log.c`、`util-lua-util.c`）；示例脚本在 `lua/fast.lua`；Rust 侧在 `rust/src/lua.rs`、`rust/src/applayer.rs`、`rust/src/jsonbuilder.rs`、`rust/cbindgen.toml`，以及 `rust/derive`、`rust/sys`（目录内容需对照实际版本核验）；插件在 `src/suricata-plugin.h` 与 `plugins/pfring/`、`plugins/napatech/`、`plugins/ndpi/`；EVE 输出扩展在 `src/output-eve.c` / `.h`、`src/output-eve-stream.c`、`src/output-eve-syslog.c`、`src/output-eve-null.c`。`plugins/` 下的启用选项与插件加载命令行需对照 `configure.ac` 与 `src/` 实际版本核验（参数见 04-01、04-07）。交叉引用：字段见 05-04、05-05、05-08 ｜ 参数见 04-01、04-04 ｜ 模块见 07-03、07-10。
+
+### 4. 关键流程与调用链
+
+Lua 规则关键字的链路从注册开始。`DetectLuaRegister` 在启动期把 `lua` 写进 `sigmatch_table`，规则解析遇到 `lua:` 选项时由 `DetectLuaSetup` 加载脚本、构造 `DetectLuaData`；`src/detect-lua-extensions.c` 的 `LuaExtensionsMatchSetup` 把 `suricata.packet`、`suricata.flow`、`suricata.rule` 等扩展库装配进 `lua_State`，`src/util-lua-sandbox.c` 施加沙箱约束。检测阶段，`SigMatch` 链求值到该关键字时调用 `DetectLuaMatch`，脚本通过 `LuaStateSetPacket`、`LuaStateSetFlow`、`LuaStateSetSignature` 等拿到当前上下文，返回是否命中；带事务上下文时走 `DetectLuaAppTxMatch`，由 `DetectAppLayerInspectEngineRegister` 注册的检视引擎把 `ja3.lua` / `ja3s.lua` 一类 buffer 交给 `DetectEngineInspectGenericList`。这里的能力边界很清楚：脚本能读取被暴露的对象、能做条件判断，但不能绕过解码、重组与检测顺序，也不能凭空看到未解析的加密明文。
+
+Lua 输出的链路是另一套。`LuaLogRegister` 把 `LuaLog` 注册为 `outputs` 下的 `lua` 模块，`OutputLuaLogInitSub` 按 `needs` 调用 `SCAppLayerParserRegisterLogger` 订阅所需协议的事务日志。运行期检测线程产生事件后，`OutputLoggerLog` 驱动到 Lua 子模块，TX logger 或 Streaming logger 先用 `LuaStateSetThreadVars` / `LuaStateSetPacket` / `LuaStateSetTX` / `LuaStateSetFlow` 注入上下文，`SCMutexLock` 保护共享 `lua_State`，再 `lua_getglobal(luastate, "log")` 取脚本的 `log` 函数、`lua_newtable` 构造参数、`LuaPushTableKeyValueInt` 塞入 `tx_id`，最后 `lua_pcall` 调用；脚本失败时源码用 `SCLogInfo("failed to run script: %s", ...)` 记录并 `lua_pop` 清理栈，而不是让引擎崩溃。`lua/fast.lua` 就是这个契约的样例：`init()` 返回 `needs` 表声明 `needs["type"] = "packet"` 与 `needs["filter"] = "alerts"`，`setup()` 用 `config.log_path() .. "/fast.log"` 打开文件，`log()` 里 `packet.get()`、`rule.get_rule()`、`p:timestring_legacy()`、`s:sid()` / `s:rev()` / `s:gid()` / `s:msg()` / `s:class_description()` / `s:priority()`、`p:tuple()` 组装出类似 `fast.log` 的一行并 `file:write(alert)`，`deinit()` 关闭文件并打印累计告警数。四钩子 `init` / `setup` / `log` / `deinit` 是 Lua 输出脚本的固定契约。
+
+Rust 扩展的链路发生在构建期与启动期。`rust/cbindgen.toml` 配置 cbindgen 从 Rust crate 生成 C 头文件，`[export.rename]` 把 `JsonBuilder` 重命名为 `SCJsonBuilder` 以避免命名冲突，`[parse.expand] features = ["cbindgen"]` 指定展开特性；`rust/src/jsonbuilder.rs` 的 `SCJb*` 函数与 `rust/src/applayer.rs` 的 `SCAppLayerRegisterParser` 由此成为 C 侧可调用的符号。应用层 parser 在启动期由各协议模块构造 `RustParser`，交给 `AppLayerRegisterParser(parser, alproto)`，后者填充 `AppLayerParser` 的 `ParseTS` / `ParseTC` / `StateGetTxCnt` / `StateGetTx` / `GetTxFiles` / `GetTxIterator` / `GetTxData` / `GetFrameIdByName` / `GetFrameNameById` 等回调并注册进 C 侧解析框架（原理见 06-05）。插件链路则是：`SCPluginRegister` 导出 `PluginRegistration`，主程序校验 `SCPlugin.version` 后调用其 `Init`，`SCPluginInit` 再 `SCPluginRegisterCapture` 登记 `SCCapturePlugin`，`InitCapturePlugin` 用 `LiveBuildDeviceList("plugin")` 与 `RunModeIdsPfringRegister(plugin_slot)` 把设备与 runmode 接入注册表。EVE 输出扩展链路最短：`SyslogInitialize` 之类的函数 `SCCalloc` 一个 `SCEveFileType` 并 `SCRegisterEveFileType` 登记，`OutputJsonInitCtx` 遇到对应 `filetype` 时用 `SCEveFindFileType` 取出，运行期由 `Write` 回调接管每条记录。四路扩展的接入点全景见图 06-14-01。
+
+:::figure id=06-14-01 | name=Lua Rust 与插件的扩展接入点全景 | dir=TD
+node x1 "规则 lua 关键字<br/>DetectLuaRegister" amber
+node x2 "lua 输出脚本<br/>LuaLogRegister" amber
+node x3 "util-lua 状态机<br/>LuaGetState" teal
+node x4 "Rust parser<br/>RustParser" purple
+node x5 "cbindgen FFI<br/>SCJb* 导出" gray
+node x6 "SCEveFileType<br/>输出扩展" green
+node x7 "SCPlugin<br/>捕获插件" blue
+node x8 "主程序 src/<br/>注册总线" red
+edge x1 -> x3 "脚本求值"
+edge x2 -> x3 "四钩子回调"
+edge x3 -> x8 "注册挂接"
+edge x4 -> x5 "生成头"
+edge x5 -> x8 "链接静态库"
+edge x6 -> x8 "SCRegisterEveFileType"
+edge x7 -> x8 "SCPluginRegisterCapture"
+edge x8 -> x1 "关键字表"
+edge x8 -> x2 "输出模块表"
+edge x8 -> x6 "filetype 表"
+:::
+
+把四路放在一起看，能力边界就清楚了：Lua 规则与 Lua 输出是「主进程内的受限脚本」，能访问被暴露的包、流、事务与规则信息，不能改写引擎核心；Rust parser 是「编译期链接的原生扩展」，能实现完整协议解析但要遵守 FFI 与 `RustParser` 回调契约；捕获插件是「带 ABI 版本校验的动态扩展」，能新增抓包后端但必须匹配 `SCPlugin.version`；EVE filetype 是「只接管写出的窄接口」，能改落点但不能改事件构造，且 `SCEveRegisterCallback` 明确限制「只能追加新字段、不能修改已加入的对象」。图 06-14-01 中红色节点正是这四类扩展共同依赖的注册总线——`sigmatch_table`、`OutputModule` 表、filetype 表与 capture plugin 表都由 `src/` 主程序持有，扩展只能往里登记，不能替换总线本身。
+
+### 5. 配置/命令/代码实例
+
+本节只给最小必要实例并显式指向权威源：configure 选项、`suricata.yaml` 的 `outputs` 与 `lua` 段、规则关键字、命令行与 `suricatasc` 命令全集见 04 全册（参数见 04-01、04-04、04-06、04-07），此处不重列参数全集。下面先给一段按真实源码书写的注册摘录，函数名与结构名均来自 `src/detect-lua.c`、`src/output-lua.c` 与 `rust/src/applayer.rs`，不构成完整实现。
+
+```c
+/* Lua 规则关键字与 Lua 输出注册，见 detect-lua.c 与 output-lua.c */
+void DetectLuaRegister(void)
+{
+    sigmatch_table[DETECT_LUA].name = "lua";
+    sigmatch_table[DETECT_LUA].Match = DetectLuaMatch;
+    sigmatch_table[DETECT_LUA].AppLayerTxMatch = DetectLuaAppTxMatch;
+    sigmatch_table[DETECT_LUA].Setup = DetectLuaSetup;
+    sigmatch_table[DETECT_LUA].Free = DetectLuaFree;
+}
+
+void LuaLogRegister(void)
+{
+    OutputRegisterModule(MODULE_NAME, "lua", OutputLuaLogInit);
+}
+
+/* Rust parser 注册，见 rust/src/applayer.rs */
+pub fn AppLayerRegisterParser(parser: &RustParser, alproto: AppProto) -> c_int {
+    unsafe { SCAppLayerRegisterParser(&det, alproto) }
+}
+```
+
+`lua/fast.lua` 的四钩子契约见下方脚本片段，注意它是脚本文本而非命令输出。
+
+```text
+function init()
+    local needs = {}
+    needs["type"] = "packet"
+    needs["filter"] = "alerts"
+    return needs
+end
+
+function setup()
+    filename = config.log_path() .. "/fast.log"
+    file = assert(io.open(filename, "a"))
+end
+
+function log()
+    local p = packet.get()
+    local s = rule.get_rule()
+    local alert = p:timestring_legacy() .. " [**] " .. s:msg()
+    file:write(alert)
+end
+
+function deinit()
+    file:close(file)
+end
+```
+
+四类扩展机制的接入点、注册入口与能力边界见下表，便于按需求选路。
+
+| 扩展方式 | 接入点 | 注册入口 | 能力边界 |
+|---|---|---|---|
+| Lua 规则关键字 | `sigmatch_table[DETECT_LUA]` | `DetectLuaRegister` | 只读上下文，受沙箱约束 |
+| Lua 输出脚本 | `outputs` 下的 `lua` 子模块 | `LuaLogRegister` | 四钩子脚本，访问暴露的库 |
+| Rust parser | `AppLayerParser` 回调表 | `AppLayerRegisterParser` | 需经 cbindgen 生成 FFI 头 |
+| EVE filetype | `SCEveFileType` 表 | `SCRegisterEveFileType` | 只接管写出，不改事件构造 |
+| 捕获插件 | `SCCapturePlugin` 表 | `SCPluginRegisterCapture` | 需 `SCPlugin.version` 匹配 |
+
+下面是一组按「前置检查 → 执行 → 验证输出 → 清理」组织的完整闭环命令，适合确认 Lua 支持已编入并验证脚本输出。
+
+```bash
+# 前置检查：确认构建包含 Lua 支持并校验配置
+suricata --build-info | grep -i lua
+suricata -T -c /etc/suricata/suricata.yaml
+
+# 执行：以含 lua 输出的常驻 IDS 运行
+suricata -c /etc/suricata/suricata.yaml -i eth0 -D
+
+# 验证：查看脚本产生的 fast.log 与 EVE 事件类型
+tail -n 3 /var/log/suricata/fast.log
+grep -o '"event_type":"[a-z]*"' /var/log/suricata/eve.json | sort | uniq -c | sort -rn | head -n 8
+
+# 清理：经控制面正常关闭
+suricatasc -c shutdown
+```
+
+典型输出如下（示例输出，具体格式需对照实际版本核验）。
+
+```text
+# 示例输出，具体格式需对照实际版本核验
+  Lua support:                             yes
+<Notice> - Configuration provided was successfully loaded. Exiting.
+11/14/2026-09:31:07.123456  [**] [1:2100498:1] ET TEST [**] [Priority: 0]
+    342 "event_type":"flow"
+      6 "event_type":"alert"
+      2 "event_type":"stats"
+```
+
+逐行判读如下。第一行是 `suricata --build-info | grep -i lua` 的回显，`Lua support: yes` 表明该构建编入了 Lua 支持；若为 `no`，则 `lua` 规则关键字与 `lua` 输出模块都不会注册，后续脚本自然不生效，此时应回到 02-02 检查 configure 选项（选项名需对照 `configure.ac` 实际版本核验）。第二行是 `suricata -T` 的成功回显，`successfully loaded` 只证明配置与规则能被解析，若 Lua 脚本路径写错或语法有误，这里或后续 `suricata.log` 会出现加载失败文本，应回到 04-08 的排错速查。第三行是 `lua/fast.lua` 写出的 `fast.log` 记录，时间戳、`gid:sid:rev`、`msg`、`Priority` 均由 `p:timestring_legacy()`、`s:gid()`、`s:sid()`、`s:rev()`、`s:msg()`、`s:priority()` 拼装，格式与内置 `fast.log` 类似；若该文件不出现，优先检查 `outputs` 里 `lua` 段是否启用、`script-dir` 是否指向 `lua/` 目录、以及脚本 `init()` 返回的 `needs` 是否与预期事件类型匹配（参数见 04-04）。第四至六行是 `eve.json` 的事件类型计数，`flow` 最多、`alert` 与 `stats` 少量属正常；Lua 输出脚本与 EVE 是两条并行管道，脚本写 `fast.log` 不会减少 EVE 事件，反过来关掉 EVE 也不影响脚本，判读时不要把它们混为一谈。字段名需对照实际版本核验。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把 Lua 脚本当成「零成本扩展」。`src/output-lua.c` 里 `SCMutexLock(&td->lua_ctx->m)` 说明脚本状态在线程间共享并加锁，一个在 `log()` 里做重 I/O、正则回溯或大表构造的脚本会直接拖慢检测线程；`src/util-lua-sandbox.c` 的沙箱约束的是能力而非开销，脚本仍运行在主进程地址空间，崩溃或死循环会影响引擎。第二个陷阱是混淆 Lua 规则关键字与 Lua 输出：前者是 `sigmatch_table` 里的 `SigMatch`，参与检测求值；后者是 `OutputModule` 下的日志子模块，只在事件产生后被调用。用 `lua` 关键字写日志、或在输出脚本里期望返回值决定告警，都是对接入点的误用。第三个陷阱是把 Rust 扩展当成运行时可插拔组件：`rust/` 是构建的一部分，Rust parser 通过 cbindgen 生成的头文件与静态库在编译期链接，`AppLayerRegisterParser` 是启动期注册，不是运行时加载 `.so`；`rust/derive`、`rust/sys` 与 `rust/cbindgen.toml` 的改动通常要求重新构建。
+
+插件与输出扩展也有各自的高频问题。`SCPlugin.version` 用于主程序与插件的 API 兼容性检查，跨版本复用已编译插件会失败，这是「插件加载不进来」的常见根因；插件加载的命令行选项与 `plugins/` 的启用方式需对照 `configure.ac` 与 `src/` 实际版本核验（参数见 04-01、04-07）。EVE filetype 必须实现 `SCEveFileType_` 的五个钩子，threaded 模式下 `ThreadInit` 会被多次调用，`Write` 需要自行保证线程安全；`SCEveRegisterCallback` 的注释明确写了「只能追加新字段、不能修改已加入 `SCJsonBuilder` 的对象」，想靠回调改写 `event_type` 或已有字段是做不到的。关于 PF_RING 要特别谨慎：本快照 `plugins/pfring/` 下确有 `source-pfring.c`、`plugin.c`、`runmode-pfring.c` 等文件，作为捕获插件注册；`src/` 主目录下并无 `source-pfring.c`，PF_RING 在当前 main 快照是否仍为受支持后端、对应启用方式与构建开关，需对照 `configure.ac` 与 `plugins/pfring/` 实际版本核验，不得凭印象写成内建后端。同理，`examples/plugins/c-json-filetype/` 一类示例路径只在 `src/output-eve.h` 的注释里被引用，是否随本快照提供需对照实际版本核验，不要当作已确认文件写进正文。
+
+还要守住几条全册一致的能力边界。Suricata 不做转发、不是防火墙，内联阻断依靠 NFQUEUE 或 AF_PACKET 桥接的 verdict（原理见 06-12）；规则语法兼容 Snort 但有自有扩展，不能宣称 100% 兼容；Hyperscan 只是可选 MPM 加速，缺失时回退 AC 等其他实现，不是必需依赖；`suricata-update` 是分仓独立工具，不参与 `src/` 主程序编译（模块见 07-11）；Rust 与 Cargo 是构建的一部分，不能把 Suricata 写成纯 C 项目。最佳实践是「能写脚本不改 C、能注册不改总线」：优先评估 Lua 规则关键字、Lua 输出、`SCEveFileType` 这些受控扩展点，其次才是 Rust parser 与捕获插件；上线前用 `suricata --build-info` 确认 Lua / 插件 / Rust 相关特性、`suricata -T` 确认含 `lua:` 的规则与脚本路径可加载、`suricata --dump-config` 确认 `outputs` 段生效，运行中盯住 `suricata.log` 的脚本报错与 `failed to run script` 提示。性能方面，脚本复杂度、事件量与线程锁竞争的关系高度依赖规则集与流量构成，任何吞吐、pps 与内存占用数字一律标注「需在目标机型实测」，不给绝对值（基准方法见 08-01，加固见 08-05）。
+
+### 7. 小结与延伸阅读
+
+本篇给出一条主线、两个权威源、三类边界。一条主线是「四类扩展共用 `src/` 的注册总线」：Lua 规则关键字经 `DetectLuaRegister` 挂进 `sigmatch_table`，Lua 输出经 `LuaLogRegister` 挂进 `OutputModule` 表，Rust parser 经 `AppLayerRegisterParser` 与 cbindgen 生成的 FFI 头挂进 `AppLayerParser` 回调表，捕获插件经 `SCPluginRegisterCapture` 挂进 capture plugin 表，EVE filetype 经 `SCRegisterEveFileType` 挂进 filetype 表；`src/util-lua.c` 的状态机、`src/util-lua-*.c` 的库族与 `src/util-lua-sandbox.c` 的沙箱，和 `rust/cbindgen.toml` 的 `[export.rename]`、`rust/src/jsonbuilder.rs` 的 `SCJb*` 导出一起，构成了脚本与原生代码两侧的支撑。两个权威源是：结构体逐字段看 05，配置与命令参数看 04；本篇及 06 全册只负责机制与调用链，不越界重列字段表或参数全集。三类边界是：Suricata 不做转发、不是防火墙；Lua 是受限脚本、Rust 是编译期链接、插件带 ABI 校验、filetype 只接管写出；加密载荷明文不可见，脚本同样看不到 HTTPS 明文正文。
+
+延伸阅读按链路向前后展开：应用层解析框架与 Rust parser 接入见 06-05，检测求值与 `SigMatch` 链见 06-08，EVE 事件构造与输出扩展点见 06-11，IPS verdict 与内联见 06-12，runmode 与线程拓扑见 06-13。按目录查模块能力可跳到 07-03（app-layer 应用层解析模块）、07-07（output / log-* 输出模块）、07-10（rust/ 与 Rust 解析器生态）；按字段查结构可跳到 05-04、05-05、05-08；按参数查配置与命令可跳到 04-01、04-04、04-06、04-07。统一交叉引用写法：字段见 05-04、05-05、05-08 ｜ 参数见 04-01、04-04、04-06 ｜ 原理见 06-05、06-08、06-11、06-13 ｜ 模块见 07-03、07-07、07-10、07-11。本篇所有未核实的具体字段名、函数签名与配置键名均标注「需对照实际版本核验」，版本基准始终为「上游 main 快照（2026-11 抓取）」。

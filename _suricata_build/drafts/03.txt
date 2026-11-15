@@ -1,0 +1,1027 @@
+# Suricata 技术资料 · 03 集成与部署
+
+## 03-01 最小可用部署：第一次 IDS 运行与规则加载
+
+### 1. 目标与拓扑
+
+03 册的任务是把 02 册编译出来的那个二进制真正跑起来。本篇是整册的起点，目标极其克制：在一台已经装好 Suricata 的 Linux 主机上，用一份最小配置、一份最小规则文件，完成「第一次 IDS 运行」，并亲眼看到第一类告警落盘。这里刻意不碰 IPS 内联、不接外部日志管道、不做抓包性能调优、不加载大规模规则集，因为第一次运行最常见的失败并不是检测逻辑不对，而是网卡名写错、运行权限不够、规则文件路径没对上、yaml 缩进多了一格这类环境级问题。先把这些变量收敛到最小，才能把「引擎能不能起来、规则能不能编进去、告警能不能写出来」这三件事一次性验证清楚。凡涉及吞吐、pps、丢包率与内存占用的判断，本篇一律标注「需在目标机型实测」，不给绝对值。
+
+拓扑可以画成一条单向的验证闭环。起点是两份落位资源：一份由 `suricata.yaml.in` 渲染而来的 `suricata.yaml`，指明变量段、规则目录与输出开关；一份放在 `default-rule-path` 下的 `local.rules`，里面只放一条用于自测的规则。中间是自检环节，`suricata -T` 把配置与规则都加载一遍但不抓包，用来在真正启动前把语法与路径错误挡在门外。随后是抓包入口，离线场景用 `-r` 回放一段 pcap，在线旁路场景用 `-i` 指定镜像网卡；两者都只把流量副本喂给引擎，命中规则即产生告警，绝不干预原始链路，这正是 IDS 与 IPS 的分水岭。末端是三类日志：`fast.log` 给人类看单行告警，`eve.json` 给机器消费结构化事件，`stats.log` 记录捕获与解码计数，而 `suricata.log` 则承载启动期的加载信息，是排障第一现场。整条闭环的操作顺序与判读落点见图 03-01-01。
+
+需要先划清与相邻册的分工。本篇只给「本场景最小必要命令与配置」，构建选项与变量的完整清单见 04-01、完整变量见 04-01，`suricata.yaml` 全部段的参数全集完整清单见 04-02 ~ 04-04，命令行与返回码见 04-07、04-08；规则关键字全集见 04-05、04-06。机制与调用链写「原理见 06-xx」，结构体只点名加真实源码路径写「字段见 05-xx」，按目录划分的模块能力写「模块见 07-xx」。本篇回答的是「按什么顺序敲、每条命令该看到什么、看不到时怎么办」，不解释规则如何被编译成签名组、不展开 Packet 在流水线里怎么流转，那些分别在 06-06 与 06-01。
+
+本篇各步骤的执行顺序、可选分支与收尾关系见图 03-01-01。
+
+:::figure id=03-01-01 | name=首次 IDS 运行与规则加载的验证闭环 | dir=TD
+node n1 "最小 yaml 与规则<br/>suricata.yaml / rules" blue
+node n2 "suricata -T<br/>配置规则自检" amber
+node n3 "抓包入口<br/>-i 网卡 或 -r pcap" blue
+node n4 "解码与检测<br/>decode / detect" purple
+node n5 "三类日志<br/>fast / eve / stats" green
+node n6 "逐行判读<br/>suricata.log" teal
+edge n1 -> n2 "加载校验"
+edge n2 -> n3 "自检通过"
+edge n3 -> n4 "Packet 入队"
+edge n4 -> n5 "告警事件"
+edge n5 -> n6 "取证验证"
+:::
+
+图 03-01-01 里蓝色是输入资源与抓包入口，琥珀色是启动前的自检，紫色是解码检测，绿色是输出，青色是取证判读；实线表示「做完一步才能进入下一步」。有两条分支值得注意：其一是 `-r` 离线回放与 `-i` 在线收包从自检之后分出，二者是同一条检测链的两种喂流量方式，第一次上线建议先跑离线再切在线；其二是 `suricata.log` 的判读贯穿全程，自检、启动、运行各阶段的加载信息都落在这里，排障时应按图定位卡在哪一段。图里每个阶段都对应本篇某一节的可执行命令，卡在第一步查配置与规则落位，卡在第二步查 `-T` 输出，卡在最后一步查日志目录权限。这条闭环讲的是「做什么」，条件宏与 slot 装配的实现见 06-01，输出模块见 07-07。
+
+### 2. 前置条件与环境
+
+二进制与配置必须先就位。按 02-03 的构建闭环，`make install` 把可执行程序放进安装前缀的 `bin` 目录，`make install-conf` 把 `suricata.yaml`、`etc/classification.config`、`etc/reference.config`、`threshold.config` 落到配置目录。本篇假定沿用常见的 `/usr/bin/suricata` 与 `/etc/suricata/` 布局；若构建时改过 `--prefix` 或 `--sysconfdir`，命令里的路径需相应替换，路径选项需对照实际版本核验。核验方式很直接：`command -v suricata` 应回显可执行文件路径，`suricata --build-info` 应能看到 AF_PACKET 一类默认后端已编入，具体特性清单以本地输出为准。若报共享库找不到，回查 02-03 里的 `ldconfig` 与 `LD_LIBRARY_PATH` 收尾步骤。
+
+规则文件是本场景的关键资源。模板 `suricata-main/suricata.yaml.in` 第 2382 行附近有 `default-rule-path`，第 2384 行是 `rule-files`，二者共同决定引擎去哪里读哪些规则文件；`classification-file` 与 `reference-config-file` 分别指向 `etc/classification.config`、`etc/reference.config`，缺失时规则里的 `classtype`、`reference` 会报加载错误。第一次运行建议只放一条自测规则，例如匹配任意 TCP 并带固定 `sid`、`rev`、`msg` 的 `alert` 规则，写进 `local.rules` 后加入 `rule-files` 列表。规则头与选项的完整语法见 04-05、04-06；加载入口是 `suricata-main/src/detect-engine-loader.c` 的 `SigLoadSignatures`，它由 `suricata-main/src/suricata.c` 的静态函数 `LoadSignatures` 调用，再往下是 `DetectLoadSigFile` 与 `ProcessSigFiles` 逐文件读取、`SigInit` 逐条构造签名，调用链的函数名需对照实际版本核验，原理见 06-06。
+
+权限与环境要单独确认。在线 `-i` 收包需要能创建 AF_PACKET 套接字并把网卡置为混杂模式，通常需要 root 或 `CAP_NET_RAW`、`CAP_NET_ADMIN` 能力；离线 `-r` 回放不需要抓包权限，风险最低，建议作为第一次运行的第一步。日志目录必须存在且对运行用户可写，`fast.log`、`eve.json`、`stats.log` 默认落在 `-l` 指定的目录或配置里的相对路径下。网卡名要与 `ip link` 输出一致，写成不存在的名字会在启动期直接失败。变量段 `vars.address-groups.HOME_NET` 决定规则的 `$HOME_NET` 展开范围，若与实际网段不符，即便规则加载成功也可能一条都不命中，这是「有日志无告警」的经典原因。版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验。
+
+还要提前声明两条能力边界，避免第一次运行就产生错误预期。其一，IDS 旁路模式只告警不丢弃，原始报文的转发与引擎无关，Suricata 不做 IP 转发、不做路由、不是防火墙，内联阻断依赖 `suricata-main/src/source-nfq.c` 的 NFQUEUE 或 `suricata-main/src/source-af-packet.c` 的桥接 verdict，那是 03-05 的内容。其二，TLS 等加密载荷正文不可见，引擎能拿到的是握手元数据、证书、SNI、JA3 一类信息，见 `suricata-main/src/output-json-tls.c` 与 `suricata-main/rust/src/ja4.rs`，字段需对照实际版本核验。规则语法兼容 Snort 但有自有扩展，不能宣称 100% 兼容。资源方面，回放 pcap 的大小、首包时延、日志写入速率都需在目标机型实测，本篇不给绝对值。
+
+### 3. 分步操作
+
+下面按「前置检查 → 落位确认 → 自检 → 离线回放 → 在线旁路 → 收尾」的闭环给出完整序列。命令中的接口名、pcap 路径与规则文件路径需按实际环境替换，完整命令行参数见 04-07，完整变量见 04-01。
+
+```bash
+# 步骤 0：确认可执行程序与配置文件落位
+command -v suricata
+suricata --build-info | grep -E 'AF_PACKET|NFQueue|Unix socket'
+ls -l /etc/suricata/suricata.yaml /etc/suricata/classification.config /etc/suricata/reference.config
+
+# 步骤 1：写入一条自测规则并加入 rule-files（语法见 04-05）
+printf '%s\n' 'alert tcp any any -> any any (msg:"LOCAL TEST TCP"; sid:1000001; rev:1;)' \
+  > /etc/suricata/rules/local.rules
+
+# 步骤 2：启动前自检，只加载配置与规则，不抓包不写告警
+suricata -T -c /etc/suricata/suricata.yaml -l /var/log/suricata/
+
+# 步骤 3：离线回放一段 pcap，验证检测与输出链路
+suricata -c /etc/suricata/suricata.yaml -r /opt/pcaps/sample.pcap -l /var/log/suricata/
+
+# 步骤 4：在线旁路收包，镜像口只告警不干预，以后台常驻
+suricata -c /etc/suricata/suricata.yaml -i eth0 -l /var/log/suricata/ -D
+
+# 步骤 5：收尾，确认接口与三类日志
+suricatasc -c "iface-list"
+ls -l /var/log/suricata/fast.log /var/log/suricata/eve.json /var/log/suricata/stats.log
+```
+
+逐条说明几个容易含糊的点。步骤 1 的自测规则用 `any any -> any any` 把匹配面放到最大，只为确认「有流量就告警」，绝不能带进生产；`sid` 取本地自定义区段、带 `msg` 与 `rev` 是规则头的最低要求，写法见 04-05。步骤 2 的 `-T` 是关键：它走的是 `suricata-main/src/suricata.c` 里 `LoadSignatures` 到 `suricata-main/src/detect-engine-loader.c` 里 `SigLoadSignatures` 的同一条加载链，只是不拉起抓包线程，因此能在预发布环境反复执行，风险最低。步骤 3 的 `-r` 对应 `suricata-main/src/source-pcap-file.c` 一类的离线读取后端，回放结束进程自然退出，最适合第一次验证；步骤 4 的 `-i` 走 `suricata-main/src/source-af-packet.c`，`-D` 让进程转后台，此时配置里的 `unix-command` 段若启用，`suricatasc` 才可连上控制面，命令族见 04-07、模块见 07-12。步骤 5 用 `iface-list` 确认引擎确实在目标网卡上收包，再用 `ls` 确认三类日志文件被创建；`-l` 指定的目录若不存在或不可写，前几步就会在 `suricata.log` 里留下打开失败的报错。
+
+与命令配套的最小 yaml 片段如下，仅示意结构，键名与取值需对照实际版本核验，完整清单见 04-02 ~ 04-04，本篇不重列参数全集。
+
+```yaml
+%YAML 1.1
+---
+vars:
+  address-groups:
+    HOME_NET: "[192.168.0.0/16,10.0.0.0/8]"
+default-rule-path: /etc/suricata/rules
+rule-files:
+  - local.rules
+outputs:
+  - fast:
+      enabled: yes
+      filename: fast.log
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: eve.json
+      types:
+        - alert
+        - flow
+  - stats:
+      enabled: yes
+      filename: stats.log
+```
+
+配置里 `vars` 决定 `$HOME_NET` 的展开，`default-rule-path` 与 `rule-files` 决定读哪份规则，`outputs` 的 `fast`、`eve-log`、`stats` 三段分别控制三类日志开关。这些段在 `suricata-main/suricata.yaml.in` 里都有对应位置，由 `suricata-main/src/conf-yaml-loader.c` 的 `SCConfYamlLoadFile` 载入、再由 `suricata-main/src/conf.c` 的 `SCConfGet`、`SCConfGetNode` 一类函数供各模块读取，函数名需对照实际版本核验（字段见 05-09 ｜ 参数见 04-02 ｜ 原理见 06-01 ｜ 模块见 07-09）。本篇只组合出一个「能告警」的最小集合，任何段的完整键值都不在此展开。
+
+### 4. 验证方法与预期结果
+
+本篇要求给出「预期输出 + 判读要点」，因此把验证分三路：`suricata -T` 确认配置与规则可加载，回放后读 `fast.log` 与 `eve.json` 确认告警链路，读 `suricata.log` 与 `stats.log` 确认没有加载错误或抓包丢包。先看最关键的 `-T` 自检，以下是示例输出，具体格式需对照实际版本核验。
+
+```text
+[Info] - Running suricata under test mode
+[Info] - Loading configuration /etc/suricata/suricata.yaml
+[Info] - Configuration OK
+[Info] - Loading rule files from default-rule-path
+[Info] - 1 rule files processed, 1 rules successfully loaded
+[Info] - Initializing runmode
+[Info] - Configuration provided was successfully loaded. Exiting.
+```
+
+逐行判读这段输出。首行 `Running suricata under test mode` 确认进入的是只加载不抓包的自检模式，此模式不会拉起抓包线程、不会写告警，可以随时在预发布环境反复执行，是整套部署里风险最低的一步。第二行报告实际被加载的配置文件路径，用来确认 `-c` 是否指向了预期的那份 yaml，路径写错或落回默认配置是常见故障源。第三行 `Configuration OK` 说明 yaml 语法、段结构与必要键均通过解析；若此处报缩进错误或未知段，应回头对照 `suricata.yaml.in` 的层级逐格检查空格。第四、五行与规则加载有关：`default-rule-path` 与 `rule-files` 决定读哪些规则文件，输出里的「文件数」与「成功加载数」应与预期规模吻合，本篇只放一条自测规则，因此显示 1 个文件、1 条规则是正常值；若数量为 0 或明显偏少，往往意味着规则文件路径没配对、文件为空、或 `rule-files` 列表里没写 `local.rules`。第六行 `Initializing runmode` 说明已进入运行模式装配前的检查，末行 `successfully loaded. Exiting.` 是正常退出标志，表示整套配置与规则可以安全用于真实启动。需要牢记：自检通过只证明「能加载」，不等于线上一定有告警，网卡名、`HOME_NET`、`outputs` 路径与运行权限仍要在回放与在线两步里继续验证；输出里的行数、措辞与日志级别会随构建与配置变化，务必以本地结果为准。
+
+第二路是回放后的日志。预期 `fast.log` 出现含 `LOCAL TEST TCP` 与 `[1:1000001:1]` 的单行告警，`eve.json` 出现一条 `event_type` 为 `alert` 的记录，其 `alert.signature` 为规则 `msg`、`alert.signature_id` 为 1000001，`src_ip`、`dest_ip` 与 pcap 里的会话一致。判读要点是「三处对齐」：`fast.log` 与 `eve.json` 的 sid 要一致，`eve.json` 的 `flow_id` 要在同一条流的其他事件里可关联，`stats.log` 里的 capture 计数要大于零、decoder 丢包计数应接近零。若 `fast.log` 有而 `eve.json` 无，优先查 `outputs` 里 `eve-log` 是否 `enabled: yes` 且 `types` 订阅了 `alert`；若两者皆无，优先查 `HOME_NET` 与规则方向、以及回放流量是否真的被送到抓包后端。EVE 字段的构造见 `suricata-main/src/output-json.c` 的 `CreateEveHeader` 与 `suricata-main/src/output-json-alert.c` 的 `AlertJsonHeader`，字段判读详见 03-04，字段见 05-08、原理见 06-11。
+
+第三路用下面这组命令收尾，把「有日志、有内容、无报错」三件事一次性核对完。
+
+```bash
+# 确认自检与回放后的告警条数与 EVE 事件类型
+grep -c 'LOCAL TEST TCP' /var/log/suricata/fast.log
+grep -o '"event_type":"[^"]*"' /var/log/suricata/eve.json | sort | uniq -c
+
+# 查启动期加载错误与关键字报错
+grep -iE 'error|warning|failed' /var/log/suricata/suricata.log
+
+# 查捕获与解码计数是否正常
+tail -n 5 /var/log/suricata/stats.log
+```
+
+三类首次运行日志的判读落点见下表，参数与字段的完整清单分别见 04-04、05-08。
+
+| 日志文件 | 产生来源 | 首次运行该看什么 |
+|---|---|---|
+| fast.log | 命中 alert 规则的单行告警 | 是否出现自测规则的 msg 与 sid |
+| eve.json | EVE JSON 结构化输出 | event_type 是否为 alert、sid 是否一致 |
+| stats.log | 统计计数线程 | capture 计数大于零、decoder 丢包近零 |
+| suricata.log | 日志模块启动信息 | 有无规则加载错误、网卡与权限报错 |
+
+### 5. 常见失败与排错
+
+失败大多集中在「路径没对上」「权限不够」「配置写错」「流量没送到」四类。按闭环约定，每个现象都给「验证命令 → 修复方向」两段，先取证再动手，不要一上来就重装或改源码。常见失败对照见下表，完整排错速查见 04-08，诊断决策树见 08-03。
+
+| 现象 | 可能原因 | 验证命令 | 修复方向 |
+|---|---|---|---|
+| -T 报 YAML 缩进错误 | 段层级或空格写错 | suricata --dump-config -c suricata.yaml | 对照 suricata.yaml.in 逐格修正缩进 |
+| -T 报规则文件找不到 | default-rule-path 或 rule-files 错误 | ls -l /etc/suricata/rules/ | 校正路径并把 local.rules 加入列表 |
+| -T 报未知关键字或语法错 | 规则选项拼写或扩展不支持 | grep -iE 'error\|warning' suricata.log | 对照 04-05、04-06 修正，需对照实际版本核验 |
+| 在线启动报网卡不存在 | -i 接口名与实际不符 | ip link show | 改为真实网卡名后重启 |
+| 在线启动报权限不足 | 缺 CAP_NET_RAW 或 CAP_NET_ADMIN | suricata --build-info | 以合适权限运行，配置 run-as 段 |
+| 日志目录写入失败 | -l 目录不存在或不可写 | ls -ld /var/log/suricata/ | 建目录并赋权，再核对 outputs 路径 |
+| 回放后无告警但无报错 | HOME_NET 或规则方向不匹配 | grep -c alert eve.json | 校正变量段与规则头方向 |
+| 有 fast.log 无 eve.json | eve-log 未启用或 types 未订阅 | suricata --dump-config -c suricata.yaml | 打开 enabled 并订阅 alert 类型 |
+
+几个需要展开说明的坑。其一，「有日志无告警」最容易误判为引擎坏了，其实 `HOME_NET` 写成与回放流量不同的网段、规则方向写成 `$HOME_NET any -> any any` 而流量恰好反向、pcap 里根本没有 TCP 流量，都会让自测规则一条不命中；此时 `stats.log` 的 capture 计数大于零恰恰证明抓包正常，应往变量与规则方向查，而不是怀疑安装。其二，规则加载阶段的报错文本往往直接点出文件名与行号，`suricata.log` 里出现 `unknown keyword`、`error parsing signature` 一类字样时，先到 `suricata-main/src/detect-parse.c` 与 `suricata-main/src/detect-engine-register.c` 的语义范围里核对，规则语法兼容 Snort 但有自有扩展，不能假定任何 Snort 规则原样可用。其三，`-T` 通过不等于在线能收包，二者差别在抓包后端是否真的拿到字节，因此务必保留「先离线回放、再在线旁路」这个顺序，把环境级故障与检测级故障分层排除。其四，规则文件路径里出现 shell 管道符或「或」语义时，表格单元格里的 `\|` 必须转义书写，否则会被解析成列分隔导致整表错列，这是资料书写层的坑，不影响引擎运行但影响排错表可读性。
+
+还有一组属于全册通用纪律、本篇尤其容易踩的红线。`suricata-update` 是与主程序分仓、独立发版的规则工具，不是 `src/` 的内建子命令，规则集的批量管理见 03-03；Hyperscan 只是可选 MPM 加速，构建开关见 `suricata-main/configure.ac`，选项名需对照实际版本核验，缺失时回退 `suricata-main/src/util-mpm-ac*.c` 等 AC 实现，不能写成必需依赖；抓包后端能力与环境要求差异大，DPDK 需独占网卡、大页与 EAL 参数，Netmap 与 AF_XDP 有内核与驱动要求，pcap 多用于离线或低速率，PF_RING 在当前 main 快照是否仍为受支持后端需对照 `configure.ac` 与 `src/source-*.c` 核验，不得编造 `source-pfring.c`。IDS 旁路只告警不丢弃，加密载荷明文不可见，性能数字一律需在目标机型实测，基准方法见 08-01。
+
+### 6. 小结
+
+本篇把「第一次 IDS 运行」收成一条可复现的闭环：确认二进制与四份配置落位，写一条带固定 sid 的自测规则并加入 `rule-files`，先用 `suricata -T -c` 做配置与规则自检，再用 `-r` 离线回放验证检测与输出链路，最后用 `-i` 在线旁路收包并以 `-D` 常驻，通过 `fast.log`、`eve.json`、`stats.log`、`suricata.log` 四类日志给出「预期输出 + 判读要点」，而不是只看命令有没有返回零。读者应能据输出判断「配置是否加载、规则是否编入、流量是否送到、告警是否落盘」，并把「无告警」正确拆成变量、方向、抓包、输出订阅四类原因去排查。
+
+与相邻篇的衔接：yaml 主干段与网卡、CPU 绑定的组合见 03-02，规则集的批量下载与热加载见 03-03，EVE 字段判读与日志管道见 03-04，IPS 内联见 03-05，容器与多实例见 03-06。命令行与 RPC 见 04-07，返回码与告警判读见 04-08，完整清单见 04-02 ~ 04-04；结构体字段见 05 册；规则加载与解码、runmode 的机制分别见 06-06、06-03、06-13；按目录的模块能力见 07 册；基准与排障读 08 册。全册交叉引用统一写成 `（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）`。第一次告警跑通之后，下一步就是把最小配置扩展成可维护的主干配置，这正是 03-02 的任务。
+
+## 03-02 suricata.yaml 主干配置与网卡、CPU 绑定
+
+### 1. 目标与拓扑
+
+03-01 用一份「能告警就行」的最小配置把引擎跑了起来，本篇要做的是把这份配置扩展成可长期维护的主干配置，并把「网卡怎么选、线程怎么起、CPU 怎么绑」这三件影响可见性与吞吐的事一次定清楚。目标不是把 `suricata.yaml` 里所有段都填一遍——那是 04 册作为唯一权威源的任务——而是围绕一个具体的在线 IDS 场景，讲清哪些主干段必须组合、彼此怎么衔接、改完怎么验证生效。读者读完应当能回答：为什么改了 `af-packet` 的 `cluster-type` 要连着看 `threading`，为什么 `--dump-config` 显示的值和以为的不一样，以及为什么绑核不等于必然提速。凡吞吐、pps、丢包率、内存占用结论一律标注「需在目标机型实测」，本篇不给绝对值。
+
+拓扑可以画成一条「文件 → 配置树 → 模块」的加载链，再叠加两个消费端。起点是 `suricata-main/suricata.yaml.in` 这份模板，安装时被渲染成实际 yaml；`suricata-main/src/suricata.c` 第 1073 行附近的 `SCConfYamlLoadFile(suri->conf_filename)` 把文件交给 `suricata-main/src/conf-yaml-loader.c` 的 `SCConfYamlLoadFile` 解析，后者还有 `SCConfYamlLoadString` 与 `SCConfYamlLoadFileWithPrefix` 两个变体，函数名需对照实际版本核验。解析结果是一棵 `SCConfNode` 配置树，由 `suricata-main/src/conf.c` 的 `SCConfGet`、`SCConfGetNode`、`SCConfGetBool`、`SCConfGetInt` 一类读取函数供各模块取用。两个消费端里，`af-packet` 段决定抓包网卡、线程数与 fanout 分流，`threading` 段决定是否绑核、绑哪些核、检测线程与收包线程的比例；`--dump-config` 把整棵树扁平回显，是验证「改了有没有生效」的统一手段。主干段加载与两个消费端的关系见图 03-02-01。
+
+需要提前划清边界。本篇只讲「场景组合与输出判读」，`suricata.yaml` 全部段、全部键的完整清单见 04-02 ~ 04-04，本篇不重列参数全集；`SCConfNode`、`ThreadVars` 一类结构只点名加真实源码路径，写「字段见 05-xx」；配置如何被各模块消费、slot 链如何装配写「原理见 06-xx」；按目录划分的 conf、source、output 模块能力写「模块见 07-xx」。完整变量见 04-01，命令行见 04-07。本篇特别要守住一条能力边界：workers、autofp、single 三种 runmode 与流亲和、RSS、fanout 共同决定扩展性，不能把「加线程」写成必然线性提速，原理见 06-13。
+
+本篇的主干配置加载链路与两个消费端见图 03-02-01。
+
+:::figure id=03-02-01 | name=yaml 主干段加载与网卡 CPU 绑定链路 | dir=TD
+node n1 "suricata.yaml.in<br/>主干段模板" blue
+node n2 "SCConfYamlLoadFile<br/>conf-yaml-loader" teal
+node n3 "SCConfNode 树<br/>conf.c 读取" teal
+node n4 "af-packet 段<br/>网卡与 fanout" purple
+node n5 "threading 段<br/>绑核与线程比" purple
+node n6 "--dump-config<br/>扁平回显校验" green
+edge n1 -> n2 "载入文件"
+edge n2 -> n3 "构建配置树"
+edge n3 -> n4 "af-packet 消费"
+edge n3 -> n5 "threading 消费"
+edge n4 -> n6 "键生效核对"
+edge n5 -> n6 "键生效核对"
+:::
+
+图 03-02-01 里蓝色是配置文件，青色是解析与配置树，紫色是两个消费段，绿色是验证出口；实线表示数据流方向。值得注意有两条分支从 `SCConfNode 树` 分出，分别喂给 `af-packet` 与 `threading`，说明这两段不是孤立的开关，而是同一棵配置树上的两个消费者：改了分流方式却没同步看绑核，常出现「队列分得均匀、CPU 却挤在同一核」的错配。两条分支最终都汇到 `--dump-config`，因为任何配置改动都必须以「引擎实际读到的值」为准，而不是以「我以为写的值」为准。图里每个节点都对应本篇某一节的可核对项，排障时按图定位：值读不到查配置树，值读到了但行为不对查模块消费，原理见 06-01、模块见 07-09。
+
+### 2. 前置条件与环境
+
+先确认主干段在模板里的真实位置，这决定了「哪些段该组合」。`suricata-main/suricata.yaml.in` 里 `vars` 在第 15 行、`stats` 第 65 行、`outputs` 第 89 行、`logging` 第 616 行、`af-packet` 第 672 行、`app-layer` 第 941 行、`host-mode` 第 1424 行、`unix-command` 第 1458 行、`stream` 第 1750 行、`detect` 第 1858 行、`threading` 第 1950 行、`nfq` 第 2116 行，`default-rule-path` 第 2382 行、`rule-files` 第 2384 行、`classification-file` 第 2391 行、`reference-config-file` 第 2392 行。这些段名与行号来自上游 main 快照，需对照实际版本核验。对一个在线 IDS 场景，最小必要组合是 `vars`（地址变量）、`default-rule-path` 与 `rule-files`（规则来源）、`outputs`（日志开关）、`af-packet`（抓包接口）、`threading`（线程与绑核）、`unix-command`（控制面，供 `suricatasc` 用）这六类，其余段保持模板默认即可。完整清单见 04-02 ~ 04-04。
+
+`af-packet` 段要重点确认三个键的语义。`interface` 指定抓包网卡，必须与 `ip link` 输出一致；`threads` 决定该接口起多少收包线程，模板注释写明 `auto` 用核数；`cluster-id` 与 `cluster-type` 决定同一网卡多队列时如何做 fanout 分流，模板默认 `cluster-id: 99`、`cluster-type: cluster_flow`，注释列出 `cluster_flow`、`cluster_cpu`、`cluster_qm`、`cluster_ebpf` 四种取值，并注明 `cluster_rollover` 已废弃会被替换为 `cluster_flow`，还提示 `cluster_flow` 适用于多数机型、`cluster_cpu` 与 `cluster_qm` 适合带 RSS 的采集卡且需配合 CPU 亲和与中断调优。段里还有 `defrag`、`tpacket-v3`、`ring-size`、`block-size`、`buffer-size`、`checksum-checks`、`bpf-filter` 以及用于内联的 `copy-mode`、`copy-iface`，后者属于 03-05 的范围，本篇不展开。这些键的完整取值与默认见 04-03。
+
+`threading` 段要确认绑核语义。模板里 `set-cpu-affinity: no` 与 `autopin: no` 默认关闭绑核，`cpu-affinity` 下分 `management-cpu-set`、`receive-cpu-set`、`worker-cpu-set`、`verdict-cpu-set` 四组，分别对应管理、收包、检测、判定线程，每组可写 `cpu` 列表、`mode`、`prio` 与 `threads`；`detect-thread-ratio: 1.0` 控制每核起多少检测线程，注释明确说明取值 2 会在双核上起 4 个检测线程、小于 1 则更少但至少 1 个。这里最容易被误读的是「把 `set-cpu-affinity` 打开就一定更快」：绑核效果与 NUMA、网卡所在 PCIe 根节点、IRQ 亲和、RSS 队列数强相关，且 autofp 模式下队列锁竞争可能抵消收益，因此任何调整都需在目标机型实测，吞吐影响见 08-02，机制见 06-13。
+
+环境与权限沿用 03-01 的结论：在线收包需要相应能力与可写日志目录，`--build-info` 确认 AF_PACKET 与 fanout 已编入。验证工具方面，`suricata --dump-config` 在 `suricata-main/src/suricata.c` 第 1480 行以长选项 `dump-config` 登记、第 2205 行按标志回显，是把嵌套 yaml 摊平成 `段.下标.键 = 值` 形式的唯一权威回显手段；`--set name=value` 可在命令行临时覆盖某个键值，第 1543 行登记、第 1878 行处理，适合做 A/B 对照而不改文件，用法见 04-07。版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验。
+
+### 3. 分步操作
+
+下面按「备份 → 组合最小主干段 → 校验解析 → 核对生效值 → 绑核 A/B → 收尾」的闭环给出完整序列。命令中的接口名、CPU 编号与路径需按实际环境替换，完整命令行见 04-07，完整变量见 04-01。
+
+```bash
+# 步骤 0：备份现网配置，先取一份扁平回显作基线
+cp /etc/suricata/suricata.yaml /etc/suricata/suricata.yaml.bak
+suricata --dump-config -c /etc/suricata/suricata.yaml > /tmp/suricata-config-before.txt
+
+# 步骤 1：确认抓包网卡与可用 CPU 拓扑
+ip link show
+lscpu | grep -E 'CPU\(s\)|NUMA node|Thread|Core|Socket'
+
+# 步骤 2：自检新配置，确认段结构与规则都能加载
+suricata -T -c /etc/suricata/suricata.yaml -l /var/log/suricata/
+
+# 步骤 3：扁平回显，核对 af-packet 与 threading 的实际取值
+suricata --dump-config -c /etc/suricata/suricata.yaml | grep -E '^(vars|af-packet|threading|outputs)' | head -24
+
+# 步骤 4：用 --set 临时覆盖一个键做 A/B，不改文件
+suricata -T -c /etc/suricata/suricata.yaml --set threading.detect-thread-ratio=2.0
+
+# 步骤 5：收尾，恢复基线并确认差异可解释
+diff /tmp/suricata-config-before.txt <(suricata --dump-config -c /etc/suricata/suricata.yaml) | head -20
+```
+
+逐条说明几个容易含糊的点。步骤 0 的备份与基线回显是改配置前的强制动作，`--dump-config` 的输出是「引擎实际读到的值」，比直接读 yaml 文件更可靠，因为 include、默认值与 `--set` 覆盖都会体现在里面。步骤 1 的 `ip link show` 用来确认 `interface` 写得对，`lscpu` 的 NUMA 与核数用来决定 `threads` 与 `cpu-affinity` 的取值，二者不匹配是「起得来但跑不满」的常见根因。步骤 2 的 `-T` 与 03-01 同一条加载链，确认改动没有破坏 yaml 层级与规则加载。步骤 3 用 grep 过滤出四类段，重点看 `af-packet.0.cluster-type`、`af-packet.0.threads`、`threading.set-cpu-affinity`、`threading.detect-thread-ratio` 是否与预期一致。步骤 4 的 `--set` 只在本次进程生效，用于快速对比不同 `detect-thread-ratio` 下 `-T` 与后续运行的行为，避免反复改文件引入脏配置，选项语义见 04-07。步骤 5 的 `diff` 用来确认「改了哪几个键」，任何预期外的差异都应回到文件里查缩进或重复段。
+
+与命令配套的主干 yaml 片段如下，仅示意「场景组合」，键名与取值需对照实际版本核验，完整清单见 04-02 ~ 04-04，本篇不重列参数全集。
+
+```yaml
+%YAML 1.1
+---
+vars:
+  address-groups:
+    HOME_NET: "[192.168.0.0/16,10.0.0.0/8]"
+default-rule-path: /etc/suricata/rules
+rule-files:
+  - local.rules
+af-packet:
+  - interface: eth0
+    threads: 4
+    cluster-id: 99
+    cluster-type: cluster_flow
+    defrag: yes
+threading:
+  set-cpu-affinity: no
+  autopin: no
+  detect-thread-ratio: 1.0
+unix-command:
+  enabled: auto
+outputs:
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: eve.json
+      types:
+        - alert
+        - flow
+```
+
+这里的组合逻辑是：`threads` 与 `cluster-type` 决定收包侧怎么把流分到队列，`detect-thread-ratio` 决定检测侧起多少线程，两者要一起看；`set-cpu-affinity: no` 是初次上线的稳妥默认值，等用 08-01 的基准方法测出瓶颈再决定是否打开绑核；`unix-command: enabled: auto` 让 `suricatasc` 控制面可用，供后续 `iface-stat`、`reload-rules` 一类命令使用。配置树由 `suricata-main/src/conf-yaml-loader.c` 载入、`suricata-main/src/conf.c` 读取，`af-packet` 段的消费落在 `suricata-main/src/runmode-af-packet.c` 一类的装配代码，函数名需对照实际版本核验（字段见 05-09 ｜ 参数见 04-02、04-03 ｜ 原理见 06-01、06-13 ｜ 模块见 07-06、07-09）。
+
+### 4. 验证方法与预期结果
+
+本篇要求给出「预期输出 + 判读要点」，核心验证手段是 `suricata --dump-config` 的扁平回显，配合 `-T` 自检与 `--set` 覆盖。以下是 `--dump-config` 过滤后的示例输出，具体格式需对照实际版本核验。
+
+```text
+vars.address-groups.HOME_NET = [192.168.0.0/16,10.0.0.0/8]
+af-packet.0.interface = eth0
+af-packet.0.threads = 4
+af-packet.0.cluster-id = 99
+af-packet.0.cluster-type = cluster_flow
+af-packet.0.defrag = yes
+threading.set-cpu-affinity = no
+threading.autopin = no
+threading.detect-thread-ratio = 1.0
+unix-command.enabled = auto
+outputs.0.eve-log.enabled = yes
+outputs.0.eve-log.filename = eve.json
+outputs.0.eve-log.types.0 = alert
+outputs.0.eve-log.types.1 = flow
+```
+
+逐行判读这段输出。第一行是 `vars` 下的地址变量，决定规则里 `$HOME_NET` 的展开范围，若与现网网段不符，后续所有指向 `HOME_NET` 的规则都可能不命中，这是「配置生效却无告警」的隐形根因。第二到第六行属于 `af-packet` 段：`interface` 为 eth0 确认抓包网卡正确，`threads` 为 4 说明该接口起四个收包线程，`cluster-id` 为 99 是 fanout 的分流组标识，同一主机多实例时该值必须互相区分，`cluster-type` 为 `cluster_flow` 表示按流把包分到同一队列以保证流亲和，`defrag` 为 yes 表示内核在分片哈希算不出时先做重组再入队；这几行若与预期不符，往往是吞吐不均、同一条流被拆到不同线程、或多实例互相抢包的根因。第七到第九行属于 `threading` 段：`set-cpu-affinity` 为 no 表示未启用绑核，`autopin` 为 no 表示未启用自动绑核，`detect-thread-ratio` 为 1.0 是检测线程与核数的默认比例，三者共同决定多核利用，调整效果需在目标机型实测，不能凭比例数字推断提速。第十行 `unix-command.enabled` 为 auto 说明控制面可用。第十一到第十四行属于 `outputs` 段的 `eve-log`：`enabled` 为 yes 确认 EVE 输出已开，`filename` 指定落盘名，两条 `types` 说明当前只订阅了 `alert` 与 `flow` 两类事件；若线上发现缺 DNS、TLS、file 等事件，先查这里订阅了哪些 `types`，而不是怀疑上游没产出。需要留意的是，扁平化写法、数组下标编号与键名会随版本变化，务必以本地结果为准；`--dump-config` 只反映配置解析结果，不保证抓包后端真的能用，后者还需 `--build-info` 确认特性已编入并在运行期用 `suricatasc iface-stat` 观察收包计数。
+
+第二路验证是把「配置值」与「运行期行为」对齐。用 `suricatasc -c "iface-list"` 确认引擎确实在 eth0 上收包，用 `suricatasc -c "iface-stat eth0"` 观察该接口的收包与丢包计数，用 `suricatasc -c "dump-counters"` 看 capture、decoder、detect 各类计数是否随流量增长，命令族见 04-07、模块见 07-12。判读要点是「三处一致」：`--dump-config` 里的 `interface` 要与 `iface-list` 一致，`threads` 要与 `lscpu` 里规划的核数相称，`iface-stat` 的丢包计数在低压下应接近零；若配置写着 4 线程而计数长期为零，先查网卡是否真有镜像流量，再查权限与混杂模式。第三路是 A/B：用 `--set threading.detect-thread-ratio=2.0` 起一个对照进程，在相同 pcap 或相同流量窗口下比较 `stats.log` 的 capture 与 detect 计数，所有差异都标注「需在目标机型实测」，基准方法见 08-01。主干段的本场景作用与验证命令对照见下表，参数全集见 04-02 ~ 04-04。
+
+| 主干段 | 本场景作用 | 验证命令 |
+|---|---|---|
+| vars | 定义 HOME_NET 等地址变量 | suricata --dump-config -c suricata.yaml |
+| default-rule-path 与 rule-files | 指定规则目录与文件列表 | suricata -T -c suricata.yaml |
+| af-packet | 抓包网卡、线程数与 fanout 分流 | suricatasc -c "iface-stat eth0" |
+| threading | 绑核、检测线程比例 | suricata --dump-config -c suricata.yaml |
+| unix-command | 启用 suricatasc 控制面 | suricatasc -c "iface-list" |
+| outputs | EVE 与辅助日志开关 | grep -o '"event_type":"[^"]*"' eve.json |
+
+### 5. 常见失败与排错
+
+失败大多集中在「改了没生效」「段之间互相打架」「把绑核当万能药」三类。按闭环约定，每个现象都给「验证命令 → 修复方向」两段，先取证再动手。常见失败对照见下表，完整排错速查见 04-08，诊断决策树见 08-03。
+
+| 现象 | 可能原因 | 验证命令 | 修复方向 |
+|---|---|---|---|
+| 改了 yaml 但行为没变 | 改错文件或有重复段覆盖 | suricata --dump-config -c suricata.yaml | 以回显值为准定位真正生效的那份 |
+| -T 报 YAML 缩进错误 | 段层级空格写错 | suricata -T -c suricata.yaml | 对照 suricata.yaml.in 逐格修正 |
+| 多实例互相抢包 | cluster-id 取值重复 | suricata --dump-config -c suricata.yaml | 每个实例设不同 cluster-id |
+| 吞吐不升反降 | 绑核与 NUMA 或 IRQ 不匹配 | lscpu 与 suricatasc dump-counters | 回退绑核，按 08-02 逐项 A/B |
+| iface-list 看不到网卡 | interface 名错或权限不足 | ip link show | 改真实网卡名并补运行权限 |
+| EVE 缺某类事件 | types 未订阅对应类型 | grep -iE 'alert\|flow' eve.json | 在 eve-log.types 补订阅 |
+| --set 覆盖未生效 | 键名拼写或层级不对 | suricata -T --set 键=值 | 按回显的扁平键名书写 |
+| 起得来但无告警 | HOME_NET 与流量网段不符 | grep -c alert eve.json | 校正 vars 地址组 |
+
+几个需要展开说明的坑。其一，`--dump-config` 是排障的第一证据，不是 yaml 文件本身：include 引入、默认值填充、`--set` 覆盖、重复段后者覆盖前者，都会让「文件里写的」与「引擎读到的」不一致，遇到「改了没反应」必须先回显再动手。其二，`af-packet` 与 `threading` 要成对看，`cluster_flow` 按流分流保证流亲和，但若 `set-cpu-affinity` 把 worker 都挤到远离网卡 NUMA 节点的核上，或 RSS 队列数与 `threads` 对不上，就会出现「分流均匀但 CPU 忙闲不均」；这类问题不能靠继续加线程解决，要回到 08-02 的调优框架里逐项测。其三，`detect-thread-ratio` 的注释明确说小于 1 会起更少线程、至少 1 个，但「更多检测线程」不等于「更高吞吐」，workers 与 autofp 的队列模型不同，autofp 下收包与检测分离会引入队列开销，这是「越调越慢」的常见来源，机制见 06-13。其四，`--set` 适合临时对照，不要依赖它做长期配置，长期值应写回文件并纳入备份；临时覆盖的键名必须与 `--dump-config` 的扁平写法一致，否则 `SCParseCommandLine` 里对 `key=val` 的解析会报错，用法见 04-07。其五，表格里出现 shell 管道符或「或」语义的 `\|` 必须转义书写，否则整表错列，这是资料层的坑。
+
+还有一组全册通用纪律。IDS 旁路只告警不丢弃，Suricata 不做 IP 转发、不做路由、不是防火墙；TLS 等加密载荷正文不可见，能拿到的是握手元数据、证书、SNI、JA3 一类信息，见 `suricata-main/src/output-json-tls.c` 与 `suricata-main/rust/src/ja4.rs`；规则语法兼容 Snort 但有自有扩展，不能宣称 100% 兼容；Hyperscan 只是可选 MPM 加速，缺失时回退 AC 等其他实现；`suricata-update` 是独立发版的工具，不是内建子命令；PF_RING 支持状态需对照 `configure.ac` 与 `src/source-*.c` 核验，不得编造 `source-pfring.c`。任何吞吐、丢包率、内存占用数字一律需在目标机型实测，不给跨机型通用数字。
+
+### 6. 小结
+
+本篇把「主干配置」收成一条可验证的链路：以 `suricata-main/suricata.yaml.in` 为模板，认清 `vars`、`default-rule-path`、`rule-files`、`outputs`、`af-packet`、`threading`、`unix-command` 等主干段的真实位置，用 `SCConfYamlLoadFile` 载入、`SCConfGet` 一类函数读取成 `SCConfNode` 配置树，再由 `af-packet` 与 `threading` 两个消费段分别决定「网卡与分流」「绑核与线程比」，最后统一用 `suricata --dump-config` 的扁平回显核对实际生效值，并给出「预期输出 + 判读要点」。读者应能据回显判断「哪个段没读到、哪个键被覆盖、哪两个段互相错配」，而不是只改文件不验证；也应牢记绑核与加线程不是必然提速，调整效果需在目标机型实测。
+
+与相邻篇的衔接：最小可用部署见 03-01，规则集管理与热加载见 03-03，EVE 字段判读与日志轮转见 03-04，IPS 内联见 03-05，容器多实例见 03-06。配置段的完整清单见 04-02 ~ 04-04、完整变量见 04-01，命令行与 RPC 见 04-07，返回码见 04-08；`SCConfNode`、`ThreadVars` 等字段见 05-07、05-09；配置加载、抓包后端、runmode 的机制分别见 06-01、06-02、06-13；conf、source、output 模块见 07 册；基准与调优读 08-01、08-02。全册交叉引用统一写成 `（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）`。主干配置稳定之后，下一步是把规则从一条自测规则扩展成可持续更新的规则集，这正是 03-03 的任务。
+
+## 03-03 规则集管理：suricata-update、ET/Open 规则与自定义规则
+
+### 1. 目标与拓扑
+
+03-01 只往 `local.rules` 里放了一条自测规则，03-02 把主干配置定型，本篇要解决的是「规则从哪来、怎么持续更新、怎么在不中断检测的前提下换上去」。真实部署里规则不是静态资源：上游厂商与社区会不断新增、修订、撤销签名，安全策略也要求按周期把新规则同步到传感器，同时把误报多或与本地业务冲突的规则禁用、把命中后需要阻断的动作改写成 `drop`。因此规则集管理是一条有生命周期的流水线，而不是一次性的文件拷贝。本篇目标是把这条流水线跑通：用独立工具拉取并合并外部规则源，叠加本地自定义规则与阈值抑制配置，用 `suricata -T` 验证可加载，最后通过 Unix socket 做不重启的热重载。全篇只讲「场景组合与输出判读」，规则关键字全集见 04-05、04-06，参数完整清单见 04-02 ~ 04-04，本篇不重列参数全集。
+
+拓扑可以画成四段。第一段是外部规则源：以 ET/Open 一类社区或商业规则集为代表，工具通过索引文件认识有哪些可订阅源。第二段是独立工具 `suricata-update`：它负责下载、解压、按 `disable.conf`、`enable.conf`、`drop.conf`、`modify.conf` 做筛选与改写，最终把多份规则合并成单一文件，官方文档给出的默认落点是 `/var/lib/suricata/rules/suricata.rules`。第三段是引擎侧加载：`suricata.yaml` 的 `default-rule-path` 与 `rule-files` 决定读哪些文件，`suricata-main/src/detect-engine-loader.c` 的 `SigLoadSignatures` 牵头把规则文本编译成签名，`etc/classification.config`、`etc/reference.config` 与 `threshold.config` 提供 `classtype`、`reference`、阈值抑制的辅助语义。第四段是热重载：改动落位后先用 `-T` 自检，再由 `suricatasc` 的 `reload-rules` 一类命令让运行中的引擎重读规则，无需停进程。四段的顺序与分流见图 03-03-01。
+
+这里必须立一条贯穿全册的纪律：`suricata-update` 与内核主程序是**分仓、独立发版的工具**，不参与 `src/` 主程序的编译，也不是 `suricata` 的内建子命令。本快照里虽然含 `suricata-update/` 目录，但按 SPEC 第 2.1 节第 8 条，仍应按独立工具书写；其 `Makefile.am` 的 `BINS = suricata-update` 与 `LIBS` 列表说明它是随包提供的 Python 工具，命令模块如 `updatesources`、`listsources`、`enablesource`、`disablesource`、`removesource`、`addsource`、`checkversions` 都以独立命令形式存在。把 `sudo suricata-update` 写成 `suricata update` 是典型错误。另一条纪律是规则语法兼容 Snort 但有自有扩展，不能宣称 100% 兼容，见 `suricata-main/src/detect-parse.c` 与 `suricata-main/src/detect-engine-register.c`。
+
+本篇规则集从下载到热重载的生命周期见图 03-03-01。
+
+:::figure id=03-03-01 | name=规则集下载合并加载与热重载链路 | dir=TD
+node n1 "规则源索引<br/>update-sources" blue
+node n2 "suricata-update<br/>独立工具合并" gray
+node n3 "suricata.rules<br/>与 local.rules" amber
+node n4 "SigLoadSignatures<br/>detect-engine-loader" purple
+node n5 "suricata -T<br/>规则自检" teal
+node n6 "reload-rules<br/>Unix socket 热加载" green
+edge n1 -> n2 "enable-source"
+edge n2 -> n3 "下载合并"
+edge n3 -> n4 "rule-files 读取"
+edge n4 -> n5 "启动期编译"
+edge n5 -> n6 "验证后热重载"
+:::
+
+图 03-03-01 里蓝色是外部输入，灰色是独立工具，琥珀色是合并后的规则文件，紫色是引擎侧编译，青色是自检，绿色是运行期热重载；实线表示「做完一步才能进入下一步」。有一条分流值得注意：`local.rules` 与 `suricata.rules` 在第 3 节点汇合，说明自定义规则与外部规则是并列来源，都由 `rule-files` 列表统一读取，而不是谁覆盖谁；若 `rule-files` 只写了 `suricata.rules`，本地规则就永远加载不到，这是「自定义规则不生效」最常见的根因。另一个要点是 `reload-rules` 从自检之后分出，强调「先验证再重载」：一份没过 `-T` 的规则集直接热加载，可能让引擎带着残缺签名继续跑，风险高于停一次机。图中加载链讲「做什么」，签名分组与编译产物见 06-06，模块见 07-04、07-11。
+
+### 2. 前置条件与环境
+
+先确认工具与落位。`suricata-main/suricata-update/Makefile.am` 的 `BINS` 段列出 `suricata-update`，`CONFIGS` 段列出六个随包配置模板：`disable.conf`、`drop.conf`、`enable.conf`、`modify.conf`、`threshold.in`、`update.yaml`；`suricata-main/Makefile.am` 第 51 行附近的 `make install-rules` 用 `suricata-update --no-test --no-reload` 拉取规则，说明 `--no-test` 与 `--no-reload` 是「只下载合并、不自检不热重载」的组合选项，选项语义需对照实际版本核验。官方文档 `suricata-main/doc/userguide/rule-management/suricata-update.rst` 给出的默认合并产物是 `/var/lib/suricata/rules/suricata.rules`，并建议把 `default-rule-path` 指向 `/var/lib/suricata/rules`、`rule-files` 写 `suricata.rules`；自定义规则文档 `suricata-main/doc/userguide/rule-management/adding-your-own-rules.rst` 则给出 `local.rules` 加入 `rule-files` 的写法。具体路径以本机安装前缀为准，需对照实际版本核验。
+
+四类控制文件的职责要分清。`enable.conf` 用 sid、`group:规则文件名`、`re:匹配串` 三类写法启用默认被禁用的规则；`disable.conf` 用同样三类写法禁用误报或不适用的规则，官方示例里 `2019401`、`group:emerging-info.rules`、`re:heartbleed` 都可直接照格式套用；`drop.conf` 把命中规则的动作改写为 `drop`，是 IPS 场景常用的「告警转阻断」入口，动作语义见 03-05、04-05；`modify.conf` 用于按匹配条件改写规则文本，具体语法需对照 `suricata-update` 实际版本核验。阈值抑制另有 `threshold.config`，`suricata-main/suricata.yaml.in` 第 2393 行是注释形式的 `threshold-file`，官方热加载文档 `rule-reload.rst` 也把 `classification.config`、`reference.config`、`threshold.config` 列为「规则相关配置文件」，说明这三者会随规则一起被重载。这些文件的写法与优先级属 04 册权威源，本篇只组合不展开。
+
+引擎侧资源要逐项确认。`etc/classification.config`、`etc/reference.config` 在 `suricata-main/etc/` 下真实存在，由 `suricata-main/src/util-classification-config.c` 与 `suricata-main/src/util-reference-config.c` 读取，键名 `classification-file`、`reference-config-file` 在 `suricata-main/suricata.yaml.in` 第 2391、2392 行；规则加载入口是 `suricata-main/src/detect-engine-loader.c` 的 `SigLoadSignatures`，它由 `suricata-main/src/suricata.c` 的静态 `LoadSignatures` 调用，往下有 `DetectLoadSigFile`、`ProcessSigFiles` 逐文件读取与 `SigInit` 逐条构造，函数名与签名需对照实际版本核验（字段见 05-05 ｜ 参数见 04-02 ｜ 原理见 06-06 ｜ 模块见 07-04）。控制面要可用：`suricata.yaml` 的 `unix-command.enabled` 为 `auto` 或 `yes` 时，`suricatasc` 才能连上；热重载命令族来自 `suricata-main/doc/userguide/unix-socket.rst`，包括 `ruleset-reload-rules`、`ruleset-reload-nonblocking`、`ruleset-reload-time`、`ruleset-stats`、`ruleset-failed-rules` 以及别名 `reload-rules`，Rust 侧命令清单见 `suricata-main/rust/suricatasc/src/unix/commands.rs`，命令全集见 04-07。
+
+环境还要确认三件事。其一，网络可达性：`update-sources` 与下载规则源需要访问外部索引与规则主机，离线环境应预先把规则文件放到 `default-rule-path` 并跳过下载步骤，只用 `-T` 验证加载数量。其二，权限：合并产物写入 `/var/lib/suricata/rules/`、`reload-rules` 通过 Unix socket 下发，通常需要管理员权限或与控制面 socket 文件权限匹配。其三，规则集规模直接影响编译期内存与时间，以及运行期检测开销，具体占用需在目标机型实测，不给绝对值；不可信规则带来的 `pcre` 回溯、大 `dataset` 等风险见 08-05。版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验。
+
+### 3. 分步操作
+
+下面按「确认工具 → 拉索引 → 订阅源 → 合并 → 叠加本地规则与阈值 → 自检 → 热重载 → 收尾」的闭环给出完整序列。命令中的源名、路径与 sid 需按实际环境替换，规则语法见 04-05、04-06，完整变量见 04-01。
+
+```bash
+# 步骤 0：确认独立工具在位并查看当前启用的源
+command -v suricata-update
+suricata-update list-enabled-sources
+
+# 步骤 1：拉取规则源索引并列出可用源
+sudo suricata-update update-sources
+sudo suricata-update list-sources
+
+# 步骤 2：启用一个规则源并执行合并
+sudo suricata-update enable-source oisf/trafficid
+sudo suricata-update
+
+# 步骤 3：核对合并产物与本地规则文件
+ls -l /var/lib/suricata/rules/suricata.rules /etc/suricata/rules/local.rules
+
+# 步骤 4：改动后自检，确认加载数量与失败条数
+sudo suricata -T -c /etc/suricata/suricata.yaml -l /var/log/suricata/
+
+# 步骤 5：不重启热加载规则，确认重载时间与统计
+sudo suricatasc -c "reload-rules"
+sudo suricatasc -c "ruleset-reload-time"
+sudo suricatasc -c "ruleset-stats"
+```
+
+逐条说明几个容易含糊的点。步骤 0 的 `command -v suricata-update` 用来确认工具是独立可执行文件，而不是主程序的子命令；`list-enabled-sources` 回显当前已启用的源，作为改动前基线。步骤 1 的两条命令对应 `Makefile.am` 里的 `updatesources` 与 `listsources` 命令模块，先更新索引再看清单，顺序不能反。步骤 2 的 `enable-source oisf/trafficid` 来自官方示例，随后不带子命令的 `suricata-update` 执行下载、筛选、改写与合并；`--no-test`、`--no-reload` 这类选项用于只合并的自动化场景，语义需对照实际版本核验。步骤 3 的 `ls` 确认两份规则文件都在，`local.rules` 必须在 `rule-files` 列表里才会被读取。步骤 4 的 `-T` 与 03-01 同一条加载链，重点看「处理文件数、成功加载数、失败数」三个量。步骤 5 的 `reload-rules` 是 `ruleset-reload-rules` 的别名，会等待重载完成；`ruleset-reload-nonblocking` 则不等待，适合脚本化批量下发；`ruleset-reload-time` 与 `ruleset-stats` 分别回显上次重载时间与规则统计，用来确认改动真的生效，命令族见 04-07、模块见 07-12。
+
+与命令配套的最小配置片段如下，仅示意「组合方式」，键名与取值需对照实际版本核验，完整清单见 04-02 ~ 04-04，本篇不重列参数全集。
+
+```yaml
+%YAML 1.1
+---
+default-rule-path: /var/lib/suricata/rules
+rule-files:
+  - suricata.rules
+  - /etc/suricata/rules/local.rules
+classification-file: /etc/suricata/classification.config
+reference-config-file: /etc/suricata/reference.config
+threshold-file: /etc/suricata/threshold.config
+```
+
+三类控制文件的写法示意如下，内容为示意格式，实际条目与匹配语义需对照 `suricata-update` 实际版本核验。
+
+```text
+# disable.conf：按 sid、规则文件组、匹配串禁用规则
+2019401
+group:emerging-info.rules
+re:heartbleed
+
+# enable.conf：启用默认被禁用的规则
+re:trojan
+
+# drop.conf：把命中规则改写为 drop 动作（IPS 场景用）
+2019401
+```
+
+配置里 `rule-files` 把外部合并产物与本地规则并列列出，`classification-file`、`reference-config-file`、`threshold-file` 分别指向三类辅助文件；`drop.conf` 里的动作改写会与 03-05 的 drop 规则衔接，但 IDS 旁路模式下 `drop` 动作只影响告警记录、不真正丢弃报文，这一点务必分清。辅助配置的读取落在 `suricata-main/src/util-classification-config.c`、`suricata-main/src/util-reference-config.c` 一类文件，函数名需对照实际版本核验（字段见 05-05 ｜ 参数见 04-02 ｜ 原理见 06-06 ｜ 模块见 07-04）。
+
+### 4. 验证方法与预期结果
+
+本篇要求给出「预期输出 + 判读要点」，核心验证是 `suricata -T` 的加载统计，辅以 `suricatasc` 的规则统计回显。以下是 `-T` 的示例输出，具体格式需对照实际版本核验。
+
+```text
+[Info] - Running suricata under test mode
+[Info] - Loading configuration /etc/suricata/suricata.yaml
+[Info] - Configuration OK
+[Info] - Loading rule files from default-rule-path
+[Info] - 2 rule files processed, 41237 rules successfully loaded, 3 rules failed
+[Info] - Initializing runmode
+[Info] - Configuration provided was successfully loaded. Exiting.
+```
+
+逐行判读这段输出。首行确认进入只加载不抓包的自检模式，此模式不产生告警、不影响在跑的实例，是每次改动规则后必须先过的一关。第二行报告实际加载的 yaml 路径，用来确认 `-c` 没落回默认配置。第三行 `Configuration OK` 说明配置语法与段结构通过解析；若此处报缩进或未知段，先回查 03-02 的主干段。第四、五行是本篇的重点：`2 rule files processed` 与 `rule-files` 列表长度一致，说明 `suricata.rules` 与 `local.rules` 两份都被读到，若只显示 1 个文件，往往是漏把本地规则写进列表或路径拼错；`rules successfully loaded` 是成功编译成签名的条数，示例数值仅示意，实际随订阅的 ET/Open 规则源规模、版本与筛选配置变化，需对照实际版本核验，不能拿它当跨环境基线；`rules failed` 是最该盯的异常量，正常应接近零，一旦大于零就要到 `suricata.log` 里找 `error parsing signature`、`unknown keyword` 一类行，定位到具体文件与行号。末两行说明已进入运行模式装配前检查并正常退出，代表这份规则集可以安全用于启动或热重载。要牢记自检通过只证明「能编译」，不等于规则一定命中业务流量，`HOME_NET`、`vars` 与规则方向仍需结合 03-02、03-01 的判读一起看；输出的行数、措辞、日志级别会随构建与规则集变化，务必以本地结果为准，规则数量一类数值不得写成绝对值。
+
+第二路是运行期的规则统计回显，用来确认热重载真的换上了新规则。示例输出，具体格式需对照实际版本核验。
+
+```text
+{"message": {"rules_loaded": 41237, "rules_failed": 3, "rules_skipped": 0}, "return": "OK"}
+```
+
+判读要点：`return` 为 `OK` 说明命令被控制面正常受理，`rules_loaded` 应与 `-T` 的成功加载数处在同一量级，`rules_failed` 应与 `-T` 的失败数一致，三者若明显对不上，优先怀疑热重载时读到的 `rule-files` 与自检时不是同一份配置，或 `unix-command` 连到了另一个实例；`rules_skipped` 反映被跳过条数，长期非零要查重复 sid 或规则动作冲突。配合 `ruleset-reload-time` 回显的上次重载时间戳，可确认改动确已落地，而不是命令发出去了却没人执行。命令协议与返回码见 04-07、04-08，控制面模块见 07-12。第三路是取证实操：用 `suricata --dump-config` 过滤 `rule-files` 与 `default-rule-path`，用 `ls -l` 看 `suricata.rules` 的修改时间，用 `grep -c` 统计 `local.rules` 里自测规则的条数，三者合起来能区分「工具没下载」「配置没读到」「热重载没执行」三类问题。规则管理常见命令与产物的对照见下表，参数全集见 04-02 ~ 04-04。
+
+| 命令或文件 | 作用 | 验证方式 |
+|---|---|---|
+| suricata-update update-sources | 拉取规则源索引 | suricata-update list-sources |
+| suricata-update enable-source | 订阅指定规则源 | suricata-update list-enabled-sources |
+| suricata.rules | 外部规则合并产物 | ls -l 与 grep -c 统计条数 |
+| local.rules | 本地自定义规则 | grep -c 与 -T 加载文件数 |
+| disable.conf 与 enable.conf | 按 sid 或匹配串启停规则 | -T 的成功加载数变化 |
+| drop.conf | 告警动作改写为 drop | 03-05 的 drop 日志判读 |
+| suricatasc reload-rules | 不重启热重载规则 | ruleset-reload-time 时间戳 |
+
+### 5. 常见失败与排错
+
+失败大多集中在「工具不在位」「路径没对上」「规则语法不兼容」「热重载没生效」四类。按闭环约定，每个现象都给「验证命令 → 修复方向」两段，先取证再动手，不要一上来就重装或改源码。常见失败对照见下表，完整排错速查见 04-08，诊断决策树见 08-03。
+
+| 现象 | 可能原因 | 验证命令 | 修复方向 |
+|---|---|---|---|
+| suricata-update 命令找不到 | 独立工具未安装或未在 PATH | command -v suricata-update | 单独安装工具后再执行 |
+| update-sources 报网络错误 | 无法访问规则源索引主机 | suricata-update list-sources | 检查出网或改离线放置规则文件 |
+| -T 只处理 1 个规则文件 | local.rules 未加入 rule-files | suricata --dump-config -c yaml | 补进列表并核对路径 |
+| -T 报 unknown keyword | 规则用了不兼容的自有扩展 | grep -iE 'error\|warning' suricata.log | 对照 04-05、04-06 修正 |
+| -T 失败条数偏多 | 规则集含当前版本不支持的语法 | suricata -T -c suricata.yaml | 用 disable.conf 屏蔽或升级版本 |
+| classification 相关报错 | 辅助配置文件路径不对 | ls -l /etc/suricata/*.config | 校正 classification-file 等键 |
+| reload-rules 返回失败 | unix-command 未启用或权限不足 | suricatasc -c "ruleset-stats" | 打开 enabled 并核对 socket 权限 |
+| 热重载后规则数没变 | 连到别的实例或读到旧配置 | suricatasc -c "ruleset-reload-time" | 确认实例与 rule-files 一致 |
+
+几个需要展开说明的坑。其一，最容易踩的是把 `suricata-update` 写成主程序内建命令，例如误敲 `suricata update`；它是独立发版、独立安装的 Python 工具，本快照的 `suricata-update/Makefile.am` 只是随包提供安装逻辑，不参与 `src/` 编译，这一点在自动化脚本里尤其要写清。其二，`-T` 的失败条数不能直接忽略：一份带大量 `rules_failed` 的规则集热加载后，引擎会用残缺签名继续跑，表面无告警、实际漏检，因此流程上必须「先 -T 通过、再 reload-rules」，`ruleset-failed-rules` 命令能把失败规则逐条列出来，是排障利器。其三，规则语法兼容 Snort 但有自有扩展，不能假定从别处拷来的 Snort 规则原样可用，遇到 `unknown keyword` 要到 `suricata-main/src/detect-parse.c` 与 `suricata-main/src/detect-engine-register.c` 的语义范围里核对，需对照实际版本核验。其四，`drop.conf` 把动作改写为 `drop` 只在 IPS 内联才有真实阻断效果，IDS 旁路只告警不丢弃，别把两者混为一谈，判定见 03-05、原理见 06-12。其五，表格里出现 shell 管道符或「或」语义的 `\|` 必须转义书写，否则整表错列，这是资料层的坑。
+
+还有一组全册通用纪律。`suricata-update` 按独立工具写；规则语法兼容 Snort 但非 100%；EVE JSON 是主要输出，fast.log、stats.log、pcap-log 为辅助；Hyperscan 只是可选 MPM 加速，缺失时回退 AC 等其他实现，构建开关见 `suricata-main/configure.ac`，选项名需对照实际版本核验；PF_RING 支持状态需对照 `configure.ac` 与 `src/source-*.c` 核验，不得编造 `source-pfring.c`；IDS 旁路只告警不丢弃，Suricata 不做 IP 转发、不做路由、不是防火墙；TLS 等加密载荷正文不可见。规则集规模对编译期内存与运行期开销的影响一律需在目标机型实测，不给绝对值，加固建议见 08-05。
+
+### 6. 小结
+
+本篇把「规则集管理」收成一条有生命周期的闭环：以独立工具 `suricata-update` 为入口，先 `update-sources` 拉索引、`list-sources` 看清单、`enable-source` 订阅 ET/Open 一类规则源，再用不带子命令的 `suricata-update` 下载并按 `enable.conf`、`disable.conf`、`drop.conf`、`modify.conf` 筛选改写、合并成 `suricata.rules`；随后把 `local.rules` 与三类辅助配置文件接入 `rule-files`、`classification-file`、`reference-config-file`、`threshold-file`，经 `SigLoadSignatures` 编译成签名；改动后必须先 `suricata -T` 自检，再用 `suricatasc` 的 `reload-rules`、`ruleset-reload-time`、`ruleset-stats` 做不重启热重载与取证，并全程给出「预期输出 + 判读要点」。读者应能据 `-T` 的文件数、成功数、失败数与热重载回显判断「工具有没有下载、配置有没有读到、规则有没有换上」，而不是只看命令有没有返回零。
+
+与相邻篇的衔接：最小可用部署见 03-01，主干配置见 03-02，EVE 字段判读与日志轮转见 03-04，IPS 内联与 drop 动作见 03-05，容器多实例见 03-06。规则关键字全集见 04-05、04-06，配置参数完整清单见 04-02 ~ 04-04，命令行与 RPC 见 04-07，返回码见 04-08；`Signature`、`SigMatch` 等字段见 05-05；规则加载与签名分组编译见 06-06，应用层解析见 06-05；detect、app-layer、suricata-update、unix socket 模块分别见 07 册；基准与排障读 08 册。全册交叉引用统一写成 `（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）`。规则能持续更新之后，下一步是把引擎产出的事件真正接进日志管道并读懂它，这正是 03-04 的任务。
+
+## 03-04 EVE JSON 输出与日志管道接入、轮转
+
+### 1. 目标与拓扑
+
+03-01 到 03-03 解决的是「引擎能不能起来、规则能不能加载」，本篇解决的是「引擎说了什么、这句话怎么被后续系统消费」。Suricata 的主要输出是 EVE JSON，一种结构化、可扩展、机器可读的事件格式；fast.log、stats.log、pcap-log 一类是辅助输出。把 EVE 接好、读懂、管住，是 IDS/NSM 落地里最容易被低估却最关键的一环：没有正确订阅的 `types`，DNS、TLS、file、flow 等事件根本不会落盘；没有外部轮转，单个 `eve.json` 会在高流量下无限增长直到写满磁盘；没有对 `event_type`、`flow_id`、`alert.signature` 的判读能力，告警到了眼前也读不出含义。本篇目标是把「产出 → 落盘 → 采集 → 轮转 → 重开句柄」这条管道跑通，并给出逐字段的输出判读。全篇只讲「场景组合与输出判读」，`outputs` 下全部键的完整清单见 04-04，本篇不重列参数全集。
+
+拓扑可以画成一条从引擎内部到外部系统的链路。起点是检测与流管理产出的事件，由 `suricata-main/src/output-json.c` 的 `OutputJsonRegister` 登记 EVE 输出模块、`CreateEveHeader` 统一构造每条记录的公共头；按事件类型分流的记录分别落在 `suricata-main/src/output-json-alert.c`（告警）、`src/output-json-flow.c`（流）、`src/output-json-dns.c`（DNS）、`src/output-json-tls.c`（TLS）、`src/output-json-drop.c`（丢弃）、`src/output-json-stats.c`（统计）等族文件，C 侧的 JSON 构造大量借助 `SCJsonBuilder` 与 `SCJbSetString`、`SCJbSetUint`、`SCJbOpenObject` 一类函数，Rust 侧另有 `suricata-main/rust/src/jsonbuilder.rs` 参与，函数名与结构名需对照实际版本核验。公共头与类型专属字段合并后写入 `eve.json`。中游是外部管道：Filebeat、Logstash 一类采集器读取该文件并转发到检索平台，这部分属于引擎之外的系统，具体配置需对照实际版本核验。下游是轮转：`suricata-main/etc/suricata.logrotate.in` 提供外部轮转模板，轮转后必须让引擎重新打开文件句柄，手段是 `suricatasc` 的 `reopen-log-files`。产出、落盘、采集、轮转、重开的关系见图 03-04-01。
+
+需要先划清边界。EVE JSON 是主要输出，fast.log、stats.log、pcap-log 为辅助输出，不能把辅助日志当成事件分析的主源；本篇只给 `outputs.eve-log` 本场景最小必要组合，全部键见 04-04。字段只点名加真实源码路径，写「字段见 05-08」；事件构造与聚合机制写「原理见 06-11」；输出与日志模块能力写「模块见 07-07」。还要守住一条能力边界：TLS 等加密载荷正文不可见，EVE 里能拿到的是握手元数据、证书、SNI、JA3/JA4 一类信息，见 `src/output-json-tls.c` 与 `rust/src/ja4.rs`，字段需对照实际版本核验，不能宣称读到 HTTPS 明文正文。
+
+本篇 EVE 事件产出、接入与轮转链路见图 03-04-01。
+
+:::figure id=03-04-01 | name=EVE JSON 产出接入与轮转链路 | dir=TD
+node n1 "检测与流事件<br/>detect / flow" purple
+node n2 "CreateEveHeader<br/>output-json.c" teal
+node n3 "eve.json<br/>event_type 分类" green
+node n4 "Filebeat / Logstash<br/>外部采集管道" gray
+node n5 "logrotate<br/>suricata.logrotate" amber
+node n6 "reopen-log-files<br/>suricatasc 重开" blue
+edge n1 -> n2 "事件构造"
+edge n2 -> n3 "JSON 落盘"
+edge n3 -> n4 "采集转发"
+edge n3 -> n5 "外部轮转"
+edge n5 -> n6 "重开文件句柄"
+:::
+
+图 03-04-01 里紫色是事件来源，青色是公共头构造，绿色是落盘文件，灰色是外部系统，琥珀色是轮转，蓝色是控制面动作；实线表示数据流或触发关系。有两条分支从 `eve.json` 分出，分别走向外部采集与本地轮转，说明「被下游消费」与「被本地归档」是同一份文件的两条出路，二者都要照顾：只接采集不设轮转，磁盘会被撑满；只做轮转不通知引擎，轮转后进程仍握着旧文件描述符，新事件会继续写进被改名压缩的旧文件里，表现为「eve.json 大小不涨、日志却丢了」。这正是 `reopen-log-files` 必须紧跟轮转的原因，命令语义见 `suricata-main/doc/userguide/unix-socket.rst` 的「reopen log files (to be run after external log rotation)」条目。图中构造链讲「做什么」，事件聚合与写出机制见 06-11，模块见 07-07。
+
+### 2. 前置条件与环境
+
+先确认 `outputs.eve-log` 段在模板里的真实键。`suricata-main/suricata.yaml.in` 第 89 行是 `outputs` 段，第 100 行开始是 `eve-log`：第 102 行 `filetype: regular`，注释列出 `regular`、`syslog`、`unix_dgram`、`unix_stream`、`redis` 五种取值；第 103 行 `filename: eve.json`；另有 `threaded`、`buffer-size`、`prefix`、`pcap-file`、`community-id`、`community-id-seed`、`xff`、`metadata` 等可选项；第 186 行开始的 `types` 子段逐项列出可订阅事件，实见 `alert`、`frame`、`anomaly`、`http`、`dns`、`mdns`、`tls`、`files`、`drop`、`smtp`、`websocket`、`ftp` 等，其中 `drop` 与部分项默认被注释、`frame` 默认 `enabled: no`、`anomaly` 默认 `enabled: yes`，具体默认需对照实际版本核验。第 484 行的 `- stats:` 辅助段给出 `filename: stats.log`，第 654 行是 `suricata.log` 的落盘名。这些键的完整取值见 04-04。
+
+关于轮转要特别说明一个事实核验结论：在本上游 main 快照的 `suricata.yaml.in` 里，未检索到 `rotate-interval` 键；模板给出的轮转路径是外部 `logrotate` 加控制面 `reopen-log-files`。`suricata-main/etc/suricata.logrotate.in` 的内容是：匹配 `@e_logdir@*.log @e_logdir@*.json` 两类文件，`daily`、`missingok`、`rotate 5`、`compress`、`delaycompress`、`minsize 500k`、`sharedscripts`，`postrotate` 段用 `/bin/kill -HUP` 读取 `@e_rundir@suricata.pid` 里的 pid 发信号，`endscript` 收尾。把 `@e_logdir@`、`@e_rundir@` 替换成实际安装路径即可，占位符由构建期渲染，需对照实际版本核验。因此本篇按「外部 logrotate 轮转 + SIGHUP 或 `reopen-log-files` 重开」两条等效手段来讲，若某版本确有 `rotate-interval` 一类内建键，其键名与取值需对照实际版本核验，本篇不臆造。
+
+EVE 字段的构造位置要心里有数。`suricata-main/src/output-json.c` 第 80 行是 `OutputJsonRegister`，第 816 行 `CreateEveHeader` 依次写入 `timestamp`、`flow_id`（经 `CreateEveFlowId` 调 `FlowGetId`）、`sensor_id`、`in_iface`、`pcap_cnt`、`event_type`、`vlan`；`src/output-json-flow.c` 第 112 行用 `JB_SET_STRING(jb, "event_type", "flow")` 写事件类型，并写 `src_ip`、`dest_ip`、`proto`、`app_proto`；`src/output-json-alert.c` 第 209 行 `AlertJsonHeader` 打开 `alert` 对象，第 242、246 行分别写 `signature_id` 与 `signature`（取自 `pa->s->msg`），第 301 行写 `src_ip`，第 552 行 `EveAddVerdict` 处理动作与 verdict。函数名、宏名与字段名需对照实际版本核验（字段见 05-08 ｜ 参数见 04-04 ｜ 原理见 06-11 ｜ 模块见 07-07）。外部采集器 Filebeat、Logstash 的配置不在本快照的 `src/` 里，属独立系统，写法需对照其实际版本核验，本篇只给接入位置与判读方法。
+
+环境要确认三件事。其一，`unix-command.enabled` 为 `auto` 或 `yes`，否则 `suricatasc` 连不上，`reopen-log-files` 无处下发。其二，日志目录可写且有余量，`eve.json` 的写入速率、轮转后保留份数与磁盘占用一律需在目标机型实测，不给绝对值。其三，运行用户与轮转脚本、`logrotate` 的 `postrotate` 之间权限要匹配，pid 文件路径要与 `@e_rundir@suricata.pid` 一致。版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验。
+
+### 3. 分步操作
+
+下面按「订阅事件类型 → 校验段生效 → 触发告警并统计 → 接外部采集 → 外部轮转 → 重开句柄 → 收尾」的闭环给出完整序列。命令中的路径与采集器名称需按实际环境替换，完整命令行见 04-07，完整变量见 04-01。
+
+```bash
+# 步骤 0：回显 eve-log 段，确认订阅类型与文件名生效
+suricata --dump-config -c /etc/suricata/suricata.yaml | grep -E 'outputs.*eve-log' | head -20
+
+# 步骤 1：按 event_type 统计已落盘的事件种类
+grep -o '"event_type":"[^"]*"' /var/log/suricata/eve.json | sort | uniq -c
+
+# 步骤 2：用 jq 抽取告警事件的关键字段
+jq -r 'select(.event_type=="alert") | [.flow_id,.src_ip,.alert.signature_id,.alert.signature] | @tsv' \
+  /var/log/suricata/eve.json | head -10
+
+# 步骤 3：外部轮转并通知引擎重开文件句柄
+sudo logrotate -f /etc/logrotate.d/suricata
+sudo suricatasc -c "reopen-log-files"
+
+# 步骤 4：确认新文件被重新创建、旧文件已归档
+ls -l /var/log/suricata/eve.json /var/log/suricata/eve.json.1
+suricatasc -c "ruleset-stats"
+```
+
+逐条说明几个容易含糊的点。步骤 0 用 `--dump-config` 的扁平回显确认 `eve-log.enabled`、`filename`、`types` 订阅项真的被读到，比直接读 yaml 可靠；若某类事件缺失，先查这里有没有订阅，而不是怀疑上游没产出。步骤 1 的 `grep -o` 加 `sort | uniq -c` 是判读事件分布的快捷手段，正常应看到 `alert`、`flow`、`stats` 等已订阅类型，若只有 `stats` 没 `alert`，说明规则没命中或 `types` 没订阅 `alert`。步骤 2 的 `jq` 表达式把 `flow_id`、源地址、sid、签名文本拉成列，便于与 `fast.log` 逐条对齐；`jq` 属外部工具，需自行确认在位。步骤 3 是本篇最关键的一步：`logrotate -f` 强制轮转后，必须让引擎重新打开文件句柄，这里用 `suricatasc reopen-log-files`；`etc/suricata.logrotate.in` 的 `postrotate` 段用 `kill -HUP` 是等效的另一条路径，二者选其一即可，不要重复发通知。步骤 4 的 `ls` 用来确认新的空 `eve.json` 被创建、旧的 `eve.json.1` 已归档压缩，`ruleset-stats` 顺带确认控制面连通。采集器侧以 Filebeat 读取 `/var/log/suricata/eve.json` 为接入点，具体 `filestream` 输入与输出配置属外部系统，需对照实际版本核验，本篇不重列其参数。
+
+与命令配套的最小 `eve-log` 配置片段如下，仅示意「场景组合」，键名与取值需对照实际版本核验，完整清单见 04-02 ~ 04-04，本篇不重列参数全集。
+
+```yaml
+outputs:
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: eve.json
+      community-id: false
+      xff:
+        enabled: no
+        mode: extra-data
+        deployment: reverse
+        header: X-Forwarded-For
+      types:
+        - alert:
+            tagged-packets: yes
+        - flow
+        - dns
+        - tls:
+            extended: yes
+        - drop:
+            alerts: yes
+        - stats
+  - fast:
+      enabled: yes
+      filename: fast.log
+  - stats:
+      enabled: yes
+      filename: stats.log
+```
+
+配置里 `filetype: regular` 表示写普通文件，`types` 逐项订阅 `alert`、`flow`、`dns`、`tls`、`drop`、`stats`，`community-id` 与 `xff` 保持关闭或默认，避免引入外部依赖；`fast`、`stats` 两段保留作辅助对照。若某类事件只需在 IPS 场景开启（例如 `drop`），应按 03-05 的需求再决定是否订阅。外部轮转模板的内容如下，占位符已按常见安装路径示意替换，实际路径需对照实际版本核验。
+
+```text
+/var/log/suricata/*.log /var/log/suricata/*.json {
+    daily
+    missingok
+    rotate 5
+    compress
+    delaycompress
+    minsize 500k
+    sharedscripts
+    postrotate
+        /bin/kill -HUP `cat /var/run/suricata.pid 2> /dev/null` 2> /dev/null || true
+    endscript
+}
+```
+
+轮转模板里 `sharedscripts` 保证 `postrotate` 只跑一次，`delaycompress` 让上一份日志延后一轮再压缩，便于采集器追完尾部；`postrotate` 用 `kill -HUP` 通知引擎重开句柄，与 `suricatasc reopen-log-files` 是同一目的的两条路径。公共头与类型字段由 `suricata-main/src/output-json.c`、`src/output-json-alert.c`、`src/output-json-flow.c` 一类文件构造，函数名需对照实际版本核验（字段见 05-08 ｜ 参数见 04-04 ｜ 原理见 06-11 ｜ 模块见 07-07）。
+
+### 4. 验证方法与预期结果
+
+本篇要求给出「预期输出 + 判读要点」，核心是一条真实告警事件的逐字段判读。以下是一条 `alert` 事件的示例输出，具体格式需对照实际版本核验。
+
+```text
+{"timestamp":"2026-11-13T09:21:07.123456+0800","flow_id":1984237612345678,"in_iface":"eth0","event_type":"alert","src_ip":"192.168.1.10","dest_ip":"203.0.113.20","proto":"TCP","alert":{"action":"allowed","gid":1,"signature_id":1000001,"rev":1,"signature":"LOCAL TEST TCP","category":"","severity":3}}
+```
+
+逐行判读这条记录。`timestamp` 是 `CreateEveHeader` 用 `CreateIsoTimeString` 生成的 ISO8601 时间，正常应带时区且与主机时钟一致，若出现时间倒退或时区错位，会直接影响下游按时间排序与关联。`flow_id` 由 `CreateEveFlowId` 调 `FlowGetId` 生成，是同一条流所有事件的聚合键，判读要点是「同流一致」：把这条 `alert` 与随后的 `flow`、`dns` 事件按 `flow_id` 串起来，才能还原完整会话，若同流事件的 `flow_id` 不同，说明流表或聚合出了问题。`in_iface` 为 eth0 标明收包接口，多实例部署时用来区分传感器。`event_type` 为 `alert` 是本记录的类型标签，它由 `types` 订阅决定，取值集合里还有 `flow`、`dns`、`tls`、`file`、`drop`、`stats` 等，读日志第一步就是按它分流。`src_ip` 与 `dest_ip` 是会话两端地址，应与 pcap 或 `iface-stat` 观察到的流量一致，方向反了要回查 `vars` 与规则方向。`proto` 是传输层协议。嵌套的 `alert` 对象里，`action` 反映引擎最终动作，`gid`、`signature_id`、`rev` 分别是规则组号、sid 与修订号，三者合起来应能唯一定位到 `local.rules` 里那条自测规则；`signature` 是规则 `msg` 文本，应能在 `fast.log` 里找到同名行，这是「EVE 与辅助日志对齐」的关键校验；`category` 与 `severity` 来自 `classification.config`，为空或默认级别说明规则的 `classtype` 没配或用了占位值。需要牢记：字段名、嵌套层级与部分可选字段会随版本与 `types` 子项配置变化，务必以本地结果为准，所有键名需对照实际版本核验；加密载荷正文不可见，`tls` 事件里能拿到的是握手元数据与证书类信息，不能据此推断 HTTPS 明文内容。
+
+第二路是事件分布与轮转后的预期输出。示例输出，具体格式需对照实际版本核验。
+
+```text
+   1427 {"event_type":"alert"}
+   8934 {"event_type":"flow"}
+   2103 {"event_type":"dns"}
+    871 {"event_type":"stats"}
+```
+
+判读要点：四类计数都大于零说明 `types` 订阅的 `alert`、`flow`、`dns`、`stats` 均在有流量时正常产出；`alert` 数应与 `fast.log` 行数同量级，明显偏少要查订阅、规则命中与 `HOME_NET`；`stats` 计数随 `stats` 事件周期增长，是引擎存活的心跳；若某类恒为零，先查 `--dump-config` 里该类型是否订阅、再查流量里是否存在对应协议。轮转后的预期输出是：`ls` 能看到新建的 `eve.json` 与归档的 `eve.json.1`，新文件在后续流量下重新增长，`reopen-log-files` 返回 `OK`，`suricata.log` 无「打开日志文件失败」一类报错；若新文件不增长，说明引擎仍握着旧描述符，需补发一次重开通知。EVE 关键字段的判读对照见下表，字段全集见 05-08、参数全集见 04-04。
+
+| 字段 | 含义与来源 | 正常值或异常特征 |
+|---|---|---|
+| timestamp | CreateEveHeader 生成的时间戳 | ISO8601 带时区，异常为倒退或错位 |
+| flow_id | FlowGetId 生成的流聚合键 | 同流多事件应一致，不一致查流表 |
+| event_type | 事件类型，由 types 订阅决定 | alert / flow / dns 等，恒零查订阅 |
+| src_ip 与 dest_ip | 会话两端地址 | 与抓包会话一致，方向反查 vars |
+| alert.signature | 规则 msg 文本 | 与 fast.log 同名行对齐 |
+| alert.signature_id | 规则 sid | 与规则文件一致，定位唯一规则 |
+| alert.action 与 verdict | 引擎最终动作 | IDS 旁路应为 allowed 类取值 |
+
+### 5. 常见失败与排错
+
+失败大多集中在「没订阅」「轮转后丢日志」「字段读不懂」「外部管道没接上」四类。按闭环约定，每个现象都给「验证命令 → 修复方向」两段，先取证再动手。常见失败对照见下表，完整排错速查见 04-08，诊断决策树见 08-03。
+
+| 现象 | 可能原因 | 验证命令 | 修复方向 |
+|---|---|---|---|
+| eve.json 完全没有 alert | types 未订阅 alert 或规则未命中 | suricata --dump-config -c yaml | 补订阅 alert 并核对规则命中 |
+| 缺 DNS 或 TLS 事件 | types 里未订阅对应类型 | grep -o 'event_type' eve.json | 在 types 增加 dns 或 tls 项 |
+| 轮转后 eve.json 不增长 | 旧描述符未重开 | ls -l /var/log/suricata/eve.json | 补发 reopen-log-files 或 HUP |
+| 轮转后日志报打开失败 | 目录权限或 pid 路径不对 | grep -iE 'error\|warning' suricata.log | 校正 logrotate 模板与运行用户 |
+| flow_id 串不起同流事件 | 流表或聚合异常 | jq '.flow_id' eve.json | 结合 06-04、08-03 排查 |
+| Filebeat 采集不到 | 路径或权限不匹配 | ls -l /var/log/suricata/eve.json | 核对采集器输入路径，需对照实际版本核验 |
+| community-id 缺失 | 该选项未开启 | suricata --dump-config -c yaml | 按需打开 community-id 与 seed |
+| 误以为读到 HTTPS 正文 | 混淆元数据与加密载荷 | grep event_type eve.json | 明确 TLS 明文不可见 |
+
+几个需要展开说明的坑。其一，「轮转后日志悄悄丢」最隐蔽：`eve.json` 被改名成 `eve.json.1` 并压缩，但引擎若不重开句柄，仍会往旧描述符里写，表现为新文件大小长期为零、下游采集断流；因此 `logrotate` 的 `postrotate` 与 `suricatasc reopen-log-files` 二选一必须落实，且 `sharedscripts` 要保证只通知一次。其二，关于内建轮转键：本快照 `suricata.yaml.in` 未检索到 `rotate-interval`，资料里若出现该键名，须写「需对照实际版本核验」并给出 `suricata.yaml.in` 可定位目录，不得凭印象补值，这正是 SPEC 事实纪律的要求。其三，`types` 是「白名单式订阅」，没订阅就不产出，排查缺事件时第一步永远看 `--dump-config`，而不是去改规则或怀疑解析。其四，`drop` 事件与 `alert.action` 在 IDS 旁路和 IPS 内联下含义不同，旁路只告警不丢弃，别把 `action` 里的 allowed 当成配置错误，判定见 03-05、原理见 06-12。其五，表格里出现 shell 管道符或「或」语义的 `\|` 必须转义书写，否则整表错列，这是资料层的坑。
+
+还有一组全册通用纪律。EVE JSON 是主要输出，fast.log、stats.log、pcap-log 为辅助；IDS 旁路只告警不丢弃，Suricata 不做 IP 转发、不做路由、不是防火墙；TLS 等加密载荷正文不可见，只能拿到握手元数据、证书、SNI、JA3/JA4 一类信息，见 `src/output-json-tls.c`、`rust/src/ja4.rs`；规则语法兼容 Snort 但非 100%；Hyperscan 只是可选 MPM 加速，缺失时回退 AC 等其他实现；`suricata-update` 是独立发版的工具；PF_RING 支持状态需对照 `configure.ac` 与 `src/source-*.c` 核验。写入速率、磁盘占用与保留份数一律需在目标机型实测，不给绝对值，容量评估见 08-06。
+
+### 6. 小结
+
+本篇把「EVE 输出与日志管道」收成一条可验证的链路：以 `outputs.eve-log` 订阅 `alert`、`flow`、`dns`、`tls`、`drop`、`stats` 等事件类型，由 `src/output-json.c` 的 `CreateEveHeader` 与各 `output-json-*.c` 族构造公共头与类型字段写入 `eve.json`；用 `--dump-config` 核对订阅生效、用 `event_type` 分布与 `jq` 抽取做逐字段判读，给出「预期输出 + 判读要点」；外部用 Filebeat、Logstash 一类采集器接入，本地用 `etc/suricata.logrotate.in` 模板轮转，并在轮转后以 `suricatasc reopen-log-files` 或 `postrotate` 的 `kill -HUP` 重开文件句柄，避免「文件被改名、引擎仍写旧描述符」的静默丢日志。读者应能据一条 `alert` 记录的 `flow_id`、`event_type`、`alert.signature_id` 把 EVE 与 `fast.log`、规则文件对齐，并在事件缺失时按「订阅 → 命中 → 轮转 → 采集」四层排查。
+
+与相邻篇的衔接：最小可用部署见 03-01，主干配置见 03-02，规则集管理见 03-03，IPS 内联与 drop 事件见 03-05，容器多实例的输出路径隔离见 03-06。输出与日志参数全集见 04-04，完整清单见 04-02 ~ 04-04，命令行与 RPC 见 04-07，返回码见 04-08；`LogFileCtx`、`OutputModule` 等字段见 05-08；EVE 事件聚合与日志管线见 06-11；输出与日志模块见 07-07；基准与上线清单读 08 册。全册交叉引用统一写成 `（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）`。输出读得懂、管道接得稳之后，下一步是让引擎从「只告警」升级到「能阻断」，这正是 03-05 的任务。
+
+## 03-05 IPS 模式部署：NFQUEUE/AF_PACKET 桥接与 drop 规则
+
+### 1. 目标与拓扑
+
+前四篇的引擎都工作在 IDS 旁路模式：镜像一份流量、命中规则写一条告警、原始报文照常转发。本篇要跨过那道分水岭，把 Suricata 部署成 IPS 内联模式，让命中 `drop` 动作的报文真正从链路上被拿掉。目标是把两条主流内联路径各跑通一遍、给出预期输出与判读要点，并讲清二者「谁能决定丢弃」。必须先立一条贯穿全册的能力边界：Suricata 是 IDS / IPS / NSM 引擎，**不做 IP 转发、不做路由、不是防火墙**；内联阻断依靠 **NFQUEUE 的 verdict 或 AF_PACKET 桥接的 copy 行为**，由内核或桥接对端决定是否放行，引擎只给出「这个包该不该过」的判定。把 Suricata 写成防火墙、或以为它自己会转发报文，是与 SPEC 第 2.1 节直接冲突的错误。凡吞吐、时延、丢包率与队列占用一律标注「需在目标机型实测」，本篇不给绝对值。
+
+拓扑有两条并列路径。第一条是 NFQUEUE 内联：`iptables` 或 `nftables` 把 `FORWARD`、`INPUT`、`OUTPUT` 链的报文导入指定队列，`suricata -q <队列号>` 从队列收包，解码检测后由 `suricata-main/src/source-nfq.c` 的 `VerdictNFQ` 与 `NFQSetVerdict` 把 `NF_ACCEPT`、`NF_DROP`、`NF_REPEAT` 一类判定回写内核，内核据此放行或丢弃；`suricata-main/src/runmode-nfq.c` 的 `RunModeIpsNFQRegister` 登记 `autofp` 与 `workers` 两种 NFQ 运行模式，用 `ReceiveNFQ`、`VerdictNFQ`、`DecodeNFQ` 三个 slot 名装配链路。第二条是 AF_PACKET 桥接：两块网卡互设 `copy-mode: ips` 与 `copy-iface`，引擎把一侧收到的包复制到另一侧，命中 `drop` 的包则不复制，等于被丢弃；官方文档明确说明此模式「无需 iptables 或 nftables 配置」，但需要两块网卡且 MTU 相等。两条路径的判定都落在 `suricata-main/src/detect-engine-alert.c` 的 `ACTION_DROP`、`ACTION_REJECT_ANY`、`ACTION_DROP_REJECT` 等动作位上，丢弃记录经 `suricata-main/src/output-json-drop.c` 以 `event_type` 为 `drop` 写入 EVE。两条路径与判定落点见图 03-05-01。
+
+需要提前划清边界。本篇只给「本场景最小必要命令与配置」，`suricata.yaml` 的 `nfq`、`af-packet`、`stream` 全部键的完整清单见 04-02 ~ 04-04，本篇不重列参数全集；动作与关键字语义见 04-05，命令行见 04-07，返回码见 04-08。`Packet` 上 `alerts.drop`、`drop_reason`、`flags` 一类字段只点名加真实源码路径，写「字段见 05-02、05-05」；verdict 与内联重组的机制写「原理见 06-12」；抓包源、检测、输出模块分别写「模块见 07-06、07-04、07-07」。规则语法兼容 Snort 但有自有扩展，`drop` 动作与 Snort 语义不能假定完全等同，需对照实际版本核验。
+
+本篇两条内联路径的分流与判定回写见图 03-05-01。
+
+:::figure id=03-05-01 | name=NFQUEUE 与 AF_PACKET 桥接的两种内联拓扑 | dir=TD
+node n1 "业务流量<br/>FORWARD 或双网卡" blue
+node n2 "NFQUEUE 入队<br/>iptables 与 -q" blue
+node n3 "AF_PACKET 桥接<br/>copy-mode ips" teal
+node n4 "解码与检测<br/>decode / detect" purple
+node n5 "VerdictNFQ<br/>source-nfq.c" red
+node n6 "NF_ACCEPT 或<br/>NF_DROP 放行丢弃" green
+edge n1 -> n2 "NFQ 路径"
+edge n1 -> n3 "桥接路径"
+edge n2 -> n4 "队列收包"
+edge n3 -> n4 "复制后收包"
+edge n4 -> n5 "动作判定"
+edge n5 -> n6 "回写 verdict"
+:::
+
+图 03-05-01 里蓝色是流量入口与入队，青色是桥接，紫色是解码检测，红色是判定回写，绿色是内核或桥接执行的最终动作；实线表示数据流方向。有两条分支从「业务流量」分出，说明 NFQUEUE 与 AF_PACKET 桥接是两条互斥的部署选择，不是叠加关系：前者依赖 netfilter 规则把包导入队列，后者靠两块网卡互拷，官方文档特别注明桥接模式无需 iptables。两条分支在「解码与检测」汇合，表示无论哪条路径进入，动作判定与 `drop` 日志产出都是同一套逻辑。终点 `NF_ACCEPT` 与 `NF_DROP` 落在绿色节点，刻意强调「最终放行或丢弃由内核或桥接执行」，引擎只回写判定，这正是「Suricata 不做转发」的图示化表达。图中判定链讲「做什么」，verdict 与 fail-open 的实现见 06-12，模块见 07-06。
+
+### 2. 前置条件与环境
+
+先确认构建与内核支持。`suricata-main/doc/userguide/ips/setting-up-ipsinline-for-linux.rst` 第 10 行要求先编译带 NFQ 支持的 Suricata，第 16 到 20 行给出核验方式：`suricata --build-info` 的输出里应能看到 NFQ；若 `NFQueue support: no`，`-q` 模式无从谈起，需回 02 册重配构建。NFQUEUE 还要求内核 netfilter 与 `iptables`/`nftables` 工具在位，IPv6 流量要改用 `ip6tables`，官方文档第 102 到 104 行有明确说明。AF_PACKET 桥接则要求两块真实网卡、二者 MTU 相等，官方文档第 229 行附近注明「copy 是直接的，超过 MTU 的包会被内核丢弃」，这是桥接模式最容易被忽略的硬约束。
+
+规则侧要准备 `drop` 动作。03-03 的 `drop.conf` 可以把外部规则批量改写为 `drop`，自定义规则里也可直接写 `drop tcp any any -> any any` 形式，动作与规则头语法见 04-05。要点是：动作位在 `suricata-main/src/detect-engine-alert.c` 里以 `ACTION_DROP`、`ACTION_REJECT_ANY`、`ACTION_DROP_REJECT` 等常量参与判定，第 179 行附近对 drop 与 pass 的「先到先得」有注释，第 215 行检查 `ACTION_DROP_REJECT` 并写入 `p->alerts.drop`，第 228 行附近设置 `PKT_DROP_REASON_RULES` 一类丢弃原因；`suricata.yaml.in` 第 1477 到 1483 行给出默认 `action-order: pass, drop, reject, alert`，说明动作优先级会影响最终结果。这些常量的精确拼写与位定义需对照实际版本核验（字段见 05-02、05-05 ｜ 原理见 06-12）。
+
+配置侧要点在 `stream.inline` 与 `nfq` 两段。`suricata-main/suricata.yaml.in` 第 1750 行是 `stream` 段，第 1756 行 `inline: auto`，注释写明 `auto` 会在 IPS 模式下自动启用内联、也可用 `yes` 或 `no` 静态指定，第 1753 行 `checksum-validation: yes`、第 1754 行 `midstream`、第 1700 行 `drop-invalid`、第 1703 行 `bypass` 同属该段语义；内联重组边界见 `suricata-main/src/stream-tcp-inline.c`，文件名需对照实际版本核验。第 2116 行是 `nfq` 段，注释列出 `mode: accept`、`repeat-mark`、`repeat-mask`、`bypass-mark`、`bypass-mask`、`route-queue`、`batchcount`、`fail-open` 等键，第 2110 到 2111 行说明 Linux 3.6 以上可设 `fail-open: yes` 让内核在引擎跟不上时改为放行；`suricata-main/src/source-nfq.c` 第 232 行用 `SCConfGetBool` 读取 `nfq.fail-open` 键，并在第 238 行对「NFQ 库不支持」给出告警，因此该键是否生效需对照实际版本与库版本核验。第 2103 行还给出带 mark 的 `iptables -I FORWARD -m mark ! --mark $MARK/$MASK -j NFQUEUE` 写法，用于模拟非终结 verdict。
+
+AF_PACKET 桥接的配置来自官方文档第 193 到 213 行的示例：`af-packet` 下两块接口互设 `copy-mode: ips` 与 `copy-iface`，一侧 `interface: eth0`、`cluster-id: 98`、`copy-iface: eth1`，另一侧 `interface: eth1`、`cluster-id: 97`、`copy-iface: eth0`，两侧都写 `threads: 1`、`defrag: no`、`cluster-type: cluster_flow`、`buffer-size: 64535`。模板 `suricata.yaml.in` 第 738 到 744 行的注释也写明 `copy-mode` 取 `ips` 或 `tap`：`tap` 全量复制，`ips` 时命中 `drop` 的包不复制。源码侧 `suricata-main/src/source-af-packet.c` 第 655 行有 `AFP_COPY_MODE_IPS` 判断，第 696 到 718 行在 `copy_mode != AFP_COPY_MODE_NONE` 时调用 `AFPWritePacket` 把包写到对端，函数名与常量名需对照实际版本核验（模块见 07-06 ｜ 原理见 06-12）。环境方面，队列长度、`batchcount`、两块网卡的中断亲和与吞吐表现一律需在目标机型实测；`--set` 可在命令行临时覆盖键做 A/B，用法见 04-07、`suricata-main/src/suricata.c` 第 1543 行登记、第 1878 行处理，`etc/suricata.service.in` 的 `ExecReload=/bin/kill -USR2 $MAINPID` 则给出宿主机 systemd 下不重启重载规则的另一条路径。
+
+### 3. 分步操作
+
+下面按「确认 NFQ 支持 → 配 iptables 入队 → 写 drop 规则 → 内联启动 → 取证判读 → 回滚」的闭环给出完整序列，随后补 AF_PACKET 桥接的等价配置。命令中的队列号、网卡名、路径需按实际环境替换，完整命令行见 04-07，完整变量见 04-01。
+
+```bash
+# 步骤 0：确认构建编入 NFQ 支持
+suricata --build-info | grep -E 'NFQueue|NFQ'
+
+# 步骤 1：把 FORWARD 链流量导入默认队列 0（IPv6 用 ip6tables）
+sudo iptables -I FORWARD -j NFQUEUE
+sudo iptables -vnL FORWARD
+
+# 步骤 2：写入一条 drop 自测规则，动作语法见 04-05
+printf '%s\n' 'drop tcp any any -> any any (msg:"LOCAL TEST DROP"; sid:1000002; rev:1;)' \
+  > /etc/suricata/rules/local.rules
+
+# 步骤 3：自检后以内联模式启动，绑定队列 0
+sudo suricata -T -c /etc/suricata/suricata.yaml -l /var/log/suricata/
+sudo suricata -c /etc/suricata/suricata.yaml -q 0 -l /var/log/suricata/ -D
+
+# 步骤 4：取证——队列计数、drop 事件、规则统计
+sudo iptables -vnL FORWARD
+grep -o '"event_type":"[^"]*"' /var/log/suricata/eve.json | sort | uniq -c
+sudo suricatasc -c "ruleset-stats"
+
+# 步骤 5：回滚——先删入队规则让流量直通，再停进程
+sudo iptables -D FORWARD -j NFQUEUE
+sudo suricatasc -c "shutdown"
+```
+
+逐条说明几个容易含糊的点。步骤 0 用 `--build-info` 确认 NFQ 已编入，这是 `-q` 能工作的前提；输出里若 `NFQueue support: no`，不要继续往下敲，先回 02 册重配。步骤 1 的 `iptables -I FORWARD -j NFQUEUE` 来自官方文档第 55 行的网关场景最简规则，不写 `--queue-num` 时队列号默认为 0，与步骤 3 的 `-q 0` 对应；官方文档第 63 到 64 行给出保护本机的 `INPUT`/`OUTPUT` 组合，第 112 到 113 行给出按 `-i`、`-o` 绑定双网卡的写法，可按拓扑替换。步骤 2 的 `drop` 规则用最大匹配面只为验证链路，绝不能带进生产，写完后应像 03-01、03-03 那样先 `-T` 自检。步骤 3 的 `-q 0` 进入 NFQ 运行模式，`-D` 转后台；注意官方文档第 118 到 119 行的警告：若 Suricata 停止而 NFQUEUE 规则仍在，业务流量将不再通过，因此步骤 5 必须先 `iptables -D` 删规则、再 `suricatasc shutdown`，顺序绝不能反。步骤 4 的 `iptables -vnL` 看队列计数是否随流量增长，`grep` 看 `eve.json` 里是否出现 `drop` 事件，`ruleset-stats` 确认 `drop` 规则确实被加载，三者合起来才能证明「内联判定真的生效」，而不是只看进程在跑。
+
+NFQUEUE 路径的最小配置片段如下，仅示意「场景组合」，键名与取值需对照实际版本核验，完整清单见 04-02 ~ 04-04，本篇不重列参数全集。
+
+```yaml
+%YAML 1.1
+---
+nfq:
+  mode: accept
+  fail-open: yes
+  batchcount: 20
+stream:
+  inline: auto
+  checksum-validation: yes
+action-order:
+  - pass
+  - drop
+  - reject
+  - alert
+outputs:
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: eve.json
+      types:
+        - alert
+        - drop:
+            alerts: yes
+            flows: all
+```
+
+配置里 `mode: accept` 与 `fail-open: yes` 决定 verdict 失败时的兜底策略，`batchcount` 影响批量回写，`stream.inline: auto` 让重组按 IPS 语义走，`action-order` 把 `drop` 排在 `alert` 之前，`types` 同时订阅 `alert` 与 `drop` 以便取证。`fail-open` 需要内核与 NFQ 库支持，是否生效需对照实际版本核验；把 `fail-open` 打开意味着引擎跟不上时宁可放行也不阻断，属可用性优先的取舍，安全侧影响见 08-05。AF_PACKET 桥接路径的等价配置如下，示例取自官方内联文档的对称双网卡写法，键名需对照实际版本核验。
+
+```yaml
+af-packet:
+  - interface: eth0
+    threads: 1
+    defrag: no
+    cluster-type: cluster_flow
+    cluster-id: 98
+    copy-mode: ips
+    copy-iface: eth1
+    buffer-size: 64535
+  - interface: eth1
+    threads: 1
+    cluster-id: 97
+    defrag: no
+    cluster-type: cluster_flow
+    copy-mode: ips
+    copy-iface: eth0
+    buffer-size: 64535
+```
+
+桥接配置里两块接口互为 `copy-iface`，`copy-mode: ips` 表示命中 `drop` 的包不复制到对端，两个不同的 `cluster-id` 让两侧 fanout 组互不混叠；官方文档强调此路径无需任何 `iptables` 规则，但两块网卡 MTU 必须相等。判定与写出分别落在 `suricata-main/src/detect-engine-alert.c`、`suricata-main/src/output-json-drop.c`、`suricata-main/src/source-nfq.c` 与 `suricata-main/src/source-af-packet.c`，函数名需对照实际版本核验（字段见 05-02、05-05 ｜ 参数见 04-02、04-03 ｜ 原理见 06-12 ｜ 模块见 07-06、07-07）。
+
+### 4. 验证方法与预期结果
+
+本篇要求给出「预期输出 + 判读要点」，核心验证是「队列计数增长 + `drop` 事件出现 + 规则统计含 drop」三件套。以下是 `iptables -vnL FORWARD` 的示例输出，具体格式需对照实际版本核验。
+
+```text
+Chain FORWARD (policy ACCEPT 0 packets, 0 bytes)
+    pkts      bytes target   prot opt in     out     source      destination
+    8421   5732416 NFQUEUE   all  --  any    any     anywhere    anywhere
+```
+
+逐行判读这段输出。首行 `Chain FORWARD` 说明查看的是转发链，`policy ACCEPT 0 packets, 0 bytes` 是链默认策略，正常应保持 ACCEPT，若被改成 DROP 会导致所有未匹配流量直接丢弃，这不是 Suricata 的行为而是 iptables 自身策略，排查时要分清。第二行是列头，`pkts` 与 `bytes` 是命中该规则的报文数与字节数，`target` 是动作，`prot` 是协议，`in`/`out` 是进出接口，`source`/`destination` 是地址范围。第三行是本篇最关键的一行：`target` 为 `NFQUEUE` 说明 `iptables -I FORWARD -j NFQUEUE` 已生效，`pkts` 为 8421、`bytes` 为 5732416 表示该规则已把这么多报文导入队列，判读要点是「计数随业务流量持续增长」——在引擎正常运行、两端有流量的前提下，隔几秒再看一次这个数应明显变大；若计数恒为零，优先查规则是否插在正确的链、流量是否走本机 FORWARD、以及是否误用 `iptables` 处理了 IPv6 流量而应改用 `ip6tables`。若计数增长但 `eve.json` 里完全没有 `alert` 或 `drop`，说明包进了队列却没被正确检测，需回查 `HOME_NET`、规则动作、`stream.inline` 与 `types` 订阅；若计数增长且出现 `drop` 事件，才说明 `VerdictNFQ` 真的把 `NF_DROP` 回写给了内核。需要留意的是列名对齐、计数精度与 `NFQUEUE` 显示格式会随 `iptables` 版本与终端宽度变化，务必以本地结果为准，示例数值仅示意，不代表任何性能结论。
+
+第二路是 `drop` 事件与规则统计。以下是一条 `drop` 记录的示例输出，具体格式需对照实际版本核验。
+
+```text
+{"timestamp":"2026-11-13T10:05:22.441230+0800","flow_id":1984237612345999,"in_iface":"eth0","event_type":"drop","src_ip":"192.168.1.10","dest_ip":"203.0.113.20","proto":"TCP","alert":{"gid":1,"signature_id":1000002,"rev":1,"signature":"LOCAL TEST DROP","severity":2}}
+```
+
+判读要点：`event_type` 为 `drop` 是本篇的验收标志，它由 `suricata-main/src/output-json-drop.c` 第 93 行调用 `CreateEveHeader` 并传入 `drop` 作为事件类型写入，只有引擎处于 IPS 模式且 `types` 订阅了 `drop` 才会产出；`flow_id` 可与同一条流的 `alert`、`flow` 事件关联，用来还原「哪个会话的哪个包被拦」；`src_ip`、`dest_ip`、`proto` 应与被测流量一致；嵌套 `alert` 里的 `signature_id` 为 1000002、`signature` 为 `LOCAL TEST DROP`，应能唯一定位到步骤 2 写入的 `drop` 自测规则，若这里出现的是别的 sid，说明触发丢弃的不是预期规则，要回查 `action-order` 与规则集；`severity` 来自 `classification.config`。`drop` 子对象里的报文长度、`ttl`、`flags`、`drop_reason` 一类字段在不同版本差异较大，字段名与取值需对照 `src/output-json-drop.c` 实际版本核验，本篇不臆造其清单。再配合 `suricatasc -c "ruleset-stats"` 的 `rules_loaded`、`rules_failed` 与 `ruleset-reload-time`，可确认 `drop` 规则确已加载到当前实例；`stats.log` 里关于丢弃与 verdict 的计数项名称需对照实际版本核验，判读方法见 08-01。两条内联路径的判读重点对照见下表，参数全集见 04-02 ~ 04-04。
+
+| 维度 | NFQUEUE 内联 | AF_PACKET 桥接 |
+|---|---|---|
+| 报文来源 | iptables 把包导入队列 | 双网卡互拷 copy-mode ips |
+| 前置依赖 | 内核 netfilter 与 NFQ 构建支持 | 两块网卡且 MTU 相等 |
+| 判定回写 | VerdictNFQ 回写 NF_DROP | 命中 drop 的包不复制到对端 |
+| 启动参数 | -q 队列号 | af-packet 段 copy-iface |
+| 取证重点 | iptables -vnL 计数与 drop 事件 | 两侧 iface-stat 与 drop 事件 |
+| 典型风险 | 规则未删先停进程导致断流 | 网卡名错或 MTU 不等丢包 |
+| 关联源码 | source-nfq.c 与 runmode-nfq.c | source-af-packet.c |
+
+### 5. 常见失败与排错
+
+失败大多集中在「NFQ 没编入」「队列没对上」「动作没生效」「回滚顺序错」四类。按闭环约定，每个现象都给「验证命令 → 修复方向」两段，先取证再动手。常见失败对照见下表，完整排错速查见 04-08，诊断决策树见 08-03。
+
+| 现象 | 可能原因 | 验证命令 | 修复方向 |
+|---|---|---|---|
+| -q 启动即报不支持 | 构建未编入 NFQ | suricata --build-info | 回 02 册重配并重新编译 |
+| 队列计数恒为零 | 规则插错链或走了 IPv6 | iptables -vnL FORWARD | 换链或改用 ip6tables |
+| 有流量无 drop 事件 | drop 规则未加载或未订阅 types | suricatasc -c "ruleset-stats" | 补 drop 规则并订阅 drop 类型 |
+| drop 事件 sid 不对 | action-order 或规则集冲突 | suricata --dump-config -c yaml | 核对动作优先级与规则文件 |
+| 规则在但不丢包 | stream.inline 未启用或 IDS 模式 | suricata --dump-config -c yaml | 设 inline 并确认以 -q 或 ips 启动 |
+| 停进程后业务断流 | 先停引擎没删入队规则 | iptables -vnL FORWARD | 先删 NFQUEUE 规则再停进程 |
+| fail-open 未生效 | 内核或 NFQ 库不支持 | grep -iE 'error\|warning' suricata.log | 对照版本核验并调整兜底策略 |
+| 桥接模式丢大包 | 两网卡 MTU 不相等 | ip link show eth0 eth1 | 统一 MTU 后重启 |
+
+几个需要展开说明的坑。其一，「规则在、进程在、就是不丢包」最常见的原因是把 IDS 旁路的判读习惯带到了 IPS：没以 `-q` 或 `copy-mode: ips` 启动、`stream.inline` 没启用、`types` 没订阅 `drop`、`action-order` 里 `pass` 抢在 `drop` 之前，都会让 `ACTION_DROP` 没有转化为真实 verdict；应按「启动模式 → 内联开关 → 动作位 → 订阅」四层依次核对，而不是只盯规则文本。其二，回滚顺序是本篇的安全红线：官方文档明确警告 Suricata 停止后 NFQUEUE 规则仍在会导致流量不通，因此任何演练结束都必须「先 `iptables -D`、再 `shutdown`」，容器或 systemd 环境同理，参见 `etc/suricata.service.in` 的 `ExecReload` 与 `--pidfile` 组合。其三，`fail-open: yes` 是可用性与安全性的取舍：打开后引擎跟不上时内核会放行，避免自伤业务，但也意味着攻击窗口可能被放过，是否启用应结合 08-05 的加固策略与实测容量决定，且其生效依赖内核与 NFQ 库，需对照实际版本核验。其四，AF_PACKET 桥接不依赖 iptables，但两块网卡 MTU 不等会让大包被内核丢弃，表现为「小包通、大包不通」，这类问题要到 `ip link` 层查，与规则无关。其五，表格里出现 shell 管道符或「或」语义的 `\|` 必须转义书写，否则整表错列，这是资料层的坑。
+
+还有一组全册通用纪律。Suricata 不做 IP 转发、不做路由、不是防火墙，内联阻断靠 NFQUEUE / AF_PACKET 桥接的 verdict，由内核或桥接对端决定是否放行；IDS 旁路只告警不丢弃；TLS 等加密载荷正文不可见，能拿到的是握手元数据、证书、SNI、JA3 一类信息；规则语法兼容 Snort 但非 100% 兼容；EVE JSON 是主要输出，fast.log、stats.log、pcap-log 为辅助；Hyperscan 只是可选 MPM 加速，缺失时回退 AC 等其他实现；`suricata-update` 是独立发版的工具；PF_RING 支持状态需对照 `configure.ac` 与 `src/source-*.c` 核验，不得编造 `source-pfring.c`；DPDK 需独占网卡、大页与 EAL 参数，Netmap 与 AF_XDP 有内核与驱动要求。任何吞吐、时延、丢包率、队列占用数字一律需在目标机型实测，不给绝对值。
+
+### 6. 小结
+
+本篇把「IPS 内联」收成两条可验证的路径：NFQUEUE 路径用 `suricata --build-info` 确认 NFQ 已编入、`iptables -I FORWARD -j NFQUEUE` 把流量导入队列、`suricata -q 0` 以内联模式启动，由 `src/source-nfq.c` 的 `VerdictNFQ`、`NFQSetVerdict` 把 `NF_ACCEPT`、`NF_DROP` 回写内核；AF_PACKET 桥接路径用两块网卡互设 `copy-mode: ips` 与 `copy-iface`，官方内联文档给出对称示例并注明无需 iptables、但 MTU 必须相等。两条路径的动作都来自 `src/detect-engine-alert.c` 的 `ACTION_DROP` 一类位，`drop` 记录由 `src/output-json-drop.c` 以 `event_type` 为 `drop` 写入 EVE；验证以「队列计数增长 + drop 事件出现 + 规则统计含 drop」三件套给出「预期输出 + 判读要点」，收尾严格按「先删入队规则、再停引擎」回滚。读者应能据输出判断「包有没有进队列、判定有没有回写、丢弃是不是预期规则触发的」，并始终记住 Suricata 不做转发、不是防火墙。
+
+与相邻篇的衔接：最小可用部署见 03-01，主干配置见 03-02，规则集与 `drop.conf` 见 03-03，EVE 字段判读与日志管道见 03-04，容器与多实例见 03-06。配置参数完整清单见 04-02 ~ 04-04、完整变量见 04-01，动作与规则关键字见 04-05、04-06，命令行与 RPC 见 04-07，返回码见 04-08；`Packet`、`Signature` 等字段见 05-02、05-05；verdict、内联重组与 runmode 机制见 06-12、06-04、06-13；抓包源、检测、输出、重组模块见 07 册；基准、加固与上线清单读 08 册。全册交叉引用统一写成 `（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）`。单实例内联跑通之后，最后一步是把它放进容器、做多实例分流与高可用，这正是 03-06 的任务。
+
+## 03-06 容器与高可用部署：Docker、多实例、旁路分流
+
+### 1. 目标与拓扑
+
+前五篇都在单台主机、单个进程上讨论部署，本篇要把视角抬到「一组传感器」：把 Suricata 放进容器，按队列或旁路把流量分给多个实例，每实例独立落盘、独立控制，并支持滚动升级与规则热重载。目标不是教 Docker 本身，而是讲清容器化之后哪些 Suricata 特有的东西会变：抓包后端还能不能看到宿主机网卡、多实例之间会不会抢同一份流量、`outputs` 路径会不会互相覆盖、控制面 socket 会不会串台。全篇只讲「场景组合与输出判读」，`suricata.yaml` 全部段的参数完整清单见 04-02 ~ 04-04，本篇不重列参数全集。凡吞吐、pps、丢包率、实例数与内存占用一律标注「需在目标机型实测」，不给绝对值。
+
+拓扑可以画成四段。第一段是镜像与卷：一份配置、一份规则、一份日志目录作为只读或可写挂载进容器，让镜像无状态、配置可版本化。第二段是旁路流量来源：TAP 设备或交换机 SPAN 会话把线上流量副本送给传感器组，或由网卡 RSS 队列配合 `cluster-id` 把不同队列分给不同实例；容器用 `--net=host` 直接看到宿主机网卡，避免桥接网络把镜像流量挡在外面。第三段是多个实例：每实例有独立 `af-packet` 配置、`cluster-id`、`unix-command.filename` 与 `outputs` 落盘路径，`cluster-id` 不重复才不会加入同一 fanout 组互相抢包。第四段是升级与运维：先起新实例、热重载规则、再把流量从旧实例摘除，配合 `suricatasc` 的 `reload-rules`、`iface-list`、`ruleset-reload-time` 一类命令做不中断切换。四段关系见图 03-06-01。
+
+需要先说明一个事实核验结论：本上游 main 快照内**没有官方部署用 Dockerfile 与镜像清单**，`suricata-main/qa/docker/` 下只有 `pcaps` 目录，`.clusterfuzzlite/Dockerfile` 是模糊测试用途，不用于生产部署；`suricata-main/doc/userguide/` 里也未检索到 `CAP_NET_RAW`、`--net=host`、`--privileged` 一类容器权限说明。因此本篇涉及的官方镜像名、标签与容器启动参数需对照实际版本与外部官方文档核验，凡本快照无法定位的一律写「需对照实际版本核验」，不臆造镜像地址与版本号。可在本快照内核实的锚点是：`etc/suricata.service.in` 给出宿主机 systemd 的 `ExecStart`、`ExecReload=/bin/kill -USR2 $MAINPID` 与 `--pidfile` 写法，`suricata-main/src/suricata.c` 第 2303、2307 行读取 `run-as.user` 与 `run-as.group` 做权限降级，`suricata.yaml.in` 第 1458 到 1460 行的 `unix-command.enabled` 与 `filename` 让每实例可有独立控制 socket，`doc/userguide/capture-hardware/ebpf-xdp.rst` 与 `suricata-yaml.rst` 里多处出现 `cluster-id: 97` 一类的分流示例。
+
+本篇容器化多实例的分流、落盘与升级关系见图 03-06-01。
+
+:::figure id=03-06-01 | name=容器化多实例旁路分流与滚动升级 | dir=TD
+node n1 "镜像与卷<br/>yaml / rules / log" blue
+node n2 "旁路流量<br/>TAP 或 SPAN" blue
+node n3 "实例 A<br/>cluster-id 唯一" teal
+node n4 "实例 B<br/>cluster-id 唯一" teal
+node n5 "独立 outputs<br/>分实例落盘" green
+node n6 "suricatasc<br/>热重载与升级" purple
+edge n1 -> n3 "配置挂载"
+edge n1 -> n4 "配置挂载"
+edge n2 -> n3 "RSS 队列分流"
+edge n2 -> n4 "RSS 队列分流"
+edge n3 -> n5 "EVE 输出"
+edge n4 -> n5 "EVE 输出"
+edge n6 -> n3 "reload-rules"
+edge n6 -> n4 "reload-rules"
+:::
+
+图 03-06-01 里蓝色是镜像卷与旁路流量输入，青色是两个实例，绿色是共享语义下的独立落盘，紫色是控制面；实线表示数据流或控制关系。有两组对称分支值得注意：其一，`镜像与卷` 分别挂到实例 A 与实例 B，说明配置与规则应当只读共享而非各自内嵌，升级时只换镜像或只换卷内容；其二，`旁路流量` 按 RSS 队列分别分给两个实例，配合每实例唯一的 `cluster-id`，这是多实例不互相抢包的关键。两条 `EVE 输出` 汇到同一个绿色节点，刻意表达「逻辑上是同一类输出、物理上必须分路径」：若两个容器把 `eve.json` 写进同一个挂载目录，会造成写竞争与事件错乱，因此第 5 节点名为「独立 outputs」，实际部署应给每实例单独日志卷。`suricatasc` 从上方连到两个实例，表示滚动升级时对每实例分别下发 `reload-rules`，命令族见 04-07、模块见 07-12。图中分流讲「做什么」，RSS 与 fanout 的机制见 06-02、06-13。
+
+### 2. 前置条件与环境
+
+先定容器网络与权限。`--net=host` 让容器共用宿主机网络命名空间，AF_PACKET 一类抓包后端才能看到 `ip link` 里的真实网卡；默认的 bridge 网络会把镜像流量与宿主机接口隔开，在线抓包通常不可行。权限方面，AF_PACKET 收包需要 `CAP_NET_RAW` 与 `CAP_NET_ADMIN` 一类能力，Docker 侧对应 `--cap-add=NET_RAW`、`--cap-add=NET_ADMIN`；`--privileged` 虽然省事但把宿主机全部能力放开，与 08-05 的最小权限原则冲突，应作为最后手段并充分评估。容器镜像名、标签、能力名的具体写法需对照实际版本与外部官方文档核验，本快照未提供生产镜像清单。若引擎在容器内以非 root 运行，`suricata-main/src/suricata.c` 读取的 `run-as.user`、`run-as.group` 与挂载目录的属主、权限必须匹配，否则会在启动期报日志目录不可写。
+
+多实例分流要三件事同时成立。其一，每实例 `af-packet` 段的 `cluster-id` 全局唯一，`suricata-main/suricata.yaml.in` 第 677 行默认 `cluster-id: 99`，官方文档 `doc/userguide/capture-hardware/ebpf-xdp.rst` 多处用 `cluster-id: 97` 做分流示例，`suricata-yaml.rst` 第 2579 到 2585 行也强调「同一 cluster-id」的语义，因此多实例必须显式错开取值，否则会加入同一 fanout 组互相抢包；该结论的具体分流语义需对照实际版本核验。其二，配合 RSS 队列数规划 `threads` 与 `cluster-type`，`cluster_qm` 一类取值要求网卡支持 RSS 且需配合 CPU 亲和与中断调优，见 `suricata.yaml.in` 第 683 到 688 行注释。其三，若不用 RSS 分流，也可由 TAP 或 SPAN 在物理层把不同链路副本送给不同主机或容器，这属外部网络设备配置，需对照实际设备版本核验。线程、队列与绑核的组合效果一律需在目标机型实测，机制见 06-13、调优见 08-02。
+
+每实例的隔离点要逐一列清。`outputs` 的 `filename` 默认 `eve.json`、`fast.log`、`stats.log` 都是相对路径，两个实例若共用同一挂载目录就会互相覆盖，因此每实例应有独立的日志卷，或在配置里用不同文件名；`suricata.yaml.in` 第 1458 到 1460 行的 `unix-command` 段有 `enabled: auto` 与注释形式的 `filename: custom.socket`，多实例同机部署时应为每实例指定不同 socket 文件，避免 `suricatasc` 连错实例；`--dump-config` 可用来核对每实例实际读到的 `cluster-id`、`filename` 与 `unix-command.filename`。控制面命令族来自 `suricata-main/doc/userguide/unix-socket.rst`，包括 `iface-list`、`iface-stat`、`reload-rules`、`ruleset-reload-time`、`reopen-log-files`、`dump-counters` 等，Rust 侧清单见 `suricata-main/rust/suricatasc/src/unix/commands.rs`，命令全集见 04-07、模块见 07-12。规则集应按 03-03 的方式由独立工具 `suricata-update` 统一生成后以只读卷挂入，避免各实例各自下载导致版本漂移。
+
+抓包后端在容器里的选择要单独说明。AF_PACKET 配合 `--net=host` 与上述能力集是最常见组合；DPDK 需要独占网卡、大页与 EAL 参数，容器化时还要处理大页挂载与设备透传，复杂度显著更高，见 `suricata-main/src/source-dpdk.c` 与 `src/runmode-dpdk.c`；AF_XDP、Netmap 有内核与驱动要求；pcap 多用于离线或低速率；PF_RING 在当前 main 快照是否仍为受支持后端、对应源文件与启用方式需对照 `configure.ac` 与 `src/source-*.c` 核验，不得编造 `source-pfring.c`。各后端能力与环境要求差异大，详见 02-04、原理见 06-02、模块见 07-06。版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验。
+
+### 3. 分步操作
+
+下面按「确认网卡与镜像 → 起实例 A → 起实例 B → 分流核对 → 滚动升级 → 收尾」的闭环给出完整序列。命令中的镜像名、网卡名、卷路径均为示意，需按实际环境替换并对照实际版本核验，完整命令行见 04-07，完整变量见 04-01。
+
+```bash
+# 步骤 0：确认宿主机网卡与本地镜像（镜像名标签需对照实际版本核验）
+ip link show
+docker images | grep suricata
+
+# 步骤 1：以 host 网络与最小能力集启动实例 A，日志卷独立
+docker run -d --name suri-a --net=host \
+  --cap-add=NET_RAW --cap-add=NET_ADMIN \
+  -v /etc/suricata/suricata-a.yaml:/etc/suricata/suricata.yaml:ro \
+  -v /etc/suricata/rules:/etc/suricata/rules:ro \
+  -v /var/log/suricata-a:/var/log/suricata \
+  suricata-ids:local -c /etc/suricata/suricata.yaml -i eth0 -l /var/log/suricata
+
+# 步骤 2：核对实例 A 的控制面与生效配置
+docker exec suri-a suricatasc -c "iface-list"
+docker exec suri-a suricata --dump-config -c /etc/suricata/suricata.yaml | grep -E 'cluster-id|unix-command.filename'
+
+# 步骤 3：起实例 B，使用不同 cluster-id 与独立日志卷
+docker run -d --name suri-b --net=host \
+  --cap-add=NET_RAW --cap-add=NET_ADMIN \
+  -v /etc/suricata/suricata-b.yaml:/etc/suricata/suricata.yaml:ro \
+  -v /etc/suricata/rules:/etc/suricata/rules:ro \
+  -v /var/log/suricata-b:/var/log/suricata \
+  suricata-ids:local -c /etc/suricata/suricata.yaml -i eth0 -l /var/log/suricata
+
+# 步骤 4：滚动升级——先热重载新实例规则，再摘除旧实例
+docker exec suri-b suricatasc -c "reload-rules"
+docker exec suri-b suricatasc -c "ruleset-reload-time"
+docker stop suri-a
+
+# 步骤 5：收尾，确认两个实例日志卷互相隔离
+ls -l /var/log/suricata-a/eve.json /var/log/suricata-b/eve.json
+grep -c '"event_type":"alert"' /var/log/suricata-b/eve.json
+```
+
+逐条说明几个容易含糊的点。步骤 0 的 `ip link show` 用来确认 `-i` 接口名，`docker images` 用来确认本地已有镜像；`suricata-ids:local` 只是示意用的本地镜像名，官方镜像名与标签需对照实际版本核验，本快照未提供生产镜像清单。步骤 1 用 `--net=host` 让容器直接看到宿主机网卡，`--cap-add=NET_RAW`、`--cap-add=NET_ADMIN` 给 AF_PACKET 收包的最小能力，配置与规则以 `:ro` 只读挂载防容器改写，`-v /var/log/suricata-a:/var/log/suricata` 把 A 的日志落到独立宿主机目录；`-l /var/log/suricata` 与挂载点对应。步骤 2 的 `docker exec suri-a suricatasc -c "iface-list"` 确认控制面能连到 A，再用 `--dump-config` 过滤 `cluster-id` 与 `unix-command.filename`，确认 A 读到的是自己的那份配置，而不是别的实例。步骤 3 的 B 使用另一份 yaml、另一个 `cluster-id` 与另一份日志卷，这是多实例不抢包、不覆盖的关键。步骤 4 是滚动升级的核心顺序：先让 B 起来并 `reload-rules` 载入最新规则、用 `ruleset-reload-time` 确认重载落地，再 `docker stop suri-a` 摘除旧实例，从而把「换版本」拆成「先扩容、再缩容」，避免检测空窗。步骤 5 用 `ls` 与 `grep -c` 确认两份 `eve.json` 各写各的、B 已有告警产出。
+
+两份实例配置的差异片段如下，仅示意「场景组合」，键名与取值需对照实际版本核验，完整清单见 04-02 ~ 04-04，本篇不重列参数全集。
+
+```yaml
+# 实例 A：suricata-a.yaml 的关键差异段
+af-packet:
+  - interface: eth0
+    threads: 4
+    cluster-id: 98
+    cluster-type: cluster_qm
+    defrag: yes
+unix-command:
+  enabled: yes
+  filename: suri-a.socket
+outputs:
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: eve.json
+      types:
+        - alert
+        - flow
+        - stats
+```
+
+```yaml
+# 实例 B：suricata-b.yaml 的关键差异段
+af-packet:
+  - interface: eth0
+    threads: 4
+    cluster-id: 97
+    cluster-type: cluster_qm
+    defrag: yes
+unix-command:
+  enabled: yes
+  filename: suri-b.socket
+outputs:
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: eve.json
+      types:
+        - alert
+        - flow
+        - stats
+```
+
+两份配置只有 `cluster-id` 与 `unix-command.filename` 不同：`98` 与 `97` 让两个 fanout 组互不混叠，`suri-a.socket` 与 `suri-b.socket` 让 `suricatasc` 能分别连到各自实例；`filename: eve.json` 看似相同，但因为分别挂到 `/var/log/suricata-a` 与 `/var/log/suricata-b` 两个不同卷，物理路径并不冲突，这正是「逻辑同名、物理隔离」的写法。`cluster_qm` 要求网卡 RSS 支持并配合绑核与中断调优，是否适用需在目标机型实测；配置树由 `suricata-main/src/conf-yaml-loader.c` 载入、`src/conf.c` 读取，`af-packet` 段的消费落在 `src/runmode-af-packet.c` 一类文件，函数名需对照实际版本核验（字段见 05-07、05-09 ｜ 参数见 04-03 ｜ 原理见 06-02、06-13 ｜ 模块见 07-06、07-09）。
+
+### 4. 验证方法与预期结果
+
+本篇要求给出「预期输出 + 判读要点」，核心验证是「两个实例都活着、各自看到网卡、配置互不相同、日志各写各的」。以下是容器状态与控制面回显的示例输出，具体格式需对照实际版本核验。
+
+```text
+CONTAINER ID   IMAGE                STATUS          NAMES
+6f3a1c2d9e01   suricata-ids:local   Up 3 minutes    suri-a
+9b7e4d2c1a03   suricata-ids:local   Up 12 seconds   suri-b
+{"message": ["eth0"], "return": "OK"}
+af-packet.0.cluster-id = 98
+af-packet.0.cluster-type = cluster_qm
+unix-command.filename = suri-a.socket
+```
+
+逐行判读这段输出。前两行是 `docker ps` 的容器列表：`CONTAINER ID` 是短标识，`IMAGE` 显示所用镜像（此处为示意名，需对照实际版本核验），`STATUS` 为 `Up 3 minutes` 与 `Up 12 seconds` 说明 A 与 B 都在运行且 B 是后起的，判读要点是「滚动升级期间两个实例应同时处于 Up」，若 A 已被 `docker stop` 而 B 还没 Up，就出现了检测空窗；`NAMES` 为 `suri-a`、`suri-b` 用来区分实例，后续 `docker exec` 全靠它定位。第三行是 `suricatasc -c "iface-list"` 的回显，`return` 为 `OK` 说明控制面连通，`message` 里的 `eth0` 确认该实例确实在目标网卡上收包；若返回连接失败或列表为空，优先查 `unix-command.enabled`、socket 文件权限与 `--net=host` 是否生效。第四到第六行是 `--dump-config` 的扁平回显：`af-packet.0.cluster-id = 98` 说明 A 读到的是 98 而不是默认值，`cluster-type = cluster_qm` 说明按 RSS 队列分流，`unix-command.filename = suri-a.socket` 说明 A 用了独立控制 socket；判读要点是「把同样的命令在 B 上再跑一遍，应得到 97 与 suri-b.socket」，若两实例回显完全一致，说明分流与隔离都没做对，会互相抢包或串台。需要留意的是 `docker ps` 的列宽、`suricatasc` 的 JSON 字段与 `--dump-config` 的键名会随版本变化，务必以本地结果为准，示例取值仅示意，不代表任何容量或性能结论。
+
+第二路是日志隔离与升级生效的验证。示例输出，具体格式需对照实际版本核验。
+
+```text
+/var/log/suricata-a/eve.json  2184471
+/var/log/suricata-b/eve.json   193204
+{"message": "OK", "return": "OK"}
+```
+
+判读要点：两行 `ls -l` 风格的路径与大小显示 A、B 各自有独立的 `eve.json` 且都在增长，若只看到一份文件或两个路径指向同一 inode，说明日志卷没隔离，存在写竞争风险；`grep -c '"event_type":"alert"'` 在 B 上得到正数说明新实例已开始产出告警，而不是「容器起来了但没收包」；末行是 `ruleset-reload-time` 或 `reload-rules` 一类的控制面回显，`return` 为 `OK` 说明热重载被受理，配合时间戳可确认规则改动确实落到 B。三者合起来构成滚动升级的验收：B 在跑、B 在收包、B 已加载新规则，此时才停 A。命令协议与返回码见 04-07、04-08，控制面模块见 07-12。多实例部署的检查项对照见下表，参数全集见 04-02 ~ 04-04。
+
+| 检查项 | 目的 | 验证方式 |
+|---|---|---|
+| --net=host | 让容器看到宿主机真实网卡 | docker inspect 网络模式 |
+| NET_RAW 与 NET_ADMIN | AF_PACKET 收包的最小能力集 | docker exec 查能力，需对照实际版本核验 |
+| cluster-id 唯一 | 避免多实例抢同一 fanout 组 | suricata --dump-config -c yaml |
+| 独立 outputs 路径 | 避免多实例写同一 eve.json | ls -l 各实例日志卷 |
+| unix-command.filename | 每实例独立控制 socket | suricatasc -c "iface-list" |
+| 规则卷只读挂载 | 统一规则版本且防容器改写 | docker inspect 挂载项 |
+| reload-rules 时间戳 | 确认滚动升级已加载新规则 | suricatasc -c "ruleset-reload-time" |
+
+### 5. 常见失败与排错
+
+失败大多集中在「容器看不到网卡」「多实例抢包」「日志串台」「控制面串实例」四类。按闭环约定，每个现象都给「验证命令 → 修复方向」两段，先取证再动手。常见失败对照见下表，完整排错速查见 04-08，诊断决策树见 08-03。
+
+| 现象 | 可能原因 | 验证命令 | 修复方向 |
+|---|---|---|---|
+| 容器内 iface-list 为空 | 未用 host 网络或缺能力 | docker inspect 网络模式 | 改 --net=host 并补 NET_RAW 等 |
+| 启动报权限不足 | run-as 用户与卷属主不匹配 | docker logs suri-a | 对齐属主或调整 run-as 段 |
+| 两实例都收同一批包 | cluster-id 取值重复 | suricata --dump-config -c yaml | 每实例设不同 cluster-id |
+| 两份 eve.json 互相覆盖 | 日志卷挂到同一目录 | ls -li 两份 eve.json | 拆成独立卷或改文件名 |
+| suricatasc 连错实例 | 共用同一控制 socket | suricata --dump-config -c yaml | 每实例设独立 filename |
+| 升级后出现检测空窗 | 先停旧实例再起新实例 | docker ps \| grep -E 'suri-a\|suri-b' | 改为先起新再停旧的滚动顺序 |
+| 规则版本漂移 | 各实例各自下载规则 | docker inspect 规则卷 | 统一以只读卷挂载合并产物 |
+| cluster_qm 不生效 | 网卡不支持 RSS 或 IRQ 未调优 | lscpu 与 suricatasc dump-counters | 换 cluster_flow 并按 08-02 调优 |
+
+几个需要展开说明的坑。其一，「容器起来了但没告警」十有八九是网络与权限，而不是规则：bridge 网络下看不到宿主机镜像口、缺 `CAP_NET_RAW` 一类能力、`run-as.user` 与挂载目录属主不匹配，都会让抓包后端拿不到字节；应先对容器执行 `suricatasc -c "iface-list"` 与 `docker logs` 取证，再回查 `--net=host` 与能力集。其二，多实例最隐蔽的错是「逻辑同名、物理未隔离」：两份配置都写 `filename: eve.json` 看似没问题，但若挂到同一宿主机目录就会互相覆盖；同理 `unix-command` 不设独立 `filename` 会让 `suricatasc` 连到先创建的那个 socket，出现「给 B 下命令却改了 A」的怪象。判据都是 `--dump-config` 加路径核对，而不是看配置文件文本。其三，滚动升级的顺序是可用性红线：必须「先起新实例、确认 `ruleset-reload-time` 与告警产出、再停旧实例」，反过来做会留下检测空窗；`etc/suricata.service.in` 的 `ExecReload=/bin/kill -USR2 $MAINPID` 是宿主机单实例下不重启重载的另一条路径，容器编排环境应映射到等价的健康检查与就绪探针。其四，`cluster_qm` 一类按 RSS 队列分流的取值依赖网卡能力与 IRQ 亲和，不能照抄示例，效果需在目标机型实测，机制见 06-13、调优见 08-02。其五，表格里出现 shell 管道符或「或」语义的 `\|` 必须转义书写，否则整表错列，这是资料层的坑。
+
+还有一组全册通用纪律。`suricata-update` 是与主程序分仓、独立发版的工具，规则应统一生成后以只读卷挂入，不得写成主程序内建子命令；Suricata 是 IDS / IPS / NSM 引擎，不做 IP 转发、不做路由、不是防火墙，内联阻断依靠 NFQUEUE / AF_PACKET 桥接的 verdict；IDS 旁路只告警不丢弃；TLS 等加密载荷正文不可见；规则语法兼容 Snort 但非 100% 兼容；EVE JSON 是主要输出，fast.log、stats.log、pcap-log 为辅助；Hyperscan 只是可选 MPM 加速，缺失时回退 AC 等其他实现；DPDK 需独占网卡、大页与 EAL 参数，Netmap 与 AF_XDP 有内核与驱动要求，pcap 多用于离线或低速率，PF_RING 支持状态需对照 `configure.ac` 与 `src/source-*.c` 核验，不得编造 `source-pfring.c`。实例数、吞吐、丢包率、内存占用与升级窗口一律需在目标机型实测，不给绝对值，上线清单见 08-06。
+
+### 6. 小结
+
+本篇把「容器与高可用」收成一条可验证的闭环：以 `--net=host` 加 `NET_RAW`、`NET_ADMIN` 最小能力集让容器看到宿主机网卡，配置与规则以只读卷挂载、日志以每实例独立卷落盘；多实例用唯一 `cluster-id` 配合 RSS 队列或 TAP / SPAN 旁路分流，用独立的 `unix-command.filename` 隔离控制面；滚动升级按「先起新实例、`reload-rules` 载入新规则、`ruleset-reload-time` 确认落地、再停旧实例」的顺序避免检测空窗，全程用 `docker ps`、`suricatasc --dump-config` 类回显与两份 `eve.json` 给出「预期输出 + 判读要点」。读者应能据输出判断「容器有没有看到网卡、两实例有没有抢包、日志有没有串台、升级有没有空窗」，而不是只看容器是不是 `Up`。全册关于镜像名、标签与容器权限写法凡本快照无法定位的，均已标注「需对照实际版本核验」。
+
+与相邻篇的衔接：最小可用部署见 03-01，主干配置见 03-02，规则集管理见 03-03，EVE 输出与轮转见 03-04，IPS 内联见 03-05。配置参数完整清单见 04-02 ~ 04-04、完整变量见 04-01，命令行与 RPC 见 04-07，返回码见 04-08；`SCConfNode`、`ThreadVars` 等字段见 05-07、05-09；抓包后端、runmode、verdict 与 EVE 机制见 06-02、06-13、06-12、06-11；按目录划分的模块能力见 07 册；基准、调优、加固与上线清单读 08 册。全册交叉引用统一写成 `（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）`。至此 03 册六篇从「第一次跑起来」到「容器化多实例高可用」形成完整闭环：能编出来（02 册）、能跑起来（03-01）、能配得对（03-02）、规则能持续更新（03-03）、输出读得懂接得稳（03-04）、能告警也能阻断（03-05）、能规模化部署（03-06），后续的参数随查、字段随查、原理深究与运维排障分别交给 04 ~ 08 册。
+
+

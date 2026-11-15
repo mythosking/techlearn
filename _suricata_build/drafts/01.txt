@@ -1,0 +1,559 @@
+# Suricata 技术资料 · 01 基础与概述
+
+## 01-01 Suricata 是什么：IDS/IPS/NSM 定位、能力矩阵与适用边界
+
+### 1. 背景与动机
+
+在讨论一个网络检测引擎之前，先要把它在整张网络里所处的位置画清楚。传统网络设备的分工是相对固定的：路由器和三层交换机负责按目的地址转发报文，防火墙依据五元组与状态表做访问控制与地址转换，负载均衡器把连接分摊到后端，而「检测」这件事长期由一类被称为入侵检测系统的旁路设备承担。它不串接在业务链路里，而是通过一个镜像口、一台 TAP 设备或交换机上的 SPAN 会话，把线上流量的副本喂给分析程序。这样分工的好处是检测设备无论死活都不会影响业务转发，坏处是它天生只能「看」和「记」，看到攻击时最多写一条告警，却无法把恶意报文从链路上拿掉。理解这层分工，是理解 Suricata 一切能力边界的起点。
+
+早期开源检测工具在长期演进中暴露出几类共性痛点。其一是单线程架构难以吃满多核处理器，在万兆乃至更高速率链路上容易出现收包跟不上、内核缓冲区丢包的情况；其二是日志格式偏人类可读而非机器可读，想把它接进后续的分析平台、做关联与长期留存时，往往要写一堆脆弱的正则去切文本；其三是对应用层协议的还原能力有限，检测大量停留在报文载荷的字节匹配层面，面对 HTTP、DNS、TLS、SMB 这类有状态、有事务概念的协议时表达能力不足。Suricata 由 OISF 主导开发，正是围绕这几条痛点设计的：从一开始就以多线程运行模式为默认方向，把应用层协议解析做成引擎的一等公民，并把结构化、可扩展的 EVE JSON 作为主要输出形态，同时保持开源与可审计。
+
+同一套引擎在实际部署中往往同时承担三种角色，这也是本篇标题把 IDS、IPS、NSM 并列的原因。旁路接入、只告警不干预时它是 IDS；串接进链路、能够给出放行或丢弃判定时它是 IPS；把它产出的流记录、协议事务、文件与连接元数据汇聚起来做取证、态势感知与威胁猎捕时，它又是 NSM 的数据源。三种角色共用同一条抓包、解码、重组、解析、检测、输出的流水线，差别主要在流水线的末端动作与部署拓扑上。初学者最容易犯的错，是把「能阻断」理解成「引擎自己会转发」，或者把「能看流量」理解成「能看见加密前的明文」，因此本册开宗明义先把能与不能的边界钉死，再进入细节。
+
+作为整套资料的第一篇，本篇只做总览，不展开任何结构体字段、参数全集或机制实现。按 SPEC 第 4 节的去重约定：机制、状态机与调用链讲「做什么」，实现细节写「原理见 06-xx」；配置项与命令行参数只给本场景最小必要示例，写「参数见 04-xx」；结构体只点名加真实源码路径，写「字段见 05-xx」；模块能力与目录归属写「模块见 07-xx」。这样安排是为了让 yaml 段、规则关键字、结构体字段在整个资料集里只在一处被完整定义，其余册一律交叉引用，避免多册重复且互相矛盾。读者若想立刻查某个参数，请直接翻 04 册；想理解一条包为什么这样走，请翻 06 册；本篇的任务是建立正确的心智模型。
+
+### 2. 核心概念
+
+IDS 即入侵检测系统，关键词是「旁路」与「只告警」。流量通过镜像方式送入引擎，引擎自身解码、重组并检测这些副本，命中规则时产生告警事件，但原始报文早已被真实链路上的设备正常转发完毕，引擎既没有机会也没有权力去丢弃它。因此 IDS 模式的部署风险最低，即使进程崩溃、规则写错、机器负载打满，最多是漏告警，不会造成业务中断。缺点是响应滞后，且无法对正在发生的攻击做即时阻断。在这种模式下把 Suricata 挂到 TAP 或 SPAN 口，是绝大多数团队第一次上线时采用的稳妥形态。
+
+IPS 即入侵防御系统，关键词是「内联」与「判定」。此时报文被内核或桥接对端暂时扣住，等待 Suricata 给出 verdict（判定）后才决定放行还是丢弃。需要特别强调：Suricata 并不自己做 IP 转发、不做路由，也不把自己实现成一台防火墙。它依赖两条外部机制之一工作——NFQUEUE 模式下由 iptables 或 nftables 规则把报文送入队列，引擎处理完通过 `nfq_set_verdict` 回写 `NF_ACCEPT` 或 `NF_DROP`；AF_PACKET 桥接模式下引擎跨两张网卡工作，借助 `copy-mode` 与 `copy-iface` 把一侧流量复制到另一侧，是否放行由桥接对端决定。换言之，丢包这个动作的执行者是内核或桥接，Suricata 只负责告诉它「该丢还是该放」。这一点写反了，后面所有关于 IPS 的理解都会跟着错。
+
+NSM 即网络安全监控，它更接近一种数据生产与消费的范式，而非单一的运行开关。Suricata 在检测之外会持续输出流记录、协议事务日志、DNS 查询与应答、TLS 握手元数据、证书信息、文件提取记录以及统计计数等。这些结构化事件汇聚后可用于回溯一次入侵的完整链条、做基线建模、做威胁猎捕与合规留存。NSM 视角下，一条告警只是众多事件类型中的一种；即便某段时间没有告警，流与协议日志本身仍然有分析价值。这也解释了为什么 EVE JSON 被定为主要输出，而 fast.log、stats.log、pcap-log 等只作为辅助：结构化事件才便于被外部管道消费。
+
+把能力摊成一张矩阵会更直观。引擎「能」做的事包括：基于规则对解码到的流量做告警；在内联部署下对命中丢弃动作的规则给出 drop 判定；输出以 EVE JSON 为主的多种日志；还原并解析大量应用层协议；对 TCP 流做重组后再检测；在多线程 runmode 下横向扩展。引擎「不能」做的事同样要明确：不做 IP 转发、不做路由、不是防火墙；不终止也不解密 TLS，因而看不到 HTTPS 等加密载荷的正文，能拿到的是握手元数据、证书、SNI、JA3 一类信息；不能宣称与 Snort 规则百分之百兼容，语法兼容但有自有扩展；不能凭空恢复没有镜像到、没有重组到的流量。下表把这些结论与对应源码位置对照列出，参数与字段的完整清单分别见 04 与 05 册。
+
+| 能力维度 | 结论 | 依据源码位置 |
+|---|---|---|
+| 旁路告警 | 支持，只产生事件不丢弃报文 | suricata-main/src/output-json-alert.c |
+| 内联阻断 | 支持，依赖 NFQUEUE 或桥接 verdict | suricata-main/src/source-nfq.c、suricata-main/src/source-af-packet.c |
+| 结构化输出 | EVE JSON 为主，fast / stats / pcap-log 为辅 | suricata-main/src/output-json.c |
+| 应用层解析 | 多协议还原与事务级检测 | suricata-main/src/app-layer-parser.c |
+| IP 转发与路由 | 不支持，不做网关 | 引擎定位，见 suricata-main/src/suricata.c |
+| 加密载荷明文 | 不可见，仅有握手元数据 | suricata-main/src/output-json-tls.c、suricata-main/rust/src/ja4.rs |
+| 规则兼容 | 兼容 Snort 语法但有自有扩展 | suricata-main/src/detect-parse.c、suricata-main/src/detect-engine-register.c |
+
+可见性边界值得单独再讲一句。引擎只能对它「自身解码并重组到的流量」做检测，这句话包含两层限制：流量必须真的被送到抓包后端；送来的字节必须能被正确解码、能被流重组还原成有序的应用层数据。任何旁路漏镜像、SPAN 会话配置不全、分片或隧道未被正确解析、TLS 已经加密的情形，都会让检测退化。把「部署了 Suricata」等同于「看见了全部流量」是危险的幻觉，这一点在 06 册讲解码、重组与应用解析时会被反复印证。
+
+### 3. 关键数据结构与源码位置
+
+主程序的入口在 `suricata-main/src/suricata.c`。该文件里定义了一个全局的运行上下文 `SCInstance suricata;`，并包含 `SCInstanceInit`、`GlobalsInitPreConfig`、`SCParseCommandLine`、`SCStartInternalRunMode` 等启动相关函数。命令行参数由 `SCParseCommandLine` 通过 `getopt_long` 解析，短选项集中在一个字符串里，长选项表里则登记了 `--build-info`、`--dump-config`、`--list-keywords`、`--engine-analysis`、`--list-runmodes` 等能力查询项。默认配置的模板是 `suricata-main/suricata.yaml.in`，其中 `vars`、`default-rule-path`、`rule-files`、`outputs`、`af-packet`、`app-layer`、`threading` 等段构成了运行参数的骨架；这些段的完整键值属于 04 册的权威范围，本篇只用其名不展开。
+
+引擎运行期最核心的几类对象分布在 `src/` 下的头文件里：`Packet` 与解码层在 `suricata-main/src/decode.h`，`Flow` 与流表在 `suricata-main/src/flow.h`，`Signature`、`SigMatch`、`DetectEngineCtx` 等检测对象在 `suricata-main/src/detect.h`，线程与模块描述 `ThreadVars`、`TmModule` 在 `suricata-main/src/threadvars.h`、`suricata-main/src/tm-threads.h`、`suricata-main/src/tm-modules.h`，输出上下文 `LogFileCtx`、`OutputModule` 在 `suricata-main/src/output.h`。这里只点名结构与其归属文件，绝不逐一列字段；每个成员的完整定义、类型、读写时机与生命周期属于 05 册，写作时统一标注「字段见 05-xx」。本篇读者只需知道：一个包进来会被封装成 `Packet`，按五元组关联到 `Flow`，与编译好的 `Signature` 集合比对，最终经输出模块落成事件。
+
+内联阻断相关的源码集中且明确。`suricata-main/src/source-nfq.c` 是 NFQUEUE 接收与判定线程的实现，文件头注释就写明它「从内核收包并把 verdict 回写内核，用于内联模式」；其中登记了 `TmModuleReceiveNFQRegister` 与 `TmModuleVerdictNFQRegister`，把 `VerdictNFQ` 设为判定线程的 `Func`，并在需要时通过 `NFQSetVerdict`、`nfq_set_verdict` 回写 `NF_ACCEPT`、`NF_DROP` 或 `NF_REPEAT`。配套的 `suricata-main/src/runmode-nfq.c` 负责把接收、解码、检测、判定这些线程模块串成 NFQ 运行模式的 slot 链。`suricata-main/src/source-af-packet.c` 则覆盖 AF_PACKET 桥接场景，配合 yaml 里的 `copy-mode`、`copy-iface` 完成两侧网卡间的流量复制。三处文件共同说明一个事实：阻断能力来自 verdict 机制，而非引擎自己转发。
+
+把本节的引用关系收束成一句话，就是本套资料强制的交叉引用写法：`（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）`。具体到本篇，`Packet`、`Flow`、`Signature` 的字段见 05-02、05-03、05-05；yaml 段与命令行参数见 04-02、04-07；抓包到输出、IPS verdict、runmode 的原理分别见 06-01、06-12、06-13；按目录划分的模块能力见 07 册各篇。01 册作为总览册，只负责让读者知道「去哪里找」，不代替这些册展开。
+
+### 4. 关键流程与调用链
+
+从进程启动到第一条告警落盘，主程序的调用链大致是：`SCParseCommandLine` 解析命令行与配置文件路径，`GlobalsInitPreConfig` 完成全局初始化，随后由 `suricata-main/src/conf.c`、`suricata-main/src/conf-yaml-loader.c` 加载 yaml 配置树，再由 `suricata-main/src/suricata.c` 中静态的 `LoadSignatures` 触发规则加载，最终 `SCStartInternalRunMode` 依据选定 runmode 把各线程模块装配成 slot 链并拉起线程。规则加载的更下游入口是 `suricata-main/src/detect-engine-loader.c` 的 `SigLoadSignatures`，它把规则文件读进来交给解析层；`suricata-main/src/detect-parse.c` 的 `SigInit` 负责把一条规则文本构造成 `Signature`。这条启动链讲的是「做什么」：装配置、编规则、起线程；每个环节的实现细节属于 06 册，配置键属于 04 册。
+
+IDS 旁路模式下，一个报文的处理路径止于输出。抓包后端 `suricata-main/src/source-*.c` 把原始帧收进来，`suricata-main/src/decode.c` 及其 `decode-ethernet.c`、`decode-ipv4.c` 等解码族逐层剥离链路层、网络层、传输层首部，`suricata-main/src/flow.c` 的 `FlowHandlePacket` 把包关联到流，`suricata-main/src/stream-tcp-reassemble.c` 的重组入口把 TCP 段拼成有序字节流，`suricata-main/src/app-layer-parser.c` 的 `AppLayerParserParse` 还原出协议事务，随后 `suricata-main/src/detect.c` 的 `DetectRun` 与 `SigMatchSignatures` 完成规则求值，命中就经 `suricata-main/src/output-json-alert.c` 写出 EVE 告警事件。全过程不产生任何 verdict，原始报文的转发与引擎无关。
+
+IPS 内联模式下，前半段流水线相同，差别出现在末端。以 NFQUEUE 为例，报文由内核送入队列，`suricata-main/src/source-nfq.c` 的接收线程取出后同样走解码、重组、检测；当规则动作是 drop 且 `PacketCheckAction` 判定为 `ACTION_DROP` 时，判定线程 `VerdictNFQ` 把 verdict 置为 `NF_DROP` 并回写内核，内核据此丢弃该报文；否则回写 `NF_ACCEPT` 放行。文件里还登记了 `NFQ_ACCEPT_MODE` 与 `SC_CAP_NET_ADMIN` 能力标志，说明这种运行需要相应的内核权限。IDS 只告警、IPS 能 drop 的分水岭就在这里，而「谁真正执行丢包」的答案始终是内核或桥接对端。完整的 verdict 状态、fail-open 策略与重组边界，原理见 06-12。
+
+NSM 视角下则没有独立的第二条流水线：流记录、协议事务、文件与统计事件都是上述同一条流水线在不同输出模块上的分叉，由 `suricata-main/src/output-json-flow.c`、`suricata-main/src/output-json-dns.c`、`suricata-main/src/output-json-tls.c` 等分别落成 EVE 的不同 `event_type`。三种角色的处理链路与阻断落点见图 01-01-01，图中实线为报文正常流向，红色节点标出内联阻断这一分支。
+
+:::figure id=01-01-01 | name=IDS IPS NSM 三角色与阻断落点 | dir=TD
+node n1 "旁路镜像流量<br/>TAP / SPAN" blue
+node n2 "抓包与解码<br/>source / decode" teal
+node n3 "检测引擎<br/>detect" purple
+node n4 "IDS 告警<br/>eve.json / fast.log" green
+node n5 "IPS verdict<br/>NFQ / 桥接" red
+node n6 "NSM 记录<br/>flow / 协议日志" green
+edge n1 -> n2 "只收不发"
+edge n2 -> n3 "Packet 入队"
+edge n3 -> n4 "旁路只告警"
+edge n3 -> n5 "内联可丢弃"
+edge n3 -> n6 "元数据落盘"
+:::
+
+### 5. 配置/命令/代码实例
+
+下面给出三种角色的最小可运行命令。IDS 模式用 `-c` 指定配置、`-i` 指定抓包网卡；IPS 模式先用 iptables 把流量送入 NFQUEUE 队列，再用 `-q` 让引擎接管该队列；无论哪种模式，上线前都建议先用 `-T` 做配置与规则自检。注意命令里的接口名、队列号需按实际环境替换，完整命令行参数见 04-07。
+
+```bash
+# IDS 旁路：镜像口收包，只告警不干预
+suricata -c /etc/suricata/suricata.yaml -i eth0 -l /var/log/suricata/
+
+# 上线前自检：只校验配置与规则，不真正抓包
+suricata -T -c /etc/suricata/suricata.yaml
+
+# IPS 内联：把 FORWARD 链流量交给 0 号队列，引擎以 -q 接管
+iptables -I FORWARD -j NFQUEUE --queue-num 0
+suricata -c /etc/suricata/suricata.yaml -q 0 -l /var/log/suricata/
+```
+
+对 `-T` 自检命令，以下是示例输出，具体格式需对照实际版本核验。
+
+```text
+[Info] - Running suricata under test mode
+[Info] - Loading configuration /etc/suricata/suricata.yaml
+[Info] - Configuration OK
+[Info] - Loading rule files from default-rule-path
+[Info] - 1 rule files processed, rules successfully loaded
+[Info] - Initializing runmode
+[Info] - Configuration provided was successfully loaded. Exiting.
+```
+
+逐行判读这段输出。第一行 `Running suricata under test mode` 确认进入的是自检模式，此模式下引擎只做加载与校验，不会拉起抓包线程、不会写告警，因此可以随时在预发布环境反复执行，风险最低。第二行报告实际被加载的配置文件路径，用来确认 `-c` 是否指向了预期的那份 yaml，路径写错或落到了默认配置是常见故障源。第三行 `Configuration OK` 说明 yaml 语法、段结构与必要键均通过解析；若此处报缩进错误或未知段，应回头查 `suricata.yaml.in` 的层级。第四、五行与规则加载有关：`default-rule-path` 与 `rule-files` 决定了读哪些规则文件，输出里的文件数、成功加载数需要与预期的规则集规模大致吻合，若数量明显偏少，往往意味着规则文件路径没配对或规则文件为空。第六行 `Initializing runmode` 说明已进入运行模式装配前的检查，最后一行 `successfully loaded. Exiting.` 是正常退出的标志，表示整套配置与规则可以安全用于真实启动。需要留意的是，自检通过并不等于线上一定有告警，网卡名、`vars` 里的 `HOME_NET`、`outputs` 路径与权限仍需在 03 册的部署流程里逐项验证；输出中的具体行数、措辞和日志级别会随构建与配置变化，务必以实际版本为准。
+
+与命令配套的最小 yaml 片段如下，仅示意结构，键名与取值需对照实际版本核验，完整参数见 04-02、04-03、04-04。
+
+```yaml
+%YAML 1.1
+---
+vars:
+  address-groups:
+    HOME_NET: "[192.168.0.0/16,10.0.0.0/8]"
+default-rule-path: /var/lib/suricata/rules
+rule-files:
+  - suricata.rules
+outputs:
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: eve.json
+      types:
+        - alert
+        - flow
+```
+
+### 6. 注意事项、陷阱与最佳实践
+
+最常见、也最危险的误读，是把 Suricata 当成防火墙或网关来规划拓扑。有人把两台机器之间唯一的通路串到运行 Suricata 的主机上，以为引擎会负责把包从一块网卡转发到另一块，结果发现业务不通。真相是引擎不做 IP 转发、不做路由，内联阻断只能靠 NFQUEUE 或 AF_PACKET 桥接给出 verdict，转发动作始终由内核协议栈或桥接对端完成。正确做法是先画清楚流量原本怎么走，再决定用镜像旁路还是用队列内联，把 Suricata 放在它该在的位置。把这条边界讲清楚，是 01-01、06-12、08-05 三篇反复强调的重点。
+
+第二个陷阱是对可见性的过度承诺。TLS 等加密载荷的正文对引擎不可见，能拿到的是握手元数据、证书、SNI、JA3 等信息，相关输出在 `suricata-main/src/output-json-tls.c` 与 `suricata-main/rust/src/ja4.rs`。任何「用 Suricata 读 HTTPS 明文内容」的期待都会落空；正确姿势是用这些元数据做指纹、证书与 SNI 层面的检测与 enrichment。与之相邻的另一个误读是「规则百分之百兼容 Snort」：语法确实兼容，但 Suricata 有自有关键字与扩展，迁移规则集时必须用 `-T` 自检并逐条验证，不能假定原样可用，这一点会在 01-02 展开。
+
+IPS 内联部署的失败模式尤其多。队列号写错、iptables 规则没把目标流量送进队列、规则动作写成 `alert` 而不是 `drop`、`stream.inline` 与重组边界没配好、fail-open 策略与业务可用性要求不匹配，都会导致「要么不阻断、要么误断网」。由于内联模式直接影响业务，最佳实践是先在 IDS 旁路模式把规则 tuned 到稳定，再切到内联；切换时保留回滚路径，并用 stats 与 drop 事件持续观察判定结果。同样要记住 Hyperscan 只是可选的多模式匹配加速，缺失时会回退到 AC 等其他实现，不能把它写成必需依赖；`suricata-update` 是与内核主程序分仓、独立发版的工具，不是 `src/` 主程序的内建子命令。
+
+最后是版本与性能纪律。本套资料统一以「上游 main 快照（2026-11 抓取）」为基准，具体版本号以 `suricata-main/configure.ac`、`suricata-main/ChangeLog` 为准，正文不写绝对值；不确定的字段名、函数签名、配置项键名一律写「需对照实际版本核验」并给出可定位目录。任何吞吐、pps、丢包率、内存占用结论一律标注「需在目标机型实测」，不给跨机型通用数字；基准方法见 08-01，调优见 08-02。把「加线程」写成必然线性提速也是错的，workers、autofp、single 三种 runmode 与流亲和、RSS、fanout 共同决定扩展性，原理见 06-13。
+
+### 7. 小结与延伸阅读
+
+本篇给出的核心结论可以浓缩成三句话：Suricata 是 IDS、IPS、NSM 三种角色共用的开源检测引擎；它能告警、能在内联下通过 verdict 触发丢弃、能输出以 EVE JSON 为主的结构化事件、能解析应用层协议；它不做 IP 转发、不做路由、不是防火墙，看不到加密载荷明文，规则兼容 Snort 但有自有扩展。三种角色共用同一条抓包到输出的流水线，差异集中在末端动作与部署拓扑，理解这一点就抓住了全册的纲。
+
+想继续深入的读者，可按需要选路径：想比较它与同类引擎的差异读 01-02，想建立整条流水线的分层视图读 01-03，想了解版本、许可、生态与资料使用约定读 01-04；想动手编译与部署读 02、03 册；想理解 verdict、runmode、解码与重组的机制读 06 册，其中 IPS 细节见 06-12、多线程见 06-13；想按目录查模块能力读 07 册；所有配置键与命令行参数查 04 册，所有结构体字段查 05 册，上线与排障读 08 册。交叉引用请始终沿用 `（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）` 的统一写法。
+
+## 01-02 与 Snort 2/3、Zeek、商业 IPS 的引擎对比
+
+### 1. 背景与动机
+
+选型是任何安全技术落地的第一道决策，而选型的难点往往不在「哪个更强」，而在「各自解决的是不是同一个问题」。网络检测领域里，Snort、Suricata、Zeek 与商业 IPS 经常被放在同一张对比表里，但它们的设计目标其实并不重合：有的以规则匹配与告警为核心，有的以协议日志与脚本化分析为核心，有的把检测、阻断、管理与支持打包成一台黑盒设备。若不先厘清这些目标差异，直接比「谁支持多少条规则」「谁的吞吐高」，很容易得出误导性结论，甚至在上线后才发现要的能力根本不在所选工具的职责范围内。本篇的动机就是把这四类引擎放回各自的坐标系，再说明 Suricata 在其中的位置。
+
+对多数团队而言，对比的触发点通常来自三类现实场景。第一类是迁移：已有基于 Snort 的规则资产与运维经验，想评估换到 Suricata 的成本，最关心规则能不能直接用、语义有没有漂移。第二类是补强：已经有一套告警系统，但发现缺少对连接全貌、协议事务与文件元数据的记录，想知道是否该引入 Zeek 这类工具做互补，而不是替换。第三类是自建与采购的权衡：在开源方案与商业 IPS 之间比较可观测性、可定制性、应急响应与总体拥有成本。三种场景关注的维度完全不同，因此本篇会分别给出「引擎分工」「规则兼容」「输出模型」「线程与扩展性」几组坐标，而不是给一个笼统的排名。
+
+理解 Suricata 自身定位，还有助于解释它为什么长成现在这样。它既保留了与 Snort 兼容的规则语法，让既有规则资产可以较低成本迁移；又从一开始就押注多线程 runmode 与结构化 EVE JSON，回应了高速链路与机器可读日志的需求；同时把应用层协议解析做成引擎内建能力，使检测能落到事务与字段层面而非仅仅字节层面。这几条设计选择，恰好对应了它与 Snort、Zeek、商业 IPS 的主要差异点。本篇会在概念、源码位置、调用链与示例四个层面把这些差异讲清楚，但机制实现仍写「原理见 06-xx」，参数写「参数见 04-xx」，字段写「字段见 05-xx」。
+
+需要提前声明几条贯穿全册、本篇尤其容易踩的红线。其一，规则语法是「兼容但有自有扩展」，绝不能写成百分之百兼容；其二，多线程是架构特性，不等于「加线程必然线性提速」；其三，EVE JSON 是主要输出，fast.log、stats.log、pcap-log 是辅助输出；其四，加密载荷明文对任何旁路引擎都不可见，Suricata 能拿到的是握手元数据、证书、SNI、JA3 等；其五，多线程 runmode 分 workers、autofp、single 三类，各有适用场景。带着这些边界去读对比，才不会被营销话术带偏。
+
+### 2. 核心概念
+
+先把四类引擎按「产出物」归类，是最省力的切口。Snort 2 与 Snort 3 属于规则告警型：核心资产是规则集，核心动作是把匹配到的流量写成告警，运维围绕规则的编写、调优与误报治理展开。Suricata 同样以规则告警为主干，但把多线程与结构化输出作为一等目标，且内建丰富的应用层协议解析，产出物除了告警还有成体系的协议与流事件。Zeek 属于日志脚本型：它默认不追求「命中即告警」，而是把观察到的连接、协议事务、文件等转成高度结构化的日志，再由脚本层做策略、关联与告警，产出物是可供分析的事件表。商业 IPS 则通常把检测、内联阻断、集中管理、签名更新与厂商支持打包，产出物是「可用的防护闭环」，但内部规则逻辑、日志结构与调优空间对外不透明。
+
+规则兼容是对比里最容易被夸大也最容易被误解的一条。Suricata 的规则语法兼容 Snort，规则头在动作、协议、地址、端口、方向上的写法，以及大量常见关键字都能直接沿用，这来自 `suricata-main/src/detect-parse.c` 的规则头与选项解析能力。但「兼容」不等于「等价」：Suricata 通过 `suricata-main/src/detect-engine-register.c` 注册了自有关键字与扩展，`sigmatch_table[]` 里既有与 Snort 对齐的部分，也有 Suricata 特有的 sticky buffer、协议字段、dataset、xbits 等能力；反过来，某些 Snort 关键字或语义在 Suricata 里可能有替代实现或行为差异。因此迁移规则集的正确姿势是「先用 `suricata -T` 自检，再逐条验证语义」，而不是假定原样可用。把这条写成百分之百兼容，是资料里明令禁止的。
+
+线程与扩展性是第二类实质差异。传统单进程单线程检测模型在多核时代容易成为瓶颈，Suricata 从设计上就提供 workers、autofp、single 三种多线程 runmode，相关定义与判定在 `suricata-main/src/runmodes.c`，其中能看到 `thread_name_workers`、`thread_name_autofp`、`thread_name_single` 以及对 `RunmodeGetActive()` 与字符串 `workers`、`autofp` 的比较。workers 模式下单个线程包办从收包到输出，autofp 模式把收包与检测拆成不同线程并经队列衔接，single 模式用于调试。但架构支持多线程不意味着吞吐随线程数线性增长：流亲和、RSS 与 fanout 的负载均衡、队列锁竞争、绑核与 NUMA 都会影响实际扩展性，原理见 06-13。与 Zeek 的集群化、商业 IPS 的专用硬件加速相比，这是不同层面的设计，不能简单比大小。
+
+输出模型是第三类差异，也直接决定后续数据管道怎么搭。Suricata 把 EVE JSON 定为主要输出，由 `suricata-main/src/output-json.c` 及 `suricata-main/src/output-json-alert.c`、`suricata-main/src/output-json-flow.c`、`suricata-main/src/output-json-dns.c`、`suricata-main/src/output-json-tls.c` 等一整个文件族的模块化实现，把告警、流、DNS、TLS、文件、统计等事件按 `event_type` 组织成结构化记录，便于直接接入 Filebeat、Logstash 一类管道；fast.log、stats.log、pcap-log 等作为辅助输出保留。Zeek 的日志同样是结构化的，但默认按协议拆成多份制表或 JSON 日志，并强调脚本层对事件的再加工。商业 IPS 的日志通常面向其自带管理台，导出与二次开发的自由度受厂商接口约束。四类引擎的分工与选型落点见图 01-02-01，后文表 01-02 给出更细的选型决策表。
+
+:::figure id=01-02-01 | name=四类检测引擎的能力分工与选型落点 | dir=TD
+node n1 "规则告警型<br/>Snort 2/3" blue
+node n2 "多线程规则型<br/>Suricata" teal
+node n3 "日志脚本型<br/>Zeek" amber
+node n4 "商业 IPS<br/>黑盒联动" gray
+node n5 "EVE JSON<br/>结构化输出" green
+node n6 "选型决策<br/>互补部署" purple
+edge n1 -> n2 "语法兼容非全等"
+edge n2 -> n5 "主输出"
+edge n3 -> n5 "日志互补"
+edge n1 -> n6 "规则迁移"
+edge n2 -> n6 "横向扩展"
+edge n3 -> n6 "取证脚本"
+edge n4 -> n6 "托管闭环"
+:::
+
+### 3. 关键数据结构与源码位置
+
+规则从文本变成可执行检测逻辑，涉及的源码位置是对比时最该点名的。规则头与选项解析在 `suricata-main/src/detect-parse.c`，其中 `SigInit` 把一条规则字符串构造成 `Signature`，`SigParseBasics`、`SigParseAction`、`SigParseAddress`、`SigParseProto`、`SigParsePort`、`SigParseOptions` 等静态函数分别处理基础信息、动作、地址、协议、端口与选项；关键字的注册表在 `suricata-main/src/detect-engine-register.c`，`SigTableSetup` 负责装配 `sigmatch_table[]`。规则文件的加载入口是 `suricata-main/src/detect-engine-loader.c` 的 `SigLoadSignatures` 与 `DetectLoadSigFile`、`ProcessSigFiles`。这几处共同解释了「兼容 Snort 但有自有扩展」这句话的代码依据：解析层对齐了通用语法，注册表则容纳了扩展关键字。
+
+检测对象本身的定义在 `suricata-main/src/detect.h`，`Signature`、`SigMatch`、`DetectEngineCtx` 等结构承载编译后的规则与上下文；检测求值主流程在 `suricata-main/src/detect.c`，能看到 `DetectRun`、`DetectFlow` 与 `SigMatchSignatures` 等函数。运行模式定义在 `suricata-main/src/runmodes.c` 及 `suricata-main/src/runmode-af-packet.c`、`suricata-main/src/runmode-nfq.c`、`suricata-main/src/runmode-dpdk.c` 等按后端配对的文件里。输出侧以 `suricata-main/src/output.c`、`suricata-main/src/output-json.c` 及 `suricata-main/src/output-json-*.c` 文件族为主。以上只点名结构与文件归属，逐字段定义属于 05 册，逐项参数属于 04 册，机制流程属于 06 册，按目录划分的模块能力属于 07 册。
+
+把对比中反复用到的引用关系按统一写法收束：`（字段见 05-05 ｜ 参数见 04-05 ｜ 原理见 06-06 ｜ 模块见 07-04）`。其中规则语法与关键字的完整清单见 04-05、04-06，`Signature` 与 `DetectEngineCtx` 的字段见 05-05，规则加载、分组与编译的调用链见 06-06，多线程 runmode 的原理见 06-13，EVE 输出的机制见 06-11，检测引擎按目录的模块划分见 07-04。本篇只借这些入口说明「Suricata 与同类引擎差在哪」，不代替任何一册展开细节，也不列出 API 全集或字段表，这是 01 册作为总览册的硬约束。
+
+### 4. 关键流程与调用链
+
+把四类引擎放在同一条「输入到产出」的抽象链上，差异会更清楚。规则告警型引擎的链是「规则文本 → 解析编译 → 按协议与端口分组 → 多模式匹配预过滤 → 逐规则求值 → 命中告警」。在 Suricata 里，这条链对应 `SigLoadSignatures` 读文件、`SigInit` 与 `SigParse` 系列把文本构造成 `Signature`、后续分组由 `suricata-main/src/detect-engine-siggroup.c`、`suricata-main/src/detect-engine-mpm.c` 等承担，最终 `DetectRun` 与 `SigMatchSignatures` 完成求值。讲的是「做什么」：把人写的规则翻译成引擎能快速匹配的形态。至于分组顺序、`fast_pattern` 选择、MPM 与预过滤引擎如何挂接，原理见 06-06、06-07，本篇不展开。
+
+日志脚本型引擎的链更接近「原始流量 → 协议解析 → 事件与日志 → 脚本策略 → 告警或富化」。Zeek 默认先把连接与协议事务落成结构化日志，再由脚本决定哪些组合构成值得告警的行为，因此它的强项在还原与取证，弱项在「开箱即用的特征告警」。Suricata 与之并非替代关系：它同样产出 flow、dns、tls、http、file 等结构化事件，可供 NSM 使用，但它主输出仍是 EVE JSON，且默认以规则告警为驱动。很多团队的实际做法是两者并存——Suricata 负责高性能规则检测与可选内联阻断，Zeek 负责连接全貌与脚本化关联，二者把同一份镜像流量各取所需。
+
+商业 IPS 的链被封装在设备内部，对外呈现为「流量进入 → 策略与签名匹配 → 阻断或放行 → 上报管理台」。它的优势是把检测、内联阻断、签名更新、集中管理与厂商支持打包成开箱即用的闭环，适合缺乏专门安全研发力量的团队；代价是规则逻辑、日志结构与调优空间不透明，二次集成受接口约束，数据主权和可审计性也不如开源方案。Suricata 在自建路线里承担的是「可审计、可定制、可对接自有数据管道」的角色，但相应地需要团队自己完成部署、规则治理、调优与值守。这个区别不是技术强弱，而是责任边界不同。
+
+线程与队列的调用链则解释了扩展性差异。Suricata 通过 `suricata-main/src/tm-threads.c` 的 `TmSlotSetFuncAppend` 把各 `TmModule` 串成 slot 链，不同 runmode 决定收包、解码、检测、输出等模块被分配到哪些线程、经哪些 `PacketQueue` 传递；workers 让单线程纵向包办，autofp 把收包与检测横向拆开，single 用于调试。EVE 输出链由 `suricata-main/src/output.c` 的输出模块注册机制挂接到 `suricata-main/src/output-json.c` 与各事件文件。再次强调：这些是「做什么」层面的描述，slot 装配、队列传递、流亲和与负载均衡的实现，原理见 06-01、06-13；字段见 05-07，模块见 07-06、07-07。四类引擎的选型决策表见表 01-02。
+
+### 5. 配置/命令/代码实例
+
+对比落到可操作层面，最有用的是两条能力查询命令：`--list-keywords` 列出引擎实现的规则关键字，`--list-runmodes` 列出可用运行模式。它们能直观说明「兼容但有扩展」和「多线程 runmode」不是空话。先用 `suricata -T` 确认配置可用，再执行查询；完整命令行参数见 04-07。
+
+```bash
+# 确认配置与规则可用
+suricata -T -c /etc/suricata/suricata.yaml
+
+# 列出引擎实现的规则关键字，观察自有扩展
+suricata --list-keywords
+
+# 列出可用运行模式
+suricata --list-runmodes
+
+# 一条兼容 Snort 语法的规则示例，写入 local.rules 后用 -T 自检
+echo 'alert tcp any any -> $HOME_NET 80 (msg:"TEST GET"; content:"GET"; http_method; sid:1000001; rev:1;)' \
+  >> /var/lib/suricata/rules/local.rules
+```
+
+对 `--list-runmodes`，以下是示例输出，具体格式需对照实际版本核验。
+
+```text
+Runmodes:
+  RunMode Type    Custom Mode   Description
+  PCAP_DEV        single        Single threaded pcap live mode
+  PCAP_DEV        autofp        Multi threaded pcap live mode
+  PCAP_DEV        workers       Workers pcap live mode
+  AF_PACKET_DEV   workers       Workers af-packet mode
+  AF_PACKET_DEV   autofp        Multi threaded af-packet mode
+  NFQ             autofp        NFQUEUE inline mode
+```
+
+逐行判读这段输出。首行 `Runmodes:` 是清单标题，随后第一列 `RunMode Type` 说明运行模式按抓包后端分组，例如 `PCAP_DEV` 对应在线 pcap 抓包、`AF_PACKET_DEV` 对应 AF_PACKET、`NFQ` 对应内联队列；这一列提醒读者 runmode 不是孤立开关，而是与 `suricata-main/src/runmode-*.c` 里按后端配对的实现一一绑定。中间一列 `Custom Mode` 出现 `single`、`autofp`、`workers` 三个值，正是本篇反复强调的三种线程模型：single 单线程调试、autofp 收发与检测分离、workers 单线程包办，读者可据此核对 `suricata-main/src/runmodes.c` 里的字符串定义。末列 `Description` 简要说明每行的适用场景，其中内联的 `NFQ` 与旁路后端同列于这份清单，正好印证「同一引擎可承担 IDS 与 IPS 两种角色」。需要留意的是，不同后端可用的 custom mode 并不相同，某后端缺某一行说明该组合在当前构建里不可用，这通常与 `configure.ac` 的编译开关、内核能力或驱动有关；若列表比预期少，应回查 `--build-info` 确认特性是否编入。输出中的对齐空格、列名与行数会随实际版本变化，务必以本地结果为准，不能把这里的示意行当作固定清单。
+
+规则示例也要判读一句。那条 `alert tcp any any -> $HOME_NET 80` 采用 Snort 熟悉的规则头，`content`、`msg`、`sid`、`rev` 是通用写法；而 `http_method` 属于 Suricata 面向应用层协议的 sticky buffer 类关键字，体现了「兼容语法 + 自有扩展」。把它写进 `local.rules` 后必须用 `suricata -T` 自检，若报未知关键字或解析失败，说明该关键字名或用法需对照实际版本核验。规则关键字全集见 04-05、04-06，字段见 05-05。四类引擎在选型维度上的对照见下表。
+
+| 维度 | Snort 2/3 | Suricata | Zeek | 商业 IPS |
+|---|---|---|---|---|
+| 主产出 | 规则告警 | 告警加 EVE 事件 | 结构化日志加脚本 | 防护闭环加管理台 |
+| 规则语法 | 原生 | 兼容但有自有扩展 | 非规则驱动 | 私有签名体系 |
+| 线程模型 | 版本相关 | workers / autofp / single | 集群化 | 专用硬件或黑盒 |
+| 输出可定制 | 中等 | 高，EVE JSON 为主 | 高，按协议分日志 | 受厂商接口约束 |
+| 内联阻断 | 支持 | 经 verdict 支持 | 非主职 | 内建支持 |
+| 可审计性 | 开源 | 开源 | 开源 | 黑盒 |
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一条要反复守住的是规则兼容的措辞。把 Suricata 写成「百分之百兼容 Snort」会直接违反能力边界，也会误导迁移评估：真实情况是语法兼容、大量关键字可沿用，但存在自有扩展与个别语义差异。迁移时的最佳实践是分三步：先用 `suricata -T` 做整体自检，再对关键规则做流量回放验证命中与告警内容，最后核对依赖自有关键字的规则是否在目标构建里启用。遇到解析失败，应到 `suricata-main/src/detect-parse.c` 与 `suricata-main/src/detect-engine-register.c` 定位，而不是想当然补写。
+
+第二条是别把 Zeek 当竞品去「二选一」。它的日志脚本范式与 Suricata 的规则告警范式是互补关系：前者强在连接全貌、协议事务与脚本化关联，后者强在高性能特征检测、应用层字段匹配与可选内联阻断。条件允许时并存部署、各取所需，往往比强行合并更稳。真正需要二选一的场合，通常是资源受限或数据管道只能接一种源，此时应先明确团队到底更缺「告警」还是「取证数据」，再决定优先级，而不是比谁名气大。
+
+第三条是别把多线程写成性能承诺。workers、autofp、single 只是线程组织方式，实际吞吐取决于流亲和、RSS 与 fanout 的均衡、队列锁竞争、绑核与 NUMA、规则集规模与 MPM 选择。实践中「线程加得越多越慢」并不罕见，因此任何吞吐、pps、丢包率、内存占用数字一律标注「需在目标机型实测」，不给绝对值；基准方法见 08-01，调优见 08-02，机制见 06-13。与此相邻，Hyperscan 只是可选的多模式匹配加速，构建开关见 `suricata-main/configure.ac`，选项名需对照实际版本核验，缺失时回退到 `suricata-main/src/util-mpm-ac*.c` 等 AC 实现，不能写成必需依赖或唯一实现。
+
+最后几条属于全册通用纪律却常在对比里被忽略。加密载荷明文对任何旁路引擎都不可见，Suricata 能拿到的是握手元数据、证书、SNI、JA3 等，见 `suricata-main/src/output-json-tls.c` 与 `suricata-main/rust/src/ja4.rs`，不要宣称能读 HTTPS 正文。`suricata-update` 与内核主程序分仓、独立发版，负责规则集下载与合并，不是 `src/` 的内建子命令。抓包后端能力与环境要求差异大，DPDK 需独占网卡、大页与 EAL 参数，Netmap 与 AF_XDP 有内核与驱动要求，pcap 多用于离线或低速率；PF_RING 在当前 main 快照是否为受支持后端、对应源文件与启用方式需对照 `suricata-main/configure.ac` 与 `suricata-main/src/source-*.c` 核验，不得编造 `source-pfring.c`。
+
+### 7. 小结与延伸阅读
+
+本篇的核心判断是：四类引擎不在同一坐标系里。Snort 2/3 与 Suricata 同属规则告警型，差别在多线程、结构化输出与应用层解析的深度；Zeek 属日志脚本型，与 Suricata 更多是互补而非替代；商业 IPS 把检测、阻断与管理打包成黑盒闭环，胜在开箱即用、代价在可审计与可定制。Suricata 的位置，是以兼容 Snort 语法降低迁移成本，以 workers、autofp、single 多线程 runmode 与流亲和支撑扩展，以 EVE JSON 为主输出对接自有数据管道，并以开源形态保留可审计与可定制空间。
+
+延伸阅读按需分流：规则语法与关键字全集见 04-05、04-06，命令与 RPC 见 04-07；`Signature`、`DetectEngineCtx` 字段见 05-05；规则加载与编译链、MPM 与预过滤、检测求值、EVE 输出、runmode 的原理分别见 06-06、06-07、06-08、06-11、06-13；检测引擎、util-mpm、source、output、rust 等按目录的模块能力见 07 册对应篇；若要把对比结论落到选型与上线，读 08 册的基准方法与上线清单，并始终记住性能数字需在目标机型实测。交叉引用沿用 `（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）`。
+
+## 01-03 整体架构：抓包 → 解码 → 流与应用解析 → 检测 → 输出
+
+### 1. 背景与动机
+
+读一个检测引擎，最容易陷入的困境是「只见树木不见森林」：能背出某条规则怎么写、某个 yaml 键怎么配，却说不清一个报文从网卡进来到最后落成一条 JSON 事件中间到底经过几道手。这种碎片化认知在顺利时问题不大，一旦要调优或排障就会暴露短板——吞吐上不去时不知道该看收包队列还是检测线程，某类攻击漏告警时不知道该怀疑解码、重组还是协议识别，日志里少了一种事件时不知道该查输出模块还是上游根本没产出。建立一条端到端的全链路视角，正是本篇的动机：把 Suricata 从抓包到输出拆成可辨认的阶段，说明每阶段的职责、边界与源码落点，让读者在后续任何一篇里都能定位「我现在看的是流水线的哪一段」。
+
+分层不是凭空设计的，而是被现实约束逼出来的。抓包后端本身极其多样：AF_PACKET、DPDK、Netmap、pcap、NFQUEUE、AF_XDP 各有不同的收包语义、环境要求与性能特征，引擎必须把「怎么把字节拿进来」隔离在最底层。拿进来的原始帧要按链路层、网络层、传输层逐层解码，还要处理 VLAN、隧道、分片等封装，这是第二层职责。基于五元组的流管理与 TCP 流重组把零散报文还原成有序字节流，第三层。应用层协议解析在字节流之上识别出 HTTP、DNS、TLS、SMB 等协议并还原出事务与字段，第四层。规则编译与检测引擎在这些缓冲区上做匹配，第五层。最后输出模块把告警、流、协议与统计事件落成结构化日志。每一层只依赖下一层交付的标准化产物，才能替换后端、新增协议、扩展输出而互不影响。
+
+支撑这条流水线的还有一条隐含的「装配线」：线程与队列。Suricata 把每个处理环节抽象成线程模块 `TmModule`，用 slot 链把它们按运行模式串起来，模块之间经 `PacketQueue` 传递 `Packet`。同一个检测逻辑，在 workers、autofp、single 三种 runmode 下被装配到不同数量、不同分工的线程上，这正是多线程能力的来源，也是扩展性差异的根源。理解架构时必须同时看到「数据怎么流动」和「线程怎么装配」这两条线，否则就会把「加线程」误当成万能提速手段。
+
+本篇依然严守总览册的边界：只讲每阶段「做什么」与「去哪里找」，不展开任何结构体字段、参数全集或机制实现。按 SPEC 第 4 节的去重约定，抓包、解码、重组、应用解析、规则编译、检测、EVE、IPS、runmode 的机制与调用链写「原理见 06-xx」；yaml 段与命令行参数写「参数见 04-xx」；`Packet`、`Flow`、`ThreadVars`、`TmModule` 等结构只点名加真实源码路径，写「字段见 05-xx」；按 `src/` 目录划分的模块能力写「模块见 07-xx」。这样本篇与 06、07 册不会重复，读者想深挖某一段时按图索骥即可。
+
+### 2. 核心概念
+
+把全链路压缩成五个阶段，是本套资料后续反复使用的坐标。第一阶段「抓包」由 `source-*.c` 文件族承担，把网卡、pcap 文件或 NFQUEUE 队列里的原始帧收进来，交给下一阶段。第二阶段「解码」由 `decode.c` 与 `decode-*` 解码族承担，逐层剥离首部、处理隧道与分片，产出填好各层指针与元数据的 `Packet`。第三阶段「流与应用解析」由 `flow.c`、`stream-tcp-reassemble.c` 与 `app-layer-parser.c` 共同承担：先把包关联到 `Flow`，把 TCP 段重组成有序流，再在流上识别协议、还原事务。第四阶段「检测」由 `detect-engine*.c` 与 `detect.c` 承担，用编译好的规则对载荷、流缓冲与应用层缓冲做匹配并决定告警或丢弃。第五阶段「输出」由 `output.c` 与 `output-json*.c` 承担，把结果写成以 EVE JSON 为主的事件。五个阶段首尾相接，构成一条从字节到事件的流水线，全链路分层见图 01-03-01。
+
+线程与队列是理解「同一条流水线为何能跑成多种形态」的关键。`ThreadVars` 描述一个线程的运行期上下文，`TmModule` 描述一个可插拔的处理模块（收包、解码、检测、输出、判定等各是一种模块），`TmSlot` 把这些模块按调用顺序挂成一条 slot 链，`PacketQueue` 负责在相邻线程或相邻 slot 之间传递 `Packet`。相关声明集中在 `suricata-main/src/threadvars.h`、`suricata-main/src/tm-threads.h`、`suricata-main/src/tm-modules.h`、`suricata-main/src/tm-queues.h`，装配逻辑在 `suricata-main/src/tm-threads.c` 的 `TmSlotSetFuncAppend`。这里只点名结构与归属，逐字段定义属于 05 册，slot 装配与队列传递的实现属于 06 册。
+
+`Packet` 与 `Flow` 是贯穿流水线的两类对象。`Packet` 承载单个报文的解码结果与各层指针，从抓包线程被创建，沿 slot 链流转，在输出或判定后回收，通常由池化机制复用；`Flow` 承载一条五元组连接的状态，跨多个 `Packet` 存活，直到超时或连接结束才被回收，检测中的 flowbits、协议状态、重组上下文都挂在它上面。前者是「一次处理」，后者是「一段会话」，生命周期完全不同。理解这一点，才能明白为什么流表内存、备用池与超时管理会成为调优重点。两者的字段见 05-02、05-03。
+
+三种 runmode 是 slot 链的三种装配策略。workers 模式下单个线程纵向包办从收包到输出，流亲和好、锁竞争少；autofp 模式把收包与检测拆成不同线程，经队列衔接，灵活性高但引入队列开销；single 模式单线程运行，主要用于调试与功能验证。模式定义与判定在 `suricata-main/src/runmodes.c`，其中可见 `thread_name_workers`、`thread_name_autofp`、`thread_name_single` 及对 `workers`、`autofp` 字符串的比较。再次强调：多线程是架构特性，不等于吞吐随线程数线性增长，流亲和、RSS 与 fanout 的均衡、队列锁竞争、绑核与 NUMA 共同决定扩展性，原理见 06-13。线程、slot 链与三种 runmode 的绑定关系见图 01-03-02。
+
+五阶段主链从抓包到输出的处理链路见图 01-03-01。
+
+:::figure id=01-03-01 | name=抓包到输出的五阶段流水线 | dir=TD
+node n1 "抓包<br/>source-*.c" blue
+node n2 "解码<br/>decode.c" teal
+node n3 "流与重组<br/>flow / stream-tcp" teal
+node n4 "应用解析<br/>app-layer-parser" purple
+node n5 "检测<br/>detect.c" purple
+node n6 "输出<br/>output-json" green
+edge n1 -> n2 "Packet"
+edge n2 -> n3 "解码后"
+edge n3 -> n4 "重组流"
+edge n4 -> n5 "事务缓冲"
+edge n5 -> n6 "告警事件"
+:::
+
+线程 slot 链与三种 runmode 的绑定关系见图 01-03-02。
+
+:::figure id=01-03-02 | name=线程 slot 链与三种 runmode 的绑定 | dir=TD
+node n1 "TmModule<br/>线程模块" blue
+node n2 "TmSlot<br/>slot 链" teal
+node n3 "PacketQueue<br/>队列传递" amber
+node n4 "workers<br/>单线程包办" green
+node n5 "autofp<br/>收发检测分离" green
+node n6 "single<br/>单线程调试" gray
+edge n1 -> n2 "TmSlotSetFuncAppend"
+edge n2 -> n3 "入队出队"
+edge n2 -> n4 "装配"
+edge n2 -> n5 "装配"
+edge n2 -> n6 "装配"
+:::
+
+可见性边界也在这条架构里得到解释。引擎只能对自身解码并重组到的流量做检测：流量必须真的被送到抓包后端，送来的字节必须能被正确解码、能被重组还原成有序应用数据。旁路漏镜像、隧道或分片未被正确解析、TLS 已经加密，都会让检测退化。加密载荷明文不可见，引擎能拿到的是握手元数据、证书、SNI、JA3 等，见 `suricata-main/src/output-json-tls.c` 与 `suricata-main/rust/src/ja4.rs`。把「部署了引擎」等同于「看见了全部流量」是危险的幻觉，这条边界贯穿 01-01、06-12、08-05 三篇。
+
+### 3. 关键数据结构与源码位置
+
+把五阶段与源码目录一一对应，是本套资料「按真实目录划分模块」原则的体现。抓包后端是 `suricata-main/src/source-af-packet.c`、`suricata-main/src/source-dpdk.c`、`suricata-main/src/source-netmap.c`、`suricata-main/src/source-pcap.c`、`suricata-main/src/source-nfq.c`、`suricata-main/src/source-af-xdp.c`、`suricata-main/src/source-nflog.c` 等一整个文件族，各自与 `suricata-main/src/runmode-af-packet.c`、`suricata-main/src/runmode-dpdk.c`、`suricata-main/src/runmode-nfq.c` 等按后端配对。解码是 `suricata-main/src/decode.c`、`suricata-main/src/decode.h` 及 `suricata-main/src/decode-ethernet.c`、`suricata-main/src/decode-ipv4.c`、`suricata-main/src/decode-ipv6.c`、`suricata-main/src/decode-tcp.c`、`suricata-main/src/decode-udp.c`、`suricata-main/src/decode-vlan.c`、`suricata-main/src/decode-gre.c` 等解码族。这几处路径均在本套资料的上游 main 快照中确认存在。
+
+流与重组层的源码是 `suricata-main/src/flow.c`、`suricata-main/src/flow.h`、`suricata-main/src/flow-hash.c`，以及 `suricata-main/src/stream-tcp.c`、`suricata-main/src/stream-tcp-reassemble.c`、`suricata-main/src/stream-tcp-inline.c`、`suricata-main/src/stream-tcp-sack.c` 等重组族。应用层解析是 `suricata-main/src/app-layer-parser.c`、`suricata-main/src/app-layer-parser.h` 与各 `suricata-main/src/app-layer-*.c` 协议实现，并有相当一部分解析器落在 `suricata-main/rust/src/` 下。检测层是 `suricata-main/src/detect.c`、`suricata-main/src/detect.h`、`suricata-main/src/detect-parse.c`、`suricata-main/src/detect-engine-register.c`、`suricata-main/src/detect-engine-loader.c` 与 `suricata-main/src/detect-engine*.c` 文件族。输出层是 `suricata-main/src/output.c`、`suricata-main/src/output.h`、`suricata-main/src/output-json.c` 与 `suricata-main/src/output-json-*.c` 事件族。
+
+配置入口与线程装配同样要点名。运行参数模板是 `suricata-main/suricata.yaml.in`，由 `suricata-main/src/conf.c`、`suricata-main/src/conf-yaml-loader.c` 加载成配置树供各模块读取；主程序 `suricata-main/src/suricata.c` 的 `SCStartInternalRunMode` 依据 runmode 触发装配，线程与 slot 的拼接在 `suricata-main/src/tm-threads.c`。`ThreadVars`、`TmModule`、`PacketQueue` 的字段见 05-07，输出上下文 `LogFileCtx`、`OutputModule` 的字段见 05-08，配置树 `ConfNode` 一类结构见 05-09。本篇只给出「哪一层对应哪个目录」，不列任何字段表或 API 全集，这正是 01 册相对 05、07 册的分工。
+
+把本节引用收束成统一写法：`（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）`。具体到架构主线的下钻路径是：包处理流水线总览见 06-01，抓包后端原理见 06-02，解码与隧道见 06-03，流与重组见 06-04，应用解析见 06-05，多线程 runmode 见 06-13；抓包与线程参数见 04-03，输出参数见 04-04；按目录划分的 decode、flow、app-layer、detect、source、output、stream-tcp 模块能力分别见 07 册对应篇。读者在任意一篇里遇到「这一段怎么实现」的疑问，都能顺着这条索引找到唯一权威源。
+
+### 4. 关键流程与调用链
+
+先说装配链。进程启动后，`suricata-main/src/suricata.c` 完成配置加载与规则加载，再由 `SCStartInternalRunMode` 把控制权交给 `suricata-main/src/runmodes.c` 选定的运行模式；各 `runmode-*.c` 依据后端类型注册所需的 `TmModule`，`suricata-main/src/tm-threads.c` 的 `TmSlotSetFuncAppend` 把它们挂成 slot 链并拉起线程，模块间以 `PacketQueue` 传递 `Packet`。这条链讲的是「做什么」：选模式、注册模块、串链、起线程。至于 slot 之间如何调度、队列如何无锁或有锁传递、流亲和如何保证同一条流落到同一检测线程，原理见 06-01 与 06-13，本篇不展开。
+
+再说数据链，按五阶段把关键函数串起来。抓包阶段由 `source-*.c` 的接收线程产出 `Packet`；解码阶段 `suricata-main/src/decode-ethernet.c` 的 `DecodeEthernet`、`suricata-main/src/decode-ipv4.c` 的 `DecodeIPV4` 等逐层填充各层指针，`suricata-main/src/decode.c` 的 `PacketDecodeFinalize` 做收尾；流阶段 `suricata-main/src/flow.c` 的 `FlowHandlePacket` 把包关联到 `Flow`；重组阶段 `suricata-main/src/stream-tcp-reassemble.c` 的 `StreamTcpReassembleHandleSegment` 与 `StreamTcpReassembleAppLayer` 把 TCP 段拼成有序字节流并向上层供给；应用解析阶段 `suricata-main/src/app-layer-parser.c` 的 `AppLayerParserParse` 还原协议事务；检测阶段 `suricata-main/src/detect.c` 的 `DetectRun` 与 `SigMatchSignatures` 完成规则求值；输出阶段由 `suricata-main/src/output-json.c` 与各 `output-json-*.c` 落成 EVE 事件。以上函数均在本套资料的上游快照中核对过定义位置，讲清的是「每阶段谁接棒」，不是求值顺序或状态机细节，后者见 06-08。
+
+规则从文本到可匹配形态，是启动时并行发生的另一条链。`suricata-main/src/detect-engine-loader.c` 的 `SigLoadSignatures`、`DetectLoadSigFile` 读规则文件，`suricata-main/src/detect-parse.c` 的 `SigInit` 及 `SigParse` 系列把文本构造成 `Signature`，随后按协议、端口、方向分组并挂接多模式匹配与预过滤引擎，最终供 `DetectRun` 使用。这条编译链的机制见 06-06、06-07，规则关键字全集见 04-05、04-06。把「启动时编规则」与「运行时跑检测」分开看，是理解引擎为何启动较慢、为何 `-T` 能提前暴露规则错误的关键。
+
+内联阻断是数据链上的一个末端分支，而非独立流水线。NFQUEUE 模式下 `suricata-main/src/source-nfq.c` 的判定线程在检测完成后依据 `PacketCheckAction` 与 `ACTION_DROP` 决定回写 `NF_ACCEPT` 还是 `NF_DROP`；AF_PACKET 桥接模式则借助 `copy-mode`、`copy-iface` 由桥接对端决定是否放行。IDS 旁路只告警、IPS 内联能 drop 的分水岭就在这里，原理见 06-12。NSM 视角下没有第三条链：流、协议、文件、统计事件都是同一条数据链在不同输出模块上的分叉。图 01-03-01 勾勒五阶段主链，图 01-03-02 勾勒线程与 runmode 的装配关系，两张图合起来构成本篇的架构总览。
+
+### 5. 配置/命令/代码实例
+
+把架构落到可运行配置，最直观的是看 `suricata.yaml.in` 里与抓包、线程、应用解析、输出相关的最小片段。下面仅示意结构与层级，键名与取值需对照实际版本核验，完整参数见 04-03、04-04。
+
+```yaml
+af-packet:
+  - interface: eth0
+    threads: auto
+    cluster-id: 99
+    cluster-type: cluster_flow
+threading:
+  set-cpu-affinity: no
+app-layer:
+  protocols:
+    tls:
+      enabled: yes
+outputs:
+  - eve-log:
+      enabled: yes
+      filename: eve.json
+      types:
+        - alert
+        - flow
+```
+
+校验配置是否被正确解析，最省事的命令是 `suricata --dump-config`，它把运行配置以扁平形式打印出来；配合 `-T` 自检与 `--build-info` 查构建特性，构成上线前的三个基本动作。完整命令行参数见 04-07。
+
+```bash
+# 规则与配置自检
+suricata -T -c /etc/suricata/suricata.yaml
+
+# 打印解析后的运行配置，核对段与键是否生效
+suricata --dump-config -c /etc/suricata/suricata.yaml | grep -E 'af-packet|threading|eve-log' | head -20
+
+# 查询本构建编入了哪些特性
+suricata --build-info
+```
+
+对 `--dump-config` 过滤后的结果，以下是示例输出，具体格式需对照实际版本核验。
+
+```text
+af-packet.0.interface = eth0
+af-packet.0.threads = auto
+af-packet.0.cluster-id = 99
+af-packet.0.cluster-type = cluster_flow
+threading.set-cpu-affinity = no
+threading.detect-thread-ratio = 1.0
+outputs.0.eve-log.enabled = yes
+outputs.0.eve-log.filename = eve.json
+outputs.0.eve-log.types.0 = alert
+outputs.0.eve-log.types.1 = flow
+```
+
+逐行判读这段输出。前四行属于 `af-packet` 段：`interface` 决定抓包网卡，`threads` 决定该接口起多少收包线程，`cluster-id` 与 `cluster-type` 决定同一网卡多队列时如何做 fanout 分流，`cluster_flow` 的语义是按流把包分到不同队列以保证流亲和；这几行若与预期不符，往往是吞吐不均或同一条流被拆到不同线程的根因。第五、六行属于 `threading` 段：`set-cpu-affinity` 为 `no` 表示未启用绑核，`detect-thread-ratio` 为 `1.0` 是检测线程与收包线程的默认比例，二者共同影响多核利用，调整效果需在目标机型实测。第七到第九行属于 `outputs` 段的 `eve-log`：`enabled` 为 `yes` 确认 EVE 输出已开，`filename` 指定落盘文件名，两条 `types` 说明当前只订阅了 `alert` 与 `flow` 两类事件；如果线上发现缺 DNS、TLS、file 等事件，首先应检查这里订阅了哪些 `types`，而不是怀疑上游没产出。需要留意的是，`--dump-config` 的实际输出格式、键的扁平化写法与数组下标编号会随版本变化，务必以本地结果为准；它只反映配置解析结果，不保证抓包后端真的能用，后者还需 `--build-info` 确认特性已编入、并在 03 册的部署流程里验证网卡与权限。
+
+把五阶段与源码、交叉引用对照，可得到下表，便于按图索骥。
+
+| 阶段 | 主要源码位置 | 下钻交叉引用 |
+|---|---|---|
+| 抓包 | suricata-main/src/source-*.c 与 runmode-*.c | 原理见 06-02、模块见 07-06、参数见 04-03 |
+| 解码 | suricata-main/src/decode.c 与 decode-* 族 | 原理见 06-03、模块见 07-01 |
+| 流与重组 | suricata-main/src/flow.c、stream-tcp-reassemble.c | 原理见 06-04、模块见 07-02 与 07-08 |
+| 应用解析 | suricata-main/src/app-layer-parser.c、rust/src/ | 原理见 06-05、模块见 07-03 与 07-10 |
+| 检测 | suricata-main/src/detect.c、detect-engine*.c | 原理见 06-06 至 06-09、模块见 07-04 |
+| 输出 | suricata-main/src/output.c、output-json*.c | 原理见 06-11、模块见 07-07、参数见 04-04 |
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是抓包后端的环境差异。AF_PACKET、DPDK、Netmap、pcap、NFQUEUE、AF_XDP 的能力与前置条件差别很大：DPDK 需独占网卡、配置大页并传 EAL 参数，不能与普通网卡即插即用；Netmap、AF_XDP 有内核版本与驱动要求；pcap 多用于离线回放或低速率场景；NFQUEUE 只在内联部署下使用。选型时先看环境能不能满足，再谈性能。PF_RING 在当前 main 快照是否仍为受支持后端、对应源文件与启用方式需对照 `suricata-main/configure.ac` 与 `suricata-main/src/source-*.c` 核验，本套资料不编造 `source-pfring.c`。后端差异的细节见 02-04、06-02、模块见 07-06。
+
+第二类是把多线程误当成线性提速。workers、autofp、single 只是 slot 链的装配方式，实际扩展性由流亲和、RSS 与 fanout 的均衡、队列锁竞争、绑核与 NUMA、规则集规模共同决定；实践中「线程越加越慢」并不罕见。同理，任何吞吐、pps、丢包率、内存占用结论一律标注「需在目标机型实测」，不给绝对值；基准方法见 08-01，调优见 08-02，机制见 06-13。与性能相邻的还有丢包点与失败点：capture 层缓冲区丢包、解码异常、重组内存触顶、流表 memcap 用尽、输出写盘阻塞，都会在不同统计项上留下痕迹，排障时应按顺序定位，决策树见 08-03。
+
+第三类仍是可见性边界。引擎只对自身解码并重组到的流量做检测，TLS 等加密载荷正文不可见，能拿到的是握手元数据、证书、SNI、JA3 等；隧道封装、分片、VLAN 若未被正确解析，检测同样会退化。不要因为架构里画了「应用解析」这一层，就以为任何加密应用都能还原出明文内容。相关输出见 `suricata-main/src/output-json-tls.c` 与 `suricata-main/rust/src/ja4.rs`，字段需对照实际版本核验。
+
+第四类是纪律性的。配置键名、函数名、结构体字段在本篇只给已核验的点名，任何不确定处写「需对照实际版本核验」并给出可定位目录；具体版本号以 `suricata-main/configure.ac`、`suricata-main/ChangeLog` 为准，正文统一写「上游 main 快照（2026-11 抓取）」。`suricata-update` 是与主程序分仓、独立发版的规则工具，不参与 `src/` 编译、不是内建子命令；Rust 组件是构建的一部分而非纯 C 项目；Hyperscan 只是可选 MPM 加速，缺失时回退 AC 等其他实现。这些都属能力边界，任何一篇都不得写反。
+
+### 7. 小结与延伸阅读
+
+本篇把 Suricata 拆成一条五阶段流水线：抓包把字节收进来，解码逐层剥离首部，流与重组把零散报文还原成有序流，应用解析在流上识别协议与事务，检测引擎据规则求值，输出模块把结果落成以 EVE JSON 为主的事件。与数据链并行的还有一条装配线：`TmModule` 经 `TmSlotSetFuncAppend` 串成 slot 链，由 `PacketQueue` 传递 `Packet`，workers、autofp、single 三种 runmode 决定线程如何分工。两条线合起来，就是「同一套检测逻辑为何能跑成多种形态」的答案，也是后续调优与排障的定位框架。
+
+延伸阅读按需分流：想理解每阶段「怎么做」读 06 册，包处理总览见 06-01、抓包见 06-02、解码见 06-03、流与重组见 06-04、应用解析见 06-05、规则编译见 06-06、检测求值见 06-08、EVE 输出见 06-11、IPS verdict 见 06-12、runmode 见 06-13；想按目录查模块能力读 07 册；所有配置键与命令行参数查 04 册，所有结构体字段查 05 册；想真正跑起来读 03 册的首次 IDS 与 yaml 主干，想做基准与排障读 08 册。全册交叉引用统一写成 `（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）`，性能数字一律标注需在目标机型实测。
+
+## 01-04 版本基准、许可、生态与资料使用约定
+
+### 1. 背景与动机
+
+技术资料最隐蔽的失效方式，不是写错，而是「写的时候对、读的时候已经不对」。Suricata 是持续演进的开源项目，`src/` 下的文件会增删、函数签名会调整、yaml 段与 configure 选项会改名、Rust 侧解析器会重构。若一套资料把某个版本的实现当成永恒事实抄进正文，又不交代它对应哪份代码，读者拿去对照更新的构建时就会处处对不上：字段名找不到、选项不生效、目录里根本没有那个文件。本套资料因此把「事实纪律」放在与内容本身同等重要的位置，本篇的动机就是把这套纪律讲清楚，让后续 64 篇在统一的基准、统一的措辞、统一的引用规则下成文。
+
+与事实纪律并列的是许可与生态认知。一个引擎用什么许可、由谁维护、由哪些组件拼成、依赖哪些独立工具，直接影响它能不能被采用、能不能被二次开发、团队要自备哪些能力。把 Suricata 写成「纯 C 项目」会漏掉 `rust/` 与 Cargo 在构建中的地位；把 `suricata-update` 写成主程序的内建子命令，会误导规则管理链路的设计；把 GPL 许可含糊带过，会在合规评估时留下隐患。这些看似「背景」的信息，恰恰是选型与集成阶段最该先确认的。
+
+第三层动机来自本套资料自身的组织复杂度。九个交付文件、六十五篇、按维度分册、三类骨架、唯一权威源去重、图号与篇号同源——如果没有一套成文的「资料使用约定」，读者很容易在多册之间迷路，或把同一份参数在几册里看到互相矛盾的说法。编号规则、交叉引用写法、「需对照实际版本核验」的适用场合、性能数字的标注要求，都需要在开篇就统一，后面各册才能只写各自的内容而不重复解释规则。本篇相当于整套资料的「元数据说明」。
+
+需要先声明：本篇讲的是「以什么为准、怎么引用、怎么标注」，不展开任何具体参数、字段或机制。构建选项的完整清单见 04-01，yaml 全局段见 04-02，结构体字段见 05 册，构建与 Rust 组件的原理见 02、06、07 册，许可与生态的落点则在本篇点名到真实文件。读者若只想知道「某个选项叫什么」，请直接翻 04 册；本篇回答的是「当某个名字对不上时，应该怎么办」。
+
+### 2. 核心概念
+
+版本基准统一写作「上游 main 快照（2026-11 抓取）」。这不是一个发行版本号，而是指本套资料核验事实所依据的那一份代码快照：上游 OISF 仓库 main 分支在 2026 年 11 月抓取后解压在 `upstream_src/suricata/suricata-main/` 下的内容。规范明令禁止编造具体版本号，`suricata-main/configure.ac`、`suricata-main/ChangeLog` 里的版本字样只作核验依据，不得抄进正文当作本套资料的版本号；需要说明版本来源时，写「具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验」。这样处理的好处是：即便读者用的是不同构建，也不会被一个写死的版本号误导，而会按指引去核对自己的实际版本。
+
+许可方面，`suricata-main/COPYING` 头部明确写着 GNU GENERAL PUBLIC LICENSE Version 2, June 1991，即 GPLv2；仓库里另有 `LICENSE`、`README.md`、`SECURITY.md` 等文件。这意味着 Suricata 是开源、可审计、可依许可条款修改与分发的项目，也是它能被集成进自建数据管道、被社区审查规则与解析逻辑的前提。合规评估时以仓库内许可文件原文为准，本篇只做归属说明，不代替法律判断。生态层面，项目由 OISF 主导，配套有官方文档、规则集、测试框架与社区工具链，构成一个围绕引擎的完整生态而非单一可执行文件。
+
+「Rust 是构建的一部分」是本套资料反复强调、且最能纠正常见误解的一条。`suricata-main/rust/` 下有 `Cargo.toml.in`、`Cargo.lock.in`、`cbindgen.toml`、`Makefile.am` 与 `rust/src/`，其中 `rust/src/` 内可见 `applayer.rs`、`jsonbuilder.rs`、`ja4.rs` 以及 `dns/`、`http2/`、`smb/`、`mdns/` 等协议目录。大量应用层解析器与 EVE JSON 构造在 Rust 侧实现，经 cbindgen 生成的 FFI 边界与 C 主程序链接，Cargo 参与 make 期构建。因此绝不能把 Suricata 写成纯 C 项目；模块见 07-10，构建细节见 02-04，FFI 与解析器接入原理见 06-05、06-14。
+
+「suricata-update 是独立工具」同样必须写准。它与内核主程序分仓、独立发版，负责规则集下载、合并与启用配置，不参与 `src/` 主程序编译，也不是 `suricata` 的内建子命令。本快照内虽含 `suricata-update/` 目录，工具本体仍按独立项目对待；规则管理实战见 03-03，模块说明见 07-11。与之相邻，PF_RING 在当前 main 快照是否为受支持后端、对应源文件与启用方式需对照 `suricata-main/configure.ac` 与 `suricata-main/src/source-*.c` 核验，不得编造 `source-pfring.c`；Hyperscan 是可选 MPM 加速，缺失时回退 AC 等其他多模式匹配实现，不是必需依赖或唯一实现。这些结论与 01-01、01-02、01-03 一致，属贯穿全册的能力边界。
+
+最后是「资料使用约定」本身。编号规则是 `文件号-篇号`，图号用 `文件号-篇号-图序号`，与正文引用、图题、`.drawio` 文件名同源；骨架分 A 论述型、B 手册字典型、C 实战型三类，01 全册为 A 型七节；唯一权威源把 configure 选项、yaml 段、规则关键字、命令与返回码划归 04，把结构体逐字段划归 05，把机制与调用链划归 06，把模块能力划归 07，把运维场景划归 08，其余册一律交叉引用。交叉引用统一写作 `（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）`；任何不确定的字段名、函数签名、配置项、选项名写「需对照实际版本核验」并给出可定位目录；任何吞吐、pps、丢包率、内存占用数字标注「需在目标机型实测」，不给绝对值。
+
+### 3. 关键数据结构与源码位置
+
+先点明一个容易踩坑的路径细节。本套资料的唯一事实锚点是 `upstream_src/suricata/suricata-main/`，注意 `suricata/` 下还有一层 `suricata-main/` 归档目录，那才是真实仓库根。因此本套资料给出的「相对 `upstream_src/suricata/` 的真实路径」都带 `suricata-main/` 前缀，例如 `suricata-main/src/suricata.c`、`suricata-main/suricata.yaml.in`；去掉这层前缀就是仓库内惯用写法，例如 `src/decode.h`、`configure.ac`。凡 0.1 节未列出、或无法用 Read、Grep 核实的文件，一律不写进正文，这是路径纪律的底线。
+
+版本与构建相关的顶层文件包括：`suricata-main/configure.ac`（构建选项与依赖探测）、`suricata-main/ChangeLog`（变更记录）、`suricata-main/COPYING`（GPLv2 许可）、`suricata-main/LICENSE`、`suricata-main/Makefile.am`、`suricata-main/autogen.sh`、`suricata-main/bundle.txt`、`suricata-main/suricata.yaml.in`（默认配置模板）、`suricata-main/threshold.config`。这些文件在本套资料的上游 main 快照中确认存在；`configure.ac` 里能看到 `AC_ARG_ENABLE` 定义的 unittests、debug、profiling、ipfw 等开关族，以及 Hyperscan 相关的 `enable_hyperscan`、`AC_DEFINE([BUILD_HYPERSCAN])` 与 `AC_ARG_WITH(libhs_includes)`、`AC_ARG_WITH(libhs_libraries)`，具体选项名需对照实际版本核验。构建选项全集见 04-01。
+
+生态组件按目录归属也逐一可查。`suricata-main/etc/` 下有 `classification.config`、`reference.config`、`schema.json`、`suricata.logrotate.in`、`suricata.service.in`、`Makefile.am`，分别对应告警分类、规则引用、EVE 模式、日志轮转与服务单元。`suricata-main/rust/` 下有 `Cargo.toml.in`、`Cargo.lock.in`、`cbindgen.toml`、`Makefile.am` 与 `rust/src/`。`suricata-main/suricata-update/` 是独立规则工具目录。此外 `suricata-main/doc/userguide/`、`suricata-main/rules/`、`suricata-main/lua/`、`suricata-main/plugins/`、`suricata-main/python/`、`suricata-main/ebpf/`、`suricata-main/qa/`、`suricata-main/scripts/`、`suricata-main/examples/`、`suricata-main/benches/` 等目录存在，分别承载官方文档、规则样例、Lua 扩展、插件、辅助脚本、eBPF、测试与基准。本篇只列归属，不展开各目录内部实现，模块见 07 册。
+
+把本套资料的去重约定整理成表，是全册引用规则的速查表；单元格里的写法即其余册应遵循的交叉引用格式。
+
+| 内容类型 | 唯一权威源 | 其余册写法 |
+|---|---|---|
+| configure 选项、yaml 段、规则关键字、命令与返回码 | 04 全册 | 最小必要调用，写参数见 04-xx |
+| 结构体逐字段定义与生命周期 | 05 全册 | 只点名加真实源码路径，写字段见 05-xx |
+| 机制、状态机与调用链 | 06 全册 | 讲做什么不讲怎么实现，写原理见 06-xx |
+| 按 src 目录划分的模块能力 | 07 全册 | 写模块见 07-xx |
+| 运维场景、基准方法、诊断与上线 | 08 全册 | 不展开运维步骤 |
+
+结构体的逐字段定义集中在 05 册：`SCInstance`、`ConfNode` 见 05-09，`ThreadVars`、`TmModule` 见 05-07，`LogFileCtx`、`OutputModule` 见 05-08，其余族见 05-02 至 05-06。本篇不列任何字段表，也不重列 API 全集，重复的清单一律交给权威源，这正是去重规则存在的意义。
+
+### 4. 关键流程与调用链
+
+构建链是理解「Rust 与 Cargo 是构建一部分」的最佳入口。从源码到可执行文件，`autogen.sh` 生成 configure 脚本，`configure.ac` 经 configure 探测依赖与开关，make 期由 `Makefile.am` 组织编译，其中 `rust/Makefile.am` 会调用 Cargo 构建 Rust 静态库，cbindgen 依据 `cbindgen.toml` 生成供 C 侧包含的 FFI 头，最终链接成 `suricata` 可执行程序并安装配置样例。这条链讲的是「做什么」：探测、编译、生成绑定、链接、安装；每个 configure 选项的默认值、依赖条件与误配后果见 04-01，构建实战见 02-03，Rust 与抓包后端的构建见 02-04，本篇不展开参数与实现。
+
+Rust 组件接入检测流水线的链也值得点一句。`rust/src/` 下的应用层解析器经 cbindgen 暴露的接口注册到 `suricata-main/src/app-layer-parser.c` 的解析器框架，EVE 事件的 JSON 构造借助 `rust/src/jsonbuilder.rs`，TLS 指纹相关能力落在 `rust/src/ja4.rs`。因此一条 TLS 事件的产出，往往跨越 C 侧抓包、解码、流重组与 Rust 侧协议解析、JSON 构造两半。这条链说明为什么把 Suricata 写成纯 C 项目会错得离谱；FFI 边界与解析器注册原理见 06-05、06-14，模块见 07-10。
+
+查询自身构建组成的链则很短：`suricata --build-info` 打印构建特性，`suricata --dump-config` 打印解析后的配置，`suricata -T` 校验配置与规则，`suricata -V` 显示版本信息。这些命令在 `suricata-main/src/suricata.c` 的 `SCParseCommandLine` 里以长选项登记，短选项集中在 `short_opts` 字符串中。它们回答的是「我这份构建里到底编进了什么」，是排障时确认 NFQUEUE、AF_PACKET、Hyperscan、Rust 等特性是否可用的第一步；命令全集见 04-07。
+
+资料集自身也有一条「定位链」：读者遇到一个名字，先按内容类型判断它属于参数、字段、机制、模块还是运维场景，再跳到 04、05、06、07、08 中对应的唯一权威源，其余册只给本场景最小必要信息并交叉引用。图 01-04-01 勾勒版本基准与生态组件的构建关系，帮助把「快照、C 主程序、Rust 组件、规则工具、配置样例」这几类东西的位置一次看清。
+
+:::figure id=01-04-01 | name=版本基准与生态组件的构建关系 | dir=TD
+node n1 "上游 main 快照<br/>configure.ac" blue
+node n2 "C 主程序<br/>src/" teal
+node n3 "Rust 组件<br/>rust/ Cargo" purple
+node n4 "规则工具<br/>suricata-update" gray
+node n5 "配置样例<br/>etc / doc" amber
+node n6 "suricata 可执行<br/>与 EVE 输出" green
+edge n1 -> n2 "autogen/configure"
+edge n1 -> n3 "make 期静态库"
+edge n1 -> n5 "安装落位"
+edge n2 -> n6 "链接"
+edge n3 -> n6 "FFI 接入"
+edge n4 -> n6 dashed "独立发版"
+:::
+
+### 5. 配置/命令/代码实例
+
+认识生态最快的方式，是直接看仓库顶层有哪些东西。下面三个命令分别用于列出顶层结构、核对某个构建开关、查询本构建特性；把它们连起来跑，就能把本篇讲的版本、许可、生态与构建关系落到实处。完整构建选项见 04-01，命令全集见 04-07。
+
+```bash
+# 列出归档目录顶层的真实文件与目录
+ls -1 suricata-main/
+
+# 在 configure 选项里核对 Hyperscan 相关开关，具体选项名需对照实际版本核验
+./configure --help | grep -i hyperscan
+
+# 查询本构建编入的特性，确认 NFQ、AF_PACKET、Hyperscan、Rust 等是否可用
+suricata --build-info
+```
+
+对 `ls -1 suricata-main/`，以下是示例输出，具体格式需对照实际版本核验。
+
+```text
+COPYING
+ChangeLog
+LICENSE
+Makefile.am
+README.md
+SECURITY.md
+acsite.m4
+autogen.sh
+benches
+bundle.txt
+config.rpath
+configure.ac
+doc
+doxygen.cfg
+ebpf
+etc
+examples
+git-templates
+libsuricata-config.in
+lua
+plugins
+python
+qa
+rules
+rust
+scripts
+shell.nix
+src
+suricata-update
+suricata.yaml.in
+threshold.config
+```
+
+逐行判读这份清单，几乎能把本篇的概念逐一对上号。`COPYING` 是 GPLv2 许可正文，头部写明 Version 2, June 1991，合规评估以它为准；`ChangeLog` 与 `configure.ac` 共同构成版本与构建事实的核验依据，前者记录变更、后者记录 `AC_ARG_ENABLE` 选项族与依赖探测，但两者的版本字样都不得抄进正文当本套资料的版本号。`autogen.sh`、`Makefile.am`、`configure.ac` 三者串起 autotools 构建链，分别对应生成 configure、组织编译、定义选项与探测。`suricata.yaml.in` 是默认配置模板，运行时被渲染成实际的 yaml。`src/` 是 C 主程序源码，`rust/` 是 Rust 组件与 Cargo 工程，二者并列出现本身就否定了「纯 C 项目」的说法。`suricata-update/` 是独立规则工具目录，印证它与主程序分仓、独立发版。`etc/` 装配置样例与轮转、服务单元，`doc/` 装官方文档，`rules/` 装规则样例，`lua/`、`plugins/` 对应扩展机制，`ebpf/` 对应 eBPF 支持，`qa/`、`python/`、`scripts/`、`benches/`、`examples/` 对应测试、辅助脚本与基准。最后 `threshold.config` 是阈值配置样例，`bundle.txt` 与打包相关，`shell.nix`、`doxygen.cfg`、`libsuricata-config.in` 分别是开发环境、文档生成与库配置辅助文件。需要注意，目录清单会随上游演进变化，某文件缺失时应以本地快照为准，不得凭印象补写；凡 0.1 节未列或无法核实的路径，一律不写进正文。
+
+再看 `./configure --help` 里与 Hyperscan 相关的一行示意，以及 `--build-info` 输出里的特性类别，以下是示例输出，具体格式需对照实际版本核验；版本字符串行按版本纪律不抄录具体版本号。
+
+```text
+  --with-libhs-includes=DIR   Hyperscan include directory
+  --with-libhs-libraries=DIR  Hyperscan library directory
+Features: NFQ AF_PACKET HAVE_PACKET_FANOUT Hyperscan Rust PCRE_JIT
+```
+
+补一段判读。前两行示意 configure 通过 `AC_ARG_WITH(libhs_includes)`、`AC_ARG_WITH(libhs_libraries)` 一类选项定位 Hyperscan 头与库，选项确切拼写需对照 `suricata-main/configure.ac` 核验；这正说明 Hyperscan 是可选加速——缺了头或链接测试失败时 `enable_hyperscan` 回退为 no，引擎改用 `suricata-main/src/util-mpm-ac*.c` 等 AC 实现，绝不把它写成必需依赖。第三行列出的 `NFQ`、`AF_PACKET`、`Hyperscan`、`Rust` 等特性名反映本构建编入了哪些能力，用来解释「为什么某个后端或某个多模式匹配算法用不了」；`--build-info` 的真实输出通常还包含版本字符串与 SIMD 支持信息，此处依版本纪律不抄版本值，读者需以本地结果为准。把这些输出与 `ls` 清单对照，就完成了从「快照里有什么」到「这份构建里编进了什么」的闭环。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一条红线是版本。全套资料统一写「上游 main 快照（2026-11 抓取）」，禁止编造具体版本号；`suricata-main/configure.ac`、`suricata-main/ChangeLog` 里的版本字样只作核验依据，不得抄进正文。遇到「这个字段在哪个版本改过」「这个选项从哪版开始有」一类问题，正确写法是「需对照实际版本核验」并给出 `src/`、`suricata.yaml.in`、`configure.ac` 等可定位目录，而不是凭印象填一个数字。性能与容量同样不给绝对值，任何吞吐、pps、丢包率、内存占用结论标注「需在目标机型实测」，基准方法见 08-01，调优见 08-02。
+
+第二条是不确定项的处理。字段名、结构体成员、函数签名、配置项键名、命令行选项、模块文件名，凡无法用 Read、Grep 在本地快照核实，一律写「需对照实际版本核验」并给出可定位目录，不得凭印象补值。PF_RING 是否仍为受支持后端、对应源文件与启用方式尤其要按此处理，本快照的 `src/source-*.c` 族里并无 `source-pfring.c`，不得编造该文件名。目录路径同理：带 `suricata-main/` 前缀才是相对 `upstream_src/suricata/` 的真实路径，未列出的路径不写进正文。
+
+第三条是别把生态关系写反。`suricata-update` 与内核主程序分仓、独立发版，负责规则集下载与合并，不参与 `src/` 主程序编译、不是内建子命令；`rust/` 与 Cargo 是构建的一部分，大量应用层解析器与 EVE 构造在 Rust 侧，Suricata 不是纯 C 项目；Hyperscan 只是可选 MPM 加速，缺失时回退 AC 等其他实现。抓包后端能力与环境要求差异大，DPDK 需独占网卡、大页与 EAL 参数，Netmap 与 AF_XDP 有内核与驱动要求，pcap 多用于离线或低速率。这些结论与 01-01、01-02、01-03 完全一致，构成贯穿全册的能力边界，任何一篇都不得写反。
+
+第四条是资料使用约定本身的纪律。九册共 65 篇，篇数固定为 01=4、02=5、03=6、04=8、05=9、06=14、07=13、08=6，编号连续不缺不重；标题逐字照抄大纲；图号与篇号、图题、`.drawio` 文件名同源；三类骨架按维度选用，01 全册为 A 论述型七节。唯一权威源不得被破坏：06、07、08 不列完整字段表，04 不讲原理与字段，05 不展开机制流程，其余册不重列参数全集。交叉引用统一写作 `（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）`。把这套约定守住，六十五篇才不会互相重复或互相打架。
+
+### 7. 小结与延伸阅读
+
+本篇确立了三件事。事实基准是「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准但不写绝对值，不确定处一律标注「需对照实际版本核验」并给可定位路径；许可与生态方面，`COPYING` 为 GPLv2，`rust/` 与 Cargo 是构建的一部分，`suricata-update/` 是独立发版的规则工具，PF_RING 支持状态、Hyperscan 可选性、抓包后端差异都按能力边界表述；资料使用方面，编号、图号、三类骨架、唯一权威源去重、交叉引用四段串、「需在目标机型实测」标注共同构成六十五篇的统一写法。理解这三点，读者就能在任何一篇里判断「这条结论以什么为准、该去哪册核对」。
+
+延伸阅读按角色分流：想逐项查构建选项读 04-01，查 yaml 全局段读 04-02，查命令与 RPC 读 04-07；想编译与验证读 02-03、02-04，其中 Rust 与 Cargo 的构建见 02-04、模块见 07-10；想理解 FFI 与解析器接入读 06-05、06-14；规则管理实战读 03-03、模块说明读 07-11；许可与合规以 `suricata-main/COPYING` 原文为准。全册交叉引用统一写成 `（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）`，版本与性能两类数字分别遵守「不写绝对值」与「需在目标机型实测」的纪律。

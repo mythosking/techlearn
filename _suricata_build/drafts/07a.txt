@@ -1,0 +1,925 @@
+# Suricata 技术资料 · 07 模块与特性介绍（分片 A）
+## 07-01 decode 解码模块
+
+### 1. 背景与动机
+
+抓包后端交付给引擎的从来不是「一个已经分好层的报文」，而是一段带链路类型标记的原始字节。它可能是一帧标准以太网报文，也可能是 Linux cooked capture 的 SLL 头、回环口的 Null 头、raw IP 裸包；帧里可能叠了单层或多层 VLAN 标签，可能封装了 GRE、VXLAN、Geneve、ERSPAN、MPLS、NSH、Teredo、PPPoE 等隧道，还可能是分片后需要另行处理的 IPv4/IPv6 片段。流表要按五元组聚合，检测引擎要按协议与方向匹配，应用层解析器要拿到连续且方向正确的流缓冲，这些下游模块都不可能各自去实现一遍链路层解析。于是 Suricata 在 `src/` 下设立了一个边界清晰的 `decode` 模块族：把「原始字节 → 统一的 `Packet` 分层视图」这件事收敛到一处完成，下游只消费解码结果。本篇作为 07 册开篇，讨论的正是这个模块族的文件构成、入口、职责边界与使用陷阱。
+
+必须先明确本册的定位与全集的去重纪律。07 册是全集的模块能力与特性唯一权威源，严格按 `src/` 真实目录划分章节，`decode` 对应 `src/decode.c`、`src/decode.h` 以及 `src/decode-*` 一整族文件；本篇讲「这个模块由哪些文件组成、每个文件的职责是什么、关键入口在哪、如何挂到流水线上」，而不重复展开 06 册已经讲透的机制与状态机（原理见 06-03）。结构体逐字段定义归 05 全册，命令行与配置参数全集归 04 全册，运维排障归 08 全册，本篇一律交叉引用而不重列。本套资料的版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验；下文所有文件名、函数名、行号均以 `upstream_src/suricata/suricata-main/` 内的真实文件为锚点，凡未能核实的具体取值一律标注「需对照实际版本核验」。
+
+能力边界必须落在最前面，避免把解码模块的能力写反。Suricata 是 IDS / IPS / NSM 引擎，不是防火墙，不做 IP 转发，不做路由；在旁路 IDS 模式下它只对镜像或分光得到的副本做解码与告警，在内联 IPS 模式下依靠 NFQUEUE 或 AF_PACKET 桥接的 verdict 决定放行还是丢弃，真正执行转发的是内核或桥接对端。解码模块的可见性同样受这条边界约束：引擎只对自身解码并重组到的流量做检测，TLS 等加密载荷的明文正文不可见，解码层最多能识别到 TLS 记录头与握手相关元数据，不能宣称能读到 HTTPS 明文。把「解码」误写成「解密」或「转发」是阅读这一模块时最常见的偏差。
+
+从工程价值看，把 `decode` 当作独立模块来理解有两个直接收益。其一是排障收敛：当 `eve.json` 里迟迟不出现 `alert` 事件时，有经验的工程师会先看 `stats.log` 中的 decoder 计数是否随收包增长，再判断是收包层没拿到数据、解码层把报文判为异常、还是流与应用层没建立，而不是一上来就改规则；解码异常事件与 decoder 计数正是这一段最直接的证据。其二是扩展：新增一种链路类型或隧道封装时，开发者知道该往哪个文件族里加、要同步哪些事件与计数登记，而不必去动检测引擎。RFC 无关的新协议解析不归 decode，而应走应用层解析框架（模块见 07-03）；把「加一个 HTTP 字段」误当成「加一个解码器」是职责错位的典型表现。
+
+还要区分两类容易被混为一谈的现象。设计上的主动放弃属于丢弃点，例如隧道递归超过上限、VLAN 标签层数超过栈容量、IP 分片无法重组、校验和校验失败且配置了严格策略；资源或配置异常属于失败点，例如包池耗尽、输出目录不可写、队列没有配对读写者。二者在统计上都表现为「计数不增」或「事件缺失」，但处理方向完全不同，前者要检查流量特征与解码策略，后者要检查资源与配置。本篇第 6 节会展开这些陷阱，并与 08 册的诊断树（原理见 08-03）衔接。
+
+### 2. 核心概念
+
+先把本篇反复用到的术语固定下来。`Packet` 是一次收包与解码的载体，承载原始帧、各层指针、时间戳、告警数组以及指向所属 `Flow` 的引用，由包池统一分配与回收；它在 `src/decode.h` 中以 `typedef struct Packet_` 定义（字段见 05-02）。`DecodeThreadVars` 是解码线程的每线程上下文，最重要的职责是承载解码性能计数器：`DecodeRegisterPerfCounters` 在线程初始化时把一组计数器登记到该上下文，解码过程中按事件递增，最终汇入 `stats.log` 与 EVE 的 stats 事件（字段见 05-02）。所谓「各层指针」，指的是解码器逐层填写的链路层、网络层、传输层与 payload 指针与长度，下游流表、重组器、检测引擎都直接读这些指针，不再回头解析字节。
+
+解码分派（decode dispatch）是这个模块的核心动作。链路层入口按抓包后端给出的链路类型选择 `DecodeEthernet`、`DecodeSll`、`DecodeRaw`、`DecodeNull` 等；网络层按 EtherType 选择 `DecodeIPV4` 或 `DecodeIPV6`；传输层按 IP 协议号选择 `DecodeTCP`、`DecodeUDP`、`DecodeSCTP`、`DecodeICMPV4`、`DecodeICMPV6`。当某一层判定为封装或隧道时，`src/decode.c` 内的 `DecodeTunnel` 会依据封装类型递归回到 PPP、IPv4、IPv6、VLAN、Ethernet、ERSPAN、NSH、ARP 等对应解码器，把内层报文继续解开；VLAN 与 QinQ 由 `src/decode-vlan.c` 维护标签栈，隧道与 VLAN 因此天然是「递归 + 栈」结构。全部层级处理完毕后，`PacketDecodeFinalize` 做统一收尾。这里只点名入口与文件分工，递归深度、栈上限、异常事件的具体判定逻辑属于机制范畴（原理见 06-03）。
+
+解码器族可以按职责分成六类，这个分类也就是本篇第 3 节文件清单的组织依据。第一类是框架与事件：`src/decode.c`、`src/decode.h`、`src/decode-events.c`、`src/decode-events.h`。第二类是链路层与特殊链路类型：`src/decode-ethernet.*`、`src/decode-sll.*`、`src/decode-sll2.*`、`src/decode-raw.*`、`src/decode-null.*`、`src/decode-chdlc.*`。第三类是网络层与传输层：`src/decode-ipv4.*`、`src/decode-ipv6.*`、`src/decode-tcp.*`、`src/decode-udp.*`、`src/decode-sctp.*`、`src/decode-icmpv4.*`、`src/decode-icmpv6.*`、`src/decode-arp.*`、`src/decode-igmp.*`、`src/decode-esp.*`。第四类是 VLAN 与隧道封装：`src/decode-vlan.*`、`src/decode-vxlan.*`、`src/decode-gre.*`、`src/decode-geneve.*`、`src/decode-erspan.*`、`src/decode-teredo.*`、`src/decode-mpls.*`、`src/decode-nsh.*`、`src/decode-ppp.*`、`src/decode-pppoe.*`、`src/decode-vntag.*`、`src/decode-etag.*`。第五类是事件登记与模板：`src/decode-events.*` 与 `src/decode-template.*`，后者是新增解码器时可参照的骨架文件。以上文件在本快照中均已确认存在。
+
+解码事件（decoder event）与 `stats` 计数是理解这个模块的另一组关键概念。解码过程中遇到截断、非法长度、未知封装、分片异常等情况时，解码器不是简单地静默丢弃，而是把事件挂到包上并递增对应计数；这些事件既可能进入 `eve.json` 的 anomaly 类事件，也可能只体现在 stats 里。事件名与计数项的完整清单需对照实际版本核验，可定位 `src/decode-events.h` 与 `src/decode.c` 中 `DecodeRegisterPerfCounters` 的登记处。要强调的是，解码事件不等于丢包：某些事件只是提示，报文仍会继续走流与检测；把事件计数直接读成「丢包数」是判读统计时最常见的误用（原理见 08-01）。
+
+最后说明本篇与相邻模块的边界。`decode` 的下游是 `flow`（模块见 07-02）与应用层解析（模块见 07-03），上游是各抓包后端的解码线程（模块见 07-06）；解码器不做流聚合、不做 TCP 重组、不做协议识别，也不做规则匹配。交叉引用在本篇与后续各篇统一采用「字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx」的写法，读者需要查字段、参数、机制或相邻模块时按图索骥即可。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，不重列任何字段。07 全册禁止出现完整结构体字段表，逐字段定义、类型、读写时机与生命周期由 05 全册统一承担；需要查字段时按括号内索引跳转。
+
+- `Packet_`、`DecodeThreadVars_`：定义集中在 `src/decode.h`，前者在 `typedef struct Packet_` 处起、以 `} Packet;` 收尾，后者在 `typedef struct DecodeThreadVars_` 处起、以 `} DecodeThreadVars;` 收尾（字段见 05-02）。`Packet` 内还提供释放与旁路相关的函数指针钩子以及隧道场景指向根包的引用，这些钩子的赋值发生在包池初始化阶段，字段与赋值时机见 05-02。
+- `PacketQueue_` 与解码线程相关的队列结构：声明见 `src/decode.h` 及 `src/tm-queues.h` 相关定义（字段见 05-02、05-07），本篇只把它当作解码模块的输入与输出载体。
+- 解码事件结构：定义与事件枚举在 `src/decode-events.h`，实现与登记辅助在 `src/decode-events.c`；具体事件名与枚举取值需对照实际版本核验。
+- 各层协议头结构：由 `src/decode-*.c/.h` 各族分别定义或引用，例如 `src/decode-ethernet.h`、`src/decode-ipv4.h`、`src/decode-tcp.h`、`src/decode-vlan.h`，字段名一律以对应头文件为准（字段见 05-02）。
+
+下面是本快照中 `src/decode*` 族的真实文件清单节选，按上一节的职责分类组织；族内文件命名规则一致，完整枚举可用 `ls src/decode*` 在快照根目录复核。
+
+```tree
+src/
+├── decode.c                  框架：分派、隧道递归、收尾、计数登记
+├── decode.h                  框架：Packet / DecodeThreadVars 等声明
+├── decode-events.c           解码异常事件实现
+├── decode-events.h           解码异常事件枚举与声明
+├── decode-template.c         新增解码器骨架模板
+├── decode-template.h
+├── decode-ethernet.c/.h      以太网链路层
+├── decode-sll.c/.h           Linux cooked capture
+├── decode-sll2.c/.h          SLL2 链路层
+├── decode-raw.c/.h           raw IP
+├── decode-null.c/.h          Null / 回环链路层
+├── decode-chdlc.c/.h         Cisco HDLC
+├── decode-ipv4.c/.h          IPv4 与分片
+├── decode-ipv6.c/.h          IPv6 与扩展头
+├── decode-tcp.c/.h           TCP
+├── decode-udp.c/.h           UDP 与隧道端口分派
+├── decode-sctp.c/.h          SCTP
+├── decode-icmpv4.c/.h        ICMPv4
+├── decode-icmpv6.c/.h        ICMPv6
+├── decode-arp.c/.h           ARP
+├── decode-igmp.c/.h          IGMP
+├── decode-esp.c/.h           ESP
+├── decode-vlan.c/.h          VLAN / QinQ 标签栈
+├── decode-vxlan.c/.h         VXLAN
+├── decode-gre.c/.h           GRE
+├── decode-geneve.c/.h        Geneve
+├── decode-erspan.c/.h        ERSPAN
+├── decode-teredo.c/.h        Teredo
+├── decode-mpls.c/.h          MPLS
+├── decode-nsh.c/.h           NSH
+├── decode-ppp.c/.h           PPP
+├── decode-pppoe.c/.h         PPPoE
+├── decode-vntag.c/.h         VNTag
+├── decode-etag.c/.h          802.1BR E-Tag
+└── decode-arp.h / 其余同名 .h   各族配套头文件
+```
+
+关键入口函数在真实源码中的位置如下，均已逐一核对：`src/decode.c` 中 `static int DecodeTunnel` 是隧道递归分派器，`void PacketDecodeFinalize(ThreadVars *tv, DecodeThreadVars *dtv, Packet *p)` 是解码收尾，`void DecodeRegisterPerfCounters(DecodeThreadVars *dtv, ThreadVars *tv)` 负责登记每线程计数器；`src/decode-vlan.c` 中 `int DecodeVLAN` 维护 VLAN 栈；`src/decode-tcp.c` 中 `int DecodeTCP`、`src/decode-udp.c` 中 `int DecodeUDP`、`src/decode-sctp.c` 中 `int DecodeSCTP` 是传输层入口；`src/decode-vxlan.c` 中 `int DecodeVXLAN`、`src/decode-ppp.c` 中 `int DecodePPP`、`src/decode-vntag.c` 中 `int DecodeVNTag` 是典型隧道封装入口。函数签名与参数需对照实际版本核验，本篇不复刻完整实现。交叉引用：字段见 05-02 ｜ 参数见 04-02 ｜ 原理见 06-03 ｜ 模块见 07-02。
+
+一个值得记住的细节是 `src/decode-template.c/.h` 的存在：它不是某个真实协议的解码器，而是给开发者准备的最小骨架，新增解码器时通常从它复制结构、补齐协议头解析与事件登记，再在框架分派处挂接。把模板文件误当成「未完成的解码器」而跳过它，会让人错失理解解码器注册方式的最快路径。解码器并不通过一张运行时注册表动态装载，而是由编译期的函数调用关系与 `src/Makefile.am` 的源文件清单共同决定，这一点与 `detect` 模块的关键字注册表（模块见 07-04）形成鲜明对比。
+
+### 4. 关键流程与调用链
+
+本节从模块视角描述 `decode` 族内部文件如何协作以及它如何挂到流水线上，重点在「入口与职责划分」，不重复展开 06 册已经讲透的解码器机制与状态机（原理见 06-03、06-01）。抓包后端的解码线程函数按链路类型调用本模块入口，随后模块内部按三层分派逐层推进；每个环节都由对应的 `src/decode-*.c` 文件承担，异常则由 `src/decode-events.*` 统一登记。
+
+链路层分派是第一跳。`src/decode-ethernet.c` 的 `DecodeEthernet` 解析以太网头并按 EtherType 把报文交给 `DecodeIPV4`、`DecodeIPV6`、`DecodeVLAN` 或 `DecodeARP`；`src/decode-sll.c` / `src/decode-sll2.c` / `src/decode-null.c` / `src/decode-raw.c` / `src/decode-chdlc.c` 分别对应不同抓包场景下出现的链路头。网络层由 `src/decode-ipv4.c`、`src/decode-ipv6.c` 处理地址、扩展头与分片标记；传输层由 `src/decode-tcp.c`、`src/decode-udp.c`、`src/decode-sctp.c`、`src/decode-icmpv4.c`、`src/decode-icmpv6.c`、`src/decode-igmp.c`、`src/decode-esp.c` 处理端口、校验和与协议头合法性，并把 payload 指针与长度填进 `Packet`。隧道与封装是分派链上的回边：当 UDP 端口或协议号指示 VXLAN、Geneve、Teredo 等封装时，`src/decode-udp.c` 调 `DecodeVXLAN` / `DecodeGeneve` / `DecodeTeredo` 等，再经 `src/decode.c` 的 `DecodeTunnel` 递归回网络层或链路层；VLAN 与 QinQ 由 `src/decode-vlan.c` 用标签栈逐层剥离，注释里明确提到最多可堆叠的标签层数常量，具体取值需对照实际版本核验。
+
+每个包的解码收尾统一走 `PacketDecodeFinalize`，它把各层指针、长度、标志位整理成下游可直接消费的形态；`DecodeRegisterPerfCounters` 在线程初始化阶段登记好的计数器则在整个过程中按事件递增，最终成为 `stats.log` 里 decoder 族计数的来源。解码完成后，`Packet` 连同绑定好的 `Flow` 引用被交给 `flow-worker` 槽位（模块见 07-02），由后者进入流查找、TCP 重组与应用层解析。也就是说，`decode` 模块的输出边界非常清楚：一个字段齐备、异常已登记、计数已更新的 `Packet`，以及一条交给下游的队列边。整个模块的分派链、隧道回边与事件落点见图 07-01-01。
+
+:::figure id=07-01-01 | name=decode 模块分派链与解码事件落点 | dir=TD
+node d1 "抓包后端交付<br/>原始帧" blue
+node d2 "链路层解码<br/>DecodeEthernet" teal
+node d3 "网络层解码<br/>DecodeIPV4/6" teal
+node d4 "传输层解码<br/>DecodeTCP/UDP" teal
+node d5 "隧道与 VLAN<br/>DecodeTunnel" purple
+node d6 "解码收尾<br/>PacketDecodeFinalize" teal
+node d7 "解码事件与计数<br/>decode-events / stats" green
+node d8 "Packet 交下游<br/>flow-worker" gray
+edge d1 -> d2 "链路类型"
+edge d2 -> d3 "EtherType"
+edge d3 -> d4 "IP proto"
+edge d4 -> d5 "封装/隧道"
+edge d5 -> d3 dashed "递归解封装"
+edge d3 -> d6 "各层指针就绪"
+edge d6 -> d7 "异常事件"
+edge d6 -> d8 "解码完成"
+edge d7 -> d8 dashed "伴随计数"
+:::
+
+图 07-01-01 中实线是每包的主分派路径，虚线是递归回边与伴随输出。需要再次强调，这张图描述的是模块内部的文件协作关系，不是 06-01 那条从收包到落盘的全流水线；把它和全流水线混为一谈，就会误以为解码模块还负责流表或告警。真正把模块挂成线程槽位的是 runmode 与 `TmModule` 机制，解码线程模块与各抓包后端配对（模块见 07-06、原理见 06-13）。本篇不展开 runmode 如何拼装 slot 链，也不展开解码器内部的字节解析算法，读者需要这两部分时分别看 06-13 与 06-03。
+
+### 5. 配置/命令/代码实例
+
+本节只给最小必要实例，并显式指向权威源：`suricata.yaml` 全段、全部命令行与返回码见 04 全册（参数见 04-02、04-07、04-08），此处不重列参数全集；07 全册每篇代码段最多给 3–5 个本模块最典型的调用，其余写「完整 API 见 04-xx」。下面这段是按真实函数名书写的解码分派摘录，仅示意模块内部调用的先后关系，不构成完整实现，也不含任何省略写法。
+
+```c
+/* decode 模块内部分派关系摘录，函数名均为真实符号，见 src/decode*.c */
+DecodeEthernet(tv, dtv, p, pkt, len);        /* 链路层入口，按 EtherType 分派 */
+DecodeIPV4(tv, dtv, p, pkt, len);            /* 网络层，处理 IPv4/分片标记 */
+DecodeTCP(tv, dtv, p, pkt, len);             /* 传输层，填写端口与 payload */
+DecodeTunnel(tv, dtv, p, pkt, len, type);    /* 封装/隧道递归回上层解码器 */
+PacketDecodeFinalize(tv, dtv, p);            /* 统一收尾，交付下游 */
+```
+
+上面五个调用分别代表链路层、网络层、传输层、隧道递归与收尾五个环节，是本模块最典型的一组入口；`DecodeTunnel` 的封装类型参数、各函数的完整签名与返回值需对照实际版本核验。完整入口清单、命令行选项与配置参数见 04-02、04-07，机制原理见 06-03，此处不再追加调用。
+
+下面给一组按「前置检查 → 执行 → 验证输出 → 清理」组织的源码核验命令，用来在拿到任意一份上游快照后快速定位解码框架的三处关键入口。它不改变运行状态，清理步骤即关闭查阅，适合作为阅读源码或核查版本差异的第一步。
+
+```bash
+# 前置：进入真实仓库根（注意归档多一层 suricata-main/）
+cd upstream_src/suricata/suricata-main
+
+# 执行：定位解码框架的三处关键入口
+grep -n "DecodeTunnel\|PacketDecodeFinalize\|DecodeRegisterPerfCounters" src/decode.c
+
+# 验证：确认 decode 族文件齐全
+ls src/decode*.c | wc -l
+
+# 清理：退出查阅目录
+cd -
+```
+
+典型输出如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+192:static int DecodeTunnel(ThreadVars *, DecodeThreadVars *, Packet *, const uint8_t *, uint32_t,
+195:static int DecodeTunnel(ThreadVars *tv, DecodeThreadVars *dtv, Packet *p, const uint8_t *pkt,
+244:void PacketDecodeFinalize(ThreadVars *tv, DecodeThreadVars *dtv, Packet *p)
+694:void DecodeRegisterPerfCounters(DecodeThreadVars *dtv, ThreadVars *tv)
+```
+
+逐行判读如下。第 192 行是 `DecodeTunnel` 的前置声明，带 `static` 说明它只在 `src/decode.c` 内可见，参数里出现 `ThreadVars *`、`DecodeThreadVars *`、`Packet *` 以及 `const uint8_t *` 的原始字节与长度，正好对应「每线程上下文 + 包载体 + 待解封装字节」三要素；紧随其后的第 195 行是同一函数的定义体起始，两行同时出现是 C 文件里先声明后定义的常见写法，不要误读成两个不同函数。第 244 行 `PacketDecodeFinalize` 同样接收线程上下文、解码线程上下文与包指针，它是所有解码路径的汇合点，判读时若发现某个新解码器没有走到这里，通常意味着分支提前返回而遗漏了收尾。第 694 行 `DecodeRegisterPerfCounters` 的参数顺序与前面两个函数相反，先 `DecodeThreadVars *` 后 `ThreadVars *`，说明它是把计数器登记到解码线程上下文里；正是这个函数决定了 `stats.log` 中 decoder 族计数项的名称与数量，具体项名需对照实际版本核验。最后 `ls src/decode*.c | wc -l` 的计数若明显偏少，说明拿到的不是完整的上游快照或归档层级不对，应回到 SPEC 第 0.1 节确认 `suricata-main/` 这一层前缀。整组输出共同验证了「隧道递归、收尾、计数登记」三件事都在 `src/decode.c` 这一个框架文件里，而不是散落在各协议解码器中。
+
+按职责整理的 decode 子族对照见下表，便于按现象反查应该先读哪个文件。
+
+| 子族 | 代表文件 | 主要职责 | 典型入口 |
+|---|---|---|---|
+| 框架与事件 | `src/decode.c`、`decode-events.c` | 隧道递归、收尾、事件与计数登记 | `DecodeTunnel`、`PacketDecodeFinalize` |
+| 链路层 | `decode-ethernet.c`、`decode-sll.c` | 按链路类型起解、类型分派 | `DecodeEthernet`、`DecodeSll` |
+| 网络层 | `decode-ipv4.c`、`decode-ipv6.c` | 地址、扩展头、分片标记 | `DecodeIPV4`、`DecodeIPV6` |
+| 传输层 | `decode-tcp.c`、`decode-udp.c` | 端口、校验和、payload 指针 | `DecodeTCP`、`DecodeUDP` |
+| 隧道与 VLAN | `decode-vlan.c`、`decode-vxlan.c` | 标签栈与封装递归 | `DecodeVLAN`、`DecodeVXLAN` |
+| 模板 | `decode-template.c` | 新增解码器骨架 | 需对照实际版本核验 |
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一组陷阱围绕隧道与 VLAN 的递归结构。隧道封装天然是嵌套的，`DecodeTunnel` 会递归回到网络层或链路层，VLAN 与 QinQ 由 `src/decode-vlan.c` 的标签栈逐层剥离；递归深度与标签层数都有上限，超过上限的报文会被判为解码异常而非无限解封装。上限常量、超限后的事件名与是否继续交付下游，需对照 `src/decode.c`、`src/decode-vlan.c` 实际版本核验。实践中若在承载大量 overlay 流量的链路上看到 decoder 异常计数持续增长，应先确认隧道层数是否触顶，而不是先怀疑规则。另一个常见误判是把内层与外层流混为一谈：隧道报文的 `Packet` 会带根包引用，流绑定策略以实际版本实现为准（原理见 06-03、字段见 05-02）。
+
+第二组陷阱与校验和卸载有关。现代网卡普遍开启 checksum offload，抓包点位于硬件校验和填充之前时，解码器看到的 TCP/UDP 校验和可能不正确，从而登记校验和类解码事件。这类事件在旁路镜像口上并不代表真实报文损坏，若把它当成攻击或丢包信号，会产生大量无意义告警。排查时应结合抓包位置、网卡卸载开关与 `stats.log` 中校验和类计数的占比一起判断，必要时在测试环境关闭卸载后复测；相关配置键名与开关需对照 `suricata.yaml.in` 实际版本核验（参数见 04-02、04-03）。同理，巨型帧、截断抓包（`snaplen` 小于帧长）与分片无法重组都会表现为长度类解码事件，判读时要区分「报文本身如此」与「抓包方式所致」。
+
+第三组陷阱是统计判读。decoder 计数与解码事件不等于丢包计数，某些事件只是提示，报文仍继续走流与检测；`stats.log` 里收包计数增长而 decoder 计数不增，才更接近「解码器没被调用」或「队列没配对」这类配置问题。排查顺序建议固定为「收包计数 → decoder 计数 → 流计数 → 应用协议计数 → 检测与告警计数」逐段收敛，这套顺序属于运维诊断树（原理见 08-03、08-01），本篇不展开运维步骤。任何关于解码吞吐、每秒解封装能力、隧道层数对性能影响的结论，一律标注「需在目标机型实测」，不给绝对值、不给跨机型通用数字。
+
+最佳实践可以归纳为四条。其一，新增解码器从 `src/decode-template.c` 起步，同步补齐 `src/decode-events.h` 的事件枚举、`DecodeRegisterPerfCounters` 的计数登记与分派处的挂接，并在 `src/Makefile.am` 的源文件清单中登记；漏掉计数登记是最常见的回归。其二，改动链路层或隧道分派后，务必用该族自带的单元测试验证，本快照中 `src/decode-vlan.c`、`src/decode-vxlan.c`、`src/decode-ppp.c` 等文件内都带有构造报文的测试代码，可直接作为回归基线（工具链见 07-13）。其三，把 decoder 异常事件纳入日常监控基线，关注相对变化而非绝对数值。其四，始终记住能力边界：解码模块不做转发、不做解密，TLS 明文正文不可见，能拿到的是握手元数据、证书、SNI 一类信息（模块见 07-03、原理见 06-05）。
+
+### 7. 小结与延伸阅读
+
+`decode` 模块把「原始字节 → 统一 `Packet` 分层视图」收敛到 `src/decode.c`、`src/decode.h` 与 `src/decode-*` 一族中，按链路层、网络层、传输层、隧道封装、事件与模板六类分工，`DecodeTunnel` 负责递归、`PacketDecodeFinalize` 负责收尾、`DecodeRegisterPerfCounters` 负责计数登记，`src/decode-template.c` 提供新增解码器的骨架。它的输出边界是一个字段齐备、异常已登记、计数已更新的 `Packet`，下游由 `flow` 与应用层解析接手；它不做流聚合、不做重组、不做协议识别、不做规则匹配，更不做转发与解密。作为 07 册的第一篇，本篇也确立了全册写法：只讲模块构成、职责与入口，字段归 05、参数归 04、机制归 06、运维归 08。
+
+需要继续深入时，建议按四条路径展开。想理解分派算法、隧道递归深度、VLAN 栈与分片重组的完整机制，读 06-03；想查 `Packet`、`DecodeThreadVars` 与 `PacketQueue` 的逐字段定义，读 05-02；想核对命令行、yaml 段与返回码，读 04-02、04-07、04-08；想按目录继续了解相邻模块，读 07-02（flow）、07-03（app-layer）、07-06（source-*）与 07-13（工具链与测试）。排障场景下的计数判读顺序与故障案例见 08-01、08-03、08-04。所有性能与容量结论均需在目标机型实测，版本差异一律以 `configure.ac`、`ChangeLog` 与本快照实际文件为准，需对照实际版本核验。
+
+## 07-02 flow 流管理模块
+
+### 1. 背景与动机
+
+单个报文能提供的上下文极其有限：一个 SYN、一个 ACK、一个 HTTP 请求行，孤立地看都不足以判断会话语义。Suricata 的规则大量依赖「同一条连接上发生过什么」——`flow:established,to_server`、`flowbits` 的跨规则置位、`stream_size`、`flow.age`、文件传输与事务日志，乃至 EVE 里用 `flow_id` 把 alert、http、dns、tls、file 等事件串成一条会话，都必须有一个稳定的会话载体。这个载体就是 `Flow`。`flow` 模块族的职责，是把海量离散的 `Packet` 按五元组与若干追踪维度聚合成双向会话、维护流表与生命周期、提供超时与回收机制，并给检测引擎、应用层解析器与输出模块提供统一挂接点。本篇按 07 册惯例，讨论 `src/flow*.c/h` 这一族的文件构成、组件分工与入口，不重复展开 06 册的流表哈希与超时状态机（原理见 06-04）。
+
+为什么要把 flow 单独作为一个模块讲清楚，有几个现实原因。其一，它是流水线上承上启下的枢纽：解码之后、`flow` 之前，引擎还没有「连接」的概念；`flow` 之后，重组、应用解析、检测与日志才共享同一个会话标识。其二，它是资源消耗与稳定性的主要来源之一：流表大小、备用池、超时线程、回收队列共同决定内存占用与锁竞争，配置不当会直接表现为丢包、内存持续上涨或告警缺失。其三，它的组件比看上去多得多，`src/flow*` 在本快照下有二十余个 `.c/.h` 文件，分别负责哈希、超时、队列、备用池、bypass、storage、flowbit、flowvar、worker 槽位与管理线程，把它们误当成一个 `flow.c` 会让人在排障时找不到北。
+
+能力边界仍然要先立住。Suricata 是 IDS / IPS / NSM 引擎，不是防火墙，不做 IP 转发，不做路由；流管理是「为检测而观察会话」，不是替内核维护连接跟踪表，更不参与转发决策。内联 IPS 模式下 verdict 由 NFQUEUE 或 AF_PACKET 桥接给出（模块见 07-06、原理见 06-12），`flow` 模块只提供流状态与是否可 bypass 的判断依据。可见性方面，引擎只对自身解码并重组到的流量建立流，TLS 等加密载荷的明文正文不可见，流上挂的是握手元数据、证书、SNI、指纹与应用层事务（模块见 07-03、原理见 06-05），不能宣称能读到 HTTPS 明文。本套资料版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验。
+
+去重纪律照旧：07 是全集的模块功能唯一权威源，`flow` 的结构体逐字段定义归 05-03，配置参数全集归 04-02、04-03，机制与调用链归 06-04，运维排障归 08 全册。本篇只讲「这个模块有哪些文件、每个文件做什么、关键入口在哪、如何挂到流水线」，交叉引用统一写「字段见 05-03 ｜ 参数见 04-02 ｜ 原理见 06-04 ｜ 模块见 07-xx」。凡涉及具体计数项名、memcap 键名、超时取值、状态枚举取值等未能逐一核实的内容，一律标注「需对照实际版本核验」并给出可定位目录。
+
+从工程价值看，建立 flow 的模块地图有三个直接收益。排障时，「有收包无告警」「有告警无 flow 事件」「内存持续上涨」「多线程下吞吐不升反降」这几类现象的根因大多能落到某个具体 flow 组件；调优时，流表容量、备用池水位、超时线程间隔、bypass 策略是相互牵制的一组量，理解组件边界才能做 A/B 对照；扩展时，`flowbits`、`xbits`、`flow` 关键字与自定义 storage 都挂在这套机制上，知道挂接点才不会把状态写错地方。以下各节按「概念 → 文件与结构 → 组件协作 → 实例 → 陷阱 → 小结」展开。
+
+### 2. 核心概念
+
+先把术语固定下来。`Flow` 是以五元组为核心、附带 VLAN、livedev、递归层级等追踪维度聚合出的双向会话，是流表哈希、TCP 会话状态、应用层事务与检测状态的共同挂接点（字段见 05-03）。`FlowKey` 是哈希用的键结构，`FlowBucket` 是流表哈希桶并带锁，`FlowLookupStruct` 是每线程做流查找时携带的临时上下文；这三者都在 `src/flow.h` 中定义，字段名与锁类型需对照实际版本核验（字段见 05-03）。`FlowQueue` / `FlowQueuePrivate` 是流在模块之间搬运的队列结构，实现在 `src/flow-queue.c`。`FlowSparePool` 是备用流对象的池化结构，实现在 `src/flow-spare-pool.c`。
+
+流生命周期可以概括为「查表 → 新建或命中 → 使用 → 超时或强制结束 → 入回收队列 → 回收复用」。查表在 `src/flow-hash.c` 的 `FlowGetFlowFromHash` 一类函数中完成，未命中时经 `FlowGetNew` 从备用池取用；使用期间，检测引擎通过 `flow-bit` / `flow-var` / `flow-storage` 在流上读写状态；超时判定由 `src/flow-timeout.c` 与 `src/flow-manager.c` 协作，管理线程 `FlowManager` 定期扫描，把到期流交给 `flow_recycle_q`，回收线程复用对象并归还备用池。bypass 是另一条支路：`src/flow-bypass.c` 与 `FlowBypassedTimeout` 让已判定可跳过的流减少后续检测开销（原理见 06-04、模块见 07-06）。这里只给组件名与职责，哈希冲突处理、桶锁粒度、超时紧急度算法属于机制范畴，本篇不展开。
+
+模块挂接点有两个，理解它们才能把 `flow` 与流水线对上号。`src/flow-worker.c` 注册 `tmm_modules[TMM_FLOWWORKER]`，把 `FlowWorker` 作为流水线上的包处理槽位；它内部对每包调用 `FlowHandlePacket`，把 `Packet` 与 `Flow` 绑定，随后同槽位或相邻槽位进入 TCP 重组、应用解析与检测。`src/flow-manager.c` 注册 `tmm_modules[TMM_FLOWMANAGER]`，把 `FlowManager` 作为管理线程（后台线程），并另外拉起回收线程；这两类线程在 runmode 收尾阶段由 `TmThreadSpawn` 一类机制启动（原理见 06-01、06-13）。也就是说，`flow` 模块同时贡献了「每包处理槽位」和「后台管理线程」两种线程形态，这是它区别于纯函数库式模块的重要特征。
+
+还需要区分三组容易混淆的概念。第一组是「流状态」与「TCP 会话状态」：前者是 `Flow` 层面的生命周期标志，后者是 `src/stream-tcp*` 维护的握手与重组状态（模块见 07-08），两者相关但不等价。第二组是 `flowbits` 与 `xbits`：`flowbits` 的作用域是单条流，`xbits` / `hostbits` 可跨流或按主机维度保存并带过期，二者分别由 `src/flow-bit.c` 与 `src/detect-xbits.c` 一类文件承担（原理见 06-09）。第三组是「bypass」与「丢弃」：bypass 是为降低开销而跳过部分检测，不等于把报文丢掉，更不等于 IPS verdict 的 drop（原理见 06-12）。把这三组概念写反，是阅读流模块时最典型的错误。
+
+最后说明边界。`flow` 的上游是 `decode`（模块见 07-01），下游是 `stream-tcp`（模块见 07-08）、`app-layer`（模块见 07-03）、`detect`（模块见 07-04）与 `output`（模块见 07-07）；它不负责字节解码、不做规则匹配、不写 EVE 日志，只负责会话的聚合、状态挂接与生命周期管理。EVE 里 `flow_id` 的聚合与事件输出由输出模块完成（原理见 06-11）。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，不重列字段。07 全册禁止完整结构体字段表，逐字段定义、内存布局与生命周期归 05-03。
+
+- `FlowKey_`、`Flow_`、`FlowBucket`：`src/flow.h` 中 `typedef struct FlowKey_` 起、`} FlowKey;` 收尾，`typedef struct Flow_` 起、`} Flow;` 收尾；`FlowBucket` 的定义同在该头文件，字段名与锁类型需对照实际版本核验（字段见 05-03）。
+- `FlowLookupStruct`：`src/flow-worker.c` 中以局部变量形式使用，声明位置见 `src/flow.h` 相关定义（字段见 05-03）。
+- `FlowQueue` / `FlowQueuePrivate`：`src/flow-queue.c` 提供 `FlowQueueNew`、`FlowQueueInit`、`FlowQueueDestroy`、`FlowEnqueue`、`FlowDequeue`、`FlowQueueAppendPrivate`、`FlowQueueExtractPrivate` 等接口（字段见 05-03）。
+- `FlowSparePool`：`src/flow-spare-pool.c` 中定义，配套 `FlowSpareGetPool`、`FlowSparePoolUpdateBlock` 等静态辅助函数。
+- `FlowBit`、`FlowVar` 与 storage 项：`src/flow-bit.c`、`src/flow-var.c`、`src/flow-storage.c` 分别实现（字段见 05-03）。
+- `TmModule` 注册表项 `tmm_modules[TMM_FLOWWORKER]` 与 `tmm_modules[TMM_FLOWMANAGER]`：`src/flow-worker.c`、`src/flow-manager.c`（字段见 05-07）。
+
+下面是本快照中 `src/flow*` 族的真实文件清单，族内命名规律清晰，完整枚举可用 `ls src/flow*` 复核。
+
+```tree
+src/
+├── flow.c / flow.h                    模块主体：初始化、查表入口、生命周期
+├── flow-private.h                     内部共享声明
+├── flow-bindgen.h                     Rust FFI 绑定相关声明
+├── flow-hash.c / flow-hash.h          流表哈希、桶锁、新建与替换
+├── flow-manager.c / flow-manager.h    管理线程与回收线程
+├── flow-timeout.c / flow-timeout.h    超时判定与状态推进
+├── flow-queue.c / flow-queue.h        流队列与私有队列
+├── flow-worker.c / flow-worker.h      流水线槽位 FlowWorker
+├── flow-spare-pool.c / .h             备用流对象池
+├── flow-bypass.c / flow-bypass.h      bypass 挂接
+├── flow-storage.c / flow-storage.h    通用流存储注册
+├── flow-bit.c / flow-bit.h            flowbits 存储
+├── flow-var.c / flow-var.h            flowvar 存储
+├── flow-util.c / flow-util.h          辅助函数
+└── flow-callbacks.c / .h              流事件回调
+```
+
+关键入口函数在真实源码中的位置如下，均已逐一核对：`src/flow.c` 中 `void FlowHandlePacket(ThreadVars *tv, FlowLookupStruct *fls, Packet *p)` 是每包流处理入口，`void FlowInitConfig(bool quiet)` 与 `void FlowShutdown(void)` 负责流表初始化与释放；`src/flow-worker.c` 中 `static TmEcode FlowWorker(ThreadVars *tv, Packet *p, void *data)` 是流水线槽位，内部调用 `FlowHandlePacket(tv, &fw->fls, p)`，并以 `tmm_modules[TMM_FLOWWORKER].name = "FlowWorker"`、`.Func = FlowWorker` 注册；`src/flow-hash.c` 中 `static Flow *FlowGetNew` 与 `Flow *FlowGetFlowFromHash` 负责新建与查表，另有 `FlowSpareSync`、`TcpReuseReplace`、`MoveToWorkQueue` 等静态辅助；`src/flow-manager.c` 中 `void FlowManagerThreadSpawn(void)`、`void FlowRecyclerThreadSpawn(void)`、`static TmEcode FlowManager` 管理后台线程，全局 `FlowQueue flow_recycle_q` 是回收队列；`src/flow-bit.c` 的 `int FlowBitSet(Flow *f, uint32_t idx)` 与 `src/flow-var.c` 的 `FlowVar *FlowVarGetByKey`、`void FlowVarFree` 是状态读写代表。函数签名与状态枚举取值需对照实际版本核验。交叉引用：字段见 05-03 ｜ 参数见 04-02 ｜ 原理见 06-04 ｜ 模块见 07-01。
+
+一个阅读时容易忽略的细节是 `src/flow-bindgen.h` 与 `src/flow-callbacks.c/.h` 的存在：前者与 Rust 侧的 FFI 绑定相关，后者把流生命周期事件暴露给其他模块订阅。这说明 `flow` 并非封闭的 C 模块，它与 `rust/` 组件（模块见 07-10）存在边界交互；把 Suricata 写成纯 C 项目会漏掉这一层。另一个细节是 `src/flow-spare-pool.c` 独立成文件而非并入 `flow.c`，正说明「对象池化」在这个模块里是一等公民，调优时它需要与流表容量一起考虑（原理见 08-02）。
+
+### 4. 关键流程与调用链
+
+本节按模块视角描述 `flow` 族内部组件如何协作、以及它如何挂到流水线上，不重复展开 06 册的流表哈希算法与超时状态机（原理见 06-04、06-01）。可以把整个模块拆成三条相互配合的线：每包处理线、后台管理线、状态挂接线。
+
+每包处理线从 `FlowWorker` 槽位开始。解码后的 `Packet` 进入该槽位，`FlowWorker` 用本线程携带的 `FlowLookupStruct` 调用 `FlowHandlePacket`；后者经 `src/flow-hash.c` 的 `FlowGetFlowFromHash` 在流表中查找，命中则复用，未命中则经 `FlowGetNew` 从 `src/flow-spare-pool.c` 管理的备用池取对象初始化并插入桶。流与包绑定后，同一条流上的 TCP 会话状态、应用解析状态与检测状态才有稳定的挂接目标。`FlowWorker` 在 `src/flow-worker.c` 中以 `TMM_FLOWWORKER` 注册进 `tmm_modules` 表，runmode 把它挂到 slot 链上（原理见 06-13）；本篇不展开 runmode 拼装过程，只指出这个注册点是模块与流水线的接口。
+
+后台管理线由 `FlowManagerThreadSpawn` 与 `FlowRecyclerThreadSpawn` 拉起。`FlowManager` 周期性扫描流表，借助 `src/flow-timeout.c` 的判定与 `FlowBypassedTimeout`（bypass 流的超时分支）挑出到期流，经 `MoveToWorkQueue` 一类辅助搬到 `flow_recycle_q`；回收线程把对象清理后归还备用池，供后续 `FlowGetNew` 复用。这条线不处理单个报文，而是以时间为轴维护流表水位与内存回收，因此它的线程形态是「管理线程」而非包处理槽位，`tmm_modules[TMM_FLOWMANAGER].Management = FlowManager` 正是这一区别的体现（字段见 05-07）。超时紧急度、新流与Established 流的不同超时策略、memcap 触顶时的强制回收，属于机制细节（原理见 06-04），本篇只点名组件。
+
+状态挂接线把 `flow` 与检测、应用、输出串起来。`src/flow-bit.c` 提供 `FlowBitSet` 一类接口供 `flowbits` 关键字在同一条流上置位与查询，`src/flow-var.c` 提供 `FlowVarGetByKey`、`FlowVarFree` 一类接口保存命名变量，`src/flow-storage.c` 提供通用存储注册让其他模块在 `Flow` 上挂自定义数据，`src/flow-callbacks.c/.h` 把流事件暴露给订阅者，`src/flow-bypass.c` 提供跳过检测的挂接。EVE 输出侧用 `flow_id` 把同一条会话的多类事件聚合起来（原理见 06-11、模块见 07-07）。三条线与模块边界见图 07-02-01。
+
+:::figure id=07-02-01 | name=flow 模块组件协作与流生命周期 | dir=TD
+node f1 "FlowWorker<br/>流水线槽位" blue
+node f2 "FlowHandlePacket<br/>流查找与绑定" teal
+node f3 "flow-hash<br/>流表与桶锁" teal
+node f4 "flow-spare-pool<br/>备用池" gray
+node f5 "flow-timeout<br/>超时判定" amber
+node f6 "FlowManager<br/>后台管理线程" purple
+node f7 "flow-recycle-q<br/>回收队列" gray
+node f8 "flow-bit / var<br/>状态挂接" green
+node f9 "flow-bypass<br/>旁路加速" green
+edge f1 -> f2 "每包触发"
+edge f2 -> f3 "查表/新建"
+edge f3 -> f4 "取用备用流"
+edge f4 -> f3 dashed "补充水位"
+edge f2 -> f8 "读写状态"
+edge f3 -> f5 "超时扫描"
+edge f5 -> f6 "交管理线程"
+edge f6 -> f7 "入回收队列"
+edge f7 -> f4 dashed "复用"
+edge f2 -> f9 dashed "bypass 判定"
+:::
+
+图 07-02-01 中实线是数据与对象的主搬运路径，虚线是补充、复用与可选分支。要强调的是，这张图是模块内部组件图，不是 06-01 的全流水线图；`FlowWorker` 只是流水线上的一个槽位，前后还有解码与检测槽位。把 flow 组件图误当成全流水线，会漏掉重组、应用解析与输出这些同样依赖 `Flow` 的环节。本篇也不展开 `Flow` 与 `Packet` 之间引用关系的具体字段（字段见 05-02、05-03），只说明二者在 `FlowHandlePacket` 处完成绑定。
+
+### 5. 配置/命令/代码实例
+
+本节只给最小必要实例。`suricata.yaml` 中 `flow` 相关段、memcap 键名与全部命令行见 04 全册（参数见 04-02、04-03、04-07），此处不重列参数全集；07 全册每篇代码段最多 3–5 个本模块最典型调用，其余写「完整 API 见 04-xx」。下面这段按真实函数名书写，示意每包流处理与后台管理的分工，不构成完整实现。
+
+```c
+/* flow 模块最典型的入口关系摘录，见 src/flow*.c */
+FlowWorker(tv, p, data);                 /* 流水线槽位：每包进入 */
+FlowHandlePacket(tv, &fls, p);           /* 查找/新建并绑定 Flow */
+FlowBitSet(f, idx);                      /* 在同一条流上置 flowbit */
+FlowManagerThreadSpawn();                /* 拉起后台超时管理线程 */
+FlowRecyclerThreadSpawn();               /* 拉起回收线程 */
+```
+
+五个调用分别代表槽位入口、每包绑定、状态挂接、管理线程与回收线程，是 `flow` 模块最典型的一组入口；`FlowWorker` 的 `data` 参数、`FlowBitSet` 的索引语义与两个 Spawn 函数的完整签名需对照实际版本核验。完整入口清单、配置键名与命令行见 04-02、04-03、04-07，机制原理见 06-04，此处不再追加调用。
+
+下面给一组按「前置检查 → 执行 → 验证输出 → 清理」组织的源码核验命令，用于在任意上游快照里快速定位 flow 模块的三类关键入口。
+
+```bash
+# 前置：进入真实仓库根
+cd upstream_src/suricata/suricata-main
+
+# 执行：定位槽位、每包入口与管理线程入口
+grep -n "FlowWorker\|FlowHandlePacket\|FlowManagerThreadSpawn\|FlowRecyclerThreadSpawn" \
+     src/flow-worker.c src/flow.c src/flow-manager.c
+
+# 验证：确认 flow 族文件数量合理
+ls src/flow*.c | wc -l
+
+# 清理：退出查阅目录
+cd -
+```
+
+典型输出如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+src/flow-worker.c:563:static TmEcode FlowWorker(ThreadVars *tv, Packet *p, void *data)
+src/flow-worker.c:585:        FlowHandlePacket(tv, &fw->fls, p);
+src/flow-worker.c:804:    tmm_modules[TMM_FLOWWORKER].name = "FlowWorker";
+src/flow-worker.c:806:    tmm_modules[TMM_FLOWWORKER].Func = FlowWorker;
+src/flow.c:560:void FlowHandlePacket(ThreadVars *tv, FlowLookupStruct *fls, Packet *p)
+src/flow.c:574:void FlowInitConfig(bool quiet)
+src/flow-manager.c:1014:void FlowManagerThreadSpawn(void)
+src/flow-manager.c:1222:void FlowRecyclerThreadSpawn(void)
+```
+
+逐行判读如下。第 563 行 `FlowWorker` 带 `static` 且返回 `TmEcode`，参数 `(ThreadVars *tv, Packet *p, void *data)` 正是 `TmModule` 包处理槽位的标准形态，说明它是挂在 slot 链上的函数而非普通工具函数；第 585 行紧随其后在同一函数体内调用 `FlowHandlePacket(tv, &fw->fls, p)`，`&fw->fls` 是本线程持有的 `FlowLookupStruct`，这一行就是「每包流查找」的发生点。第 804 与 806 行把模块名与 `Func` 指针写进 `tmm_modules[TMM_FLOWWORKER]`，这是模块被 runmode 发现的注册点，若这两行缺失，`FlowWorker` 就不会出现在流水线里。第 560 行 `FlowHandlePacket` 的参数里出现 `FlowLookupStruct *fls`，与 585 行的实参对应，可据此确认查找上下文由调用方持有；第 574 行 `FlowInitConfig(bool quiet)` 是流表初始化入口，`quiet` 控制是否输出提示，具体行为需对照实际版本核验。第 1014 与 1222 行两个 Spawn 函数都无参数返回 `void`，说明它们是启动后台线程的入口而非每包路径，这一步把「管理线程」与「包处理槽位」两类线程形态区分开来。最后 `ls src/flow*.c | wc -l` 的计数若明显偏少，应回到 SPEC 第 0.1 节确认归档层级。整组输出共同验证了「槽位注册 → 每包绑定 → 后台管理」三层结构确实分散在三个不同文件中。
+
+按组件整理的职责对照见下表，便于按现象反查应先读哪个文件。
+
+| 组件 | 代表文件 | 主要职责 | 典型入口 |
+|---|---|---|---|
+| 模块主体 | `flow.c` / `flow.h` | 初始化、关闭、每包流处理 | `FlowHandlePacket`、`FlowInitConfig` |
+| 流表哈希 | `flow-hash.c` | 桶锁、查表、新建与替换 | `FlowGetFlowFromHash`、`FlowGetNew` |
+| 流水线槽位 | `flow-worker.c` | 注册 `TMM_FLOWWORKER` | `FlowWorker` |
+| 管理线程 | `flow-manager.c` | 超时扫描与回收线程 | `FlowManagerThreadSpawn` |
+| 超时判定 | `flow-timeout.c` | 到期判定与状态推进 | 需对照实际版本核验 |
+| 队列与备用池 | `flow-queue.c`、`flow-spare-pool.c` | 搬运与对象复用 | `FlowEnqueue`、`FlowSpareGetPool` |
+| 状态挂接 | `flow-bit.c`、`flow-var.c`、`flow-storage.c` | flowbits / flowvar / 自定义存储 | `FlowBitSet`、`FlowVarGetByKey` |
+| bypass | `flow-bypass.c` | 跳过后续检测的挂接 | 需对照实际版本核验 |
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一组陷阱围绕容量与水位。`flow` 模块的内存占用主要由流表规模、备用池水位与每条流上挂载的 storage/tx 共同决定；流表 memcap、备用池相关键名与取值需对照 `suricata.yaml.in` 与 `src/flow*.c` 实际版本核验（参数见 04-02、04-03）。常见误操作是只调大流表上限而不管备用池与超时线程间隔，结果是水位上来后回收跟不上，内存持续上涨；或者反过来把超时设得过短，长连接被提前回收，表现为 `flowbits` 状态莫名丢失、事务日志断裂。调优应把流表容量、备用池、超时策略与 bypass 当作一组联动量做 A/B 对照，任何吞吐、内存占用、每秒新建流数量的结论一律标注「需在目标机型实测」，不给绝对值。
+
+第二组陷阱是多线程下的锁与亲和。`FlowBucket` 带锁，流表哈希与桶锁粒度决定了并发访问成本；增加检测线程并不必然带来线性提速，还要看 RSS / fanout 是否把同一条流稳定送到同一线程、流亲和是否成立（原理见 06-13、08-02）。在 `autofp` 与 `workers` 之间切换时，流查找发生在哪个线程、队列如何搬运都会变化，若观察到吞吐不升反降，应先核对 runmode 与队列配对，而不是先加线程。`src/flow-bindgen.h` 还提示了与 Rust 侧的 FFI 边界，跨语言传递流对象时要留意所有权与生命周期，相关字段名需对照实际版本核验（模块见 07-10）。
+
+第三组陷阱是概念混淆带来的误判。前面提到「流状态」与「TCP 会话状态」不等价、`flowbits` 与 `xbits` 作用域不同、bypass 不等于丢弃，这三点在排障时最容易被写反。举例来说，看到某条流不再产生应用层事件，可能是被 bypass 跳过检测，也可能是重组深度触顶，还可能是流已超时回收，三者证据分别在 bypass 计数、重组 memcap 与 flow 超时统计里，判读顺序属于诊断树（原理见 08-03、08-04）。另一个高频误用是把 `stats.log` 里的流计数直接读成「并发连接数」，计数项名称与含义需对照实际版本核验（参数见 04-08、原理见 08-01）。此外要记住能力边界：`flow` 不参与转发决策，内联 drop 由 verdict 给出（原理见 06-12），TLS 明文正文不可见。
+
+最佳实践可以归纳为四条。其一，把流表与备用池水位、超时线程间隔、bypass 命中率纳入日常监控基线，关注相对变化而非绝对数值。其二，新增需要在流上挂状态的特性时，优先走 `src/flow-storage.c` 的通用存储注册，而不是往 `Flow` 结构体里塞字段，避免破坏 05-03 的字段口径。其三，改动 `flow-worker` 或 `flow-hash` 后，用该族自带的单元测试与 `suricata -T` 做回归；`src/flow-hash.c`、`src/flow-manager.c` 内均带有构造场景的测试代码（工具链见 07-13）。其四，任何涉及流生命周期的变更都要同时检查 `src/flow-callbacks.c/.h` 的订阅者与 `src/output-json-flow.c` 一类输出侧，避免流已回收而事件仍在引用旧对象。交叉引用：字段见 05-03 ｜ 参数见 04-02 ｜ 原理见 06-04 ｜ 模块见 07-10。
+
+### 7. 小结与延伸阅读
+
+`flow` 模块把离散的 `Packet` 聚合成稳定的双向会话，并以二十余个 `src/flow*` 文件分工实现流表哈希与桶锁、每包处理槽位、后台超时与回收线程、队列与备用池、flowbits / flowvar / storage 状态挂接以及 bypass。它同时贡献了「流水线上的 `FlowWorker` 槽位」与「后台 `FlowManager` 管理线程」两种线程形态，是流水线承上启下的枢纽；它不做解码、不做重组、不做规则匹配、不写日志，更不参与转发 verdict。理解它的组件边界，是排查「无告警、内存涨、吞吐不升」三类现象的前提。
+
+继续深入的路径有四条。想理解流表哈希、桶锁、超时紧急度与 TCP 会话状态的完整机制，读 06-04 与 07-08；想查 `Flow`、`FlowKey`、`FlowBucket`、`FlowLookupStruct` 的逐字段定义，读 05-03；想核对 `flow` 相关 yaml 段、memcap 键名与命令行，读 04-02、04-03、04-07；想按目录了解相邻模块，读 07-01（decode）、07-03（app-layer）、07-04（detect）、07-07（output）与 07-10（rust/）。容量规划、调优联动与故障案例见 08-02、08-03、08-04。所有性能与容量结论均需在目标机型实测，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验。
+
+## 07-03 app-layer 应用层解析模块
+
+### 1. 背景与动机
+
+规则要匹配「HTTP 请求里的 URI」「DNS 查询名」「TLS 握手的 SNI 与证书」「SMB 文件名」，仅有报文与流是不够的：这些对象存在于应用层的结构化事务里，且往往跨多个 TCP 段、甚至跨方向成对出现。引擎必须先把重组后的连续字节流还原成协议语义，才能给检测引擎提供 `http.uri`、`dns.query`、`tls.sni`、`file.data` 这类可匹配的缓冲区，给输出模块提供结构化的 http、dns、tls、file 事件。`app-layer` 模块族承担的正是这件事：协议识别、解析器注册、事务（tx）与 Frame 维护、状态机推进，以及把解析结果交给检测与日志。本篇按 07 册惯例讨论 `src/app-layer*.c/h` 与 `rust/src/` 解析器目录的构成、注册接口与职责边界，不重复展开 06 册的应用层解析机制与状态机（原理见 06-05）。
+
+这个模块在全集里有一个特殊地位：它是 C 与 Rust 两套运行时交汇最密集的地方。本快照的 `src/app-layer-*.c` 里既有 C 实现的解析器（HTTP 经由 libhtp、FTP、SMTP、SSH、SSL/TLS、SMB、DNS 相关、DNP3、Modbus、NFS、TFTP、IKE、IMAP 等族），也有大量解析器实现在 `rust/src/` 下（dns、http2、smb、ftp、ike、quic、dhcp、krb、ldap、mqtt、nfs、ntp、pgsql、pop3、rdp、rfb、sip、snmp、ssh、telnet、tftp、websocket、x509、ja4 等目录与单文件）。`rust/src/applayer.rs` 定义 `RustParser` 与 `ParseFn`，经 `rust/cbindgen.toml` 生成 FFI 头把解析器注册回 C 侧框架。SPEC 第 2.1 节明确要求不得把 Suricata 写成纯 C 项目，本篇就是最直接的证据之一（模块见 07-10）。因此讲 `app-layer` 不能只讲 `src/app-layer-parser.c`，必须把 Rust 解析器生态一起纳入视野。
+
+能力边界要再次立住，而且这一篇尤其容易写反。Suricata 是 IDS / IPS / NSM 引擎，不是防火墙，不做 IP 转发，不做路由；应用层解析是「为检测与日志还原可见语义」，不是代理、不是网关、不改写报文。可见性方面，引擎只对自身解码并重组到的流量做解析，TLS 等加密载荷的明文正文不可见：`app-layer` 能拿到的是握手阶段的 ClientHello/ServerHello 元数据、证书、SNI、ALPN、JA3/JA4 一类指纹，以及加密前可见的明文字段，不能宣称能读到 HTTPS 正文（相关 Rust 侧实现见 `rust/src/ja4.rs`、`rust/src/tls_version.rs`，具体字段需对照实际版本核验）。把「协议解析」写成「解密」或「内容审计」是这一模块最危险的误述。本套资料版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验。
+
+去重纪律照旧：07 是模块功能唯一权威源，`AppLayerParserState`、`AppLayerParserThreadCtx`、`AppLayerResult` 等逐字段定义归 05-04，配置参数全集归 04-02，机制与调用链归 06-05，运维排障归 08 全册。本篇只讲「有哪些文件、每类文件做什么、注册接口在哪、如何挂到流水线与日志」，交叉引用统一写「字段见 05-04 ｜ 参数见 04-02 ｜ 原理见 06-05 ｜ 模块见 07-10」。凡涉及具体协议名枚举、配置键名、事件名未逐一核实的内容，一律标注「需对照实际版本核验」并给出可定位目录。
+
+从工程价值看，建立这个模块的地图有四个直接收益。排障时，「协议没被识别」「EVE 里没有 http 事件」「`http.uri` 规则不命中」「事务日志断裂」这几类现象大多能落到协议识别、parser 是否启用、重组深度或 tx 进度上；扩展时，新增解析器要清楚走 C 注册还是 Rust FFI 注册；性能上，解析器数量、启用协议集合与重组深度共同决定 CPU 与内存开销；安全上，解析器是处理不可信输入的第一线，其健壮性直接关系到引擎稳定性。以下各节按「概念 → 文件与结构 → 组件协作 → 实例 → 陷阱 → 小结」展开。
+
+### 2. 核心概念
+
+先把术语固定下来。`AppProto` 是协议标识，`src/app-layer-protos.c` 提供 `AppProtoToString`、`StringToAppProto`、`AppProtoNewProtoFromString` 三个真实函数完成协议名与枚举的转换；`ALPROTO_HTTP`、`ALPROTO_DNS` 一类常量与完整枚举取值需对照 `src/app-layer-protos.h` 实际版本核验。协议识别（protocol detection）由 `src/app-layer-detect-proto.c` 承担，入口 `AppLayerProtoDetectGetProto` 在 `src/app-layer.c` 中被调用，静态辅助 `AppLayerProtoDetectPPGetProto` 处理按端口与 pattern/probe 的匹配；识别策略通常综合端口、首包特征与探测结果，具体算法属于机制范畴（原理见 06-05）。
+
+解析与注册是本模块的两条主线。`AppLayerParserParse` 是框架统一解析入口，`src/app-layer-parser.c` 提供一整套 `AppLayerParserRegister*` 接口让各协议把自己的解析回调、状态函数、事务函数、Frame 函数、事件函数登记进框架：`AppLayerParserRegisterParser`、`AppLayerParserRegisterStateFuncs`、`AppLayerParserRegisterTxFreeFunc`、`AppLayerParserRegisterGetTxCnt`、`AppLayerParserRegisterGetTx`、`AppLayerParserRegisterGetTxIterator`、`AppLayerParserRegisterGetFrameFuncs`、`AppLayerParserRegisterGetStateProgressFunc`、`AppLayerParserRegisterGetEventInfo`、`AppLayerParserRegisterTxDataFunc`、`AppLayerParserRegisterApplyTxConfigFunc`、`AppLayerParserRegisterSetStreamDepthFlag`、`AppLayerParserRegisterOptionFlags`、`AppLayerParserRegisterLoggerBits`、`SCAppLayerParserRegisterLogger` 等。这一长串接口看似冗余，实则把「状态分配、解析、事务枚举、事务释放、进度判定、事件查询、日志位、Frame、配置应用」逐项解耦，让 C 与 Rust 解析器都能以同一套契约接入。
+
+事务（tx）与 Frame 是理解检测如何拿到应用层缓冲区的关键。解析器的输出不是一整块流，而是一个个事务：一条 HTTP 请求/响应对、一次 DNS 查询/应答、一次 TLS 握手记录。框架用 `AppLayerParserGetTx`、`AppLayerParserGetTransactionLogId`、`AppLayerParserGetTransactionInspectId`、`AppLayerParserTransactionsCleanup` 管理事务的枚举、检测进度与清理；`src/app-layer-frames.c` / `rust/src/frames.rs` 提供 Frame 机制把流缓冲按协议帧切分，供 sticky buffer 与预过滤使用（原理见 06-05、06-08、字段见 05-04）。检测引擎跑在事务维度上，`DetectRunTx` 一类入口与之对应（模块见 07-04）。这里只给概念与接口名，状态机推进、inspect id 与 log id 的推进条件属于机制范畴。
+
+C 与 Rust 的分工与边界需要单独说清。`src/app-layer-parser.h` 定义 `AppLayerParserState`、`AppLayerParserThreadCtx`、`AppLayerResult`、`AppLayerGetTxIterTuple` 等结构（字段见 05-04）；`rust/src/applayer.rs` 定义 `pub struct RustParser`（含 `parse_ts: ParseFn`、`parse_tc: ParseFn` 两个方向回调）、`pub type ParseFn`（`unsafe extern "C" fn`（参数需对照实际版本核验，返回 `AppLayerResult`））以及 `pub fn AppLayerRegisterParser(parser: &RustParser, alproto: AppProto) -> c_int`。Rust 解析器经 `rust/cbindgen.toml` 生成 FFI 头，把 `RustParser` 结构交回 C 侧注册；`src/app-layer-register.c` 里用 `StringToAppProto(p->name)` 与 `AppProtoToString(alproto)` 做名称校验，正是这条边界的落点之一。把 Suricata 写成纯 C 项目、或把 Rust 解析器写成独立于框架的另一套系统，都与源码不符。
+
+最后说明配置与输出边界。`suricata.yaml.in` 中 `app-layer:` 段（第 941 行附近）下有 `protocols:` 子段（第 943 行附近），用于逐个协议设定启用状态与解析参数，完整键名需对照实际版本核验（参数见 04-02）。解析结果经 `src/output-json-*.c` 落成 EVE 的 http、dns、tls、file、smtp 等事件（模块见 07-07、原理见 06-11）。`app-layer` 不写日志、不做规则匹配、不抓包，只负责识别协议、推进解析、产出事务与 Frame。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，不重列字段。07 全册禁止完整结构体字段表，逐字段定义归 05-04。
+
+- `AppLayerParserState`、`AppLayerParserThreadCtx`、`AppLayerResult`、`AppLayerGetTxIterTuple`：`src/app-layer-parser.h` 声明，实现在 `src/app-layer-parser.c`（字段见 05-04）。
+- `AppProto` 及相关枚举：`src/app-layer-protos.h` / `src/app-layer-protos.c`（字段见 05-04）。
+- 协议识别上下文：`src/app-layer-detect-proto.c/.h` 中的 `AppLayerProtoDetectThreadCtx` 一类结构，字段名需对照实际版本核验（字段见 05-04）。
+- `RustParser`、`ParseFn`、`AppLayerResultRust`、`AppLayerTxData`、`StreamSliceRust`：`rust/src/applayer.rs` 及其 `use` 引入项，FFI 边界见 `rust/cbindgen.toml`（字段见 05-04）。
+- Frame 与事件结构：`src/app-layer-frames.c/.h`、`src/app-layer-events.c/.h`、`rust/src/frames.rs`（字段见 05-04）。
+
+下面是本快照中 `src/app-layer*` 族的真实文件清单节选，按框架、协议识别、C 解析器、辅助四类组织；族内完整枚举可用 `ls src/app-layer*` 复核。
+
+```tree
+src/
+├── app-layer.c / app-layer.h                 模块总入口与初始化
+├── app-layer-parser.c / .h                  解析框架与注册接口族
+├── app-layer-register.c / .h                名称校验与注册辅助
+├── app-layer-protos.c / .h                  AppProto 名称映射
+├── app-layer-detect-proto.c / .h            协议识别（端口/特征/探测）
+├── app-layer-events.c / .h                  应用层事件
+├── app-layer-frames.c / .h                  Frame 机制
+├── app-layer-expectation.c / .h             期望连接（如 FTP 数据通道）
+├── app-layer-ftp.c / .h                     FTP 解析器（C）
+├── app-layer-htp.c / .h                     HTTP 解析器（libhtp）
+├── app-layer-htp-body.c / .h                HTTP body 辅助
+├── app-layer-htp-file.c / .h                HTTP 文件辅助
+├── app-layer-htp-mem.c / .h                 HTTP 内存辅助
+├── app-layer-htp-range.c / .h               HTTP range 辅助
+├── app-layer-htp-xff.c / .h                 XFF 辅助
+├── app-layer-http2.c / .h                   HTTP/2 挂接
+├── app-layer-ike.c / .h                     IKE 挂接
+├── app-layer-imap.c / .h                    IMAP 挂接
+├── app-layer-modbus.c / .h                  Modbus 挂接
+├── app-layer-nfs-tcp.c / .h                NFS over TCP 挂接
+├── app-layer-nfs-udp.c / .h                NFS over UDP 挂接
+├── app-layer-smb.c / .h                     SMB 挂接
+├── app-layer-smtp.c / .h                    SMTP 解析器（C）
+├── app-layer-ssh.c / .h                     SSH 解析器（C）
+├── app-layer-ssl.c / .h                     TLS/SSL 挂接
+├── app-layer-tftp.c / .h                    TFTP 挂接
+├── app-layer-dnp3.c / .h                    DNP3 挂接
+└── app-layer-dnp3-objects.c / .h            DNP3 对象定义
+```
+
+Rust 侧解析器目录的真实清单节选如下，`rust/src/` 下每个目录通常含 `mod.rs`、`parser.rs`、`detect.rs`、`log.rs`、`logger.rs` 等文件，完整枚举可用 `ls rust/src/` 复核。
+
+```tree
+rust/src/
+├── applayer.rs                 RustParser / ParseFn / 注册入口
+├── frames.rs                   Frame 机制（Rust 侧）
+├── filecontainer.rs            文件容器
+├── filetracker.rs              文件跟踪
+├── jsonbuilder.rs              EVE JSON 构造
+├── ja4.rs                      JA4 指纹
+├── kerberos.rs                 Kerberos
+├── tls_version.rs              TLS 版本
+├── dns/                        DNS 解析器
+├── http2/                      HTTP/2 解析器
+├── smb/                        SMB 解析器
+├── ftp/                        FTP 解析器
+├── ike/                        IKE 解析器
+├── quic/                       QUIC 解析器
+├── dhcp/  krb/  ldap/  mqtt/   DHCP/KRB/LDAP/MQTT 等
+├── nfs/  ntp/  pgsql/  pop3/   NFS/NTP/PGSQL/POP3 等
+├── rdp/  rfb/  sip/  snmp/     RDP/RFB/SIP/SNMP 等
+├── ssh/  telnet/  tftp/        SSH/TELNET/TFTP 等
+├── websocket/  x509/  mime/    WebSocket/X509/MIME 等
+├── dcerpc/  enip/  asn1/       DCERPC/ENIP/ASN1 等
+├── sctp/  sdp/  bittorrent_dht/ SCTP/SDP/DHT 等
+├── detect/                     Rust 侧检测关键字实现
+└── ffi/                        FFI 辅助
+```
+
+关键入口在真实源码中的位置如下，均已逐一核对：`src/app-layer-parser.c` 中 `int AppLayerParserRegisterParser`（第 460 行）、`void AppLayerParserRegisterStateFuncs`（第 493 行）、`void AppLayerParserRegisterTxFreeFunc`（第 554 行）、`void AppLayerParserRegisterGetTx`（第 574 行）、`void AppLayerParserRegisterGetTxIterator`（第 584 行）、`void AppLayerParserRegisterGetFrameFuncs`（第 661 行）、`void AppLayerParserRegisterTxDataFunc`（第 682 行）、`AppLayerParserState *AppLayerParserStateAlloc(void)`（第 260 行）、`AppLayerParserThreadCtx *AppLayerParserThreadCtxAlloc(void)`（第 337 行）、`void AppLayerParserTransactionsCleanup(Flow *f, const uint8_t pkt_dir)`（第 993 行）；`src/app-layer-detect-proto.c` 中 `AppProto AppLayerProtoDetectGetProto`（第 1396 行）；`src/app-layer-protos.c` 中 `const char *AppProtoToString(AppProto alproto)`（第 53 行）、`AppProto StringToAppProto(const char *proto_name)`（第 73 行）、`AppProto AppProtoNewProtoFromString`（第 87 行）；`rust/src/applayer.rs` 中 `pub struct RustParser`（第 46 行）、`pub type ParseFn`（第 134 行）、`pub fn AppLayerRegisterParser(parser: &RustParser, alproto: AppProto) -> c_int`（第 180 行）。函数签名与枚举取值需对照实际版本核验。交叉引用：字段见 05-04 ｜ 参数见 04-02 ｜ 原理见 06-05 ｜ 模块见 07-10。
+
+一个值得记住的细节是 `src/app-layer-expectation.c/.h` 的存在：它处理「期望连接」，典型场景是 FTP 控制通道协商出的动态数据通道需要被预先关联到同一会话，这类跨连接关联既不属于纯流管理，也不属于单协议状态机，而是框架级的辅助能力（原理见 06-05）。另一个细节是 `src/app-layer-ssl.c/.h` 与 `rust/src/ja4.rs`、`rust/src/tls_version.rs` 并存：TLS 相关元数据分布在 C 挂接与 Rust 实现两侧，正好印证「C 与 Rust 混合」这一事实，也提醒读者不要把某个协议的实现归到单一语言。
+
+### 4. 关键流程与调用链
+
+本节按模块视角描述 `app-layer` 族内部组件如何协作、以及它如何挂到流水线与日志上，不重复展开 06 册的协议识别状态机与事务推进条件（原理见 06-05、06-01）。可以把整个模块拆成四段：协议识别、注册装配、解析推进、事务与输出。
+
+协议识别是第一段。重组后的连续流缓冲先交给 `src/app-layer.c`，后者调用 `src/app-layer-detect-proto.c` 的 `AppLayerProtoDetectGetProto`，综合端口、首包 pattern 与 probe 结果得到 `AppProto`；`src/app-layer-protos.c` 的 `AppProtoToString` / `StringToAppProto` 负责名称与枚举互转，`src/app-layer-register.c` 在注册时用这两个函数做一致性校验。识别结果写回 `Flow` 的 `alproto` 一类字段（字段见 05-03、05-04），后续所有解析与检测都据此分派。识别失败的常见后果是协议保持 unknown，`http.*`、`dns.*` 一类 sticky buffer 规则自然不命中，EVE 里也不会出现对应事件；这属于排障第一段的证据（原理见 08-03）。
+
+注册装配是第二段，发生在引擎初始化阶段。每个协议解析器通过 `src/app-layer-parser.c` 的 `AppLayerParserRegisterParser` 登记两个方向的解析回调，再按需登记 `AppLayerParserRegisterStateFuncs`（状态分配与释放）、`AppLayerParserRegisterGetTx` / `AppLayerParserRegisterGetTxCnt` / `AppLayerParserRegisterTxFreeFunc`（事务枚举与释放）、`AppLayerParserRegisterGetStateProgressFunc`（进度判定）、`AppLayerParserRegisterGetFrameFuncs`（Frame）、`AppLayerParserRegisterGetEventInfo`（事件）、`AppLayerParserRegisterTxDataFunc` 与 `AppLayerParserRegisterApplyTxConfigFunc`（事务数据与配置）、`AppLayerParserRegisterLoggerBits` / `SCAppLayerParserRegisterLogger`（日志位）。Rust 解析器走 `rust/src/applayer.rs` 的 `AppLayerRegisterParser`，把 `RustParser` 结构（含 `parse_ts` / `parse_tc` 两个 `ParseFn`）经 FFI 交给同一套注册接口。`rust/cbindgen.toml` 生成的头文件是这条路径的契约边界（模块见 07-10）。
+
+解析推进与事务输出是第三、四段。稳态下，`AppLayerParserParse` 按方向把流缓冲喂给已注册的解析回调，解析器推进状态机并产出一个或多个 tx；框架用 `AppLayerParserGetTx`、`AppLayerParserGetTransactionInspectId`、`AppLayerParserGetTransactionLogId` 维护检测进度与日志进度，`AppLayerParserTransactionsCleanup` 在适当时候回收已完成事务，`src/app-layer-frames.c` 与 `rust/src/frames.rs` 提供 Frame 供缓冲区匹配使用。检测引擎在事务维度上求值（模块见 07-04、原理见 06-08），输出模块把结构化结果写成 EVE 的 http、dns、tls、file、smtp 等事件（模块见 07-07、原理见 06-11）。`src/app-layer-events.c/.h` 与 `src/app-layer-expectation.c/.h` 分别承担异常事件与期望连接这两类旁路能力。四段关系与 C/Rust 边界见图 07-03-01。
+
+:::figure id=07-03-01 | name=app-layer 模块注册、识别与解析链路 | dir=TD
+node a1 "重组流缓冲<br/>stream-tcp" blue
+node a2 "协议识别<br/>app-layer-detect-proto" teal
+node a3 "AppProto 映射<br/>app-layer-protos" gray
+node a4 "AppLayerParserParse<br/>解析入口" purple
+node a5 "C parser<br/>app-layer-htp/ftp" teal
+node a6 "Rust parser<br/>rust/src/*/" teal
+node a7 "事务 tx 与 Frame<br/>app-layer-frames" amber
+node a8 "EVE 应用事件<br/>output-json-*" green
+edge a1 -> a2 "连续流"
+edge a2 -> a3 "查协议名"
+edge a3 -> a4 "确定 alproto"
+edge a4 -> a5 "C 注册回调"
+edge a4 -> a6 "Rust FFI 回调"
+edge a5 -> a7 "生成 tx"
+edge a6 -> a7 "生成 tx"
+edge a7 -> a8 "日志落盘"
+edge a2 -> a4 dashed "识别结果"
+:::
+
+图 07-03-01 中实线是主解析链路，虚线是识别结果向解析入口的传递。要强调的是，这张图是模块内部组件图，不是 06-05 的完整状态机图，也不是 06-01 的全流水线图；`AppLayerParserParse` 只是流水线中应用解析段的一个框架入口，前后还有重组与检测。把协议识别、注册、解析、事务四个阶段拆开看，才能理解为什么「协议已识别但无 http 事件」与「协议未识别」是两类完全不同的故障。本篇不展开事务进度推进的具体条件（原理见 06-05），也不展开检测引擎如何消费 tx（原理见 06-08）。
+
+### 5. 配置/命令/代码实例
+
+本节只给最小必要实例。`suricata.yaml` 中 `app-layer.protocols` 全段与全部命令行见 04 全册（参数见 04-02、04-07），此处不重列参数全集；07 全册每篇代码段最多 3–5 个本模块最典型调用，其余写「完整 API 见 04-xx」。下面这段按真实函数名书写，示意注册与解析两条路径，不构成完整实现。
+
+```c
+/* app-layer 模块最典型的注册与解析入口摘录，见 src/app-layer-parser.c */
+AppLayerParserRegisterParser(ipproto, alproto, direction, parse_ts_fn); /* 登记解析回调 */
+AppLayerParserRegisterGetTx(ipproto, alproto, get_tx_fn);                /* 登记事务枚举 */
+AppLayerParserTransactionsCleanup(f, pkt_dir);                          /* 回收已完成事务 */
+AppLayerProtoDetectGetProto(tctx, f, buf, buflen, ipproto, flags);      /* 协议识别 */
+AppLayerParserParse(tv, alp_tctx, f, alproto, direction, buf, len);     /* 统一解析入口 */
+```
+
+五个调用分别代表解析回调注册、事务枚举注册、事务清理、协议识别与统一解析入口，是本模块最典型的一组接口；`AppLayerParserParse` 的完整参数列表、`AppLayerProtoDetectGetProto` 的 flags 语义与各注册函数的回调签名需对照实际版本核验。完整接口清单、配置键名与命令行见 04-02、04-07，机制原理见 06-05，此处不再追加调用。
+
+下面给一组按「前置检查 → 执行 → 验证输出 → 清理」组织的源码核验命令，用于同时定位 C 侧注册接口与 Rust 侧解析器契约。
+
+```bash
+# 前置：进入真实仓库根
+cd upstream_src/suricata/suricata-main
+
+# 执行：定位 C 侧注册/清理接口与 Rust 侧解析器契约
+grep -n "AppLayerParserRegisterParser\|AppLayerParserTransactionsCleanup" src/app-layer-parser.c
+grep -n "pub struct RustParser\|pub type ParseFn\|pub fn AppLayerRegisterParser" rust/src/applayer.rs
+
+# 验证：确认 Rust 解析器目录数量合理
+ls -d rust/src/*/ | wc -l
+
+# 清理：退出查阅目录
+cd -
+```
+
+典型输出如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+src/app-layer-parser.c:460:int AppLayerParserRegisterParser(uint8_t ipproto, AppProto alproto,
+src/app-layer-parser.c:993:void AppLayerParserTransactionsCleanup(Flow *f, const uint8_t pkt_dir)
+rust/src/applayer.rs:46:pub struct RustParser {
+rust/src/applayer.rs:134:pub type ParseFn = unsafe extern "C" fn(
+rust/src/applayer.rs:180:pub fn AppLayerRegisterParser(parser: &RustParser, alproto: AppProto) -> c_int {
+```
+
+逐行判读如下。第 460 行 `AppLayerParserRegisterParser` 的参数以 `uint8_t ipproto`、`AppProto alproto` 开头，说明注册是按「IP 协议号 + 应用层协议 + 方向」三元组索引的，返回 `int` 表明注册可能失败，判读时若返回错误通常意味着协议已注册或参数越界；这一行是 C 与 Rust 解析器共同接入的起点，不要误以为只服务 C 解析器。第 993 行 `AppLayerParserTransactionsCleanup(Flow *f, const uint8_t pkt_dir)` 接收 `Flow *` 与方向，说明事务清理是流级、按方向推进的动作，而非每包动作；若事务长期不清理，最直接的后果是内存增长，这也解释了为什么重组深度与事务进度会一起影响内存占用。第 46 行 `pub struct RustParser {` 是 Rust 侧解析器描述结构的定义起点，其内部字段包含 `parse_ts` / `parse_tc` 两个方向回调；第 134 行 `pub type ParseFn = unsafe extern "C" fn(` 把解析回调定义为 `extern "C"` 的 FFI 函数类型并返回 `AppLayerResult`，这正是 C 框架能调用 Rust 函数的关键，`unsafe` 则提示跨语言调用不受 Rust 借用检查保护。第 180 行 `AppLayerRegisterParser(parser: &RustParser, alproto: AppProto) -> c_int` 把 `RustParser` 引用与协议枚举交给框架并返回 `c_int`，与第 460 行 C 侧注册接口在语义上对齐，两者共同构成 FFI 边界。最后 `ls -d rust/src/*/ | wc -l` 若偏少，说明拿到的是裁剪过的快照，应回到 SPEC 第 0.1 节确认归档层级。整组输出共同验证了「C 框架统一注册、Rust 以 FFI 接入」这一混合结构。
+
+按子族整理的职责对照见下表，便于按现象反查应先读哪个文件。
+
+| 子族 | 代表文件 | 主要职责 | 典型入口 |
+|---|---|---|---|
+| 解析框架 | `app-layer-parser.c/.h` | 注册接口族、状态与事务管理 | `AppLayerParserRegisterParser` |
+| 协议识别 | `app-layer-detect-proto.c` | 端口/特征/探测识别 | `AppLayerProtoDetectGetProto` |
+| 协议名映射 | `app-layer-protos.c` | 名称与枚举互转 | `AppProtoToString`、`StringToAppProto` |
+| 注册辅助 | `app-layer-register.c` | 名称一致性校验 | 需对照实际版本核验 |
+| C 解析器 | `app-layer-htp.c`、`app-layer-ftp.c` | 具体协议状态机 | 需对照实际版本核验 |
+| Rust 解析器 | `rust/src/dns/`、`rust/src/http2/` | 具体协议状态机 | `RustParser`、`AppLayerRegisterParser` |
+| 事务与 Frame | `app-layer-frames.c`、`rust/src/frames.rs` | 帧切分与缓冲区供给 | 需对照实际版本核验 |
+| 事件与期望 | `app-layer-events.c`、`app-layer-expectation.c` | 异常事件、期望连接 | 需对照实际版本核验 |
+| 配置 | `suricata.yaml.in` 的 `app-layer.protocols` | 逐协议启用与参数 | 参数见 04-02 |
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一组陷阱围绕协议识别与启用状态。「规则不命中」时最容易先怀疑规则写法，但更常见的根因是协议根本没被识别，或 `app-layer.protocols` 里该协议未启用、解析参数过严。识别综合端口、首包特征与 probe，非标准端口上的协议、加密后的协议、被分片或重组不完整的首包都可能导致识别失败；协议名枚举与配置键名需对照 `src/app-layer-protos.h`、`suricata.yaml.in` 实际版本核验（参数见 04-02）。排查顺序建议固定为「重组缓冲是否到位 → alproto 是否识别 → parser 是否启用 → tx 是否产出 → sticky buffer 是否可见 → 规则是否命中」，这套顺序属于诊断树（原理见 08-03、08-04），本篇不展开运维步骤。另一个高频误判是把「协议未识别」与「协议识别但检测被跳过」混为一谈，后者可能来自 bypass、重组深度或事务进度，证据完全不同。
+
+第二组陷阱与可见性边界直接相关，这一篇风险最高。TLS 等加密载荷的明文正文不可见，`app-layer` 能拿到的是握手元数据、证书、SNI、ALPN、JA3/JA4 指纹等；任何「解析 HTTPS 正文」「解密后匹配」的表述都与能力边界冲突。QUIC 等新协议同样有加密边界，可见字段取决于握手阶段与实现，具体字段需对照 `rust/src/quic/`、`rust/src/ja4.rs` 实际版本核验。另需牢记 `app-layer` 不做转发、不改写报文，内联模式下的 verdict 由 NFQUEUE / AF_PACKET 桥接给出（原理见 06-12），把协议解析器当成代理或网关是职责错位。加密流超过重组深度后不再供给应用层，这也是「长连接后段看不到应用事件」的常见原因（原理见 06-04、06-05）。
+
+第三组陷阱是 C / Rust 边界与性能。新增解析器时若忽略 `rust/cbindgen.toml` 的 FFI 生成步骤，或改动 `RustParser` 字段后未同步 C 侧头文件，会出现链接期或运行期错位；`src/flow-bindgen.h`、`src/app-layer-register.c` 这类文件正是边界落点，字段名需对照实际版本核验（模块见 07-10）。性能方面，启用协议越多、事务越密、重组越深，CPU 与内存开销越大；解析器数量、fast_pattern 与 MPM 编译规模之间也有联动（模块见 07-05、原理见 08-02）。任何吞吐、每秒事务数、内存占用结论一律标注「需在目标机型实测」，不给绝对值。解析器处理不可信输入，其健壮性还关系到引擎稳定性，可疑崩溃应结合 fuzz target 与单测复核（工具链见 07-13）。
+
+最佳实践可归纳为四条。其一，启用协议遵循最小化原则，只开业务确实需要的协议，减少攻击面与开销。其二，新增解析器先明确走 C 还是 Rust：C 侧按 `src/app-layer-parser.c` 的注册接口族登记，Rust 侧实现 `RustParser` 并经 `AppLayerRegisterParser` 接入，同时补齐 `detect.rs`、`log.rs` 一类配套文件（参考 `rust/src/dns/`、`rust/src/http2/` 的目录结构）。其三，改动事务进度或 Frame 逻辑后，务必用该族自带的单元测试回归；`src/app-layer-ssh.c` 等文件内含大量构造报文的测试代码，可直接作为基线。其四，把协议识别率、各协议事件数量与事务清理水位纳入监控基线，关注相对变化。交叉引用：字段见 05-04 ｜ 参数见 04-02 ｜ 原理见 06-05 ｜ 模块见 07-10。
+
+### 7. 小结与延伸阅读
+
+`app-layer` 模块把重组后的连续字节流还原成协议语义，以 `src/app-layer-parser.c/.h` 为框架、`src/app-layer-detect-proto.c` 做协议识别、`src/app-layer-protos.c` 做名称映射、一众 `src/app-layer-*.c` 承载 C 解析器、`rust/src/` 下数十个目录与 `applayer.rs` 承载 Rust 解析器，经 `rust/cbindgen.toml` 的 FFI 边界接入同一套注册契约。它以事务（tx）与 Frame 为检测与日志的产出单位，以 `AppLayerParserTransactionsCleanup` 等接口管理生命周期；不写日志、不做规则匹配、不抓包、不转发、不解密，TLS 明文正文不可见。作为 C 与 Rust 交汇最密集的模块，它也是「Suricata 不是纯 C 项目」最直接的证据。
+
+继续深入的路径有四条。想理解协议识别策略、事务状态机、inspect id / log id 推进与 Frame 的完整机制，读 06-05、06-08；想查 `AppLayerParserState`、`AppLayerResult`、`RustParser` 的逐字段定义与 FFI 布局，读 05-04；想核对 `app-layer.protocols` 全段与命令行，读 04-02、04-07；想按目录了解相邻模块，读 07-01（decode）、07-02（flow）、07-04（detect）、07-07（output）、07-08（stream-tcp）与 07-10（rust/）。协议识别失败的排障与容量调优见 08-03、08-04、08-02。所有性能与容量结论均需在目标机型实测，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验。
+
+## 07-04 detect 检测引擎模块
+
+### 1. 背景与动机
+
+一条规则从文本文件里的一行字符串，变成运行期对每个报文或每个事务高效求值的可执行结构，中间要经历解析、关键字查表、签名构造、按协议与端口方向分组、预过滤引擎挂接、多模式匹配器编译、检测线程上下文装配等一整套流程；运行期还要按 buffer 顺序求值 `SigMatch` 链、处理阈值与抑制、维护 flowbits 等有状态关键字、判定 alert / pass / drop / reject 动作并排队告警。这套复杂度几乎全部落在 `src/detect*` 一族里。本快照中 `src/detect*` 的 `.c/.h` 文件合计四百余个，是全仓库规模最大的模块族；把它们笼统称作「检测引擎」而不细分职责，读者在排障时根本无法定位到具体文件。本篇按 07 册惯例讨论这个模块族的分层、文件构成、关键入口与生命周期，不重复展开 06 册已经讲透的规则编译、MPM 与检测求值机制（原理见 06-06 ~ 06-09）。
+
+为什么必须把 `detect` 单独作为一个模块讲清楚，有三个现实原因。其一，它是「唯一权威源去重」里最容易被写串的一册：规则关键字全集归 04-05、04-06，结构体逐字段归 05-05、05-06，机制与调用链归 06-06 ~ 06-09，模块能力归本篇，边界不立住就会在多个册里重复堆砌关键字表。其二，它是启动期与运行期两类失败最集中的地方：规则加载报错、未知关键字、编译期内存膨胀、热重载失败、无告警、误报过多，根因大多能落到某个具体 `detect-engine-*` 文件。其三，它的规模决定了阅读策略：四百余个文件里，真正属于框架核心的只有十几个，其余是按关键字或阶段切分的实现，按「三层分工」去读才不会迷路。
+
+能力边界必须先立住。Suricata 是 IDS / IPS / NSM 引擎，不是防火墙，不做 IP 转发，不做路由；检测引擎负责判定「是否命中规则、产生何种动作」，内联模式下的 drop 依靠 NFQUEUE 或 AF_PACKET 桥接的 verdict 落地（原理见 06-12、模块见 07-06），IDS 旁路模式只告警不丢弃。规则语法兼容 Snort 但有自有扩展，`src/detect-parse.c`、`src/detect-engine-register.c` 是这一点的源码依据，不能宣称 100% 兼容；EVE JSON 是主要输出（`src/output-json*.c`），fast.log / stats.log 等为辅助输出。可见性方面，引擎只对自身解码并重组到的流量做检测，TLS 等加密载荷的明文正文不可见，能拿到的是握手元数据、证书、SNI、JA3/JA4 一类指纹，不能宣称能读到 HTTPS 明文。把检测引擎写成「能过滤并转发流量」或「能审计加密正文」都是写反。本套资料版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验。
+
+去重纪律照旧：07 是全集的模块功能唯一权威源，`Signature`、`SigMatch`、`DetectEngineCtx`、`SigGroupHead` 等逐字段定义归 05-05、05-06，规则关键字与命令参数全集归 04-05、04-06、04-07，机制与调用链归 06-06 ~ 06-09，运维排障归 08 全册。本篇只讲「这个模块由哪些文件组成、三层各做什么、关键入口在哪、生命周期如何」，交叉引用统一写「字段见 05-05 ｜ 参数见 04-05 ｜ 原理见 06-06 ｜ 模块见 07-05」。凡涉及具体关键字枚举、配置键名、函数签名未逐一核实的内容，一律标注「需对照实际版本核验」并给出可定位目录。
+
+从工程价值看，建立这个模块的地图有四个直接收益。排障时，`suricata -T` 报语法错、报未知关键字、在线跑通却无 alert、误报过多，分别对应解析层、注册表层、分组与 buffer 可见性、规则质量四类根因；调优时，规则集规模、fast_pattern 选择、MPM 算法与 `sgh-mpm-context` 共同决定编译期内存与运行期 CPU；扩展时，新增关键字要清楚注册表与预过滤支持位怎么挂；安全上，不可信规则的 `pcre` 回溯、`dataset` 大表、超多 `fast_pattern` 会直接冲击启动期资源。以下各节按「概念 → 分层文件 → 编译与运行链 → 实例 → 陷阱 → 小结」展开。
+
+### 2. 核心概念
+
+先把三层分工固定下来，这是阅读四百余个文件的地图。第一层是核心框架：`src/detect.c` / `detect.h`（检测线程槽位与求值主流程）、`src/detect-parse.c` / `detect-parse.h`（规则文本解析与 `Signature` 构造）、`src/detect-engine.c` / `detect-engine.h`（`DetectEngineCtx` 生命周期与热重载）、`src/detect-engine-loader.c` / `.h`（规则文件加载）、`src/detect-engine-register.c` / `.h`（关键字注册表）、`src/detect-engine-build.c` / `.h`（分组编译总装）、`src/detect-engine-siggroup.c` / `.h`、`src/detect-engine-sigorder.c` / `.h`（分组与排序）。第二层是编译与阶段实现：`src/detect-engine-mpm.c`、`src/detect-engine-prefilter.c`、`src/detect-engine-prefilter-common.c`、`src/detect-engine-content-inspection.c`、`src/detect-engine-inspect-buffer.c`、`src/detect-engine-payload.c`、`src/detect-engine-state.c`、`src/detect-engine-iponly.c`、`src/detect-engine-threshold.c`、`src/detect-engine-tag.c`、`src/detect-engine-alert.c`、`src/detect-engine-event.c`、`src/detect-engine-file.c`、`src/detect-engine-frame.c`、`src/detect-engine-uint.c`、`src/detect-engine-port.c`、`src/detect-engine-proto.c`、`src/detect-engine-address*.c`、`src/detect-engine-profile.c`、`src/detect-engine-analyzer.c` 等。第三层是关键字实现族：`src/detect-*.c/.h` 里按关键字一一切分的文件，例如 `detect-content`、`detect-pcre`、`detect-fast-pattern`、`detect-flow`、`detect-flowbits`、`detect-xbits`、`detect-hostbits`、`detect-byte*`、`detect-dataset`、`detect-datarep`、`detect-http-*`、`detect-tls-*`、`detect-file-*`、`detect-transform-*`、`detect-lua`、`detect-ja4-hash`、`detect-template`、`detect-requires`、`detect-config`、`detect-entropy`、`detect-iprep`、`detect-geoip` 等，每个文件通常自带注册与单元测试。
+
+编译期与运行期是理解本模块的第二组概念。编译期把规则文本变成可执行结构：`SigTableSetup` 建立关键字表 `sigmatch_table`，`SigLoadSignatures` 读取规则文件，`SigInit` 逐条解析成 `Signature` 与 `SigMatch` 链，`SigGroupHeadBuildMatchArray` 一类函数按协议 / 端口 / 方向把签名分进 `SigGroupHead`，`PrefilterSetupRuleGroup` 与 `PatternMatchPrepareGroup` 给每个组挂上 MPM 与预过滤引擎，`MpmStoreReportStats` 输出编译统计。运行期则以 `Detect` 槽位为入口，经 `DetectRun`、`DetectRunTx`、`SigMatchSignatures` 完成匹配与告警排队。这两个阶段的分界线，就是 `DetectEngineCtx` 构建完成、检测线程上下文 `DetectEngineThreadCtxInit` 装配完毕的时刻（字段见 05-05、05-06；原理见 06-06、06-08）。本篇只点名阶段与入口，不展开求值顺序与 buffer 机制。
+
+关键字注册表是第三组概念，也是「规则语法兼容 Snort 但有自有扩展」的落点。`src/detect-engine-register.c` 中 `void SigTableSetup(void)` 初始化全局 `sigmatch_table[]`，表项类型 `SigTableElmt` 携带关键字名、描述、flags、别名、替代项、是否支持预过滤（`SupportsPrefilter`）等信息；同一文件还提供关键字列举与 `--list-keywords` 一类输出能力，具体选项需对照实际版本核验（参数见 04-07）。规则里出现表里没有的关键字时，加载阶段就会报未知关键字错误——这正是 08-04 案例库里的一类典型故障。`sigmatch_table` 的表项字段与关键字枚举取值需对照实际版本核验（字段见 05-05）。
+
+动作与输出是第四组概念。规则动作 `alert`、`pass`、`drop`、`reject` 决定命中后的行为；`drop` / `reject` 只在内联 IPS 模式下才真正影响报文，且仍由 verdict 落地（原理见 06-12）。告警与事件由 `src/detect-engine-alert.c` 与输出模块协作写成 EVE 的 alert / drop 事件（模块见 07-07、原理见 06-11）。需要强调，`detect` 模块本身不写日志文件、不抓包、不重组流，它消费上游提供的 `Packet`、flow 状态与应用层事务缓冲区，产出命中判定与告警队列。把「检测」写成「输出」或「阻断执行」都是职责错位。
+
+最后说明与相邻模块的边界。`detect` 的上游是 `flow`（模块见 07-02）、`app-layer`（模块见 07-03）、`stream-tcp`（模块见 07-08），下游是 `output`（模块见 07-07）；MPM 与 Hyperscan 匹配器由 `util-mpm` 模块提供（模块见 07-05），`detect` 通过 `detect-engine-mpm.c` 与之挂接。交叉引用在本篇统一采用「字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx」写法。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，不重列字段。07 全册禁止完整结构体字段表，逐字段定义归 05-05、05-06、05-07。
+
+- `Signature`、`SigMatch`、`DetectEngineCtx`、`SigGroupHead`：`src/detect.h` 与 `src/detect-engine*.c` 中定义与构建（字段见 05-05、05-06）。
+- `sigmatch_table[]`、`SigTableElmt`：`src/detect-engine-register.c` 与相关头文件（字段见 05-05）。
+- `PrefilterEngine` 与 MPM 挂接结构：`src/detect-engine-prefilter.h`、`src/detect-engine-mpm.h`、`src/util-mpm.h`（字段见 05-06）。
+- `DetectEngineThreadCtx` 与检测线程上下文：`src/detect-engine.c` 一类文件，`DetectEngineThreadCtxInit` 为装配入口（字段见 05-05、05-07）。
+- `TmModule` 注册表项中检测槽位：`src/detect.c` 与 `src/tm-modules.h`（字段见 05-07）。
+
+下面是本快照中 `src/detect*` 族的真实文件清单节选。该族共四百余个 `.c/.h` 文件，无法也不必逐行罗列，下表按三层分工给出代表性文件；完整枚举请在快照根目录用 `ls src/detect*` 复核，命名规则为「`detect-engine-*.c` 属编译与阶段层、`detect-<关键字>.c` 属关键字层」。
+
+```tree
+src/
+├── detect.c / detect.h                        检测槽位与求值主流程
+├── detect-parse.c / detect-parse.h            规则解析与 Signature 构造
+├── detect-engine.c / detect-engine.h          DetectEngineCtx 生命周期
+├── detect-engine-loader.c / .h                规则文件加载
+├── detect-engine-register.c / .h              关键字注册表 SigTableSetup
+├── detect-engine-build.c / .h                 分组编译总装
+├── detect-engine-siggroup.c / .h              签名分组 SigGroupHead
+├── detect-engine-sigorder.c / .h              签名排序
+├── detect-engine-mpm.c / .h                   MPM 与分组挂接
+├── detect-engine-prefilter.c / .h             预过滤引擎
+├── detect-engine-prefilter-common.c / .h      预过滤公共辅助
+├── detect-engine-content-inspection.c / .h    内容匹配
+├── detect-engine-inspect-buffer.c / .h        InspectionBuffer
+├── detect-engine-payload.c / .h               payload 检测
+├── detect-engine-state.c / .h                 检测状态
+├── detect-engine-iponly.c / .h                IP-only 规则
+├── detect-engine-threshold.c / .h             阈值与抑制
+├── detect-engine-tag.c / .h                   tag 关键字
+├── detect-engine-alert.c / .h                 告警排队
+├── detect-engine-event.c / .h                 解码/流事件规则
+├── detect-engine-file.c / .h                  文件检测
+├── detect-engine-frame.c / .h                 Frame 检测
+├── detect-engine-uint.c / .h                  整数型关键字辅助
+├── detect-engine-port.c / .h                  端口分组
+├── detect-engine-proto.c / .h                 协议分组
+├── detect-engine-address.c / .h               地址分组（含 ipv4/ipv6 分文件）
+├── detect-engine-profile.c / .h               profiling
+├── detect-engine-analyzer.c / .h              规则分析
+├── detect-content.c / .h                      content 关键字
+├── detect-pcre.c / .h                         pcre 关键字
+├── detect-fast-pattern.c / .h                 fast_pattern 选择
+├── detect-flow.c / detect-flowbits.c           flow 与 flowbits
+├── detect-xbits.c / detect-hostbits.c          xbits 与 hostbits
+├── detect-byte*.c / .h                        byte_* 族
+├── detect-dataset.c / detect-datarep.c        dataset 与 datarep
+├── detect-http-*.c / .h                       HTTP sticky buffer 族
+├── detect-tls-*.c / .h                        TLS 关键字族
+├── detect-file-*.c / .h                       文件关键字族
+├── detect-transform-*.c / .h                  transform 族
+├── detect-lua.c / .h                          lua 关键字
+├── detect-ja4-hash.c / .h                     JA4 指纹关键字
+├── detect-template.c / .h                     关键字模板
+├── detect-requires.c / detect-config.c        requires / config 关键字
+├── detect-entropy.c / detect-iprep.c          entropy / iprep 关键字
+└── detect-geoip.c / .h                        geoip 关键字
+```
+
+关键入口在真实源码中的位置如下，均已逐一核对：`src/detect.c` 中 `TmEcode Detect(ThreadVars *tv, Packet *p, void *data)`（第 3281 行）、`static void DetectRun`（第 105 行声明）、`static void DetectRunTx`（第 91 行声明、第 2614 行定义）、`void SigMatchSignatures`（第 3360 行）；`src/detect-engine-register.c` 中 `void SigTableSetup(void)`（第 638 行），并以 `sigmatch_table[i]`、`SigTableElmt`、`SupportsPrefilter` 等形式使用关键字表；`src/detect-engine-loader.c` 中 `int SigLoadSignatures(DetectEngineCtx *de_ctx, char *sig_file, bool sig_file_exclusive)`（第 384 行），`src/detect-engine.c` 在第 4280、4339、5296 行调用它；`src/detect-engine-siggroup.c` 中 `int SigGroupHeadBuildMatchArray(DetectEngineCtx *de_ctx, SigGroupHead *sgh)`（第 531 行）；`src/detect-engine-prefilter.c` 中 `int PrefilterSetupRuleGroup(DetectEngineCtx *de_ctx, SigGroupHead *sgh)`（第 1289 行），内部第 1291 行调用 `PatternMatchPrepareGroup(de_ctx, sgh)`；`src/detect-engine-mpm.c` 中 `int PatternMatchPrepareGroup(DetectEngineCtx *de_ctx, SigGroupHead *sh)`（第 2394 行）、`void PatternMatchThreadPrepare`（第 993 行）、`void MpmStoreReportStats(const DetectEngineCtx *de_ctx)`（第 1561 行）；`src/detect-engine-build.c` 在第 2009–2183 行依次调用 `SigGroupHeadBuildMatchArray`、`PrefilterSetupRuleGroup` 与 `MpmStoreReportStats`。`SigInit`、`DetectEngineCtxInit`、`DetectEngineCtxFree`、`DetectEngineThreadCtxInit` 在本快照的单元测试代码中反复出现，均为真实符号，签名需对照实际版本核验。交叉引用：字段见 05-05 ｜ 参数见 04-05 ｜ 原理见 06-06 ｜ 模块见 07-05。
+
+一个阅读时值得记住的细节是 `src/detect-template.c/.h` 与 `src/decode-template.c/.h` 一样属于骨架文件：前者是新增关键字时可参照的最小实现，后者是新增解码器的模板。另一个细节是 `src/detect-engine-analyzer.c` 与 `src/detect-engine-profile.c` 的存在：检测引擎自带规则分析与 profiling 能力，这两类能力属于引擎自身而非运维脚本，具体选项与输出格式需对照实际版本核验（参数见 04-07、原理见 08-02）。
+
+### 4. 关键流程与调用链
+
+本节按模块视角描述 `detect` 族的编译期与运行期两条链，以及 `DetectEngineCtx` 的生命周期，重点在「哪一层文件负责哪一段」，不重复展开 06 册已经讲透的规则编译、MPM 构建、SigMatch 求值与有状态关键字机制（原理见 06-06、06-07、06-08、06-09）。
+
+编译期链从关键字表初始化开始。`SigTableSetup` 把全部内置关键字登记进 `sigmatch_table`，每个表项携带解析回调、Setup 回调、flags 与是否支持预过滤等信息；随后 `SigLoadSignatures` 按配置读取规则文件，逐行交给 `SigInit` 做规则头与选项解析，构造 `Signature` 与 `SigMatch` 链。解析阶段遇到表里没有的关键字会直接报错，遇到语法错误会在 `suricata -T` 阶段暴露（参数见 04-08、原理见 06-06）。解析完成后，`src/detect-engine-siggroup.c` 的 `SigGroupHeadBuildMatchArray` 一类函数按协议、端口、方向与地址把签名分进 `SigGroupHead`，`src/detect-engine-sigorder.c` 处理排序；`src/detect-engine-build.c` 作为总装，依次调用分组结果上的 `PrefilterSetupRuleGroup`，后者再调 `PatternMatchPrepareGroup` 为每个组构建 MPM 与预过滤引擎，最后由 `MpmStoreReportStats` 输出编译统计。这条链的产物就是一个构建完毕的 `DetectEngineCtx`（字段见 05-05、05-06）。
+
+运行期链从 `Detect` 槽位开始。`TmEcode Detect(ThreadVars *tv, Packet *p, void *data)` 是 `TmModule` 形态的包处理槽位，内部走 `DetectRun`，涉及应用层事务时走 `DetectRunTx`，再由 `SigMatchSignatures` 完成候选签名的求值与告警排队。检测线程上下文由 `DetectEngineThreadCtxInit` 从 `DetectEngineCtx` 装配，运行期只读地共享编译产物、按线程持有匹配暂存区；`PatternMatchThreadPrepare` 一类函数为 MPM 准备每线程上下文。命中后的动作（alert / pass / drop / reject）由 `src/detect-engine-alert.c` 与输出模块协作落成 EVE 事件（模块见 07-07、原理见 06-11）。这里只给入口与文件分工，SigMatch 链求值顺序、InspectionBuffer 与 payload / stream / app-layer buffer 的匹配顺序属于机制范畴（原理见 06-08）。
+
+`DetectEngineCtx` 的生命周期把两条链串起来：启动期由 `DetectEngineCtxInit` 创建并完成上述编译，`DetectEngineCtxFree` 负责释放；规则热重载时引擎会构建新的 `DetectEngineCtx` 再原子替换，`src/detect-engine.c` 中多处 `SigLoadSignatures`（以新上下文重载） 正是这条路径的证据，`suricatasc reload-rules` 是触发它的控制面命令（参数见 04-07、模块见 07-12、原理见 06-06）。理解这一点很重要：热重载失败时旧上下文仍在服务，规则集不会瞬间失效，但新规则也不会生效，排查时要同时看加载日志与当前生效的上下文。两条链与三层分工的关系见图 07-04-01。
+
+:::figure id=07-04-01 | name=detect 模块编译期与运行期职责链 | dir=TD
+node c1 "规则文件<br/>rule-files" blue
+node c2 "加载与解析<br/>SigLoadSignatures" teal
+node c3 "关键字表<br/>SigTableSetup" amber
+node c4 "签名分组<br/>SigGroupHead" amber
+node c5 "MPM/预过滤<br/>PatternMatchPrepareGroup" amber
+node c6 "Detect 槽位<br/>detect.c" purple
+node c7 "SigMatch 求值<br/>DetectRun / DetectRunTx" purple
+node c8 "告警与动作<br/>alert / drop" red
+node c9 "EVE 输出<br/>output-json" green
+edge c1 -> c2 "读取规则"
+edge c3 -> c2 "关键字查表"
+edge c2 -> c4 "构造 Signature"
+edge c4 -> c5 "挂接预过滤"
+edge c5 -> c6 "编译产物就绪"
+edge c6 -> c7 "每包/每事务"
+edge c7 -> c8 "命中判定"
+edge c8 -> c9 "事件落盘"
+edge c4 -> c7 dashed "sgh 候选规则"
+:::
+
+图 07-04-01 中上半部（c1 至 c5）是编译期、下半部（c6 至 c9）是运行期，虚线表示分组产出的候选规则在运行期被消费。要强调的是，这张图是模块内部的职责链，不是 06-01 的全流水线图，也不是 06-06 的规则编译机制图；`Detect` 只是流水线上的一个槽位，前后还有流、重组、应用解析与输出。`util-mpm` 与 Hyperscan 的匹配器实现不在这张图里展开（模块见 07-05、原理见 06-07）。本篇也不重列规则关键字全集（参数见 04-05、04-06），只说明它们以 `src/detect-<关键字>.c` 的形式挂在注册表上。
+
+### 5. 配置/命令/代码实例
+
+本节只给最小必要实例。规则关键字全集、命令行与返回码见 04 全册（参数见 04-05、04-06、04-07、04-08），此处不重列参数全集；07 全册每篇代码段最多 3–5 个本模块最典型调用，其余写「完整 API 见 04-xx」。下面这段按真实函数名书写，示意编译期与运行期最典型的入口关系，不构成完整实现。
+
+```c
+/* detect 模块最典型的编译与运行入口摘录，见 src/detect*.c */
+SigTableSetup();                                  /* 初始化关键字注册表 */
+SigLoadSignatures(de_ctx, sig_file, false);        /* 读取并解析规则文件 */
+PatternMatchPrepareGroup(de_ctx, sgh);             /* 为分组构建 MPM 预过滤 */
+Detect(tv, p, data);                              /* 检测槽位：每包进入 */
+SigMatchSignatures(&th_v, de_ctx, det_ctx, p);    /* 候选签名求值 */
+```
+
+五个调用分别代表关键字表初始化、规则加载、分组预过滤构建、检测槽位与签名求值，是 `detect` 模块最典型的一组入口；`SigLoadSignatures` 的 `sig_file_exclusive` 参数、`SigMatchSignatures` 的完整签名与 `PatternMatchPrepareGroup` 的返回值语义需对照实际版本核验。完整接口清单、规则关键字与命令行见 04-05、04-06、04-07、04-08，机制原理见 06-06 ~ 06-09，此处不再追加调用。
+
+下面给一组按「前置检查 → 执行 → 验证输出 → 清理」组织的源码核验命令，用于在任意上游快照里快速定位编译期与运行期的五个关键入口。
+
+```bash
+# 前置：进入真实仓库根
+cd upstream_src/suricata/suricata-main
+
+# 执行：定位关键字表、加载、分组、预过滤与检测入口
+grep -n "void SigTableSetup\|int SigLoadSignatures\|int SigGroupHeadBuildMatchArray\|int PrefilterSetupRuleGroup\|int PatternMatchPrepareGroup" \
+     src/detect-engine-register.c src/detect-engine-loader.c \
+     src/detect-engine-siggroup.c src/detect-engine-prefilter.c src/detect-engine-mpm.c
+
+# 验证：确认 detect 族规模（本快照为数百个文件）
+ls src/detect*.c | wc -l
+
+# 清理：退出查阅目录
+cd -
+```
+
+典型输出如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+src/detect-engine-register.c:638:void SigTableSetup(void)
+src/detect-engine-loader.c:384:int SigLoadSignatures(DetectEngineCtx *de_ctx, char *sig_file, bool sig_file_exclusive)
+src/detect-engine-siggroup.c:531:int SigGroupHeadBuildMatchArray(DetectEngineCtx *de_ctx, SigGroupHead *sgh,
+src/detect-engine-prefilter.c:1289:int PrefilterSetupRuleGroup(DetectEngineCtx *de_ctx, SigGroupHead *sgh)
+src/detect-engine-mpm.c:2394:int PatternMatchPrepareGroup(DetectEngineCtx *de_ctx, SigGroupHead *sh)
+```
+
+逐行判读如下。第 638 行 `SigTableSetup(void)` 无参数、返回 `void`，是引擎初始化期调用的一次性动作，负责把全部关键字登记进 `sigmatch_table`；若这一步缺失，后续任何含关键字的规则都会在解析阶段报未知关键字。第 384 行 `SigLoadSignatures` 接收 `DetectEngineCtx *`、`char *sig_file` 与 `bool sig_file_exclusive`，返回 `int` 表示加载成功与否，正常返回零或正值、异常返回负值，具体约定需对照实际版本核验；`sig_file` 为空时通常表示按配置里的规则文件列表加载，`sig_file_exclusive` 控制是否排斥其他规则源。第 531 行 `SigGroupHeadBuildMatchArray` 的参数里出现 `SigGroupHead *sgh`，说明分组结果是一个可挂接匹配数组的结构，这一步决定每个包/事务会拿到哪些候选签名。第 1289 行 `PrefilterSetupRuleGroup` 同样以 `SigGroupHead *sgh` 为参数，是给分组挂预过滤引擎的入口；它内部调用 `PatternMatchPrepareGroup`，两者是「总装」与「具体实现」的关系，不要误读成两个并列阶段。第 2394 行 `PatternMatchPrepareGroup(DetectEngineCtx *de_ctx, SigGroupHead *sh)` 返回 `int`，负责为该组构建 MPM 上下文，是 `detect` 与 `util-mpm` 模块的交界点（模块见 07-05）。最后 `ls src/detect*.c | wc -l` 的数量级可用来判断快照是否完整，若只有几十个说明归档层级或裁剪有问题，应回到 SPEC 第 0.1 节确认。整组输出共同验证了「注册表 → 加载 → 分组 → 预过滤 → MPM」这条编译期链确实分散在五个不同文件中。
+
+按三层分工整理的职责对照见下表，便于按现象反查应先读哪个文件。
+
+| 层次 | 代表文件 | 主要职责 | 典型入口 |
+|---|---|---|---|
+| 核心框架 | `detect.c`、`detect-parse.c`、`detect-engine.c` | 槽位、解析、上下文生命周期 | `Detect`、`SigInit` |
+| 编译总装 | `detect-engine-build.c`、`detect-engine-siggroup.c` | 分组与构建编排 | `SigGroupHeadBuildMatchArray` |
+| 预过滤挂接 | `detect-engine-mpm.c`、`detect-engine-prefilter.c` | MPM 与预过滤引擎 | `PatternMatchPrepareGroup` |
+| 求值阶段 | `detect-engine-content-inspection.c`、`detect-engine-state.c` | 内容求值与检测状态 | 需对照实际版本核验 |
+| 关键字实现 | `detect-content.c`、`detect-http-*.c`、`detect-tls-*.c` | 单个关键字解析与匹配 | 需对照实际版本核验 |
+| 动作与告警 | `detect-engine-alert.c` | 动作判定与告警排队 | 需对照实际版本核验 |
+| 关键字注册 | `detect-engine-register.c` | 表项与 `--list-keywords` | `SigTableSetup` |
+| 规则动作 | `suricata.yaml.in`、`规则文件` | `alert\|pass\|drop\|reject` | 参数见 04-05 |
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一组陷阱围绕规则语法兼容边界。Suricata 规则语法兼容 Snort 但有自有扩展，不能宣称 100% 兼容；把 Snort 规则集原样搬来时出现未知关键字或语义偏差是正常现象，应逐条用 `suricata -T` 校验（参数见 04-08、原理见 04-05）。`suricata -T` 报语法错通常落在 `src/detect-parse.c`，报未知关键字则落在 `src/detect-engine-register.c` 的 `sigmatch_table` 查表处，两者定位不同，修复方向也不同：前者改规则写法，后者确认关键字是否受支持或是否拼写错误。规则加载错误文本、返回码与排错速查见 04-08，本篇不重列。另一个高频误判是把「规则加载成功」等同于「规则会命中」：加载成功只说明语法与关键字合法，能否命中还取决于分组、buffer 可见性与流量本身。
+
+第二组陷阱与编译期资源有关。规则集规模、`fast_pattern` 选择、MPM 算法与 `detect.sgh-mpm-context` 共同决定编译期内存与时间；不可信规则里的 `pcre` 回溯、`dataset` 大表、超多 `fast_pattern` 会让启动期资源急剧膨胀，这类风险属于安全加固范畴（原理见 08-05）。`suricata.yaml.in` 中 `sgh-mpm-context: auto`、`sgh-mpm-caching: yes`、`sgh-mpm-caching-path`、`prefilter` 等段是相关配置锚点，键名与默认值需对照实际版本核验（参数见 04-02、04-03）。显式把 `mpm-algo` 指定为 `ac` 时对 `sgh-mpm-context` 有额外要求，配置文件注释里已有说明，具体约束需对照 `suricata.yaml.in` 实际版本核验（模块见 07-05）。缓存目录要有正确写权限，否则编译产物无法落盘，表现为启动变慢或反复重编译。
+
+第三组陷阱是概念与能力边界。`drop` / `reject` 只在内联 IPS 模式下影响报文，且真正执行丢弃的是 verdict 而非检测引擎自身（原理见 06-12）；IDS 旁路模式只告警不丢弃。TLS 等加密载荷的明文正文不可见，`http.*`、`file.data` 一类 buffer 只对自身解码并重组到的明文协议有效，不能宣称能匹配 HTTPS 正文。EVE JSON 是主要输出，fast.log / stats.log 为辅助；把 fast.log 当主输出会漏掉结构化字段。规则热重载要同时看加载日志与当前生效上下文，旧上下文在新上下文构建失败时仍在服务（模块见 07-12、原理见 06-06）。任何吞吐、每秒规则数、编译期内存占用结论一律标注「需在目标机型实测」，不给绝对值、不给跨机型通用数字。
+
+最佳实践可归纳为四条。其一，规则上线前统一用 `suricata -T` 自检，并把规则集纳入版本管理，变更可回滚。其二，新增关键字从 `src/detect-template.c/.h` 起步，同步在 `src/detect-engine-register.c` 注册表项、按需补齐 `SupportsPrefilter` 支持位，并在文件内附带单元测试；`src/detect-engine-state.c`、`src/detect-bytejump.c` 等文件内含大量构造规则的测试代码，可作回归基线（工具链见 07-13）。其三，对规则集做质量治理：优先让高区分度的 content 承担 `fast_pattern`，控制 `pcre` 与 `dataset` 规模，避免启动期资源失控。其四，把规则加载耗时、编译统计、alert 率与引擎分析输出纳入监控基线，关注相对变化。交叉引用：字段见 05-05 ｜ 参数见 04-05 ｜ 原理见 06-06 ｜ 模块见 07-05。
+
+### 7. 小结与延伸阅读
+
+`detect` 模块把规则文本变成可执行匹配，规模达四百余个 `src/detect*` 文件，按「核心框架 → 编译与阶段实现 → 关键字实现」三层分工：编译期由 `SigTableSetup`、`SigLoadSignatures` / `SigInit`、`SigGroupHeadBuildMatchArray`、`PrefilterSetupRuleGroup` / `PatternMatchPrepareGroup` 完成，运行期由 `Detect` → `DetectRun` / `DetectRunTx` → `SigMatchSignatures` 完成，`DetectEngineCtx` 的生命周期与热重载把两者串起来。它消费上游的 `Packet`、flow 与事务缓冲区，产出命中判定与告警队列；不写日志、不抓包、不重组、不转发，也不解密，规则语法兼容 Snort 但有自有扩展、不能宣称 100% 兼容。
+
+继续深入的路径有四条。想理解规则加载、分组编译、MPM 构建、SigMatch 求值与有状态关键字的完整机制，读 06-06、06-07、06-08、06-09；想查 `Signature`、`SigMatch`、`DetectEngineCtx`、`SigGroupHead` 的逐字段定义，读 05-05、05-06；想核对规则关键字全集、命令行与返回码，读 04-05、04-06、04-07、04-08；想按目录了解相邻模块，读 07-02（flow）、07-03（app-layer）、07-05（util-mpm）、07-07（output）与 07-12（控制面）。规则加载失败的案例、不可信规则加固与性能调优见 08-04、08-05、08-02。所有性能与容量结论均需在目标机型实测，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验。
+
+## 07-05 util-mpm 与 Hyperscan 匹配模块
+
+### 1. 背景与动机
+
+如果检测引擎对每个报文都把规则集里的每一条 `content` 逐条做子串查找，几千条规则乘以每秒几十万包的开销是无法接受的。实际做法是先用多模式匹配（MPM，Multi-Pattern Matcher）把每个规则组里最有区分度的模式串（fast_pattern）一次性扫过缓冲区，只把可能命中的少量候选签名交给后续的精确求值。`util-mpm` 模块族承担的正是这个「一次扫描、批量筛候选」的预过滤底座：它把模式串编译成高效数据结构，在运行期一次扫描返回候选集合，从而把检测成本从「规则数 × 包数」压到「扫描一次 + 少量候选求值」。本篇按 07 册惯例讨论 `src/util-mpm*.c/h`、`src/util-hyperscan.c/.h` 与 `src/detect-engine-mpm.c` 的构成、两套实现、注册与挂接，不重复展开 06 册的 MPM 与预过滤机制（原理见 06-07）。
+
+这一篇有一个必须反复强调、也最容易被写反的事实：**Hyperscan 是可选的 MPM 加速，不是必需依赖，也不是唯一实现**。本快照里 `src/util-mpm-ac*.c` 提供 Aho-Corasick 系列实现，`src/util-mpm-hs*.c` 与 `src/util-hyperscan.c` 提供 Hyperscan 实现；`src/util-mpm.c` 中通过条件编译定义 `# define DEFAULT_MPM MPM_HS`（编译了 Hyperscan 时）与 `# define DEFAULT_MPM MPM_AC`（未编译时），`suricata.yaml.in` 里 `mpm-algo: auto` 的注释也明确写着 auto 会在 Hyperscan 可用时选 hs。换句话说，缺少 libhs 时引擎回退到 AC 等其他多模式匹配实现，功能完整、只是性能特征不同。把 Hyperscan 写成「Suricata 必需依赖」「唯一 MPM 实现」或「不开就跑不起来」，都与源码直接冲突（SPEC 第 2.1 节第 5 条）。
+
+能力边界照旧先立住。Suricata 是 IDS / IPS / NSM 引擎，不是防火墙，不做 IP 转发，不做路由；MPM 只是检测引擎内部的匹配加速部件，既不参与抓包，也不参与转发或 verdict（原理见 06-12）。可见性方面，MPM 扫描的是引擎自身解码并重组到的缓冲区，TLS 等加密载荷的明文正文不可见，能匹配的是握手元数据、SNI、证书字段与明文协议内容，不能宣称能匹配 HTTPS 正文。规则语法兼容 Snort 但有自有扩展、EVE JSON 为主要输出，这些全册约束同样适用。本套资料版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验。
+
+去重纪律照旧：07 是模块功能唯一权威源，`MpmCtx`、`MpmPattern`、`MpmConfig`、`SigGroupHead`、`PrefilterEngine` 等逐字段定义归 05-06，configure 选项与 yaml 参数全集归 04-01、04-02、04-03，机制与调用链归 06-07，运维排障归 08 全册。本篇只讲「这个模块由哪些文件组成、两套实现如何共存、注册表与配置如何选中实现、如何挂到检测引擎」，交叉引用统一写「字段见 05-06 ｜ 参数见 04-01 ｜ 原理见 06-07 ｜ 模块见 07-04」。凡涉及具体选项名、缓存键名、函数签名未逐一核实的内容，一律标注「需对照实际版本核验」并给出可定位目录。
+
+从工程价值看，理解这个模块有四个直接收益。排障时，「上线后吞吐骤降」「启动时编译期内存暴涨」「换机器后性能差异明显」这几类现象，往往与 Hyperscan 是否启用、回退到 AC、`sgh-mpm-context` 设置、`fast_pattern` 质量有关（案例见 08-04）；编译时，知道 `--with-libhs-includes` / `--with-libhs-libraries` 与 `BUILD_HYPERSCAN` 宏的关系，才能判断某个构建到底带不带加速；调优时，`mpm-algo` 与 `sgh-mpm-context` 是一对联动量；扩展时，理解 `MpmTableSetup` 注册表才能看清新增 MPM 实现的边界。以下各节按「概念 → 文件与结构 → 注册与挂接链 → 实例 → 陷阱 → 小结」展开。
+
+### 2. 核心概念
+
+先把术语固定下来。`MPM` 是多模式匹配器，`fast_pattern` 是每条规则里被挑出来送进 MPM 的最具区分度的模式串（由 `src/detect-fast-pattern.c` 一类文件负责选择，原理见 06-07、参数见 04-06）；`MpmCtx` 是一个规则组（或全局）的匹配上下文，持有模式集合与编译后的匹配结构；`MpmThreadCtx` 是每线程的运行期暂存；`MpmPattern` 描述单个模式串及其偏移、深度、大小写变体与关联的签名 id（字段见 05-06）。`mpm_table[MPM_TABLE_SIZE]` 是 `src/util-mpm.c` 里的全局注册表，`MpmTableSetup` 把各实现登记进去，表项类型 `MpmTableElmt` 携带初始化、添加模式、预处理、搜索、销毁等回调（字段名需对照实际版本核验）。
+
+两套实现的分工是本篇的核心。`src/util-mpm.h` 的枚举里依次列出 `MPM_NOTSET`、`MPM_AC`、`MPM_AC_KS`、`MPM_HS`、`MPM_TABLE_SIZE`，说明引擎至少同时认识 AC、AC-KS 与 Hyperscan 三种 matcher。AC 系列在 `src/util-mpm-ac.c`、`src/util-mpm-ac-ks.c`、`src/util-mpm-ac-ks-small.c`、`src/util-mpm-ac-queue.c` 中实现，典型接口有 `SCACInitCtx`、`SCACAddPatternCS` / `SCACAddPatternCI`、`SCACPreparePatterns`、`SCACSearch`、`SCACDestroyCtx`、`SCACPrintInfo`，内部还有 `SCACCreateGotoTable`、`SCACCreateFailureTable`、`SCACCreateDeltaTable`、`SCACPrepareStateTable` 一类状态表构建函数；它们是纯 C 的自动机实现，不依赖外部库。Hyperscan 系列在 `src/util-mpm-hs.c`、`src/util-mpm-hs-core.c`、`src/util-mpm-hs-cache.c` 与 `src/util-hyperscan.c` 中实现，把模式串转成 Hyperscan 可编译的表达式、调用 `hs_compile` / `hs_scan` 一类 API，并提供编译错误日志与数据库缓存；`src/util-hyperscan.c` 里真实存在 `HSRenderPattern(const uint8_t *pat, uint16_t pat_len)` 与 `HSLogCompileError(const char *expr, hs_compile_error_t *compile_err, hs_error_t err)` 两个函数，且整个文件包在 `#ifdef BUILD_HYPERSCAN` 之内（原理见 06-07）。
+
+可选加速与回退是第三组概念，必须讲透。`configure.ac` 里 Hyperscan 支持由探测决定：先 `enable_hyperscan="no"`，再经 `PKG_CHECK_MODULES([libhs], libhs)`、可选的 `--with-libhs-includes=DIR` 与 `--with-libhs-libraries=DIR`、`AC_CHECK_HEADER(hs.h, HYPERSCAN="yes", HYPERSCAN="no")`、`AC_CHECK_LIB(hs, hs_compile)` 逐项检查，全部通过才 `enable_hyperscan="yes"` 并 `AC_DEFINE([BUILD_HYPERSCAN], [1], [Intel Hyperscan support enabled])`；配置摘要里还输出 `Hyperscan support: ${enable_hyperscan}`。也就是说，加速能力是构建期条件编译的、可选的，具体选项名与探测细节需对照 `configure.ac` 实际版本核验（参数见 04-01）。运行期由 `suricata.yaml.in` 的 `mpm-algo: auto` 选择：auto 在 Hyperscan 可用时用 hs，否则回退 AC；显式指定 `ac` 时配置文件注释提示对 `detect.sgh-mpm-context` 有额外要求，具体约束需对照实际版本核验（参数见 04-02）。`src/util-mpm.c` 里 `DEFAULT_MPM MPM_HS` 与 `DEFAULT_MPM MPM_AC` 两组宏正是这条回退逻辑在源码里的落点。
+
+缓存与挂接是第四组概念。`src/util-mpm.h` 中的 `MpmConfig` 结构携带 `cache_dir_path`、`cache_max_age_seconds`、`cache_stats` 等缓存相关信息，`MPMCTX_FLAGS_GLOBAL` / `MPMCTX_FLAGS_NODEPTH` / `MPMCTX_FLAGS_CACHE_TO_DISK` 等标志描述上下文属性（字段见 05-06）；`suricata.yaml.in` 里 `sgh-mpm-caching: yes`、`sgh-mpm-caching-path`、`sgh-mpm-caching-max-age` 一类注释与键与之对应，键名需对照实际版本核验。挂接方面，`src/detect-engine-mpm.c` 的 `PatternMatchPrepareGroup` 把 `MpmCtx` 构建与 `PrefilterEngine` 注册连起来，`src/detect-engine-prefilter.c` 的 `PrefilterSetupRuleGroup` 在编译期调用它，`src/detect-fast-pattern.c` 决定哪些模式串进入 MPM（模块见 07-04、原理见 06-07）。本篇只点名接口，不展开预过滤引擎的注册算法。
+
+最后说明边界。`util-mpm` 的上游是 `detect` 的规则分组与 fast_pattern 选择（模块见 07-04），下游把候选签名交回检测求值（原理见 06-08）；它不解析规则文本、不做精确匹配、不写日志、不抓包，只负责「一次扫描返回候选」。把 MPM 命中直接读成「规则命中」是判读时的常见误用：MPM 只保证候选，最终是否命中还要经过完整 `SigMatch` 链求值。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，不重列字段。07 全册禁止完整结构体字段表，逐字段定义归 05-06。
+
+- `MpmThreadCtx_`、`MpmPattern_`、`MpmConfig_`、`MpmCtx_`、`MpmCtxFactoryItem`、`MpmCtxFactoryContainer_`：`src/util-mpm.h` 中依次定义，并以 `} MpmThreadCtx;`、`} MpmPattern;`、`} MpmConfig;`、`} MpmCtx;` 等收尾（字段见 05-06）。
+- `mpm_table[MPM_TABLE_SIZE]`、`MpmTableElmt`：`src/util-mpm.c` 与 `src/util-mpm.h`（字段见 05-06）。
+- `MPM_AC` / `MPM_AC_KS` / `MPM_HS` / `MPM_TABLE_SIZE` 枚举、`MPM_INIT_HASH_SIZE`、`MPMCTX_FLAGS_*`、`MPM_CTX_FACTORY_UNIQUE_CONTEXT`、`MpmCheckSafeSizetMult`：`src/util-mpm.h`（字段见 05-06）。
+- `SigGroupHead`、`PrefilterEngine`：`src/detect-engine-siggroup.h`、`src/detect-engine-prefilter.h`（字段见 05-06）。
+
+下面是本快照中该模块族的真实文件清单，`src/util-hyperscan.c/.h` 确实存在，完整枚举可用 `ls src/util-mpm* src/util-hyperscan*` 复核。
+
+```tree
+src/
+├── util-mpm.c / util-mpm.h                    框架、注册表、MpmCtx 工厂
+├── util-mpm-ac.c / util-mpm-ac.h              Aho-Corasick 主实现
+├── util-mpm-ac-ks.c / util-mpm-ac-ks.h        AC-KS 实现
+├── util-mpm-ac-ks-small.c                     AC-KS 小表变体
+├── util-mpm-ac-queue.c / util-mpm-ac-queue.h  AC 队列辅助
+├── util-mpm-hs.c / util-mpm-hs.h              Hyperscan MPM 实现
+├── util-mpm-hs-core.c / util-mpm-hs-core.c.h  Hyperscan 核心
+├── util-mpm-hs-cache.c / util-mpm-hs-cache.h  Hyperscan 数据库缓存
+├── util-hyperscan.c / util-hyperscan.h        Hyperscan 通用辅助
+├── detect-engine-mpm.c / detect-engine-mpm.h  与检测引擎的挂接
+├── detect-engine-prefilter.c / .h             预过滤引擎
+├── detect-fast-pattern.c / .h                 fast_pattern 选择
+└── configure.ac / suricata.yaml.in            构建开关与 mpm-algo 配置
+```
+
+关键入口在真实源码中的位置如下，均已逐一核对：`src/util-mpm.c` 中 `MpmTableElmt mpm_table[MPM_TABLE_SIZE]`（第 46 行）、`void MpmTableSetup(void)`（第 223 行）、`void MpmInitThreadCtx`（第 194 行）、`void MpmInitCtx(MpmCtx *mpm_ctx, uint8_t matcher)`（第 208 行）、`int MpmAddPattern`（第 434 行）、`int SCMpmAddPatternCI`（第 257 行）、`MpmFactoryIsMpmCtxAvailable`（第 113 行）、`MpmFactoryGetMpmCtxForProfile`（第 130 行）、`MpmFactoryReClaimMpmCtx`（第 155 行），以及第 217、218、220 行的 `DEFAULT_MPM` / `DEFAULT_MPM_AC` 条件宏；`src/util-mpm-ac.c` 中 `void SCACInitCtx(MpmCtx *)`（第 739 行）、`int SCACAddPatternCS`（第 1004 行）、`int SCACPreparePatterns(MpmConfig *, MpmCtx *)`（第 646 行）、`uint32_t SCACSearch`（第 853 行）、`void SCACDestroyCtx(MpmCtx *)`（第 770 行）、`void SCACPrintInfo(MpmCtx *)`（第 1011 行）；`src/util-hyperscan.c` 中 `char *HSRenderPattern(const uint8_t *pat, uint16_t pat_len)`（第 42 行）与 `void HSLogCompileError(const char *expr, hs_compile_error_t *compile_err, hs_error_t err)`（第 61 行），文件整体受 `#ifdef BUILD_HYPERSCAN` 保护；`src/util-mpm-hs.c` 中出现 `hs_scan`（第 1082 行），`src/util-mpm-hs-cache.c` 中出现 `hs_compile`（第 142 行）；`src/detect-engine-mpm.c` 中 `int PatternMatchPrepareGroup(DetectEngineCtx *de_ctx, SigGroupHead *sh)`（第 2394 行）、`void PatternMatchThreadPrepare`（第 993 行）、`void MpmStoreReportStats(const DetectEngineCtx *de_ctx)`（第 1561 行）。配置锚点：`configure.ac` 第 654–692 行为 libhs 探测与 `BUILD_HYPERSCAN` 定义、第 2622 行输出 `Hyperscan support`；`suricata.yaml.in` 第 1863 行 `sgh-mpm-context: auto`、第 1866 行 `sgh-mpm-caching: yes`、第 1867 行 `sgh-mpm-caching-path`、第 1884 行 `prefilter` 段、第 1938 行 `mpm-algo: auto`。函数签名与配置键名需对照实际版本核验。交叉引用：字段见 05-06 ｜ 参数见 04-01 ｜ 原理见 06-07 ｜ 模块见 07-04。
+
+一个值得记住的细节是 `SCACPreparePatterns(MpmConfig *, MpmCtx *)` 的签名里出现了 `MpmConfig *`：说明在这份快照里 AC 预处理已与缓存配置结构挂钩，与早期仅传 `MpmCtx *` 的形态不同；这类签名差异正是「需对照实际版本核验」的现实理由，抄旧版资料的函数签名会直接对不上。另一个细节是 `src/util-hyperscan.c` 与 `src/util-mpm-hs.c` 并存：前者是通用辅助（模式渲染、编译错误日志），后者是 MPM 接口实现，二者职责不同，不要合并成一个文件来叙述。
+
+### 4. 关键流程与调用链
+
+本节按模块视角描述 `util-mpm` 族内部如何注册两套实现、如何被选中、如何构建与挂接，不重复展开 06 册的 MPM 构建与预过滤算法（原理见 06-07、06-06）。可以把链路拆成四段：注册、选择、构建、挂接与运行。
+
+注册是第一段。`MpmTableSetup` 在引擎初始化期把各 matcher 的回调登记进 `mpm_table[MPM_TABLE_SIZE]`：AC 侧登记 `SCACInitCtx` / `SCACAddPatternCS` / `SCACPreparePatterns` / `SCACSearch` / `SCACDestroyCtx` 等，Hyperscan 侧在 `BUILD_HYPERSCAN` 生效时登记对应实现。`src/util-mpm.h` 的枚举 `MPM_AC`、`MPM_AC_KS`、`MPM_HS` 给出表索引，`MpmInitCtx(MpmCtx *, uint8_t matcher)` 依据 matcher 值从表里取回调初始化上下文。注册表机制让「两套实现共存」成为编译期装配问题，而不是运行期分支判断。
+
+选择是第二段。构建期由 `configure.ac` 的 libhs 探测决定是否定义 `BUILD_HYPERSCAN`，进而决定 `src/util-mpm.c` 里 `DEFAULT_MPM` 取 `MPM_HS` 还是 `MPM_AC`；运行期由 `suricata.yaml.in` 的 `mpm-algo: auto`（或显式值）选出具体 matcher。auto 的语义是「Hyperscan 可用则用 hs，否则回退 AC」，这与 `DEFAULT_MPM_AC MPM_AC` 一起构成回退保证。`detect.sgh-mpm-context` 决定 MPM 上下文是按组分配还是全局共享，与所选 matcher 存在联动，配置注释里已有提示，具体约束需对照实际版本核验（参数见 04-02）。这一段是全篇最关键的能力边界：Hyperscan 缺席不改变功能，只改变性能特征。
+
+构建与挂接是第三、四段。编译期，`src/detect-fast-pattern.c` 从规则里挑出 fast_pattern，`MpmAddPattern` / `SCMpmAddPatternCI` 把模式串连同偏移、深度、大小写变体与签名 id 加进 `MpmCtx`；AC 侧由 `SCACPreparePatterns` 建立 goto / failure / delta 状态表，Hyperscan 侧由 `HSRenderPattern` 把字节串转成 `\xNN` 形式的表达式并编译数据库，`HSLogCompileError` 负责把编译失败写进日志，`src/util-mpm-hs-cache.c` 负责数据库缓存。`src/detect-engine-prefilter.c` 的 `PrefilterSetupRuleGroup` 调用 `src/detect-engine-mpm.c` 的 `PatternMatchPrepareGroup`，把构建好的 `MpmCtx` 挂成 `PrefilterEngine`，`MpmStoreReportStats` 输出编译统计；`PatternMatchThreadPrepare` 为检测线程准备每线程上下文。运行期由 `SCACSearch` 或 `hs_scan` 一类接口一次扫描缓冲区返回候选，交回 `SigMatchSignatures` 精确求值（模块见 07-04、原理见 06-08）。四段关系与回退支路见图 07-05-01。
+
+:::figure id=07-05-01 | name=util-mpm 两套实现与 Hyperscan 可选回退 | dir=TD
+node m1 "fast_pattern 选择<br/>detect-fast-pattern" blue
+node m2 "MpmCtx 构建<br/>MpmAddPattern" teal
+node m3 "MpmTableSetup<br/>mpm_table 注册" gray
+node m4 "AC 实现<br/>util-mpm-ac*" teal
+node m5 "Hyperscan 实现<br/>util-mpm-hs*" purple
+node m6 "BUILD_HYPERSCAN<br/>configure 探测" amber
+node m7 "mpm-algo: auto<br/>suricata.yaml" amber
+node m8 "PrefilterEngine<br/>detect-engine-mpm" green
+edge m7 -> m3 "选定算法"
+edge m6 -> m5 "编译期开关"
+edge m3 -> m4 "注册 AC"
+edge m3 -> m5 "注册 HS"
+edge m1 -> m2 "挑选模式串"
+edge m2 -> m3 "填充 MpmCtx"
+edge m5 -> m8 "编译数据库"
+edge m4 -> m8 "构建状态表"
+edge m7 -> m4 dashed "缺失回退 AC"
+:::
+
+图 07-05-01 中虚线是本篇最应被记住的一条边：当 Hyperscan 未编译或不可用时，`mpm-algo: auto` 回退到 AC 实现，功能不受影响。实线展示注册、构建与挂接的主路径。要强调的是，这张图是模块内部组件图，不是 06-07 的 MPM 算法图，也不是 06-01 的全流水线图；`PrefilterEngine` 只是检测引擎编译期产物的一部分。把「MPM 命中」误当成「规则命中」会漏掉后续精确求值这一步（原理见 06-08）。本篇也不展开 AC 状态表与 Hyperscan 数据库的具体构建算法（原理见 06-07）。
+
+### 5. 配置/命令/代码实例
+
+本节只给最小必要实例。configure 选项全集、yaml 参数全集与命令行见 04 全册（参数见 04-01、04-02、04-03、04-07），此处不重列参数全集；07 全册每篇代码段最多 3–5 个本模块最典型调用，其余写「完整 API 见 04-xx」。下面这段按真实函数名书写，示意注册、加模式、预处理与挂接，不构成完整实现。
+
+```c
+/* util-mpm 模块最典型的注册、构建与挂接入口摘录 */
+MpmTableSetup();                                  /* 登记 AC/HS 等 matcher 回调 */
+MpmInitCtx(mpm_ctx, matcher);                     /* 按选定 matcher 初始化上下文 */
+MpmAddPattern(mpm_ctx, pat, patlen, off, depth, pid, sid, flags); /* 加入模式串 */
+SCACPreparePatterns(mpm_conf, mpm_ctx);           /* AC 侧构建状态表 */
+PatternMatchPrepareGroup(de_ctx, sgh);            /* 挂接为预过滤引擎 */
+```
+
+五个调用分别代表注册表初始化、上下文初始化、模式串加入、AC 预处理与检测引擎挂接，是本模块最典型的一组入口；`MpmAddPattern` 的参数顺序、`SCACPreparePatterns` 的 `MpmConfig *` 语义与 `PatternMatchPrepareGroup` 的返回值需对照实际版本核验。Hyperscan 侧的编译入口与缓存接口完整清单见 `src/util-mpm-hs*.c`，完整配置选项与命令见 04-01、04-02、04-07，机制原理见 06-07，此处不再追加调用。
+
+下面给一组按「前置检查 → 执行 → 验证输出 → 清理」组织的核验命令，用来在任意上游快照里确认「两套实现 + 可选加速 + auto 回退」这三件事的源码依据。
+
+```bash
+# 前置：进入真实仓库根
+cd upstream_src/suricata/suricata-main
+
+# 执行：确认枚举、默认回退、构建开关与 mpm-algo 默认值
+grep -n "MPM_AC\|MPM_HS\|DEFAULT_MPM\|void MpmTableSetup" src/util-mpm.h src/util-mpm.c
+grep -n "BUILD_HYPERSCAN\|Hyperscan support" configure.ac
+grep -n "mpm-algo:" suricata.yaml.in
+
+# 验证：确认 Hyperscan 通用辅助文件存在
+ls src/util-hyperscan.c src/util-mpm-hs.c
+
+# 清理：退出查阅目录
+cd -
+```
+
+典型输出如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+src/util-mpm.h:52:    MPM_AC,
+src/util-mpm.h:54:    MPM_HS,
+src/util-mpm.c:217:# define DEFAULT_MPM    MPM_HS
+src/util-mpm.c:220:# define DEFAULT_MPM    MPM_AC
+src/util-mpm.c:223:void MpmTableSetup(void)
+configure.ac:692:  AS_IF([test "x$enable_hyperscan" = "xyes"], [AC_DEFINE([BUILD_HYPERSCAN], [1], [Intel Hyperscan support enabled])])
+suricata.yaml.in:1938:mpm-algo: auto
+```
+
+逐行判读如下。第 52 行与第 54 行的 `MPM_AC`、`MPM_HS` 同属 `src/util-mpm.h` 中的一个枚举，中间还有 `MPM_AC_KS`，三者并列且以 `MPM_TABLE_SIZE` 收尾，说明引擎在设计上就认识多套 matcher，Hyperscan 只是其中一个枚举值而非唯一实现，这是「可选加速」最直接的源码证据。第 217 行 `# define DEFAULT_MPM MPM_HS` 与第 220 行 `# define DEFAULT_MPM MPM_AC` 是同名宏在不同条件编译分支下的两个定义：前者在定义了 `BUILD_HYPERSCAN` 的构建里生效，后者在未定义时生效，二者不会同时存在；把这两行读成「配置冲突」是误解，正确解读是「编译期按是否带 Hyperscan 选定默认 matcher」，缺失即回退 AC。第 223 行 `MpmTableSetup(void)` 无参数返回 `void`，是初始化期把各实现登记进 `mpm_table` 的入口，回调表的存在进一步说明实现是可替换的。`configure.ac` 第 692 行用 `AS_IF` 判断 `enable_hyperscan` 是否为 `yes` 才 `AC_DEFINE([BUILD_HYPERSCAN], [1])`，可见宏是由 libhs 探测结果条件定义的，不是无条件打开；探测链里的 `AC_CHECK_HEADER(hs.h)`、`AC_CHECK_LIB(hs, hs_compile)` 与 `--with-libhs-includes` / `--with-libhs-libraries` 共同决定这个变量，具体选项名需对照实际版本核验。第 1938 行 `mpm-algo: auto` 是运行期默认值，auto 会在 Hyperscan 可用时选 hs、否则回退 AC，与前面两组 `DEFAULT_MPM` 宏形成构建期与运行期的双重保证。最后 `ls src/util-hyperscan.c src/util-mpm-hs.c` 若报文件不存在，说明快照裁剪或归档层级有误，应回到 SPEC 第 0.1 节确认。整组输出共同验证了「Hyperscan 是可选 MPM 加速、缺失时回退 AC」这一必须写清的能力边界。
+
+按文件族与实现整理的对照见下表，便于按现象反查应先读哪个文件。
+
+| 文件族 | 代表文件 | 实现/职责 | 关键入口 |
+|---|---|---|---|
+| 框架与注册表 | `util-mpm.c` / `util-mpm.h` | `mpm_table`、MpmCtx 工厂、枚举 | `MpmTableSetup`、`MpmInitCtx` |
+| AC 实现 | `util-mpm-ac.c`、`util-mpm-ac-ks.c` | 纯 C 自动机、状态表 | `SCACSearch`、`SCACPreparePatterns` |
+| HS 实现 | `util-mpm-hs.c`、`util-mpm-hs-core.c` | Hyperscan 数据库与扫描 | 需对照实际版本核验 |
+| HS 通用辅助 | `util-hyperscan.c` | 模式渲染、编译错误日志 | `HSRenderPattern`、`HSLogCompileError` |
+| HS 缓存 | `util-mpm-hs-cache.c` | 编译数据库缓存 | 需对照实际版本核验 |
+| 检测挂接 | `detect-engine-mpm.c`、`detect-engine-prefilter.c` | 预过滤引擎挂接 | `PatternMatchPrepareGroup` |
+| 模式选择 | `detect-fast-pattern.c` | 挑选 fast_pattern | 需对照实际版本核验 |
+| 构建开关 | `configure.ac` | libhs 探测、`BUILD_HYPERSCAN` | 参数见 04-01 |
+| 运行期选择 | `suricata.yaml.in` | `mpm-algo` 取值 `auto\|hs\|ac` | 参数见 04-02 |
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一组陷阱就是把 Hyperscan 写反，这里再集中强调一次。Hyperscan 是可选 MPM 加速，构建开关见 `configure.ac` 的 libhs 探测与 `BUILD_HYPERSCAN` 宏，缺失时回退 AC 等其他多模式匹配实现，功能完整、只是性能特征不同；它不是必需依赖，也不是唯一实现，更不能写成「不开就跑不起来」。与之相关的高频故障是「换机器后吞吐变化」：两台机器 `--build-info` 里 `Hyperscan support` 一项不同，一套走 hs、一套回退 AC，吞吐自然有差异，这不是规则或网卡问题（案例见 08-04）。排查时应先看 `suricata --build-info` 的 Hyperscan 支持状态与配置摘要，再看 `mpm-algo` 实际取值，最后才怀疑规则集，具体选项名与输出格式需对照实际版本核验（参数见 04-01、04-07、04-08）。
+
+第二组陷阱围绕配置联动与缓存。`mpm-algo` 与 `detect.sgh-mpm-context` 是一对联动量，`suricata.yaml.in` 注释明确指出显式选 `ac` 时对 `sgh-mpm-context` 有额外要求；改 `mpm-algo` 而不检查该段，可能触发编译期错误或退化到非预期路径，具体约束与键名需对照实际版本核验（参数见 04-02）。`sgh-mpm-caching` 相关键控制编译产物落盘，缓存目录必须有正确写权限、路径可写且空间充足，否则表现为每次启动都重新编译、启动显著变慢；缓存最大存活时间一类键决定是否裁剪旧缓存，取值需对照实际版本核验。另一个易忽略点是 Hyperscan 编译错误：`HSLogCompileError` 会把无法编译的表达式与错误原因写进日志，若规则里出现无法转成合法表达式的模式，日志是定位的第一证据，不要只看「规则加载成功」。
+
+第三组陷阱涉及规则质量与资源。`fast_pattern` 选择直接决定 MPM 效率：把过短、过于常见的串设为 fast_pattern，会让候选集合膨胀、抵消预过滤收益；规则集规模、模式数量与 MPM 编译产物大小共同决定启动期内存与时间，超多 `fast_pattern` 与不可信规则里的复杂表达式属于安全加固范畴（原理见 08-05）。`MpmConfig` 的缓存信息与 `MPMCTX_FLAGS_CACHE_TO_DISK` 一类标志说明编译产物可被缓存，字段与标志含义见 05-06。任何吞吐、每秒扫描字节数、编译期内存占用结论一律标注「需在目标机型实测」，不给绝对值、不给跨机型通用数字。能力边界同样不能忘：`util-mpm` 不抓包、不转发、不解密，TLS 明文正文不可见；PF_RING 是否为受支持后端需对照 `configure.ac` 与 `src/source-*.c` 实际版本核验（SPEC 第 2.1 节第 7 条），与本篇的 MPM 加速是两件事，不要混谈。
+
+最佳实践可归纳为四条。其一，生产构建前用 `suricata --build-info` 确认 `Hyperscan support` 状态，并把它写进上线清单，避免不同机型跑出不同性能特征却无人察觉（原理见 08-06）。其二，`mpm-algo` 优先保持 `auto`，需要显式指定时同步核对 `sgh-mpm-context`、`sgh-mpm-caching` 与缓存目录权限。其三，做规则质量治理：让高区分度的 content 承担 fast_pattern，控制 `pcre` 与 `dataset` 规模，避免编译期资源失控（参数见 04-06）。其四，把编译统计、启动耗时、缓存命中与 MPM 候选率纳入监控基线，关注相对变化；可用 `MpmStoreReportStats` 的输出与引擎分析选项交叉验证，具体选项需对照实际版本核验（参数见 04-07、原理见 08-02）。交叉引用：字段见 05-06 ｜ 参数见 04-01 ｜ 原理见 06-07 ｜ 模块见 07-04。
+
+### 7. 小结与延伸阅读
+
+`util-mpm` 模块提供检测引擎的预过滤底座：`src/util-mpm.c/.h` 负责注册表、`MpmCtx` 工厂与枚举，`src/util-mpm-ac*.c` 提供纯 C 的 AC / AC-KS 实现，`src/util-mpm-hs*.c` 与 `src/util-hyperscan.c/.h` 提供 Hyperscan 实现，`src/detect-engine-mpm.c` 与 `src/detect-engine-prefilter.c` 把它挂成 `PrefilterEngine`，`src/detect-fast-pattern.c` 决定哪些模式串进入匹配器。全篇最需要记住的一条是：**Hyperscan 是可选 MPM 加速，构建期由 `configure.ac` 的 libhs 探测与 `BUILD_HYPERSCAN` 决定，运行期由 `mpm-algo: auto` 选择，缺失时回退 AC，功能不受影响**。它不解析规则、不做精确匹配、不写日志、不抓包、不转发、不解密，MPM 命中只是候选而非规则命中。
+
+继续深入的路径有四条。想理解 fast_pattern 选择、`MpmCtx` 构建、预过滤引擎注册与 AC / Hyperscan 算法的完整机制，读 06-07；想查 `MpmCtx`、`MpmPattern`、`MpmConfig`、`SigGroupHead`、`PrefilterEngine` 的逐字段定义，读 05-06；想核对 configure 选项、yaml 段与命令行，读 04-01、04-02、04-03、04-07；想按目录了解相邻模块，读 07-04（detect）、07-10（rust/）与 07-13（工具链）。Hyperscan 未启用导致吞吐变化的案例、调优联动与不可信规则加固见 08-04、08-02、08-05。所有性能与容量结论均需在目标机型实测，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验。

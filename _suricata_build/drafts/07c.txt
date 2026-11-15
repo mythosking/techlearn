@@ -1,0 +1,727 @@
+# Suricata 技术资料 · 07 模块与特性介绍（分片 C）
+## 07-10 rust/ 与 Rust 解析器生态
+
+### 1. 背景与动机
+
+把 Suricata 说成「一个用 C 写成的 IDS」，是阅读这份源码时最常见、也最容易把后续判断带偏的概括。准确的说法写在 `rust/src/lib.rs` 的文件头注释里：Suricata 是一个 C 与 Rust 混合的应用（`Suricata is a hybrid C and Rust application`），`rust/` 目录下放的是用 Rust 编写的那部分组件。这不是把几个工具函数换门语言重写一遍的小改动，而是把整条数据面上攻击面最集中的一段——面对不可信网络字节的应用层协议解析——连同 EVE 事件构造、TLS 指纹、文件提取跟踪、以及一部分检测关键字实现，成体系地迁到了内存安全的语言一侧。本篇作为分片 C 的开篇，讨论 `rust/` 这一族的 crate 构成、FFI 边界、构建挂接方式与职责边界，不重复展开 06 册已经讲透的应用层解析状态机与 EVE 聚合机制（原理见 06-05、06-11、06-14）。
+
+引入 Rust 的第一个动因是内存安全。应用层解析器拿到的是攻击者可以任意构造的字节流：长度字段可以撒谎，分片可以乱序，压缩与编码可以嵌套，状态机可以在任何一个字节处被诱导进入未预期的分支。用 C 手写这类状态机时，越界读、释放后使用、重复释放与整数溢出几乎无法靠人工审查穷尽，而这类缺陷恰好是网络入侵检测引擎最不能有的——解析器本身就成了被入侵面。Rust 的所有权、借用检查与类型系统在编译期消除整类问题，`nom` 一类的解析组合子又让「按长度切分再校验」的写法成为默认习惯。把协议解析迁到 Rust，等于把安全边界前移到编译期，这是工程上最根本的收益，而不是赶语言时髦。
+
+第二个动因是覆盖面与迭代速度。本快照的 `rust/src/` 下有三十八个协议或功能子目录，从 `http2/`、`dns/`、`smb/`、`ftp/`、`ike/`、`quic/`、`ssh/`、`krb/` 到 `mqtt/`、`modbus/`、`dnp3/`、`rdp/`、`nfs/`、`pgsql/`、`ldap/`、`websocket/`、`mdns/`、`llmnr/`、`dhcp/`、`enip/`、`rfb/`、`sip/`、`sdp/`、`telnet/`、`tftp/`、`bittorrent_dht/`、`asn1/`、`dcerpc/`、`mime/`、`x509/`，几乎每一个在 `src/output-json-*.c` 里有对应事件文件的协议，都能在 Rust 侧找到承载它的模块。新增协议时开发者复制 `rust/src/applayertemplate/` 起步，配合 `rust/derive` 的过程宏生成事件与 Frame 类型，再经 FFI 挂到 C 侧框架，比在 C 里从零写一套状态机要轻得多。这套分工也解释了为什么 07-03 讲 app-layer 框架时必须反复指向 `rust/`：框架在 C，解析实体大量在 Rust。
+
+必须先立住本册的定位与去重纪律。07 册是全集的「模块能力与特性」唯一权威源，严格按真实目录划分章节；`rust/` 是其中唯一一个不在 `src/` 之下、却作为一等构建公民参与编译的模块，因此单列一篇。本篇讲「这个模块由哪些 crate 与目录组成、FFI 边界在哪、怎么挂进构建、职责到哪里为止」，而不重复展开 06 册的机制与状态机（原理见 06-05、06-11、06-14），也不重复 02-04 的构建步骤（模块见 02-04）。结构体逐字段定义归 05 全册，configure 选项、yaml 段与命令行归 04 全册，运维排障归 08 全册，一律交叉引用而不重列。交叉引用统一写「字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx」。版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验；下文所有文件名、crate 名与函数名均以 `upstream_src/suricata/suricata-main/` 内的真实文件为锚点。
+
+能力边界同样要在最前面立住，避免把「换了语言」误读成「换了定位」。Suricata 仍是 IDS / IPS / NSM 引擎，不是防火墙，不做 IP 转发，不做路由；Rust 组件只参与解析、构造与部分检测，不参与抓包决策与 verdict 回写（原理见 06-12）。可见性方面，引擎只对自身解码并重组到的流量做检测，TLS 等加密载荷的明文正文不可见；Rust 侧的 `x509/`、`rust/src/tls_version.rs`、`rust/src/ja4.rs`、`rust/src/quic/` 处理的是握手元数据、证书与指纹，不能宣称能读到 HTTPS 明文（原理见 06-05）。Hyperscan 仍是可选 MPM 加速（`src/util-mpm-hs.c`，构建开关需对照实际版本核验），缺失时回退 AC 等其他实现，不因 Rust 的存在变成必需依赖。`suricata-update` 是与内核主程序分仓的独立工具（模块见 07-11），`rust/suricatasc`、`rust/suricatactl` 虽在同一 workspace 里，仍是控制面与运维工具，不是主程序的内建子命令。
+
+从工程价值看，建立 `rust/` 的模块地图有三个直接收益。其一是构建失败定位：编译报缺 `rustc`、缺 `cbindgen`、Rust 版本过低或生成头不匹配时，知道该查 `configure.ac` 的 Cargo/Rust 段、`rust/Cargo.toml.in` 的 workspace 定义还是 `rust/cbindgen.toml`，而不是去改 C 源码。其二是排障收敛：`eve.json` 里某协议的事件字段异常时，理解分工的人会直接到 `rust/src/<协议>/` 找解析与日志实现，而不是在 `src/output-json-*.c` 里空转。其三是扩展：新增协议、新增检测关键字或新增输出字段时，知道该用哪个过程宏、要不要重新生成 C 头、要不要在 `rust/Makefile.am` 里登记 feature。以下各节按「概念 → 文件与结构 → 组件协作 → 实例 → 陷阱 → 小结」展开。
+
+### 2. 核心概念
+
+先把术语固定下来。`workspace` 是 `rust/Cargo.toml.in` 里 `[workspace]` 段定义的一组 crate 集合，本快照 `members` 共七项：根 crate `"."` 以及 `derive`、`suricatactl`、`suricatasc`、`sys`、`ffi`、`htp` 六个子 crate；`default-members` 只有三项，即根 crate、`suricatactl`、`suricatasc`，意味着不带参数执行 cargo 命令时只构建这三个。`[lib]` 段声明 `crate-type = ["staticlib", "rlib"]`、`name = "suricata"`，前者产出供 C 链接的静态库，后者产出供 Rust 侧复用的库；`configure.ac` 中 `RUST_SURICATA_LIBNAME="libsuricata_rust.a"` 正是这个静态库的名字。`[workspace.package]` 里 `version = "@PACKAGE_VERSION@"` 由 configure 替换为实际版本号，`rust-version` 的具体取值需对照实际版本核验。这里要点破一个高频误判：本快照里是 `Cargo.toml.in` 与 `Cargo.lock.in`，**不是** `Cargo.toml` 与 `Cargo.lock`；只有跑过 configure 才会由 `.in` 模板生成实际文件，直接照搬网上「`cd rust && cargo build`」的经验会在一份刚解压的快照上扑空。
+
+第二组概念是 FFI 边界，它由三层共同构成。最外层是 `rust/cbindgen.toml`：该文件 `language = "C"`、`include_guard = "__RUST_BINDINGS_GEN_H_"`，并带一条 `autogen_warning` 明确写着生成文件由 cbindgen 自动生成、不要手工修改；cbindgen 扫描 Rust 侧的 `no_mangle` 导出，生成 `dist/rust-bindings.h`、`dist/rust-ffi.h` 一类 C 头，这两个名字登记在 `rust/Makefile.am` 的 `EXTRA_DIST` 里。中间层是 `rust/ffi` crate：根 crate 的 `rust/src/lib.rs` 以 `#[macro_use] extern crate suricata_ffi` 引入它，导出宏负责把 Rust 函数安全地包装成 `extern "C"` 符号；`rust/ffi/src/` 下有 `applayer.rs`、`conf.rs`、`debug.rs`、`detect.rs`、`direction.rs`、`eve.rs`、`flow.rs`、`jsonbuilder.rs`、`lib.rs`、`packet.rs`、`plugin.rs`、`thread.rs` 十二个模块，基本就是「C 能看到的 Rust 面」的分类清单。最内层是 `rust/sys` crate（`rust/sys/src/lib.rs`、`sys.rs`），提供 Rust 侧访问 C 符号的声明，方向与前一层相反。三者合起来才是完整的边界：cbindgen 管「Rust 导出给 C」，ffi crate 管「导出宏与桥接」，sys crate 管「Rust 调用 C」。
+
+第三组概念是 `rust/derive` 过程宏与 `rust/htp`。`rust/derive/src/` 下四个文件 `applayerevent.rs`、`applayerframetype.rs`、`applayerstate.rs`、`stringenum.rs` 分别生成应用层事件、Frame 类型、parser 状态与字符串枚举的样板代码，让协议作者只写声明不写重复的类型转换；`rust/derive/Cargo.toml.in`、`rust/derive/Makefile.am` 表明它是独立编译的 proc-macro crate。`rust/htp` 是 libhtp 的 Rust 实现，自带 `LICENSE`、`README.md`、`cbindgen.toml`、`fuzz/` 与 `src/`，是 workspace 里唯一带独立许可说明与自带 fuzz 目录的成员，说明它相对主仓有更独立的来源。注意 `rust/src/ffi/`（根 crate 内的一个模块，含 `base64.rs`、`hashing.rs`、`mod.rs`、`strings.rs`）与 `rust/ffi/`（workspace 成员 crate）同名而不同层，阅读时不要混为一谈；大纲里把 `rust/ffi` 与 `rust/src` 并列，指的正是后者这个成员 crate。
+
+第四组概念是「解析实体」与「附属设施」的分工。`rust/src/applayer.rs` 是 FFI 面最集中的文件，其中带 `no_mangle` 或 `extern "C"` 一类的导出符号有二十余处，涵盖 parser 注册、状态获取、事务遍历与事件回填；`rust/src/frames.rs` 承载 Frame 抽象，`rust/src/filecontainer.rs` 与 `rust/src/filetracker.rs` 承载文件提取与跟踪，`rust/src/jsonbuilder.rs` 承载 EVE 事件构造，`rust/src/ja4.rs` 承载 JA4 指纹，`rust/src/detect/` 承载一部分检测关键字实现（含 `byte_extract.rs`、`byte_math.rs`、`datasets.rs`、`entropy.rs`、`uint.rs`、`uri.rs`、`vlan.rs`、`requires.rs`、`parser.rs` 以及 `tojson/`、`transforms/` 两个子目录）。此外 `rust/src/conf.rs`、`core.rs`、`flow.rs`、`decode.rs`、`common.rs`、`feature.rs`、`debug.rs`、`lua.rs`、`lzma.rs`、`util.rs` 是跨模块的基础设施。这些文件共同说明：Rust 侧不只是「协议解析器集合」，还承担了输出构造、指纹、文件与检测辅助四类一等职能。
+
+最后说明边界与三组易混淆项。`rust/` 不做抓包（模块见 07-06）、不拼装 runmode 线程链（原理见 06-13）、不主导规则加载与分组编译（原理见 06-06）；`Packet`、`Flow`、`DetectEngineCtx`、`AppLayerParserState` 等核心结构仍在 C 侧 `src/decode.h`、`src/flow.h`、`src/detect.h`、`src/app-layer-parser.h` 定义（字段见 05-02、05-03、05-05、05-04），Rust 侧只有对应的绑定视图。易混淆的三组是：根 crate 的 `rust/src/ffi/` 模块与 workspace 成员 `rust/ffi/`；模板 `Cargo.toml.in` 与生成物 `Cargo.toml`；Rust parser（解析实体）与 `src/app-layer-parser.c`（C 侧框架，模块见 07-03）。把这三组写反，就会在排障时找错文件。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，不重列任何字段。07 全册禁止出现完整结构体字段表，逐字段定义、类型、内存布局与生命周期归 05 全册统一承担；需要查字段时按括号内索引跳转。
+
+- `AppLayerParserState_` 与应用层会话上下文：C 侧声明见 `src/app-layer-parser.h`、`src/app-layer-parser.c`，Rust 侧的镜像与导出集中在 `rust/src/applayer.rs`、`rust/src/frames.rs`（字段见 05-04）。
+- `Packet_`、`Flow_`、`DetectEngineCtx`：分别见 `src/decode.h`、`src/flow.h`、`src/detect.h`；Rust 侧绑定视图见 `rust/src/decode.rs`、`rust/src/flow.rs`、`rust/src/core.rs`，字段名需对照实际版本核验（字段见 05-02、05-03、05-05）。
+- EVE 构造上下文：`rust/src/jsonbuilder.rs` 与 C 侧 `src/output-json*.c` 配合，C 侧结构名带 `SC` 前缀的类型需对照实际版本核验（字段见 05-08）。
+- FFI 绑定声明：`rust/ffi/src/*.rs` 与 `rust/sys/src/sys.rs`，以及生成头 `dist/rust-bindings.h`、`dist/rust-ffi.h`（二者由 cbindgen 生成，路径登记在 `rust/Makefile.am`，文件本体需对照实际版本核验）。
+- 控制面与运维工具：`rust/suricatasc/src/unix/`（`client.rs`、`commands.rs`、`main.rs`、`mod.rs`、`rustyprompt.rs`）与 `rust/suricatactl/src/`（`main.rs`、`filestore/`），均为独立二进制 crate（模块见 07-12）。
+
+下面是本快照中 `rust/` 的真实文件清单节选，按 workspace 成员与根 crate 职能分组；族内命名规律清晰，完整枚举可用 `ls -1 rust/` 与 `ls -1 rust/src/` 在快照根目录复核。
+
+```tree
+rust/
+├── Cargo.toml.in            workspace / [lib] / [workspace.package] 定义
+├── Cargo.lock.in            依赖锁模板（非 Cargo.lock）
+├── Makefile.am              SUBDIRS、EXTRA_DIST、RUST_FEATURES
+├── cbindgen.toml            cbindgen 目标语言与生成头配置
+├── rustfmt.toml             rustfmt 配置
+├── derive/                  过程宏 crate：Cargo.toml.in、Makefile.am、src/
+├── ffi/                     导出宏 crate：Cargo.toml.in、Makefile.am、
+│                            cbindgen.toml、src/
+├── sys/                     C 符号声明 crate：Cargo.toml.in、Makefile.am、src/
+├── htp/                     libhtp Rust 实现：LICENSE、README.md、fuzz、src
+├── suricatasc/              控制面客户端：Cargo.toml.in、Makefile.am、src
+├── suricatactl/             运维工具：Cargo.toml.in、Makefile.am、src
+└── src/
+    ├── lib.rs               根 crate 入口（混合 C/Rust 声明）
+    ├── applayer.rs          FFI 导出最集中的解析框架桥接
+    ├── applayertemplate/    新增 parser 骨架
+    ├── frames.rs / flow.rs / decode.rs / core.rs / common.rs
+    ├── jsonbuilder.rs / ja4.rs / lua.rs / conf.rs / feature.rs
+    ├── filecontainer.rs / filetracker.rs / debug.rs / util.rs
+    ├── detect/              检测关键字实现与 tojson、transforms
+    ├── ffi/                 根 crate 内 FFI 辅助（勿与 rust/ffi 混淆）
+    ├── mime/                MIME / SMTP 解析（mime.rs、smtp.rs 等）
+    ├── http2/ dns/ smb/ ftp/ ike/ krb/ quic/ ssh/ rdp/ mqtt/
+    ├── modbus/ dnp3/ sip/ sdp/ telnet/ tftp/ pgsql/ nfs/ snmp/
+    ├── ldap/ websocket/ mdns/ llmnr/ dhcp/ enip/ rfb/ pop3/
+    ├── bittorrent_dht/ asn1/ dcerpc/ x509/ sctp/ utils/ ntp/
+    └── kerberos.rs / tls_version.rs / encryption.rs / handshake.rs
+```
+
+关键函数与类在真实源码中的位置如下，均已逐一核对：`rust/src/lib.rs` 的文件头注释明示混合 C/Rust 定位，并以 `#[macro_use] extern crate suricata_ffi` 引入导出宏；`rust/src/applayer.rs` 集中了二十余处 FFI 导出符号（具体符号名与签名需对照实际版本核验）；`rust/derive/src/lib.rs` 与各 `applayer*.rs` 是过程宏入口；`rust/sys/src/sys.rs` 是 Rust 调 C 的 `extern` 声明集中处；`rust/suricatasc/src/main.rs` 在 Windows 上直接输出 `suricatasc is not supported on Windows`，非 Windows 才转到 `crate::unix::main::main()`；`rust/suricatactl/src/main.rs` 是 filestore 子命令入口。C 侧消费这些导出的位置主要是 `src/app-layer-parser.c`、`src/output-json*.c` 与 `src/detect-engine-register.c`（模块见 07-03、07-07、07-04）。辅助脚本 `scripts/rustc.py`、`scripts/rustfmt.sh` 分别参与 Rust 编译器探测与格式检查，`rust/rustfmt.toml` 是格式配置。交叉引用：字段见 05-04 ｜ 参数见 04-01 ｜ 原理见 06-05、06-14 ｜ 模块见 07-03。
+
+一个阅读时容易忽略的细节是 `rust/src/mime/` 的存在与 `src/util-decode-mime.c` 的缺席。大纲与历史资料里常提到 `src/util-decode-mime.c` 这类 C 侧 MIME 解码工具，但本快照的 `src/util-*.c` 族（共一百三十六个文件）中**不存在** `util-decode-mime.c`，`src/Makefile.am` 与 `configure.ac` 也没有对它的引用；MIME 相关实现落在 `rust/src/mime/`（`mime.rs`、`smtp.rs`、`detect.rs`、`mod.rs`、`smtp_log.rs`），对应的 fuzz target 是 `src/tests/fuzz/fuzz_mimedecparseline.c`（工具链见 07-13）。这一事实再次说明：把 Suricata 写成纯 C 项目、或按旧版目录去找 MIME 解析，都会落空；具体函数与字段需对照实际版本核验。另一个细节是 `rust/Makefile.am` 的 `EXTRA_DIST` 同时列出 `Cargo.toml`、`Cargo.lock` 与各自 `.in` 模板，说明分发包里两者可能并存，判读时以「configure 是否跑过」区分生成物与模板。
+
+### 4. 关键流程与调用链
+
+本节从模块视角描述 `rust/` 内部 crate 如何协作、以及它如何挂到构建与运行时的流水线上，重点在「装配与边界」，不重复展开 06 册已经讲透的应用层解析状态机、EVE 聚合与扩展注册机制（原理见 06-05、06-11、06-14）。可以把整个模块拆成三条相互配合的线：构建装配线、运行时 FFI 调用线、扩展登记线。
+
+构建装配线发生在编译期。`configure.ac` 的「Cargo/Rust」段（约第 2049 行起）以 `AC_ARG_VAR([RUSTC])`、`AC_PATH_PROG` 检查 `rustc` 与 `rustdoc`，缺失时直接报错并给出各发行版的安装提示；同一文件早段设定 `RUST_SURICATA_LIBNAME="libsuricata_rust.a"` 作为链接产物名。顶层 `Makefile.am` 的 `SUBDIRS` 把 `rust` 排在首位，进入 `rust/Makefile.am` 后 `SUBDIRS = derive ffi htp sys suricatasc suricatactl` 依次构建六个成员 crate，根 crate 由 cargo 按 `[workspace]` 统一解析；`RELEASE` 由 `if !DEBUG` 决定是否加 `--release`，`RUST_FEATURES` 按 `HAVE_JA3` / `HAVE_JA4` 追加 `ja3` / `ja4` feature（对应 configure 选项名需对照实际版本核验）。随后 cbindgen 依 `rust/cbindgen.toml` 从 Rust 导出生成 `dist/rust-bindings.h`、`dist/rust-ffi.h`，C 源码 include 这些头并链接静态库，最终合成 `suricata` 可执行文件。这条线解释了为什么「Rust 组件是构建的一部分」而非可选插件（能力边界见 SPEC 第 2.1 节第 6 条）。
+
+运行时 FFI 调用线是每包的主路径。C 侧 `src/app-layer-parser.c` 按协议与方向调度，经生成头里声明的 `extern "C"` 符号调用 Rust parser 的解析、状态推进、事务获取与事件回填接口；Rust 侧在 `rust/src/<协议>/` 与 `rust/src/applayer.rs` 中把字节流解析成事务（tx）与 Frame，结果回交给 C 侧的检测引擎（模块见 07-04、原理见 06-08），再由 `rust/src/jsonbuilder.rs` 配合 `src/output-json*.c` 构造 EVE 事件落盘（模块见 07-07、原理见 06-11）。文件提取与 JA3 / JA4 指纹分别由 `rust/src/filecontainer.rs`、`rust/src/filetracker.rs`、`rust/src/ja4.rs` 与 `src/util-ja3.c` 参与。这里只点名参与文件与方向，解析状态机、事务生命周期与事件聚合算法属于机制范畴，本篇不展开。整个模块的构建装配、FFI 边界与运行方向见图 07-10-01。
+
+:::figure id=07-10-01 | name=rust 组件构建装配与 C/Rust FFI 边界 | dir=TD
+node r1 "configure.ac<br/>RUSTC 与产物名" blue
+node r2 "rust/Makefile.am<br/>六成员 SUBDIRS" blue
+node r3 "cargo build<br/>workspace 七 crate" amber
+node r4 "cbindgen.toml<br/>生成 C 头" amber
+node r5 "libsuricata_rust.a<br/>静态库" amber
+node r6 "C 主程序链接<br/>src 与 detect" purple
+node r7 "Rust parser<br/>http2/dns/smb" teal
+node r8 "jsonbuilder / ja4<br/>EVE 与指纹" green
+node r9 "suricatasc / ctl<br/>控制面工具" gray
+edge r1 -> r2 "启用 Rust 构建"
+edge r2 -> r3 "make 触发 cargo"
+edge r3 -> r4 "导出符号扫描"
+edge r3 -> r5 "staticlib 产物"
+edge r4 -> r6 "rust-bindings.h"
+edge r5 -> r6 "链接入主程序"
+edge r6 -> r7 "FFI 调用解析"
+edge r7 -> r8 "事务与事件"
+edge r2 -> r9 "构建独立 bin"
+edge r9 -> r6 "Unix socket 命令"
+:::
+
+图 07-10-01 中蓝色是构建输入与装配入口，琥珀色是编译产物，紫色是 C 主程序，青色是 Rust 解析实体，绿色是输出与指纹，灰色是同 workspace 的控制面工具。需要强调这张图描述的是模块内部的装配与边界关系，不是 06-01 那条从收包到落盘的全流水线；把它和全流水线混为一谈，就会误以为 `rust/` 还负责抓包或 verdict。扩展登记线是第三条：开发者用 `rust/derive` 的过程宏声明事件与 Frame 类型，用 `rust/ffi` 的导出宏暴露 `extern "C"` 符号，经 cbindgen 重新生成头，再在 `src/app-layer-parser.c` 一侧完成注册（原理见 06-14、模块见 07-03）；漏掉重新生成头这一步，是新增 parser 时最典型的链接期错误。
+
+### 5. 配置/命令/代码实例
+
+本节只给最小必要实例，并显式指向权威源：configure 选项、yaml 段与命令行全集归 04 全册（参数见 04-01、04-02、04-07），此处不重列参数全集；07 全册每篇代码段最多给 3–5 个本模块最典型的调用，其余写「完整 API 见 04-xx」。下面给一组按「前置检查 → 执行 → 验证输出 → 清理」组织的源码核验命令，用来在拿到任意一份上游快照后快速确认 Rust workspace 的构成、库产物类型与 FFI 生成头配置，不改变运行状态，适合作为阅读源码或核查版本差异的第一步。
+
+```bash
+# 前置：进入真实仓库根（注意归档多一层 suricata-main/）
+cd upstream_src/suricata/suricata-main
+
+# 执行：查看 workspace 成员、默认成员与库产物类型
+sed -n '9,24p' rust/Cargo.toml.in
+sed -n '50,52p' rust/Cargo.toml.in
+
+# 验证：确认 cbindgen 目标语言与生成头登记
+grep -E "^language|^include_guard" rust/cbindgen.toml
+grep -E "rust-bindings.h|rust-ffi.h" rust/Makefile.am
+
+# 清理：退出查阅目录
+cd -
+```
+
+典型输出如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+[workspace]
+members = [
+    ".",
+    "derive",
+    "suricatactl",
+    "suricatasc",
+    "sys",
+    "ffi",
+    "htp",
+]
+
+default-members = [
+    ".",
+    "suricatactl",
+    "suricatasc",
+]
+[lib]
+crate-type = ["staticlib", "rlib"]
+name = "suricata"
+language = "C"
+include_guard = "__RUST_BINDINGS_GEN_H_"
+		dist/rust-bindings.h \
+		dist/rust-ffi.h \
+```
+
+逐行判读如下。输出开头 `[workspace]` 与其后 `members` 列表共七项，第一项 `"."` 表示根 crate 自身，其余六项正是 `rust/Makefile.am` 的 `SUBDIRS`；若某份快照这里少了 `htp` 或 `sys`，说明 workspace 成员被裁剪，不能照搬本篇的目录清单。紧接着的 `default-members` 只有三项，提示不带 `--workspace` 的 cargo 命令不会自动构建 `derive`、`ffi`、`htp`、`sys` 等被其他 crate 依赖的成员，判读「为什么本地只编出三个产物」时应回到这里。`[lib]` 段的 `crate-type = ["staticlib", "rlib"]` 是全组最关键的一行：`staticlib` 供给 C 链接、`rlib` 供给 Rust 侧复用，`name = "suricata"` 与 `configure.ac` 里 `libsuricata_rust.a` 的命名遥相呼应；若这里只剩 `rlib`，C 侧就会链接失败。再往后 `language = "C"` 与 `include_guard` 说明 cbindgen 生成的是 C 头而非 C++ 头，且带固定宏保护，手写包含时不要重复定义同名 guard。末两行 `dist/rust-bindings.h`、`dist/rust-ffi.h` 出现在 `rust/Makefile.am` 的 `EXTRA_DIST` 中，是分发包登记的生成头路径，而非本快照里必然存在的手写源码；若 `ls rust/dist/` 为空，属正常现象，需先跑构建再由 cbindgen 产出。整组输出共同验证了「workspace 多 crate、静态库供 C 链接、生成头由 cbindgen 管」三件事，任何一环对不上都应回到 `rust/Cargo.toml.in` 与 `rust/cbindgen.toml` 复核版本差异。
+
+按职责整理的 `rust/` 子族对照见下表，便于按现象反查应该先读哪个目录。
+
+| 子族 | 代表路径 | 主要职责 | 关联模块 |
+|---|---|---|---|
+| workspace 定义 | `rust/Cargo.toml.in` | 成员、默认成员、库产物类型 | 构建见 02-04 |
+| 生成头配置 | `rust/cbindgen.toml` | C 头语言、guard、生成警告 | 字段见 05-04 |
+| 导出宏 crate | `rust/ffi/src/` | 把 Rust 符号包成 `extern "C"` | 原理见 06-14 |
+| C 符号声明 crate | `rust/sys/src/` | Rust 侧访问 C 符号 | 字段见 05-02 |
+| 过程宏 crate | `rust/derive/src/` | 事件、Frame、状态、枚举生成 | 模块见 07-03 |
+| 解析实体 | `rust/src/http2/` 等 | 协议解析与事务构造 | 原理见 06-05 |
+| 输出与指纹 | `jsonbuilder.rs`、`ja4.rs` | EVE 构造与 JA4 指纹 | 模块见 07-07 |
+| 控制面工具 | `rust/suricatasc/` | Unix socket 客户端 | 模块见 07-12 |
+
+完整 configure 选项见 04-01，完整命令行与返回码见 04-07，机制原理见 06-05、06-11、06-14，此处不再追加调用。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一组陷阱围绕「把 Rust 当可选插件或纯 C 项目」。顶层 `Makefile.am` 的 `SUBDIRS` 把 `rust` 排在首位，`configure.ac` 缺 `rustc` 会直接报错退出，因此 Cargo 参与 make 是构建的一环，不是可跳过的实验特性。与之相连的误判是文件命名：本快照只有 `Cargo.toml.in` / `Cargo.lock.in`，直接对一份刚解压的快照执行 `cargo build` 会找不到清单文件，必须先跑 configure 让 `.in` 模板落地。第三个误判是 cbindgen 版本：`rust/src/lib.rs` 的注释明确提到较新的 C 字符串字面量写法在旧版 cbindgen 上不被支持，为避免强制用户自行安装新版而暂时保留旧写法；因此在不同发行版上生成头可能因 cbindgen 版本而略有差异，遇链接期符号不一致时应先核对 cbindgen 版本，具体版本下限需对照实际版本核验。
+
+第二组陷阱是 Rust 工具链与 feature 开关。`rust/Cargo.toml.in` 的 `rust-version`、`.github/workflows/builds.yml` 里的 `RUST_VERSION_KNOWN` 是两处不同用途的版本约束，前者是 crate 的最低支持版本，后者是 CI 里「已知能通过构建与检查」的稳定版，二者不要求相等；把它们混为一谈，会在本地用较新工具链却照抄 CI 版本号时得出错误结论，具体取值需对照实际版本核验。`rust/Makefile.am` 的 `HAVE_JA3` / `HAVE_JA4` 决定 `RUST_FEATURES` 是否追加 `ja3` / `ja4`，对应 configure 选项名需对照 `configure.ac` 核验；误以为「装了 Rust 就自动有 JA4」会在指纹字段缺失时找错方向。`.github/workflows/rust-checks.yml` 的名字是 `Cargo Audit and Update`，主要跑 `cargo audit` 做依赖漏洞审计，它不是单元测试工作流，别把它当成 `cargo test` 的替代（CI 形态见 07-13）。
+
+第三组陷阱与 FFI 边界有关。生成头带 `autogen_warning`，明确不要手工修改；手改 `dist/rust-bindings.h` 会在下次 cbindgen 运行时被覆盖，且容易与 Rust 侧导出签名失配。跨 FFI 的内存归属更要小心：C 侧的 `Packet`、`Flow` 与 Rust 侧的事务对象谁分配、谁释放、生命周期多长，都以对应头文件与导出函数约定为准，字段名与函数签名需对照实际版本核验（字段见 05-02、05-03、05-04）；把 Rust 侧 tx 当成 C 结构体直接改写，是典型的越界与悬垂来源。另一个隐蔽问题是同名目录：根 crate 的 `rust/src/ffi/` 与 workspace 成员 `rust/ffi/` 职责不同，改错目录会让人疑惑「为什么导出没生效」。
+
+第四组陷阱是能力边界与性能口径。Rust 组件不改变引擎定位：仍是 IDS / IPS / NSM，不做转发，TLS 等加密载荷明文不可见（原理见 06-05）；`rust/src/x509/`、`rust/src/quic/`、`rust/src/ja4.rs` 记录的是证书、握手元数据与指纹，不能宣称能输出 HTTPS 明文。Hyperscan 仍是可选 MPM 加速，缺失回退 AC（`src/util-mpm-ac*.c`），不得写成必需依赖。任何关于「Rust parser 比 C parser 快多少」「启用 JA4 掉多少吞吐」的结论，一律标注「需在目标机型实测」，不给绝对值、不给跨机型通用数字（基准方法见 08-01）。
+
+最佳实践可以归纳为四条。其一，拿到快照后先按第 5 节的命令核对 workspace 成员与 `[lib]` 产物类型，再用 `suricata --build-info` 确认目标构建里 Rust 与相关 feature 的状态（参数见 04-07）。其二，改动 Rust 代码后同步跑 `scripts/rustfmt.sh`（配置在 `rust/rustfmt.toml`）与 CI 里的 `cargo audit` / clippy 类检查，把格式与依赖漏洞挡在合入前。其三，新增协议从 `rust/src/applayertemplate/` 起步，按「过程宏声明 → 导出宏暴露 → cbindgen 重生成头 → C 侧注册」的顺序推进，并在 `rust/Makefile.am` 需要时补 feature 与 `EXTRA_DIST` 登记。其四，把 `rust/src/mime/` 而非 `src/util-decode-mime.c` 当作 MIME 解析的落点，前者在本快照真实存在，后者不存在、需对照实际版本核验。
+
+### 7. 小结与延伸阅读
+
+`rust/` 模块把「用内存安全语言承载不可信输入解析与输出构造」这件事收敛到一个由七个 crate 组成的 Cargo workspace 里：根 crate 产出 `staticlib` 与 `rlib` 两类库供 C 链接与 Rust 复用，`derive` 提供过程宏，`ffi` 提供导出宏，`sys` 提供 C 符号声明，`htp` 是独立来源的 libhtp 实现，`suricatasc` 与 `suricatactl` 是同仓库的控制面与运维工具；`rust/src/` 下三十八个协议与功能子目录承载解析实体，`applayer.rs`、`jsonbuilder.rs`、`ja4.rs`、`filecontainer.rs`、`filetracker.rs`、`frames.rs` 与 `detect/` 承担桥接、输出、指纹、文件与检测辅助。FFI 边界由 `rust/cbindgen.toml` 生成的 C 头、`rust/ffi` 的导出宏与 `rust/sys` 的声明三层共同构成；构建上由 `configure.ac` 检查工具链、`rust/Makefile.am` 装配成员、cbindgen 生成头、最终链入 `suricata`。它不抓包、不拼装 runmode、不主导规则加载，核心结构体仍在 C 侧；它不是可选插件，而是构建的一部分。
+
+需要继续深入时，建议按四条路径展开。想理解应用层协议识别、事务与 Frame 的完整状态机以及 Rust parser 如何接入框架，读 06-05；想理解 EVE 事件聚合、扩展点与插件机制，读 06-11、06-14；想查 `AppLayerParserState`、`Packet`、`Flow`、`DetectEngineCtx` 的逐字段定义，读 05-04、05-02、05-03、05-05；想核对 configure 选项、yaml 段与命令行，读 04-01、04-02、04-07。想按目录继续了解相邻模块，读 07-03（app-layer）、07-07（output）、07-11（规则管理）、07-12（控制面）与 07-13（工具链与测试）；Rust 构建与抓包后端构建见 02-04。构建失败与字段异常的排障顺序见 08-03、08-04。所有性能与容量结论均需在目标机型实测，版本差异一律以 `configure.ac`、`ChangeLog` 与本快照实际文件为准，需对照实际版本核验。
+
+## 07-11 suricata-update 与规则管理
+
+### 1. 背景与动机
+
+规则集是 IDS 的「检测内容」来源，引擎再强，没有规则也只是空转。真实部署里规则来源从来不是单一文件：Emerging Threats Open 这类公共规则集需要定期下载更新，厂商或社区源需要按订阅启用，安全团队要写 `local.rules` 表达本网特有的策略，还要按本机实际流量禁用误报规则、启用被默认关闭的规则、改写部分规则的动作或消息、给高频告警加阈值抑制。若靠人工把十几个来源的文件下载、解压、合并、去重、改写，再用 `suricata -T` 试跑一遍，流程既易错又难以复现，升级时还容易把本地定制覆盖掉。于是 OISF 把「取规则、管来源、做变换、合并输出、触发自检与热加载」这件事收敛成一个专门工具，这就是 `suricata-update`。本篇讨论这个工具与内核主程序的边界、本快照里能核验到什么、以及规则从下载到生效的完整职责链，不重复展开 03-03 的部署操作步骤、04-05 / 04-06 的规则关键字全集与 06-06 的规则加载机制。
+
+必须先给出一条**事实核验结论**，它直接决定了本篇该怎么写：`suricata-update` 是与 Suricata 内核主程序**分仓、独立发版**的工具，而在本快照里，`suricata-update/` 目录下**只有 `Makefile.am` 一个文件**，没有 `setup.py`，没有 `suricata/update/*.py` 一类 Python 工具本体，也没有 `configs/` 下的配置文件实体。顶层 `bundle.txt` 明确写着 `suricata-update https://github.com/OISF/suricata-update master`，`scripts/bundle.sh` 的职责正是按这份声明把独立仓库拉取进来；`configure.ac` 第 1532 行以 `test -f "$srcdir/suricata-update/setup.py"` 作为「工具本体是否已捆绑」的判据，本快照不满足该判据，因此 `SURICATA_UPDATE_DIR` 不会被赋值，顶层 `Makefile.am` 的 `SUBDIRS` 中由 `$(SURICATA_UPDATE_DIR)` 条件加入的那一项为空。据此应当明确写出：**`suricata-update` 工具本体不在本快照，需对照实际版本核验**；本快照能核验的只有它的安装规则清单、独立仓库声明、configure 条件装配与官方文档说明（能力边界见 SPEC 第 2.1 节第 8 条）。SPEC 与大纲里「本快照内 `suricata-update/` 目录含工具本体」的表述，与这份实际快照的文件状态并不一致，本篇一律以 Read / Grep 核实到的事实为准，不把 Makefile.am 里列出的预期文件清单当成已存在的源码。
+
+能核验到的安装规则本身信息量很大。`suricata-update/Makefile.am` 用 `LIBS` 列出三十余个预期 Python 模块路径，用 `CONFIGS` 列出 `disable.conf`、`drop.conf`、`enable.conf`、`modify.conf`、`threshold.in`、`update.yaml` 六个预期配置，用 `BINS = suricata-update` 声明可执行入口；`install-exec-local` 在 `HAVE_PYTHON` 条件下把模块装到 `$(prefix)/lib/suricata/python/suricata/update/`、把配置装到对应 `configs/`、把 `bin/suricata-update` 装到 `$(bindir)` 并改写首行解释器，`uninstall-local` 与 `clean-local` 分别负责卸载与清理 `.pyc`。换句话说，这份 Makefile.am 描述的是「工具本体被 bundle 进来之后如何安装」，而不是工具本体本身；它恰好从侧面证明了工具是独立分发的 Python 包，不参与 `src/` 主程序编译。
+
+去重纪律照旧：07 册是全集的模块能力唯一权威源，`suricata-update` 对应顶层 `suricata-update/`、`bundle.txt`、`scripts/bundle.sh`、`configure.ac` 的相关段、`doc/userguide/rule-management/` 以及主程序侧的 `src/detect-engine-loader.c` 等加载入口；本篇讲「工具与主程序的边界、本快照可核验的文件、命令族与配置语义、规则如何生效」，不重复展开 03-03 的运维步骤、04-05 / 04-06 的关键字语法、06-06 的规则编译分组。结构体逐字段归 05 全册，configure 选项与命令行全集归 04 全册，交叉引用统一写「字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx」。版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验。
+
+能力边界要在最前面立住。规则语法**兼容 Snort 但有自有扩展**（`src/detect-parse.c`、`src/detect-engine-register.c`），不能宣称 100% 兼容（能力边界见 SPEC 第 2.1 节第 4 条）；`suricata-update` 不是 `suricata` 的子命令、不是内建模块，它是独立进程、独立发版，只负责规则集的获取与合并，不参与报文解码、检测与 verdict（原理见 06-12）。Suricata 仍是 IDS / IPS / NSM 引擎，不是防火墙、不做转发；EVE JSON 是主要输出（`src/output-json*.c`），工具产出的规则是否命中仍由主程序决定。规则热加载经 Unix socket 的 `reload-rules` 命令触发（模块见 07-12），不是工具直接改内存里的检测上下文（原理见 06-06）。
+
+从工程价值看，把这条边界讲清有三个直接收益。其一是排障收敛：`suricata -T` 报规则错时，能分清是「工具合并出的文本文件有问题」还是「主程序加载器解析失败」，前者查 `suricata.rules` 与变换配置，后者查 `src/detect-parse.c`。其二是升级与回滚：知道工具独立发版，就不会在升级主程序时误以为规则工具也随之升级，也不会把 `pip` 装的旧版工具与源码树里的安装规则混为一谈。其三是部署：容器或离线环境里若没有 bundle 进工具本体，`make install` 会给出「不会下载规则」的提示，理解 `configure.ac` 的条件装配就能提前准备规则卷挂载。以下各节按「概念 → 文件与结构 → 组件协作 → 实例 → 陷阱 → 小结」展开。
+
+### 2. 核心概念
+
+先把「独立工具」拆成四层含义，避免只记住一句口号。第一层是**独立仓库**：`bundle.txt` 以 `name {repo} {branch|tag}` 格式声明 `suricata-update` 来自 `https://github.com/OISF/suricata-update` 的 `master` 分支，`scripts/bundle.sh` 支持 `SU_REPO`、`SU_BRANCH`、`DESTDIR` 环境变量覆盖，并支持 `pr/NNN`、`mr/NNN` 一类拉取请求引用。第二层是**独立发版**：工具自带 `version.py`、有独立的 readthedocs 文档，`doc/userguide/rule-management/suricata-update.rst` 里明确写它「bundled with Suricata version 4.1 and later」，且老版本可单独安装，说明其版本节奏与主程序不同。第三层是**独立 Python 包**：`suricata-update/Makefile.am` 把模块装到 `lib/suricata/python/suricata/update/`、把 `bin/suricata-update` 装到 `bindir`，由 `HAVE_PYTHON` 条件控制，与 `src/` 的 C 编译产物完全分离。第四层是**不进主程序编译**：顶层 `Makefile.am` 的 `SUBDIRS = rust src plugins qa rules doc etc python ebpf \ $(SURICATA_UPDATE_DIR)` 里，只有 configure 检测到 `setup.py` 并 `AC_SUBST` 之后，`$(SURICATA_UPDATE_DIR)` 才会展开为 `suricata-update`；本快照该变量为空，因此这一项不参与构建。这四层合起来，才是 SPEC 第 2.1 节第 8 条「分仓 / 独立工具」的完整含义。
+
+第二组概念是命令族。从 `suricata-update/Makefile.am` 的 `LIBS` 清单可以确认工具按子命令组织在 `suricata/update/commands/` 下：`addsource.py`、`enablesource.py`、`disablesource.py`、`removesource.py`、`listsources.py`、`updatesources.py`、`checkversions.py` 分别对应来源的添加、启用、禁用、移除、列举、更新与版本检查；大纲点名的 `update-sources`、`enable-source`、`list-sources` 正落在其中。另有 `main.py` 作为入口、`engine.py` 驱动流程、`sources.py` 管来源定义、`rule.py` 解析规则文本、`parsers.py` 与 `matchers.py` 处理匹配、`net.py` 负责下载、`extract.py` 处理解压、`notes.py`、`maps.py`、`osinfo.py`、`util.py`、`exceptions.py`、`loghandler.py`、`config.py` 提供支撑，`data/index.py` 与 `data/update.py` 管来源索引数据。需要强调：这些是**安装规则里列出的预期模块路径**，本快照里没有对应 Python 源码，具体子命令拼写、选项名（如 `--no-test`、`--no-reload`、`--no-merge` 一类）与返回值一律需对照实际版本核验，可定位 `suricata-update/Makefile.am` 与 `doc/userguide/rule-management/`。
+
+第三组概念是变换配置与产物。`CONFIGS` 里的 `disable.conf`、`enable.conf`、`modify.conf`、`drop.conf`、`threshold.in`、`update.yaml` 分别对应按 sid 或正则禁用规则、启用规则、改写规则、把规则动作改为 drop、生成阈值抑制配置、以及工具自身的来源与路径设置；这些文件名与 03-03 提到的 `disable.conf` / `enable.conf` / `modify.conf` / `threshold.config` 是同一族（后者是主程序侧落位名，具体映射需对照实际版本核验）。合并产物通常是 `rules/suricata.rules`，官方文档 `suricata-update.rst` 给出的配置样例是 `default-rule-path: /var/lib/suricata/rules` 配 `rule-files: - suricata.rules`；主程序侧另有顶层 `threshold.config` 与 `etc/classification.config`、`etc/reference.config` 作为规则分类与引用配置。工具把规则写好后，还要经 `suricata -T` 自检、`suricatasc reload-rules` 热加载（模块见 07-12）才真正在运行实例里生效（参数见 04-02、04-07）。
+
+第四组是要分清的四组易混淆项。其一，**工具本体**与**安装规则**：`suricata-update/Makefile.am` 存在不等于 Python 工具本体存在，本快照正是这种状态。其二，**规则下载**与**规则加载**：前者是独立工具的职责，后者由 `src/detect-engine-loader.c` 与 `src/detect-parse.c` 在主程序启动或热加载时完成（原理见 06-06），二者之间只通过磁盘上的规则文件耦合。其三，**规则管理**与**规则语法**：工具不理解 `content`、`pcre`、`flowbits` 的语义，它只做文本与来源层面的处理，关键字全集归 04-05、04-06。其四，**热加载**与**重启**：`reload-rules` 走 Unix socket 让主程序重建检测上下文，不等价于重启进程，也不保证零丢包，具体语义需对照实际版本核验（模块见 07-12）。最后说明边界：`suricata-update` 不产生检测结论、不解码报文、不参与 verdict，规则是否命中由 `src/detect-engine*.c` 决定。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，不重列任何字段。07 全册禁止出现完整结构体字段表；且本篇要特别说明：由于工具本体不在本快照，工具内部的 Python 类、数据结构与函数签名**均不可核验**，一律写「需对照实际版本核验」并给出可定位目录。
+
+- 本快照中真实存在且已逐一核对的文件：`suricata-update/Makefile.am`（唯一位于该目录的文件）、顶层 `bundle.txt`、`scripts/bundle.sh`、`configure.ac` 的 Suricata-Update 条件段、顶层 `Makefile.am` 的 `SUBDIRS` 与 `install-full` 提示、`doc/userguide/rule-management/`（`suricata-update.rst`、`adding-your-own-rules.rst`、`rule-reload.rst`、`rule-profiling.rst`、`index.rst` 及 `suricata-update/` 子目录）、顶层 `threshold.config`、`etc/classification.config`、`etc/reference.config`、`rules/` 目录、`suricata.yaml.in`。
+- 主程序侧加载与检测结构：`Signature`、`SigMatch`、`DetectEngineCtx` 见 `src/detect.h`、`src/detect-engine*.c`、`src/detect-parse.c`（字段见 05-05）；`ConfNode` 树见 `src/conf.h`、`src/conf.c`（字段见 05-09）；规则加载入口见 `src/detect-engine-loader.c`，关键字注册见 `src/detect-engine-register.c`（原理见 06-06）。
+- 控制面结构：`UnixCommand`、`UnixClient` 及命令表见 `src/unix-manager.c`、`src/unix-manager.h`（字段见 05-09、原理见 06-14、模块见 07-12）。
+- 工具侧结构：`suricata/update/` 下的类与配置模型**不在本快照**，需对照独立仓库 `https://github.com/OISF/suricata-update` 及 `suricata-update/Makefile.am` 列出的 `LIBS` / `CONFIGS` 清单核验。
+
+下面是本快照中与规则管理相关的真实文件清单节选，按「独立工具装配」「主程序加载」「文档与配置」三组组织；完整枚举可用 `ls -1 suricata-update/`、`ls -1 doc/userguide/rule-management/` 复核。
+
+```tree
+suricata-main/
+├── suricata-update/
+│   └── Makefile.am          唯一文件：LIBS/CONFIGS/BINS 安装规则
+├── bundle.txt               独立仓库声明（repo、branch）
+├── scripts/bundle.sh        按 bundle.txt 拉取工具本体
+├── configure.ac             AC_ARG_ENABLE([suricata-update]) 条件段
+├── Makefile.am              SUBDIRS 含 $(SURICATA_UPDATE_DIR)
+├── threshold.config         顶层阈值配置样例
+├── suricata.yaml.in         default-rule-path / rule-files 所在
+├── rules/                   规则目录
+├── etc/
+│   ├── classification.config
+│   └── reference.config
+├── src/
+│   ├── detect-engine-loader.c   规则文件读取与加载入口
+│   ├── detect-parse.c           规则头与选项解析
+│   ├── detect-engine-register.c 关键字注册
+│   ├── unix-manager.c           reload-rules 等控制命令
+│   └── conf.c / conf-yaml-loader.c   yaml 段读取
+└── doc/userguide/rule-management/
+    ├── index.rst
+    ├── suricata-update.rst
+    ├── adding-your-own-rules.rst
+    ├── rule-reload.rst
+    ├── rule-profiling.rst
+    └── suricata-update/     文档配图目录
+```
+
+关键函数与类在真实源码中的位置如下。`configure.ac` 中以 `AC_ARG_ENABLE` 定义 `--disable-suricata-update`（默认启用），`have_suricata_update` 初值 `no`，仅当 `test -f "$srcdir/suricata-update/setup.py"` 成立且 `enable_python = yes` 时才把 `SURICATA_UPDATE_DIR` 置为 `suricata-update` 并执行 `AC_SUBST`、`AC_CONFIG_FILES(suricata-update/Makefile)`、`AC_OUTPUT`；条件不满足时 `install_suricata_update_reason="not bundled"`。顶层 `Makefile.am` 的 `SUBDIRS` 以 `$(SURICATA_UPDATE_DIR)` 收尾，`install-full` 目标会提示运行 `make install-conf` 或 `make install-full` 安装初始配置与规则。`suricata-update/Makefile.am` 的 `install-exec-local`、`uninstall-local`、`clean-local` 三个规则是安装侧入口。主程序侧 `src/detect-engine-loader.c` 的规则加载函数名需对照实际版本核验（原理见 06-06）；`src/unix-manager.c` 中 `reload-rules` 由 `UnixManagerRegisterCommand("reload-rules", UnixManagerReloadRules, NULL, 0)` 注册（模块见 07-12）。工具侧的 `main.py`、`engine.py` 等仅为安装规则里列出的预期路径，不在本快照。交叉引用：字段见 05-05、05-09 ｜ 参数见 04-02、04-05、04-07 ｜ 原理见 06-06 ｜ 模块见 07-04、07-12。
+
+一个阅读时容易忽略的细节是 `doc/userguide/rule-management/suricata-update.rst` 与 `suricata-update/Makefile.am` 的措辞差异：文档说工具「bundled with Suricata」并随安装自动可用，Makefile.am 也确实准备了一整套安装逻辑，但本快照缺 `setup.py` 与 Python 源码，configure 因此判定为「not bundled」。这不是矛盾，而是「发行包会 bundle、git 快照默认不 bundle」的两种状态；`scripts/bundle.sh` 正是把后者变成前者的桥梁。凡涉及工具子命令、配置键名与产物路径的具体取值，本快照无法提供事实锚点，一律需对照实际版本核验。
+
+### 4. 关键流程与调用链
+
+本节从模块视角描述规则从「独立仓库」到「检测引擎生效」的职责链，重点在「谁负责哪一段」，不重复展开 06 册已经讲透的规则加载、解析与分组编译机制（原理见 06-06），也不重复 03-03 的部署操作步骤。可以把整条链拆成三段：工具获取与装配段、规则变换与产出段、主程序加载与生效段。
+
+工具获取与装配段发生在编译安装期。`scripts/bundle.sh` 读 `bundle.txt`，把 `OISF/suricata-update` 的 `master` 分支拉取到 `suricata-update/` 目录，使 `setup.py`、`suricata/update/*.py`、`configs/*` 与 `bin/suricata-update` 落地；随后 `configure` 的 Suricata-Update 条件段检测到 `setup.py`，把 `SURICATA_UPDATE_DIR` 加入 `SUBDIRS`，`make install` 时按 `install-exec-local` 把 Python 模块装到 `lib/suricata/python/suricata/update/`、把可执行入口装到 `bindir`。若跳过 bundle（本快照即如此），configure 保持 `have_suricata_update="no"`，顶层 Makefile.am 安装时会提示「不会下载规则」，此时规则必须由部署方以卷挂载或手工方式提供。这一段解释了为什么「主程序编译成功」与「规则工具可用」是两件独立的事。
+
+规则变换与产出段发生在工具运行时。`suricata-update` 读 `update.yaml` 与来源索引（`data/index.py`、`data/update.py` 一类路径，需对照实际版本核验），按 `list-sources` / `enable-source` 等子命令选定的源下载规则（`net.py`、`extract.py`），再用 `disable.conf`、`enable.conf`、`modify.conf`、`drop.conf`、`threshold.in` 做过滤与改写（`rule.py`、`parsers.py`、`matchers.py`），合并去重后写出 `suricata.rules`，本地定制通常放在 `local.rules`。工具可选用 `suricata -T` 对合并结果做规则自检（参数见 04-07），也可在成功后触发 `suricatasc reload-rules` 让运行中的实例热加载（模块见 07-12）。这里只点名职责与配置名，子命令选项、匹配语法与退出码一律需对照实际版本核验。
+
+主程序加载与生效段由 `suricata.yaml.in` 的 `default-rule-path` 与 `rule-files` 指向产物，启动时经 `src/conf.c`、`src/conf-yaml-loader.c` 读入配置树（字段见 05-09），由 `src/detect-engine-loader.c` 读取规则文件、`src/detect-parse.c` 解析规则头与选项、`src/detect-engine-register.c` 提供已注册关键字，最终构造 `Signature` 并按协议、端口、方向分组编译（原理见 06-06、字段见 05-05、模块见 07-04）。热加载路径则由 `src/unix-manager.c` 的 `reload-rules` 命令触发引擎重建检测上下文（模块见 07-12）。三段的职责边界与数据流向见图 07-11-01。
+
+:::figure id=07-11-01 | name=suricata-update 独立工具与主程序规则生效链 | dir=TD
+node u1 "独立仓库<br/>OISF/suricata-update" gray
+node u2 "bundle.sh / bundle.txt<br/>拉取工具本体" gray
+node u3 "suricata-update<br/>独立 Python 工具" blue
+node u4 "规则源<br/>ET/Open 等" blue
+node u5 "变换配置<br/>disable/enable/modify" amber
+node u6 "suricata.rules<br/>合并产物" amber
+node u7 "suricata -T<br/>规则自检" green
+node u8 "detect-engine-loader<br/>主程序加载" purple
+node u9 "检测与 EVE<br/>告警输出" green
+edge u1 -> u2 "git clone master"
+edge u2 -> u3 "安装到 bindir"
+edge u4 -> u3 "下载规则"
+edge u5 -> u3 "过滤与改写"
+edge u3 -> u6 "写合并规则"
+edge u6 -> u7 "自检输入"
+edge u7 -> u8 "校验通过"
+edge u6 -> u8 "rule-files 引用"
+edge u8 -> u9 "编译后生效"
+:::
+
+图 07-11-01 中灰色是外部依赖与装配桥，蓝色是输入接口，琥珀色是规则与编译产物，绿色是校验与输出，紫色是检测引擎。需要强调这张图描述的是「规则内容供应链」，不是 06-01 那条从收包到落盘的报文流水线；把它和全流水线混为一谈，就会误以为 `suricata-update` 参与了逐包检测。图中 `u2` 到 `u3` 的边在**本快照**上是断开的——`suricata-update/` 只有 Makefile.am，工具本体需经 bundle 才出现，这正是本篇最需要记住的事实。规则热加载的支线（由 `reload-rules` 经 Unix socket 触发）属于控制面（模块见 07-12），不在这张图的主链上重复展开。
+
+### 5. 配置/命令/代码实例
+
+本节只给最小必要实例，并显式指向权威源：configure 选项、yaml 段、规则关键字与命令行全集归 04 全册（参数见 04-01、04-02、04-05、04-07），此处不重列参数全集。由于工具本体不在本快照，下面这组命令不尝试运行 `suricata-update`，而是按「前置检查 → 执行 → 验证输出 → 清理」组织一次**快照事实核验**：确认工具是否随快照分发、独立仓库声明是什么、configure 以什么条件把它装配进构建。它不改变运行状态，适合作为部署前或核查版本差异的第一步。
+
+```bash
+# 前置：进入真实仓库根（注意归档多一层 suricata-main/）
+cd upstream_src/suricata/suricata-main
+
+# 执行：确认本快照里该目录的实际内容
+ls -1 suricata-update/
+
+# 验证：确认独立仓库声明与 configure 条件装配
+cat bundle.txt
+grep -nE "AC_ARG_ENABLE\(\[suricata-update\]|setup.py|SURICATA_UPDATE_DIR|AC_CONFIG_FILES\(suricata-update|not bundled" configure.ac
+
+# 清理：退出查阅目录
+cd -
+```
+
+典型输出如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+Makefile.am
+# Specify suricata-update requirements.
+#
+# Format:
+#
+#   name {repo} {branch|tag}
+suricata-update https://github.com/OISF/suricata-update master
+1524:    AC_ARG_ENABLE([suricata-update], AS_HELP_STRING([--disable-suricata-update],
+1532:        if test -f "$srcdir/suricata-update/setup.py"; then
+1545:            SURICATA_UPDATE_DIR="suricata-update"
+1546:            AC_SUBST(SURICATA_UPDATE_DIR)
+1547:            AC_CONFIG_FILES(suricata-update/Makefile)
+1562:        install_suricata_update_reason="not bundled"
+```
+
+逐行判读如下。输出第一行 `Makefile.am` 是全组最关键的一条：`ls -1 suricata-update/` 只返回一个文件，说明本快照里没有 `setup.py`、没有 Python 工具本体、也没有 `configs/` 配置实体，任何「直接在本快照运行 suricata-update」的假设都不成立，应写「工具本体不在本快照，需对照实际版本核验」。其后 `bundle.txt` 的注释给出 `name {repo} {branch|tag}` 格式，正文那行把 `suricata-update` 映射到 `https://github.com/OISF/suricata-update` 的 `master` 分支，这是「独立仓库」最直接的证据，也解释了构建脚本要从哪里取源码。第 1524 行的 `AC_ARG_ENABLE` 调用说明该工具在 configure 层有独立开关，`--disable-suricata-update` 可关闭装配，默认值为启用；判读时若某份构建日志显示该工具被跳过，应先查这个选项而不是查 C 源码。第 1532 行 `test -f "$srcdir/suricata-update/setup.py"` 是装配判据：只有 `setup.py` 存在才认为工具已捆绑，本快照该条件为假。第 1545 至 1547 行是条件成立时的动作：把 `SURICATA_UPDATE_DIR` 赋值为 `suricata-update`、`AC_SUBST` 导出给 Makefile、生成 `suricata-update/Makefile`；这三行与顶层 `Makefile.am` 里 `SUBDIRS` 末尾的 `$(SURICATA_UPDATE_DIR)` 严丝合缝，说明它是「可选加入构建」而非「必然编译」。末行 `install_suricata_update_reason="not bundled"` 是条件不成立时的收尾赋值，configure 最终汇总信息里给出的正是这个原因。整组输出共同验证了「工具独立分发、经 bundle 才进构建、本快照未提供本体」三件事，凡与这三件事冲突的资料都应回到 `bundle.txt`、`scripts/bundle.sh` 与 `configure.ac` 复核版本差异。
+
+按职责整理的规则管理相关文件对照见下表，便于按现象反查应该先读哪一处。
+
+| 环节 | 代表文件 | 主要职责 | 本快照状态 |
+|---|---|---|---|
+| 独立仓库声明 | `bundle.txt` | 记录 repo 与 branch | 存在，指向独立仓库 |
+| 工具拉取 | `scripts/bundle.sh` | 按声明 bundle 工具本体 | 存在，尚未执行 |
+| 安装规则 | `suricata-update/Makefile.am` | 装 Python 模块与 bin | 存在，唯一文件 |
+| 条件装配 | `configure.ac` 相关段 | 检测 setup.py 决定是否加入 | 存在，判据为假 |
+| 规则加载 | `src/detect-engine-loader.c` | 读取并加载规则文件 | 存在，函数名需核验 |
+| 规则解析 | `src/detect-parse.c` | 规则头与选项解析 | 存在 |
+| 热加载 | `src/unix-manager.c` | reload-rules 控制命令 | 存在，模块见 07-12 |
+| 使用文档 | `doc/userguide/rule-management/` | 子命令与配置说明 | 存在，取值需核验 |
+
+完整 configure 选项见 04-01，完整 yaml 段与命令见 04-02、04-07，规则关键字见 04-05、04-06，机制原理见 06-06，此处不再追加调用。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一组陷阱是「把工具写成主程序内建模块」。最常见的错误说法是「用 `suricata-update` 子命令更新规则」「Suricata 内建了规则更新功能」，这与 SPEC 第 2.1 节第 8 条直接冲突：它是独立仓库、独立发版、独立 Python 包，通过 `rule-files` 指向的磁盘文件与主程序耦合，不参与 `src/` 编译，也不是 `suricata` 的命令行选项。与之相连的第二个误判是把本快照的 `suricata-update/Makefile.am` 当成工具本体：那只是安装规则，里面 `LIBS` 列出的三十余个 `.py` 路径一个都不存在于本快照，照着它去 Read 会全部扑空。正确写法是「工具本体不在本快照，需对照实际版本核验」，并给出 `bundle.txt` 与 `scripts/bundle.sh` 作为定位线索。
+
+第二组陷阱围绕配置与产物的名字。`disable.conf` / `enable.conf` / `modify.conf` / `threshold.in` 出现在工具的安装清单里，而 `threshold.config` 出现在主程序顶层、`classification.config` 与 `reference.config` 在 `etc/` 下；它们分属工具侧与主程序侧，键名、路径与落位方式需对照实际版本核验，不能因为名字相近就互相代替。`doc/userguide/rule-management/suricata-update.rst` 给出的 `default-rule-path: /var/lib/suricata/rules` 是示例值，不是本套资料的默认配置；所有 yaml 段与默认值以 `suricata.yaml.in` 为准（参数见 04-02）。另一个常见错误是认为工具写完 `suricata.rules` 规则就立即生效：生效还要经过主程序加载与可选的热加载，离线环境里若没跑 `suricata -T` 与 `reload-rules`，旧规则集会一直用到下次重启（模块见 07-12、原理见 06-06）。
+
+第三组陷阱是规则语法与兼容性。规则语法兼容 Snort 但有自有扩展（`src/detect-parse.c`、`src/detect-engine-register.c`），不能宣称 100% 兼容；从第三方拿来的规则若使用了本版本未注册的关键字，`suricata -T` 会在加载期报未知关键字，此时应查关键字注册表而不是改工具配置（原理见 06-06、参数见 04-05、04-06）。不可信规则还带来资源风险：`pcre` 回溯、超大 `dataset`、`fast_pattern` 过多会让规则编译期的内存与时间显著膨胀，这类结论一律标注「需在目标机型实测」，不给绝对值（加固见 08-05）。
+
+第四组陷阱是能力边界与运维口径。Suricata 是 IDS / IPS / NSM 引擎，不是防火墙、不做转发；工具产出的 `drop` 规则是否真正丢弃，取决于 IPS 内联模式下的 verdict 与 `stream.inline`（原理见 06-12），与规则管理工具无关。EVE JSON 是主要输出，工具不产生也不消费 EVE 事件。性能方面，规则集规模、合并频率与热加载对检测吞吐、编译期内存的影响，一律标注「需在目标机型实测」（基准见 08-01、调优见 08-02）。
+
+最佳实践可以归纳为四条。其一，构建或部署前先按第 5 节核验工具是否随快照分发；未分发时明确走 `scripts/bundle.sh` 或由部署方提供规则文件，不要让 `make install-full` 的「不会下载规则」提示变成上线后的空规则集。其二，把工具合并产物纳入版本管理或配置管理，`local.rules` 与 `disable.conf` 一类定制单独留存，避免升级时覆盖；每次合并后固定跑 `suricata -T` 自检（参数见 04-07）。其三，把 `reload-rules` 纳入变更流程，理解它走 Unix socket 且需对应权限（模块见 07-12），socket 文件权限控制见 08-05。其四，始终按「独立工具」写文档与脚本：命令拼写在脚本里做一次探测，不硬编码子命令与选项名，具体取值需对照实际版本核验。
+
+### 7. 小结与延伸阅读
+
+`suricata-update` 负责规则集的获取、来源管理、变换、合并与自检触发，是与 Suricata 内核主程序分仓、独立发版的 Python 工具；它不参与 `src/` 编译，不是主程序子命令，与引擎之间只通过 `default-rule-path` / `rule-files` 指向的磁盘规则文件耦合。本快照能核验到的是 `suricata-update/Makefile.am`（唯一文件，含 `LIBS` / `CONFIGS` / `BINS` 安装规则）、`bundle.txt` 的独立仓库声明、`scripts/bundle.sh` 的拉取逻辑、`configure.ac` 以 `suricata-update/setup.py` 是否存在为判据的条件装配、顶层 `Makefile.am` 的 `$(SURICATA_UPDATE_DIR)`，以及 `doc/userguide/rule-management/` 的官方文档；**工具本体不在本快照，需对照实际版本核验**。规则真正生效还要经 `src/detect-engine-loader.c` 加载、`src/detect-parse.c` 解析、按协议方向分组编译，并可由 Unix socket 的 `reload-rules` 热加载（原理见 06-06、模块见 07-12）。
+
+需要继续深入时，建议按四条路径展开。想理解规则加载、解析、分组编译与 `suricata -T` 的校验点，读 06-06；想查 `Signature`、`SigMatch`、`DetectEngineCtx` 与 `ConfNode` 的逐字段定义，读 05-05、05-09；想核对 configure 选项、yaml 段、规则关键字与命令行全集，读 04-01、04-02、04-05、04-06、04-07。想按场景把工具用起来，读 03-03（规则集管理部署）、07-12（控制面与热加载）、07-13（`suricata -T` 与规则自检工具链）；不可信规则与权限加固见 08-05，上线检查清单见 08-06。所有性能与容量结论均需在目标机型实测，版本差异一律以 `configure.ac`、`ChangeLog`、独立仓库与本快照实际文件为准，需对照实际版本核验。
+
+## 07-12 unix socket、suricatasc 与控制面
+
+### 1. 背景与动机
+
+Suricata 是常驻进程，一跑就是几天甚至几周，运维过程中不可能每次查询或变更都重启：需要看引擎是否还活着、跑在什么 runmode 上、运行了多久、各网卡收包计数是多少；需要在不中断检测的前提下换规则集、重开被 logrotate 轮转过的日志句柄、给某台主机加一条 hostbit、把一批 pcap 送进去离线回放、或临时调整 memcap 配额。若只靠信号加配置文件轮询，能表达的动作极少，返回值也没有结构化格式，第三方脚本难以可靠集成。于是 Suricata 在 `src/` 下给出一个基于 Unix 域套接字的控制面：主程序侧由一个管理线程监听 socket、接受 JSON 命令、回写 JSON 应答，客户端侧由 `suricatasc` 把用户输入翻译成协议报文。本篇讨论这个控制面模块的文件构成、注册接口、命令族、协议形态与安全边界，不重复展开 06 册已经讲透的扩展机制（原理见 06-14），也不重复 04-07 的命令全集与 03-04 的日志轮转场景。
+
+官方文档 `doc/userguide/unix-socket.rst` 把协议定性得很清楚：Suricata 可以监听一个 Unix socket 并接受用户命令，交换协议是 JSON-based 且消息格式是通用的；`suricatasc` 会在安装或升级 Suricata 时自动装上；socket 默认总是启用，实际由 `suricata.yaml` 的 `unix-command.enabled`（取 `yes` 或 `auto`）控制，可选的 `filename` 用来指定替代的 socket 文件名，且该文件名始终相对本地状态基目录解析。文档还列举了多种语言的客户端实现：Rust 版即本仓库 `rust/suricatasc`（文档标注为 Suricata 8+ 提供），旧版 Python 客户端指向 `python/suricata/sc/suricatasc.py`，另有 Perl 与 C 的示例。这些事实把「控制面」定位得很稳：它是进程外的运维通道，不是数据面的一部分。
+
+必须先给出本快照的事实核验结论。`src/unix-manager.c`、`src/unix-manager.h`、`src/runmode-unix-socket.c`、`src/runmode-unix-socket.h` 四个文件确认存在；`rust/suricatasc/` 下有 `Cargo.toml.in`、`LICENSE`、`Makefile.am`、`README.md` 与 `src/`，其中 `src/unix/` 内含 `client.rs`、`commands.rs`、`main.rs`、`mod.rs`、`rustyprompt.rs`；`rust/suricatactl/` 同属控制面与运维工具但在 07-10 已作为 workspace 成员点名。`configure.ac` 第 826 行起以 `AC_ARG_ENABLE` 定义 `--enable-unix-socket`，帮助串标注 `[default=test]`，第 872 行在显式启用时定义 `BUILD_UNIX_SOCKET` 宏；`src/unix-manager.h` 里 `UnixManagerRegisterCommand` 与 `UnixManagerRegisterBackgroundTask` 的声明被 `#ifdef BUILD_UNIX_SOCKET` 包住，说明这套接口受条件编译保护。具体宏值、默认模式语义与 yaml 键名需对照实际版本核验。
+
+去重纪律与全册一致：07 册是「模块能力与特性」唯一权威源，控制面对应 `src/unix-manager.*`、`src/runmode-unix-socket.*`、`rust/suricatasc/`、`doc/userguide/unix-socket.rst` 与 `suricata.yaml.in` 的 `unix-command` 段；本篇讲「模块由哪些文件组成、注册了哪些命令、协议怎么走、边界在哪」，不重复展开 06-14 的扩展注册机制，也不重列 04-07 的命令行与 RPC 全集。结构体逐字段归 05 全册，配置参数与命令全集归 04 全册，运维操作归 03 / 08 全册，交叉引用统一写「字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx」。版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验。
+
+能力边界要在最前面立住。控制面只是「给常驻进程发命令」，不改变 Suricata 作为 IDS / IPS / NSM 引擎的定位：它不做 IP 转发、不是防火墙、不参与逐包检测；socket 上流动的是 JSON 命令与应答，不是报文副本，`pcap-file` 一类命令触发的是离线 pcap 回放（模块见 07-06、07-13），不是在线抓包。可见性约束同样不变：TLS 等加密载荷的明文正文不可见，控制面能查到的计数与状态来自引擎已解码并重组到的流量（原理见 06-05）。EVE JSON 仍是主要输出（模块见 07-07），控制面不产生 EVE 事件本身，只触发 `reopen-log-files`、`reload-rules` 一类动作。
+
+从工程价值看，建立控制面的模块地图有三个直接收益。其一是排障：`stats.log` 与 `eve.json` 之外，`dump-counters`、`iface-stat`、`memcap-list`、`ruleset-failed-rules` 提供运行时的即时证据，理解它们由哪个文件注册，才知道某条命令为何在当前 runmode 下不可用。其二是变更：`reload-rules` 把 07-11 的规则管理工具与运行实例连起来，`reopen-log-files` 把 03-04 的日志轮转闭环，缺了控制面这些流程都要靠重启。其三是扩展：`UnixManagerRegisterCommand` 与 `UnixManagerRegisterBackgroundTask` 是其他模块往控制面挂命令的入口，知道挂接点才不会把新命令写进 `suricatasc` 客户端却忘了服务端注册。以下各节按「概念 → 文件与结构 → 组件协作 → 实例 → 陷阱 → 小结」展开。
+
+### 2. 核心概念
+
+先把控制面拆成三层。服务端是 `src/unix-manager.c`：它维护 `UnixCommand` 与 `UnixClient` 两类上下文（字段见 05-09），由 `UnixManager` 线程跑 `UnixMain` 主循环，`UnixCommandAccept` 接受连接、`UnixCommandRun` 派发、`UnixCommandExecute` 按命令名查表并执行回调、`UnixCommandSendJSONToClient` 回写应答，`UnixCommandBackgroundTasks` 处理后台任务，`UnixNew`、`UnixCommandSetMaxFD`、`UnixClientAlloc`、`UnixClientFree`、`UnixCommandClose` 负责初始化与资源回收。协议层是「JSON over Unix domain socket」：客户端发一条带 `command` 字段、必要时带 `arguments` 的 JSON 对象，服务端回一条 JSON 对象；`src/unix-manager.h` 里 `#define UNIX_CMD_TAKE_ARGS 1` 是注册时的标志，标记该命令是否需要携带参数。客户端是 `rust/suricatasc`：`main.rs` 在非 Windows 平台转到 `crate::unix::main::main()`，Windows 上直接输出 `suricatasc is not supported on Windows`，`src/unix/` 下 `client.rs` 管连接、`commands.rs` 管命令表、`rustyprompt.rs` 管交互提示。
+
+命令表是理解这个模块的核心，且它**分散在两个文件注册**。`src/unix-manager.c` 第 1084 行起注册标准命令：`shutdown`、`command-list`、`help`、`version`、`uptime`、`running-mode`、`capture-mode`、`conf-get`、`dump-counters`、`reload-rules`、`ruleset-reload-rules`、`ruleset-reload-nonblocking`、`ruleset-reload-time`、`ruleset-stats`、`ruleset-failed-rules`、`ruleset-profile`，以及 tenant 族（`register-tenant-handler`、`unregister-tenant-handler`、`register-tenant`、`reload-tenant`、`reload-tenants`、`unregister-tenant`）、hostbit 族（`add-hostbit`、`remove-hostbit`、`list-hostbit`）、`reopen-log-files`、memcap 族（`memcap-set`、`memcap-show`、`memcap-list`）、dataset 族（`dataset-add`、`dataset-remove`、`dataset-dump`），另在第 1240 行附近按条件注册 `iface-stat`、`iface-list`、`iface-bypassed-stat`、`ebpf-bypassed-stat`。而 `src/runmode-unix-socket.c` 第 1779 行起单独注册 pcap 回放族：`pcap-file`、`pcap-file-continuous`、`pcap-file-number`、`pcap-file-list`、`pcap-last-processed`、`pcap-interrupt`、`pcap-current`，并用 `UnixManagerRegisterBackgroundTask(UnixSocketPcapFilesCheck, pcapcmd)` 挂上后台检查任务。把这两处混为一谈，是阅读控制面时最常见的偏差。
+
+按职责可以把命令族分成六组：生命周期与信息（`shutdown`、`version`、`uptime`、`running-mode`、`capture-mode`、`command-list`、`help`、`conf-get`）、计数与诊断（`dump-counters`、`iface-stat`、`iface-list`、`memcap-list`、`ruleset-stats`、`ruleset-failed-rules`、`ruleset-profile`）、规则变更（`reload-rules`、`ruleset-reload-rules`、`ruleset-reload-nonblocking`、`ruleset-reload-time`）、日志与运行时状态（`reopen-log-files`、`memcap-set`、`memcap-show`、`add-hostbit`、`remove-hostbit`、`list-hostbit`、`dataset-add`、`dataset-remove`、`dataset-dump`）、多租户（tenant 族六个）、离线回放（pcap 族七个）。完整命令清单与参数见 04-07，本篇只给分组与真实命令名，不重列全集。
+
+客户端侧还有一组值得单独说的概念。`rust/suricatasc/src/unix/commands.rs` 里 `Commands` 结构持有两样东西：一份由 `command_defs()` 用 `serde_json` 定义的本地命令表（例如 `pcap-file` 带 `filename`、`output-dir`、`tenant`、`continuous` 等参数描述），以及一份从服务端下发的 `server_commands` 列表；`Commands::new` 用后者补充前者，`is_valid` 依据服务端列表校验命令是否适用于当前 runmode，`CommandParser::parse` 把用户输入拼成含 `command` 字段、必要时带 `arguments` 字段的 JSON 对象。这份设计解释了一个常见现象：客户端认识的命令不一定能发，服务端没下发的命令会被 `is_valid` 挡下并报 `Command not valid for current Suricata running-mode`。具体字段与错误文本需对照实际版本核验。
+
+最后说明边界与三组易混淆项。易混淆之一是 `src/unix-manager.c`（服务端管理线程，所有 runmode 共享）与 `src/runmode-unix-socket.c`（unix socket runmode，专管 pcap 批量回放）；之二是 `suricatasc`（交互客户端）与 `suricatactl`（运维工具，模块见 07-10）；之三是 `reload-rules` 走控制面（模块见 07-11、07-12）与规则加载走 `src/detect-engine-loader.c`（原理见 06-06）。控制面不逐包处理、不做解码、不做检测、不写 EVE 事件，它只提供「命令进入引擎并改动运行时状态」的通道。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，不重列任何字段。07 全册禁止出现完整结构体字段表，逐字段定义、类型与生命周期归 05 全册统一承担。
+
+- `UnixCommand`、`UnixClient`：定义在 `src/unix-manager.c`，前者承载监听 socket、命令表与后台任务，后者承载单个连接的状态；字段名与成员构成需对照实际版本核验（字段见 05-09）。
+- `TmModule` 注册项：`TmModuleUnixManagerRegister` 在 `src/unix-manager.h` 声明，把管理线程挂进 `tmm_modules[]`（字段见 05-07、原理见 06-13）。
+- `PcapCommand` 与 pcap 回放上下文：`src/runmode-unix-socket.c` 内定义，配合 `unix_manager_pcap_task_running`、`unix_manager_pcap_task_failed`、`unix_manager_pcap_task_interrupted` 等文件内状态变量使用，字段名需对照实际版本核验（字段见 05-09）。
+- 客户端命令表：`rust/suricatasc/src/unix/commands.rs` 的 `Commands`、`CommandParser`、`Argument` 与 `CommandParseError`（Rust 侧结构，字段见 05-09 的跨语言边界说明，具体定义需对照实际版本核验）。
+- 配置树：`ConfNode` 与 `unix-command` 段读取见 `src/conf.c`、`src/conf-yaml-loader.c`（字段见 05-09、参数见 04-02）。
+
+下面是本快照中控制面相关的真实文件清单节选，按服务端、客户端、文档与配置四组组织；完整枚举可用 `ls -1 src/unix-manager* src/runmode-unix-socket* rust/suricatasc/` 复核。
+
+```tree
+suricata-main/
+├── src/
+│   ├── unix-manager.c        服务端：监听、命令表、应答、后台任务
+│   ├── unix-manager.h        UnixManagerInit / Register 等声明
+│   ├── runmode-unix-socket.c pcap 回放命令与后台任务
+│   ├── runmode-unix-socket.h RunModeUnixSocketGetDefaultMode 等声明
+│   ├── conf.c / conf-yaml-loader.c   unix-command 段读取
+│   └── detect-engine-loader.c       reload-rules 关联入口
+├── rust/suricatasc/
+│   ├── Cargo.toml.in / Makefile.am / LICENSE / README.md
+│   └── src/
+│       ├── main.rs           Windows 分支与非 Windows 入口
+│       └── unix/
+│           ├── client.rs     连接与收发
+│           ├── commands.rs   本地命令表与解析
+│           ├── main.rs       客户端主流程
+│           ├── mod.rs        模块声明
+│           └── rustyprompt.rs 交互提示
+├── rust/suricatactl/         运维工具（模块见 07-10）
+├── suricata.yaml.in          unix-command 段
+├── configure.ac              --enable-unix-socket 段
+└── doc/userguide/
+    ├── unix-socket.rst       协议、启用方式与命令说明
+    └── command-line-options.rst
+```
+
+关键函数在真实源码中的位置如下，均已逐一核对。`src/unix-manager.c`：`UnixNew`（第 107 行）、`UnixCommandSetMaxFD`（213）、`UnixClientAlloc`（230）、`UnixClientFree`（246）、`UnixCommandClose`（257）、`UnixCommandSendJSONToClient`（288）、`UnixCommandAccept`（335）、`UnixCommandBackgroundTasks`（443）、`UnixCommandExecute`（466）、`UnixCommandRun`（543）、`UnixMain`（631）；命令回调族 `UnixManagerShutdownCommand`（685）、`UnixManagerVersionCommand`（694）、`UnixManagerUptimeCommand`（702）、`UnixManagerRunningModeCommand`（714）、`UnixManagerCaptureModeCommand`（722）、`UnixManagerReloadRulesWrapper`（730）、`UnixManagerReloadRules`（757）、`UnixManagerNonBlockingReloadRules`（762）、`UnixManagerReloadTimeCommand`（767）、`UnixManagerRulesetStatsCommand`（779）、`UnixManagerRulesetProfileCommand`（792）、`UnixManagerShowFailedRules`（823）、`UnixManagerConfGetCommand`（880）、`UnixManagerListCommand`（910）、`UnixManagerReopenLogFiles`（944）；框架入口 `UnixManagerReloadRules`（952）、`UnixManagerRegisterCommand`（989）、`UnixManagerRegisterBackgroundTask`（1044）、`UnixManagerInit`（1068）、`UnixManagerThreadInit`（1139）、`UnixManager`（1155）、`UnixManagerThreadSpawn`（1211）、`UnixManagerThreadSpawnNonRunmode`（1235）、`UnixSocketKillSocketThread`（1259）。`src/unix-manager.h` 声明 `int UnixManagerInit(void)`、`void UnixManagerThreadSpawn(int mode)`、`void UnixSocketKillSocketThread(void)`，并在 `BUILD_UNIX_SOCKET` 下声明两个 Register 函数与 `void TmModuleUnixManagerRegister(void)`。`src/runmode-unix-socket.c`：`RunModeUnixSocketGetDefaultMode`（86）、`UnixSocketPcapFilesList`（140）、`UnixSocketPcapFilesNumber`（171）、`UnixSocketPcapCurrent`（184）、`UnixSocketPcapLastProcessed`（197）、`UnixSocketPcapInterrupt`（210）、`UnixSocketAddPcapFileImpl`（291）、`UnixSocketAddPcapFile`（402）、`UnixSocketAddPcapFileContinuous`（421）、`UnixSocketPcapFilesCheck`（439），命令注册集中在第 1779 至 1787 行。函数签名、参数与返回值一律需对照实际版本核验。交叉引用：字段见 05-09、05-07 ｜ 参数见 04-02、04-07 ｜ 原理见 06-13、06-14 ｜ 模块见 07-11。
+
+一个阅读时容易忽略的细节是 `UnixManagerThreadSpawn` 在本文件里出现了两次（第 1211 行与第 1298 行），`UnixSocketKillSocketThread` 也成对出现（第 1259 行与第 1303 行）：这是 `BUILD_UNIX_SOCKET` 条件编译下的两套分支，未启用时提供空实现或退出桩，与 07-06 里 source 后端成对注册函数是同一类写法，判读时若只看到后一份就断言「控制面没有实现」会得出错误结论。另一个细节是 `rust/suricatasc/src/main.rs` 用 `#[cfg(not(target_os = "windows"))]` 把 Unix socket 客户端整体隔离，说明控制面能力有平台边界，具体平台支持范围需对照实际版本核验。
+
+### 4. 关键流程与调用链
+
+本节从模块视角描述控制面内部文件如何协作、以及它如何挂到主程序上，重点在「注册与职责划分」，不重复展开 06 册已经讲透的扩展注册与线程机制（原理见 06-14、06-13）。可以把整个模块拆成三条相互配合的线：启动装配线、命令往返线、pcap 回放后台线。
+
+启动装配线发生在进程初始化阶段。`configure` 的 `--enable-unix-socket`（默认 `test`，具体语义需对照实际版本核验）决定 `BUILD_UNIX_SOCKET` 是否定义；运行时 `suricata.yaml.in` 的 `unix-command.enabled` 决定是否真正拉起管理线程（参数见 04-02）。`UnixManagerInit` 完成命令表与后台任务的初始化，各功能文件在初始化阶段用 `UnixManagerRegisterCommand` 把自己的回调挂进表：标准命令来自 `src/unix-manager.c` 自身，pcap 回放命令来自 `src/runmode-unix-socket.c`，`iface-*` 一类按条件追加。`TmModuleUnixManagerRegister` 把 `UnixManager` 登记为线程模块，`UnixManagerThreadSpawn` 或 `UnixManagerThreadSpawnNonRunmode` 拉起线程，`UnixMain` 进入监听循环；`UnixCommandSetMaxFD` 与 `UnixClientAlloc` / `UnixClientFree` 负责连接资源。这条线解释了「命令表是启动期静态拼出来的」，不是运行时动态加载插件。
+
+命令往返线是每次交互的主路径。`suricatasc` 读用户输入，`CommandParser::parse` 依本地命令表与服务端下发的 `server_commands` 校验并生成 JSON 报文；`client.rs` 经 Unix socket 发出；服务端 `UnixCommandAccept` 接受连接、`UnixCommandRun` 取出报文、`UnixCommandExecute` 按 `command` 字段查命令表并调用对应回调（例如 `reload-rules` 落到 `UnixManagerReloadRules`、`reopen-log-files` 落到 `UnixManagerReopenLogFiles`、`conf-get` 落到 `UnixManagerConfGetCommand`），最后由 `UnixCommandSendJSONToClient` 回写 JSON 应答。带 `UNIX_CMD_TAKE_ARGS` 标志的命令会解析 `arguments`，不带标志的忽略参数。`UnixCommandBackgroundTasks` 则在循环间隙推进已注册的后台任务。整个模块的注册来源、命令往返与后台支线见图 07-12-01。
+
+:::figure id=07-12-01 | name=unix socket 控制面注册来源与命令往返 | dir=TD
+node c1 "suricatasc 客户端<br/>commands.rs 解析" blue
+node c2 "Unix 域套接字<br/>JSON 命令" blue
+node c3 "unix-manager.c<br/>UnixCommandExecute" teal
+node c4 "命令表<br/>RegisterCommand" teal
+node c5 "reload-rules<br/>规则热加载" amber
+node c6 "pcap-file 后台任务<br/>FilesCheck" gray
+node c7 "查询类命令<br/>counters / iface" green
+node c8 "主程序运行时状态<br/>detect / conf" purple
+node c9 "EVE 与 stats<br/>计数落盘" green
+edge c1 -> c2 "command 与 arguments"
+edge c2 -> c3 "accept 与派发"
+edge c3 -> c4 "查命令表"
+edge c4 -> c5 "规则变更"
+edge c4 -> c6 "pcap 回放"
+edge c4 -> c7 "只读查询"
+edge c5 -> c8 "重建检测上下文"
+edge c6 -> c8 "回放送入流水线"
+edge c7 -> c8 "读取计数"
+edge c8 -> c9 "事件与统计"
+:::
+
+图 07-12-01 中蓝色是输入接口与协议，青色是服务端派发与命令表，琥珀色是规则变更，灰色是后台支线，绿色是查询与输出，紫色是被引擎状态承接的落点。需要强调这张图描述的是模块内部的注册与往返关系，不是 06-01 那条从收包到落盘的报文流水线；把它和全流水线混为一谈，就会误以为控制面参与逐包检测。pcap 回放后台线是第三条：`src/runmode-unix-socket.c` 用 `UnixManagerRegisterBackgroundTask(UnixSocketPcapFilesCheck, pcapcmd)` 挂上检查任务，`pcap-file` 命令经 `UnixSocketAddPcapFileImpl` 与 `UnixListAddFile` 把文件加入待回放列表，再由离线 pcap 后端消费（模块见 07-06、工具链见 07-13）；`pcap-current`、`pcap-last-processed`、`pcap-file-number`、`pcap-file-list`、`pcap-interrupt` 提供进度与中断控制。这条线只在 unix socket runmode 下完整可用，与标准命令在不同文件注册，是本篇最需要记住的模块边界。
+
+### 5. 配置/命令/代码实例
+
+本节只给最小必要实例，并显式指向权威源：命令行、RPC 命令与返回码全集归 04 全册（参数见 04-02、04-07、04-08），此处不重列参数全集；07 全册每篇代码段最多给 3–5 个本模块最典型的调用，其余写「完整 API 见 04-xx」。下面给一组按「前置检查 → 执行 → 验证输出 → 清理」组织的源码核验命令，用来在拿到任意一份上游快照后快速确认控制面注册了哪些命令、pcap 族命令由哪个文件单独注册，不改变运行状态，适合作为排障前或核查版本差异的第一步。
+
+```bash
+# 前置：进入真实仓库根（注意归档多一层 suricata-main/）
+cd upstream_src/suricata/suricata-main
+
+# 执行：抽取服务端注册的标准命令名
+grep -nE "UnixManagerRegisterCommand\(\"" src/unix-manager.c | head -15
+
+# 验证：确认 pcap 类命令与后台任务由另一文件注册
+grep -nE "UnixManagerRegisterCommand\(\"pcap|UnixManagerRegisterBackgroundTask" src/runmode-unix-socket.c
+
+# 清理：退出查阅目录
+cd -
+```
+
+典型输出如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+1084:    UnixManagerRegisterCommand("shutdown", UnixManagerShutdownCommand, NULL, 0);
+1085:    UnixManagerRegisterCommand("command-list", UnixManagerListCommand, &command, 0);
+1086:    UnixManagerRegisterCommand("help", UnixManagerListCommand, &command, 0);
+1087:    UnixManagerRegisterCommand("version", UnixManagerVersionCommand, &command, 0);
+1088:    UnixManagerRegisterCommand("uptime", UnixManagerUptimeCommand, &command, 0);
+1089:    UnixManagerRegisterCommand("running-mode", UnixManagerRunningModeCommand, &command, 0);
+1090:    UnixManagerRegisterCommand("capture-mode", UnixManagerCaptureModeCommand, &command, 0);
+1091:    UnixManagerRegisterCommand("conf-get", UnixManagerConfGetCommand, &command, UNIX_CMD_TAKE_ARGS);
+1092:    UnixManagerRegisterCommand("dump-counters", StatsOutputCounterSocket, NULL, 0);
+1093:    UnixManagerRegisterCommand("reload-rules", UnixManagerReloadRules, NULL, 0);
+1094:    UnixManagerRegisterCommand("ruleset-reload-rules", UnixManagerReloadRules, NULL, 0);
+1095:    UnixManagerRegisterCommand("ruleset-reload-nonblocking", UnixManagerNonBlockingReloadRules, NULL, 0);
+1096:    UnixManagerRegisterCommand("ruleset-reload-time", UnixManagerReloadTimeCommand, NULL, 0);
+1097:    UnixManagerRegisterCommand("ruleset-stats", UnixManagerRulesetStatsCommand, NULL, 0);
+1098:    UnixManagerRegisterCommand("ruleset-failed-rules", UnixManagerShowFailedRules, NULL, 0);
+1779:    UnixManagerRegisterCommand("pcap-file", UnixSocketAddPcapFile, pcapcmd, UNIX_CMD_TAKE_ARGS);
+1780:    UnixManagerRegisterCommand("pcap-file-continuous", UnixSocketAddPcapFileContinuous, pcapcmd, UNIX_CMD_TAKE_ARGS);
+1781:    UnixManagerRegisterCommand("pcap-file-number", UnixSocketPcapFilesNumber, pcapcmd, 0);
+1782:    UnixManagerRegisterCommand("pcap-file-list", UnixSocketPcapFilesList, pcapcmd, 0);
+1783:    UnixManagerRegisterCommand("pcap-last-processed", UnixSocketPcapLastProcessed, pcapcmd, 0);
+1784:    UnixManagerRegisterCommand("pcap-interrupt", UnixSocketPcapInterrupt, pcapcmd, 0);
+1785:    UnixManagerRegisterCommand("pcap-current", UnixSocketPcapCurrent, pcapcmd, 0);
+1787:    UnixManagerRegisterBackgroundTask(UnixSocketPcapFilesCheck, pcapcmd);
+```
+
+逐行判读如下。第 1084 至 1098 行连续十五行都出自 `src/unix-manager.c`，说明标准命令是在 `UnixManagerInit` 阶段一次性静态登记的；每个注册调用四个参数依次是命令名、回调函数、传给回调的 `data` 指针与标志位，例如 `command-list` 与 `help` 复用同一个 `UnixManagerListCommand` 回调、`data` 传 `&command`，判读时不要误以为是两条不同实现。`conf-get` 与 `reload-rules` 是这一组里最值得记住的两条：前者带 `UNIX_CMD_TAKE_ARGS`，对应「需要参数」的标志，后者把 07-11 的规则合并产物与运行实例连起来，是热加载在控制面的落点（模块见 07-11、原理见 06-06）。第 1093、1094 行 `reload-rules` 与 `ruleset-reload-rules` 指向同一个回调 `UnixManagerReloadRules`，第 1095 行 `ruleset-reload-nonblocking` 才指向 `UnixManagerNonBlockingReloadRules`，说明阻塞与非阻塞是两种不同语义，具体行为需对照实际版本核验。第 1779 行起八行全部出自 `src/runmode-unix-socket.c`，文件名前缀 `pcap-` 与 `data` 处的 `pcapcmd` 共同表明这些命令共享一个 pcap 回放上下文；其中 `pcap-file` 与 `pcap-file-continuous` 带 `UNIX_CMD_TAKE_ARGS`（要给 `filename`、`output-dir` 等参数，参数见 04-07），其余进度查询类不带参数。末行 `UnixManagerRegisterBackgroundTask(UnixSocketPcapFilesCheck, pcapcmd)` 不是命令而是后台任务登记，说明 pcap 队列的推进由 `UnixCommandBackgroundTasks` 在监听循环间隙驱动，而不是靠客户端反复轮询。整组输出共同验证了「标准命令在 unix-manager.c 注册、pcap 回放命令与后台任务在 runmode-unix-socket.c 注册」，任何一处对不上都应回到这两个文件复核版本差异。
+
+按命令组整理的注册来源对照见下表，便于按现象反查应该先读哪个文件。
+
+| 命令组 | 代表命令 | 注册位置 | 典型用途 |
+|---|---|---|---|
+| 生命周期与信息 | `shutdown`、`version`、`uptime` | `src/unix-manager.c` 第 1084 行起 | 查询与停机 |
+| 计数与诊断 | `dump-counters`、`iface-stat` | `src/unix-manager.c` | 排障取证 |
+| 规则热加载 | `reload-rules`、`ruleset-reload-nonblocking` | `src/unix-manager.c` | 规则变更 |
+| 日志与状态 | `reopen-log-files`、`memcap-list` | `src/unix-manager.c` | 轮转与配额 |
+| hostbit 与 dataset | `add-hostbit`、`dataset-add` | `src/unix-manager.c` | 运行时状态 |
+| pcap 回放 | `pcap-file`、`pcap-file-number` | `src/runmode-unix-socket.c` 第 1779 行起 | 离线回放 |
+| 客户端定义 | `Commands`、`CommandParser` | `rust/suricatasc/src/unix/commands.rs` | 本地校验 |
+
+完整命令与参数见 04-07，返回码与错误文本见 04-08，机制原理见 06-14，此处不再追加调用。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一组陷阱是条件编译与启用状态。`src/unix-manager.h` 把 `UnixManagerRegisterCommand`、`UnixManagerRegisterBackgroundTask` 的声明包在 `#ifdef BUILD_UNIX_SOCKET` 里，`configure.ac` 的 `--enable-unix-socket` 帮助串标注默认 `test`，而官方文档 `unix-socket.rst` 又写「socket 默认总是启用」；这三处措辞面向不同层次（编译期宏、configure 选项、运行时 yaml 开关），具体默认模式语义与三者对应关系需对照实际版本核验。判读「命令发不出去」时，应依次确认：构建是否带 `BUILD_UNIX_SOCKET`、`unix-command.enabled` 是否为 `yes` / `auto`、socket 文件是否落在预期的本地状态目录，而不是先怀疑客户端。`suricata --build-info` 可辅助确认构建期能力（参数见 04-07）。
+
+第二组陷阱是命令按 runmode 生效。`rust/suricatasc/src/unix/commands.rs` 的 `is_valid` 以服务端下发的 `server_commands` 为准，不在列表里的命令会被挡下并报 `Command not valid for current Suricata running-mode`；pcap 族命令只在 unix socket runmode 下由 `src/runmode-unix-socket.c` 注册，普通 IDS 运行模式下发 `pcap-file` 自然不可用。把「客户端命令表里查得到」当成「服务端一定能执行」，是控制面最常见的误判，错误文本与判定顺序需对照实际版本核验（参数见 04-08）。另一个细节是 `reload-rules` 与 `ruleset-reload-nonblocking` 语义不同，后者不等待规则加载完成即返回，脚本里若紧接着读 `ruleset-stats` 可能拿到旧值，具体时序需对照实际版本核验。
+
+第三组陷阱是控制面安全。socket 文件按官方文档落在本地状态基目录，`filename` 相对该目录解析；能连上 socket 就等于能执行 `shutdown`、`dataset-add`、`memcap-set`、`add-hostbit`、`register-tenant` 这类高权限动作，也能通过 `conf-get` 读到配置内容。因此目录权限、socket 文件权限、运行用户与组必须一并收紧（加固见 08-05），具体选项名需对照 `suricata.yaml.in` 与 `configure.ac` 核验。容器化部署尤要注意：把状态目录挂成可读可写的共享卷，等于把控制面暴露给同宿主机其他容器。任何第三方客户端（文档列举的 Python / Perl / C 示例）接入前都应先确认协议版本与权限边界。
+
+第四组陷阱是能力边界与性能口径。控制面不转发报文、不参与逐包检测，`pcap-file` 是离线回放而非在线抓包（模块见 07-06、工具链见 07-13）；Suricata 仍是 IDS / IPS / NSM 引擎，不是防火墙、不做转发，TLS 等加密载荷明文不可见。`reload-rules` 期间检测上下文重建对吞吐、延迟与短暂告警窗口的影响，一律标注「需在目标机型实测」，不给绝对值、不给跨机型通用数字（基准见 08-01、调优见 08-02）。
+
+最佳实践可以归纳为四条。其一，排障前先用第 5 节的命令确认命令注册来源与当前 runmode，再决定发哪条命令，避免盲目重试。其二，把 `dump-counters`、`iface-stat`、`memcap-list`、`ruleset-failed-rules` 纳入值班脚本的取证清单，输出判读方法见 08-01、08-03。其三，规则变更走「工具合并 → `suricata -T` 自检 → `reload-rules` 热加载 → `ruleset-stats` 复核」的闭环（模块见 07-11、参数见 04-07），日志轮转走 `reopen-log-files` 而非重启（模块见 03-04）。其四，收紧 socket 与状态目录权限，把控制面访问纳入审计，具体权限模型需对照实际版本核验（加固见 08-05）。
+
+### 7. 小结与延伸阅读
+
+`unix socket` 控制面把「给常驻进程发结构化命令」这件事收敛到 `src/unix-manager.c` / `.h`、`src/runmode-unix-socket.c` / `.h` 与 `rust/suricatasc/` 三处：服务端由 `UnixManager` 线程跑 `UnixMain` 循环，`UnixManagerRegisterCommand` 在初始化期静态拼出命令表，`UnixCommandExecute` 查表派发、`UnixCommandSendJSONToClient` 回写 JSON；标准命令（shutdown、version、dump-counters、reload-rules、reopen-log-files、hostbit、memcap、dataset、tenant 族）注册在 `src/unix-manager.c`，pcap 回放族与 `UnixSocketPcapFilesCheck` 后台任务注册在 `src/runmode-unix-socket.c`；客户端 `rust/suricatasc` 用 `Commands` 与 `CommandParser` 做本地校验并生成 JSON 报文，且带 Windows 平台隔离。协议是 JSON over Unix domain socket，启用受 `BUILD_UNIX_SOCKET`、`--enable-unix-socket` 与 `unix-command.enabled` 三层约束。它不逐包处理、不解码、不检测、不写 EVE 事件，只提供改动运行时状态的通道。
+
+需要继续深入时，建议按四条路径展开。想理解扩展注册与插件机制，读 06-14；想理解线程模块如何挂进 runmode，读 06-13；想查 `UnixCommand`、`UnixClient`、`ConfNode`、`TmModule` 的逐字段定义，读 05-09、05-07；想核对命令行、RPC 命令全集与返回码，读 04-02、04-07、04-08。想按场景把控制面用起来，读 07-11（规则管理与 `reload-rules`）、03-04（日志轮转与 `reopen-log-files`）、07-13（`pcap-file` 与离线回放工具链）；排障取证见 08-01、08-03，权限加固见 08-05，上线清单见 08-06。所有性能与容量结论均需在目标机型实测，版本差异一律以 `configure.ac`、`ChangeLog`、`doc/userguide/unix-socket.rst` 与本快照实际文件为准，需对照实际版本核验。
+
+## 07-13 工具链与测试：suricata-verify、单元测试、fuzz
+
+### 1. 背景与动机
+
+网络检测引擎的正确性不能靠「跑起来看有没有告警」来担保。应用层解析器面对的是攻击者可任意构造的畸形字节，规则编译面对的是数千条规则与上百个关键字的组合，输出面对的是多线程并发写同一份 EVE 文件，任何一处越界、空指针或状态机遗漏都可能在高负载下才暴露。要在这类系统里做回归，必须把验证前移到三个层次：编译进主程序、可一键执行的单元与模块测试；以随机与变异输入持续轰击解析入口的模糊测试；以及跨进程、跨配置、拿真实 pcap 与预期输出比对的端到端回归。Suricata 在 `src/tests/`、`src/tests/fuzz/`、`qa/`、`.github/workflows/`、`scripts/` 与 `ebpf/` 里给出了这套工具链的全貌。本篇作为分片 C 的收尾，讨论这些文件族的构成、入口与产物形态，不重复展开 02-05 的调试构建步骤与 08-03 的运维诊断树。
+
+先给事实核验结论。本快照 `src/tests/` 下有五十个 `.c` 单元测试文件（覆盖 `detect-*`、`stream-tcp-*`、`source-*`、`output-json-stats`、`reputation`、`util-plugin` 等族），`src/tests/fuzz/` 下有十七个条目，其中十二个是 `fuzz_*.c` 形态的 fuzz target，另有 `confyaml.c`、`nallocinc.c`、`onefile.c`、`oss-fuzz-configure.sh` 与 `README`；`src/runmode-unittests.c` / `.h` 确认存在。`qa/` 下有 `Makefile.am`、`coccinelle/`、`docker/`、`ci/`、`live/`、`gnuplot/`、`lsan.suppress`、`valgrind.suppress`、`drmemory.suppress`、`sb-taint-config.yaml`、`wirefuzz.pl`、`run-ossfuzz-corpus.sh`、`unix.sh`、`travis.sh`。`.github/workflows/` 下十四个工作流文件确认存在，含 `builds.yml`、`cifuzz.yml`、`rust-checks.yml`、`formatting.yml`、`docs.yml`、`scan-build.yml`、`codeql.yml`、`codeqlpy.yml` 等。`configure.ac` 第 446 行起定义 `--enable-unittests`、第 494 行起 `--enable-debug`、第 502 行起 `--enable-debug-validation`（且明确与 unittests 互斥）。`doc/userguide/command-line-options.rst` 写明内置单测仅在以 `--enable-unittests` 配置并构建后才可用，运行时不需要配置文件，用 `suricata -u` 执行并可用 `-l` 指定日志目录。
+
+还必须点破两条「本快照不存在」的事实，避免编造。其一，`suricata-verify` 是**独立测试框架 / 独立仓库**，本快照里没有它的源码目录；线索在 `.github/workflows/builds.yml` 的 `workflow_dispatch` 输入项 `SU_REPO`、`SU_BRANCH`、`SV_REPO`、`SV_BRANCH` 上——它们分别对应 `suricata-update` 与 `suricata-verify` 两个外部仓库的覆盖地址，说明 CI 会从外部拉取该框架做端到端回归。因此本篇对 `suricata-verify` 一律写「不在本快照，需对照实际版本核验」，只描述它在工具链里的位置，不杜撰其内部脚本与用例格式。其二，前文 07-10 已核实的 `src/util-decode-mime.c` 在本快照不存在，而 `src/tests/fuzz/fuzz_mimedecparseline.c` 真实存在，这一对事实从测试侧再次印证 MIME 解析落在 `rust/src/mime/`，需要对照实际版本核验。
+
+去重纪律照旧：07 册是全集的「模块能力与特性」唯一权威源，工具链与测试对应 `src/tests/`、`src/runmode-unittests.c`、`qa/`、`.github/workflows/`、`scripts/`、`ebpf/`、`python/` 与 `doc/userguide/devguide/`；本篇讲「有哪些文件、各自跑什么、怎么触发、产物是什么」，不重复展开 02-05 的构建变体与 Sanitizer 组合步骤，也不重复 08-03 / 08-04 的故障案例。结构体逐字段归 05 全册，configure 选项与命令行全集归 04 全册，机制与调用链归 06 全册，交叉引用统一写「字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx」。版本基准统一写「上游 main 快照（2026-11 抓取）」，具体版本号以 `configure.ac`、`ChangeLog` 为准，需对照实际版本核验。
+
+能力边界要在最前面立住。测试工具链不参与生产运行：单测与 fuzz 构建带额外断言、Sanitizer 与调试符号，性能代价明显，**不可用作生产基准**（基准方法见 08-01）。Suricata 仍是 IDS / IPS / NSM 引擎，不是防火墙、不做转发；fuzz 与 pcap 回放只验证引擎对「自身解码并重组到的流量」的处理，TLS 等加密载荷的明文正文依旧不可见（原理见 06-05）。`suricata -T` 是规则自检而非吞吐测试，规则语法兼容 Snort 但有自有扩展、不能宣称 100% 兼容（模块见 07-11、参数见 04-05）。任何关于单测耗时、fuzz 覆盖速率、回归用例通过率的数字，一律标注「需在目标机型实测」，不给绝对值。
+
+从工程价值看，建立工具链的模块地图有三个直接收益。其一是定位回归：新增 parser 后知道该往 `src/tests/` 补构造报文的测试、往 `src/tests/fuzz/` 补对应入口，而不是只靠线上试跑。其二是读懂 CI 失败：`.github/workflows/` 里 `builds.yml`、`cifuzz.yml`、`rust-checks.yml`、`formatting.yml` 各管一段，失败信息落在不同 job 上，理解分工才能快速定位是编译、格式、依赖审计还是 fuzz 崩溃。其三是区分本地与端到端：`suricata -u` 与 `suricata -T` 是本地快速闸门，`suricata-verify` 一类独立框架才做跨进程端到端比对，把两者混用会低估上线风险。以下各节按「概念 → 文件与结构 → 组件协作 → 实例 → 陷阱 → 小结」展开。
+
+### 2. 核心概念
+
+第一组概念是内置单元测试。`configure.ac` 的 `--enable-unittests` 定义 `UNITTESTS` 宏并置 `BUILD_UNITTESTS` 构建条件，开启后各 `.c` 文件内自带的测试代码与 `src/tests/` 下的独立测试文件才被编入主程序；运行入口是 `src/runmode-unittests.c`，命令行是 `suricata -u`（参数见 04-07）。`src/util-unittest.c` 与 `src/util-unittest-helper.c` 提供注册与辅助设施（函数名需对照实际版本核验），而 `src/tests/` 的五十个 `.c` 是按模块拆分的测试用例，例如 `detect-parse.c`、`detect-http-uri.c`、`detect-tls-certs.c`、`stream-tcp-reassemble.c`、`stream-tcp-inline.c`、`source-pcap.c`、`source-netmap.c`、`output-json-stats.c`、`reputation.c`、`util-plugin.c` 等。样稿 07-01 也提到 `src/decode-vlan.c`、`src/decode-vxlan.c`、`src/decode-ppp.c` 等文件内自带构造报文的测试代码，说明单测有两种存在形态：内嵌在源文件里与独立在 `src/tests/` 里。
+
+第二组概念是 fuzz target。`src/tests/fuzz/` 里十二个 `fuzz_*.c` 分别对准不同入口：`fuzz_applayerparserparse.c` 打应用层解析、`fuzz_applayerprotodetectgetproto.c` 打协议识别、`fuzz_confyamlloadstring.c` 打配置解析、`fuzz_dataset.c` 打 dataset、`fuzz_decodebase64.c` 打 base64 解码、`fuzz_decodepcapfile.c` 打 pcap 文件解码、`fuzz_iprep.c` 打 IP 信誉、`fuzz_mimedecparseline.c` 打 MIME 行解析、`fuzz_predefpcap_aware.c`、`fuzz_siginit.c`、`fuzz_sigpcap.c`、`fuzz_sigpcap_aware.c` 打规则初始化与规则加 pcap 的组合。辅助文件 `confyaml.c`、`nallocinc.c`、`onefile.c` 提供语料构造与分配器钩子，`oss-fuzz-configure.sh` 是 OSS-Fuzz 侧的构建脚本，`README` 说明用法（具体入口函数与构建方式需对照实际版本核验）。`.github/workflows/cifuzz.yml` 的名字是 `ClusterFuzzLite`，用 `google/clusterfuzzlite/actions/build_fuzzers@v1` 与 `run_fuzzers@v1`，`language: rust`、sanitizer 矩阵为 `address`、`fuzz-seconds: 600`、`mode: 'code-change'`，说明 CI 里的 fuzz 以 Rust 侧目标为主并对改动代码做短时冒烟。`qa/` 下的 `wirefuzz.pl`、`run-ossfuzz-corpus.sh` 与 `qa/lsan.suppress` 是配套的语料回放与抑制清单。
+
+第三组概念是 CI 工作流。`.github/workflows/builds.yml` 是主构建工作流，`env` 里 `DEFAULT_CFLAGS` 带 `-Wall -Wextra -Werror`，`RUST_VERSION_KNOWN` 固定一个已知能通过构建与检查的 Rust 稳定版（具体取值需对照实际版本核验），`workflow_dispatch` 暴露 `SU_REPO` / `SU_BRANCH` / `SV_REPO` / `SV_BRANCH` 四个外部仓库覆盖项；`rust-checks.yml` 名为 `Cargo Audit and Update`，跑 `cargo audit` 做依赖漏洞审计；`cifuzz.yml` 跑 ClusterFuzzLite；`formatting.yml` 管格式；`docs.yml` 构建文档；`scan-build.yml`、`codeql.yml`、`codeqlpy.yml` 做静态分析；另有 `commits.yml`、`authors.yml`、`nix.yml`、`prepare-deps.yml`、`scorecards-analysis.yml`、`close-updated-prs.yml`。这些工作流共同构成提交前与合入前的自动化闸门，产物形态与 02-05 呼应。
+
+第四组概念是 `qa/` 与辅助脚本。`qa/coccinelle/` 下是一组语义补丁（如 `banned-functions.cocci`、`malloc-error-check.cocci`、`direct-packet.cocci`、`pktnotset-packet.cocci`、`uint.cocci`、`size_t.cocci`、`siginit.cocci`、`realloc.cocci`、`access-pkt-packet.cocci`、`struct-flags.py`、`run_check.sh`），用于批量检查 C 代码里的危险写法；`qa/valgrind.suppress`、`qa/lsan.suppress`、`qa/drmemory.suppress` 是 Sanitizer 与内存检查器的抑制清单；`qa/docker/`、`qa/ci/`、`qa/live/`、`qa/gnuplot/`、`qa/unix.sh`、`qa/travis.sh` 提供环境、实时与绘图辅助。`scripts/` 下有生成器与检查器：`setup-app-layer.py`、`setup-decoder.sh`、`setup-simple-detect.sh` 生成新模块骨架，`check-dist-rules.py`、`check-doc-rules.py`、`check-enum-uint-keywords.py`、`check-uint-keywords.py`、`check_keyword_doc_links.py`、`eve-parity.py`、`evedoc.py`、`schema-sort.py`、`fuzz_gen_corpus_datasets.py`、`rustc.py`、`rustfmt.sh`、`clang-format.sh`、`generate-images.sh`、`bundle.sh`（分发工具，模块见 07-11）。`ebpf/` 下有 `bypass_filter.c`、`filter.c`、`lb.c`、`xdp_filter.c`、`xdp_lb.c`、`vlan_filter.c` 与配套头，属旁路过滤与负载均衡的辅助程序；`python/` 与 `doc/userguide/devguide/`（`codebase/`、`contributing/`、`extending/`、`internals/`、`libsuricata/`、`upgrading/`）提供客户端与开发者文档。
+
+最后说明三组易混淆项。其一，**内置单测**（编进主程序、`suricata -u` 跑）与**独立测试框架**（`suricata-verify`，跨进程端到端、需外部拉取）不是一回事。其二，`src/tests/fuzz/` 的 C 侧 fuzz target 与 `qa/wirefuzz.pl` 一类语料脚本职责不同，前者是被测入口，后者是驱动与语料。其三，`.github/workflows/` 是 CI 编排，`qa/` 是被 CI 或本地调用的脚本与补丁，二者是「调度」与「执行」的关系。工具链本身不产生检测结论、不参与逐包流水线，它只验证 `src/` 与 `rust/` 的行为。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，不重列任何字段。工具链以文件与脚本为主体，没有需要逐字段展开的核心运行时结构；被测试代码引用的结构一律交叉引用 05 全册。
+
+- `TmModule`、`ThreadVars`：单测 runmode 亦以线程模块形式挂载，见 `src/runmode-unittests.c`、`src/tm-modules.h`、`src/tm-threads.h`（字段见 05-07、原理见 06-13）。
+- `ConfNode`、`DetectEngineCtx`：配置解析与规则初始化类 fuzz target 会触达，见 `src/conf.h`、`src/detect.h`（字段见 05-09、05-05）。
+- `Packet`、`Flow`：解码与流相关单测构造的对象，见 `src/decode.h`、`src/flow.h`（字段见 05-02、05-03）。
+- 测试与 fuzz 侧的框架结构：`src/util-unittest.c`、`src/util-unittest-helper.c` 与 `src/tests/fuzz/` 内各 target 的局部上下文，函数名与结构名需对照实际版本核验（字段见 05-07）。
+
+下面是本快照中工具链与测试相关的真实文件清单节选，按「编译期单测」「fuzz」「质量保障脚本」「CI 与辅助」四组组织；完整枚举可用 `ls -1 src/tests/ src/tests/fuzz/ qa/ .github/workflows/` 复核。
+
+```tree
+suricata-main/
+├── configure.ac             --enable-unittests / debug / validation
+├── src/
+│   ├── runmode-unittests.c / .h   单测 runmode 入口
+│   ├── util-unittest.c            单测框架辅助
+│   ├── util-unittest-helper.c     构造报文等辅助
+│   ├── tests/                     五十个 .c 模块测试
+│   │   ├── detect-*.c / stream-tcp-*.c / source-*.c
+│   │   ├── output-json-stats.c / reputation.c / util-plugin.c
+│   │   └── fuzz/                  十七个条目
+│   │       ├── fuzz_applayerparserparse.c 等十二个 target
+│   │       ├── confyaml.c / nallocinc.c / onefile.c
+│   │       ├── oss-fuzz-configure.sh / README
+│   │       └── fuzz_mimedecparseline.c
+│   └── decode-vlan.c 等           文件内自带测试代码
+├── qa/
+│   ├── coccinelle/           语义补丁与 run_check.sh
+│   ├── lsan.suppress / valgrind.suppress / drmemory.suppress
+│   ├── wirefuzz.pl / run-ossfuzz-corpus.sh
+│   ├── unix.sh / travis.sh / sb-taint-config.yaml
+│   └── docker/ ci/ live/ gnuplot/
+├── .github/workflows/        十四个工作流文件
+│   ├── builds.yml / cifuzz.yml / rust-checks.yml
+│   ├── formatting.yml / docs.yml / scan-build.yml
+│   └── codeql.yml / codeqlpy.yml / commits.yml 等
+├── scripts/                  setup-*.py / check-*.py / rustfmt.sh 等
+├── ebpf/                     bypass_filter.c / xdp_filter.c / lb.c 等
+├── python/                   客户端与辅助包
+└── doc/userguide/
+    ├── command-line-options.rst / devguide/
+    └── partials/options-unittests.rst
+```
+
+关键函数与入口在真实源码中的位置如下，均已逐一核对。`configure.ac`：第 446 行的 `AC_ARG_ENABLE(unittests)` 与 `UNITTESTS` 宏定义、`BUILD_UNITTESTS` 构建条件（第 449、451 行），第 494 行的 `AC_ARG_ENABLE(debug)` 与 `DEBUG` 宏定义（第 497 行），第 502 行的 `AC_ARG_ENABLE(debug-validation)`，且在第 506 行明确 `debug_validation can't be enabled with enabled unittests!`，`AC_ARG_ENABLE(unix-socket)`（第 826 行，与 07-12 呼应）。`src/runmode-unittests.c` / `.h` 是单测 runmode 的实现与声明，具体注册函数名需对照实际版本核验（原理见 06-13）。`src/util-unittest.c`、`src/util-unittest-helper.c` 提供单测登记与报文构造辅助。`src/tests/fuzz/` 各 target 的 `LLVMFuzzerTestOneInput` 一类入口名需对照实际版本核验。`scripts/setup-app-layer.py`、`scripts/setup-decoder.sh`、`scripts/setup-simple-detect.sh` 是新增模块的脚手架，`scripts/rustc.py`、`scripts/rustfmt.sh` 参与 Rust 工具链检查（模块见 07-10），`qa/coccinelle/run_check.sh` 是语义补丁的执行入口。`doc/userguide/command-line-options.rst` 第 13 行起说明 `--enable-unittests` 与 `suricata -u`。交叉引用：字段见 05-07 ｜ 参数见 04-01、04-07 ｜ 原理见 06-13 ｜ 模块见 07-10、07-12。
+
+一个阅读时容易忽略的细节是 `configure.ac` 把 `--enable-debug-validation` 与 `--enable-unittests` 设为互斥：这不是随意限制，而是两类构建注入的代码路径不同，混用会让断言与验证宏互相干扰；照抄网上「全开调试选项」的经验会在 configure 阶段直接报 `debug_validation can't be enabled with enabled unittests!`。另一个细节是 `src/tests/fuzz/fuzz_mimedecparseline.c` 与 `src/util-decode-mime.c` 的对照：前者真实存在，后者在 `src/util-*.c` 一百三十六个文件里不存在，MIME 实现落在 `rust/src/mime/`（模块见 07-10），这提醒读者测试文件名往往比被测试实现更早暴露目录迁移的痕迹，具体函数需对照实际版本核验。
+
+### 4. 关键流程与调用链
+
+本节从模块视角描述各测试文件族如何协作、以及它们如何被触发，重点在「入口与产物」，不重复展开 02-05 的构建变体步骤与 08 册的运维诊断（原理见 06-13）。可以把整个工具链拆成三条相互配合的线：本地单测线、fuzz 线、CI 与端到端回归线。
+
+本地单测线从 `configure` 开始。`./configure --enable-unittests` 定义 `UNITTESTS` 并置 `BUILD_UNITTESTS` 条件，make 时把 `src/tests/` 下五十个测试文件与各源文件内嵌测试一并编入；`suricata -u` 进入 `src/runmode-unittests.c` 的单测 runmode，按注册的测试项逐个执行断言并汇总通过 / 失败（参数见 04-07、原理见 06-13）。`make check` 是 automake 侧的等价闸门，`suricata -T` 则是规则自检而非单元测试：它加载规则文件、走 `src/detect-engine-loader.c` 与 `src/detect-parse.c` 验证语法与关键字注册（原理见 06-06、模块见 07-11）。三者用途不同，常被混为一谈：单测验 C / Rust 代码路径，规则自检验规则文本，`make check` 验构建产物。单测构建带断言与调试符号，不可用作生产基准（基准见 08-01）。
+
+fuzz 线以 `src/tests/fuzz/` 的十二个 `fuzz_*.c` target 为被测入口，`oss-fuzz-configure.sh` 负责 OSS-Fuzz 侧构建，`qa/run-ossfuzz-corpus.sh` 与 `qa/wirefuzz.pl` 负责语料回放，`qa/lsan.suppress`、`qa/valgrind.suppress`、`qa/drmemory.suppress` 提供内存检查器的抑制清单。CI 侧 `.github/workflows/cifuzz.yml` 用 ClusterFuzzLite 以 `address` sanitizer 对改动代码做 `fuzz-seconds: 600` 的短时冒烟，`language: rust` 表明当前编排以 Rust 侧目标为主。值得注意的是 `rust/htp/fuzz/` 自带 fuzz 目录（模块见 07-10），说明 libhtp 的 Rust 实现有独立的模糊测试入口。Sanitizer 组合、语料生成与崩溃复现的具体步骤见 02-05，本篇只点名文件与触发点。
+
+CI 与端到端回归线由 `.github/workflows/` 编排。`builds.yml` 用固定的 `DEFAULT_CFLAGS` 与 `RUST_VERSION_KNOWN` 拉起主构建，`rust-checks.yml` 跑 `cargo audit`，`formatting.yml` 管格式，`docs.yml` 构建文档，`scan-build.yml` 与 `codeql*.yml` 做静态分析，`qa/coccinelle/` 的语义补丁由 `run_check.sh` 一类脚本调用。`builds.yml` 的 `SU_REPO` / `SU_BRANCH` / `SV_REPO` / `SV_BRANCH` 输入项把 `suricata-update`（模块见 07-11）与 `suricata-verify` 两个独立仓库接进 CI：前者提供规则工具，后者提供跨进程、拿真实 pcap 与预期输出比对的端到端回归框架。**`suricata-verify` 不在本快照，需对照实际版本核验**。三条线的触发关系、产物与相互引用见图 07-13-01。
+
+:::figure id=07-13-01 | name=工具链三层验证与 CI 触发关系 | dir=TD
+node t1 "configure 开关<br/>unittests / debug" blue
+node t2 "src/tests 单测<br/>五十个 .c" teal
+node t3 "src/tests/fuzz<br/>十二个 target" teal
+node t4 "suricata -u / -T<br/>make check" green
+node t5 "qa 脚本<br/>coccinelle / suppress" gray
+node t6 "workflows<br/>builds / cifuzz" purple
+node t7 "ClusterFuzzLite<br/>address sanitizer" purple
+node t8 "suricata-verify<br/>独立回归框架" gray
+node t9 "Sanitizer 与报告<br/>崩溃复现输入" amber
+edge t1 -> t2 "enable-unittests"
+edge t1 -> t3 "fuzz 编译"
+edge t2 -> t4 "-u 执行"
+edge t3 -> t4 "回归输入"
+edge t3 -> t7 "cifuzz 调用"
+edge t5 -> t2 "静态检查"
+edge t6 -> t7 "CI 触发"
+edge t6 -> t8 "SV 仓库拉取"
+edge t7 -> t9 "ASan 报告"
+edge t8 -> t4 "端到端验证"
+:::
+
+图 07-13-01 中蓝色是构建开关，青色是被测代码入口，绿色是本地执行闸门，灰色是辅助脚本与外部框架，紫色是 CI 编排，琥珀色是产物。需要强调这张图描述的是「验证供应链」，不是 06-01 那条从收包到落盘的报文流水线；把它和全流水线混为一谈，就会误以为测试工具参与生产检测。图中 `t8` 用灰色标出，是因为 `suricata-verify` 属独立仓库、本快照不含其源码，只能通过 `builds.yml` 的 `SV_REPO` / `SV_BRANCH` 输入项确认它在 CI 里的位置。本地单测、fuzz 与端到端回归是递进关系：前两者快速、可反复跑，后者慢但覆盖跨进程行为，上线前不应互相替代（清单见 08-06）。
+
+### 5. 配置/命令/代码实例
+
+本节只给最小必要实例，并显式指向权威源：configure 选项、命令行与返回码全集归 04 全册（参数见 04-01、04-07、04-08），此处不重列参数全集；07 全册每篇代码段最多给 3–5 个本模块最典型的调用，其余写「完整 API 见 04-xx」。下面给一组按「前置检查 → 执行 → 验证输出 → 清理」组织的源码核验命令，用来在拿到任意一份上游快照后快速确认测试规模、CI 工作流与构建开关，不改变运行状态，适合作为阅读源码或核查版本差异的第一步。
+
+```bash
+# 前置：进入真实仓库根（注意归档多一层 suricata-main/）
+cd upstream_src/suricata/suricata-main
+
+# 执行：统计内置单测与 fuzz target 规模
+ls -1 src/tests/*.c | wc -l
+ls -1 src/tests/fuzz/fuzz_*.c | wc -l
+
+# 验证：确认 CI 工作流与单测 / 控制面开关
+ls -1 .github/workflows/ | grep -E "cifuzz|rust-checks|builds"
+grep -nE "AC_ARG_ENABLE\(unittests|AC_ARG_ENABLE\(unix-socket" configure.ac
+
+# 清理：退出查阅目录
+cd -
+```
+
+典型输出如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+50
+12
+builds.yml
+cifuzz.yml
+rust-checks.yml
+446:    AC_ARG_ENABLE(unittests,
+447:           AS_HELP_STRING([--enable-unittests], [Enable compilation of the unit tests]),[enable_unittests=$enableval],[enable_unittests=no])
+826:    AC_ARG_ENABLE(unix-socket,
+827:           AS_HELP_STRING([--enable-unix-socket], [Enable unix socket [default=test]]),[enable_unixsocket="$enableval"],[enable_unixsocket=test])
+```
+
+逐行判读如下。输出第一行 `50` 是 `src/tests/*.c` 的文件数，说明本快照的内置单元测试按模块拆得相当细，覆盖检测、流重组、抓包后端、输出与信誉等族；若某份快照该数字明显偏小，先确认归档层级是否带了 `suricata-main/` 这一层前缀，而不是急于断言「测试被删了」。第二行 `12` 是 `fuzz_*.c` 形态的 fuzz target 数，与 `src/tests/fuzz/` 下共十七个条目并不矛盾——其余五个是 `confyaml.c`、`nallocinc.c`、`onefile.c`、`oss-fuzz-configure.sh`、`README` 一类辅助与说明文件，判读时不要把「条目数」当成「target 数」。随后三行 `builds.yml`、`cifuzz.yml`、`rust-checks.yml` 是 `ls` 结果经 `grep` 过滤后的工作流名，按字典序排列；三者分别对应主构建、ClusterFuzzLite 模糊测试与 `cargo audit` 依赖审计，任何一条 CI 失败都应先落到对应工作流而不是重跑全部。第 446、447 行确认 `--enable-unittests` 存在且默认 `no`，这正是 `doc/userguide/command-line-options.rst` 所说「内置单测需先以该选项配置构建」的源码依据，也解释了为什么直接对普通构建执行 `suricata -u` 可能没有测试可跑。第 826、827 行确认 `--enable-unix-socket` 默认 `test`，与 07-12 的条件编译结论互相印证；注意两个选项的默认值写法不同（一个 `no`、一个 `test`），具体模式语义需对照实际版本核验。整组输出共同验证了「单测与 fuzz 规模、CI 三段分工、两个构建开关的位置」，凡与这三件事冲突的资料都应回到 `configure.ac`、`src/tests/` 与 `.github/workflows/` 复核版本差异。
+
+按层次整理的工具链对照见下表，便于按现象反查应该先读哪个目录。
+
+| 层次 | 代表路径 | 入口或开关 | 产物形态 |
+|---|---|---|---|
+| 内置单测 | `src/tests/`、`src/runmode-unittests.c` | `--enable-unittests`、`suricata -u` | 进程内断言汇总 |
+| fuzz target | `src/tests/fuzz/fuzz_*.c` | OSS-Fuzz / ClusterFuzzLite | 崩溃复现输入 |
+| 静态与语义检查 | `qa/coccinelle/`、`scripts/check-*.py` | `qa/coccinelle/run_check.sh` | 补丁与检查报告 |
+| Sanitizer 辅助 | `qa/lsan.suppress`、`qa/valgrind.suppress` | CFLAGS 与 CI 组合 | 抑制清单 |
+| CI 工作流 | `.github/workflows/` 十四个文件 | push 与 pull_request | 构建、审计、静态分析 |
+| 独立回归框架 | `suricata-verify`（独立仓库） | `SV_REPO` / `SV_BRANCH` | 端到端回归结果 |
+| 辅助工具 | `ebpf/`、`scripts/setup-*.py` | 各脚本自带入口 | 脚手架与过滤程序 |
+
+完整 configure 选项见 04-01，完整命令行与返回码见 04-07、04-08，机制原理见 06-13、06-06，此处不再追加调用。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一组陷阱是把测试构建当生产构建。带 `--enable-unittests`、`--enable-debug` 或 Sanitizer 的二进制插入了断言、校验与影子内存，性能代价明显，**不可用作生产基准**（基准方法见 08-01、构建变体见 02-05）。`configure.ac` 还把 `--enable-debug-validation` 与 `--enable-unittests` 设为互斥，第 506 行会直接报错；照抄「把所有调试开关全打开」的经验会在 configure 阶段卡住。另一个常见误用是把 `suricata -T` 当吞吐测试：它是规则自检，只验证规则文本能否被 `src/detect-parse.c` 与关键字注册表接受（原理见 06-06），与性能无关。
+
+第二组陷阱是混淆三层验证。`suricata -u` 跑的是编译进主程序的单元与模块测试，`make check` 是 automake 侧闸门，`suricata-verify` 一类独立框架才做跨进程、拿真实 pcap 与预期 EVE 输出比对的端到端回归；本快照**不含** `suricata-verify` 源码，只能通过 `builds.yml` 的 `SV_REPO` / `SV_BRANCH` 确认它在 CI 里的位置，其用例格式、目录结构与通过标准一律需对照实际版本核验。把「本地单测全绿」当成「上线没问题」，会漏掉配置组合、日志管道与多实例行为；反过来，跳过本地闸门直接跑端到端，又会让定位成本变高。正确顺序是本地快速闸门先行、CI 全量跟进、上线清单收尾（清单见 08-06）。
+
+第三组陷阱是 fuzz 与 Sanitizer 的判读。`cifuzz.yml` 的 `language: rust` 与 `address` sanitizer 说明当前 CI 编排以 Rust 侧目标为主，不代表 C 侧 target 不存在；`src/tests/fuzz/` 里十二个 `fuzz_*.c` 与 `rust/htp/fuzz/` 是两套入口（模块见 07-10）。`qa/` 下三份 `*.suppress` 是抑制清单，用来屏蔽已知无害报告，滥用抑制会掩盖真实缺陷。崩溃复现输入、覆盖速率与回归耗时一律标注「需在目标机型实测」，不给绝对值。`fuzz_mimedecparseline.c` 存在而 `src/util-decode-mime.c` 不存在这一对事实，也提醒读者：按旧版目录去找被测实现会落空，MIME 解析在 `rust/src/mime/`，需对照实际版本核验（模块见 07-10）。
+
+第四组陷阱是能力边界与口径。测试工具链不参与生产检测，Suricata 仍是 IDS / IPS / NSM 引擎，不是防火墙、不做转发；fuzz 与 pcap 回放只验证引擎对「自身解码并重组到的流量」的处理，TLS 等加密载荷明文不可见（原理见 06-05）。规则语法兼容 Snort 但有自有扩展，不能宣称 100% 兼容（模块见 07-11、参数见 04-05）。`suricata-update` 是独立工具（模块见 07-11），`builds.yml` 的 `SU_REPO` / `SU_BRANCH` 同样是从外部仓库拉取，不因出现在 CI 里就变成主程序内建模块。
+
+最佳实践可以归纳为四条。其一，拿到快照后先按第 5 节确认单测与 fuzz 规模、CI 工作流与构建开关，再决定跑哪一层验证。其二，新增 decode、parser 或 detect 关键字时同步补 `src/tests/` 用例与 `src/tests/fuzz/` 入口，并用 `scripts/setup-decoder.sh`、`scripts/setup-app-layer.py`、`scripts/setup-simple-detect.sh` 生成骨架（模块见 07-01、07-03、07-04）。其三，把 `rust-checks.yml` 的 `cargo audit`、`formatting.yml` 的格式检查与 `qa/coccinelle/` 的语义补丁纳入提交前闸门，理解各自失败信息落在不同 job 上。其四，始终记住调试与 Sanitizer 构建的性能代价，把性能结论留给 08-01 的基准方法，所有容量与通过率数字标注「需在目标机型实测」。
+
+### 7. 小结与延伸阅读
+
+`工具链与测试` 模块把「验证引擎正确性」拆成三个递进层次并落到真实目录：内置单测由 `--enable-unittests` 定义 `UNITTESTS`、`src/runmode-unittests.c` 驱动、`src/tests/` 五十个 `.c` 与各源文件内嵌测试构成，`suricata -u` 执行；fuzz 由 `src/tests/fuzz/` 十二个 `fuzz_*.c` target、`oss-fuzz-configure.sh`、`qa/` 的语料与抑制清单、以及 `.github/workflows/cifuzz.yml` 的 ClusterFuzzLite 编排构成；CI 与端到端回归由 `.github/workflows/` 十四个工作流、`qa/coccinelle/` 语义补丁、`scripts/` 生成器与检查器、`ebpf/` 辅助程序、以及独立框架 `suricata-verify` 构成。其中 `suricata-verify` **不在本快照，需对照实际版本核验**，只能由 `builds.yml` 的 `SV_REPO` / `SV_BRANCH` 确认其接入位置；`src/util-decode-mime.c` 同样不存在，而 `fuzz_mimedecparseline.c` 真实存在，MIME 实现在 `rust/src/mime/`（模块见 07-10）。`configure.ac` 的 `--enable-debug-validation` 与 `--enable-unittests` 互斥，调试构建不可用作生产基准。工具链不参与生产检测，只验证 `src/` 与 `rust/` 的行为。
+
+需要继续深入时，建议按四条路径展开。想理解单测 runmode 如何挂进线程链、以及调试构建与 Sanitizer 的组合，读 06-13、02-05；想查 `TmModule`、`ConfNode`、`DetectEngineCtx`、`Packet` 的逐字段定义，读 05-07、05-09、05-05、05-02；想核对 configure 选项、命令行与返回码全集，读 04-01、04-07、04-08。想按目录继续了解相邻模块，读 07-10（Rust 组件与 `rust/htp/fuzz/`）、07-11（规则管理与 `suricata -T`）、07-12（控制面与 `pcap-file` 回放）、07-06（离线 pcap 后端）；排障取证与故障案例见 08-03、08-04，性能基准方法见 08-01，上线检查清单见 08-06。所有性能、容量与通过率结论均需在目标机型实测，版本差异一律以 `configure.ac`、`ChangeLog`、`.github/workflows/` 与本快照实际文件为准，需对照实际版本核验。
