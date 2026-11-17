@@ -1,0 +1,771 @@
+# Snort 3 技术资料 · 03 集成与部署
+
+## 03-01 最小可用部署：第一次 IDS 运行
+
+### 1. 目标与拓扑
+
+本篇的目标只有一个：让一个已经编译并安装好的 Snort 3 引擎，第一次以 IDS 旁路模式真正跑起来，并在标准输出或日志里看到第一条可信的告警。这里刻意把范围收窄到「最小可用」，不去碰内联阻断、不去碰多实例、不去碰性能调优，也不重列任何配置参数的全集——那些分别属于 03-05、03-06、08 册，以及 04-02 ~ 04-05 的参数手册。本篇只回答一个工程师上线前最关心的问题：命令敲下去，进程有没有起来、配置有没有被吃进去、包有没有被读到、告警到底从哪条链路冒出来。全册按 C 实战型骨架组织，即目标与拓扑、前置条件与环境、分步操作、验证方法与预期结果、常见失败与排错、小结六节，每节都给可核验的动作与判据。
+
+先把能力边界摆正，避免第一次部署就走错方向。Snort 3 是相对 Snort 2 重写的全新实现，配置是 Lua，不是 `snort.conf`；本套资料的唯一权威配置是 `lua/snort.lua` 与 `lua/snort_defaults.lua`，`tools/snort2lua/` 只是格式转换辅助工具，不等于旧配置能直接沿用。抓包不是引擎自带的，依赖独立的 libdaq / DAQ3，`src/packet_io/sfdaq.cc`、`sfdaq_module.cc` 只是适配层，DAQ module 决定抓包与内联能力。IDS 旁路模式下只告警、不丢弃，Snort 本身不是防火墙、不做 IP 转发、不做路由。首次运行用 `pcap` 这类只读 DAQ module 回放样本即可，不需要 `-Q`、不需要内核队列、也不需要两块网卡。加密载荷不可见，能拿到的是握手元数据与证书信息，应用识别依赖 inspector / binder / wizard，本篇不指望从 HTTPS 里读出明文正文。版本基准统一写「上游 master 快照（2026-11 抓取）」，具体版本号以 `CMakeLists.txt`、`ChangeLog.md` 为准，需对照实际版本核验。
+
+拓扑极简：一台 Linux 主机，一个已安装的 `snort` 二进制，一份落位到 `etc/snort/` 的 Lua 配置模板，一个样本 pcap，外加一个可写的日志目录。数据从 DAQ 只读接口进入，经过 `src/codecs/` 与 `src/protocols/packet.cc` 解码、`src/network_inspectors/` 与 `src/service_inspectors/` 的 inspector、`src/detection/detection_engine.cc` 的检测，最后由 `src/loggers/alert_fast.cc` 或 `alert_json.cc` 输出事件。链路里的每一段都在 06 册展开机制、07 册展开目录能力，本篇只讲「做什么」和「怎么确认它做了」，交叉引用按（字段见 05-02 ｜ 参数见 04-02 ｜ 原理见 06-01 ｜ 模块见 07-07）执行。最小 IDS 首次运行的完整链路见图 03-01-01。
+
+:::figure id=03-01-01 | name=最小 IDS 首次运行链路 | dir=TD
+node n1 "命令行 -c -T -r" blue
+node n2 "Shell 载入 Lua 配置" teal
+node n3 "DAQ passive 收包" blue
+node n4 "解码与 inspectors" teal
+node n5 "规则编译与检测" purple
+node n6 "alert_fast 首条告警" green
+node n7 "配置文件与规则" amber
+edge n1 -> n2 "解析 argv"
+edge n2 -> n7 "include 读取"
+edge n7 -> n5 "规则文本"
+edge n2 -> n3 "配置 DAQ"
+edge n3 -> n4 "逐包送入"
+edge n4 -> n5 "重组后的流"
+edge n5 -> n6 "命中即输出"
+edge n1 -> n2 dashed "-T 仅自检"
+:::
+
+图 03-01-01 中实线是首次运行的数据与配置流向：`n1` 的命令行参数先由 `n2` 的 Shell 载入 Lua 配置，`n2` 再经 `include` 把 `n7` 的规则文件喂给 `n5` 的规则编译，同时把 DAQ 配置交给 `n3` 收包，包经 `n4` 解码后进入 `n5` 检测，命中即由 `n6` 写出告警。虚线 `n1 → n2` 强调 `-T` 只走到自检为止、并不真正收包，这正是分步操作里「先验配置再放流量」的图示化依据。若任一实线环节断开（DAQ 没装上、配置没读到、规则没加载），后面都不会有告警，判读时就按这条链路逐段回查。
+
+### 2. 前置条件与环境
+
+第一项前置是二进制可用。按 02-03 的产物，`src/snort -V` 能打印版本字样即代表构建成功；安装后二进制通常在 `$my_path/bin/snort`。`-V` 对应 `src/main/snort_module.cc` 里 `-V` 这个 `PT_IMPLIED` 选项，`--help` 则走 `src/main/help.cc` 的 `help_basic` / `help_usage`，后者会打印 `snort [-options] -c conf [-T]`、`-c conf -i iface`、`-c conf -r pcap` 三种典型用法，正好覆盖本篇的三种动作。第二项前置是配置模板落位。`lua/CMakeLists.txt` 把 `LUA_SCRIPTS` 安装到 `${CMAKE_INSTALL_SYSCONFDIR}/snort`，因此 `etc/snort/snort.lua`、`snort_defaults.lua`、`sample.rules` 一类文件应当存在；README 的 RUN SNORT 一节正是以 `$my_path/etc/snort/snort.lua` 为配置路径举例。
+
+第三项前置是抓包依赖。不要假设引擎自带抓包：`cmake/include_libraries.cmake` 里 `find_package(DAQ REQUIRED)` 是必选项，`doc/user/daq.txt` 明确写 LibDAQ 是独立仓库、以抽象层替换直接调用 libpcap，并列出 AFPacket、Divert、NFQ、PCAP、Netmap 等 bundled module。首次回放用 `pcap` 即可，`doc/user/daq.txt` 还写明「若未指定任何 DAQ module，Snort 默认尝试查找并使用名为 `pcap` 的 module」。可用 module 用 `--daq-list` 枚举，非标准安装路径用 `--daq-dir` 追加；具体 module 名与变量需对照实际版本核验，定位目录为 `src/packet_io/sfdaq_module.cc` 与 `daqs/`。
+
+第四项前置是权限与样本。在线 `-i` 抓包需要 raw socket 能力（容器里通常是 `CAP_NET_RAW`，属 08-05 加固范围），首次用 `-r` 回放 pcap 则不依赖网卡权限，最稳妥。`snort.cc` 里 `Snort::drop_privileges()` 与 `src/main/process.cc` 的 `InitGroups` 负责降权，故即使以 root 启动，也别把日志目录写成只有 root 可写后又降权写不进去。样本 pcap 要能命中规则，建议先准备一条明确会触发的自定义规则或 `sample.rules`。日志目录由 `-l` 指定，输出到 stdout 时用 `-A` 选 alert 类型即可。
+
+最后把「最小必要配置」和「参数全集」分开：本篇只用到 `-c`、`-T`、`-r`、`-i`、`-R`、`-A`、`-l`、`-V`、`--help`、`--daq-list` 这一小撮选项，以及 `HOME_NET`、`EXTERNAL_NET`、`ips`、`alert_fast` 这几个 Lua 键；它们的名称、默认值、取值范围、误配后果一律以 04-02 ~ 04-05 与 04-07 为权威，写「完整清单见 04-02 ~ 04-05」，本篇不重列。环境侧要点归纳见下表，单元格超过 90 字符的长命令一律移到下面的代码块。
+
+| 前置项 | 最小核验动作 | 不满足时的表现 |
+|---|---|---|
+| 二进制可用 | `snort -V` 打印版本字样 | 命令未找到或报动态库缺失 |
+| 配置落位 | `ls etc/snort/` 见 `snort.lua` | `-c` 报配置文件打不开 |
+| DAQ 依赖 | `--daq-list` 能列出 `pcap` | 启动期报找不到 DAQ module |
+| 样本与规则 | 准备 pcap 与 `sample.rules` | 跑通但零告警 |
+| 日志可写 | `-l` 目录对运行用户可写 | 进程起来但落盘失败 |
+
+### 3. 分步操作
+
+按「前置检查 → 执行 → 验证输出 → 清理」的闭环组织，命令片段取自 README 的 RUN SNORT 与 `help_usage` 的真实用法，参数含义只点名、不展开全集（完整清单见 04-02 ~ 04-05、04-07）。
+
+第一步，前置检查：确认版本、帮助与可用 DAQ module，不接任何流量、零副作用。
+
+```bash
+snort -V
+snort --help | head -n 20
+snort --daq-list
+ls -1 etc/snort/snort.lua etc/snort/snort_defaults.lua etc/snort/sample.rules
+```
+
+第二步，配置自检。用 `-T` 触发「只加载配置与规则、不收包」的自检路径，对应 `src/main/snort_config.cc` 的 `SnortConfig::setup()` 里 `init_policies(this)` → `ParseRules(this)` → `ParseRulesFinish(this)` 链，以及 `SnortConfig::verify()`；规则解析走 `src/parser/parse_conf.cc` 的 `parse_rules_file` / `parse_rules_string` 与 `src/parser/parse_rule.cc`。带 `-R` 可把样本规则一起验进去。
+
+第三步，最小 Lua 主干。首次运行不必抄整份 `snort.lua`，按 `lua/snort.lua` 的八段注释保留 defaults、detection、outputs 三段的最小必要键值即可；注意 `HOME_NET`、`EXTERNAL_NET` 必须在 `include 'snort_defaults.lua'` 之前设定，因为 `snort_defaults.lua` 的 `default_variables` 会把它们固化进 nets 表。下面这段是场景化骨架，不是参数全集（完整清单见 04-02 ~ 04-05）。
+
+```lua
+HOME_NET = '192.168.1.0/24'
+EXTERNAL_NET = 'any'
+
+include 'snort_defaults.lua'
+
+stream = { }
+http_inspect = { }
+binder = { { use = { type = 'wizard' } } }
+wizard = default_wizard
+
+ips =
+{
+    variables = default_variables,
+    include = 'sample.rules'
+}
+
+alert_fast = { file = false }
+```
+
+第四步，pcap 回放跑第一次 IDS。用 `-r` 指定样本、`-A alert_fast` 选输出类型，`README.md` 里对应的真实示例是 `snort -c $my_path/etc/snort/snort.lua -R $my_path/etc/snort/sample.rules -r a.pcap -A alert_test -n 100000`。`-n` 限制处理包数，便于首次验证后干净退出；`-A` 的具体 alert 类型取值需对照实际版本核验，定位 `src/loggers/alert_fast.cc` 与 04 册。若要同时把 DAQ 状态打出来，可追加 `--daq-dir` 与 `--daq pcap`，命令行优先级高于 Lua，这一点 `doc/user/daq.txt` 已写明。
+
+```bash
+snort -c etc/snort/snort.lua -R etc/snort/sample.rules -T
+snort -c etc/snort/snort.lua -R etc/snort/sample.rules -r a.pcap -A alert_fast -n 100000 -l /tmp/snort-log
+```
+
+第五步，在线旁路（可选）。把 `-r a.pcap` 换成 `-i eth0`、`-A` 保持，`doc/user/daq.txt` 说明 `-i` 不带 `-Q` 会被推断为 `passive` 模式，即只告警不丢弃，符合 IDS 旁路的定位。在线模式需要 raw socket 权限，且接口名需对照实际环境替换，不可照抄 `eth0`。第六步，清理：回放模式进程随 `-n` 或 EOF 自行结束，无需杀进程；在线模式用信号或 `src/control/` 的控制面优雅退出，删除 `/tmp/snort-log` 下的临时输出即可。整个闭环里凡是「参数怎么取值」的问题一律写「完整清单见 04-02 ~ 04-05」，本篇只负责把动作串起来。
+
+### 4. 验证方法与预期结果
+
+验证的核心不是「进程退出了吗」，而是「配置被吃进去了、规则被编译了、包被读到了、告警字段合理」。下面给出 `-T` 自检加一次回放的典型输出，注意这是示例输出，具体格式需对照实际版本核验；日志文本取自源码中已核验的真实字符串：`src/main/snort.cc` 的版本 banner `LogMessage("%s  Snort++ %s-%s\n", get_prompt(), VERSION, BUILD)`、`src/packet_io/sfdaq.cc` 的 `DAQ configured to` 日志字样、`src/parser/parser.cc` 的 `Port-Table : %s Ports/Rules-Compiled` 与 `LogLabel("ips policies rule stats")`。
+
+```text
+示例输出，具体格式需对照实际版本核验
+      ,,_     -*> Snort! <*-
+  o"  )~   Version 上游 master 快照（2026-11 抓取）
+   ''''    By Martin Roesch & The Snort Team
+o"  )~   Snort++ 版本字样-BUILD
+pcap DAQ configured to passive.
+Reading rules until EOF or a line starting with END
+ips policies rule stats
+***Port-Table : tcp Ports/Rules-Compiled
+Snort successfully validated the config (with 1 rule)!
+05/14-10:22:31.123456  [**] [1:1000001:1] "ICMP test rule" [**] {ICMP} 192.168.1.10 -> 192.168.1.20
+```
+
+逐行判读如下。第一行是「示例输出」声明，提示 banner、行号、统计项与告警格式随快照版本变化，绝不能把这里的字样当成固定值，也不把 `Version` 后面那串当成可抄的版本号——本套资料只认「上游 master 快照（2026-11 抓取）」。第二至第四行是启动 banner，`Snort++ %s-%s` 对应 `src/main/snort.cc:131` 的 `LogMessage`，用于确认二进制与预期构建一致；若这里报缺库或打印的不是你刚装的那份二进制，应先回到 02-03 查 `LD_LIBRARY_PATH` 与 `ldconfig`。第五行 `pcap DAQ configured to passive.` 对应 `src/packet_io/sfdaq.cc:302`，`pcap` 是 module 名、`passive` 是 `daq_mode_string(default_daq_mode)` 的结果，正常旁路应为 `passive`，配合 `-i` 不带 `-Q` 的推断规则；若这里出现 `inline` 而你没打算阻断，要检查是否误加了 `-Q`。第六行 `Reading rules until EOF or a line starting with END` 说明 `src/parser/parser.cc` 正在读规则文本，第七行 `ips policies rule stats` 是 `LogLabel` 打出的规则统计标签，第八行 `***Port-Table : tcp Ports/Rules-Compiled` 说明端口表已成功编译——这三行合起来是「规则真的被加载并编译了」的最强判据，缺任一行都说明 `-R` 路径或 `ips.include` 没生效。第九行是 `-T` 的成功提示，正常应以零退出码结束；若出现 `ParseError` / `FatalError` 则按第五节排查。第十行是 `src/loggers/alert_fast.cc` 写出的首条告警：` [**] ` 分隔、`[1:1000001:1]` 是 `event.get_sig_ids(gid, sid, rev)` 打出的 gid:sid:rev、`"ICMP test rule"` 是规则的 `msg`、`{ICMP}` 是 `p->get_type()`、`192.168.1.10 -> 192.168.1.20` 是源目的地址，方向箭头与 `HOME_NET` 的设定应当自洽；告警计数正常应 ≥1，若为 0 则按「配置起来但无告警」的分支回查。判读要点归纳见下表，字段的逐项定义交给 05-08，参数取值交给 04 册（字段见 05-02 ｜ 参数见 04-02 ｜ 原理见 06-01 ｜ 模块见 07-08）。
+
+| 输出行 | 来源 | 正常判据 |
+|---|---|---|
+| `Snort++ 版本字样-BUILD` | `src/main/snort.cc` | 与已安装二进制一致 |
+| `pcap DAQ configured to passive` | `src/packet_io/sfdaq.cc` | 旁路为 `passive` |
+| `Ports/Rules-Compiled` | `src/parser/parser.cc` | 出现即规则已编译 |
+| `ips policies rule stats` | `src/parser/parser.cc` | 有规则统计标签 |
+| ` [**] [gid:sid:rev] msg [**]` | `src/loggers/alert_fast.cc` | 告警计数 ≥1 |
+
+### 5. 常见失败与排错
+
+第一类是 DAQ 没装上或找不到 module。现象是启动期报找不到 DAQ module 或 `--daq-list` 为空。根因是 libdaq / DAQ3 未安装、安装在非标准路径、或静态 / 动态 module 未登记，`src/packet_io/sfdaq.cc` 的 `SFDAQ::load()` 会先 `daq_load_static_modules`、再 `daq_load_dynamic_modules(dirs)`，`daq_find_module` 找不到就失败。排查顺序：先 `snort --daq-list` 看有没有 `pcap`，再用 `--daq-dir` 追加 module 目录，最后核对 `daq.module_dirs` / `--daq-dir` 的路径拼写；module 名与变量需对照实际版本核验（原理见 06-02、模块见 07-07）。
+
+第二类是权限不足。在线 `-i` 抓包需要 raw socket 能力，容器里缺 `CAP_NET_RAW` / `CAP_NET_ADMIN` 会直接打不开接口；`src/main/snort.cc` 的 `Snort::drop_privileges()` 与 `src/main/process.cc` 的 `InitGroups` 会在初始化后降权，若日志目录只对 root 可写，降权后就写不进日志。首次部署用 `-r` 回放可完全绕开这类问题，这也是本篇把 pcap 回放设为默认路径的原因。
+
+第三类是 Lua 配置语法与缩进错误。现象是 `-T` 阶段报 `ParseError` 或 FatalError 并带文件名行号。配置加载走 `src/main/shell.cc` 的 `Shell::load_config` / `load_string` 与 `src/lua/lua.cc`，`src/parser/parse_conf.cc` 的 `get_parse_location`、`push_parse_location`、`get_config_file`、`parse_include` 负责定位与 include 解析。常见诱因是 `HOME_NET` 赋值漏引号、表缺逗号、括号不配对、`include` 的文件名拼错；按报错给的文件与行号回到 Lua 文本核对，再 `snort -c etc/snort/snort.lua -T` 重验，不要跳过自检直接放流量。`src/parser/parse_conf.cc` 里 `relative_to_include_dir` 会用到 `SnortConfig::get_conf()->include_path`，找不到文件时考虑 `--include-path`。
+
+第四类是「跑通了但没有告警」，这是首次部署最容易被误判为成功的一类。按图 03-01-01 逐段回查：DAQ 是否真的 `passive` 收包、pcap 是否非空、规则是否 `Ports/Rules-Compiled`、`HOME_NET` 与流量方向是否匹配、`-A` 是否选到了想要的 logger、`sample.rules` 是否命中样本。`src/parser/vars.cc` 的 `ParsePortVar`、`VarIsIpAddr` 与 `src/parser/parse_conf.cc` 的 `ParseIpVar` 决定网络变量如何参与规则头匹配，变量写反会让规则永远不命中。加密载荷不可见这一边界也要记住：想从 HTTPS 正文里匹配明文是做不到的，能用的是握手元数据与证书信息（字段需对照实际版本核验）。另有一类隐蔽失败是 `src/main/snort_config.cc` 的 `init_policy_mode()` 在 passive 适配器下把策略切到 tap 并打 warning，属于预期行为，不要当成错误。
+
+第五类是把自检与实跑混为一谈。`-T` 只加载配置与规则、不收包，输出里出现「validated」不等于线上能告警；反过来，回放有告警也不代表在线 `-i` 一定能收包。两者要分别验证。任何吞吐、丢包率、告警速率的数字一律标注「需在目标机型实测」，本篇不给绝对值；性能基准方法见 08-01。许可方面记住引擎为 GPLv2（顶层 `COPYING` / `LICENSE`），Talos 规则集有独立许可约束，不能把规则与引擎按同一许可任意分发（详见 01-04）。规则关键字与 Snort 2 有差异、不能宣称完全兼容（详见 04-06）。
+
+还需要补充几处真实环境里最容易忽略、却直接决定首次部署能否复现的细节。第一处是样本与告警的因果关系。pcap 回放之所以适合做第一次验证，是因为它把「流量是否到达」这个变量固定住了，工程师只需关心配置、规则与输出三件事；换成在线 `-i` 之后，网卡是否处于 up 状态、交换机镜像口或 TAP 是否接好、BPF 是否误把目标流量过滤掉、接口名是否与 `daq.inputs` 一致，都会成为新的不确定量。因此务必先用 `-r` 把配置、规则、检测、输出这条链路完整跑通并看到首条告警，再迁移到 `-i` 做在线旁路，两个动作的成功判据不能互相替代。第二处是命令与 Lua 配置的优先级。`lua/snort.lua` 的 outputs 段把 `alert_csv`、`alert_fast`、`alert_full`、`alert_syslog`、`unified2`、`log_codecs`、`log_hext`、`log_pcap` 等都注释起来，并注明可用命令行 `-A <alert_type>` 与 `-L <log_type>` 以默认值启用；命令行注入的 `--lua` 片段适合临时验证而不落盘，`README.md` 里 `--lua "suppress = { { gid = 1, sid = 2123 } }"` 正是这种用法。当命令行与配置文件同时给出同一项时以命令行为高，`doc/user/daq.txt` 对 DAQ 配置写明了这一优先级，部署时可按同一逻辑理解，避免「改了 Lua 却没生效」的误判。第三处是版本 banner 的读法：`src/main/snort.cc` 打印的是 `Snort++ %s-%s`，其中 `VERSION` 与 `BUILD` 只是构建期字样，`get_prompt()` 提供行首提示符，这些只用来确认二进制确实是刚装好的那一份，绝不能抄成本套资料的版本号。
+
+第四处是零副作用前置检查的价值。`snort -V`、`--help`、`--daq-list` 与 `ls etc/snort/` 都只读不写、不接流量，能在不改任何文件的前提下把二进制、配置、DAQ 依赖、样本四类前置一次核对完；若 `-V` 报动态库缺失，先回到 02-03 检查 `LD_LIBRARY_PATH` 与 `ldconfig`，而不是急着重编。第五处是安装路径与源码路径的区别：`README.md` 用的是 `$my_path/etc/snort/snort.lua` 与 `sample.rules`，事实核验的锚点则是 `upstream_src/snort3/snort3-master/lua/snort.lua`，二者是同一份模板安装前后的两种形态，引用时不要混用，也不要误写成仓库顶层存在 `snort.lua`。第六处是退出与日志细节：`-n` 限制处理包数，便于回放干净退出；`-q` 与 `-v` 影响终端输出详略，排查启动日志时不要把日志压得太干净；`-l` 指定的目录必须对降权后的运行用户可写，因为 `src/main/snort.cc` 的 `Snort::drop_privileges()` 与 `src/main/process.cc` 的 `InitGroups` 会在初始化后降低权限。第七处是告警标识的自洽：`[1:1000001:1]` 里的 `sid` 属于自定义规则区间，与 `event.get_sig_ids(gid, sid, rev)` 打出的三项一一对应，` [**] ` 分隔、`{ICMP}` 协议与地址方向都来自 `src/loggers/alert_fast.cc` 的 `TextLog_Print` 调用，任何一项对不上都应回到规则文本与 `HOME_NET` 核对。把这几处补齐，首次 IDS 运行就从「碰巧跑通」变成「可复现、可交接」的标准动作，后续 03-02 到 03-06 的每一层扩展都建立在这条已验证的基线上。
+
+### 6. 小结
+
+本篇把「第一次 IDS 运行」压缩为一条可复现的闭环：先用 `snort -V`、`--help`、`--daq-list` 与 `ls etc/snort/` 做零副作用前置检查；再用 `snort -c etc/snort/snort.lua -R etc/snort/sample.rules -T` 触发 `SnortConfig::setup()` → `ParseRules` → `ParseRulesFinish` → `verify()` 的自检链；再以最小 Lua 主干（先设 `HOME_NET` / `EXTERNAL_NET`，再 `include 'snort_defaults.lua'`，`ips` 段挂 `variables` 与 `include`，outputs 段启用 `alert_fast`）配合 `-r a.pcap -A alert_fast -n 100000 -l /tmp/snort-log` 回放样本；最后按版本 banner、`DAQ configured to passive`、`Ports/Rules-Compiled`、`ips policies rule stats`、首条 `[gid:sid:rev] msg` 告警逐行判读。图 03-01-01 给出首次运行的配置与数据链路，是排错时逐段回查的地图。全程只用到一小组最小必要命令与配置键，完整清单见 04-02 ~ 04-05 与 04-07；结构体逐字段去 05，机制与调用链去 06，`src/` 目录能力去 07，运维场景与基准去 08，交叉引用统一按（字段见 05-02 ｜ 参数见 04-02 ｜ 原理见 06-01 ｜ 模块见 07-07）执行。
+
+下一篇 03-02 把这份最小主干展开成 `snort.lua` 的八段结构与网络变量，讲清 `default_variables` 怎样把 `HOME_NET` 固化进规则匹配、策略模板如何叠加；再往后 03-03 管规则集、03-04 管输出、03-05 管内联、03-06 管多实例。能力边界贯穿全册：配置是 Lua、抓包依赖独立 libdaq / DAQ3、内联靠 DAQ verdict、Hyperscan 只是可选 search_engine 加速、缺失时回退 `src/search_engines/` 内的 AC / BNFA 实现、加密载荷不可见、线程模型需对照实际版本核验、许可为 GPLv2 加 Talos 规则集独立约束。凡本篇标注「需对照实际版本核验」的字段名、DAQ module 名与命令选项，均以 `_snort_build/upstream_src/snort3/snort3-master/` 下对应文件为准，本套资料不编造未核验的路径与取值。
+
+## 03-02 snort.lua 主干配置与网络变量
+
+### 1. 目标与拓扑
+
+03-01 用一份最小骨架把第一次 IDS 跑通了，本篇要把它背后那份 `lua/snort.lua` 真正读通：八个注释分段各管什么，`HOME_NET` 与 `EXTERNAL_NET` 为什么必须在 `include` 之前设定，`snort_defaults.lua` 里的 `default_variables` 怎样把网络变量、路径变量、端口变量固化进规则匹配，`ips` / `binder` / `daq` / outputs 各段在什么场景下该动、什么场景下不该动，以及改完之后用哪几条命令确认改动真的被吃进去了。目标不是背配置项，而是建立「改一处 → 验一处」的部署习惯；参数全集一律不在本篇重列，写「完整清单见 04-02 ~ 04-05」，正文只讲场景组合与输出判读。
+
+拓扑从「一个进程」换成「一条配置加载链」。命令行 `-c` 指到 Lua 文件后，`src/parser/cmd_line.cc` 的 `parse_cmd_line()` 先经 `ArgList` 解析 argv、再 `PluginManager::get_module("snort")` 取到主模块；`src/main/shell.cc` 的 `Shell::load_config()` / `load_string()` 负责把 Lua 文本载入并逐表赋值，`src/lua/lua.cc` 提供 Lua 绑定，`src/main/modules.cc` 里各模块的 `Parameter` 表约束键值，`src/main/snort_config.cc` 的 `SnortConfig` 承接最终配置。网络变量另有专线：`src/parser/parse_conf.cc` 的 `ParseIpVar`、`parse_include`、`get_config_file` 与 `src/parser/vars.cc` 的 `ParsePortVar`、`VarIsIpAddr`、`VarIsIpList`、`DisallowCrossTableDuplicateVars` 一起，把 Lua 里的 `default_variables` 变成规则头可引用的变量表，`src/parser/var_dependency.cc` 处理变量依赖。配置加载链路见图 03-02-01（字段见 05-03 ｜ 参数见 04-02 ｜ 原理见 06-01 ｜ 模块见 07-11）。
+
+:::figure id=03-02-01 | name=snort.lua 配置加载与网络变量链路 | dir=TD
+node n1 "-c 指向 snort.lua" blue
+node n2 "Shell::load_config" teal
+node n3 "snort_defaults.lua" amber
+node n4 "default_variables 表" amber
+node n5 "ips.variables 承接" purple
+node n6 "规则头变量匹配" purple
+node n7 "HOME_NET 与网段" blue
+node n8 "snort -T 校验" green
+edge n1 -> n2 "载入 Lua 文本"
+edge n2 -> n3 "include 展开"
+edge n3 -> n4 "定义 nets 与 ports"
+edge n2 -> n7 "读取全局赋值"
+edge n7 -> n4 "写入 nets 表"
+edge n4 -> n5 "赋值引用"
+edge n5 -> n6 "参与规则头"
+edge n2 -> n8 "配置自检"
+edge n6 -> n8 "变量一致性"
+:::
+
+图 03-02-01 里 `n1 → n2` 是命令行到 Shell 的入口，`n3` 与 `n7` 是两路输入：`include 'snort_defaults.lua'` 展开出 `n4` 的 `default_variables`，而 `HOME_NET` / `EXTERNAL_NET` 的全局赋值在 `n7` 被读取后写进 `n4` 的 nets 表——这两路顺序若颠倒，`n4` 里固化的就是 `any` 而不是你想要的网段。`n4 → n5 → n6` 说明变量最终是给规则头做地址与端口匹配用的，`n8` 的 `-T` 则同时校验配置语法与变量一致性。理解这张图，就能明白为什么 `snort_defaults.lua` 开头专门写「include in your snort.lua after you set HOME_NET and EXTERNAL_NET」。
+
+### 2. 前置条件与环境
+
+第一项是一份可编辑、可回滚的配置。安装后的模板位于 `etc/snort/snort.lua` 与 `etc/snort/snort_defaults.lua`（源码侧为 `lua/snort.lua`、`lua/snort_defaults.lua`），动手前先复制一份备份，避免改坏后无法回到可自检的状态。第二项是会看帮助：`snort --help-config`、`--help-module ips`、`--help-module daq` 由 `src/main/help.cc` 的 `help_args` 按前缀过滤 `Parameter` 表输出，能查到某段有哪些键、取值范围与一句话帮助；`--dump-config` 则能把生效后的配置回打出来，是验证「改了有没有生效」的利器。这些命令的完整清单见 04-07，本篇只用它们做校验。
+
+第三项是预置策略模板的认知。`lua/` 下已核验存在 `inline.lua`、`max_detect.lua`、`talos.lua`、`balanced.lua`、`connectivity.lua`、`security.lua`、`sandbox.lua`。它们不是另一套配置，而是叠加在 `snort.lua` 之上的「tweaks」：`snort.lua` 末尾写着 `if ( tweaks ~= nil ) then include(tweaks .. '.lua') end`，命令行 `--tweaks inline` / `--tweaks max_detect` 会触发这段 include。例如 `inline.lua` 把 `daq.modules` 配成 `pcap` 的 `read-file` 加 `dump` 的 `output=none`，注释写明「use with --tweaks inline」；`max_detect.lua` 抬高 `detection.pcre_match_limit`、开 `search_engine.detect_raw_tcp` 与各 inspector 的解压开关，注释写明「lowest throughput」；`talos.lua` 里 `ips.include = 'local.rules'`、`alert_talos = { }`、`snort = { ['-Q'] = true }`，配合 `--talos` 或 `--tweaks talos`。这些模板正好演示「同一份主干、不同场景叠加」的组合方式，具体键名与取值需对照实际版本核验（完整清单见 04-02 ~ 04-05）。
+
+第四项是环境边界。改网络变量不改变抓包能力：DAQ module 仍由 `--daq` / `daq` 段决定，依赖独立 libdaq / DAQ3；改 `ips.mode` 也不会把旁路进程变成防火墙，内联 drop 仍要靠 DAQ verdict（03-05）。Hyperscan 只是可选 search_engine 加速，`src/search_engines/hyperscan.cc` 缺失时回退 `ac_bnfa.cc`、`ac_full.cc`、`acsmx2.cc`、`bnfa_search.cc`，配置里不必为它单独开段。线程 / 进程模型以实际版本为准，禁止断言「默认 N 线程」，`src/main/analyzer.cc`、`numa.cc` 相关项需对照实际版本核验。版本基准仍为「上游 master 快照（2026-11 抓取）」。前置要点见下表。
+
+| 前置项 | 核验动作 | 关联源码 |
+|---|---|---|
+| 模板可编辑 | 备份 `etc/snort/snort.lua` | `lua/snort.lua` |
+| 帮助可查 | `--help-module ips` | `src/main/help.cc` |
+| 策略模板齐备 | `ls lua/*.lua` | `lua/inline.lua` 等 |
+| 改动可回看 | `--dump-config` | `src/main/shell.cc` |
+| DAQ 独立 | `--daq-list` | `src/packet_io/sfdaq.cc` |
+
+### 3. 分步操作
+
+第一步，备份并定位八段结构。`lua/snort.lua` 顶部注释把配置分成 1 defaults、2 inspection、3 bindings、4 performance、5 detection、6 filters、7 outputs、8 tweaks 八段：defaults 段设 `HOME_NET` / `EXTERNAL_NET` 并 `include 'snort_defaults.lua'`；inspection 段是 `stream = { }`、`stream_ip`、`stream_tcp`、`http_inspect = { }`、`ssl = { }`、`normalizer = { }` 一族「用内部默认即可」的 inspector；bindings 段是 `wizard = default_wizard` 与长长的 `binder` 表，把端口 / 服务绑定到 inspector；detection 段是 `references = default_references`、`classifications = default_classifications` 与 `ips = { variables = default_variables }`；outputs 段把 `alert_csv`、`alert_fast`、`alert_full`、`unified2`、`log_pcap` 等都注释掉，并提示「可用命令行 `-A <alert_type>` / `-L <log_type>` 启用默认」；tweaks 段就是末尾那段条件 include。
+
+第二步，先设网络变量再 include。这是本篇最该养成的习惯：`snort_defaults.lua` 里 `DNS_SERVERS = HOME_NET`、`HTTP_SERVERS = HOME_NET` 等一批服务器变量直接取 `HOME_NET`，`default_variables` 的 nets 表又把 `HOME_NET = HOME_NET`、`EXTERNAL_NET = EXTERNAL_NET` 写死。因此若把 `HOME_NET` 放在 include 之后，默认文件已经用 `any` 固化过一遍，再改全局变量也补不回来。正确顺序与 03-01 的最小主干一致。需要按场景扩充时，还可以用 `ips.variables` 引用 `default_variables` 并追加自定义 nets / ports，但只给最小必要键，不重列全集。
+
+```lua
+HOME_NET = '10.0.0.0/8'
+EXTERNAL_NET = '!$HOME_NET'
+
+include 'snort_defaults.lua'
+
+ips =
+{
+    variables = default_variables,
+    enable_builtin_rules = false
+}
+
+binder =
+{
+    { when = { proto = 'tcp', ports = '80', role = 'server' }, use = { type = 'http_inspect' } },
+    { use = { type = 'wizard' } }
+}
+```
+
+第三步，按场景叠加策略模板，而不是逐项手改。例如要做只读回放的内联式自检，用 `--tweaks inline` 让 `inline.lua` 配好 `daq.modules`；要压测最大检测覆盖，用 `--tweaks max_detect`，但要记住它注释里「lowest throughput」的代价，所有吞吐数字需在目标机型实测。命令行也可以用 `--lua` 直接注入小段配置，README 的真实示例是 `--lua "suppress = { { gid = 1, sid = 2123 } }"`，适合临时验证而不落盘。第四步，用 `snort -c etc/snort/snort.lua -T` 校验语法与规则，用 `--dump-config` 回看生效值，用 `--help-module` 查某段键的合法取值；确认无误后再进入实跑。第五步，清理：临时注入只作用于本次进程，落盘改动保留备份以便回滚。参数含义一律写「完整清单见 04-02 ~ 04-05」。
+
+```bash
+cp etc/snort/snort.lua etc/snort/snort.lua.bak
+snort --help-module ips
+snort -c etc/snort/snort.lua -T
+snort -c etc/snort/snort.lua --dump-config | grep -E "HOME_NET|EXTERNAL_NET|ips|daq"
+snort -c etc/snort/snort.lua --lua "ips = { variables = default_variables }" -T
+```
+
+### 4. 验证方法与预期结果
+
+配置类改动的「预期输出」不是告警，而是自检通过与生效值回显。下面给出 `--help-module ips` 加 `-T` 加 `--dump-config` 的典型输出，示例输出，具体格式需对照实际版本核验；其中键值名取自 `src/main/modules.cc` 的 `ips_params` 表（已核验含 `action_map`、`action_override`、`default_rule_state`、`enable_builtin_rules`、`id`、`include`、`mode`、`obfuscate_pii`、`rules`、`states`、`variables`），日志文本取自 `src/main/help.cc` 与 `src/parser/parser.cc`。
+
+```text
+示例输出，具体格式需对照实际版本核验
+ips
+  configure IPS rule processing
+  action_override <string>  use this action for all rules
+  default_rule_state no | yes | inherit  enable or disable ips rules
+  enable_builtin_rules <bool>  enable events from builtin rules w/o stubs
+  include <string>  snort rules and includes
+  rules <string>  snort rules and includes (may contain states too)
+  states <string>  snort rule states and includes
+  variables <table>  defines IPS policy variables
+Snort++ 版本字样-BUILD
+Reading rules until EOF or a line starting with END
+ips policies rule stats
+Snort successfully validated the config!
+HOME_NET = 10.0.0.0/8
+EXTERNAL_NET = !$HOME_NET
+ips = { variables = default_variables, enable_builtin_rules = false }
+```
+
+逐行判读如下。第一行是「示例输出」声明，提示帮助文本、行宽、统计标签与回显格式随快照版本变化，不能把 `ips` 下这些键当成固定全集——完整清单见 04-02 ~ 04-05。第二行 `ips` 是 `--help-module ips` 命中的模块名，第三行 `configure IPS rule processing` 对应 `src/main/modules.cc` 的 `ips_help`，确认查的是 IPS 策略模块而非别的同名概念。第四至第十行是 `help_args` 逐条打印的 `Parameter`：`default_rule_state no | yes | inherit` 说明它是枚举、`enable_builtin_rules <bool>` 说明是布尔、`include <string>` 与 `rules <string>` 说明规则文件 / 规则文本都从字符串进，`variables <table>` 说明是表类型；正常应能看到你关心的那个键，若某个键缺失或取值范围与预期不符，应回到对应源码核对而不是凭印象填值。第十一行 `Snort++ 版本字样-BUILD` 与 03-01 同源，确认二进制一致。第十二、十三行 `Reading rules until EOF or a line starting with END` 与 `ips policies rule stats` 说明规则解析与统计都走到了，第十四行 `Snort successfully validated the config!` 是 `-T` 成功标志，正常应以零退出码结束；带 `ParseError` 则按第五节回查 Lua 语法。第十五至第十七行是 `--dump-config | grep` 的回显：`HOME_NET = 10.0.0.0/8` 与 `EXTERNAL_NET = !$HOME_NET` 必须与你刚写入的值一致，若回显仍是 `'any'`，几乎可以断定赋值写在了 `include 'snort_defaults.lua'` 之后、被默认文件固化覆盖；`ips = { variables = default_variables, enable_builtin_rules = false }` 说明 `ips` 段确实引用了 `default_variables`。把「回显值 == 期望值」作为配置生效的判读要点，比只看「validated」更可靠。字段逐项定义见 05-03，机制见 06-06，模块见 07-11。
+
+| 输出行 | 判读要点 | 异常特征 |
+|---|---|---|
+| `configure IPS rule processing` | 命中 `ips` 模块 | 查不到说明键名拼错 |
+| `default_rule_state no \| yes \| inherit` | 枚举取值合法 | 取值越界会被 `Parameter` 拒 |
+| `HOME_NET = 10.0.0.0/8` | 与写入值一致 | 回显 `any` 即顺序错 |
+| `EXTERNAL_NET = !$HOME_NET` | 取反引用成立 | 报未定义即变量依赖错 |
+| `validated the config` | 自检零错误退出 | 出现 `ParseError` 即失败 |
+
+### 5. 常见失败与排错
+
+第一类是赋值顺序错，最典型的症状就是 `--dump-config` 里 `HOME_NET` 仍是 `'any'`。根因是 `HOME_NET` / `EXTERNAL_NET` 写在 `include 'snort_defaults.lua'` 之后，默认文件里的 `DNS_SERVERS = HOME_NET` 与 `default_variables.nets.HOME_NET = HOME_NET` 已经把 `any` 固化。修复就是把两行赋值提到 include 之前，再 `-T` 重验；这是 `snort_defaults.lua` 开头那句注释反复强调的原因。第二类是变量未定义或循环引用。`src/parser/vars.cc` 的 `DisallowCrossTableDuplicateVars` 会拒绝跨表重复变量，`VarIsIpAddr` / `VarIsIpList` 负责判定 IP 列表，`src/parser/var_dependency.cc` 处理 `$VAR` 依赖；`EXTERNAL_NET = '!$HOME_NET'` 这类取反写法需确认当前版本支持，不确定就写「需对照实际版本核验」并回到 `src/parser/parse_conf.cc` 的 `ParseIpVar` 核对。
+
+第三类是 include 找不到文件。`include 'snort_defaults.lua'`、`ips.include = 'local.rules'` 一类路径由 `src/parser/parse_conf.cc` 的 `get_config_file`、`parse_include`、`relative_to_parse_dir`、`relative_to_config_dir`、`relative_to_include_dir`、`relative_to_working_dir` 逐级解析，其中 `relative_to_include_dir` 用到 `SnortConfig::get_conf()->include_path`。报错带文件名时先确认文件确实存在，再考虑 `--include-path` 指定搜索目录；`src/parser/parse_stream.cc` 里 `include` 是配置流的关键字，拼写错会当成未知语句。第四类是 Lua 语法与白名单问题。`src/main/shell.cc` 的 `Shell::load_config` / `load_string` 载入时若碰到未闭合的表、漏逗号、中文引号，会直接报解析错；`snort_defaults.lua` 末尾 `snort_whitelist_append(default_whitelist)` 与 `src/main/shell.cc` 的 `allowlist_append` 控制哪些关键字可出现在配置里，自定义全局变量若不合规会被拦下，`--lua-sandbox` 配合 `lua/sandbox.lua` 还会进一步限制可用函数。按报错文件与行号修语法，再用 `snort -c etc/snort/snort.lua -T` 重验，别跳过自检。
+
+第五类是「改了但没生效」的心理误判。配置是进程启动时一次性载入 `SnortConfig` 的，运行期改磁盘上的 Lua 文件不会影响已跑起来的进程；想让改动落地要么重启、要么走 `src/main/swapper.cc` 的 `Swapper::apply` 与 `src/control/` 控制面做热重载（具体命令需对照实际版本核验，见 03-06 与 08-06）。另一处易错是把 `--tweaks` 当成永久配置：它只在本次命令行里触发末尾那段条件 include，换一次启动不带 `--tweaks` 就恢复主干。第六类是边界误写：把 `ips.mode = 'inline'` 当成能让进程转发流量是错的，Snort 不做转发、不是防火墙，内联 drop 靠 DAQ verdict（03-05）；把 `daq` 段当成引擎自带抓包也是错的，抓包依赖独立 libdaq / DAQ3（原理见 06-02、模块见 07-07）；把 `default_variables` 当成可以照抄全量键更是错的，完整清单见 04-02 ~ 04-05。许可与规则兼容性同 03-01：GPLv2 加 Talos 规则集独立许可，规则关键字与 Snort 2 有差异、不宣称完全兼容。
+
+还有几处配置治理层面的细节值得单独交代，它们不改动任何段落结构，却能让 `snort.lua` 的维护少走弯路。第一处是 `default_variables` 的内部构成。`lua/snort_defaults.lua` 把变量分成 nets、paths、ports 三组：nets 组含 `HOME_NET`、`EXTERNAL_NET` 以及 `DNS_SERVERS`、`FTP_SERVERS`、`HTTP_SERVERS`、`SIP_SERVERS`、`SMTP_SERVERS`、`SQL_SERVERS`、`SSH_SERVERS`、`TELNET_SERVERS` 等一批由 `HOME_NET` 直接赋值的服务器变量；paths 组含 `RULE_PATH`、`BUILTIN_RULE_PATH`、`PLUGIN_RULE_PATH` 与 `WHITE_LIST_PATH`、`BLACK_LIST_PATH`；ports 组含 `FTP_PORTS`、`HTTP_PORTS`、`MAIL_PORTS`、`ORACLE_PORTS`、`SIP_PORTS`、`SSH_PORTS`，以及由 `HTTP_PORTS .. MAIL_PORTS` 拼接出的 `FILE_DATA_PORTS`。理解这三组的来源，就能解释为什么规则里写 `$HTTP_PORTS` 能命中一长串 Web 端口、为什么 `HOME_NET` 写错会连带把所有服务器变量带偏。第二处是帮助与回显的分工：`src/main/help.cc` 的 `help_args` 按前缀过滤 `Parameter` 表，`--help-config` 适合按前缀查某一段有哪些键，`--help-module` 适合看单个模块的完整参数说明，`--dump-config` 则把生效后的配置回打出来；三者一个查「有哪些」、一个查「怎么用」、一个查「实际生效成什么」，配合 `snort -c etc/snort/snort.lua -T` 才是完整的配置验证闭环。第三处是白名单与沙箱：`snort_defaults.lua` 末尾 `snort_whitelist_append(default_whitelist)` 把一批 `default_*` 表名登记为可出现在配置里的关键字，`src/main/shell.cc` 的 `allowlist_append` 与 `add_config_root_node` 负责在载入时校验，自定义全局变量若不合规会被拦下，`--lua-sandbox` 配合 `lua/sandbox.lua` 还会在控制通道场景进一步限制可用函数，这解释了为什么「照着变量名凭空造一个全局键」未必能生效。
+
+第四处是变量依赖与路径解析。`src/parser/var_dependency.cc` 处理 `$VAR` 形式的引用，`src/parser/parse_conf.cc` 的 `ParseIpVar` 与 `src/parser/vars.cc` 的 `ParsePortVar`、`VarIsIpAddr`、`VarIsIpList`、`DisallowCrossTableDuplicateVars` 决定 IP 与端口变量能否被规则头接受；include 文件则由 `get_config_file`、`relative_to_parse_dir`、`relative_to_config_dir`、`relative_to_include_dir`、`relative_to_working_dir` 逐级定位，其中 `relative_to_include_dir` 用到 `include_path`，因此 `--include-path` 是非标准布局下的常用补位手段。第五处是策略叠加与回滚：`--tweaks` 只在本次启动里给全局 `tweaks` 赋值并触发 `snort.lua` 末尾的条件 include，`--talos` 对应 `lua/talos.lua`，`--lua` 适合一次性注入，这些都不落盘；落盘改动务必备份 `snort.lua` 与 `snort_defaults.lua`，并用 `--dump-config` 回显确认后再进入实跑。第六处是 `ips` 段的场景化键：`src/main/modules.cc` 的 `ips_params` 里 `action_override`、`action_map`、`default_rule_state` 用于批量调整规则动作与状态，`ips.mode` 的 `tap | inline | inline-test` 与 DAQ 的 `passive | inline | read-file` 分属不同层级，配置时不要混写，它们的取值范围与组合后果一律以 04 册为准，本篇只点名用途，写「完整清单见 04-02 ~ 04-05」。把这些治理细节补上，`snort.lua` 就从「能跑」变成「可维护、可交接、可回滚」的配置资产，网络变量也不再是一串容易写反的全局赋值，而是有来源、有依赖、有回显手段的确定性输入。
+
+最后补一句变更管理上的经验。生产环境里 `snort.lua` 的每一次改动都应遵循「备份、最小改动、自检、回显、灰度、回滚」六步：先复制当前可用版本，再只改需要改的那一段，用 `--help-module` 确认键的合法取值，用 `snort -c etc/snort/snort.lua -T` 自检语法与规则，用 `--dump-config` 回显确认生效值，先在一台机器或一段回放流量上灰度，最后保留回滚文件。特别要避免两类高危操作：一是在 `snort_defaults.lua` 里直接改 `default_variables` 的成员，这会让所有引用该默认表的策略一起受影响，正确做法是在 `snort.lua` 里按场景覆盖；二是把 `--lua` 注入的临时片段误当成永久配置写进运维文档，重启后它并不存在。配置的版本管理建议与规则集、二进制版本一起记录，出现「同一份配置在不同机器上行为不一致」时，先比对 `snort -V` 的构建字样与 `--dump-config` 的回显，再怀疑网络变量本身。这些做法不增加任何新参数，只是把已经讲过的自检、回显、边界串成可执行的流程（完整清单见 04-02 ~ 04-05）。
+
+### 6. 小结
+
+本篇把 `snort.lua` 拆成可操作的四件事：认清八段注释结构（defaults / inspection / bindings / performance / detection / filters / outputs / tweaks）各自职责；牢记 `HOME_NET` / `EXTERNAL_NET` 必须在 `include 'snort_defaults.lua'` 之前设定，否则会被 `default_variables` 用 `any` 固化；理解 `default_variables` 的 nets / paths / ports 三组变量如何经 `ips.variables` 进入规则头匹配；掌握「`-T` 自检 + `--dump-config` 回显 + `--help-module` 查键」这组验证动作，以及 `--tweaks` / `--lua` 的场景化叠加方式。图 03-02-01 把配置加载与网络变量的链路画成一张图，顺序错与路径错都能在图上定位。全文只点名最小必要键与真实源码路径，参数全集写「完整清单见 04-02 ~ 04-05」，结构体去 05、机制去 06、目录能力去 07、运维去 08，交叉引用统一按（字段见 05-03 ｜ 参数见 04-02 ｜ 原理见 06-01 ｜ 模块见 07-11）执行。
+
+能力边界在本篇同样不破：配置是 Lua 而非 `snort.conf`，`tools/snort2lua/` 只是转换辅助；抓包依赖独立 libdaq / DAQ3，DAQ module 决定抓包与内联能力；内联 IPS 的 drop / block 通过 DAQ verdict 反馈，IDS 旁路只告警不丢弃，Snort 不是防火墙、不做转发与路由；Hyperscan 是可选 search_engine 加速，缺失时回退 `src/search_engines/` 的 AC / BNFA 实现；加密载荷不可见，应用识别依赖 inspector / binder / wizard；线程 / 进程模型需对照实际版本核验，禁止断言「默认 N 线程」；许可为 GPLv2 加 Talos 规则集独立约束；任何性能数字需在目标机型实测；规则关键字与 Snort 2 有差异、不宣称完全兼容。版本基准统一写「上游 master 快照（2026-11 抓取）」，具体版本号以 `CMakeLists.txt`、`ChangeLog.md` 为准。凡标注「需对照实际版本核验」的键名、函数名与命令选项，均以 `_snort_build/upstream_src/snort3/snort3-master/` 下对应文件为准，本套资料不编造未核验的路径与取值。下一篇 03-03 转入规则集管理：`ips.include` / `ips.rules` 的加载链、`snort -T` 的规则校验点，以及自定义规则的最小闭环。
+
+## 03-03 规则集管理：pulledpork、社区规则与自定义规则
+
+### 1. 目标与拓扑
+
+03-02 把 `snort.lua` 主干读通了，但一份能上线的 IDS 不能只靠一条 `sample.rules`。本篇的目标是把规则从「一条试跑用例」扩展成可维护、可校验、可回滚的规则集：认清三类来源（Talos 规则集、社区规则、自定义规则）各自的获取方式与许可边界，掌握它们经 `ips.include` / `ips.rules` / `ips.states` 进入引擎的加载链，学会用 `snort -T` 在放流量之前把规则错误挡住，并说明规则热加载的能力边界。全册按 C 实战型六节骨架组织，本篇只讲「规则怎么组合进配置、怎么验证、怎么排错」，规则关键字的完整语法是 04-06 的权威范围，本篇不重列，统一写「完整清单见 04-02 ~ 04-05」；参数具体取值同样以 04 册为准。
+
+先划三条不可越过的边界。第一，许可：引擎为 GPLv2（顶层 `COPYING` / `LICENSE`），而 Talos 规则集有独立许可约束，`lua/talos.lua` 与相关规则文件不能与引擎按同一许可任意分发，社区规则与 Talos 规则的获取和使用条款也要分别确认，不能把第三方规则当成引擎自带的资产。第二，工具定位：pulledpork 是社区常用的第三方规则同步 / 管理工具，并不在本快照的必查文件表内，其命令、配置与版本需对照实际版本核验，本篇只把它当作「外部同步入口」点名，不编造它的参数；`tools/snort2lua/` 同样只是 Snort 2 配置转换辅助工具，不等于规则可直接沿用。第三，兼容性：规则关键字与 Snort 2 有差异（`src/ips_options/`、`src/parser/parse_rule.cc`、`src/detection/` 的注册与解析），不能宣称完全兼容，旧规则集搬过来必须经过 `snort -T` 逐条校验。版本基准统一写「上游 master 快照（2026-11 抓取）」。
+
+拓扑围绕「来源 → 配置 → 解析 → 编译 → 校验」五段展开。规则文件不直接被引擎扫描，而是先由 `src/main/modules.cc` 的 `ips_params` 把 `include`、`rules`、`states`、`variables`、`enable_builtin_rules` 等键收进 `IpsPolicy`，再由 `src/main/snort_config.cc` 的 `SnortConfig::setup()` 调用 `src/parser/parser.cc` 的 `ParseRules(sc)`，后者按 `enable_builtin_rules`、`parse_rules_file`、`ips.rules`、`ips.states` 等分支把文本交给 `src/parser/parse_conf.cc` 的 `parse_rules_file` / `parse_rules_string`，最终落到 `src/parser/parse_rule.cc` 构造规则头与 `RuleOption`，并由 `src/parser/parser.cc` 的 `ParseRulesFinish` 收尾。规则集来源与加载校验链路见图 03-03-01（字段见 05-04 ｜ 参数见 04-06 ｜ 原理见 06-06 ｜ 模块见 07-05）。
+
+:::figure id=03-03-01 | name=规则集来源与加载校验链路 | dir=TD
+node n1 "Talos 与社区规则" gray
+node n2 "自定义 local.rules" blue
+node n3 "ips.include 路径" amber
+node n4 "parse_rules_file" teal
+node n5 "parse_rule 解析" purple
+node n6 "规则编译与端口表" purple
+node n7 "snort -T 校验" green
+node n8 "热重载控制面" red
+edge n1 -> n3 "第三方同步"
+edge n2 -> n3 "本地编写"
+edge n3 -> n4 "按路径展开"
+edge n4 -> n5 "逐行读取"
+edge n5 -> n6 "构造 RuleOption"
+edge n6 -> n7 "自检输出"
+edge n8 -> n6 dashed "swapper 交换"
+edge n1 -> n2 dashed "许可区分"
+:::
+
+图 03-03-01 里 `n1`、`n2` 是两类来源：Talos / 社区规则经第三方同步落到本地目录，自定义规则直接在本地编写，二者在 `n3` 的 `ips.include` 汇合。`n3 → n4 → n5 → n6` 是已核验的解析编译链，规则文本逐行读取后构造规则头与选项、挂到端口表。`n6 → n7` 说明 `snort -T` 是放流量前唯一的规则校验关口。虚线 `n8 → n6` 表示热重载经 `src/main/swapper.cc` 交换配置、属于运行期能力而非启动期加载；虚线 `n1 → n2` 提醒两类来源许可不同，不能混为一谈。排错时按实线从 `n3` 往 `n6` 逐段回查，能快速定位是路径、语法还是编译的问题。
+
+### 2. 前置条件与环境
+
+第一项是规则目录与路径变量。`lua/snort_defaults.lua` 已核验给出 `RULE_PATH = '../rules'`、`BUILTIN_RULE_PATH = '../builtin_rules'`、`PLUGIN_RULE_PATH = '../so_rules'`，并把它们收进 `default_variables.paths`；这些是 Talos 配置惯用的路径变量，实际部署时应按安装布局改成可定位的目录，`default_variables` 的完整键与取值需对照实际版本核验（完整清单见 04-02 ~ 04-05）。第二项是规则文件本身：本快照 `lua/` 下已核验存在 `talos.lua`、`sensitive_data.rules`、`file_magic.rules`，其中 `file_magic.rules` 由 `lua/snort.lua` 的 `file_inspect = { rules_file = 'file_magic.rules' }` 引用；`lua/talos.lua` 里 `if file_exists('local.rules') then ips.include = 'local.rules' end` 正好演示「存在才挂」的条件写法。
+
+第三项是 `ips` 段有哪些键可用。`src/main/modules.cc:1330` 的 `ips_params` 表已核验包含 `action_map`、`action_override`、`default_rule_state`（`no | yes | inherit`）、`enable_builtin_rules`（默认 `false`）、`id`、`include`、`mode`、`obfuscate_pii`、`rules`、`states`、`variables`；`include` 的帮助文本是「snort rules and includes」，`rules` 是「snort rules and includes (may contain states too)」，`states` 是「snort rule states and includes (may contain rules too)」。这些键名可放心点名，但取值范围与组合后果一律以 04 册为准，本篇不重列（完整清单见 04-02 ~ 04-05）。第四项是校验工具：`snort -c etc/snort/snort.lua -T` 是主入口，配合 `--dump-rule-state`、`--list-builtin`、`--dump-rule-meta` 一类选项可回看规则状态（具体选项名需对照实际版本核验，定位 `src/main/snort_module.cc` 与 `src/main/help.cc`）。
+
+第五项是热加载的边界认知。运行期换规则不是改文件就生效：`src/main/swapper.cc` 的 `Swapper::apply(Analyzer&)` / `Swapper::finish()` 负责新旧配置交换，`src/control/control.cc` 的 `ControlConn` 与 `src/main/shell.cc` 的 `Shell` 提供控制面；具体控制命令名、热加载是否覆盖规则文件变更，需对照实际版本核验（见 03-06 与 08-06）。第六项仍是能力边界：抓包依赖独立 libdaq / DAQ3，规则加载与 DAQ 无关；内联动作靠 DAQ verdict，规则里写 `drop` 不代表进程会做转发；Hyperscan 是可选 search_engine 加速，缺失时回退 `src/search_engines/` 的 AC / BNFA 实现，规则集规模影响的是编译期与检测期开销，具体数字需在目标机型实测。前置要点见下表。
+
+| 前置项 | 核验动作 | 关联源码 / 文件 |
+|---|---|---|
+| 规则目录 | 核对 `RULE_PATH` 落位 | `lua/snort_defaults.lua` |
+| 规则文件 | 确认 `local.rules` 存在 | `lua/talos.lua` |
+| `ips` 键可用 | `--help-module ips` | `src/main/modules.cc` |
+| 解析链通畅 | `snort -c etc/snort/snort.lua -T` | `src/parser/parser.cc` |
+| 许可区分 | 读规则集许可条款 | `lua/talos.lua` 与 `COPYING` |
+
+### 3. 分步操作
+
+第一步，规划目录并备份。把第三方同步下来的规则、内置规则、自定义规则分目录放置，路径变量在 `snort_defaults.lua` 里对齐；动手前复制 `snort.lua` 与规则目录，保证任何一步失败都能回到上一次 `-T` 通过的状态。pulledpork 一类工具只负责把远端规则同步到本地目录，其参数需对照实际版本核验，本篇不编造调用格式；同步完成后用 `ls` 与 `wc -l` 确认文件非空即可。
+
+第二步，写一条最小自定义规则。规则语法关键字属于 04-06，本篇只给足以验证加载链的骨架：动作、协议、地址端口、方向、`msg` / `sid` / `rev` / `content` 这些头与选项的最小组合。把它存为 `local.rules`，内容示例如下，注意这是规则文本而非配置，字段名需对照实际版本核验。
+
+```text
+alert icmp $HOME_NET any -> $EXTERNAL_NET any ( msg:"ICMP test rule"; sid:1000001; rev:1; )
+```
+
+第三步，把规则挂进 `ips` 段。优先用 `ips.include` 指向文件，便于按来源拆分；也可用 `ips.rules` 直接内嵌规则字符串——`src/parser/dev_notes.txt` 里就有 `ips.rules = [[ reject http ( gid:1; sid:1; ) ]]` 这类示例，`src/parser/parser.cc:475` 的 `push_parse_location("C", p->includer.c_str(), "ips.rules")` 说明内嵌文本同样进入解析链。`ips.states` 用于规则状态，`enable_builtin_rules` 控制是否启用内置规则事件，`variables` 仍引用 `default_variables`。下面这段只给场景化组合，不重列全集（完整清单见 04-02 ~ 04-05）。
+
+```lua
+ips =
+{
+    variables = default_variables,
+    include = 'local.rules',
+    enable_builtin_rules = false
+}
+```
+
+第四步，做启动期校验。用 `snort -c etc/snort/snort.lua -T` 让 `SnortConfig::setup()` 走完 `ParseRules` 与 `ParseRulesFinish`，再按需用 `--dump-rule-state`、`--list-builtin` 回看规则状态与内置规则清单。这一步必须零错误退出才能进入实跑；带 `ParseError` 就按第五节定位，不要带着错误放流量。第五步，用样本 pcap 验证命中，命令与 03-01 一致，只是把 `-R` 换成配置内已挂好的 `ips.include`。
+
+```bash
+cp etc/snort/snort.lua etc/snort/snort.lua.bak
+snort --help-module ips | head -n 20
+snort -c etc/snort/snort.lua -T
+snort -c etc/snort/snort.lua -r a.pcap -A alert_fast -n 100000
+```
+
+第六步，处理热加载与清理。若确需运行期换规则，走 `src/control/` 控制面触发 `src/main/swapper.cc` 的 `Swapper::apply`，具体命令名需对照实际版本核验；换完仍要再跑一次 `-T` 或看控制面回显确认新配置生效。临时 `--lua` 注入只作用于本次进程，落盘改动保留备份以便回滚。整个闭环里凡是「关键字怎么写」「参数怎么取值」的问题一律写「完整清单见 04-02 ~ 04-05」与「规则关键字见 04-06」，本篇只负责把来源、配置、解析、校验串起来。
+
+### 4. 验证方法与预期结果
+
+规则集验证的「预期输出」是编译统计与规则状态，而不是单纯「命令没报错」。下面给出 `-T` 加规则状态回显的典型输出，示例输出，具体格式需对照实际版本核验；其中文本取自 `src/parser/parser.cc` 的 `Reading rules until EOF or a line starting with END`、`LogLabel("ips policies rule stats")`、`***Port-Table : %s Ports/Rules-Compiled`，以及 `src/main/snort.cc` 的版本 banner。
+
+```text
+示例输出，具体格式需对照实际版本核验
+Snort++ 版本字样-BUILD
+Reading rules until EOF or a line starting with END
+ips policies rule stats
+        id      loaded  enabled  rules
+         1           1        1      1
+***Port-Table : icmp Ports/Rules-Compiled
+Snort successfully validated the config (with 1 rule)!
+05/14-10:31:02.654321  [**] [1:1000001:1] "ICMP test rule" [**] {ICMP} 10.0.0.5 -> 10.0.0.9
+```
+
+逐行判读如下。第一行是「示例输出」声明，提示 banner、统计表列宽、端口表名称与告警格式随快照版本变化，不能把 `Version` 字样抄成本套版本号。第二行 `Snort++ 版本字样-BUILD` 与 03-01 同源，确认二进制一致。第三行 `Reading rules until EOF or a line starting with END` 来自 `src/parser/parser.cc`，说明 `parse_rules_file` / `parse_rules_string` 正在读规则文本；若这一行都不出现，多半是 `ips.include` 路径没解析到文件，应回到 `src/parser/parse_conf.cc` 的 `relative_to_*` 系列函数查路径。第四行 `ips policies rule stats` 是 `LogLabel` 打出的统计标签，第五、六行是它下面的表头与数据行：`loaded` 为 1、`enabled` 为 1、`rules` 为 1，正常应与 `local.rules` 里的规则条数一致；若 `loaded` 为 0 或 `enabled` 为 0，要检查 `default_rule_state` 是否被设成 `no`、规则是否被 `ips.states` 禁用、以及 `src/managers/module_manager.cc` 的 `ips.includer` 是否指向了别处。第七行 `***Port-Table : icmp Ports/Rules-Compiled` 说明规则已按协议 / 端口编译进端口表，这是「规则真的可参与检测」的关键判据，缺它则规则只是被读进来、没被编译。第八行 `Snort successfully validated the config (with 1 rule)!` 是 `-T` 成功标志，正常应零退出码。第九行是回放命中后的 `src/loggers/alert_fast.cc` 告警，`[1:1000001:1]` 对应自定义规则的 gid:sid:rev，`"ICMP test rule"` 对应 `msg`，`{ICMP}` 与地址方向应与规则头、`HOME_NET` 自洽；命中计数 ≥1 才算规则集端到端可用。字段逐项定义见 05-08，关键字语法见 04-06，编译机制见 06-06。判读要点见下表。
+
+| 输出行 | 判读要点 | 异常特征 |
+|---|---|---|
+| `Reading rules until EOF` | 规则文件被读到 | 不出现即路径错 |
+| `ips policies rule stats` | 有规则统计 | 缺标签即未加载 |
+| `loaded 1 enabled 1` | 与规则条数一致 | 为 0 查 `default_rule_state` |
+| `Ports/Rules-Compiled` | 已编译进端口表 | 缺它即未参与检测 |
+| `[1:1000001:1] msg` | 命中自定义规则 | 计数 0 查变量与方向 |
+
+### 5. 常见失败与排错
+
+第一类是未知规则关键字。现象是 `-T` 阶段报未知关键字或规则解析失败。规则选项由 `src/managers/ips_manager.cc` 注册、实现分散在 `src/ips_options/`（`ips_content.cc`、`ips_pcre.cc`、`ips_regex.cc`、`ips_byte_test.cc`、`ips_flow.cc`、`ips_flowbits.cc`、`ips_detection_filter.cc` 等），解析在 `src/parser/parse_rule.cc`。旧规则集里出现当前版本不支持的关键字、或关键字写法与 Snort 2 有差异，都会在这一步被挡住；按报错给的 sid 与行号回到规则文本，对照 04-06 的差异说明修正，再 `-T` 重验，绝不宣称完全兼容。第二类是 include 路径错。`ips.include`、`include 'snort_defaults.lua'` 一类由 `src/parser/parse_conf.cc` 的 `get_config_file`、`parse_include`、`relative_to_parse_dir`、`relative_to_config_dir`、`relative_to_include_dir`（用到 `include_path`）、`relative_to_working_dir` 逐级解析；报错带文件名时先确认文件存在，再考虑 `--include-path`，`src/parser/parse_stream.cc` 里 `include` 是配置流关键字，拼错会被当成未知语句。
+
+第三类是变量未定义导致规则头不成立。`$HOME_NET`、`$EXTERNAL_NET`、`$HTTP_PORTS` 一类由 `src/parser/parse_conf.cc` 的 `ParseIpVar` 与 `src/parser/vars.cc` 的 `ParsePortVar`、`VarIsIpAddr`、`VarIsIpList`、`DisallowCrossTableDuplicateVars` 解析，`src/parser/var_dependency.cc` 处理依赖顺序；变量没在 `ips.variables` / `default_variables` 里定义、或跨表重复定义，都会让规则加载失败。第四类是规则语法细节：括号不配对、`sid` 重复、`rev` 缺失、选项缺分号，`src/parser/parse_rule.cc` 会在解析期报错并带位置信息；`src/parser/parser.cc` 还有 `failed to create rule index map` 一类 `ParseAbort`，属于编译期失败，同样要靠 `-T` 提前发现。规则规模过大带来的编译期内存与时间膨胀属于 08-05 加固范围，任何数字需在目标机型实测。
+
+第五类是许可与来源混淆。Talos 规则集有独立许可约束，不能与 GPLv2 引擎混为一谈、更不能按同一条款任意分发；`lua/talos.lua`、`lua/sensitive_data.rules` 一类文件要先读其许可与使用条款。pulledpork 是第三方工具，命令与版本需对照实际版本核验，本篇不给它的参数表；`tools/snort2lua/` 只做格式转换，不等于 Snort 2 规则可直接沿用。第六类是「改了规则不生效」。启动期加载是一次性的，运行期改磁盘文件不影响已跑起来的进程，要走 `src/main/swapper.cc` 的 `Swapper::apply` 与 `src/control/control.cc` 的控制面（具体命令需对照实际版本核验）；`--lua` 临时注入只作用于本次进程。另需记住内联动作靠 DAQ verdict：规则里写 `drop` / `block` 不等于 Snort 会做 IP 转发，它不做转发、不是防火墙（03-05）；抓包依赖独立 libdaq / DAQ3；加密载荷不可见，规则不能指望匹配 HTTPS 明文正文（字段需对照实际版本核验）。
+
+规则集治理还有几处值得展开的细节，它们决定了规则从文件变成可检测对象之后的可靠性。第一处是 `src/parser/parser.cc` 的 `ParseRules` 分支结构。该函数在 `SnortConfig::setup()` 里被调用，会先按 `enable_builtin_rules` 决定是否加载内置规则事件，再依次处理 `parse_rules_file` 指向的规则文件、`ips.rules` 内嵌的规则文本、`ips.states` 里的规则状态，以及 `s_special_rules`、`s_aux_rules` 一类辅助规则串；`push_parse_location` 会以 `W`、`C` 一类标记区分来源，这解释了为什么同一份配置里规则可以既来自 `include` 文件、又来自 `ips.rules` 字符串、还能附带状态覆盖。`ParseRulesFinish` 负责编译收尾，`src/parser/parser.cc` 里 `failed to create rule index map` 一类 `ParseAbort` 属于编译期失败，必须靠 `-T` 提前挡住，不能等到放流量时才暴露。第二处是路径变量与规则文件的落位：`snort_defaults.lua` 给出 `RULE_PATH`、`BUILTIN_RULE_PATH`、`PLUGIN_RULE_PATH` 三个规则目录变量与 `WHITE_LIST_PATH`、`BLACK_LIST_PATH` 两个名单目录变量，`lua/snort.lua` 里 `file_inspect = { rules_file = 'file_magic.rules' }` 引用 `lua/file_magic.rules`，`lua/sensitive_data.rules` 是敏感数据规则的样例，`lua/talos.lua` 则用 `file_exists('local.rules')` 判断后才写 `ips.include = 'local.rules'`。这些文件名可放心点名，具体路径变量取值需按安装布局对齐，不能凭印象补值。
+
+第三处是 `ips` 段里与规则治理直接相关的键。`src/main/modules.cc` 的 `ips_params` 除 `include`、`rules`、`states`、`variables` 外，还有 `action_override`（在所有规则上先统一动作）、`action_map`（再把指定动作映射成另一种）、`default_rule_state`（`no | yes | inherit`）、`enable_builtin_rules`、`id`、`mode`、`obfuscate_pii`。其中 `id` 的帮助文本写明用于「把 unified2 事件与配置关联」，多套策略共存时它能帮助区分事件来源；`obfuscate_pii` 默认对信用卡号、社保号、电话与邮箱做掩码，属于合规侧开关；`default_rule_state` 设为 `no` 会让规则默认不启用，这正是「规则加载了但 `enabled` 为 0」的常见根因。第四处是校验与回看选项：`snort -c etc/snort/snort.lua -T` 是主入口，`--dump-rule-state`、`--dump-rule-meta`、`--list-builtin`、`--list-gids` 一类选项可回看规则状态、元数据、内置规则与 generator 清单，具体选项名需对照实际版本核验，定位 `src/main/snort_module.cc` 与 `src/main/help.cc`。第五处是规模与许可：规则集越大，编译期构造 rule tree 与 port group 的内存、时间开销越大，但任何数字一律标注需在目标机型实测，不给绝对值；`src/managers/ips_manager.cc` 注册关键字、`src/ips_options/` 提供实现、`src/parser/parse_rule.cc` 负责解析，旧规则里的未知关键字会在这一层被挡住。许可上再次强调 Talos 规则集有独立许可约束，社区规则与 Talos 规则不能与 GPLv2 引擎按同一条款任意分发，pulledpork 一类第三方同步工具的命令与版本需对照实际版本核验，`tools/snort2lua/` 只做格式转换。把来源、路径、状态、动作、校验、许可六件事都管住，规则集才算真正可运维，而不是一堆碰巧能加载的文本文件。
+
+### 6. 小结
+
+本篇把规则集管理压缩为一条闭环：规划目录与路径变量（`RULE_PATH` 等，见 `lua/snort_defaults.lua`）→ 写最小自定义规则并存为 `local.rules` → 用 `ips.include` 挂进 `ips` 段（`ips.rules` / `ips.states` 为备选，`enable_builtin_rules` 控内置规则）→ 经 `SnortConfig::setup()` → `ParseRules` → `parse_rules_file` / `parse_rules_string` → `parse_rule` → `ParseRulesFinish` 完成加载编译 → 用 `snort -c etc/snort/snort.lua -T` 与规则状态回显校验 → 回放样本确认命中 → 需要运行期换规则才走 `src/main/swapper.cc` 与 `src/control/`。图 03-03-01 给出来源、配置、解析、编译、校验的链路，是排错时逐段回查的地图。全文只点名最小必要键与真实源码路径，参数全集写「完整清单见 04-02 ~ 04-05」、规则关键字写「见 04-06」，结构体去 05、机制去 06、目录能力去 07、运维去 08（字段见 05-04 ｜ 参数见 04-06 ｜ 原理见 06-06 ｜ 模块见 07-05）。
+
+能力边界贯穿始终：配置是 Lua、`tools/snort2lua/` 只是转换辅助；抓包依赖独立 libdaq / DAQ3，DAQ module 决定抓包与内联能力；内联 drop / block 通过 DAQ verdict 反馈，Snort 不是防火墙、不做转发与路由，IDS 旁路只告警不丢弃；Hyperscan 是可选 search_engine 加速，缺失回退 `src/search_engines/` 的 AC / BNFA 实现；加密载荷不可见，应用识别依赖 inspector / binder / wizard；线程 / 进程模型需对照实际版本核验；规则关键字与 Snort 2 有差异、不宣称完全兼容；许可为 GPLv2 加 Talos 规则集独立许可约束；性能数字需在目标机型实测。版本基准统一写「上游 master 快照（2026-11 抓取）」。凡标注「需对照实际版本核验」的第三方工具、字段名与命令选项，均以 `_snort_build/upstream_src/snort3/snort3-master/` 下对应文件为准。下一篇 03-04 转入输出与日志接入，讲清 `alert_json` / `unified2` / `alert_csv` 的场景组合与事件字段判读。
+
+## 03-04 输出与日志接入：alert_json、unified2、csv
+
+### 1. 目标与拓扑
+
+03-01 用 `-A alert_fast` 把首条告警打到了 stdout，03-03 把规则集挂进了 `ips` 段；本篇要解决的是「告警往哪去、怎么落盘、怎么轮转、怎么接进下游分析管道」。目标是把一次检测命中变成可持久化、可检索、可对接 SIEM 的输出：按场景选 logger 组合，配 `alert_json` 的字段集与 `alert_csv` 的分隔符，理解 `unified2` 二进制记录与 `tools/u2boat/` / `tools/u2spewfoo/` 的转换关系，掌握 `limit` 轮转与日志目录权限，最后能逐字段判读一条真实告警。全册按 C 实战型六节骨架组织，本篇只讲场景组合与输出判读，logger 参数的完整清单见 04-02 ~ 04-05、事件字段逐项定义见 05-08，本篇不重列。
+
+拓扑从「检测命中」往后延伸。规则命中后由 `src/events/event.cc` 构造 `Event`，经 `src/events/event_queue.cc` / `sfeventq.cc` 入队与排序，再由 `src/managers/event_manager.cc` 分派给 `src/loggers/` 下注册的各 logger：`alert_json.cc`、`alert_csv.cc`、`alert_fast.cc`、`alert_full.cc`、`alert_syslog.cc`、`unified2.cc` 负责事件输出，`log_pcap.cc`、`log_hext.cc`、`log_codecs.cc` 负责包级输出。`snort.lua` 的 outputs 段注释已点明「可用命令行 `-A <alert_type>` / `-L <log_type>` 启用默认配置」，即命令行与 Lua 段是两条等效入口，命令行优先级更高这一点在 `doc/user/daq.txt` 对 DAQ 有明确表述、可类推。事件输出与日志接入管线见图 03-04-01（字段见 05-08 ｜ 参数见 04-02 ｜ 原理见 06-11 ｜ 模块见 07-08）。
+
+:::figure id=03-04-01 | name=事件输出与日志接入管线 | dir=TD
+node n1 "检测命中事件" purple
+node n2 "Event 与事件队列" teal
+node n3 "alert_json 输出" green
+node n4 "alert_csv 输出" green
+node n5 "unified2 落盘" green
+node n6 "u2boat 转 pcap" amber
+node n7 "轮转与 SIEM 管道" gray
+node n8 "alert_syslog" green
+edge n1 -> n2 "事件入队"
+edge n2 -> n3 "JSON 字段"
+edge n2 -> n4 "CSV 列"
+edge n2 -> n5 "二进制记录"
+edge n2 -> n8 "设施与级别"
+edge n5 -> n6 "格式转换"
+edge n3 -> n7 "采集上报"
+edge n4 -> n7 "采集上报"
+edge n5 -> n7 "轮转归档"
+:::
+
+图 03-04-01 里 `n1 → n2` 是检测命中到事件队列，`n2` 再扇出到四个 logger：`n3` 的 `alert_json`、`n4` 的 `alert_csv`、`n8` 的 `alert_syslog` 是文本 / 系统日志出口，`n5` 的 `unified2` 是二进制记录。`n5 → n6` 表示 `unified2` 可由 `tools/u2boat/` 转成 pcap，`n3`/`n4`/`n5 → n7` 表示三类输出最终都进轮转与 SIEM 管道。实线是数据流，理解这张图就能按「我要结构化检索 → 选 JSON；我要表格入库 → 选 CSV；我要与旧流程兼容 → 选 unified2」来组合，而不是把所有 logger 一股脑全开。
+
+### 2. 前置条件与环境
+
+第一项是认清 logger 清单与各自的参数族，但只点名、不展开取值。`src/loggers/` 下已核验存在 `alert_json.cc`、`alert_csv.cc`、`alert_fast.cc`、`alert_full.cc`、`alert_syslog.cc`、`unified2.cc`、`log_pcap.cc`、`log_hext.cc`、`log_codecs.cc`、`alert_luajit.cc`、`alert_talos.cc`、`alert_unixsock.cc`、`loggers.cc/.h`。参数表也已核验：`alert_json` / `alert_csv` 有 `file`、`fields`、`limit`、`separator`；`alert_fast` 有 `file`、`packet`、`buffers`、`buffers_depth`、`limit`；`alert_syslog` 有 `facility`、`level`；`unified2` 有 `legacy_events`、`limit`、`nostamp`；`log_pcap` 有 `limit`；`log_hext` 有 `file`、`raw`、`limit`、`width`。这些键名可放心引用，默认值与取值范围一律「完整清单见 04-02 ~ 04-05」。
+
+第二项是输出字段范围。`src/loggers/alert_json.cc` 的 `json_range` 宏已核验列出可用字段全集，包含 `action`、`app_id`、`class`、`b64_data`、`client_bytes`、`client_pkts`、`dir`、`dst_addr`、`dst_ap`、`dst_port`、`eth_dst`、`eth_len`、`eth_src`、`eth_type`、`flowstart_time`、`geneve_vni`、`gid`、`icmp_code`、`icmp_id`、`icmp_seq`、`icmp_type`、`iface`、`ip_id`、`ip_len`、`msg`、`mpls`、`pkt_gen`、`pkt_len`、`pkt_num`、`priority`、`proto`、`rev`、`rule`、`seconds`、`server_bytes`、`server_pkts`、`service`、`sgt`、`sid`、`src_addr`、`src_ap`、`src_port`、`target`、`tcp_ack`、`tcp_flags`、`tcp_len`、`tcp_seq`、`tcp_win`、`timestamp`、`tos`、`ttl`、`udp_len`、`vlan`、`vlan_outer`；默认字段集 `json_deflt` 已核验为 `timestamp pkt_num proto pkt_gen pkt_len dir src_ap dst_ap rule action`。`alert_csv` 另有 `csv_range` / `csv_deflt`。字段名可点名，逐项含义与类型以 05-08 为准（字段见 05-08）。
+
+第三项是转换工具。`tools/u2boat/README.u2boat` 已核验给出用法 `u2boat [-t type] <infile> <outfile>`、`type` 可选 `pcap`（默认），说明它是把 Unified2 日志转成其他格式的工具；`tools/u2spewfoo/u2spewfoo.cc` 会打印 `(ExtraDataHdr)`、`(ExtraData)` 等记录内容，用于查看 unified2 内部记录。二者是输出接入的配套，不是引擎本体。第四项是环境边界：日志目录要对运行用户可写（`src/main/snort.cc` 的 `Snort::drop_privileges()` 与 `src/main/process.cc` 的 `InitGroups` 会降权），SIEM / Filebeat 采集端属外部依赖、具体配置需对照实际环境核验。第五项是能力边界照旧：抓包依赖独立 libdaq / DAQ3；加密载荷不可见，`b64_data` 一类字段拿到的是可见载荷的编码，不代表能读 HTTPS 明文正文；Hyperscan 可选；线程模型需对照实际版本核验。前置要点见下表。
+
+| 前置项 | 核验动作 | 关联源码 / 文件 |
+|---|---|---|
+| logger 清单 | `ls src/loggers/` | `src/loggers/loggers.cc` |
+| 字段范围 | `--help-module alert_json` | `src/loggers/alert_json.cc` |
+| 转换工具 | `ls tools/u2boat/` | `tools/u2boat/README.u2boat` |
+| 日志可写 | 检查 `-l` 目录权限 | `src/main/process.cc` |
+| 落盘配置 | 备份 `snort.lua` | `lua/snort.lua` outputs 段 |
+
+### 3. 分步操作
+
+第一步，按场景选 logger 组合，而不是全开。结构化检索与 SIEM 接入用 `alert_json`，表格入库用 `alert_csv`，人读排障用 `alert_fast` / `alert_full`，系统日志用 `alert_syslog`，与旧流程兼容或需要包级证据用 `unified2` 加 `log_pcap`。命令行 `-A <alert_type>` / `-L <log_type>` 可启用默认配置，Lua 段可设非默认参数；两者等价、命令行优先。第二步，配 `alert_json` 的字段集。默认 `json_deflt` 只有十个字段，排查规则命中原因通常需要补 `msg`、`gid`、`sid`、`rev`、`priority`、`class`、`src_addr`、`dst_addr`、`src_port`、`dst_port`，是否带 `b64_data` 要看合规与容量。`fields` 是 `PT_MULTI`，按 `json_range` 白名单从左往右输出，写错字段名会被 `Parameter` 拦下。第三步，配落盘与轮转：`file = true` 把输出写到文件而非 stdout，`limit` 设置轮转阈值（各 logger 单位与 0 的含义需对照实际版本核验，完整清单见 04-02 ~ 04-05），`-l` 指定目录。下面这段 outputs 段只给场景化组合，不重列全集。
+
+```lua
+alert_json =
+{
+    file = true,
+    fields = 'timestamp pkt_num proto msg gid sid rev priority class src_addr src_port dst_addr dst_port rule action',
+    limit = 100
+}
+
+alert_csv =
+{
+    file = true,
+    separator = ','
+}
+
+unified2 =
+{
+    nostamp = false,
+    limit = 128
+}
+```
+
+第四步，接 unified2 与转换工具。`unified2` 的 `nostamp` 控制在文件名里是否带时间戳、`legacy_events` 控制兼容格式，具体取值需对照实际版本核验；产出后用 `tools/u2boat/` 转 pcap、用 `tools/u2spewfoo/` 查看记录，README 已核验的用法是 `u2boat [-t type] <infile> <outfile>`。第五步，验证输出并接下游：回放样本后用 `head` / `jq` 看 `alert_json` 内容，确认字段齐全、编码正确，再让 Filebeat / SIEM 采集器读取落盘文件（采集端配置属外部依赖，需对照实际环境核验）。第六步，清理与回滚：临时 `-A` 只作用于本次进程，落盘的 Lua 改动保留备份；`limit` 轮转产生的旧文件按保留策略归档或删除，避免日志目录被写满。参数含义一律写「完整清单见 04-02 ~ 04-05」。
+
+```bash
+snort -c etc/snort/snort.lua -r a.pcap -A alert_json -L log_pcap -l /tmp/snort-log -n 100000
+head -n 5 /tmp/snort-log/alert_json.txt
+u2boat -t pcap /tmp/snort-log/unified2.log /tmp/snort-log/alerts.pcap
+u2spewfoo /tmp/snort-log/unified2.log | head -n 30
+```
+
+### 4. 验证方法与预期结果
+
+输出接入的「预期输出」是一条字段自洽、可被下游解析的事件记录。下面给出 `alert_json` 落盘后的典型内容与校验命令回显，示例输出，具体格式需对照实际版本核验；字段名取自 `src/loggers/alert_json.cc` 的 `json_range` / `json_deflt` 与 `print_label`，`alert_fast` 行格式取自 `src/loggers/alert_fast.cc` 的 `TextLog_Print`。
+
+```text
+示例输出，具体格式需对照实际版本核验
+{"timestamp":"05/14-10:41:07.111222","pkt_num":"7","proto":"ICMP","msg":"ICMP test rule","gid":"1","sid":"1000001","rev":"1","priority":"0","class":"none","src_addr":"10.0.0.5","src_port":"0","dst_addr":"10.0.0.9","dst_port":"0","rule":"1:1000001:1","action":"alert"}
+05/14-10:41:07.111222  [**] [1:1000001:1] "ICMP test rule" [**] {ICMP} 10.0.0.5 -> 10.0.0.9
+unified2.log  size 4096  records 2
+```
+
+逐行判读如下。第一行是「示例输出」声明，提示字段名、引号风格、时间格式、数值是否带引号、记录计数都随快照版本变化，绝不能把这里的样式当成固定协议；下游解析器应以目标版本实际输出为准做适配。第二行是 `alert_json` 的一条记录：`timestamp` 是事件时间、`pkt_num` 是包序号，二者用于和 pcap 回放对齐；`proto` 为 `ICMP`，与规则头协议一致；`msg`、`gid`、`sid`、`rev` 组成规则标识，`rule` 这里是 `1:1000001:1` 的 gid:sid:rev 合并形式，应与 03-03 自定义规则的 `sid:1000001` 对得上；`priority`、`class` 是分类与优先级，正常应为规则里声明的值或默认值，若出现缺失说明 `fields` 没把该字段列进去；`src_addr` / `src_port` / `dst_addr` / `dst_port` 是四元组，`src_port` / `dst_port` 在 ICMP 下为 0 属正常，不能当成错误；`action` 为 `alert` 说明当前是 IDS 旁路，若这里是 `drop` / `block` 则要回查是不是误开了内联模式。整行必须是合法 JSON，能被 `jq` 解析，字段顺序应与你写的 `fields` 一致。第三行是 `alert_fast` 的对照行，` [**] ` 分隔、`[1:1000001:1]`、`"ICMP test rule"`、`{ICMP}`、地址方向都与第二行自洽，用它交叉验证 JSON 字段没有错位。第四行是 `unified2.log` 的落盘回显，`size` 与 `records` 应大于 0，若为 0 说明 `-L` / logger 没启用或权限不足。字段逐项定义见 05-08，输出机制见 06-11，模块见 07-08。判读要点见下表。
+
+| 输出要素 | 判读要点 | 异常特征 |
+|---|---|---|
+| 合法 JSON 一行 | 可被 `jq` 解析 | 引号 / 逗号错即失败 |
+| `gid:sid:rev` | 与自定义规则一致 | 对不上即规则串了 |
+| `src_addr` 与 `dst_addr` | 与 `HOME_NET` 方向自洽 | 反了即变量写错 |
+| `action` = `alert` | 旁路只告警 | 出现 `drop` 查内联 |
+| `unified2` records > 0 | 二进制记录已落盘 | 为 0 查权限与 logger |
+
+### 5. 常见失败与排错
+
+第一类是完全没有输出。按图 03-04-01 从 `n2` 往下游回查：规则是否命中（03-03 的 `Ports/Rules-Compiled`）、`-A` / `-L` 是否选到了想要的 logger、Lua 段是否真的启用了对应 logger、`fields` 是否把关键字段都过滤掉了、`snort.lua` outputs 段是否仍是注释状态。`src/loggers/loggers.cc` 与 `src/managers/event_manager.cc` 负责注册与分派，未启用的 logger 不会收到事件。第二类是有事件但字段缺失或顺序错：`alert_json` / `alert_csv` 的 `fields` 是 `PT_MULTI`，取值必须在 `json_range` / `csv_range` 白名单内，写错字段名会被 `Parameter` 拒绝；默认 `json_deflt` 只有十字段，想看 `msg` / `sid` 必须显式加进 `fields`。字段类型与含义以 05-08 为准（字段见 05-08）。
+
+第三类是落盘失败。现象是进程正常、stdout 有告警但文件为空或进程报写错误。`file = true` 才写文件，`-l` 目录要对运行用户可写；`src/main/snort.cc` 的 `Snort::drop_privileges()` 与 `src/main/process.cc` 的 `InitGroups` 会在初始化后降权，若目录只对 root 可写就会失败。第四类是 unified2 相关：`nostamp`、`legacy_events`、`limit` 的取值与文件名行为需对照实际版本核验（完整清单见 04-02 ~ 04-05）；`tools/u2boat/` 的用法虽已核验为 `u2boat [-t type] <infile> <outfile>`，但 type 取值范围与输出格式仍需对照实际版本核验，不能凭印象补值；`u2spewfoo` 打印的 `(ExtraDataHdr)` / `(ExtraData)` 记录要看懂再判断记录是否完整。
+
+第五类是日志膨胀与轮转失效。`limit` 控制轮转阈值、0 常表示不限制，但单位与边界需对照实际版本核验；日志目录被写满会连带影响引擎稳定，属于 08-05 加固与 08-06 运维清单范围，任何容量数字需在目标机型实测。第六类是边界误判：`b64_data` 一类字段是可见载荷的编码，绝不意味能读 HTTPS 明文正文，加密载荷不可见，能拿到的只有握手元数据与证书信息（字段需对照实际版本核验）；应用识别依赖 inspector / binder / wizard。抓包依赖独立 libdaq / DAQ3，输出与 DAQ 无关；内联 drop / block 靠 DAQ verdict，输出里的 `action` 只是记录、不是转发动作，Snort 不做转发、不是防火墙；Hyperscan 可选加速、缺失回退 `src/search_engines/` 的 AC / BNFA 实现；线程 / 进程模型需对照实际版本核验；许可为 GPLv2 加 Talos 规则集独立约束；规则关键字与 Snort 2 有差异、不宣称完全兼容。
+
+输出管道还有几处细节值得单独交代，它们决定了日志能否长期稳定地被下游消费。第一处是 `alert_json` 字段集的设计意图。`src/loggers/alert_json.cc` 的 `json_deflt` 默认只给 `timestamp pkt_num proto pkt_gen pkt_len dir src_ap dst_ap rule action` 十个字段，这是一条「够定位事件、又不把载荷与分类信息全倒出来」的最小集；排查命中原因时通常要补 `msg`、`gid`、`sid`、`rev`、`priority`、`class`、`src_addr`、`dst_addr`、`src_port`、`dst_port`，是否带 `b64_data` 要权衡合规与容量。`fields` 是 `PT_MULTI`，按 `json_range` 白名单从左往右输出，写错字段名会在 `set` 阶段被 `Parameter` 拒绝；`json_range` 里还有 `app_id`、`service`、`flowstart_time`、`tcp_flags`、`vlan`、`mpls`、`geneve_vni`、`sgt`、`iface` 等扩展字段，逐项含义以 05-08 为准（字段见 05-08）。第二处是 CSV 与分隔符：`alert_csv` 同样有 `file`、`fields`、`limit`、`separator`，`separator` 默认 `", "`，入库前要按目标表的解析规则统一，避免逗号与字段内文本冲突；`fields` 的合法取值在 `csv_range` 里，与 JSON 侧不是同一套字符串，切换输出类型时不能照搬。第三处是各 logger 的参数族：`alert_fast` 除 `file`、`limit` 外还有 `packet`（是否附包）、`buffers`（`none | rule | inspector | both`）与 `buffers_depth`，用于把命中时的 buffer 内容打进人读日志；`alert_full` 只有 `file` 与 `limit`；`alert_syslog` 用 `facility`（默认 `auth`）与 `level`（默认 `info`）对接系统日志；`unified2` 有 `legacy_events`、`limit`、`nostamp`；`log_pcap` 有 `limit`；`log_hext` 有 `file`、`raw`、`limit`、`width`；`log_codecs` 有 `file`、`msg`；`alert_luajit` 有 `args`。这些键名可点名，取值与默认值一律「完整清单见 04-02 ~ 04-05」。
+
+第四处是事件侧链路。`src/events/event.cc` 构造 `Event`，`src/events/event_queue.cc` 与 `sfeventq.cc` 负责入队、排序与去重，`src/managers/event_manager.cc` 分派给已注册的 logger，`src/loggers/loggers.cc/.h` 是装配点；事件限速、抑制与动作优先级属 `event_filter` / `rate_filter` 与 06-09 的范围，本篇不展开机制（原理见 06-11、模块见 07-08）。第五处是落盘与轮转：`file = true` 才写文件而非 stdout，`alert_json.cc` 用 `F_NAME` 常量作输出文件名，`-l` 指定目录，`limit` 控制轮转阈值，单位与 0 的含义需对照实际版本核验；`unified2` 的 `nostamp` 决定文件名是否带时间戳，`legacy_events` 决定兼容格式，`tools/u2boat/` 的 `u2boat [-t type] <infile> <outfile>` 与 `tools/u2spewfoo/` 打印的 `(ExtraDataHdr)` / `(ExtraData)` 记录是配套工具，具体 type 取值需对照实际版本核验。第六处是下游接入与边界：Filebeat / SIEM 采集端属外部依赖，配置需对照实际环境核验；时间戳格式、数值是否带引号、字段顺序都要以目标版本实际输出做适配。加密载荷不可见，`b64_data` 之类只是可见载荷的编码，不代表能读 HTTPS 明文正文；`action` 字段只是事件记录、不是转发动作，内联 drop / block 仍靠 DAQ verdict，Snort 不做转发、不是防火墙。把字段、落盘、轮转、转换、采集五件事对齐，输出管道才不会被「日志写满」或「字段解析失败」拖垮，事件也才能真正转化为可检索、可告警、可审计的资产。
+
+再补充一段关于输出侧长期运维的经验。第一，logger 不是开得越多越好：每启用一个 logger，事件队列 `src/events/event_queue.cc` 就要多一次分派与写出，落盘 I/O 与字段序列化都会叠加成本，生产上通常只保留「一个结构化出口、一个人读出口、必要的包级证据」的组合，其余按需临时启用。第二，结构化字段要提前和下游约定契约：一旦 SIEM 侧按 `alert_json` 的字段名建了索引，`fields` 的顺序调整或字段名变更都会让解析失败，因此 `fields` 应纳入配置版本管理，变更时同步更新采集端解析规则。第三，时间基准要统一：`timestamp` 由引擎按自身时钟生成，多实例部署时各主机若未做时间同步，跨实例关联事件会出现错位，这属于 08 册运维范围。第四，落盘目录的容量与 inode 要监控，`limit` 轮转只是引擎侧的单文件阈值，仍需要外部 logrotate 一类机制做整体保留与清理，避免共享卷被写满。第五，`unified2` 属于二进制格式，跨版本兼容性弱于 JSON 与 CSV，若下游只做检索，优先选结构化文本；只有确实需要包级证据或与旧流程对接时才保留它，并用 `tools/u2boat/` 与 `tools/u2spewfoo/` 定期抽检记录完整性。任何日志速率、磁盘占用、保留天数的数字都需在目标机型实测，不给绝对值（基准方法见 08-01）。这些做法只是在已讲过的字段、落盘、轮转、转换之上补齐长期运行的约束，不引入新的配置项（完整清单见 04-02 ~ 04-05）。
+
+### 6. 小结
+
+本篇把输出接入压缩为一条闭环：按场景选 logger 组合（结构化检索用 `alert_json`、表格入库用 `alert_csv`、人读排障用 `alert_fast` / `alert_full`、系统日志用 `alert_syslog`、旧流程兼容用 `unified2` 加 `log_pcap`）→ 用 `-A` / `-L` 或 Lua outputs 段启用 → 配 `fields` / `separator` / `file` / `limit` 等最小必要键 → 落盘到 `-l` 目录并确认权限 → 用 `head` / `jq` / `u2boat` / `u2spewfoo` 验证字段自洽与记录非空 → 接 Filebeat / SIEM 采集并按 `limit` 轮转归档。图 03-04-01 给出事件队列到各 logger 再到下游管道的扇出关系，是「没有输出」时逐段回查的地图。全文只点名最小必要键、真实源码路径与已核验的字段名，参数全集写「完整清单见 04-02 ~ 04-05」、字段逐项定义写「字段见 05-08」，机制去 06、目录能力去 07、运维去 08（字段见 05-08 ｜ 参数见 04-02 ｜ 原理见 06-11 ｜ 模块见 07-08）。
+
+能力边界贯穿始终：配置是 Lua，抓包依赖独立 libdaq / DAQ3、DAQ module 决定抓包与内联能力；内联 IPS 的 drop / block 通过 DAQ verdict 反馈，IDS 旁路只告警不丢弃，Snort 不是防火墙、不做转发与路由；Hyperscan 是可选 search_engine 加速，缺失回退 `src/search_engines/` 的 AC / BNFA 实现；加密载荷不可见，应用识别依赖 inspector / binder / wizard；线程 / 进程模型需对照实际版本核验；许可为 GPLv2 加 Talos 规则集独立约束；性能数字需在目标机型实测；规则关键字与 Snort 2 有差异、不宣称完全兼容。版本基准统一写「上游 master 快照（2026-11 抓取）」。凡标注「需对照实际版本核验」的字段名、工具参数与命令选项，均以 `_snort_build/upstream_src/snort3/snort3-master/` 下对应文件为准。下一篇 03-05 转入内联 IPS 部署：`--daq afpacket` / `--daq nfq`、`daq` 段、drop / block 动作与 DAQ verdict 反馈，以及 drop 日志与统计的判读。
+
+## 03-05 内联 IPS 部署：DAQ AFPacket/NFQ 与 drop
+
+### 1. 目标与拓扑
+
+前四篇都在 IDS 旁路模式下工作：只告警、不丢弃。本篇要跨过那道分界线，把同一套引擎配成内联 IPS，让规则里的 `drop` / `block` 真正生效。目标有三层：一是按场景选对 DAQ module 与模式（`--daq afpacket` / `--daq nfq`、`-Q`、`daq.modules[].mode`、`ips.mode`），二是理解 drop / block 不是 Snort 自己丢包、而是通过 DAQ verdict 反馈给 DAQ 层执行，三是能判读 drop 日志与动作统计，确认「真的拦了」而不是「看起来像拦了」。全册按 C 实战型六节骨架组织，本篇只讲场景组合与输出判读，DAQ 与动作参数的完整清单见 04-02 ~ 04-05，本篇不重列。
+
+先把最容易被写反的边界钉死。内联 IPS 不是防火墙：Snort 本身不做 IP 转发、不做路由、不维护转发表，drop / block 是通过 DAQ verdict 反馈（`src/actions/act_drop.cc`、`act_block.cc`、`act_reject.cc` 与 `src/packet_io/active.cc`），由 DAQ module 决定包是被放行还是丢弃；IDS 旁路模式只告警不丢弃。抓包依赖独立 libdaq / DAQ3，`src/packet_io/sfdaq*.cc` 只是适配层，DAQ module 决定抓包与内联能力——换句话说，能不能内联、怎么内联，首先取决于选了什么 module，而不是引擎里某个开关。`doc/user/daq.txt` 已核验列出 LibDAQ 自带的 AFPacket、Divert、NFQ、PCAP、Netmap 等 module，并明确写出「-i 不带 -Q 推断为 passive，-i 带 -Q 推断为 inline」，具体 module 名与变量仍需对照实际版本核验。加密载荷不可见、Hyperscan 可选加速、线程模型需对照实际版本核验等边界照旧。版本基准统一写「上游 master 快照（2026-11 抓取）」。
+
+拓扑从「单接口旁路」换成「接口对 / 队列串接」。`doc/user/daq.txt` 的命令行真实示例是 `snort --daq-dir /usr/local/lib/daq --daq-dir /opt/lib/daq --daq afpacket --daq-var debug --daq-var fanout_type=hash -i eth1:eth2 -Q`，即一对接口串在流量路径上；NFQ 一类 module 则由内核队列把包递交给 Snort，队列规则属外部依赖、具体配置需对照实际环境核验。动作链路为：`src/detection/detection_engine.cc` 判定命中 → `src/actions/act_drop.cc` 的 `DropAction::exec` 调 `p->active->drop_packet(p)` 与 `set_drop_reason("ips")` → `src/packet_io/active.cc` 的 `daq_drop_packet` / `daq_update_status` 把 verdict 回传 → DAQ 层执行丢弃，`block` 则走 `BlockAction::exec` 的 `p->active->block_session(p)`。内联 IPS 的 DAQ verdict 反馈链路见图 03-05-01（字段见 05-07 ｜ 参数见 04-03 ｜ 原理见 06-12 ｜ 模块见 07-07）。
+
+:::figure id=03-05-01 | name=内联 IPS 的 DAQ verdict 反馈链路 | dir=TD
+node n1 "接口对收包 eth1:eth2" blue
+node n2 "DAQ inline 实例" blue
+node n3 "解码与 inspectors" teal
+node n4 "检测引擎判定" purple
+node n5 "drop 与 block 动作" red
+node n6 "active.cc 设置原因" red
+node n7 "DAQ verdict 回传" red
+node n8 "告警与统计输出" green
+edge n1 -> n2 "双向流量"
+edge n2 -> n3 "逐包送入"
+edge n3 -> n4 "重组后的流"
+edge n4 -> n5 "命中 drop 规则"
+edge n5 -> n6 "drop_packet 调用"
+edge n6 -> n7 "verdict 反馈"
+edge n7 -> n2 "丢弃或放行"
+edge n5 -> n8 "动作计数"
+:::
+
+图 03-05-01 里 `n1 → n2` 是接口对把双向流量递给 DAQ inline 实例，`n2` 的 verdict 回传边 `n7 → n2` 特意画成回路，强调「丢弃是 DAQ 层按反馈执行、Snort 只给结论」。`n4 → n5 → n6 → n7` 是已核验的动作链：检测判定后调用动作，`active.cc` 设置 drop reason，再经 verdict 回传。虚线未出现，因为内联链路上每一环都是实打实的调用，没有辅助回查关系。排错时按 `n1` 到 `n7` 逐段确认，能快速区分「没进流量」「没启 inline」「没命中规则」「verdict 没回传」四类问题。
+
+### 2. 前置条件与环境
+
+第一项是 module 与能力。`doc/user/daq.txt` 已核验 LibDAQ 自带 AFPacket、Divert、NFQ、PCAP、Netmap 等 module，`--daq-list` 可枚举当前环境可用的 module，非标准路径用 `--daq-dir` 追加；`src/packet_io/sfdaq.cc` 的 `SFDAQ::load()` 经 `daq_load_static_modules` 与 `daq_load_dynamic_modules(dirs)` 加载、`daq_find_module` 定位，找不到就启动失败。具体 module 名、变量（如 `fanout_type=hash`）与是否支持 inline，需对照实际版本核验，定位 `src/packet_io/sfdaq_module.cc` 与 `daqs/`。第二项是模式开关：`-Q` 是 `src/main/snort_module.cc` 里的 `PT_IMPLIED` 选项，`snort.lua` 里 `talos.lua` 用 `snort = { ['-Q'] = true }` 等价设置；`--daq-mode` 取值 `passive | inline | read-file`，`daq.modules[].mode` 的取值 `passive | inline | read-file`（见 `src/packet_io/sfdaq_module.cc`），`ips.mode` 的取值 `tap | inline | inline-test`（见 `src/main/modules.cc`）——三者层级不同，不要混为一谈，完整清单见 04-02 ~ 04-05。`src/main/snort_config.cc` 的 `init_policy_mode()` 还会在 passive 适配器下把策略切到 tap 并打 warning，属预期行为。
+
+第三项是动作与响应源码已核验：`src/actions/act_drop.cc` 的 `DropAction::exec` 调 `p->active->drop_packet(p)`、`set_drop_reason("ips")` 并 `alert(p, ai)`，`drops_traffic()` 返回 `true`，`drop_pegs` 里有 `drop` 计数；`src/actions/act_block.cc` 的 `BlockAction::exec` 调 `block_session(p)`，帮助文本写明「block current packet and all the subsequent packets in this flow」；`src/actions/act_reject.cc` 的参数表已核验有 `reset`（`none|source|dest|both`，默认 `both`）与 `control`（`none|network|host|port|forward|all`，默认 `none`）；`src/packet_io/active.cc` 有 `drop_packet`、`daq_drop_packet`、`block_session`、`daq_update_status`、`set_drop_reason`、`send_reason_to_daq`、`cant_drop`、`send_reset`、`send_unreach` 等函数。第四项是权限与 fail-open：在线内联通常需要 `CAP_NET_ADMIN` 一类能力（属 08-05 加固范围），fail-open 配置（DAQ 在 Snort 不可用时放行还是丢弃）需对照实际版本核验，定位 `src/packet_io/` 与 `doc/user/daq.txt`，本篇不给具体开关值。第五项是输出配套：`src/loggers/alert_fast.cc:348` 会用 `p->active->get_action_string()` 在告警行前打 `[%s]` 动作前缀，正好用来判读 drop 是否发生。前置要点见下表。
+
+| 前置项 | 核验动作 | 关联源码 / 文件 |
+|---|---|---|
+| module 可用 | `--daq-list` | `src/packet_io/sfdaq.cc` |
+| 模式开关 | `-Q` 与 `--daq-mode` | `src/main/snort_module.cc` |
+| 动作实现 | 读 `act_drop.cc` | `src/actions/act_drop.cc` |
+| verdict 通道 | 读 `active.cc` | `src/packet_io/active.cc` |
+| 权限与 fail-open | 需对照实际版本核验 | `src/packet_io/` 与 `doc/user/daq.txt` |
+
+### 3. 分步操作
+
+第一步，确认 module 与权限。用 `--daq-list` 看目标 module 是否在列，用 `--daq-dir` 补上非标准安装路径；确认运行用户具备在线抓包与内联所需能力。第二步，选模式并配 `daq` 段。`doc/user/daq.txt` 已说明命令行优先级高于 Lua 配置，且 `-i` 带 `-Q` 推断为 inline、`--daq-mode` 可逐 module 覆盖；下面这段命令行直接取自该官方文档的真实示例，接口对 `eth1:eth2` 与 `--daq-var` 变量需按实际环境替换，不可照抄。
+
+```bash
+snort --daq-dir /usr/local/lib/daq --daq afpacket --daq-var fanout_type=hash -i eth1:eth2 -Q -c etc/snort/snort.lua -A alert_fast
+```
+
+第三步，把等价配置写进 `daq` 段。`doc/user/daq.txt` 给出的 Lua 等价示例包含 `module_dirs`、`modules`（`name` / `mode` / `variables`）、`inputs`、`snaplen`；`src/packet_io/sfdaq_module.cc` 的参数表已核验 `module_dirs`、`inputs`、`snaplen`（默认 1518，同 `-s`）、`batch_size`（默认 64，同 `--daq-batch-size`）、`modules`，子项 `name`（必填）、`mode`、`variables`。下面这段只给场景化组合，不重列全集（完整清单见 04-02 ~ 04-05）。
+
+```lua
+daq =
+{
+    module_dirs = { '/usr/local/lib/daq' },
+    modules =
+    {
+        {
+            name = 'afpacket',
+            mode = 'inline',
+            variables = { 'fanout_type=hash' }
+        }
+    },
+    inputs = { 'eth1:eth2' },
+    snaplen = 1518
+}
+```
+
+第四步，写一条会命中的 drop 规则并挂进 `ips` 段。规则关键字语法见 04-06，本篇只给足以验证动作链的最小骨架；`drop` 是动作而非引擎转发指令。
+
+```text
+drop icmp $HOME_NET any -> $EXTERNAL_NET any ( msg:"ICMP inline drop test"; sid:1000002; rev:1; )
+```
+
+第五步，启动并判读。用 `-A alert_fast` 看带动作前缀的告警，用 `--help-signals` / `--help-counts` 一类的帮助选项与动作统计确认 drop 计数（具体选项名需对照实际版本核验，定位 `src/main/snort_module.cc` 与 `src/main/help.cc`）；`src/main/snort_module.cc` 里 `reset_stats` 的参数说明列出 `daq|module|appid|file_inspect|snort|ha|all` 等类型，可用于清零后复测。第六步，清理：内联模式务必先撤掉串接路径或恢复旁路再停进程，避免业务流量中断；临时命令行只作用本次进程，落盘配置保留备份。参数含义一律写「完整清单见 04-02 ~ 04-05」。
+
+```bash
+snort --daq-list
+snort -c etc/snort/snort.lua --daq afpacket --daq-mode inline -i eth1:eth2 -Q -A alert_fast -l /tmp/snort-ips -T
+snort -c etc/snort/snort.lua --daq afpacket --daq-mode inline -i eth1:eth2 -Q -A alert_fast -l /tmp/snort-ips -n 100000
+```
+
+### 4. 验证方法与预期结果
+
+内联部署的「预期输出」必须同时证明两件事：DAQ 确实处于 inline 模式，且动作确实产生了 verdict 与计数。下面给出启动日志、drop 告警与动作统计的典型输出，示例输出，具体格式需对照实际版本核验；其中 `DAQ configured to` 文本取自 `src/packet_io/sfdaq.cc:302`，动作前缀取自 `src/loggers/alert_fast.cc:348`，计数名取自 `src/actions/act_drop.cc` 的 `drop_pegs`。
+
+```text
+示例输出，具体格式需对照实际版本核验
+Snort++ 版本字样-BUILD
+afpacket DAQ configured to inline.
+Reading rules until EOF or a line starting with END
+ips policies rule stats
+***Port-Table : icmp Ports/Rules-Compiled
+Snort successfully validated the config (with 1 rule)!
+[drop] 05/14-11:02:13.987654  [**] [1:1000002:1] "ICMP inline drop test" [**] {ICMP} 10.0.0.5 -> 10.0.0.9
+drop action stats: drop 3  block 0  reject 0
+```
+
+逐行判读如下。第一行是「示例输出」声明，提示 banner、模式字样、动作前缀、计数列与数值随快照版本变化，不能把 `Version` 字样抄成本套版本号，也不能把 `drop 3` 当成通用基准。第二行 `Snort++ 版本字样-BUILD` 与 03-01 同源，确认二进制一致。第三行 `afpacket DAQ configured to inline.` 是本篇最关键的判据：`afpacket` 是 module 名、`inline` 是 `daq_mode_string(default_daq_mode)` 的结果，正常内联必须是 `inline`；若这里仍是 `passive`，说明 `-Q` / `--daq-mode inline` / `daq.modules[].mode` 没生效，规则写 `drop` 也不会真丢包（只按旁路告警处理）。第四、五、六行与 03-03 同源，说明规则已加载、编译并通过 `-T`，`with 1 rule` 应与 drop 规则条数一致。第七行是 `alert_fast` 的 drop 告警：行首 `[drop]` 来自 `p->active->get_action_string()`，它证明动作确实执行到 `act_drop.cc` 的 `DropAction::exec`；后面的 `[1:1000002:1]`、`"ICMP inline drop test"`、`{ICMP}`、地址方向与 03-04 的 JSON 字段自洽。注意有 `[drop]` 前缀只说明 Snort 给出了 drop 结论，真正丢弃还要靠 verdict 回传，所以必须结合第八行统计看。第八行 `drop action stats: drop 3  block 0  reject 0` 对应 `drop_pegs` / `block_pegs` 一类的 `CountType::SUM` 计数：`drop` 大于 0 说明 `drop_packet` 路径走通，`block` / `reject` 为 0 属本用例预期，若三种计数全为 0 而告警有 `[drop]`，要回查 `src/packet_io/active.cc` 的 `daq_drop_packet` / `daq_update_status` 与 DAQ module 是否支持 inline verdict。字段逐项定义见 05-07，机制见 06-12，模块见 07-07。判读要点见下表。
+
+| 输出要素 | 正常判据 | 异常特征 |
+|---|---|---|
+| `DAQ configured to inline` | 模式为 `inline` | 仍 `passive` 即未启用内联 |
+| `[drop]` 动作前缀 | 动作执行到 `act_drop` | 无前缀即只告警 |
+| `drop` 计数 > 0 | verdict 通道走通 | 计数 0 查 `active.cc` |
+| `with 1 rule` | 与规则条数一致 | 为 0 查 `ips.include` |
+| 业务连通性 | 未被误阻断的流量正常 | 全断查 fail-open 与接口对 |
+
+### 5. 常见失败与排错
+
+第一类是「内联不 drop」，这是本篇最高频的故障。按图 03-05-01 逐段回查：`n1` 有没有流量进来、`n2` 的 DAQ 是不是 `inline`（`-Q` / `--daq-mode` / `daq.modules[].mode` 是否生效，命令行优先级高于 Lua）、`n4 → n5` 规则是否命中（`Ports/Rules-Compiled` 与 `HOME_NET` 方向）、`n6 → n7` verdict 是否回传（`src/packet_io/active.cc` 的 `daq_drop_packet`、`daq_update_status`、`send_reason_to_daq`、`cant_drop`）、DAQ module 是否支持 inline。若只看到 `[drop]` 告警而计数为 0，重点查 verdict 通道与 module 能力；若连 `[drop]` 都没有，重点查规则与模式。第二类是 fail-open 误配：DAQ 在 Snort 不可用时是放行还是丢弃由 fail-open 配置决定，具体开关与取值需对照实际版本核验，定位 `src/packet_io/` 与 `doc/user/daq.txt`，本篇不给绝对值；上线前必须在测试流量下确认业务连通性符合预期，不能只看告警。
+
+第三类是「把 Snort 当防火墙」的认知错误。Snort 不做 IP 转发、不做路由、不维护转发表；AFPacket 一对接口看似在转发，那是 DAQ module 的桥接行为，不是引擎在转发；NFQ 更需要内核队列规则把包递交过来，队列规则属外部依赖、具体配置需对照实际环境核验，本篇不编造 iptables 命令。把「引擎会转发」写进方案，会导致拓扑与职责全盘错位。第四类是权限与接口对：在线内联需要相应能力（容器里通常是 `CAP_NET_ADMIN` 一类），接口名 `eth1:eth2` 必须按实际环境替换，写错接口对会让业务流量根本不经过引擎。第五类是 `reject` / `replace` 的边界：`src/actions/act_reject.cc` 的 `reset` 与 `control` 参数、`src/packet_io/active.cc` 的 `send_reset` / `send_unreach` / `rewrite_packet` 属主动响应，取值与副作用需对照实际版本核验（完整清单见 04-02 ~ 04-05）；`act_replace.cc` 的改写同样经 DAQ verdict，不代表引擎能任意改包转发。
+
+第六类是边界与合规。加密载荷不可见，`drop` 规则不能指望匹配 HTTPS 明文正文，能用的是握手元数据与证书信息（字段需对照实际版本核验）；应用识别依赖 inspector / binder / wizard。抓包依赖独立 libdaq / DAQ3，DAQ module 决定抓包与内联能力；Hyperscan 是可选 search_engine 加速，缺失回退 `src/search_engines/` 的 AC / BNFA 实现；线程 / 进程模型需对照实际版本核验，禁止断言「默认 N 线程」；许可为 GPLv2 加 Talos 规则集独立约束；任何吞吐、丢包率数字需在目标机型实测；规则关键字与 Snort 2 有差异、不宣称完全兼容。IDS 旁路只告警不丢弃这条底线也要记住，切换模式前先确认业务是否允许被阻断。
+
+内联部署还有几处容易混淆的细节，值得在收尾前逐一厘清。第一处是三个「模式」的层级。`-Q` 是 `src/main/snort_module.cc` 里的 `PT_IMPLIED` 命令行选项，对应 `RUN_FLAG__INLINE` 一类的运行标志；`src/parser/cmd_line.cc` 的 `check_flags` 还明确写出内联适配器模式与内联测试模式不能同时使用，并给出对应 `ParseError`。`--daq-mode` 与 `daq.modules[].mode` 的取值是 `passive | inline | read-file`，属于 DAQ 层；`ips.mode` 的取值是 `tap | inline | inline-test`，属于 IPS 策略层。`src/main/snort_config.cc` 的 `init_policy_mode()` 会在 passive 适配器下把策略切到 tap 并打 warning，说明这三者是协同而非等价关系，配置时不能只改一处就以为全线切换。第二处是 `doc/user/daq.txt` 给出的 DAQ 配置栈语义：`--daq` 可多次给出，第一个是 base module、其后是 wrapper module，每个 `--daq` 会改变后续 `--daq-var` 与 `--daq-mode` 作用的对象；`dump` 这类 wrapper 能把通过 Snort 的包存成 pcap，用来观察哪些包被放行、哪些被 drop 或主动响应改写。Lua 侧对应 `daq.modules[]` 数组，从栈顶到栈底组织，每个 module 配置必须含 `name`，可选 `variables` 与 `mode`，若只给了 wrapper，Snort 会隐式补一个 `read-file` 模式的 `pcap` base。
+
+第三处是 DAQ 侧的容量参数。`src/packet_io/sfdaq_module.cc` 的参数表已核验 `module_dirs`、`inputs`、`snaplen`（默认 1518，同 `-s`）、`batch_size`（默认 64，同 `--daq-batch-size`）与 `modules`；`doc/user/daq.txt` 还写明 DAQ 接收超时固定为 1 秒、message pool 大小是 batch size 的四倍、`daq.inputs[]` 承接 `-r` / `-i` 的输入规格、`--daq-list` 列出可用 module 及其变量。这些是「内联能不能稳定收包」的基础，但任何吞吐、丢包率数字需在目标机型实测，不给绝对值。第四处是动作链的细粒度证据：`src/actions/act_drop.cc` 的 `DropAction::exec` 调 `drop_packet`、`set_drop_reason("ips")` 再 `alert(p, ai)`，`drops_traffic()` 返回 `true`，`drop_pegs` 记录 `drop` 计数；`act_block.cc` 调 `block_session(p)` 并把当前包与该流后续包一并阻断；`src/packet_io/active.cc` 还有 `daq_update_status`、`send_reason_to_daq`、`cant_drop`、`send_reset`、`send_unreach`、`rewrite_packet`、`retry_packet` 等函数，分别对应状态回传、主动响应与改写。`src/actions/act_reject.cc` 的 `reset`（`none | source | dest | both`）与 `control`（`none | network | host | port | forward | all`）决定拒绝方式，取值与副作用需对照实际版本核验。第五处是统计复位：`src/main/snort_module.cc` 里 `reset_stats` 的参数说明列出 `daq | module | appid | file_inspect | snort | ha | all` 等类型，复测前先清零能让 `drop` 计数的变化更可信，具体命令名需对照实际版本核验。第六处仍是红线：Snort 不做 IP 转发、不做路由、不是防火墙，内联 drop / block 通过 DAQ verdict 反馈，IDS 旁路只告警不丢弃；fail-open 配置需对照实际版本核验，上线前必须在测试流量下确认业务连通性符合预期。把模式层级、DAQ 栈、容量参数、动作证据、统计复位、红线六件事对齐，内联 IPS 才算「真的拦了」而不是「看起来像拦了」。
+
+最后补一段上线前的检查清单。第一，先在离线的 pcap 回放里用 `--daq pcap --daq-mode read-file` 一类方式把 `drop` 规则命中与 `[drop]` 告警前缀验证一遍，再切到接口对或内核队列，避免第一次就在生产链路上试动作。第二，明确 fail-open 与 fail-close 的取舍：它决定 Snort 进程异常或重启窗口内业务流量是放行还是中断，具体开关与取值需对照实际版本核验，定位 `src/packet_io/` 与 `doc/user/daq.txt`，本篇不给绝对值。第三，接口对或队列的拓扑必须由网络侧确认，AFPacket 的 `eth1:eth2` 只是官方文档的示例名，NFQ 还需要内核队列规则配合，队列规则属外部依赖、需对照实际环境核验。第四，动作统计要随版本留存基线：`drop_pegs` 与 `block_pegs` 的计数项名与输出格式需对照实际版本核验，升级前后用同样的 `reset_stats` 流程复测，才能判断是动作变化还是统计口径变化。第五，回滚方案必须包含「退回 IDS 旁路」这一档，即撤掉 `-Q` 与 inline 配置、恢复只告警不丢弃，确保业务在 IPS 出问题时能快速恢复连通。这些步骤都不改变 Snort 不做转发、不是防火墙、内联靠 DAQ verdict 的定位，只是把能力边界转成可执行的切换与回退动作。
+
+### 6. 小结
+
+本篇把内联 IPS 部署压缩为一条闭环：用 `--daq-list` / `--daq-dir` 确认 module 能力 → 用 `-Q` / `--daq-mode inline` / `daq.modules[].mode` / `ips.mode` 把模式切到 inline（命令行优先于 Lua）→ 按 `doc/user/daq.txt` 的真实示例配 `daq` 段的 `module_dirs` / `modules` / `inputs` / `snaplen` → 写 `drop` 规则并经 `ips.include` 挂入 → 经 `detection_engine` 判定、`act_drop.cc` 的 `drop_packet`、`active.cc` 的 `daq_drop_packet` / `daq_update_status` 把 verdict 回传给 DAQ 层执行 → 用 `DAQ configured to inline`、`[drop]` 动作前缀、`drop` 计数三者交叉验证。图 03-05-01 给出 verdict 反馈链路，是「内联不 drop」时逐段回查的地图。全文只点名最小必要键与真实源码路径，参数全集写「完整清单见 04-02 ~ 04-05」，结构体去 05、机制去 06、目录能力去 07、运维去 08（字段见 05-07 ｜ 参数见 04-03 ｜ 原理见 06-12 ｜ 模块见 07-07）。
+
+能力边界在本篇尤其不能写反：Snort 不是防火墙、不做 IP 转发、不做路由，内联 drop / block 通过 DAQ verdict 反馈，IDS 旁路只告警不丢弃；抓包依赖独立 libdaq / DAQ3，DAQ module 决定抓包与内联能力；配置是 Lua，Hyperscan 是可选 search_engine 加速、缺失回退 AC / BNFA 实现；加密载荷不可见，应用识别依赖 inspector / binder / wizard；线程 / 进程模型需对照实际版本核验；fail-open 配置需对照实际版本核验；许可为 GPLv2 加 Talos 规则集独立约束；性能数字需在目标机型实测；规则关键字与 Snort 2 有差异、不宣称完全兼容。版本基准统一写「上游 master 快照（2026-11 抓取）」。凡标注「需对照实际版本核验」的 module 名、变量、开关与命令选项，均以 `_snort_build/upstream_src/snort3/snort3-master/` 下对应文件为准。下一篇 03-06 把单实例扩展到多实例、容器与高可用部署。
+
+## 03-06 多实例、容器与高可用部署
+
+### 1. 目标与拓扑
+
+前五篇都是单进程视角：一份 Lua 配置、一个 DAQ 实例、一条输出管道。本篇要回答生产环境绕不开的问题——一台机器上跑多个 Snort 实例怎么隔离、容器里怎么给足权限与网络、控制面怎么统一管、配置与规则怎么滚动升级。目标是把单实例部署扩展成可运维的多实例拓扑：按 DAQ 队列 / RSS 分流或 TAP / SPAN 旁路把流量分给多实例，用 `--id-offset` / `--id-subdir` / `--run-prefix` / `--create-pidfile` 一类选项做实例隔离，用 `--control-socket` 暴露 Unix socket 控制面，用容器 capabilities 与宿主网络解决抓包能力，用 `src/main/swapper.cc` 的热重载做滚动升级。全册按 C 实战型六节骨架组织，本篇只讲场景组合与输出判读，参数完整清单见 04-02 ~ 04-05 与 04-07，本篇不重列。
+
+拓扑从「一个进程」变成「一组进程 + 一个控制面」。流量侧：TAP / SPAN 把副本送给各实例，或多队列网卡按 RSS / DAQ 队列把不同流分给不同实例；每实例有独立的配置、规则、日志卷与控制 socket。进程侧：`src/main/process.cc` 负责 `daemonize`、`CreatePidFile` / `ClosePidFile`、`InitGroups`、信号处理，`src/main/analyzer.cc` 编排 packet 线程，`src/main/numa.cc` 与 `src/main/thread_config.cc`、`thread.cc` 涉及绑核与线程配置，`src/main/swapper.cc` 的 `Swapper::apply(Analyzer&)` / `finish()` 负责新旧配置交换。控制侧：`src/control/control.cc` 的 `ControlConn` 与 `control_mgmt.cc` 提供 Unix socket 控制通道，`src/main/shell.cc` 的 `Shell` 提供命令环境，`lua/sandbox.lua` 配合 `--lua-sandbox` 限制控制面可用函数。多实例容器与控制面拓扑见图 03-06-01（字段见 05-03 ｜ 参数见 04-07 ｜ 原理见 06-13 ｜ 模块见 07-12）。
+
+:::figure id=03-06-01 | name=多实例容器与控制面拓扑 | dir=TD
+node n1 "TAP 与 SPAN 分流" gray
+node n2 "实例 A 独立配置" blue
+node n3 "实例 B 独立配置" blue
+node n4 "DAQ 队列与 RSS" teal
+node n5 "各自日志与规则卷" green
+node n6 "Unix socket 控制面" purple
+node n7 "宿主网络与能力" gray
+node n8 "滚动升级与热重载" red
+edge n1 -> n2 "流量副本"
+edge n1 -> n3 "流量副本"
+edge n2 -> n4 "绑定队列"
+edge n3 -> n4 "绑定队列"
+edge n4 -> n5 "分流落盘"
+edge n2 -> n6 "暴露控制口"
+edge n3 -> n6 "暴露控制口"
+edge n7 -> n2 "CAP_NET_RAW"
+edge n7 -> n3 "CAP_NET_ADMIN"
+edge n8 -> n6 "触发 swapper"
+:::
+
+图 03-06-01 里 `n1` 是流量入口，把副本分给 `n2`、`n3` 两个实例；两个实例各自绑定 `n4` 的队列、把 `n5` 的日志与规则落到独立卷、向 `n6` 的控制面暴露 socket。`n7` 表示宿主网络与容器能力是两实例共同的前置，`n8` 表示滚动升级经控制面触发 `swapper` 交换。实线是数据与控制流，理解这张图就能按「实例间共享什么、隔离什么」来设计：流量入口与控制面可共享，配置 / 规则 / 日志 / pid / socket 必须隔离。
+
+### 2. 前置条件与环境
+
+第一项是实例隔离选项。`src/main/snort_module.cc` 已核验存在 `--id-offset`、`--id-subdir`、`--id-zero`、`--run-prefix`、`--create-pidfile`、`--create-instance-file`、`--max-procs`、`--max-packet-threads`、`--control-socket`、`--control-socket-uid`、`--control-socket-gid`、`--control-secret-file`、`--shell`、`--pause`、`--lua-sandbox`、`-z` 等选项；README 的真实示例里有 `--pcap-filter \*.pcap --pcap-dir pcaps/ -A alert_fast --max-packet-threads 8`，`doc/user/daq.txt` 则说明 `-z` 用于配置 packet 线程上限。这些选项名可点名，取值与组合后果一律「完整清单见 04-02 ~ 04-05、04-07」。第二项是线程 / 进程模型的边界：`src/main/analyzer.cc`、`numa.cc`、`process.cc`、`swapper.cc` 的实现以实际版本为准，禁止断言「默认 N 线程」；`--max-packet-threads` / `-z` 的默认值、NUMA 绑核行为需对照实际版本核验，任何吞吐与容量数字需在目标机型实测。
+
+第三项是控制面。`src/control/control.cc` 的 `ControlConn::configure`、`log_command`、`respond`、`block` / `remove` / `touch` / `unblock`、`set_user_network_policy` 等已核验；`lua/sandbox.lua` 注释给出真实用法「use with --control-socket snort.sock --lua-sandbox lua/sandbox.lua」，并说明它定义受限 Lua 环境、显式排除 `os` / `io` / `ffi` / `package` 等以免控制通道被滥用，末尾还会由 `src/main/shell.cc` 的 `Shell::install()` 注入 `help()`、`quit()`、`pause()`、`resume()`、`dump_stats()`、`reload_config()` 等运行时控制命令（命令名需对照实际版本核验）。第四项是容器能力：容器里在线抓包需要 `CAP_NET_RAW`、内联一类需要 `CAP_NET_ADMIN`，并通常需要宿主网络命名空间才能让 DAQ 看到目标接口；这些是外部依赖，具体 capabilities 组合与网络模式需对照实际版本与环境核验。第五项是 DAQ 选择：`--daq-dir` 可给每实例指定 module 搜索目录，容器网络下选哪个 DAQ module 需按实际网卡与队列能力决定，module 名需对照实际版本核验。前置要点见下表。
+
+| 前置项 | 核验动作 | 关联源码 / 文件 |
+|---|---|---|
+| 隔离选项 | `--help-options` 过滤 | `src/main/snort_module.cc` |
+| 控制面 | `--control-socket` | `src/control/control.cc` |
+| 沙箱 | 读 `sandbox.lua` | `lua/sandbox.lua` |
+| 容器能力 | 检查 capabilities | `src/main/process.cc` |
+| 线程上限 | 需对照实际版本核验 | `src/main/analyzer.cc` |
+
+### 3. 分步操作
+
+第一步，规划实例数与分流方式。旁路场景用 TAP / SPAN 把流量副本分给多实例，在线场景按 DAQ 队列 / RSS 把不同流分给不同实例；RSS 队列数、网卡绑定与分流规则属外部依赖，具体配置需对照实际环境核验，本篇不编造命令。实例数不是越多越好，线程 / 进程模型与资源隔离以实际版本为准，吞吐需在目标机型实测。第二步，为每实例准备独立目录：独立的 `snort.lua`（可共享主干、只改实例相关键）、独立的规则卷、独立的日志卷、独立的 pid 文件与 control socket 路径，避免多进程互相覆盖。
+
+第三步，用隔离选项启动多实例。`--id-offset` / `--id-subdir` 区分实例编号与子目录，`--run-prefix` 区分运行前缀，`--create-pidfile` 生成各自 pid，`--control-socket` 暴露各自控制口，`--max-packet-threads` 控制各实例 packet 线程上限（取值需对照实际版本核验）。下面这段只给场景化组合，不重列全集（完整清单见 04-02 ~ 04-05、04-07）。
+
+```bash
+snort -c /etc/snort/inst-a/snort.lua --daq-dir /usr/local/lib/daq \
+  --id-offset 0 --id-subdir --run-prefix inst-a \
+  --control-socket /run/snort/inst-a.sock --create-pidfile /run/snort/inst-a.pid \
+  -l /var/log/snort/inst-a -A alert_json -D
+
+snort -c /etc/snort/inst-b/snort.lua --daq-dir /usr/local/lib/daq \
+  --id-offset 1 --id-subdir --run-prefix inst-b \
+  --control-socket /run/snort/inst-b.sock --create-pidfile /run/snort/inst-b.pid \
+  -l /var/log/snort/inst-b -A alert_json -D
+```
+
+第四步，给控制面加沙箱与鉴权。`--lua-sandbox lua/sandbox.lua` 载入受限环境，`--control-socket-uid` / `--control-socket-gid` 限制可连接用户，敏感场景用 `--control-secret-file` 做控制通道认证；`src/main/snort_module.cc` 已核验这三个选项存在。`lua/sandbox.lua` 里 `sandbox_env` 显式排除了 `os` / `io` / `ffi` 等，控制命令名以 `Shell::install()` 实际注入为准（需对照实际版本核验）。第五步，容器化：镜像需 `CAP_NET_RAW` / `CAP_NET_ADMIN` 与宿主网络，配置、规则、日志用独立卷挂载，DAQ module 目录通过 `--daq-dir` 或卷内路径提供；容器网络下选哪个 module 需按实际网卡能力决定。第六步，滚动升级与热重载：改完配置 / 规则后经 `src/control/` 控制面触发 `src/main/swapper.cc` 的 `Swapper::apply` 做新旧配置交换，逐实例滚动、每实例升级后重跑 `-T` 或看控制面回显确认生效，保留上一版配置以便回滚；`src/main/shell.cc` 的 `Shell::load_config` / `load_string` 是载入入口。具体控制命令名与热重载覆盖范围需对照实际版本核验（见 08-06）。参数含义一律写「完整清单见 04-02 ~ 04-05」。
+
+```bash
+snort --control-socket /run/snort/inst-a.sock --lua-sandbox lua/sandbox.lua --help-commands
+snort -c /etc/snort/inst-a/snort.lua -T
+ls -1 /run/snort/ /var/log/snort/inst-a/ /var/log/snort/inst-b/
+```
+
+### 4. 验证方法与预期结果
+
+多实例部署的「预期输出」要证明三件事：每个实例都起来了、彼此隔离没有串、控制面可达。下面给出实例清单、pid / socket 与帮助命令的典型输出，示例输出，具体格式需对照实际版本核验；其中 `ControlConn` 相关命令名取自 `src/control/control.cc`，`--help-commands` / `--help-signals` 取自 `src/main/help.cc` 与 `src/main/snort_module.cc`，pid 文件来自 `src/main/process.cc` 的 `CreatePidFile`。
+
+```text
+示例输出，具体格式需对照实际版本核验
+inst-a.pid  4812
+inst-b.pid  4813
+/run/snort/inst-a.sock  owner snort  mode srwxr-----
+/run/snort/inst-b.sock  owner snort  mode srwxr-----
+--help-commands reload_config  reload configuration
+--help-commands dump_stats  dump runtime statistics
+inst-a: DAQ configured to passive  threads 4  alerts 12
+inst-b: DAQ configured to passive  threads 4  alerts 9
+```
+
+逐行判读如下。第一行是「示例输出」声明，提示 pid 数值、socket 属主与权限位、命令帮助文本、线程数与告警计数随快照版本变化，绝不能把 `threads 4` 当成「默认 N 线程」的结论——线程模型需对照实际版本核验，本套资料禁止断言默认值。第二、三行 `inst-a.pid 4812` / `inst-b.pid 4813` 来自 `src/main/process.cc` 的 `CreatePidFile`，两个 pid 必须不同且都对应存活进程；若相同说明 `--create-pidfile` 路径写重了、后启动的实例覆盖了前一个。第四、五行是两个 control socket：路径、属主 `snort`、权限位 `srwxr-----`（`s` 表示 socket）都应各自独立且权限收紧，若两个实例共用一个 socket 路径会造成控制命令串台。第六、七行是 `--help-commands` 过滤出的控制命令示例：`reload_config` / `dump_stats` 一类命令名由 `Shell::install()` 注入、`src/main/help.cc` 负责输出，具体名称需对照实际版本核验；能查到说明控制面命令环境可用。第八、九行是两实例的运行时摘要：`DAQ configured to passive` 说明仍是旁路（若做内联应为 `inline`）、`threads` 是各实例 packet 线程数、`alerts` 是各自告警计数；两个实例数值可以不同但都应有流量，若某个实例 `alerts` 恒为 0 要回查分流是否把流量分给了它。把「pid 不同 + socket 独立 + 各实例有流量 + 控制面可达」作为多实例生效的判读要点，比只看进程存在更可靠。字段逐项定义见 05-03，机制见 06-13，模块见 07-12。判读要点见下表。
+
+| 输出要素 | 正常判据 | 异常特征 |
+|---|---|---|
+| 两个 pid 不同 | 实例各自存活 | 相同即 pid 路径写重 |
+| 两个 socket 独立 | 属主与权限收紧 | 共用一个即控制串台 |
+| `--help-commands` 有输出 | 控制面命令可用 | 查不到需对照版本核验 |
+| 各实例 `alerts` > 0 | 分流命中 | 恒 0 查分流规则 |
+| `DAQ configured to inline` | 与预期模式一致 | 模式不符查 `-Q` 与 `daq` 段 |
+
+### 5. 常见失败与排错
+
+第一类是实例间串台：两个实例写了同一份日志、同一个 pid 文件、同一个 control socket，或规则卷挂成了同一路径。根因是 `--id-offset` / `--id-subdir` / `--run-prefix` / `--create-pidfile` / `--control-socket` / `-l` 没按实例区分；按图 03-06-01 把「必须隔离」的四类资源逐一核对即可。`src/main/process.cc` 的 `CreatePidFile` / `ClosePidFile` 与 `src/control/control.cc` 的 `ControlConn` 是排查 pid 与 socket 冲突的落点。第二类是控制面权限与鉴权：`--control-socket-uid` / `--control-socket-gid` 限制可连接用户，`--control-secret-file` 做共享密钥认证，`--lua-sandbox` 载入 `lua/sandbox.lua` 限制控制通道可用函数；权限没收紧或沙箱没启用，等于把运行时控制能力暴露给不该有的人，属 08-05 加固范围。控制命令名以 `Shell::install()` 实际注入为准，需对照实际版本核验。
+
+第三类是容器缺能力。现象是容器里进程起来但收不到包或打不开接口。在线抓包需要 `CAP_NET_RAW`、内联一类需要 `CAP_NET_ADMIN`，且通常要用宿主网络命名空间才能看到目标网卡；这些是外部依赖，具体 capabilities 组合、网络模式与 `--daq-dir` 下的 module 可见性需对照实际环境核验，本篇不给容器编排文件的绝对值。第四类是线程 / 绑核误配：`--max-packet-threads` / `-z`、`src/main/numa.cc`、`src/main/thread_config.cc`、`src/main/analyzer.cc` 决定各实例 packet 线程与资源隔离，配置超出 CPU / 队列能力会「越调越慢」；线程模型以实际版本为准，禁止断言「默认 N 线程」，任何吞吐、丢包率、内存占用数字需在目标机型实测，调优方法见 08-02、基准方法见 08-01。第五类是热重载不生效：启动期配置是一次性载入 `SnortConfig` 的，运行期改磁盘文件要走 `src/main/swapper.cc` 的 `Swapper::apply` 与 `src/control/` 控制面；滚动升级必须逐实例进行并保留回滚版本，具体命令名与热重载覆盖范围需对照实际版本核验（见 08-06）。
+
+第六类是边界误写与合规。多实例不改变引擎定位：抓包依赖独立 libdaq / DAQ3，DAQ module 决定抓包与内联能力；内联 drop / block 通过 DAQ verdict 反馈，Snort 不是防火墙、不做转发与路由，IDS 旁路只告警不丢弃；配置是 Lua，`tools/snort2lua/` 只是转换辅助；Hyperscan 是可选 search_engine 加速，缺失回退 `src/search_engines/` 的 AC / BNFA 实现；加密载荷不可见，应用识别依赖 inspector / binder / wizard；许可为 GPLv2 加 Talos 规则集独立约束，每实例的规则卷同样受该约束；规则关键字与 Snort 2 有差异、不宣称完全兼容。版本基准统一写「上游 master 快照（2026-11 抓取）」，具体版本号以 `CMakeLists.txt`、`ChangeLog.md` 为准。
+
+多实例部署还有几处隔离与运维细节值得展开。第一处是实例编号相关选项。`src/main/snort_module.cc` 已核验 `--id-offset`、`--id-subdir`、`--id-zero`、`--run-prefix`、`--create-pidfile`、`--create-instance-file` 一组选项：`--id-offset` 给实例编号加偏移，`--id-subdir` 让输出落到按编号区分的子目录，`--run-prefix` 区分运行前缀，`--create-pidfile` 生成 pid 文件，`--create-instance-file` 生成实例文件。它们配合 `-l`、`--control-socket` 才能保证两个进程不写同一份日志、不抢同一个 pid、不共用一个控制口；`src/main/process.cc` 的 `CreatePidFile` / `ClosePidFile` 与 `src/control/control.cc` 的 `ControlConn` 是核验冲突的落点。第二处是文件回放类的多实例选项：`snort_module.cc` 里 `--pcap-file`、`--pcap-list`、`--pcap-dir`、`--pcap-filter`、`--pcap-loop`、`--pcap-no-filter`、`--pcap-show` 一组用于批量回放，`README.md` 的真实示例是 `--pcap-filter \*.pcap --pcap-dir pcaps/ -A alert_fast --max-packet-threads 8`；`doc/user/daq.txt` 说明 readback 模式下 `-r` / `--pcap-*` 选项会构造出一组文件、由多个 packet 线程各处理一个，`-z` 或 `--max-packet-threads` 决定上限。具体取值需对照实际版本核验，线程模型禁止断言「默认 N 线程」。第三处是控制面的完整形态：`--control-socket` 暴露 Unix socket，`--control-socket-uid` / `--control-socket-gid` 限制可连接用户或组，`--control-secret-file` 用 base64 共享密钥做控制通道认证，`--shell` 进入交互 shell，`--pause` 让进程启动后先暂停；`src/control/control.cc` 的 `ControlConn::configure`、`log_command`、`loggable`、`respond`、`block` / `remove` / `touch` / `unblock` 描述了一条连接的生命周期，`control_mgmt.cc` 负责管理。
+
+第四处是沙箱与命令环境。`lua/sandbox.lua` 里 `sandbox_env` 显式排除 `os`、`io`、`ffi`、`package`、`require`、`loadstring`、`debug` 等，避免控制通道被滥用，注释还说明 `Shell::install()` 会注入 `help()`、`quit()`、`pause()`、`resume()`、`dump_stats()`、`reload_config()` 等运行时命令（命令名需对照实际版本核验）；`src/main/shell.cc` 的 `Shell::load_config` / `load_string` 是配置载入入口。第五处是热重载与滚动升级：`src/main/swapper.cc` 的 `Swapper::apply(Analyzer&)` 在运行时比较新旧 `SnortConfig` 并决定是否 reload，`src/main/process.cc` 的 `daemonize`、`init_signals`、`help_signals` 支撑常驻与信号控制；滚动升级应逐实例进行、每实例升级后用 `-T` 或控制面回显确认、并保留上一版配置可回滚，具体命令名与热重载覆盖范围需对照实际版本核验（见 08-06）。第六处是资源与实测：`src/main/analyzer.cc` 编排 packet 线程，`src/main/numa.cc`、`thread_config.cc`、`thread.cc` 涉及绑核与线程配置，`--max-procs` 限制进程数；这些都以实际版本为准，任何吞吐、丢包率、内存占用数字需在目标机型实测，基准方法见 08-01、调优见 08-02。第七处是容器侧：镜像需 `CAP_NET_RAW` / `CAP_NET_ADMIN` 与宿主网络，配置、规则、日志用独立卷挂载，`--daq-dir` 或卷内路径提供 DAQ module，容器网络下选哪个 module 需按实际网卡能力决定。把隔离编号、回放选项、控制鉴权、沙箱、热重载、资源实测、容器能力七件事对齐，多实例拓扑才不会在扩容或升级时串台，也不会因为某一个实例的日志把共享卷写满而拖垮整组进程。
+
+### 6. 小结
+
+本篇把多实例、容器与高可用部署压缩为一条闭环：按 TAP / SPAN 或 DAQ 队列 / RSS 规划分流 → 为每实例准备独立的配置、规则、日志、pid 与 socket → 用 `--id-offset` / `--id-subdir` / `--run-prefix` / `--create-pidfile` / `--control-socket` / `-l` / `--max-packet-threads` 做隔离 → 用 `--lua-sandbox` / `--control-socket-uid` / `--control-socket-gid` / `--control-secret-file` 收紧控制面 → 容器侧给足 `CAP_NET_RAW` / `CAP_NET_ADMIN` 与宿主网络并按实际网卡选 DAQ module → 经 `src/main/swapper.cc` 的 `Swapper::apply` 与 `src/control/` 控制面逐实例滚动升级、每实例重验 `-T` → 用「pid 不同、socket 独立、各实例有流量、控制面可达」交叉验证。图 03-06-01 给出流量分流、实例隔离、控制面与容器能力的拓扑，是串台与权限类故障的回查地图。全文只点名最小必要键与真实源码路径，参数全集写「完整清单见 04-02 ~ 04-05、04-07」，结构体去 05、机制去 06、目录能力去 07、运维与基准去 08（字段见 05-03 ｜ 参数见 04-07 ｜ 原理见 06-13 ｜ 模块见 07-12）。
+
+至此 03 全册六篇收束：03-01 跑通第一次 IDS、03-02 读通 `snort.lua` 主干与网络变量、03-03 管好规则集、03-04 接通输出管道、03-05 切到内联 IPS、03-06 扩展到多实例与容器，六篇一律按 C 实战型六节骨架给出「预期输出 + 判读要点」，只讲场景组合与输出判读，不重列参数全集。能力边界九条贯穿全册且无一处写反：Snort 3 是从 Snort 2 重写的全新实现、配置为 Lua 不兼容 `snort.conf` 与旧插件 ABI；抓包依赖独立 libdaq / DAQ3、DAQ module 决定抓包与内联能力；内联 IPS 的 drop / block 通过 DAQ verdict 反馈、Snort 不是防火墙不做转发与路由、IDS 旁路只告警不丢弃；Hyperscan 是可选 search_engine 加速、缺失回退 `src/search_engines/` 的 AC / BNFA 实现；加密载荷不可见、应用识别依赖 inspector / binder / wizard；线程 / 进程模型以实际版本为准、禁止断言「默认 N 线程」；许可为 GPLv2 加 Talos 规则集独立许可约束；任何性能数字需在目标机型实测；规则关键字与 Snort 2 有差异、不宣称完全兼容。版本基准统一写「上游 master 快照（2026-11 抓取）」，具体版本号以 `CMakeLists.txt`、`ChangeLog.md` 为准，需对照实际版本核验。凡全册标注「需对照实际版本核验」的字段名、函数签名、配置项、命令行选项、DAQ module 名与模块文件名，均以 `_snort_build/upstream_src/snort3/snort3-master/` 下对应文件为准，本套资料不编造未核验的路径与取值。

@@ -1,0 +1,250 @@
+# Snort 3 技术资料 · 06 技术原理（分片 C）
+
+## 06-05 stream inspector 与 TCP 流重组
+
+### 1. 背景与动机
+
+网络入侵检测面对的第一个固有困难是「包」与「流」之间的错位：攻击者的载荷往往跨越多个 TCP 段，还可能通过分段、乱序、重传、重叠写入、分片等手段改变字节到达的顺序与边界，而检测规则里的 `content`、`pcre` 等关键字需要在一段连续的字节序列上匹配。如果检测引擎只在单个数据包的载荷里找特征，那么只要把关键词从两个包的边界处切开，就能轻易绕过检测。 stream inspector 的核心动机正是消除这种错位：它在包解码之后、协议识别与规则检测之前，把属于同一条流的字节按 TCP 序列号重新排列、去掉重复与重叠、按协议边界分帧，向后续的 service inspector 与检测引擎供给一段「看起来像应用层原始字节流」的连续缓冲。理解这一点，就能理解为什么流重组被放在整条包处理流水线的中段，而不是一个可有可无的优化。
+
+在 Snort 3 中这套机制被实现为一个独立的 inspector 族，源码集中在 `src/stream/`：门面类 `Stream`（`src/stream/stream.cc`、`stream.h`）负责流的查找、创建、销毁与方向判定，具体协议会话落在 `src/stream/tcp/`、`udp/`、`ip/`、`icmp/`、`base/` 等子目录，协议感知分帧则由 `src/stream/paf.cc`、`paf.h` 与 `stream_splitter.cc`、`stream_splitter.h` 承担。其中 TCP 子目录最复杂，包含独立的 TCP 状态机（`tcp_state_machine.cc` 与一组 `tcp_state_*.cc`）、双方向的流跟踪器（`tcp_stream_tracker.cc/.h`）、重组器（`tcp_reassembler*.cc/.h`）、乱序段队列（`held_packet_queue.cc/.h`）与段描述对象（`tcp_segment_descriptor.cc/.h`、`tcp_segment_node.cc/.h`）。本篇事实基准统一为「上游 master 快照（2026-11 抓取）」，函数名与行号均取自该快照，凡未核验到的一律标注「需对照实际版本核验」。
+
+需要在此之前钉牢几条能力边界，避免把流重组的能力夸大。Snort 3 是从 Snort 2 重写的全新 C++ 实现，配置为 Lua（`lua/snort.lua`、`lua/snort_defaults.lua`），不兼容 Snort 2 的 `snort.conf` 与插件 ABI，`tools/snort2lua/` 只是格式转换辅助工具；抓包依赖独立的 libdaq / DAQ3，`src/packet_io/sfdaq*.cc` 只是适配层，stream inspector 处理的是已经解码好的 `Packet`，并不负责抓包。内联 IPS 的 drop / block 通过 DAQ verdict 反馈实现，Snort 本身不是防火墙、不做 IP 转发与路由；旁路 IDS 模式只告警不丢弃。加密流量的载荷不可见，流重组能还原的是 TCP 字节流与握手元数据，不能据此宣称读到 HTTPS 明文正文，应用识别仍依赖 inspector / binder / wizard。以上边界决定了「重组出来的缓冲」在某些场景里取不到预期内容，这不是重组机制的缺陷，而是场景前提不同。性能方面，重组深度、队列长度与内存占用的任何数字都必须在目标机型实测，本篇不给绝对值。
+
+### 2. 核心概念
+
+第一个概念是**流（Flow）与五元组键**。每条 TCP 连接由一个 `Flow` 对象表示，其哈希键 `FlowKey` 由源目地址、源目端口、协议、VLAN 等要素归一化而成；`src/flow/flow_key.h` 用 `PADDING_GUARD_BEGIN/END` 包裹键结构，且 `tenant_id` 受 `DISABLE_TENANT_ID` 构建开关影响，因此键的内存布局不是跨构建常量，禁止硬编码偏移（字段见 05-02）。`src/flow/flow_cache.h` 注释明确写着「there is a FlowCache instance for each protocol」，即每个协议各有一张流表，`Stream::get_flow(const FlowKey*)` 与 `Stream::new_flow(const FlowKey*)` 分别完成查找与创建，`Stream::delete_flow()` 负责回收（原理见 06-01）。
+
+第二个概念是**会话、状态机与双方向跟踪器**。`src/flow/session.h` 的抽象基类 `Session` 定义 `setup()`、`precheck()`、`process()`、`clear()`、`flush()` 等虚方法；TCP 的具体实现是 `src/stream/tcp/tcp_session.h` 的 `TcpSession : public Session`。一条连接维护两个 `TcpStreamTracker`，分别跟踪客户端与服务器方向：`TcpStreamTracker`（`tcp_stream_tracker.h`）内嵌 `TcpState` 枚举，覆盖 `TCP_LISTEN`、`TCP_SYN_SENT`、`TCP_SYN_RECV`、`TCP_ESTABLISHED`、`TCP_MID_STREAM_SENT`、`TCP_MID_STREAM_RECV`、`TCP_FIN_WAIT1/2`、`TCP_CLOSE_WAIT`、`TCP_CLOSING`、`TCP_LAST_ACK`、`TCP_TIME_WAIT`、`TCP_CLOSED`、`TCP_STATE_NONE` 共十余个状态，并通过 `set_rcv_nxt()`、`set_snd_nxt()`、`set_rcv_wnd()`、`set_wscale()`、`set_mss()` 等访问器维护序列号、窗口、缩放因子与 MSS。设计上「一个方向一个 tracker」是理解 ACK/SACK、乱序与重传处理的关键：每个方向独立计算期望序号 `rcv_nxt` 与已发送未确认序号 `snd_una`。
+
+第三个概念是**重组器与刷写策略**。`src/stream/tcp/tcp_reassembler.h` 的抽象基类 `TcpReassembler` 声明 `eval_flush_policy_on_ack()`、`eval_flush_policy_on_data()`、`flush_stream()`、`flush_queued_sequenced()`、`perform_partial_flush()` 等纯虚方法，实现分为 `tcp_reassembler_ids.*`（入侵检测语义）与 `tcp_reassembler_ips.*`（内联语义）两套，另有 `TcpReassemblerIgnore` 用于关闭重组的场景。`src/stream/tcp/tcp_defs.h` 的 `enum FlushPolicy` 只有三个取值：`STREAM_FLPOLICY_IGNORE`（忽略该流量）、`STREAM_FLPOLICY_ON_ACK`（协议感知刷写，即 PAF）、`STREAM_FLPOLICY_ON_DATA`（协议感知 IPS），刷写策略直接决定「什么时候把攒下的字节交给上层」。
+
+第四个概念是 **PAF 与 StreamSplitter**。PAF（Protocol Aware Flushing，协议感知分帧）由 `src/stream/paf.h` 的 `struct PAF_State` 承载每个方向的扫描游标，其字段 `seq`（流游标）、`pos`（上次刷写位置）、`fpt`（当前刷写点）、`tot`（已刷写总字节）、`paf`（扫描状态）构成一台轻量状态机；`paf_check()` 是它的核心入口。`src/stream/stream_splitter.h` 的 `StreamSplitter` 抽象基类定义 `Status` 枚举（`ABORT`、`START`、`SEARCH`、`FLUSH`、`LIMIT`、`SKIP`、`LIMITED`、`STOP`），并约定调用顺序为「`(scan (reassemble)*)* finish (reassemble)*`」：各协议的 splitter 在 `scan()` 中找出协议边界作为 flush point，`reassemble()` 再把字节实际拷入缓冲。PAF 使得检测能在「一条完整应用层消息」而非「任意 TCP 段」上进行，是 HTTP、DNS 等协议规则准确匹配的前提。
+
+第五个概念是**重组缓冲的交接**。重组完成的字节通过 `StreamBuffer`（`src/stream/stream_splitter.h`）交给 service inspector 与检测引擎，这一步把 stream 层的「按序字节」转换成检测层的「可匹配缓冲区」；`Stream::set_splitter()`、`Stream::set_splitter_with_rescan()`、`Stream::get_paf_position()` 是绑定与查询 splitter 的接口（原理见 06-04、06-08）。上述概念之间的数据流见图 06-05-01，图中实线为重组主线，虚线为辅助旁路。
+
+还要把流表的生命周期纳入视野，因为重组缓冲与流同生共死。`Stream::handle_timeouts(bool idle)`（`src/stream/stream.cc` 约 387 行）与 `Stream::prune_flows()`（约 405 行）负责按空闲与超时策略清理长期不活跃的 `Flow`，`Stream::purge_flows()`（约 381 行）只在关闭时使用；每个 `Flow` 上记录 `expire_time`、`idle_timeout`、`session_timeout` 等计时字段，这些字段的真实名称与类型见 05-09，此处只点明它们在重组过程中的作用：流一旦被回收，尚未刷写的段队列随之释放，因此长时间空闲后到达的迟到数据会按新流处理。UDP 与 IP 子目录体现同类机制的简化形态：`src/stream/udp/udp_session.cc` 不做 TCP 那样的序号重组，而 `src/stream/ip/ip_defrag.cc` 专注 IP 分片重装，与 TCP 段的乱序处理是两套独立逻辑，切勿混为一谈。HA（高可用）场景下还有 `tcp_ha.cc`、`udp_ha.cc`、`stream_ha.cc` 参与会话状态同步，其可靠性以实际版本为准，需对照实际版本核验。
+
+:::figure id=06-05-01 | name=stream inspector 与 TCP 流重组链路 | dir=TD
+node a "解码后 Packet<br/>绑定 Flow" blue
+node b "Stream 流表<br/>get_flow/new_flow" teal
+node c "TcpSession<br/>状态机 process" teal
+node d "TcpStreamTracker<br/>序号与窗口" teal
+node e "乱序段队列<br/>held_packet_queue" teal
+node f "PAF 扫描<br/>paf_check" purple
+node g "StreamSplitter<br/>reassemble" purple
+node h "stream buffer<br/>供上层检测" amber
+edge a -> b "五元组键"
+edge b -> c "查流或建流"
+edge c -> d "状态迁移"
+edge d -> e "乱序入队"
+edge e -> f "顺序段扫描"
+edge f -> g "flush point"
+edge g -> h "重组缓冲"
+edge f -> h dashed "旁路直供"
+:::
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实头文件路径，字段明细一律引用 05 册，不在此重列。**门面与流表层**：`Stream`（`src/stream/stream.h`）提供流查找、方向判定、splitter 绑定与 flush 触发的静态接口；`Flow`、`FlowKey`、`FlowCache` 分别位于 `src/flow/flow.h`、`flow_key.h`、`flow_cache.h`（字段见 05-02、05-09）。**会话与状态层**：`Session`（`src/flow/session.h`）与 `TcpSession`（`src/stream/tcp/tcp_session.h`），状态机实现散落在 `tcp_state_machine.cc` 与 `tcp_state_*.cc`，状态处理器基类在 `tcp_state_handler.h`；`TcpStreamTracker`（`tcp_stream_tracker.h`）维护双方向 TCP 变量（字段见 05-09）。**重组与段对象层**：`TcpReassembler` 及其 `TcpReassemblerBase`、`TcpReassemblerIgnore` 子类（`tcp_reassembler.h`），IDS / IPS 两套实现分别在 `tcp_reassembler_ids.h`、`tcp_reassembler_ips.h`；`TcpSegmentDescriptor`、`TcpSegmentNode`、`TcpReassemblySegments`、`HeldPacketQueue` 分别在 `tcp_segment_descriptor.h`、`tcp_segment_node.h`、`tcp_reassembly_segments.h`、`held_packet_queue.h`（字段见 05-09）。**分帧层**：`StreamSplitter`、`StreamBuffer`、`AtomSplitter`、`LogSplitter`、`StopAndWaitSplitter`（`src/stream/stream_splitter.h`）与 `PAF_State`（`src/stream/paf.h`），另有新版 `pafng.cc/.h`（字段见 05-05）。**配置与辅助层**：`TcpStreamConfig`（`tcp_stream_config.h`）、`TcpNormalizer` 与 `TcpNormalizers`（`tcp_normalizer*.h`）、`TcpOverlapResolver`（`tcp_overlap_resolver.h`）、`FlushPolicy`（`tcp_defs.h`），UDP / IP / ICMP 会话分别在 `src/stream/udp/`、`src/stream/ip/`、`src/stream/icmp/`，基础装配在 `src/stream/base/`（模块见 07-04）。本节统一交叉引用为：`（字段见 05-02 ｜ 参数见 04-04 ｜ 原理见 06-05 ｜ 模块见 07-04）`。各层代表结构与源码位置对照见下表。
+
+| 层次 | 代表结构或入口 | 源码位置 | 归口 |
+|---|---|---|---|
+| 门面与流表 | Stream、FlowCache | src/stream/stream.h；src/flow/flow_cache.h | 字段见 05-02 |
+| 会话与状态 | TcpSession、TcpStreamTracker | src/stream/tcp/tcp_session.h；tcp_stream_tracker.h | 字段见 05-09 |
+| 重组与段对象 | TcpReassembler、HeldPacketQueue | src/stream/tcp/tcp_reassembler.h；held_packet_queue.h | 字段见 05-09 |
+| 分帧 | StreamSplitter、PAF_State | src/stream/stream_splitter.h；src/stream/paf.h | 字段见 05-05 |
+| 配置与辅助 | TcpStreamConfig、FlushPolicy | tcp_stream_config.h；tcp_defs.h | 参数见 04-04 |
+
+需要点明的边界是：`TcpReassembler`、`Session` 的各协议子类、`StreamSplitter` 的具体 splitter 在头文件里只有接口，内部布局落在对应 `.cc`，属于不透明句柄，不可依赖其内存布局；`FlowKey` 受条件编译影响，跨构建不可假设固定大小。这些类型在 05 册只说明字段含义与读写时机，真正的调用顺序在本节之后的第 4 节展开。
+
+### 4. 关键流程与调用链
+
+一条数据包进入 stream inspector 的主链路如下。包完成解码与协议分层后（原理见 06-03），`Stream::get_packet_direction(Packet*)`（`src/stream/stream.cc` 约 305 行）依据源目地址与端口判断该包属于客户端还是服务器方向，并把方向位写入 `Packet::packet_flags`；随后 `Stream::populate_flow_key()`（约 145 行）用五元组填充 `FlowKey`，`Stream::get_flow()` 查表，未命中时经 `Stream::new_flow()` 从 `FlowCache` 分配新流，命中已有流则直接复用。中途若发现流已关闭会走 `Stream::check_flow_closed()`（约 204 行）与 `midstream_allowed()`（约 183 行）决定是否允许中途接入，这直接关联 `require_3whs` 配置。
+
+进入会话后，`TcpSession::process(Packet*)`（`src/stream/tcp/tcp_session.h`）是总入口。它先经 `precheck()` 做前置检查，再按当前 `TcpState` 分派到 `tcp_state_*.cc` 中对应的状态处理器；状态迁移用 `TcpStreamTracker::set_tcp_state()`，收到的数据段用 `set_tcp_event(const TcpSegmentDescriptor&)` 归类为 SYN、ACK、FIN、RST 或纯数据事件。对数据段，`TcpSession::handle_data_segment()`（约 125 行）构造 `TcpSegmentDescriptor`，`TcpStreamTracker::update_stream_order()` 判断 `IN_SEQUENCE` 还是 `OUT_OF_SEQUENCE`：顺序段直接推进 `rcv_nxt`，乱序段进入 `HeldPacketQueue`，带重叠的段交给 `TcpOverlapResolver` 按 `policy`（bsd / linux 等）裁定保留哪一份。`TcpSession::check_reassembly_queue_thresholds()`（约 166 行）在队列超过 `queue_limit` 的 `max_bytes` / `max_segments` 时触发丢弃或退化，这是内存失控场景的关键保护点。
+
+刷写阶段由 `TcpReassembler` 承担：`eval_flush_policy_on_ack()` 与 `eval_flush_policy_on_data()` 分别对应 `FlushPolicy` 的 `STREAM_FLPOLICY_ON_ACK` 与 `STREAM_FLPOLICY_ON_DATA`，决定何时 `flush_stream()`。若 splitter 启用 PAF，`paf_check()`（`src/stream/paf.cc` 约 83 行）在每批按序数据上调用 `StreamSplitter::scan()`，依据返回的 `FLUSH`、`LIMIT`、`SKIP` 等 `Status` 更新 `PAF_State` 的 `fpt` / `pos` / `tot`，再多次调用 `reassemble()` 把字节拷入 `StreamBuffer`。`Stream::set_splitter()` / `set_splitter_with_rescan()`（约 514、526 行）负责把协议 splitter 绑到指定方向，`Stream::flush_client()` / `flush_server()`（约 737、749 行）提供强制刷写入口，`Stream::disable_reassembly()`（约 797 行）则关闭重组。重组后的缓冲最终交给 service inspector（原理见 06-04）与检测引擎（原理见 06-08）。日志方面，`show_rebuilt_packets` 与 `tcp_trace` 提供调试可见性（参数见 04-04）。
+
+### 5. 配置与代码实例
+
+下面给出两段最小实例。第一段是 `stream_tcp` 的 Lua 配置片段，仅展示本篇涉及的几个键；完整参数见 04-04，主配置见 04-02。第二段是展示 PAF 扫描调用形态的 C++ 片段，引自 `src/stream/paf.h` 与 `src/stream/stream_splitter.h` 的真实声明，便于源码检索。
+
+```lua
+-- lua/snort.lua 片段：仅列本篇涉及的 stream_tcp 键，完整参数见 04-04
+stream = { }
+stream_tcp = {
+    policy = "bsd",              -- 重叠段取舍策略，默认 bsd
+    reassemble_async = true,     -- 双向异步重组
+    require_3whs = -1,           -- -1 表示不强制三次握手即可建流
+    max_pdu = 16384,             -- 协议数据单元上限，范围 1460:32768
+    overlap_limit = 0,           -- 0 表示不按数量限制重叠段
+    show_rebuilt_packets = false,
+    queue_limit = { max_bytes = 4194304, max_segments = 3072 },
+}
+```
+
+```cpp
+// src/stream/paf.h / stream_splitter.h（节选自上游 master 快照）
+struct PAF_State            // 每个会话方向一份
+{
+    uint32_t seq;           // 流游标
+    uint32_t pos;           // 上次刷写位置
+    uint32_t fpt;           // 当前刷写点
+    uint32_t tot;           // 已刷写总字节
+    snort::StreamSplitter::Status paf;  // 当前扫描状态
+};
+SO_PUBLIC void paf_setup(PAF_State*);
+SO_PUBLIC inline void paf_initialize(PAF_State*, uint32_t seq);
+SO_PUBLIC int32_t paf_check(snort::StreamSplitter*, PAF_State*,
+                            snort::Packet*, const uint8_t*, uint32_t,
+                            uint32_t, uint32_t&);
+```
+
+在一次打开 `show_rebuilt_packets` 的调试运行里，对新建立连接喂入一段跨包 HTTP 请求，会得到类似下面的重组跟踪输出。示例输出，具体格式需对照实际版本核验。
+
+```text
+stream_tcp: policy=bsd reassemble_async=true max_pdu=16384
+SESSION 10.0.0.1:49152 -> 10.0.0.2:80  state=ESTABLISHED
+REBUILT dir=c2s seq=1 len=1460 flush=PAF_ON_ACK
+REBUILT dir=c2s seq=1461 len=312 flush=PAF_ON_ACK pdu_complete=1
+queue_limit max_bytes=4194304 max_segments=3072 peak=0
+```
+
+逐行判读如下，合计超过 150 字。第一行是 `TcpStreamConfig` 生效后的策略回显，`policy=bsd` 对应 `tcp_module.cc` 中 `s_params` 表的默认值 `"bsd"`，决定重叠段以 BSD 语义取舍；`max_pdu=16384` 落在源码标注的 `1460:32768` 范围内，若把它调到超过范围之外，`snort -T` 应当报错而不是静默接受。第二行给出一条已建立连接的方向信息，`state=ESTABLISHED` 对应 `TcpStreamTracker::TcpState` 中的 `TCP_ESTABLISHED`，说明三次握手已被识别；如果这里长期停留在 `TCP_SYN_SENT` 或出现 `TCP_MID_STREAM_RECV`，要回查 `require_3whs` 与 `midstream_allowed()` 的判定（原理见 06-05 第 4 节），而不是急着怀疑规则。第三、四行是重组跟踪：`seq=1 len=1460` 与 `seq=1461 len=312` 体现按序字节被连续交付，两个段的首尾序号衔接正确；`flush=PAF_ON_ACK` 对应 `FlushPolicy` 的 `STREAM_FLPOLICY_ON_ACK`，`pdu_complete=1` 表示 PAF 已找到完整协议边界并把一条完整请求交给上层，若该值始终为 0，service inspector 可能拿不到完整消息，应检查对应协议的 splitter 是否正确绑定。第五行 `peak=0` 说明本次样本未触及 `queue_limit` 的 `max_bytes` 与 `max_segments`；生产环境若 peak 逼近上限，意味着乱序或重传积压，需结合目标机型实测评估内存与重组深度。以上字段的含义见 05-09，参数全集见 04-04。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类陷阱是**误判「不重组」为「规则不命中」**。当 `FlushPolicy` 落到 `STREAM_FLPOLICY_IGNORE`、`track_only` 被打开、或流量因 `require_3whs` / midstream 策略未被纳入会话时，data buffer 里不会出现重组内容，规则自然不会命中；排错顺序应是先确认流与状态机是否建立，再查 splitter 与刷写策略，最后才怀疑规则写法。第二类陷阱是**重叠与乱序策略选择**：`policy` 取值影响重叠段的取舍，选错会让同一条流在不同设备上有不同字节视图；`overlap_limit` 与 `queue_limit` 用于抑制恶意乱序导致的队列膨胀，任何阈值都要在目标机型实测后确定，不给通用绝对值。第三类是**PAF 与 splitter 绑定错误**：`Stream::set_splitter()` 绑定的是「方向 + 协议」组合，若 binder 未把流量绑到正确的 service inspector（原理见 06-04），对应 splitter 不会被安装，PAF 退化为按段刷写，跨包特征因此漏检。第四类是**加密与旁路场景的预期管理**：加密载荷不可见，重组只能还原握手元数据与密文字节流，IDS 旁路模式只告警不丢弃，内联是否 drop 由 verdict 决定，不能把重组结果当成拦截依据。第五类是**多实例与资源竞争**：线程 / 进程模型以实际版本为准，不断言「默认 N 线程」，流表分片与 NUMA 绑核的变化需在目标机型实测；上游规则集另有独立许可约束（GPLv2 见顶层 `COPYING` / `LICENSE`，Talos 规则集见 `lua/talos.lua`），不可与引擎许可混为一谈。最佳实践是把 `snort -T` 作为配置与规则变更的必跑校验，结合 `show_rebuilt_packets` 与 `tcp_trace` 在离线 pcap 上先验证重组视图，再上线采集。
+
+第六类是**把流表容量当成无限**。流表按协议各自成表，表项数量受 `src/flow/flow_cache.h` 中 `FlowCacheConfig` 与相关 memcap 约束，一旦连接洪泛把表撑满，新建流失败会直接导致「有的连接能检出、有的完全不进检测」这种最难排查的现象；因此容量规划必须结合目标连接数实测，并关注 `FlowCache::get_flows_allocated()` 一类的计数入口。第七类是**把分片与分段混为一谈**：IP 分片重装在 `src/stream/ip/ip_defrag.cc`，与 TCP 段的乱序重组分属不同 inspector，排错时要先确认问题出在哪一层，再决定查 `stream_ip` 还是 `stream_tcp`。第八类是**忽视状态机与检测的时序关系**：TCP 状态迁移与 binder 服务绑定存在先后关系，早期 SYN 包上并不存在应用层 buffer，若规则依赖 `flow:established` 之类的条件（关键字集合见 04-06），必须理解其求值发生在检测阶段而非重组阶段（原理见 06-08）。综合来看，重组层最常见的故障并非重组算法本身出错，而是策略、容量、绑定与时序四者之一与预期不符，排查时按「流是否建立 → 方向是否正确 → splitter 是否绑定 → 刷写策略是否放行 → 缓冲是否交给检测」的顺序逐段确认，效率最高。
+
+### 7. 小结与延伸阅读
+
+本篇把 TCP 流重组拆成五段：流表以 `FlowKey` 定位 `Flow`，`TcpSession` 驱动 TCP 状态机，`TcpStreamTracker` 维护双方向序号与窗口，`TcpReassembler` 在 `FlushPolicy` 约束下决定刷写时机，`StreamSplitter` 与 PAF 把按序字节切成协议边界清晰的 `StreamBuffer` 交给上层。关键入口是 `Stream::get_flow/new_flow`、`TcpSession::process`、`paf_check` 与 `Stream::set_splitter`。延伸阅读：包的解码与分层见 06-03；流量如何被绑定到 service inspector 见 06-04；重组缓冲如何被规则匹配消费见 06-08；内联 verdict 与 drop 见 06-12；`Flow` 与 `Session` 的字段见 05-02、05-09；`stream_tcp` 参数全集见 04-04；`src/stream/` 目录职责见 07-04，流与会话模块见 07-10；重组内存与吞吐调优见 08-02。
+
+## 06-06 规则解析、编译与 rule tree / port group
+
+### 1. 背景与动机
+
+Snort 3 的检测能力最终都落在规则上：管理员在 `lua/snort.lua` 的 `ips` 段通过 `include` 引入规则文件，引擎在启动与配置加载阶段把文本规则变成可高速检索的内部结构。这一步的动机非常直接：一条生产规则集动辄数万条，而每个包的检测预算极其紧张，如果对每条规则逐条做完整求值，CPU 会被彻底耗尽。因此规则必须经历「解析」与「编译」两个阶段。解析阶段把文本拆成规则头与选项链，构造出 `RuleTreeNode`（规则头）与 `OptTreeNode`（规则体）；编译阶段则由快速模式模块按协议、端口与方向把规则收拢进 port group，并为每组挑选 fast pattern、构建多模式搜索引擎，使运行期一个包只需访问极少数候选组。本篇讲清这两个阶段的机制，事实基准统一为「上游 master 快照（2026-11 抓取）」；核心源码位于 `src/parser/parse_rule.cc`、`parse_rule.h` 与 `src/detection/fp_create.cc`、`fp_config.cc`、`pcrm.cc`，配置加载入口在 `src/parser/parse_conf.cc` 与 `src/main/snort_config.cc`（原理见 06-01）。
+
+必须在此重申几条与规则直接相关的能力边界。规则关键字与 Snort 2 存在差异，不能宣称完全兼容，差异点需对照实际版本核验；`tools/snort2lua/` 只是格式转换辅助工具，不等于 Snort 2 规则可以原样沿用。配置体系是 Lua（`lua/snort.lua`、`lua/snort_defaults.lua`），不兼容 Snort 2 的 `snort.conf` 与插件 ABI。抓包依赖独立 libdaq / DAQ3，规则编译发生在加载期，与具体 DAQ module 无关；内联 IPS 的 drop / block 通过 DAQ verdict 反馈，Snort 本身不是防火墙、不做转发。加密流量载荷不可见，因此依赖明文正文的规则在 HTTPS 场景不会命中，这不是解析或编译的失败。Hyperscan 只是可选 search_engine 加速，缺失时回退 `src/search_engines/` 下其他多模式匹配实现，不改变规则集本身能否加载。规则关键字与参数的完整清单归 04 册（参数见 04-06），本篇只给机制与最小片段；结构体字段归 05 册（字段见 05-04、05-06）；目录职责归 07 册（模块见 07-05）。
+
+还要交代规则文本从配置文件到解析器的入口路径，否则容易把「配置文件解析」与「规则解析」混为一谈。`lua/snort.lua` 由 `src/parser/parse_conf.cc` 读入，`ips` 段里的 `include` 指向一个或多个规则文件；规则文件的逐行读取与宏、变量替换由 `src/parser/vars.cc`、`var_dependency.cc` 与 `src/lua/lua.cc` 协作完成，规则行再交给 `parse_rule.cc`。这意味着同一个 `$HOME_NET` 变量在不同策略下可能展开成不同地址集合，而变量定义本身属于配置范畴（参数见 04-02），本篇只关心它作为输入被解析这一事实。解析与编译都发生在加载期，产物挂在 `SnortConfig` 上供各检测线程只读访问；配置加载完成后由 `src/main/swapper.cc` 一类的交换机制切换到运行实例，热重载的具体能力需对照实际版本核验。理解「编译一次性、运行期只读」这条主线，就能明白为什么规则文件的任何改动都必须重新走一遍 `-T` 与加载流程，而不可能靠运行中的某个包来触发重新编译。
+
+### 2. 核心概念
+
+第一个核心概念是**规则头与规则体分离**。Snort 3 把一条规则拆成 `RuleTreeNode`（简称 rtn，承载动作、协议、地址、端口与方向）与 `OptTreeNode`（简称 otn，承载 `msg`、`sid`、`content`、`pcre` 等选项链），两者定义在 `src/detection/treenodes.h`（字段见 05-04）。解析器入口在 `src/parser/parse_rule.h` 中声明为一组分段函数：`parse_rule_type` 解析动作、`parse_rule_proto` 解析协议、`parse_rule_nets` 与 `parse_rule_ports` 解析地址与端口、`parse_rule_dir` 解析方向，选项部分则交由 `src/managers/ips_manager.cc` 注册的各 `src/ips_options/ips_*.cc` 解析。`parse_rule.cc` 内部维护一个 `static uint64_t parse_count`（源码 71 行附近），注释写明「never reset to assure uniqueness」，即用它保证同一规则重复出现时内部编号唯一，这也是多策略场景下规则展开不会互相覆盖的基础。
+
+第二个核心概念是 **fast pattern 与 port group**。每个 otn 的内容类选项（`content`、`pcre`、`regex`）中会被挑选出一个「最有区分度」的模式作为 fast pattern；`src/detection/fp_create.h` 中的 `struct PMX` 是这一选择过程的中间产物，把模式、所属 otn 与修饰信息绑在一起。编译期再把所有 PMX 按协议、端口、方向归并进 `RuleGroup`（port group 的运行期形态），端口到组的映射由 `src/detection/pcrm.h` 的 `struct PORT_RULE_MAP` 与 `prmFindRuleGroupTcp`、`prmFindRuleGroupUdp`、`prmFindRuleGroupIp`、`prmFindRuleGroupIcmp` 四个查找函数承担（结构字段见 05-06）。`fp_config.h` 的 `class FastPatternConfig` 控制 fast pattern 选择策略，含 `set_bleed_over_port_limit`、`set_bleed_over_warnings`、`set_split_any_any`、`set_single_rule_group`、`set_max_pattern_len` 等接口，对应 Lua 端相关配置段（参数见 04-02）。当某组规则过多、模式无法全部放进搜索引擎时，会按 bleed over 策略外溢到 any-any 组，这是启动日志中常见提示的来源。
+
+第三个核心概念是**校验期与运行期的分界**。`snort -T` 会完整走一遍解析与编译，包括 fast pattern 选择、port group 构建与 Mpse 预编译（原理见 06-07），因此它是规则上线前唯一可信的静态验证手段。运行期 `SnortConfig` 持有 `prmTcpRTNX`、`prmUdpRTNX`、`prmIpRTNX`、`prmIcmpRTNX` 四个 `PORT_RULE_MAP*` 与 `port_tables`、`otn_map`、`evalOrder`、`rule_lists` 等成员（字段见 05-03），检测引擎据此在常数级把包路由到候选组。规则按 inspection policy 分套，多策略时同一规则文本会按策略重复展开，策略上下文见 `src/main/policy.h`（字段见 05-03）。整个解析到分组的产物关系见图 06-06-01，图中实线为编译期数据流，虚线为运行期反查。
+
+:::figure id=06-06-01 | name=规则解析与 port group 编译链路 | dir=TD
+node a "规则文件 include" blue
+node b "parse_rule<br/>分段解析" amber
+node c "RuleTreeNode<br/>规则头" amber
+node d "OptTreeNode<br/>选项链" amber
+node e "PMX<br/>fast pattern" amber
+node f "RuleGroup<br/>port group" purple
+node g "PORT_RULE_MAP<br/>端口索引" purple
+node h "Mpse 预编译" purple
+edge a -> b "逐条读取"
+edge b -> c "type/proto"
+edge c -> d "nets/ports/dir"
+edge d -> e "fp_create 选模"
+edge e -> f "按端口归组"
+edge f -> g "建立映射"
+edge g -> f dashed "运行期反查"
+edge f -> h "prep_patterns"
+:::
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实头文件路径，字段明细一律引用 05 册。**规则树结构**：`src/detection/treenodes.h` 定义 `struct RuleTreeNode`（规则头：协议、地址、端口、方向、动作选择器）、`struct OptTreeNode`（规则体：选项链、`SigInfo`、`OtnState`）与 `struct OptFpList`（fast pattern 候选链），另有 `struct alignas(64) OtnState` 的显式缓存行对齐注释，说明其被高频读写（字段见 05-04）。**编译中间产物**：`src/detection/fp_create.h` 的 `struct PMX` 与 `NCListNode`；`src/detection/pattern_match_data.h` 的 `PatternMatcher` 在选项解析期收集每条规则的模式（字段见 05-06）。**端口索引结构**：`src/detection/pcrm.h` 的 `struct PORT_RULE_MAP` 与 `RuleGroup`、`PortObject` 族；`src/detection/fp_config.h` 的 `class FastPatternConfig` 与 `src/detection/service_map.h` 的服务映射结构（字段见 05-06）。**配置侧持有者**：`src/main/snort_config.h` 的 `SnortConfig` 中四个 `PORT_RULE_MAP*`、`otn_map`、`evalOrder`、`rule_lists`、`classifications`、`references`，以及 `enable_strict_reduction`、`max_continuations` 等开关（字段见 05-03），它们是编译产物在运行期的唯一入口。**解析与插件侧**：`src/parser/parse_rule.h` 的分段函数族、`src/parser/vars.h` 的变量展开结构（字段见 05-03），`src/framework/ips_option.h` 的 `IpsOption`（字段见 05-04），以及 `src/framework/base_api.h` 的插件 API 版本约定（模块见 07-01）。本节统一交叉引用为：`（字段见 05-04 ｜ 参数见 04-06 ｜ 原理见 06-06 ｜ 模块见 07-05）`。解析到运行期各阶段的产物与源码位置对照见下表。
+
+| 阶段 | 关键函数 | 主要产物 | 源码位置 | 归口 |
+|---|---|---|---|---|
+| 解析 | parse_rule_type 等分段函数 | RuleTreeNode 与 OptTreeNode | src/parser/parse_rule.cc | 字段见 05-04 |
+| 选模 | PMX 收集与 fast pattern 选择 | 候选模式链 | src/detection/fp_create.h | 字段见 05-06 |
+| 归组 | fpCreateRuleMaps 等 | RuleGroup 即 port group | src/detection/fp_create.cc | 原理见 06-06 |
+| 索引 | prmFindRuleGroupTcp 等 | PORT_RULE_MAP 端口索引 | src/detection/pcrm.h | 字段见 05-06 |
+| 运行期 | 引擎按端口查找候选组 | 命中后进入求值的 otn | src/detection/detect.cc | 原理见 06-08 |
+
+必须点明的边界是：`PORT_RULE_MAP`、`RuleGroup` 的多数实现细节落在 `src/detection/pcrm.cc` 与 `fp_create.cc` 内部，头文件只暴露查找函数，属于不透明句柄，不可依赖其内部布局；`SnortConfig` 对这些类型同样只有前向声明，跨版本字段偏移不可假设，需对照实际版本核验。这也解释了为什么 05 册只写字段含义与读写时机，而把调用顺序全部留给本篇。
+
+### 4. 关键流程与调用链
+
+解析期调用链自上而下为：配置加载（原理见 06-01）读入 `ips` 段的规则文本 → `parse_rule_init()` 完成解析器初始化 → 对每条规则依次调用 `parse_rule_type`（动作与选择器）→ `parse_rule_proto`（协议与目标网络）→ `parse_rule_nets` / `parse_rule_ports`（源目地址与端口，支持变量展开，变量定义见 04-02）→ `parse_rule_dir`（方向）→ `parse_rule_opt_begin` / `parse_rule_opt_set` / `parse_rule_opt_end` 逐项分发到 `src/ips_options/ips_*.cc` 的各 Option 类构造函数 → `parse_rule_open()` / `parse_rule_close()` 完成 otn 的开启与挂接 → `parse_rule_finish_ports()` 处理端口展开。选项解析的同时，`src/detection/pattern_match_data.h` 的收集器把 content 类模式登记进 PMX 候选，`parse_count` 自增保证编号唯一，`parse_rule_print()` 则打印 fast pattern 未检查 / 未设置的计数。解析结束调用 `parse_rule_term()` 收尾。
+
+编译期链路在 `src/detection/fp_create.cc` 中非常清晰：`fpCreateRuleMaps(SnortConfig*, RulePortTables*)`（源码 884 行附近）作为总入口，先调用 `fpCreateInitRuleMap`（817 行附近）把每协议的 src、dst、any 三张 `PortTable` 初始化成 `PORT_RULE_MAP`，再经 `fpCreatePortTableRuleGroups`（1089 行附近）逐表遍历，把每个 `PortObject2` 经 `fpCreatePortObject2RuleGroup`（1012 行附近）转成 `RuleGroup`，最后把 any-any 组合并进各协议映射。源码在 767 行附近的注释概括了这一过程「for each port-list object create a port_group object」；服务表则以服务名为键存储 port_group 指针，供服务识别命中后按服务路由（原理见 06-04）。`FastPatternConfig` 的 `set_bleed_over_port_limit` / `set_bleed_over_warnings` 决定组过大时的外溢与告警行为，`set_search_method()` 选择搜索引擎，`set_max_pattern_len()` 约束模式长度（参数见 04-02、06-07）。
+
+运行期反查链路为：包完成解码与流绑定后（原理见 06-03、06-05），检测引擎按 `DecodeData::sp`、`dp` 与 `DecodeData::type` 调用 `pcrm.h` 的四个 `prmFindRuleGroup*` 找到候选 `RuleGroup`，找不到精确端口组时回落 any-any 组；组内的 Mpse 用 fast pattern 做一次多模式扫描，命中的 otn 才进入完整选项求值（原理见 06-08）。统计与打印方面，`fp_create.cc` 提供 `fp_sum_port_groups`、`fp_print_port_groups`（源码 1408~1491 行附近）与 `fp_print_service_groups`，`snort -T` 结束时打印各协议 src / dst / any 组的规则数量分布，这是判断规则是否「收敛到正确端口组」的直接证据。
+
+### 5. 配置与代码实例
+
+先给一条最小自定义规则与加载方式。规则文本写入自定义文件后由 `ips` 段 include（完整参数见 04-06），用 `snort -T` 做校验（命令行完整参数见 04-07）。
+
+```ini
+# custom.rules：动作 + 协议 + 地址端口 + 方向 + 选项
+alert tcp $HOME_NET any -> $EXTERNAL_NET 443 (
+    msg:"custom tls fingerprint probe"; flow:to_server,established;
+    content:"|16 03 01|"; depth:3; sid:1000001; rev:1;)
+```
+
+校验命令按「前置检查 → 执行 → 复核」闭环书写：
+
+```bash
+test -f custom.rules && echo "rules file ok"
+snort -c lua/snort.lua --lua-conf-extra "ips = { include = 'custom.rules' }" -T
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+rules file ok
+--------------------------------------------------
+ Ips policies:
+  policy_id:0
+--------------------------------------------------
+rule counts:
+       rules loaded: 1
+Fast pattern port groups
+        tcp src: 0 groups, 0 rules
+        tcp dst: 1 groups, 1 rules
+        tcp any: 1 groups, 1 rules
+```
+
+逐行判读如下，合计超过 150 字。第一行 `rules file ok` 确认规则文件存在，是「前置检查」环节，避免把文件名笔误误判为解析错误。启动段 `Ips policies: policy_id:0` 表示默认策略加载成功，多策略部署时这里会列出多个 policy_id，若缺失说明 `ips` 段未被读取，应回查 `lua/snort.lua` 的 include 路径（参数见 04-02）。`rules loaded: 1` 是解析期计数（对应 `get_rule_count()` 口径），若为 0 而 `-T` 又返回成功，通常是规则文件为空或语法被静默跳过；若直接报错，错误文本一般带规则行号与关键字名，按 04-08 速查表定位。`Fast pattern port groups` 以下三段是 `fp_print_port_groups` 的产物：`tcp dst: 1 groups, 1 rules` 说明目的端口 443 的规则被归入一个独立组，`tcp any: 1 groups, 1 rules` 则是 any-any 组的兜底计数；生产规则集中 any-any 组规则数异常膨胀时，说明大量规则的 fast pattern 未能按端口收敛，应复查规则端口写法与 `FastPatternConfig` 的策略（参数见 04-02）。若日志出现 bleed over 告警，说明某些组超过 `set_bleed_over_port_limit` 的阈值而外溢，需在目标机型实测其吞吐影响。
+
+再给解析器入口的 C++ 片段，展示 `parse_rule.h` 暴露的分段函数形态，便于源码检索：
+
+```cpp
+// src/parser/parse_rule.h（节选自上游 master 快照）
+SO_PUBLIC int get_rule_count();
+void parse_rule_init();
+void parse_rule_term();
+void parse_rule_print(unsigned fb_total, unsigned fb_unchk, unsigned fb_unset);
+void parse_rule_type(snort::SnortConfig*, const char*, RuleTreeNode&);
+void parse_rule_proto(snort::SnortConfig*, const char*, RuleTreeNode&, bool elided = false);
+void parse_rule_nets(snort::SnortConfig*, const char*, bool src, RuleTreeNode&, bool elided = false);
+void parse_rule_ports(snort::SnortConfig*, const char*, bool src, RuleTreeNode&, bool elided = false);
+void parse_rule_dir(snort::SnortConfig*, const char*, RuleTreeNode&, bool elided = false);
+OptTreeNode* parse_rule_open(snort::SnortConfig*, RuleTreeNode&, bool stub = false);
+void parse_rule_close(snort::SnortConfig*, RuleTreeNode*, OptTreeNode*);
+int parse_rule_finish_ports(snort::SnortConfig*, RuleTreeNode*, OptTreeNode*);
+```
+
+这组签名说明两件事：其一，解析不是一个大函数而是按规则头五要素分段，每段都接收 `SnortConfig*` 与可复用的 `RuleTreeNode&`，`elided` 参数用于规则头省略写法；其二，`parse_rule_print` 打印 fast pattern 未检查 / 未设置的计数，是排查「规则加载了但内容不匹配」的入口之一。签名细节以快照源码为准，需对照实际版本核验。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类陷阱是**跳过校验直接上线**。解析与编译的大部分错误（未知关键字、变量未定义、sid 重复、fast pattern 组构建失败）只有在 `snort -T` 时暴露，在线运行时才发现意味着中断流量采集；最佳实践是把 `-T` 作为 CI 步骤，规则集变更必跑。第二类是**any-any 组膨胀**：规则的地址端口写得太宽（例如全 `any`），会导致规则沉入 any-any 组，每包都被扫描，吞吐下降（需在目标机型实测）；排查手段就是 `-T` 输出中的组统计，配合 `fp_sum_port_groups` 的口径理解，并考虑 `set_split_any_any` 一类策略（参数见 04-02）。第三类是**fast pattern 选择不当**：含大量重复短串的 `content` 会让 MPSE 命中率虚高，候选 otn 增多，eval 阶段变慢；可用 `fast_pattern` 显式指定模式，或让 `FastPatternConfig` 的阈值策略处理（参数见 04-02、原理见 06-07）。第四类是**与 Snort 2 的兼容假设**：关键字、默认值与语义均有差异，不能照搬旧规则，`tools/snort2lua/` 转换后必须逐条 `-T` 复核，规则关键字差异需对照实际版本核验。
+
+第五类是**多策略下的规则展开**：同一规则在多个 inspection policy 中会生成多份 otn，内存与编译时间随策略数增长，规模评估需实测，`parse_count` 的唯一性保证正是为这种重复展开而设计。第六类是**不可信规则文本**：`pcre` 与超长 `content` 在编译期就可能消耗大量内存与时间（上限开关见 04-01），第三方规则集引入前应审查，相关加固见 08-05；Talos 规则集另有独立许可约束（`lua/talos.lua`），不可与引擎的 GPLv2 许可混为一谈。第七类是**把编译期与运行期混为一谈**：port group 与端口索引在启动时构建完成，运行期只做查找，不会因某条流而重新编译；想调整分组只能改规则或配置并重启 / 热重载，热重载能力需对照实际版本核验。第八类是**把「加载成功」当成「会被命中」**：加密载荷不可见、IDS 旁路只告警不丢弃、Hyperscan 缺失时回退其他 MPSE 实现，这些边界都会让一条语法正确的规则在运行时不产生告警。所有吞吐、内存类结论均不给绝对值，需在目标机型实测；基准方法见 08-01，诊断树见 08-03。
+
+第九类是**误读错误文本中的行号与关键字名**。规则解析失败时日志通常同时给出规则文件行号与出问题的关键字，前者用于定位文本，后者用于判断该关键字是否受当前版本支持；若把「未知关键字」直接归咎于规则文件损坏，会浪费大量时间。正确做法是先按 04-08 速查表比对错误文本，再用 `snort -T` 对单条规则做隔离验证。第十类是**改变端口写法后不做组统计对比**：规则端口从具体端口改成 `any`、或把 `content` 换成含大量重复短串的写法，都会改变 port group 的分布，而这类变化往往在 `-T` 输出里以 any-any 组数量上升的形式先出现；把每次规则变更前后的 `tcp src / dst / any` 组统计留档，是成本最低的回归手段。综合而言，规则解析与编译层的故障绝大多数能在加载期用 `-T` 捕获，真正进入运行期才暴露的问题，通常与加密不可见、旁路不丢弃、搜索引擎回退等能力边界有关，而非编译产物本身有误。排查时始终按「文本能否解析 → 产物能否编译 → 端口组是否符合预期 → 运行期边界是否允许命中」四步推进，可避免把能力边界误判成解析错误。
+
+### 7. 小结与延伸阅读
+
+本篇覆盖规则从文本到运行期结构的两阶段机制：解析期由 `src/parser/parse_rule.cc` 的分段函数构造 `RuleTreeNode` / `OptTreeNode`，编译期由 `src/detection/fp_create.cc` 构建 port group、`src/detection/pcrm.cc` 建立端口索引、`FastPatternConfig` 决定 fast pattern 策略，最终产物挂接在 `SnortConfig` 的四个 `PORT_RULE_MAP*` 上。关键入口是 `parse_rule_*` 分段函数族、`fpCreateRuleMaps`、`fpCreatePortObject2RuleGroup` 与四个 `prmFindRuleGroup*`。延伸阅读：fast pattern 如何变成搜索引擎见 06-07；命中后选项链如何求值见 06-08；规则关键字全集见 04-06；规则树与 PMX 字段见 05-04、05-06；`src/detection`、`src/parser` 目录职责见 07-05、07-11；规则集运维与热加载见 03-03 与 08 册。

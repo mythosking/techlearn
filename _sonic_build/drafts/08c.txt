@@ -1,0 +1,303 @@
+# SONiC 技术资料 · 08 运维、性能基准与排障（分片 C）
+
+## 08-05 安全加固：管理面、Redis 暴露与镜像供应链
+
+### 1. 背景与动机
+
+SONiC 作为白盒交换机网络操作系统，其安全模型与通用 Linux 主机有本质差别。控制面并非集中在一个单体进程里，而是分散在 database、orchagent、bgp、teamd、snmp、sonic-gnmi、sonic-telemetry 等多个容器及其中的守护进程；数据面则在 ASIC 转发芯片上，控制面经 SAI 下发，除虚拟交换机 `platform/vs/` 外不做软件转发（原理见 06-01 ｜ 模块见 07-02）。这种「容器化控制面 + Redis 分层数据库 + SAI 抽象」的架构决定了安全加固不能照搬主机加固的套路：要害不在某一个登录 Shell，而在三个地方——外部能否触达管理面接入点、Redis 这条贯穿全系统的数据总线是否对不该访问的主体开放、以及把源码变成可安装镜像的供应链是否可信。本篇的动机就是把这三个面拆开讲清，给出可落地的检查与加固顺序，并明确哪些结论必须留到目标机型核验，版本基准统一为「上游 master 快照（2026-11 抓取）」。
+
+为什么把 Redis 单列为加固面，是本篇最需要读者建立的直觉。CONFIG_DB、APPL_DB、ASIC_DB、STATE_DB、COUNTERS_DB 等逻辑库共同构成控制面的「中枢神经」：`config` 命令写 CONFIG_DB，各 `*mgrd` 搬运到 APPL_DB，orchagent 翻译进 ASIC_DB，syncd 经 SAI 编程 ASIC，状态与计数再回写 STATE_DB、COUNTERS_DB（原理见 06-02 ｜ 原理见 06-05）。这意味着谁能写 CONFIG_DB，谁就能间接改变转发行为；谁能读 ASIC_DB 与 STATE_DB，谁就能窥探拓扑与运行状态。因此 Redis 的绑定地址、保护模式与实例隔离，远比「给交换机设个密码」更接近问题的核心。把 Redis 暴露面收敛好，等于给整条异步流水线加了一道边界闸门。
+
+管理面加固的动机来自接入方式的多样化。传统 CLI 之外，SONiC 通过 `dockers/docker-sonic-gnmi/` 与 `dockers/docker-sonic-telemetry/` 提供 gNMI 与 telemetry 接入，经 `sonic-mgmt-common/translib/` 转换、依赖 `models/yang/` 的模型与 `cvl/` 的校验（模块见 07-07 ｜ 原理见 06-14）。这些接口一旦暴露在管理网甚至业务网，若缺少认证、授权与传输保护，就等于把配置下发能力对外开放。AAA 是这道门的第一把锁：`sonic-utilities/config/aaa.py` 里可以核验到对 AAA 表 authentication、authorization、accounting 的读写，以及 login 方式在 ldap、radius、tacacs+、local 之间的切换。管理面加固不是关闭功能，而是「默认最小暴露、显式开启认证、传输加密、操作留痕」。
+
+供应链加固的动机则来自构建链路的复杂性。SONiC 镜像不是在一台普通主机上裸 `make` 出来的，而是在 `sonic-slave-*/` 构建容器内、经 `Makefile`、`slave.mk`、`rules/` 与 `azure-pipelines.yml` 编排产出 ONIE 安装包（模块见 07-01 ｜ 模块见 07-13）。构建链上任一环被污染，都会把问题带进生产镜像，而且很难在运行期发现。本快照里可以核验到 `scripts/build_sbom.py`、`scripts/build_sbom.sh` 及一整族 `sbom_*.py` 脚本、`azure-pipelines.yml` 中的 SBOM 漏洞扫描阶段、`scripts/efi-sign.sh` 的 EFI 签名脚本，以及 `scripts/audit_dep_completeness.sh` 的缓存键完整性门禁。这些机制共同回答一个问题：镜像里的每个组件从哪来、有没有已知漏洞、构建产物有没有被签名与校验。把供应链纳入加固视野，是 SONiC 运维区别于「只管配置」的关键一步。
+
+需要提前说清本篇的边界。第一，SONiC 是白盒 NOS，不是通用服务器操作系统，本文谈的加固都围绕容器化控制面与 Redis 分层数据库展开，不展开主机内核层的通用加固。第二，FRR / FRRouting 源码、Linux 内核、厂商 SAI 实现均不在本快照，涉及它们的加固细节一律写「不在本快照，需对照实际版本核验」。第三，Redis 各逻辑库的编号来自运行时 `database_config.json`，须对照 `sonic-py-swsssdk/src/swsssdk/dbconnector.py` 的 `SonicDBConfig` 与实际版本核验，本文不写死任何库号（参数见 04-04）。第四，所有加固项的开关名、路径与返回形态都需对照实际版本核验，本文给的是可定位目录与核验方法，而不是声称全平台通用的一步到位脚本。
+
+### 2. 核心概念
+
+理解三个加固面，先要建立「信任边界」这个概念。信任边界是系统中两个不同信任级别主体之间的交界，加固的本质就是让每次跨越边界都经过显式的检查。在 SONiC 里，管理终端与管理面接入点之间、外部主体与 Redis 实例之间、构建产物与生产镜像之间，各有一条信任边界。三条边界上的主体、凭据与校验方式都不同，但遵循同一原则：默认拒绝、最小权限、可审计。把它画出来就是图 08-05-01 的骨架，后面第四节的调用链会逐条展开。
+
+管理面这一组概念要区分「接入协议」「转换层」与「认证授权」三个层次。接入协议指 gNMI、REST 与 CLI 这些外部可见的接口，分别落在 `dockers/docker-sonic-gnmi/`、`dockers/docker-sonic-telemetry/` 与 `sonic-utilities/` 的 show/config 命令族（命令全集见 04-05）。转换层是 `sonic-mgmt-common/translib/`，它把外部请求翻译成对 CONFIG_DB 等库的操作，并依赖 `models/yang/` 的模型与 `cvl/` 的校验来保证语义合法（模块见 07-07 ｜ 原理见 06-14）。认证授权层由 AAA 承担，`config/aaa.py` 中对 AAA 表的 authentication、authorization、accounting 三类配置分别对应「你是谁」「你能做什么」「你做了什么」三个问题。三者不可混为一谈：开了 gNMI 不等于做了认证，配了 AAA 不等于传输加密，三者要叠加才是完整的管理面加固。
+
+Redis 暴露面这一组概念的关键是「监听形态」与「保护模式」两个词。`dockers/docker-database/database_config.json.j2` 为每个实例定义了 hostname、port 与 unix_socket_path 等字段，说明 Redis 既可能绑定 TCP 地址，也可能通过 Unix 域套接字提供本机访问；`supervisord.conf.j2` 里可以核验到 `redis-server` 的 `--bind`、`--port`、`--unixsocket` 等启动参数，以及依据 `is_protected_mode` 决定是否附加 `--protected-mode no` 的分支。所谓暴露面，就是这些监听端点的可达范围：绑定回环地址并配合保护模式，是把 Redis 收敛到容器内部；因特定场景（如 BMC 链路、linecard 中板）需要跨实例访问而放宽绑定或关闭保护模式，就等于扩大了攻击面。加固的目标是让每一次放宽都有明确理由与补偿控制，而不是无意识地沿用默认。
+
+供应链这一组概念要抓住「可追溯」与「完整性」两条线。`sonic-slave-*/` 是构建容器的定义目录，`Makefile`、`slave.mk`、`rules/` 是装配规则，它们决定了「用什么环境、按什么步骤构建」（模块见 07-01）。`azure-pipelines.yml` 中的 SBOM 阶段与 `scripts/build_sbom.py`、`sbom_*.py` 脚本族负责生成软件物料清单并做漏洞扫描，回答「镜像里有什么、有没有已知漏洞」。完整性则由签名与校验回答：`scripts/efi-sign.sh` 用私钥与证书对 shim、grub、vmlinuz 等 EFI 文件签名，确保启动链上的固件未被篡改。可追溯解决「来源清不清楚」，完整性解决「途中有没有被改」，两者缺一不可。要强调这些脚本的存在只能在本快照核验其文件名与用途，签名密钥管理、证书链与验签的落地细节需对照实际版本核验。
+
+最后要建立一个贯穿三面的判断习惯：配置动作与生效结果是两件事。写下一条 AAA 配置、调整一次 Redis 绑定、生成一份 SBOM，都不等于加固已经生效或风险已经消除；要按「前置检查 → 执行 → 验证输出 → 清理」的闭环，用 `show`、`config` 与 `sonic-db-cli` 读回状态来确认（参数见 04-05）。这一点与全册铁律「config 返回成功不等于硬件已下发」同源（原理见 06-01），只是这里的「硬件」换成了「安全状态」。带着这个习惯读后面的命令实例，才不会把「命令跑通了」误当成「系统安全了」。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名关键结构与源码落位，逐字段内容一律留给 05 册，不在此重列字段表（字段见 05-02 ｜ 字段见 05-03）。管理面的核心落位是 `sonic-mgmt-common/sonic-mgmt-common-master/translib/` 与 `models/yang/`、`cvl/`，CLI 侧是 `sonic-utilities/sonic-utilities-master/config/aaa.py` 与 `show/`、`config/` 目录。Redis 暴露面的核心落位是 `sonic-buildimage/sonic-buildimage-master/dockers/docker-database/` 下的 `database_config.json.j2`、`database_global.json.j2`、`multi_database_config.json.j2`、`supervisord.conf.j2` 与 `docker-database-init.sh`。供应链的核心落位是顶层 `Makefile`、`Makefile.work`、`slave.mk`、`rules/`、`azure-pipelines.yml`、`scripts/` 下的 SBOM 与签名脚本族，以及 `sonic-slave-*/` 各构建容器目录（模块见 07-01 ｜ 模块见 07-13）。以上路径均相对各自子仓的 `xxx-master/` 根。
+
+AAA 侧可以核验到的事实性细节有两类。其一是 `config/aaa.py` 中出现的模块级常量 `RADIUS_MAXSERVERS` 与 `RADIUS_PASSKEY_MAX_LEN`，以及 `is_secret`、`prompt_secret` 这类处理凭据的辅助函数，说明该模块确实承担了密钥输入与服务器数量约束；其二是可编程入口，`login()` 函数通过 `add_table_kv` 与 `del_table_key` 维护 AAA 表的 authentication/login 项，取值在 ldap、radius、tacacs+、local 之间切换，`authorization()` 与 `accounting()` 则维护对应的 authorization/login、accounting/login 项。这些函数名与常量名在本快照可核验，但它们写入的 AAA 表完整字段定义与校验规则需对照实际版本核验（字段见 05-02 ｜ 参数见 04-05）。特别提醒：这里只说「函数名真实存在」，不展开函数签名与参数全集。
+
+Redis 启动侧的落位最值得逐字说明，因为它直接对应「暴露面」。`supervisord.conf.j2` 里 `redis-server` 的命令行可以核验到 `--bind {{ LOOPBACK_IP }} {{ redis_items['hostname'] }}`、`--port {{ redis_items['port'] }}`、`--unixsocket {{ redis_items['unix_socket_path'] }}` 等形态，以及依据 `not redis_items['is_protected_mode']` 决定是否附加 `--protected-mode no` 的 Jinja 分支。`docker-database-init.sh` 里可以核验到根据实例 hostname 是否为 127.0.0.1 来计算 `is_protected_mode` 的逻辑，以及当检测到 switch_bmc 场景时为主 redis 实例注入 bmc_link_ip、bmc_link_if 并关闭保护模式、当检测到 linecard 数据库时为暴露到中板而关闭保护模式的分支。这些是「为什么会放宽绑定」的真实成因，字段名与模板变量属配置层面，具体取值与生成结果需对照实际版本核验（参数见 04-04 ｜ 字段见 05-03）。
+
+供应链侧的落位可以核验到一组明确的脚本与流水线阶段。`scripts/` 下有 `build_sbom.py`、`build_sbom.sh`、`install_sbom_tool.sh`、`sbom_emit_provenance.py`、`sbom_parse_lockfiles.py`、`sbom_resolve_licenses.py`、`sbom_cve_refs.py`、`sbom_diff.py` 等一整族与物料清单相关的工具，以及 `efi-sign.sh`、`convert-pfx-cert-format.sh` 这两个与签名、证书格式转换相关的脚本。`azure-pipelines.yml` 中可核验到 CacheKeyLint 这一 PR 门禁阶段（依赖 `scripts/audit_dep_completeness.sh` 做缓存键完整性审计），以及 SBOM 漏洞扫描阶段（发布 `sbom-vuln-scan-results` 工件）。`efi-sign.sh` 的用法提示里列出 `-p` 私钥、`-c` 证书、`-e` 待签 EFI 文件、`-s` 输出文件四个选项，并点明签名对象是 shim、grub、vmlinuz。这些只是「文件名与用途可核验」，签名密钥保管、证书链信任与验签流程的细节需对照实际版本核验（模块见 07-13）。
+
+为便于把「加固面—落位—核验去向」串起来，下表按三个面归纳可核验的源码位置；表中均为目录或文件名，不含未核实的路径与取值。
+
+| 加固面 | 关键落位（相对子仓 xxx-master/ 根） | 可核验职责 | 核验去向 |
+|---|---|---|---|
+| 管理面 | `sonic-mgmt-common/translib/`、`models/yang/`、`cvl/` | 协议转 CONFIG_DB 操作与校验 | 原理见 06-14 |
+| 认证授权 | `sonic-utilities/config/aaa.py` | AAA 表 authentication/authorization/accounting | 参数见 04-05 |
+| Redis 绑定 | `dockers/docker-database/supervisord.conf.j2` | bind/port/unixsocket/protected-mode 参数 | 参数见 04-04 |
+| 实例拓扑 | `dockers/docker-database/database_config.json.j2` | 定义实例 hostname/port/socket 与库映射 | 字段见 05-03 |
+| 构建环境 | `sonic-slave-*/`、`Makefile`、`slave.mk`、`rules/` | 构建容器与装配规则 | 模块见 07-01 |
+| 物料与签名 | `scripts/build_sbom.py`、`efi-sign.sh`、`azure-pipelines.yml` | SBOM、漏洞扫描与 EFI 签名 | 模块见 07-13 |
+
+表中「管理面」与「认证授权」分列，是为了强调接入转换与鉴权是两套机制：前者决定请求如何变成数据库操作，后者决定谁有资格发请求。若把二者混成一项，加固时容易只做一半。Redis 的「绑定」与「实例拓扑」同理，一个管进程怎么监听，一个管有哪些实例与库映射，排障时要分别核对（原理见 06-02 ｜ 模块见 07-02）。
+
+### 4. 关键流程与调用链
+
+把三个加固面的信任边界与数据流叠在一起，就得到本篇的核心图：一次外部请求从管理终端到达 ASIC 之前要跨越的边界，以及镜像从构建到启动要跨越的完整性关卡，见图 08-05-01。
+
+:::figure id=08-05-01 | name=SONiC 三大加固面与信任边界 | dir=TD
+node a "运维与管理终端<br/>外部输入" gray
+node b "管理面 gNMI REST CLI<br/>translib 与 YANG CVL" purple
+node c "AAA 认证授权<br/>config/aaa.py" teal
+node d "CONFIG_DB" blue
+node e "Redis 实例<br/>bind 与 protected-mode" blue
+node f "容器内消费者<br/>mgrd orchagent syncd" green
+node g "构建与 CI<br/>slave SBOM 签名" amber
+node h "镜像与固件<br/>EFI 签名校验" red
+node i "ASIC 数据面" red
+edge a -> b "管理请求"
+edge b -> c "鉴权"
+edge c -> d "写入"
+edge d -> e "落地"
+edge e -> f "消费"
+edge g -> h "产出与验签"
+edge h -> i "启动装载"
+edge f -> i "下发"
+:::
+
+图 08-05-01 用颜色区分语义：gray 为外部输入，purple 为管理面的控制面接入与转换，teal 为认证授权，blue 为数据库与 Redis 实例，green 为容器内消费者，amber 为构建产物与 CI，red 为固件、硬件与数据面边界。读图要抓住两条主链。上半链是「运行时信任链」：管理终端的请求先到管理面接入点，经 AAA 鉴权后才被允许写 CONFIG_DB，CONFIG_DB 落到 Redis 实例，再由 mgrd、orchagent、syncd 逐级消费并最终下发 ASIC；任何一级鉴权或绑定缺失，都会让这条链在对应边界上失守（原理见 06-01 ｜ 原理见 06-14）。下半链是「构建完整性链」：构建与 CI 环节产出镜像并做 SBOM 与签名，镜像与固件经 EFI 验签后才被装载，最终承载数据面；这条链保证的是「跑起来的软件就是被审核过的那份」（模块见 07-13）。
+
+先看运行时信任链的管理面一段。外部请求进入 `dockers/docker-sonic-gnmi/` 或 telemetry 容器后，由 `sonic-mgmt-common/translib/` 转换，转换过程受 `models/yang/` 模型与 `cvl/` 校验约束（模块见 07-07）；与此同时 AAA 决定这次请求是否被授权。`config/aaa.py` 里的 authentication/login 决定用 ldap、radius、tacacs+ 还是 local 做身份认证，authorization/login 决定授权来源，accounting/login 决定是否记录操作（参数见 04-05）。关键在于这三者是「与」的关系而非「或」：任何一项缺省都意味着对应边界没有检查。telemetry 的证书相关配置可从 `telemetry_vars.j2` 的 certs、gnmi、x509 字段看出有传输保护的位置，但证书如何签发、如何轮换需对照实际版本核验。管理面加固的正确顺序是「先确认接入面只暴露在管理网，再确认认证开启，最后确认传输加密与审计留痕」。
+
+再看 Redis 绑定一段。CONFIG_DB 的写入最终落到某个 Redis 实例，而 `supervisord.conf.j2` 决定这个实例监听在哪里：`--bind` 后面跟的是 LOOPBACK_IP 与实例 hostname 的组合，`--protected-mode no` 是否附加取决于 `is_protected_mode`。`docker-database-init.sh` 里根据 hostname 是否为回环地址设定保护模式，并在 switch_bmc、linecard 等特定场景主动放宽绑定或关闭保护模式。运行时信任链在这一点的加固判据很具体：默认应当只绑定回环地址并开启保护模式，任何对 0.0.0.0 或非回环地址的绑定、任何 `--protected-mode no` 的出现，都要能追溯到明确的场景理由（如 BMC 链路、中板通信）并有网络层隔离作为补偿控制。读 `database_config.json.j2` 时还要注意它定义了 remote_redis 实例，跨实例访问的存在本身不是问题，问题是它是否暴露在不该可达的网络上（参数见 04-04 ｜ 字段见 05-03）。
+
+最后看构建完整性链。`sonic-slave-*/` 定义了构建环境，`Makefile`、`slave.mk`、`rules/` 决定装配，`azure-pipelines.yml` 编排了 CacheKeyLint 门禁与 SBOM 漏洞扫描阶段（模块见 07-01 ｜ 模块见 07-13）。CacheKeyLint 通过 `scripts/audit_dep_completeness.sh` 在 PR 阶段拦截未被缓存键覆盖的依赖变更，防止缓存命中服务了陈旧产物——这是供应链里很隐蔽的一类风险。`scripts/build_sbom.py` 与 `sbom_*.py` 脚本族生成物料清单并解析锁文件、许可证与 CVE 引用，`efi-sign.sh` 用私钥与证书对 shim、grub、vmlinuz 签名。完整性链上的加固判据是：构建在受控的 slave 容器内进行、产物有 SBOM、关键固件有签名，且验签在启动时真实执行。需要强调，签名脚本与 SBOM 脚本的存在只能说明「机制具备」，密钥是否妥善保管、验签是否被绕过、SBOM 是否覆盖全部组件，都需对照实际版本与实际部署核验。三条链合起来还呼应一个贯穿全册的事实：即便前面全部正确，`config` 返回成功也只代表配置进了 CONFIG_DB，不等于 ASIC 已下发（原理见 06-01），加固状态同理需要读回验证。
+
+### 5. 配置/命令/代码实例
+
+本节给两组最小实例：一组用只读命令核对 Redis 绑定与保护模式的实际形态并作逐行判读，一组给出 AAA 配置与 gNMI/telemetry 证书字段的落位片段。完整的 show / config 命令见 04-05，Redis 对象与库映射见 04-04，字段定义见 05-02 与 05-03，本节不重列参数全集。所有示例输出均注明「示例输出，具体格式需对照实际版本核验」；库名、表名、容器名与命令选项需对照实际版本核验。先给一组只读核对命令：查看 Redis 实例的绑定地址与保护模式，再看一眼 AAA 与 gNMI/telemetry 的配置落位。以下命令需在具备相应权限的环境执行，属只读探查，不改变配置。
+
+```bash
+# 前置检查：确认数据库容器可达（容器名需对照实际版本核验）
+docker exec -it database redis-cli PING
+# 执行：读取主 Redis 实例的绑定地址与保护模式（端口与实例名需对照实际版本核验）
+docker exec -it database redis-cli CONFIG GET bind
+docker exec -it database redis-cli CONFIG GET protected-mode
+# 验证：从配置库读回 AAA 认证方式与 gNMI 证书配置（表名与字段名需对照实际版本核验）
+sonic-db-cli CONFIG_DB HGET 'AAA|authentication' login
+sonic-db-cli CONFIG_DB HGET 'GNMI|certs' server_cert
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（下列取值仅为格式示意，不代表任何具体版本或机型）
+PONG
+1) "bind"
+2) "127.0.0.1"
+1) "protected-mode"
+2) "yes"
+"local"
+(nil)
+```
+
+逐行判读如下。第一段 `redis-cli PING` 返回 `PONG`，说明数据库容器内 Redis 通道可达，这是任何暴露面核对的前置条件；若连不上应先查容器状态而非怀疑加固配置。第二段 `CONFIG GET bind` 返回 `127.0.0.1`，表明该实例只绑定回环地址，外部网络无法直接连到这个 Redis，这是期望的默认收敛形态；若这里出现 `0.0.0.0` 或某个业务网地址，就要回到 `docker-database-init.sh` 查是否有 switch_bmc 或 linecard 分支被触发，并要求给出场景理由与网络隔离补偿。第三段 `CONFIG GET protected-mode` 返回 `yes`，说明保护模式开启，未认证的外部连接会被拒绝；若返回 `no`，则与 `supervisord.conf.j2` 里附加 `--protected-mode no` 的分支对应，属于需要重点审查的放宽项。第四段 `sonic-db-cli CONFIG_DB HGET 'AAA|authentication' login` 返回 `local`，说明登录认证采用本地方式，若期望集中认证则应看到 radius 或 tacacs+，需与 `config/aaa.py` 的取值集合核对。第五段读 `GNMI|certs` 的 server_cert 返回 `(nil)`，说明该字段未配置，意味着 gNMI 的服务端证书可能缺失，需要结合 `telemetry_vars.j2` 的 certs、gnmi、x509 三项与 `dockers/docker-sonic-gnmi/` 的实际启动参数判断传输是否受保护。整体看，这组命令把图 08-05-01 上半链的「Redis 绑定」与「认证授权」两个边界读回成可判读的取值，任何一项偏离预期都要顺着对应源码分支追原因，而不是改完就认定安全（参数见 04-04 ｜ 参数见 04-05 ｜ 原理见 06-14 ｜ 模块见 07-07）。
+
+第二组给出 AAA 配置与证书字段的命令形态，用来说明「加固动作」如何落到配置库；这些命令会写配置，执行前需确认变更窗口与回退方案，配置项名称与取值需对照实际版本核验。
+
+```bash
+# 配置集中认证与授权、开启记账（命令形态依据 config/aaa.py 可核验函数整理，需对照实际版本核验）
+config aaa authentication login tacacs+
+config aaa authorization login tacacs+,local
+config aaa accounting login tacacs+,local
+# 配置 TACACS+ 服务器与密钥（服务器地址与密钥为示例值，实际需替换并安全保管）
+config aaa tacacs add 192.0.2.10
+config aaa tacacs key 192.0.2.10 <secret>
+# 保存配置使变更在重启后保留（具体命令需对照实际版本核验）
+config save
+```
+
+这段配置的意图是把认证、授权、记账三项都指向集中式 TACACS+，并用 local 作为授权回退，避免集中服务器不可达时完全失去登录能力。`config/aaa.py` 里 `login()`、`authorization()`、`accounting()` 分别写入 AAA 表的 authentication/login、authorization/login、accounting/login 项，`add_table_kv` 与 `del_table_key` 是其底层读写手段；`prompt_secret`、`is_secret` 说明密钥输入有专门的隐藏与校验处理。需要强调两点：其一，这里服务器地址 `192.0.2.10` 与 `<secret>` 仅为格式示例，不是可用值，实际部署必须替换并妥善保管密钥；其二，AAA 配置是否真正生效、集中服务器是否可达、传输是否加密，都要用第一组的只读命令与 `show` 输出回读确认，命令返回成功不等于认证已按预期工作（参数见 04-05 ｜ 模块见 07-06）。
+
+第三组用一段模板片段印证「Redis 绑定如何由配置生成」，便于把运行期读回的取值与源码分支对上；片段依据 `dockers/docker-database/supervisord.conf.j2` 中可核验的 Jinja 形态整理，做了简化，真实模板需对照实际版本核验。
+
+```jinja
+{% if not redis_items['is_protected_mode'] %}
+{%- set ADDITIONAL_OPTS = '--protected-mode no' %}
+{% else %}
+{%- set ADDITIONAL_OPTS = '' %}
+{% endif %}
+command=/bin/bash -c "... exec /usr/bin/redis-server /etc/redis/redis.conf \
+  --bind {{ LOOPBACK_IP }} {{ redis_items['hostname'] }} --port {{ redis_items['port'] }} \
+  --unixsocket {{ redis_items['unix_socket_path'] }} {{ ADDITIONAL_OPTS }}"
+```
+
+这段模板说明三件事：监听地址由 `LOOPBACK_IP` 与 `redis_items['hostname']` 共同决定，保护模式由 `is_protected_mode` 决定，Unix 域套接字路径由 `unix_socket_path` 给出。把它与第一组命令对照，就能从「运行期看到 bind=127.0.0.1、protected-mode=yes」反推出「生成时 hostname 为回环、is_protected_mode 为真」，从而定位到 `docker-database-init.sh` 里计算该标志的分支。这种「运行期取值 ↔ 生成期模板」的双向对照，是 Redis 暴露面排障最有效的方法（参数见 04-04 ｜ 字段见 05-03 ｜ 模块见 07-02）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是「开了功能等于做了加固」的陷阱。最常见的是把 gNMI 或 telemetry 容器起来、把 AAA 命令敲完，就认定管理面安全了。实际上接入、转换、认证、授权、传输加密、审计是互相独立的不同层次：容器在跑只说明接入可用，AAA 配了 local 只说明有本地认证，证书字段为 nil 时传输可能仍是明文。判读必须按图 08-05-01 上半链逐层核对，缺哪一层补哪一层，不能用一层的成功掩盖另一层的缺失（原理见 06-14 ｜ 模块见 07-07）。
+
+第二类是 Redis 保护模式的语义陷阱。`--protected-mode no` 并不等于「允许任意外部连接」，它只是关闭了 Redis 自带的保护模式；真正的可达性还取决于 `--bind` 的地址、容器网络与宿主机防火墙。反过来，绑定回环地址也不等于绝对安全：若同容器或同网络命名空间内有非受信进程，Unix 域套接字与回环 TCP 仍可被本地访问。因此放宽绑定与关闭保护模式这两件事要结合 `%docker-database-init.sh` 里 switch_bmc、linecard 等成因一起看，确认每一次放宽都有明确理由与补偿控制（参数见 04-04 ｜ 模块见 07-02）。这里的文件名以可核验的 `docker-database-init.sh` 为准。
+
+第三类是事实纪律与编号陷阱。Redis 各逻辑库编号来自运行时 `database_config.json`，须对照 `sonic-py-swsssdk/src/swsssdk/dbconnector.py` 的 `SonicDBConfig` 核验，禁止写死某库是某号；`database_config.json.j2` 中出现的 id 字段是模板取值，本文不据此下结论（参数见 04-04）。FRR / FRRouting 源码、Linux 内核与厂商 SAI 实现不在本快照，涉及它们的加固细节一律写「不在本快照，需对照实际版本核验」，不得编造文件、字段名与版本。签名密钥保管、证书链信任与验签流程在本快照只能核验到脚本存在与选项形态，落地细节需对照实际版本核验（模块见 07-13）。
+
+第四类是「配置生效」与「安全状态」混淆的陷阱。写下 AAA 配置、改完 Redis 绑定，都不等于加固已生效；`config` 返回成功与新状态下线是两件事，这与全册「config 返回不等于硬件已下发」的铁律同源（原理见 06-01）。正确的验证闭环是「前置检查 → 执行 → 用只读命令读回 → 对照预期判读 → 必要时清理或回退」，本节第一组命令就是这个闭环的示范。第五类是供应链陷阱：把「构建能出镜像」等同于「供应链可信」。能否构建只说明工具链齐全，而 SBOM 是否覆盖全部组件、CVE 扫描是否阻断高危项、EFI 验签是否在启动时真实执行，都需要单独核验；`azure-pipelines.yml` 里的 CacheKeyLint 与 SBOM 扫描阶段存在，只能说明机制具备（模块见 07-13）。
+
+最佳实践归纳为四条。其一，按信任边界分层加固：管理面先收敛暴露面再开认证与加密，Redis 先默认收敛绑定与保护模式再为特定场景逐个开口，供应链先保证构建环境受控再叠加 SBOM 与签名。其二，所有加固项都用「运行期读回 ↔ 生成期模板」双向对照来验证，把取值反推到源码分支，而不是凭命令返回判定。其三，示例输出一律注明「示例输出，具体格式需对照实际版本核验」并附逐行判读，命令按闭环写全，密钥与地址用示例值并提醒替换。其四，跨册引用统一用四段式写法，本篇涉及的字段写「字段见 05-02 / 05-03」、命令参数写「参数见 04-04 / 04-05」、配置流水线与管理面原理写「原理见 06-01 / 06-14」、模块能力写「模块见 07-02 / 07-07 / 07-13」，不在本篇重列字段表与参数全集。任何容量、时延与吞吐类结论一律标注「需在目标机型实测」，不给绝对值（基准方法见 08-01 ｜ 调优见 08-02）。
+
+### 7. 小结与延伸阅读
+
+本篇把 SONiC 的安全加固拆成三个面：管理面、Redis 暴露面与镜像供应链。管理面的要害是接入、转换、认证、授权、传输加密与审计六层叠加，落位在 `sonic-mgmt-common/translib/`、`config/aaa.py` 与 gNMI/telemetry 容器；Redis 暴露面的要害是绑定地址与保护模式，落位在 `dockers/docker-database/` 的 `supervisord.conf.j2`、`database_config.json.j2` 与 `docker-database-init.sh`；供应链的要害是可追溯与完整性，落位在 `sonic-slave-*/`、`azure-pipelines.yml`、`scripts/build_sbom.py` 与 `scripts/efi-sign.sh`。图 08-05-01 把三条信任边界画在同一张图里，是回查索引；三条判断贯穿全篇——开了功能不等于做了加固、配置生效不等于安全状态、机制存在不等于落地有效。
+
+延伸阅读按目标分流。想补管理面原理，接读 06-14（gNMI / REST / CLI 与 YANG 模型）与 03-04（CLI 与 telemetry、gNMI 接入）；想补 Redis 分层与数据流，接读 06-01、06-02 与 04-04（Redis 数据库编号与对象全集）；想补命令全集，接读 04-05；想补字段定义，接读 05-02 与 05-03；想补模块能力，接读 07-02（dockers 容器族）、07-06（CLI 模块）、07-07（sonic-mgmt-common）与 07-13（脚本、CI 与基础设施）；想补构建与供应链上游，接读 02-02、02-05 与 07-01。上线前如何把本篇的加固项变成可执行的检查清单，接读 08-06；排障时按现象反查，接读 08-03 与 08-04。
+
+跨册引用请始终使用「字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx」的写法，`xx` 替换为具体篇号。最后重申资料纪律：本篇所有示例输出均注明「示例输出，具体格式需对照实际版本核验」并附逐行判读；所有源码路径均相对各子仓 `xxx-master/` 根；Redis 库编号一律不写死，须对照 `sonic-py-swsssdk` 的 `SonicDBConfig` 核验；FRR / Linux 内核 / 厂商 SAI 写「不在本快照，需对照实际版本核验」；签名密钥、证书链与验签流程的细节同样标注核验要求并给出 `scripts/`、`dockers/docker-sonic-gnmi/` 等可定位目录。版本基准始终为「上游 master 快照（2026-11 抓取）」，不写绝对版本号与 Redis DB 编号；性能、容量与时延类结论一律标注「需在目标机型实测」。至此 08 册分片 C 的安全加固篇收束，下一篇 08-06 把本篇的加固项与全册的部署、排障要点整理成上线 checklist 与运维手册。
+
+## 08-06 上线 checklist 与运维手册
+
+### 1. 目标与场景
+
+本篇的目标是把前面各册分散讲述的部署、加固、基准与排障要点，收敛成一份可照着执行的上线检查清单和一本值班可翻的运维手册。SONiC 作为整机 NOS，上线并不是「把配置敲完」就结束：镜像要对、容器要起、配置要落到 CONFIG_DB 并逐级进入 APPL_DB、ASIC_DB，端口与协议要真正可用，计数要能读，安全边界要收口，回滚方案要备好（原理见 06-01 ｜ 模块见 07-02）。任何一个环节漏检，都可能在业务流量接入后变成难以定位的故障。checklist 的价值就在于把这些环节变成逐项打勾的动作，并用明确的「通过判据」取代模糊的「看起来没问题」。
+
+适用场景有三类。第一类是新设备首次上线：从镜像启动、`config_db.json` 落地、端口与 BGP 配置，到接入监控与加固收口，按清单从头走一遍。第二类是升级或重新部署后的复核：用同一份清单确认新版本下各层状态 intact，避免「升级成功但某项能力悄悄退化」，升级与回滚的命令形态见 03-05，受平台与版本限制的 warm reboot 需对照实际版本核验。第三类是变更后的回归检查：改了 AAA、调整了 Redis 绑定、下发了一批 ACL 之后，用清单快速确认没有破坏其他层。三类场景共用一份清单，区别只在执行范围与抽样比例。
+
+本篇与相邻篇的边界要划清。03 册讲「怎么把设备跑起来」的部署步骤，本篇讲「怎么确认设备可以上线并持续健康」的检查与判读；08-03、08-04 讲「出故障后按决策树反查」，本篇的「常见失败与排错」只做分诊与指向，不重复完整案例；08-05 讲加固项的来龙去脉，本篇把它的关键项变成清单条目；08-01、08-02 讲基准方法与调优，本篇只引用「需在目标机型实测」的结论，不给绝对值。换句话说，本篇是「把这些能力组合起来用」的运维视角，不重列任何参数全集（参数见 04-05）或字段表（字段见 05-02）。
+
+版本基准统一为「上游 master 快照（2026-11 抓取）」。清单里的命令名、选项、表名、容器名与字段都需对照实际版本核验，本文给的是「用哪类命令、判读什么状态」的方法，而不是声称全平台无差别适用的脚本。所有容量、收敛、时延与吞吐数字一律标注「需在目标机型实测」，不给绝对值、不给跨机型通用数字（基准方法见 08-01 ｜ 调优见 08-02）。
+
+### 2. 前置条件与环境
+
+执行上线 checklist 之前，先把「人和工具」的条件备齐，否则清单本身会变成误判来源。访问条件上，需要可用的管理网通道与console带外通道：带外通道用于容器或网络异常时的兜底访问，不能只依赖在网管理地址。权限条件上，需要一个具备配置与查询权限的账号，且该账号的认证方式应与 08-05 的加固结论一致——若已切换到 TACACS+ 或 RADIUS，要先确认集中认证服务器可达，并保留 local 回退，避免加固后把自己锁在门外（模块见 07-06）。工具条件上，需要 `show` / `config` 命令族、`sonic-db-cli`、`docker` 命令与 `redis-cli` 可用；这些可执行文件与参数需对照实际版本核验。
+
+信息条件同样关键。手里要有与目标版本匹配的镜像及其来源记录，最好能追溯到构建产物与 SBOM，确认供应链可核验（模块见 07-13）；要有与设备 `device/<vendor>/<hwsku>/` 匹配的 `config_db.json` 或 minigraph 生成结果，确认平台与 HWSKU 一致（模块见 07-10）；要有端口、VLAN、IP、BGP 与 AAA 的规划表，作为「通过判据」的比对基线；要有网络侧的预期状态，如对端设备、邻居 AS 与预期前缀数，否则 `show ip bgp summary` 的输出无从判读（参数见 04-02 ｜ 参数见 04-03）。
+
+变更条件包括变更窗口、回退方案与备份。回退方案至少要能回答三件事：当前运行镜像是什么、能否切回上一版本、`config_db.json` 是否有可恢复的副本。升级与回滚走 `sonic_installer/` 相关命令，具体命令名与选项需对照实际版本核验（模块见 07-06）。配置持久化用 `config save` 一类命令保证变更在重启后保留，其具体形态需对照实际版本核验。若涉及 warm reboot，要先确认该能力受平台与版本限制，不能默认全平台支持（原理见 06-10）。
+
+环境上还要明确「观察点」。各层状态的读取点不同：`show` 命令读的是对外呈现的状态，`sonic-db-cli` 读的是各逻辑库的原始表项，容器与进程状态要经 `docker` 或 `show processes` 一类命令查看。把这几个观察点分清，才能在清单执行中正确判读：例如 `show interfaces status` 看到端口 up 是运行时状态，`sonic-db-cli ASIC_DB` 里看到端口对象是芯片视图，两者不能互相替代（原理见 06-05 ｜ 排障见 08-03）。Redis 各库编号来自运行时配置，须对照 `sonic-py-swsssdk/src/swsssdk/dbconnector.py` 的 `SonicDBConfig` 核验，本文不写死库号（参数见 04-04）。
+
+### 3. 分步操作
+
+清单的执行顺序遵循「先确认底座、再逐层向上、最后收口与放量」的分层门禁思想，整条路径见图 08-06-01。图中实线为通过的递进关系，虚线为异常时的回退路径；每层门禁不通过，就停在该层排障，不带病向上推进。
+
+:::figure id=08-06-01 | name=上线检查的分层门禁与回退路径 | dir=TD
+node a "版本与镜像核对<br/>show version" gray
+node b "容器与进程状态<br/>docker ps show processes" teal
+node c "CONFIG_DB 落地<br/>config_db.json" blue
+node d "APPL_DB ASIC_DB 表项<br/>sonic-db-cli" blue
+node e "端口与 BGP 状态<br/>show interfaces bgp" purple
+node f "计数与监控<br/>COUNTERS_DB telemetry" green
+node g "加固与回滚<br/>AAA 绑定 备份" red
+node h "灰度与容量<br/>需目标机型实测" amber
+edge a -> b "版本正确"
+edge b -> c "容器正常"
+edge c -> d "配置落地"
+edge d -> e "逐段判读"
+edge e -> f "业务可用"
+edge f -> g "安全收口"
+edge g -> h "受控放量"
+edge h -> a dashed "异常回退"
+:::
+
+图 08-06-01 的颜色语义与全册一致：gray 为输入与外部依赖，teal 为配置管理，blue 为数据库，purple 为控制面，green 为运行时与 SAI，red 为故障与硬件边界，amber 为产物与容量。读图要点是「顺序不可跳跃」：版本与镜像不对，后面全白查；容器没起，谈配置落地没有意义；CONFIG_DB 没落地，APPL_DB 与 ASIC_DB 必然为空；逐段判读通过，才谈得上业务可用与安全收口。最下面那条虚线回退路径提醒读者，上线检查不是单向流程，任何一层发现不可接受的结果，都要能退回上一状态。
+
+下面是可直接照做的上线 checklist。表中命令为形态示意，具体命令名、选项、表名与字段名需对照实际版本核验；「通过判据」给出可判读的预期，凡涉及容量与时延处均标注需在目标机型实测。单元格内出现的 `|` 已按规范转义。
+
+| 检查项 | 命令（形态示意，需核验） | 通过判据 |
+|---|---|---|
+| 版本基准 | `show version` | 版本与镜像信息与规划一致，版本号需核验 |
+| 镜像来源与签名 | 核对构建产物 SBOM 与签名记录 | 产物可追溯到受控构建，验签通过（见 08-05） |
+| 平台与 HWSKU | `show platform summary` | 平台与 HWSKU 与 device/ 目录期望一致 |
+| 关键容器状态 | `docker ps` | database、orchagent、bgp 等容器处于 Up |
+| 关键进程 | `show processes` | orchagent、syncd、bgpd 存在且未反复重启 |
+| 配置持久化 | `config save` | 配置写回成功，重启后保留（命令需核验） |
+| 配置合法性 | `config load` 预检或 sonic-cfggen | JSON 可解析，无字段校验错误 |
+| CONFIG_DB 端口 | `sonic-db-cli CONFIG_DB KEYS 'PORT\|*'` | 端口条目存在，字段见 05-02 |
+| APPL_DB 端口 | `sonic-db-cli APPL_DB KEYS 'PORT_TABLE:*'` | 有与规划一致的端口表项 |
+| ASIC_DB 对象 | `sonic-db-cli ASIC_DB KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_PORT:*'` | 有端口对象，键格式需核验 |
+| 端口状态 | `show interfaces status` | 预期端口 Oper 为 up（需已接线与对端配置） |
+| VLAN 与接口 IP | `show vlan brief`、`show ip interface` | 成员与 IP 与规划一致 |
+| BGP 邻居 | `show ip bgp summary` | 邻居 Established，前缀数符合预期 |
+| 路由表项 | `sonic-db-cli APPL_DB KEYS 'ROUTE_TABLE:*'` | 预期路由已进入 APPL_DB |
+| 计数器 | `show interfaces counters` | 计数非零且随流量增长 |
+| 系统健康 | `show system health` | 无 critical 级告警 |
+| 日志错误 | `show logging` | 无持续增长的 ERROR 与异常重启记录 |
+| 时间同步 | `show clock`、NTP 状态命令 | 时间与 NTP 源一致（命令需核验） |
+| AAA 认证方式 | `sonic-db-cli CONFIG_DB HGET 'AAA\|authentication' login` | 与规划一致，保留 local 回退 |
+| Redis 暴露面 | `docker exec -it database redis-cli CONFIG GET bind` | 仅绑定回环，protected-mode 为 yes |
+| warm reboot 策略 | 查 WARM_RESTART 表（表名需核验） | 受平台与版本限制，需核验 |
+| 监控与告警 | telemetry / gNMI 采集端 | 关键指标可采集，告警阈值生效 |
+| 回滚方案 | `sonic-installer list` | 有可回退镜像与配置备份（命令需核验） |
+| 容量基线 | 按 08-01 方法实测 | 收敛与时延已在目标机型实测，无绝对值 |
+
+清单共 24 项，覆盖图 08-06-01 的八层门禁。执行时建议按表序自上而下，一项一记：前 8 项属「底座正确」，确认版本、容器与配置落地；第 9 至 14 项属「流水线逐段」，确认配置经 APPL_DB、ASIC_DB 到业务状态；第 15 至 18 项属「可观测性」，确认计数、健康、日志与时间；第 19 至 24 项属「安全与可持续」，确认加固、回滚与容量基线（字段见 05-02 ｜ 参数见 04-05 ｜ 原理见 06-02 ｜ 模块见 07-02）。
+
+### 4. 验证方法与预期结果
+
+清单列完，关键是「怎么判定通过」。下面给一组按分层门禁组织的只读验证命令，并附示例输出与逐行判读。命令需在具备查询权限的环境执行，命令名、选项、容器名与表名需对照实际版本核验。
+
+```bash
+# 前置检查：版本与容器底座（命令与输出格式需对照实际版本核验）
+show version
+docker ps
+# 执行：逐层读取配置与表项（库名、表名与键格式需对照实际版本核验）
+sonic-db-cli CONFIG_DB KEYS 'PORT|*'
+sonic-db-cli APPL_DB KEYS 'PORT_TABLE:*'
+sonic-db-cli ASIC_DB KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_PORT:*'
+# 验证：对外呈现的业务状态
+show interfaces status
+show ip bgp summary
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（下列取值仅为格式示意，不代表任何具体版本或机型）
+SONiC Software Version: SONiC.master.xxxx
+Platform: x86_64-xxxx
+HwSKU: xxxx
+CONTAINER ID   IMAGE        STATUS        NAMES
+a1b2c3d4e5f6   database     Up 2 hours    database
+f6e5d4c3b2a1   orchagent    Up 2 hours    orchagent
+PORT|Ethernet0
+PORT_TABLE:Ethernet0
+ASIC_STATE:SAI_OBJECT_TYPE_PORT:oid:0x1000000000001
+Ethernet0   xxxxx   200G   110   up   up
+Neighbor        V    AS    MsgRcvd   MsgSent   State
+192.0.2.1       4    65001   1200      1205      Established
+```
+
+逐行判读如下。第一段 `show version` 输出里 `SONiC Software Version`、`Platform`、`HwSKU` 三项分别对应版本基准、平台与硬件 SKU，要与规划表和 `device/<vendor>/<hwsku>/` 目录一致；若 HwSKU 与预期不符，端口数、通道编号都会随之偏差，后续端口检查必然对不上（模块见 07-10）。第二段 `docker ps` 的 STATUS 列显示 database 与 orchagent 均为 `Up`，说明底座容器在跑；若关键容器不在列表或状态反复重启，应停在容器层排障，不要继续看配置（模块见 07-02）。第三段 `sonic-db-cli CONFIG_DB KEYS 'PORT|*'` 返回 `PORT|Ethernet0`，说明端口配置已落 CONFIG_DB，其中 `|` 是 CONFIG_DB 表键的分隔符，具体分隔符与键格式需对照实际版本核验。第四段 APPL_DB 的 `PORT_TABLE:Ethernet0` 说明配置已被搬运到 APPL_DB；若 CONFIG_DB 有而 APPL_DB 无，问题多在 cfgmgr 搬运环节（原理见 06-03）。第五段 ASIC_DB 的 `ASIC_STATE:SAI_OBJECT_TYPE_PORT:oid:...` 说明端口对象已进入芯片视图；但要注意 ASIC_STATE 出现对象只代表 syncd 已纳入视图，不等于厂商 SAI 已写入芯片并生效，属性是否受支持需能力查询确认（原理见 06-05）。第六段 `show interfaces status` 里 Ethernet0 的 Oper 状态为 `up`，是运行时链路状态，需接线与对端配置齐全；第七段 `show ip bgp summary` 里邻居 State 为 `Established`、MsgRcvd 与 MsgSent 持续增长，说明 BGP 会话正常，前缀数要与规划比对（原理见 06-07）。整组命令按「版本 → 容器 → 三层库 → 业务状态」推进，正是图 08-06-01 的逐段落地；任何一层缺失都停在该层，用 08-03 的决策树反查，不要一句「上线完成」带过（排障见 08-03 ｜ 参数见 04-05）。
+
+验证方法上还要遵守三条原则。其一，判据要「可判读」，例如「邻居 Established」「计数随流量增长」是可以直接从输出读出的，而「网络正常」不是判据；写清单时把主观描述换成可观测字段。其二，分层要对号入座：`show` 看呈现状态、`sonic-db-cli` 看原始表项、容器命令看进程健康，三者互为印证又不可互相替代。其三，性能类验证必须标注「需在目标机型实测」，配置下发时延、收敛时间与转发吞吐不给绝对值（基准方法见 08-01 ｜ 调优见 08-02）。
+
+### 5. 常见失败与排错
+
+上线检查中失败最集中的地方，是「某一层有、下一层无」的断点。下表按现象组织分诊路径，给出证据来源、可能原因与修复方向；完整诊断树与案例见 08-03、08-04，本节只做指向。表中命令与表名需对照实际版本核验，单元格内的 `|` 已转义。
+
+| 现象 | 首要证据 | 可能原因 | 修复方向 |
+|---|---|---|---|
+| config 成功但 APPL_DB 无 | CONFIG_DB 与 APPL_DB 对照 | 配置校验未过或 mgrd 未搬运 | 查 cvl 校验与 cfgmgr 日志 |
+| APPL_DB 有但 ASIC_DB 无 | ASIC_DB 查询 | orchagent 未翻译或属性不支持 | 查 orchagent 日志与能力查询 |
+| 端口 Oper 为 down | show interfaces status | 未接线、对端未配或速率不匹配 | 查物理链路与对端配置 |
+| BGP 非 Established | show ip bgp summary | AS 或地址不匹配、网络不可达 | 核对规划与链路，FRR 细节需核验 |
+| 计数不涨 | COUNTERS_DB 与接口计数 | FlexCounter 未采集或轮询未开 | 查 flexcounterorch 与轮询配置 |
+| 容器反复重启 | docker ps 与 show logging | 依赖服务未起或资源不足 | 查启动顺序与容器资源 |
+| 加固后无法登录 | AAA 与本地回退 | 集中认证不可达且无 local 回退 | 经带外恢复并保留 local 回退 |
+| 升级后能力退化 | 清单复核对照 | 版本差异或平台能力变化 | 对照实际版本核验，必要时回退 |
+
+这些现象的共同处理原则是「先分层定位、再查具体进程」。例如「config 成功但 APPL_DB 无」，先用 `sonic-db-cli` 对照 CONFIG_DB 与 APPL_DB 确认断点在搬运段，再查 `cfgmgr/` 的 mgrd 是否运行、`sonic-mgmt-common/cvl/` 的校验是否拒绝（原理见 06-03 ｜ 模块见 07-07）；若一上来就怀疑硬件或重启设备，既找不到根因又扩大了变更面。再如「APPL_DB 有但 ASIC_DB 无」，断点在 orchagent 翻译段，应查 `orchagent/orchdaemon.cpp` 的调度与属性是否被厂商 SAI 支持，而厂商 SAI 不在本快照，相关细节需对照实际版本核验（原理见 06-04 ｜ 原理见 06-05）。
+
+有几类失败与运维操作本身直接相关，值得单列。一是「加固把自己锁在外面」：切换到集中认证后未保留 local 回退，集中服务器一旦不可达就失去登录能力，必须经带外通道恢复并调整 AAA 配置（见 08-05 ｜ 参数见 04-05）。二是「升级后能力退化」：不同版本对 warm reboot、多 ASIC 等能力支持不同，升级后要用同一份清单复核，能力受平台与版本限制，需对照实际版本核验（原理见 06-10 ｜ 原理见 06-11）。三是「缓存命中服务陈旧产物」：这类供应链风险在 `azure-pipelines.yml` 的 CacheKeyLint 阶段被拦截，上线时若发现产物与源码不一致，应回到构建环节核验而非在运行期修修补补（模块见 07-13）。四是「把状态当配置」：`show interfaces status` 的 up 是运行时状态，不能反推某次 config 已使硬件下发，判读要按图 08-06-01 逐段推进（原理见 06-01）。
+
+### 6. 小结
+
+本篇把上线与运维收敛成一份可执行的分层清单：以图 08-06-01 的八层门禁为骨架，用 24 项 checklist 覆盖版本镜像、容器进程、配置落地、流水线表项、业务状态、可观测性、安全收口与容量基线；用一组只读验证命令示范「版本 → 容器 → 三层库 → 业务状态」的逐段判读，并给出常见失败的分诊表。三条判断贯穿全篇：判据必须可判读，分层不可跳跃，性能必实测。与 08-05 呼应，加固项被落到「AAA 认证方式」「Redis 暴露面」两个具体检查条目；与 08-03、08-04 呼应，失败现象按断点分诊并指向完整案例。
+
+延伸阅读按目标分流。想看部署步骤，接读 03-01 至 03-06；想看基准与调优，接读 08-01、08-02；想看诊断树与案例，接读 08-03、08-04；想看加固项的来龙去脉，接读 08-05；想补命令与参数，接读 04-02 至 04-05；想补字段定义，接读 05-02 与 05-03；想补模块能力，接读 07-02、07-06、07-07、07-10 与 07-13；想补底层原理，接读 06-01 至 06-14 相应各篇。跨册引用请始终使用「字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx」的写法，`xx` 替换为具体篇号。
+
+最后重申资料纪律：本篇所有示例输出均注明「示例输出，具体格式需对照实际版本核验」并附逐行判读；命令名、选项、表名、容器名与字段名不确定处均标注核验要求并给出 `dockers/`、`orchagent/`、`cfgmgr/`、`src/swsssdk/` 等可定位目录；Redis 库编号一律不写死，须对照 `sonic-py-swsssdk` 的 `SonicDBConfig` 核验；FRR / Linux 内核 / 厂商 SAI 写「不在本快照，需对照实际版本核验」；warm reboot、多 ASIC 等受平台与版本限制的能力不宣称全平台无条件支持。版本基准始终为「上游 master 快照（2026-11 抓取）」，不写绝对版本号与 Redis DB 编号；性能、容量、收敛与时延类结论一律标注「需在目标机型实测」。至此 08 册运维、性能基准与排障六个篇目齐备，分片 C 的两篇以「加固收口」与「上线清单」完成全册落地。

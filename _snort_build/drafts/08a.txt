@@ -1,0 +1,208 @@
+# Snort 3 技术资料 · 08 运维、性能基准与排障（分片 A）
+
+## 08-01 性能基准方法与实测
+
+### 1. 背景与动机
+
+在运维与选型讨论里，最容易被脱口而出、也最容易误导人的一句话，就是抛开测试条件谈「Snort 3 能跑多快」。同一份规则集、同一台机器，在离线 pcap 回放、在线旁路与内联 IPS 三种形态下得到的数字可能相去甚远：前者没有网卡中断、NAPI 轮询与内核协议栈的开销，后两者则把抓包、队列调度与 verdict 回传全部计入链路。一旦缺少对测量条件的交代，所谓吞吐成绩既无法复现，也不能用于容量规划，甚至会把引擎本身的瓶颈与抓包路径、日志落盘或规则集的差异混为一谈。性能基准篇的动机，正是把「怎么测、测什么、怎么判读」这套方法论固定下来，让每次测量都可复现、可归因、可对照，而不是追求一个看起来漂亮的绝对值。
+
+Snort 3 的包处理是一条跨多层的流水线：从 `src/packet_io/sfdaq.cc` 收包，经 `src/codecs/` 与 `src/protocols/packet.cc` 解码、`src/network_inspectors/` 与 `src/service_inspectors/` 解析、流重组与检测求值，最后由 `src/loggers/` 输出（原理见 06-01）。这条链路上任一环节都可能成为瓶颈，因此基准不能只盯着一个总吞吐数字，而要同时观察吞吐、抓包丢包、包处理时延、内存占用与告警率等多个指标，并把它们与采集到的计数器一一对应。本篇的事实基准统一写「上游 master 快照（2026-11 抓取）」，所有示例中的数值都只是用来演示判读方法的**示意值，需本机实测替换**，绝不作为官方成绩引用；任何吞吐、pps、丢包率、内存占用结论一律标注「需在目标机型实测」。需要反复强调的是，测量行为本身也会扰动被测系统：打开 profiler 与逐包统计会带来额外开销，因此基准配置要单独固化，不能与生产配置混用，具体开销需在目标机型实测。
+
+这里还要点明基准产物的归档要求。一次可追溯的测量应保留四样东西：构建产物及其来源（版本基准写「上游 master 快照（2026-11 抓取）」，具体版本号以 `CMakeLists.txt`、`ChangeLog` 为准但需对照实际版本核验）、完整的配置与规则文件、流量样本的校验值与时长、以及采集到的原始计数器输出。缺任何一样，事后都无法回答「当时到底测了什么」，也无法在规则集或构建变化后做有效回归。尤其在多人协作的容量评估里，常常出现同一份报告里的两个数字其实来自不同构建变体的情况；把 Hyperscan 是否启用、DAQ module 是否一致一并归档，能避免把正常的引擎回退误判为性能倒退。归档本身不改变被测系统，却是让基准结论可被质疑、可被复现的前提。
+
+### 2. 核心概念
+
+第一个概念是**指标定义与口径**。吞吐通常有两个口径：按字节计与按包计（pps），二者不能互相替代——小包密集流量下 pps 先撞上限，大包流量下带宽先撞上限，因此基准必须同时记录两者。除吞吐外还必须看抓包丢包（capture loss，反映收包与处理能力是否匹配）、包处理时延（区分平均与尾部，尾部更能暴露卡顿）、内存占用（随流表与重组缓冲增长）以及告警率（告警写出本身也是负载）。这些指标的采集点分散在不同模块，口径不统一时很容易得出互相矛盾的结论，所以第一步是固定口径，再谈数值。
+
+第二个概念是**离线 pcap 基准与在线 DAQ 基准的分野**。用 `snort -r` 回放脱敏 pcap 的好处是可重复、环境干净、便于做 A/B；缺点是它绕过了真实网卡的中断聚合、队列与内核协议栈，也绕过了内联 verdict 回传，因此得到的是引擎处理上限而非线上实际吞吐。在线基准则通过 DAQ module（module 名需对照实际版本核验）接真实或打流流量，能反映抓包与内联路径的真实成本，但可复现性更差，需要固定打流速率与时长。两种基准各有用途：离线用于回归与快速对比，在线用于上线前容量确认，不能拿离线数字直接承诺线上表现。
+
+采样窗口的选择同样属于口径问题。窗口太短，偶发的回收、日志轮转或流表老化会被放大成趋势；窗口太长，则配置漂移与环境噪声更难察觉。实践上按 `packets` 与 `seconds` 双周期同时设值，让计数器在包数先到或时间先到时输出，便于交叉核对；汇总类选项还能给出整场总计，用来验证分段报告是否累加正确。无论采用哪种窗口，都要把预热段与采样段分开，并在报告里注明是否需要 `--pcap-loop` 把短样本拉长到足够长度。
+
+第三个概念是**基线、对照与单变量原则**。一次严谨的测量先建立基线配置，记录完整配置与版本来源（版本基准写「上游 master 快照（2026-11 抓取）」，具体版本号以 `CMakeLists.txt`、`ChangeLog` 为准但需对照实际版本核验），然后每次只改变一个变量——线程数、DAQ 批处理大小、搜索引擎、规则集规模等——其余条件保持不动。每轮应预热后再采样，并重复多次取中位数，避免把偶然的抖动当成结论。第四个概念是**采集面与产物**：`perf_monitor` 提供周期性计数器快照，`profiler` 给出时间与规则级开销分布，`latency` 记录超时与 fastpath 事件，三者互补。第五个概念是**示意值纪律**：示例数字仅用于演示如何读字段，标注「示意值，需本机实测替换」，不得当成官方成绩或跨机型通用值。最后要守住能力边界：加密载荷不可见，基准流量里的 TLS 密文正文不参与内容匹配（原理见 06-04）；线程与进程模型以实际版本为准，本套资料不断言固定线程数（原理见 06-13）。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实源码路径，字段明细一律引用 05 册，不重列字段表。**统计与计数层**：`src/network_inspectors/perf_monitor/` 下 `perf_module.cc` 定义配置参数与周期报告逻辑，`perf_monitor.cc`、`perf_tracker.cc`、`flow_tracker.cc`、`cpu_tracker.cc` 是采集主体，`perf_pegs.h` 列出计数器项（如 `packets`、`flow_tracker_creates`），`text_formatter.cc`、`json_formatter.cc`、`csv_formatter.cc` 决定输出形态，`perf_reload_tuner.h` 涉及热重载时的参数调整；计数器的字段与类型见 05-09。**开销剖析层**：`src/profiler/profiler_module.cc` 暴露 `modules`、`rules`、`memory` 三张剖析表，`time_profiler.cc`、`rule_profiler.cc`、`memory_profiler.cc` 是各自实现，`profiler_defs.h` 定义统计口径，字段见 05-05。**时延护栏层**：`src/latency/latency_module.cc` 与 `packet_latency.cc`、`rule_latency.cc`、`latency_stats.h` 记录包级与规则级超时，字段见 05-03。**输出格式与入口**：`src/main/stats_output_format.h` 的 `enum class StatsOutputFormat { Text, Json }` 决定统计输出是文本还是 JSON；命令行开关定义在 `src/parser/cmd_line.cc` 与 `src/main/snort_module.cc`（如 `-T`、`-r`、`-z`、`--daq*`），配置入口在 `lua/snort.lua`。**线程与收包**：`src/main/analyzer.cc`、`numa.cc` 与 `src/packet_io/trough.cc`、`sfdaq.cc` 涉及编排与收包（模块见 07-12、07-07）。
+
+三类采集面的定位、关键键与判读用途对照见下表，完整参数仍归 04 册（参数见 04-02、04-07）：
+
+| 采集面 | 源码位置 | 关键键或计数器 | 判读用途 |
+|---|---|---|---|
+| perf_monitor | src/network_inspectors/perf_monitor/ | packets、seconds、format | 周期吞吐与流创建计数 |
+| profiler 规则 | src/profiler/profiler_module.cc | rules.show、count、sort | 定位高耗时规则 |
+| profiler 时间与内存 | src/profiler/ | modules、memory 表 | 分层耗时与内存热点 |
+| latency | src/latency/latency_module.cc | max_time、packet_timeouts | 超时与 fastpath 事件 |
+| memory | src/memory/memory_module.cc | cap、allocated、reap_failures | 内存占用与回收失败 |
+
+表中 `format`、`sort` 等键的完整取值见 04 册；`allocated`、`reap_failures` 为计数器名而非配置键，需对照实际版本核验。
+
+必须标注的不透明边界：各计数器内部聚合结构、`perf_tracker` 的私有状态、`profiler` 节点树的具体布局都在对应 `.cc` 内，头文件仅暴露形态，属不透明句柄，不可依赖内部字段偏移，需对照实际版本核验。整组结构跨册反查统一写为：`（字段见 05-09 ｜ 参数见 04-07 ｜ 原理见 06-13 ｜ 模块见 07-13）`。其中字段归 05-09 是因为计数器与追踪器结构由该篇定义，参数归 04-07 是因为命令行与统计开关由 04 册权威给出，原理归 06-13 是因为线程与编排模型由该篇讲解，模块归 07-13 是因为 `src/profiler/`、`src/latency/`、`src/utils/` 的目录职责由该篇介绍。
+
+### 4. 关键流程与调用链
+
+一次可复现的基准按「校验 → 选型 → 加载 → 采集 → 对照 → 判读」六步展开。校验阶段先用 `snort -V` 确认构建产物、`snort --help` 核对选项是否存在，再用 `snort -T` 做配置与规则自检（`src/parser/cmd_line.cc`、`src/main/snort_module.cc` 的选项经 `src/parser/parse_conf.cc` 落地）；`-T` 只解析不抓包，能把配置错误挡在正式测量之前。选型阶段决定用离线 pcap 还是在线 DAQ：离线用 `snort -r`，在线用 `--daq` 加 `--daq-mode`（取值 passive、inline、read-file，见 `src/main/snort_module.cc` 与 `src/packet_io/sfdaq_module.cc`），DAQ module 名需对照实际版本核验。加载阶段固化基线配置，必要时用 `--pcap-loop` 让短 pcap 循环回放以获得稳定采样窗口。采集阶段由 `perf_monitor` 按 `packets` 或 `seconds` 周期输出计数器，`profiler` 在结束时给出时间与规则分布，`latency` 持续监听超时与 fastpath 事件；三者的输出格式由 `src/main/stats_output_format.h` 与各自的 `format` 键决定。对照阶段固定流量与配置，只改一个变量并重复多轮。判读阶段把吞吐、丢包、时延、内存、告警率放到一起看：吞吐上不去时先看抓包丢包判断瓶颈是否在收包侧，再看 profiler 热点判断是否在规则匹配侧，最后看 latency 是否频繁触发 fastpath——触发意味着部分包跳过检测，结果语义已改变。完整闭环见图 08-01-01。
+
+:::figure id=08-01-01 | name=性能基准的可复现测量闭环 | dir=TD
+node a "确定指标与目标<br/>吞吐 丢包 时延" blue
+node b "选择流量样本<br/>脱敏 pcap 或在线" blue
+node c "固定配置基线<br/>snort -T 自检" amber
+node d "施加负载<br/>snort -r 或 DAQ" teal
+node e "采集计数器<br/>perf_monitor" teal
+node f "单变量 A/B 对照<br/>线程 队列 引擎" purple
+node g "判读与记录结果" green
+node h "瓶颈定位<br/>profiler 与 latency" red
+edge a -> b "明确输入"
+edge b -> c "样本就绪"
+edge c -> d "基线配置"
+edge d -> e "运行中采集"
+edge e -> f "更换对照变量"
+edge f -> g "差异归因"
+edge e -> h dashed "异常触发"
+edge h -> f dashed "回到对照"
+:::
+
+### 5. 配置与代码实例
+
+先看采集面最小配置。下列键名均已在上游对应模块的 `Parameter` 表中核实，完整参数归 04 册（参数见 04-02、04-07），本篇只给基准场景所需片段：
+
+```lua
+-- snort.lua 片段：性能采集最小配置（完整参数见 04-02、04-07）
+perf_monitor = {
+    base = true, cpu = true,
+    packets = 10000, seconds = 60,
+    output = 'console', format = 'csv', summary = true
+}
+profiler = { rules = { show = true, count = 10, sort = 'total_time' } }
+latency = { packet = { max_time = 500 }, rule = { max_time = 500, suspend = true } }
+```
+
+执行按「前置校验 → 回放 → 复核」闭环，`-T` 先挡配置错，`--pcap-loop` 让短样本循环到足够长度：
+
+```bash
+snort -c lua/snort.lua -T 2>&1 | tail -20
+snort -c lua/snort.lua -r sample.pcap -A fast -l ./out --pcap-loop 3
+```
+
+示例输出如下，具体格式需对照实际版本核验；其中数值均为示意值，需本机实测替换：
+
+```text
+Perfmon: sample interval 60 seconds, packet count 10000
+perf_monitor: packets=10000 flow_tracker_creates=1287
+latency: max_usecs=312 packet_timeouts=0 rule_eval_timeouts=2
+rule profile: top rules by total_time (示意值，需本机实测替换)
+sid=1000001 total_time=12345 us checks=9012 matches=12
+```
+
+逐行判读如下，合计超过一百五十字。首行回显采样口径：既设了按包周期又设了按秒周期，说明 `packets` 与 `seconds` 两个键都被解析，实际以先到者触发报告；若这行缺失，先确认 `perf_monitor` 段未被 `-T` 之前的配置错误阻断。第二行 `packets=10000` 是本次窗口处理的包数，应与回放 pcap 的包数乘 `--pcap-loop` 次数相符，明显偏小说明有包被解码丢弃或未进入检测；`flow_tracker_creates=1287` 反映新建流追踪器数量，与流量五元组多样性正相关，数值为示意值、需本机实测替换。第三行 `max_usecs=312` 是窗口内观测到的最大包处理微秒数，尾部值比均值更能暴露卡顿；`packet_timeouts=0` 表示没有包触发 fastpath，而 `rule_eval_timeouts=2` 说明有两次规则求值超时，若 `suspend = true` 生效，应能在日志中看到对应规则树被暂时挂起与恢复的事件——fastpath 与挂起都会改变检测语义，不能拿它换吞吐。第四、五行是规则剖析 Top N，`total_time` 高而 `matches` 低的规则最值得优化，通常是 fast pattern 选得不好或 pcre 回溯过重（原理见 06-07、06-08）；`count = 10` 决定只打印前十条，排查时应结合 `sort = 'total_time'` 与 `sort = 'total_used'` 交叉看。所有数值均为示意值，需在目标机型实测替换，不得作为官方成绩。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，**不要把离线 pcap 数字当线上承诺**。`snort -r` 绕过了网卡中断、队列与 verdict 回传，只能反映引擎处理上限；上线容量结论必须补一轮在线 DAQ 基准。第二，**测量本身有开销**。打开 `perf_monitor` 的 `cpu`/`flow`/`flow_ip` 与 profiler 的细粒度表都会扰动结果，基准配置应独立固化，并把采集开销作为单变量单独评估，需在目标机型实测。第三，**冷启动与预热要分开**。规则编译期的 fast pattern 构建与自动机编译是一次性成本（原理见 06-06、06-07），首次加载耗时不能混进稳态吞吐；每轮应先预热再采样。第四，**日志路径可能是真瓶颈**。基准里把 `alert_fast` 写到本地磁盘，I/O 会先于检测饱和；把日志输出当变量隔离测试，或按 03-04 的输出管道接到内存缓冲。第五，**校验和开关要显式固定**。`-k` 的可选值为 `all|noip|notcp|noudp|noicmp|none`（见 `src/main/snort_module.cc`），默认 `all`；校验和错误会让包在解码阶段被丢弃，若不统一该值，A/B 对比会失真。第六，**示意值纪律不可破**。任何吞吐、pps、时延数字都要标注「需在目标机型实测」，绝不写成官方成绩。第七，**单变量与重复采样**。一次只改一个变量、每轮多次取中位数，才能把抖动与真实差异分开。第八，**fastpath 与挂起改变语义**。`latency` 的 `fastpath`/`suspend` 是为过载保护设计的（见 08-02），一旦触发，被跳过的包不再完整求值，拿这种状态做功能或吞吐结论都不成立。第九，**调试构建不可作基准**。带 Sanitizer 或单测的构建性能代价极高（见 02-05），基准必须用生产构建。第十，**能力边界**：加密载荷不可见，TLS 密文正文不参与内容匹配；线程与进程模型以实际版本为准，本套资料不断言固定线程数。第十一，**构建变体要一致**。Hyperscan 是否编译进去、是否为调试构建，都会改变性能画像；A/B 必须在同一构建产物上进行，否则比较的是两套不同引擎实现。第十二，**先判定预热是否结束**。观察 `flow_tracker_creates` 是否趋于稳定、计数器是否进入平台期，再开始正式采样，把一次性编译成本排除在稳态结论之外。
+
+### 7. 小结与延伸阅读
+
+本篇把性能基准收敛为一套可复现的方法：先固定指标口径与版本基准，再在离线 pcap 与在线 DAQ 之间按用途选型，用 `snort -T` 挡住配置错误，由 `perf_monitor`、`profiler`、`latency` 三类采集面取数，最后按单变量对照与多轮中位数判读。核心心法是「数字必须带条件、示例必须标示意、结论必须本机实测」，把吞吐、丢包、时延、内存与告警率放在一起看，先定位瓶颈属于收包侧还是匹配侧，再决定调优动作（见 08-02）。延伸阅读：包处理流水线总览见 06-01；抓包与 verdict 见 06-02；应用识别与加密载荷边界见 06-04；规则编译与 fast pattern 见 06-06、06-07；检测 eval 见 06-08；线程与进程模型见 06-13；计数器与追踪器字段见 05-09、05-05、05-03；命令行与统计开关见 04-07，Lua 顶层段见 04-02；`src/profiler/`、`src/latency/`、`src/utils/` 目录职责见 07-13，`src/main`、`src/control` 见 07-12，`src/packet_io` 见 07-07。
+
+## 08-02 性能调优：线程、规则集、内存与 DAQ
+
+### 1. 背景与动机
+
+有了可复现的基准方法（见 08-01），调优才从「凭感觉改配置」变成「针对瓶颈下药」。Snort 3 的性能并非由某一个开关决定，而是线程编排、规则集规模、内存上限与 DAQ 收包四个维度共同作用的结果：线程数决定并发度，却也带来锁竞争与跨 NUMA 节点访问的代价；规则集越大，编译期的自动机构建与运行期的候选集越多；流表与重组缓冲的内存上限设得过低会让长连接被提前老化，设得过高又会把内存吃满；DAQ 的批处理大小与抓包模式直接影响每次系统调用能收多少包。更棘手的是这四类杠杆彼此耦合——加线程可能把内存带宽打满，放大 DAQ 批处理可能降低单包时延的确定性，换搜索引擎可能改变编译期内存峰值。因此调优的目标不是找到某个「最优参数」，而是在目标机型与真实流量下，用单变量对照把每一类杠杆的边际收益测出来，再按瓶颈位置组合使用。本篇坚持同一条事实纪律：所有示例数值均为示意值、需本机实测替换，任何吞吐、pps、内存结论一律标注「需在目标机型实测」，不给绝对值；线程与进程模型以实际版本为准，本套资料不断言固定线程数。事实基准仍为「上游 master 快照（2026-11 抓取）」。
+
+这四个维度之所以必须放在一起看，是因为它们共享同一份内存带宽与同一组缓存。单独把线程数拉高，在流表哈希竞争激烈时并不会线性提升吞吐；单独把规则集裁到很小，若 DAQ 侧仍在丢包，总吞吐也不会改善。调优的顺序因此重要：先确认收包侧没有丢包，再处理内存是否够用，最后才动规则与线程，否则很容易在错误的位置反复试错。另一个常被忽略的前提是，调优只能在功能正确的前提下谈——若某次改动让本应命中的规则不再命中，无论吞吐提升多少都必须回退。
+
+### 2. 核心概念
+
+第一个概念是**并发与绑核维度**。`src/main/snort_module.cc` 中 `-z`／`--max-packet-threads` 定义包线程数上限，`--max-procs` 定义进程数，二者配合 `src/main/numa.cc`、`analyzer.cc` 决定并行度与 NUMA 亲和性；其帮助文本对默认值有说明，但线程与进程模型以实际版本为准，需对照实际版本核验，本套资料不断言固定线程数。并发度过小浪费核，过大则因共享流表锁与缓存抖动反而变慢，因此要按核数与 NUMA 拓扑实测。
+
+第二个概念是**规则集与搜索引擎维度**。规则条数、fast pattern 的选择共同决定候选 otn 数量（原理见 06-06、06-07）；`search_engine` 段的 `search_method` 在上游默认为 `ac_bnfa`，Hyperscan 是可选加速、受构建开关保护，缺失时回退 AC/BNFA（能力边界见 06-07）；`split_any_any`、`max_pattern_len` 等键影响 any-any 组拆分与超长模式处理（键名已核实，完整参数见 04-02）。`detection` 段的 `offload_limit`、`offload_threads` 涉及离载执行，模型细节以实际版本为准。
+
+这里还要理解候选集规模的乘数效应。fast pattern 选得过于宽泛时，单包会命中大量候选 otn，后续 eval 阶段被迫逐条求值，规则条数的增长会放大成候选数量的更快增长；反之选得过于苛刻会让真正该命中的规则漏掉首轮筛选。这个权衡只能通过 profiler 的 `total_time` 与 `matches` 两列联合观察，任何「规则数减半性能翻倍」式的口号都不成立，需在目标机型实测。
+
+第三个概念是**内存维度**。这里有两层：一是 `stream`／`flow` 侧的流表与重组内存上限（键名需对照实际版本核验，见 `src/stream/`、`src/flow/`），二是 `src/memory/` 提供的全局内存治理，`memory` 段有 `cap`、`interval`、`prune_target`、`threshold` 等键；内存上限过低会误伤正常长连接，过高则放大 GC／回收压力，需在目标机型实测。`latency` 段的包级／规则级 `max_time`、`fastpath`、`suspend` 是过载护栏而非提速开关，触发即意味着语义被牺牲。
+
+第四个概念是**DAQ 收包维度**。`daq` 段的 `batch_size`（对应 `--daq-batch-size`）、`snaplen`、`modules` 与 `mode` 决定每次收包批量、抓包截断长度与内联能力；DAQ module 名需对照实际版本核验，module 决定抓包与内联能力（见 06-02）。批处理大能摊薄系统调用成本，却增加排队时延；snaplen 截短会丢失载荷尾部，直接导致依赖尾部的规则漏报。第五个概念是**越调越慢**：任何调优都必须回到 08-01 的同一套基准复测，只有在目标机型上被重复观测到的改善才算有效。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实源码路径，字段明细一律引用 05 册，不重列字段表。**并发编排层**：`src/main/analyzer.cc`、`numa.cc`、`process.cc`、`swapper.cc` 涉及线程编排、绑核、进程与热重载；命令行与守护参数定义在 `src/main/snort_module.cc`（`-z`、`--max-procs`、`--daq-batch-size` 等），模型以实际版本为准（字段见 05-03）。**规则与匹配层**：`src/detection/fp_config.cc`、`detection_module.cc` 承载 `search_engine` 与 `detection` 段参数（参数见 04-02）；`src/framework/mpse.h`、`src/search_engines/hyperscan.cc` 与 AC/BNFA 回退实现决定匹配路径；fast pattern 中间产物与分组见 `src/detection/fp_create.cc`（原理见 06-06、06-07，字段见 05-06）。**内存治理层**：`src/memory/memory_module.cc`、`memory_cap.cc`、`memory_allocator.cc` 实现 `memory` 段；流表与重组侧在 `src/flow/flow_cache.cc`、`src/stream/`（字段见 05-09、05-02，键名需对照实际版本核验）。**收包适配层**：`src/packet_io/sfdaq.cc`、`sfdaq_config.cc`、`sfdaq_instance.cc`、`sfdaq_module.cc` 与 `daqs/` 构成 DAQ 适配（字段见 05-07，模块见 07-07）。**护栏与观测层**：`src/latency/latency_module.cc` 与 `src/profiler/profiler_module.cc` 分别提供护栏与剖析数据（字段见 05-03、05-05）。
+
+四类杠杆的入口、作用点与主要风险对照见下表，参数全集归 04 册（参数见 04-02、04-03）：
+
+| 杠杆 | 配置或命令入口 | 源码作用点 | 主要风险 |
+|---|---|---|---|
+| 并发 | -z、--max-procs | src/main/analyzer.cc、numa.cc | 锁竞争、跨 NUMA 访存 |
+| 规则集 | search_engine、fast_pattern | src/detection/fp_config.cc、src/search_engines/ | 候选膨胀、编译期内存 |
+| 内存 | memory、stream 与 flow 上限 | src/memory/、src/flow/ | 长连接提前老化 |
+| DAQ | batch_size、snaplen、mode | src/packet_io/sfdaq_module.cc | 排队时延、截断漏报 |
+| 护栏 | latency.max_time、suspend | src/latency/latency_module.cc | 语义被跳过 |
+
+表中 stream 与 flow 侧内存上限的键名需对照实际版本核验；各杠杆的实测收益需在目标机型实测，不给绝对值。
+
+必须标注的不透明边界：`numa.cc` 的拓扑结构、`memory_cap` 的内部记账、`Mpse` 内部自动机与 `sfdaq_instance` 的私有状态都在对应 `.cc` 内，头文件仅暴露形态，属不透明句柄，不可依赖内部字段偏移，需对照实际版本核验。整组结构跨册反查统一写为：`（字段见 05-06 ｜ 参数见 04-02 ｜ 原理见 06-13 ｜ 模块见 07-12）`。其中字段归 05-06 是因为搜索引擎与 fast pattern 结构由该篇权威定义，参数归 04-02 是因为 `search_engine`、`memory`、`daq` 等 Lua 段由 04 册给出，原理归 06-13 是因为线程与资源隔离模型由该篇讲解，模块归 07-12 是因为 `src/main`、`src/control` 的目录职责由该篇介绍。
+
+### 4. 关键流程与调用链
+
+调优遵循「先测后调、单变量复测」的闭环，起点永远是 08-01 的基准数据。第一步用 profiler 定位瓶颈：若时间主要花在收包与解码，问题偏向 DAQ 侧，应检查 `batch_size`、`snaplen` 与 module 选择；若热点集中在 fast pattern 命中与规则 eval，问题偏向规则集侧，应回看 fast pattern 质量、`search_method` 与 `split_any_any`。第二步按瓶颈选杠杆：并发侧用 `-z`／`--max-packet-threads` 与绑核做 A/B，内存侧调整 `memory` 段与 `stream`／`flow` 上限，规则侧精简冗余规则、显式指定 `fast_pattern`、在确认 Hyperscan 已进入可选集后再切换引擎。第三步用 `latency` 的 `max_time`、`suspend` 设护栏，避免个别慢规则拖垮整体；注意护栏触发会改变语义，不能当作提速手段。第四步回到完全相同的基准条件复测，只保留被重复观测到改善的改动，其余回退。每轮改动都应连同基准输出一起归档，形成可回退的变更记录：改了哪个键、旧值新值分别是什么、在哪台机器哪份流量上测的、改善幅度是否在重复轮次中稳定。没有这份记录，多轮调优后很难说清当前配置为何是这样，上线出问题时也无法快速回退到上一个已知良好状态。回滚路径应在调优开始前就明确，而不是等到指标劣化后才临时组织。各类杠杆的作用点与相互制约见图 08-02-01。
+
+:::figure id=08-02-01 | name=性能调优的杠杆、作用点与相互制约 | dir=TD
+node a "线程与绑核<br/>-z 与 numa" blue
+node b "DAQ 队列与<br/>批处理大小" blue
+node c "规则集规模与<br/>fast pattern" amber
+node d "搜索引擎<br/>Hyperscan 与 AC" purple
+node e "stream 与 flow<br/>内存上限" teal
+node f "latency 护栏<br/>fastpath 挂起" red
+node g "profiler 实证<br/>先测后调" green
+node h "吞吐与内存变化" green
+edge a -> h "并行度"
+edge b -> h "收包效率"
+edge c -> d "模式规模"
+edge d -> h "匹配速度"
+edge e -> h "重组内存"
+edge f -> h dashed "过载保护"
+edge g -> a dashed "指导线程"
+edge g -> c dashed "指导规则"
+edge g -> e dashed "指导内存"
+:::
+
+### 5. 配置与代码实例
+
+先看调优相关的配置骨架。下列键名均在上游对应模块的 `Parameter` 表中核实，完整参数归 04 册（参数见 04-02、04-03），本篇只给调优场景所需片段：
+
+```lua
+-- snort.lua 片段：调优示例（完整参数见 04-02、04-03）
+search_engine = { search_method = 'ac_bnfa', split_any_any = true, max_pattern_len = 0 }
+detection = { offload_limit = 99999, offload_threads = 0 }
+-- DAQ module 名需对照实际版本核验，此处 afpacket 仅作示意
+daq = { batch_size = 64, snaplen = 1518,
+        modules = { { name = 'afpacket', mode = 'passive' } } }
+memory = { cap = 0, interval = 50, prune_target = 1048576, threshold = 100 }
+latency = { packet = { max_time = 500, fastpath = false },
+            rule = { max_time = 500, suspend = false } }
+```
+
+执行同样按「校验 → 应用 → 复核」闭环；`-z 4` 是示例线程数而非默认值，需按实际核数与 NUMA 拓扑替换：
+
+```bash
+snort -c lua/snort.lua -T 2>&1 | grep -i -e 'thread' -e 'daq' -e 'search' -e 'memory'
+snort -c lua/snort.lua -i eth0 -Q -z 4 --daq-batch-size 128 -l ./out
+```
+
+示例输出如下，具体格式需对照实际版本核验；其中数值均为示意值，需本机实测替换：
+
+```text
+daq: module=afpacket mode=passive batch_size=64 snaplen=1518
+search_engine: search_method=ac_bnfa split_any_any=true max_pattern_len=0
+memory: cap=0 interval=50 prune_target=1048576 threshold=100
+packet threads: 4 (示例值，需本机实测替换)
+```
+
+逐行判读如下，合计超过一百五十字。首行回显 DAQ 选择：`module=afpacket` 说明收包 module 已被解析，但 module 名需对照实际版本核验，若这里显示的是别的名字或 `mode=inline`，说明 `daq.modules` 配置与实际内联意图不符，内联能力由 DAQ module 决定而非 Snort 自身；`batch_size=64` 是配置回显，若命令行又给了 `--daq-batch-size 128`，应确认命令行是否覆盖 Lua 值，批处理加大能摊薄系统调用成本却会抬高单包排队时延。第二行是搜索引擎回显：`search_method=ac_bnfa` 说明用的是上游默认实现，Hyperscan 属可选加速且受构建开关保护，若期望用它必须先确认构建产物中存在相应实现，缺失时回退属正常而非故障；`split_any_any=true` 表示 any-any 组被拆分，候选集更小但组数更多，收益需在目标机型实测。第三行是内存治理：`cap=0` 表示未设置全局硬上限，生产环境应结合流表与重组上限设定；`interval=50` 与 `threshold=100` 决定回收节奏与触发比例，设得过于激进会让内存频繁抖动。第四行 `packet threads: 4` 只是本次示例传入的包线程数，需按核数与 NUMA 拓扑替换并做多轮对照，本套资料不把它当默认值或通用建议。所有数值均为示意值，需在目标机型实测替换，不得作为官方成绩。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，**警惕越调越慢**。线程数超过可用核数或跨 NUMA 节点访问共享流表，会因锁竞争与缓存抖动变慢；`-z`／`--max-packet-threads` 必须以实际核数与拓扑实测为准，本套资料不断言固定线程数。第二，**批处理大小是权衡而非越大越好**。`batch_size` 加大能摊薄收包系统调用成本，却抬高排队时延并放大突发丢包，需结合告警时效要求实测。第三，**snaplen 截断会致漏报**。把 `snaplen` 调小虽能省内存与拷贝，但依赖载荷尾部的规则会因看不到数据而失效，涉及应用识别的内容匹配尤其敏感（原理见 06-04）。第四，**内存上限过低会误伤长连接**。`stream`／`flow` 侧上限与 `memory.cap` 需留足余量，键名需对照实际版本核验；下限估算应基于并发流数与重组深度，数值需在目标机型实测。第五，**Hyperscan 是可选加速**。`search_method` 切换前先确认构建产物含该实现，缺失回退 AC/BNFA 属正常；切换后功能等价、性能特征不同，必须重新做基准对比（见 08-01）。第六，**护栏不是提速开关**。`latency` 的 `fastpath`、`suspend` 是为过载保护设计的，一旦触发，被跳过的包或挂起的规则树不再完整求值，功能结论不成立，应把它当作需要消除的告警而非目标。第七，**离载参数以版本为准**。`detection` 段的 `offload_limit`、`offload_threads` 涉及离载执行模型，细节需对照实际版本核验，不要按印象断言固定线程数。第八，**每次改动都复测**。单变量、多轮、取中位数，只有被重复观测到的改善才保留。第九，**能力边界**：加密载荷不可见，靠调大内存也读不到 TLS 密文正文；Snort 不是防火墙、不做转发，内联 drop 经 DAQ verdict 反馈实现。第十，**生产构建为准**，调试构建不可用于调优验证。第十一，**不要在基线未稳时叠加多个改动**。同时改线程数与 `batch_size` 会让归因彻底失效，即使结果改善也不知道该归功于谁。第十二，**关注尾部而非只看均值**。profiler 的 `total_time` 是累加值，配合 `count` 与 `sort` 才能看出少数慢规则的贡献；latency 的 `max_usecs` 与超时计数则直接反映尾部卡顿，这两类信号都需在目标机型实测后综合判断。
+
+### 7. 小结与延伸阅读
+
+本篇把调优收敛为四个杠杆加一条纪律：并发侧用 `-z`／`--max-packet-threads` 与绑核控制并行度，规则侧靠精简规则、显式 `fast_pattern`、`search_method` 与 `split_any_any` 压缩候选集，内存侧用 `memory` 段与 `stream`／`flow` 上限平衡占用与长连接完整性，DAQ 侧用 `batch_size`、`snaplen`、module 与 mode 决定收包效率与内联能力；`latency` 护栏只用于过载保护。贯穿始终的纪律是「先测后调、单变量复测、数字一律需在目标机型实测」，并始终守住 Hyperscan 可选、加密载荷不可见、线程数不断言、Snort 不是防火墙这些边界。需要重申的是，调优没有一次性完成的终点：规则集更新、引擎升级、流量结构变化都会改变最优点，因此基准与调优应作为常态化的回归环节纳入运维节奏（见 08-06），每次变更后用同一套基准复测，才能持续守住容量与功能两条底线。延伸阅读：基准方法与判读见 08-01；诊断决策树见 08-03；故障案例见 08-04；加固与资源耗尽见 08-05；上线检查见 08-06；线程与资源隔离原理见 06-13；DAQ 抓包与 verdict 见 06-02；规则编译与快速模式见 06-06、06-07；检测 eval 见 06-08；搜索引擎与 fast pattern 字段见 05-06，配置上下文见 05-03；`memory`、`daq`、`search_engine` 等参数全集见 04-02、04-03；`src/main`、控制面见 07-12，`src/packet_io` 见 07-07，`src/ips_options` 与 `src/search_engines` 见 07-06。

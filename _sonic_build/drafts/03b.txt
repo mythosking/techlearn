@@ -1,0 +1,367 @@
+# SONiC 技术资料 · 03 集成与部署（分片 B）
+## 03-03 端口、VLAN、IP 与 BGP 基础配置实战
+
+### 1. 目标与拓扑
+
+本篇把前两篇的准备工作落到一次可复现的配置闭环上。目标是在一台已经启动、容器齐备的 SONiC 设备上，依次完成四类最基础也最常用的业务配置：把物理端口划入二层 VLAN、为 VLAN 创建三层交换虚拟接口（SVI）并配置 IP 地址、与对端建立 eBGP 邻居并确认会话进入 Established 且路由可达。之所以把这四类配置放在一篇里串联，是因为它们恰好覆盖 SONiC 配置流水线的四个典型落点——端口速率与 VLAN 成员由 `sonic-swss/sonic-swss-master/cfgmgr/` 下的 `portmgrd.cpp`、`vlanmgrd.cpp` 承接，SVI 的 IP 由 `intfmgrd.cpp` 承接，BGP 则由 `sonic-buildimage-master/dockers/docker-fpm-frr/` 内的路由进程承接并经 `sonic-swss-master/fpmsyncd/` 回写 `APPL_DB`。读者如果能把这条链路上每一段的「配置已写入」和「硬件已下发」区分开，就掌握了 03 册乃至整个 SONiC 运维的核心方法论（原理见 06-06 ｜ 原理见 06-07 ｜ 模块见 07-06）。
+
+拓扑上推荐两台设备背靠背直连：DUT-A 的 Ethernet1 与 DUT-B 的 Ethernet1 用一对光纤或虚拟链路相连，两端都把该端口加入 Vlan10；DUT-A 的 SVI 配置为 10.0.0.1/31，DUT-B 配置为 10.0.0.0/31；DUT-A 使用 AS 65001，DUT-B 使用 AS 65002，双方互指对端 IP 作为 eBGP 邻居。若只有一台虚拟交换机（vs）可用，也可在同一台设备上创建两个 VLAN 并分别配 IP 来模拟二层与三层，但 BGP 邻居仍需两台逻辑设备才能建连，因此两台 vs 实例是最小完整拓扑。端口名一律使用 SONiC 内部名 `Ethernet1` 而非面板别名 `Eth200GE0/1`，除非设备处于 alias 命名模式；命名模式由 `config_db.json` 与运行时配置决定，需对照实际版本核验（参数见 04-02 ）。需要强调的是，本文所有示例地址、AS 号与 VLAN ID 都是便于复现的规划值，不代表任何真实网络，实际取值需对照实际版本核验并按本网地址规划替换。
+
+把这一次配置从命令到芯片的经历画出来，是理解「为什么 config 返回成功不等于转发已生效」的关键。端口、VLAN、IP 与 BGP 的下发链路见图 03-03-01。
+
+:::figure id=03-03-01 | name=端口 VLAN IP 与 BGP 配置下发链路 | dir=TD
+node n1 "config 命令<br/>VLAN IP BGP" teal
+node n2 "CONFIG_DB<br/>PORT VLAN 等表" blue
+node n3 "cfgmgr 各 mgrd" teal
+node n4 "APPL_DB 期望状态" blue
+node n5 "orchagent<br/>Orch 调度" purple
+node n6 "ASIC_DB 对象" amber
+node n7 "syncd 与 SAI" green
+node n8 "ASIC 转发芯片" red
+node n9 "show 验证命令" gray
+edge n1 -> n2 "写入配置"
+edge n2 -> n3 "订阅变更"
+edge n3 -> n4 "写入意图"
+edge n4 -> n5 "消费"
+edge n5 -> n6 "写入对象"
+edge n6 -> n7 "调用"
+edge n7 -> n8 "编程下发"
+edge n9 -> n2 "读状态"
+:::
+
+图 03-03-01 用颜色区分语义：teal 为管理面 CLI 与配置管理进程，blue 为 `CONFIG_DB` 与 `APPL_DB` 两类数据库，purple 为 `orchagent` 控制面，amber 为 `ASIC_DB`，green 为 `syncd` 与 SAI 运行时，red 为 ASIC 硬件边界，gray 为辅助的 `show` 验证命令。图中每一条边都对应真实进程：边「订阅变更」对应 `sonic-swss-master/cfgmgr/` 的 `vlanmgrd.cpp`、`intfmgrd.cpp`、`portmgrd.cpp`；边「消费」与「写入对象」对应 `sonic-swss-master/orchagent/` 的 `portsorch.cpp`、`intfsorch.cpp`、`routeorch.cpp` 等派生实现；边「编程下发」对应 `sonic-sairedis/sonic-sairedis-master/syncd/` 经 SAI 调用，厂商 SAI 实现不在本快照、需对照实际版本核验。`show` 命令只从各库读状态、不参与编程，因此用 gray 表示辅助角色（原理见 06-01 ｜ 原理见 06-05 ｜ 模块见 07-04）。这张图也是第 5 节排错顺序的依据：配置不生效时，先确认命令是否写入 `CONFIG_DB`，再逐段看 `APPL_DB`、`ASIC_DB`，最后才轮到怀疑 ASIC 或线缆。
+
+### 2. 前置条件与环境
+
+在动手配置之前，必须先确认设备处于「可配置且可观测」的状态，否则一旦配置不生效，根因会混杂在启动故障里而无法定位。第一项前置是镜像与平台已正确落地：设备应已完成 03-01 的虚拟交换机启动与 03-02 的 `config_db.json` 初始化，`show version` 能返回 Platform、HwSKU 与 ASIC 类型。ASIC 取 `vs` 表示虚拟交换机，此时转发由软件模拟，一切速率与时延数字都需在目标机型实测、不得外推到真实硬件（参数见 04-01 ｜ 参数见 04-02）。第二项前置是关键容器处于运行态：`docker-database`、`docker-orchagent`、`docker-fpm-frr`、`docker-teamd` 等应正常，可用 `show feature status` 或 `docker ps` 检查；FRR / FRRouting 协议源码不在本快照，容器内集成方式需对照实际版本核验（模块见 07-02 ｜ 模块见 07-08）。
+
+第三项前置是待配置端口的物理与链路状态。VLAN 成员与 SVI 都以端口可操作为前提，若端口因速率分组、线缆或拆线（breakout）配置不当而处于 `down`，后续 IP 与 BGP 验证就失去意义。应先用 `show interfaces status` 确认目标端口，必要时对照 `device/<vendor>/<hwsku>/` 下的端口配置文件（表名与字段需对照实际版本核验）。第四项前置是命名模式：SONiC 支持以内部名或面板别名两种模式显示与输入接口，命令里写 `Ethernet1` 还是 `Eth200GE0/1` 取决于当前命名模式，写错会直接报接口不存在；模式由配置决定，需对照实际版本核验（参数见 04-05）。第五项前置是配置持久化与备份：改动前先执行一次 `config save` 把当前运行配置落盘，并另存一份 `config_db.json` 副本，以便出错时回退，持久化与回滚机制见 03-05。最后，多数 `config` 写操作需要提权或属于特定用户组，权限不足会在执行阶段才暴露，务必在正式窗口前用一次无害的只读命令确认账号可用。
+
+把上述前置做成一组前置检查命令，按「只读、无副作用」原则逐条执行。
+
+```bash
+show version
+show feature status
+show interfaces status Ethernet1
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（取值仅为格式示意，不代表任何具体版本）
+Software Version: SONiC.HEAD.000000-00000000
+Platform: x86_64-generic-r0
+HwSKU: sample-hwsku
+ASIC: vs
+Uptime: 0 days, 02:14:07
++-----------------+------------------+-----------+
+| Feature         | State            | AutoStart |
++-----------------+------------------+-----------+
+| database        | running          | enabled   |
+| swss            | running          | enabled   |
+| bgp             | running          | enabled   |
+| teamd           | running          | enabled   |
++-----------------+------------------+-----------+
+Interface   Lanes        Speed   MTU   Alias        Oper  Admin
+Ethernet1   25,26,27,28  200000  9100  Eth200GE0/1  down  down
+```
+
+逐行判读如下。第一段 `show version` 里，`Software Version` 是构建产物决定的版本标识，本套资料统一以「上游 master 快照（2026-11 抓取）」为基准，示例中的 `SONiC.HEAD.000000-00000000` 只是格式示意、不得当作真实版本号引用；`Platform` 与 `HwSKU` 共同指向 `device/<vendor>/<hwsku>/` 机型目录，是判断端口配置是否加载正确的锚点；`ASIC` 为 `vs` 表明这是虚拟交换机，性能类结论需在目标机型实测；`Uptime` 若与预期启动时间不符，说明连到的并非目标实例。第二段 `show feature status` 中，`database`、`swss`、`bgp`、`teamd` 的 State 均为 `running` 且 AutoStart 为 `enabled`，是容器齐备的正常特征；若 `bgp` 为 `stopped` 或 `enabled` 与 `running` 不一致，源自 `dockers/` 的编排配置（参数见 04-07 ｜ 原理见 06-13），需先修复再继续。第三段 `show interfaces status Ethernet1` 中，`Admin` 为 `down` 表示管理上未启用，`Oper` 为 `down` 表示链路未起；这是待配置端口的常见初始态，执行 VLAN 成员与 IP 配置前应先把端口管理状态置 up，或确认对端已连线，否则后续验证会出现「配置写入了但链路不通」的假故障。三段输出共同构成「系统—容器—端口」三级前置快照，缺任何一级都不宜开始配置（排障见 08-03）。
+
+为便于逐项核对，把前置条件、验证命令与失败处置归纳成下表；表中命令名与状态取值需对照实际版本核验。
+
+| 前置项 | 验证命令 | 正常特征 | 失败处置 |
+|---|---|---|---|
+| 镜像与机型 | `show version` | Platform/HwSKU 与本机型一致 | 回到 03-01、03-02 检查启动与配置落地 |
+| 关键容器 | `show feature status` | database/swss/bgp 均为 running | 查 `dockers/` 编排与容器日志，见 06-13 |
+| 端口状态 | `show interfaces status` | 目标端口 Admin 为 up | 先启用端口或检查链路，见 08-03 |
+| 命名模式 | 接口的别名/内部名 | 命令中的接口名可被识别 | 对照配置确认命名模式，见 04-05 |
+| 配置备份 | `config save` 与另存副本 | 回退文件存在且可读 | 先备份再改，回滚见 03-05 |
+| 账号权限 | 任一只读 `show` 命令 | 可正常返回 | 提权或加入相应用户组后再操作 |
+
+### 3. 分步操作
+
+配置按「前置检查 → 执行 → 验证输出 → 清理」的闭环推进，每一步都不把内容推给下一步，而是就地确认结果。第一步是端口与 VLAN：先用 `show vlan brief` 确认 Vlan10 尚不存在，避免重复添加；再执行 `config vlan add 10` 创建二层 VLAN，用 `config vlan member add 10 Ethernet1` 把端口加入为 untagged 成员；如需 tagged，则加对应的 tagging 选项（选项名需对照实际版本核验，完整命令见 04-05）。创建后再次 `show vlan brief` 核对 VLAN 与成员是否写入 `CONFIG_DB` 的 `VLAN`、`VLAN_MEMBER` 表（表名与字段需对照实际版本核验，字段见 05-02）。若端口此前为 `down`，还应先把端口管理状态置 up。清理用 `config vlan member del 10 Ethernet1` 与 `config vlan del 10`，删除成员先于删除 VLAN，顺序不可颠倒。
+
+第二步是 SVI 与 IP：先用 `show ip interfaces` 确认 10.0.0.1 未被占用、避免地址冲突；再执行 `config interface ip add Vlan10 10.0.0.1/31` 给 SVI 配地址。命令中的掩码必须写成带斜杠的前缀形式，缺少掩码会被 CLI 直接拒绝（该校验逻辑在 `sonic-utilities/sonic-utilities-master/config/main.py`，命令名与选项需对照实际版本核验）。地址写入 `CONFIG_DB` 的 `VLAN_INTERFACE` 表后，由 `cfgmgr/intfmgrd.cpp` 翻译、经 `orchagent/intfsorch.cpp` 生成对象，最终落到 ASIC；因此配置返回只代表意图已进库。验证用 `show ip interfaces` 看地址是否出现在 Vlan10 上，并配合按库核对。清理用 `config interface ip del Vlan10 10.0.0.1/31`。
+
+第三步是 eBGP：BGP 相关命令由 `config/main.py` 的 `bgp` 命令组与 `config/bgp_cli.py` 提供的设备全局配置扩展共同构成，本快照可核验到 `config bgp ...` 命令组以及 `config bgp shutdown all` 等子命令，但建立邻居的逐条命令名、参数顺序与 FRR 集成细节需在 `dockers/docker-fpm-frr/` 与实际版本核验后确定，本文不臆造完整语法（完整命令见 04-05 ｜ 模块见 07-08）。可行的最小闭环是：先在 DUT-A 与 DUT-B 上分别完成 ASN 与邻居地址的配置，执行后用 `show ip bgp summary` 观察会话状态；若能提供 `sonic-db-cli` 访问，还可直接查询 `CONFIG_DB` 中 BGP 相关表项确认配置已落库（表名与字段需对照实际版本核验）。以下代码块给出前两步的可执行闭环，命令中的接口名、VLAN ID 与地址需按本网规划替换。
+
+```bash
+# --- 第一步：端口与 VLAN（前置检查 → 执行 → 验证 → 清理）---
+show vlan brief                              # 前置：确认 Vlan10 不存在
+sudo config interface startup Ethernet1      # 端口管理状态置 up
+sudo config vlan add 10                      # 执行：创建 Vlan10
+sudo config vlan member add 10 Ethernet1     # 执行：加入 untagged 成员
+show vlan brief                              # 验证：核对 VLAN 与成员
+
+# --- 第二步：SVI 与 IP ---
+show ip interfaces                           # 前置：确认地址未冲突
+sudo config interface ip add Vlan10 10.0.0.1/31
+show ip interfaces                           # 验证：确认地址已出现
+
+# --- 清理（按相反顺序）---
+sudo config interface ip del Vlan10 10.0.0.1/31
+sudo config vlan member del 10 Ethernet1
+sudo config vlan del 10
+```
+
+上面的闭环有三个容易被忽略的要点。其一，`config interface startup Ethernet1` 属于第一步的前置动作，若跳过它，端口 Admin 保持 `down`，即便 VLAN 与 IP 都写入正确，`show interfaces status` 仍显示链路未起，验证会失败。其二，`show vlan brief` 在前置与验证阶段各出现一次，形成对照：前置时 Vlan10 不存在、验证时存在且带 Ethernet1 成员，这种「前后对照」是判断配置真正生效的最小证据，比单次输出更可靠。其三，清理顺序必须与创建顺序相反——先删 IP、再删 VLAN 成员、最后删 VLAN，否则删除仍被成员引用的 VLAN 会失败。整段命令只触及 `CONFIG_DB` 的读写，不直接编程 ASIC，真正下发由后续流水线完成（原理见 06-01 ｜ 原理见 06-06）。
+
+### 4. 验证方法与预期结果
+
+验证要分层进行：CLI 层看 `show` 输出、配置库层看表项、期望与对象库层看流水线是否走通，三层结论一致才算配置真正生效。第一层用 `show vlan brief` 检查二层配置，第二层用 `show ip interfaces` 检查三层地址，第三层用 `show ip bgp summary` 检查控制面协议会话。下面给出 `show vlan brief` 的实例与判读。
+
+```bash
+show vlan brief
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（取值仅为格式示意）
++-----------+-----------------+-----------------+---------------------------+
+| VLAN ID   | IP Address      | Ports           | Ports (untagged)          |
++-----------+-----------------+-----------------+---------------------------+
+| 10        | 10.0.0.1/31     |                 | Ethernet1                 |
++-----------+-----------------+-----------------+---------------------------+
+Total number of VLANs: 1
+```
+
+逐行判读如下。列头 `VLAN ID`、`IP Address`、`Ports`、`Ports (untagged)` 表明该命令把 `VLAN`、`VLAN_INTERFACE`、`VLAN_MEMBER` 三张表合并展示，这一点可从 `sonic-utilities/sonic-utilities-master/show/vlan.py` 的 `brief()` 函数核实：它分别 `get_table('VLAN')`、`get_table('VLAN_INTERFACE')`、`get_table('VLAN_MEMBER')` 后拼装行，列名与顺序随版本变化、需对照实际版本核验。数据行中 `VLAN ID` 为 10，与 `config vlan add 10` 对应；`IP Address` 为 10.0.0.1/31，说明第二步的 SVI 地址已写入 `VLAN_INTERFACE` 并能在 CLI 层回显；`Ports (untagged)` 出现 `Ethernet1`，说明 `config vlan member add 10 Ethernet1` 已写入 `VLAN_MEMBER`，且端口以 untagged 方式加入；`Ports`（tagged 列）为空是预期结果，因为本次未加 tagged 选项。末行 `Total number of VLANs: 1` 应与创建数量一致，若显示 0 或缺失，说明前置检查阶段发现的问题未解决。特别要提醒：`show vlan brief` 读取的是 `CONFIG_DB`，它只能证明「配置已写入」，不能证明 ASIC 已建立 VLAN 与成员关系；后者要按库查 `APPL_DB`、`ASIC_DB` 与 `STATE_DB`，这正是下一节排错的核心（字段见 05-02 ｜ 原理见 06-06 ｜ 排障见 08-03）。
+
+第二层 `show ip interfaces` 在前面前置检查中已出现，此处关注验证态：应能在 Vlan10 行看到 10.0.0.1/31，管理状态与操作状态符合预期；该命令底层调用 `ipintutil`，由 `sonic-utilities-master/show/main.py` 中 `ip` 命令组的 `interfaces` 实现，命令形式为 `show ip interfaces`（复数），大纲中「show ip interface」为简写，实际命令名需对照实际版本核验。第三层 `show ip bgp summary` 用来确认 BGP 会话，判读重点如下面的实例所示。
+
+```bash
+show ip bgp summary
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（取值仅为格式示意，不代表任何具体版本）
+IPv4 Unicast Summary:
+BGP router identifier 10.0.0.1, local AS number 65001
+Neighbor    V    AS    MsgRcvd  MsgSent  Up/Down  State/PfxRcd
+10.0.0.0    4    65002 28       30       00:05:11 1
+Total number of neighbors 1
+```
+
+逐行判读如下。首行 `IPv4 Unicast Summary` 表明这是 IPv4 单播地址族的汇总，具体输出格式随 FRR 集成方式变化、需对照实际版本核验。第二行给出本端 router identifier 与本地 AS，`10.0.0.1` 与规划的 DUT-A SVI 地址一致、`65001` 与规划 AS 一致，若取值不符通常是 BGP 全局配置未生效。第三行为列头，`V` 是协议版本、`AS` 是对端自治域、`MsgRcvd` 与 `MsgSent` 是收发报文计数、`Up/Down` 是会话时长、`State/PfxRcd` 是会话状态或收到的前缀数。第四行是对端 `10.0.0.0` 的实测值：`AS` 为 `65002` 与规划一致，`MsgRcvd` 与 `MsgSent` 均为正数且持续增长是会话活跃的正常特征，`Up/Down` 非零说明会话已建立过，`State/PfxRcd` 为 `1` 表示 Established 且收到一条前缀——不同版本可能显示 `Established` 文字而非数字，需对照实际版本核验。末行 `Total number of neighbors 1` 应与配置邻居数一致。最关键的判读纪律是：`State/PfxRcd` 正常只说明协议会话建立，并不等于路由已写进 `APPL_DB`、更不等于已下发 ASIC；按 SONiC 异步流水线，路由还要经 `fpmsyncd.cpp` 同步、`orchagent` 消费、`syncd` 编程，因此必须把 `show ip bgp summary` 与按库核对分开判读（原理见 06-07 ｜ 排障见 08-04）。
+
+为把三层验证的关系固定下来，把验证目标、命令、证据库与「能证明什么」归纳成下表；命令名、表名与状态取值需对照实际版本核验。
+
+| 层次 | 验证命令 | 主要证据来源 | 能证明 | 不能证明 |
+|---|---|---|---|---|
+| 二层 VLAN | `show vlan brief` | `CONFIG_DB` 的 VLAN 表 | VLAN 与成员已写入配置库 | ASIC 已建 VLAN 对象 |
+| 三层 SVI | `show ip interfaces` | `CONFIG_DB` 与运行时 | 地址已配置 | 路由已进转发表 |
+| 控制面 BGP | `show ip bgp summary` | FRR 协议进程 | 会话建立与前缀收发 | 路由已下发 ASIC |
+| 下发链路 | `sonic-db-cli` 查库 | APPL_DB/ASIC_DB/STATE_DB | 流水线各段状态 | 链路物理质量 |
+| 物理链路 | `show interfaces status` | STATE_DB 与端口状态 | Oper/Admin 状态 | 上层协议可达性 |
+
+### 5. 常见失败与排错
+
+排错的总原则是「先分段、再定因」：按图 03-03-01 的顺序，从 `CONFIG_DB` 一路查到 ASIC，看到哪一段断掉，就把根因范围收窄到那一两个进程。第一类是配置未入库：`config` 命令返回成功，但 `show vlan brief` 或 `show ip interfaces` 看不到预期内容。此时先用 `sonic-db-cli CONFIG_DB` 查对应表项，确认是否真的写入；若配置库无表项，问题在 CLI 输入（接口名、命名模式、掩码格式）或校验环节（`sonic-mgmt-common/sonic-mgmt-common-master/cvl/` 的校验，校验见 06-03）；若配置库有而 CLI 不显示，问题在 `show` 读取路径或命名模式显示差异。第二类是期望状态未生成：配置库有表项但 `APPL_DB` 无对应意图，通常是 `cfgmgr/` 的某个 `mgrd` 未运行或订阅失败，应查容器状态与日志（模块见 07-03 ｜ 原理见 06-03）。
+
+第三类是 ASIC 未下发：`APPL_DB` 有意图但转发表无效果，应查 `ASIC_DB` 是否出现对象、`STATE_DB` 是否回写运行时状态；`orchagent` 未消费或 `syncd` 未编程都落在这段（原理见 06-04 ｜ 原理见 06-05）。第四类是物理与链路：端口 `Oper` 长期 `down`、VLAN 成员加不上、对端不可达，多与速率分组、breakout、线缆或对端配置有关，需回到前置检查并重查 `show interfaces status`。第五类是 BGP 专项：`State/PfxRcd` 长期为 `Idle` 或 `Active` 且收发计数为零，先查对端地址可达性与 AS 配置，再查 `CONFIG_DB` 的 BGP 表项；若会话 Established 但学不到路由，重点查路由策略与 `fpmsyncd/` 同步。所有收敛时间、下发时延与吞吐结论都需在目标机型实测，不给绝对值（基准方法见 08-01 ｜ 调优见 08-02）。
+
+按库逐段核对可用以下命令组，执行时把库名与表名替换为实际版本对应值（库编号与表名需对照实际版本核验，参数见 04-04）。
+
+```bash
+sonic-db-cli CONFIG_DB keys 'VLAN*'
+sonic-db-cli CONFIG_DB hgetall 'VLAN|10'
+sonic-db-cli APPL_DB keys 'INTF_TABLE:*'
+sonic-db-cli ASIC_DB keys 'ASIC_STATE:SAI_OBJECT_ID*'
+sonic-db-cli STATE_DB keys 'PORT_TABLE*'
+show interfaces status
+show ip bgp summary
+```
+
+这组命令构成一条自下而上的证据链。第一条列出 `CONFIG_DB` 中VLAN 相关的键，预期能看到 `VLAN|10`、`VLAN_MEMBER|10|Ethernet1`、`VLAN_INTERFACE|Vlan10|10.0.0.1/31` 一类条目；第二条取 `VLAN|10` 的全部字段，确认 `vlanid` 为 10，字段含义见 05 册（字段见 05-02）。第三条查 `APPL_DB` 的接口表，预期出现 `INTF_TABLE:Vlan10` 一类键，说明 `intfmgrd` 已把配置翻译成期望状态；若缺失，问题定位在 `cfgmgr` 段。第四条查 `ASIC_DB` 的 ASIC 状态对象，预期能看到 SAI 对象条目，说明 `orchagent` 已写入、等待 `syncd` 编程；表前缀随版本变化、需对照实际版本核验。第五条查 `STATE_DB` 的端口表，可对照端口运行时状态。最后两条回到 CLI，用 `show interfaces status` 与 `show ip bgp summary` 做端到端确认。重要的是按「配置库 → 期望库 → 对象库 → 状态库 → CLI」顺序推进，而不是一上来怀疑硬件；这条顺序把 SONiC 的异步流水线变成了可逐段验证的诊断树（排障见 08-03 ｜ 案例见 08-04）。
+
+### 6. 小结
+
+本篇完成了一次覆盖端口、VLAN、SVI IP 与 eBGP 的配置闭环，核心成果不是记住几条 `config` 命令，而是建立了「配置写入 ≠ 硬件下发」的判读方法：先用 `show vlan brief`、`show ip interfaces`、`show ip bgp summary` 在 CLI 层确认，再用 `sonic-db-cli` 沿 `CONFIG_DB → APPL_DB → ASIC_DB → STATE_DB` 逐段核对，最后结合 `show interfaces status` 确认物理链路。图 03-03-01 给出了这条链路与每段落点，`cfgmgr/` 承接 VLAN 与 IP、`orchagent/` 翻译为对象、`syncd/` 经 SAI 编程，BGP 则经 `docker-fpm-frr/` 与 `fpmsyncd/` 进入同一条流水线（原理见 06-06 ｜ 原理见 06-07 ｜ 模块见 07-08）。命令、表名、字段名与状态取值均需对照实际版本核验，性能类结论需在目标机型实测（字段见 05-02 ｜ 参数见 04-02 ｜ 参数见 04-05）。
+
+下一篇 03-04 把视角从「配置业务」转到「如何管理与观测配置」：讲解 `show` / `config` CLI 的接入方式、telemetry 采集与 gNMI 管理面，并把本篇反复使用的 `show`、`sonic-db-cli` 放进统一的管理面框架里理解。跨册引用请继续使用（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）的写法，本篇涉及的 VLAN 表字段写「字段见 05-02」、涉及的配置库编号写「参数见 04-04」、涉及的下发链路写「原理见 06-06」、涉及的 CLI 模块写「模块见 07-06」，具体的四段式反查即（字段见 05-02 ｜ 参数见 04-04 ｜ 原理见 06-06 ｜ 模块见 07-06）。
+
+## 03-04 show / config CLI 与 telemetry、gNMI 接入
+
+### 1. 目标与拓扑
+
+前一篇用 `show`、`config` 与 `sonic-db-cli` 完成了从端口到 BGP 的配置闭环，但没有回答一个更基础的问题：这些命令本身从哪里接入交换机，除了 CLI 还有哪些入口能读写同一份配置与状态。本篇补齐这块，讲清 `sonic-utilities` 的 `show` / `config` CLI 接入、`sonic-buildimage-master/dockers/docker-sonic-telemetry/` 的遥测采集，以及 `dockers/docker-sonic-gnmi/` 承载的 gNMI 管理面，并把三条入口统一到一张接入图上（模块见 07-06 ｜ 模块见 07-07 ｜ 原理见 06-14）。
+
+三条入口协议形态不同，最终都汇聚到 `CONFIG_DB` 与各状态库。`show` / `config` 由 `sonic-utilities/sonic-utilities-master/show/main.py` 与 `config/main.py` 用 click 构建命令树，`show` 经 `swsscommon` 的连接器读各库、`config` 经 `ConfigDBConnector` 写 `CONFIG_DB`（`swsscommon` 本体不在本快照，需对照实际版本核验）；gNMI 请求进入 `sonic-mgmt-common/sonic-mgmt-common-master/translib/` 的转换层，经 `cvl/` 的 YANG 校验后同样落到 `CONFIG_DB`；telemetry 则从 `STATE_DB`、`COUNTERS_DB` 等读取运行时状态与计数器并对外订阅推送。「三条入口、一个配置源」是本篇主线，相关结构字段见 05 册、命令全集见 04 册（字段见 05-03 ｜ 参数见 04-05 ｜ 原理见 06-14 ｜ 模块见 07-07）。
+
+三种入口的语义差异也值得提前厘清。CLI 是面向人的、以设备为中心的接口，命令名与输出格式围绕运维习惯设计，优点是直观、可脚本化，缺点是没有统一的模型校验、不同版本命令名可能变化。gNMI 是面向机器的、以模型为中心的接口，请求路径来自 YANG 模型，Set 操作要经 `cvl/` 校验才能落到 `CONFIG_DB`，因此天然具备结构化与可验证性，适合编排系统批量下发；代价是客户端与模型版本需要对齐。telemetry 则是面向观测的流式接口，它不改写配置，只把状态与计数推送给采集器，与 CLI 的 `show` 形成互补——`show` 是拉取式的即时快照，telemetry 是推送式的持续序列。理解三者的定位差异，才能在排障时选对工具：查单台设备的瞬时状态用 CLI，做跨设备批量配置用 gNMI，做长时间趋势与告警用 telemetry（原理见 06-09 ｜ 原理见 06-14 ｜ 模块见 07-06）。
+
+拓扑延续 03-03 的两台设备，另加一台管理站：管理站通过 SSH 使用 CLI、通过 gNMI 客户端使用 gNMI、通过遥测采集器接收 telemetry 数据流，三者都指向同一台 DUT 的管理口。外部 gNMI 客户端与遥测采集平台不在本快照，其命令名、选项与订阅路径需对照实际版本核验，本文只给接入形态与服务端可核验路径。三条入口与后端流水线见图 03-04-01。
+
+:::figure id=03-04-01 | name=CLI telemetry 与 gNMI 三条管理面入口 | dir=TD
+node n1 "show / config CLI" teal
+node n2 "gNMI 客户端<br/>外部工具" gray
+node n3 "telemetry 采集器" gray
+node n4 "translib 与 CVL" teal
+node n5 "CONFIG_DB" blue
+node n6 "APPL_DB" blue
+node n7 "orchagent" purple
+node n8 "ASIC_DB" amber
+node n9 "STATE_DB 与<br/>COUNTERS_DB" blue
+node n10 "syncd 与 SAI" green
+edge n1 -> n5 "读写配置"
+edge n2 -> n4 "gNMI 请求"
+edge n4 -> n5 "校验后写入"
+edge n5 -> n6 "mgrd 写意图"
+edge n6 -> n7 "消费"
+edge n7 -> n8 "写对象"
+edge n8 -> n10 "调用 SAI"
+edge n10 -> n9 "回写状态计数"
+edge n3 -> n9 "订阅遥测"
+edge n9 -> n1 "供 show 读取"
+:::
+
+图 03-04-01 中，teal 为管理面 CLI 与配置校验层，blue 为各数据库，purple 为 `orchagent` 控制面，amber 为 `ASIC_DB`，green 为 `syncd` 与 SAI，gray 为不在本快照的外部客户端。三条入口的差异集中在图的上半部：CLI 直接读写 `CONFIG_DB`；gNMI 先经 `translib/` 与 `cvl/` 校验再写入 `CONFIG_DB`；telemetry 主要读 `STATE_DB`、`COUNTERS_DB`。三条入口在 `CONFIG_DB` 汇合后，共用第 3-03 篇那条 `cfgmgr/` → `APPL_DB` → `orchagent/` → `ASIC_DB` → `syncd/` 的流水线，因此 gNMI 下发一次配置它同样不是同步生效（原理见 06-01 ｜ 原理见 06-14）。边「供 show 读取」表示 `show` 从状态库取数回显，是 CLI 只读状态的体现。
+
+### 2. 前置条件与环境
+
+第一项前置是三类服务的载体齐备。CLI 由 `sonic-utilities-master/show/` 与 `config/` 提供；gNMI 服务端由 `dockers/docker-sonic-gnmi/` 承载，其 `gnmi-native.sh` 负责拼装启动参数、`telemetry_vars.j2` 从配置库渲染变量；telemetry 由 `dockers/docker-sonic-telemetry/` 承载，其 `telemetry.sh` 与 `docker-telemetry-entry.sh` 负责启动，`dialout.sh` 负责拨出模式。这些文件在本快照可核验，具体命令行选项与默认值需对照实际版本核验（模块见 07-02 ｜ 模块见 07-07）。第二项前置是管理面模型链可定位：`sonic-mgmt-common-master/models/yang/` 下有 `openconfig-interfaces.yang`、`openconfig-if-ip.yang` 等模型以及 `sonic/` 目录，`cvl/` 下有 `cvl.go`、`cvl_api.go`、`conf/` 与 `custom_validation/`，`translib/` 下有 `translib.go`、`app_interface.go`、`subscribe.go` 等，`generic_config_updater/` 提供补丁式更新入口；模型路径与键名需对照实际版本核验（模块见 07-07）。
+
+这里补充 CLI 与配置更新链路的关系。`sonic-utilities-master/show/main.py` 与 `config/main.py` 是 click 命令树的两个入口，前者经 `swsscommon` 的连接器读库、后者经 `ConfigDBConnector` 写库；`swsscommon` 的实现在 `sonic-swss-common`，不在本快照，需对照实际版本核验。除逐条 `config` 命令外，`sonic-utilities-master/generic_config_updater/` 提供补丁式更新，其 `main.py`、`patch_sorter.py`、`change_applier.py` 等文件可在本快照核验，适合在大型 `config_db.json` 上做局部字段修改而避免整表覆盖；补丁格式、支持字段与回滚行为需对照实际版本核验（模块见 07-06 ｜ 参数见 04-05）。对运维而言，CLI 与 gNMI 是两条写入路径，GCU 是 CLI 侧的增量写入助手，它们最终都落到 `CONFIG_DB`，因此配置生效的异步特性完全一致。
+
+第三项前置是 gNMI 与 telemetry 的监听配置。服务端脚本通过 `sonic-cfggen -d -t` 渲染 `telemetry_vars.j2` 后读取配置：gNMI 侧从 `CONFIG_DB` 的 `GNMI` 表取 `gnmi`、`certs` 子字段，`telemetry.sh` 侧从 `TELEMETRY` 表取同名字段，证书相关 `x509` 取自 `DEVICE_METADATA`；`GNMI` 未配置时，`telemetry.sh` 有默认端口 8080 的兜底逻辑。脚本支持 `--port`、`--server_crt`、`--server_key`、`--ca_crt`、`--noTLS`、`--insecure`、`--unix_socket`、`--gnmi_vrf`、`-zmq_port` 等参数，是否启用取决于 TLS 与监听模式配置，需对照实际版本核验（参数见 04-05 ｜ 参数见 04-07）。第四项前置是外部客户端与证书：如使用 gNMI 订阅，需要一台装有客户端工具的管理站以及与服务端的信任关系，客户端工具不在本快照，需对照实际版本核验。第五项前置仍是备份与权限，改动前用 `config save` 落盘并另存副本。
+
+把管理面组件与本快照可核验路径归纳成下表，便于逐项核对；容器名、表名与文件名需对照实际版本核验。
+
+| 组件 | 载体 | 职责 | 本快照可核验路径 |
+|---|---|---|---|
+| show / config CLI | sonic-utilities | `show` 读状态、`config` 写配置 | `show/main.py`、`config/main.py` |
+| gNMI 服务端 | docker-sonic-gnmi | gNMI 监听与 dialout | `gnmi-native.sh`、`telemetry_vars.j2` |
+| telemetry 服务端 | docker-sonic-telemetry | 订阅推送与拨出 | `telemetry.sh`、`telemetry_vars.j2` |
+| YANG 模型 | sonic-mgmt-common | 定义配置数据模型 | `models/yang/` |
+| CVL 校验 | sonic-mgmt-common | 配置语法与语义校验 | `cvl/cvl.go`、`cvl/conf/` |
+| translib 转换 | sonic-mgmt-common | 协议请求转配置库操作 | `translib/translib.go` |
+| 补丁式更新 | sonic-utilities | 增量修改配置 | `generic_config_updater/` |
+
+动手前先做一组只读前置检查，确认服务在运行、监听配置可读。
+
+```bash
+show feature status
+docker ps --format '{{.Names}}\t{{.Status}}'
+sonic-db-cli CONFIG_DB keys 'GNMI*'
+sonic-db-cli CONFIG_DB keys 'TELEMETRY*'
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（取值仅为格式示意）
++-----------------+------------------+-----------+
+| Feature         | State            | AutoStart |
++-----------------+------------------+-----------+
+| gnmi            | running          | enabled   |
+| telemetry       | running          | enabled   |
++-----------------+------------------+-----------+
+gnmi            Up 2 hours
+telemetry       Up 2 hours
+database        Up 3 hours
+GNMI|gnmi
+TELEMETRY|gnmi
+```
+
+逐行判读如下。第一段 `show feature status` 中 `gnmi` 与 `telemetry` 的 State 均为 `running`、AutoStart 为 `enabled`，是两项服务已启用的正常特征；若 State 为 `stopped` 而 AutoStart 为 `enabled`，说明进程反复退出或启动被阻断，应先看容器日志（模块见 07-02 ｜ 原理见 06-13）。第二段 `docker ps` 中对应容器为 `Up 2 hours`，与第一段互相印证；若 `show feature status` 显示运行但容器不在列表里，通常是特性被禁用或镜像缺失，需回到 `dockers/` 与构建产物核查。第三、四段 `sonic-db-cli CONFIG_DB keys` 分别返回 `GNMI|gnmi` 与 `TELEMETRY|gnmi`，说明 gNMI 与 telemetry 各自的监听配置已在配置库落位；这里要注意两者是两张独立的表，gNMI 服务端读 `GNMI` 表、telemetry 服务端读 `TELEMETRY` 表，虽字段名相似但不可混写，表名与字段需对照实际版本核验。若查询返回空，则服务端会走脚本内的默认端口兜底，是否可用取决于版本实现。四段输出共同构成「服务—容器—配置」三级前置快照，缺任何一级都不宜开始接入测试（排障见 08-03）。
+
+### 3. 分步操作
+
+第一组是 CLI 接入闭环。CLI 入口在 `sonic-utilities-master/show/main.py` 与 `config/main.py`，命令树由 click 的 `group` / `command` 装饰器构建，常用只读命令包括 `show version`、`show interfaces status`、`show vlan brief`、`show ip interfaces`、`show ip bgp summary`、`show feature status`、`show processes`、`show logging` 等，写操作用 `config ...`（完整命令见 04-05）。闭环做法是：先 `show logging` 或 `show feature status` 看前置，再执行一条 `config` 写操作，随后用对应的 `show` 回显验证，最后用反向 `config` 清理。CLI 的特点是直接读写 `CONFIG_DB` 与各库，不经过 YANG 校验链，因此速度快但缺少模型层约束（原理见 06-01 ｜ 模块见 07-06）。
+
+第二组是 gNMI 接入闭环。先确认 `GNMI` 表配置，必要时写入监听端口与证书字段；配置片段如下，字段名来自 `telemetry_vars.j2` 与 `gnmi-native.sh` 可核验的取值路径，具体结构需对照实际版本核验。写完重启 gnmi 特性使脚本重新渲染参数，再用管理站的外部客户端发起 Get 读取一个已知路径，确认返回与配置库一致；Set 操作则经 `translib/` 转换与 `cvl/` 校验后写入 `CONFIG_DB`，其返回成功同样不代表 ASIC 已下发（原理见 06-14 ｜ 模块见 07-07）。
+
+```json
+{
+    "GNMI": {
+        "gnmi": {
+            "port": "50051",
+            "certs": "/etc/sonic/credentials/gnmi"
+        },
+        "certs": {
+            "server_crt": "/etc/sonic/credentials/server.crt",
+            "server_key": "/etc/sonic/credentials/server.key"
+        }
+    }
+}
+```
+
+```bash
+sudo config feature state gnmi enabled      # 前置：确保 gnmi 特性启用
+sonic-db-cli CONFIG_DB hgetall 'GNMI|gnmi'  # 验证：确认端口与证书字段
+# 以下为外部客户端示例（工具不在本快照，命令与路径需对照实际版本核验）
+gnmic -a <DUT管理IP>:50051 --insecure get --path /openconfig-interfaces:interfaces
+```
+
+第三组是 telemetry 接入闭环。telemetry 有拨入（dial-in，客户端主动连服务端订阅）与拨出（dial-out，设备主动向采集器推送）两种形态，分别由 `docker-telemetry-entry.sh` 与 `dialout.sh` 相关逻辑承载，路径黑名单在 `/etc/telemetry/paths_blacklist.txt`（需对照实际版本核验）。配置侧读 `TELEMETRY` 表，未配置时 `telemetry.sh` 有默认端口 8080 的兜底。闭环做法是：先确认 `TELEMETRY` 表与采集器地址，再用采集器建立一个对 `COUNTERS_DB` 或接口计数路径的订阅，观察计数器是否随流量增长；读取计数不编程 ASIC，这一点与 CLI 一致（原理见 06-09 ｜ 模块见 07-09）。
+
+```bash
+sonic-db-cli CONFIG_DB hgetall 'TELEMETRY|gnmi'   # 前置：确认监听配置
+show feature status                                # 确认 telemetry running
+# 外部采集器订阅命令不在本快照，需对照实际版本核验；命令行侧可用 show 交叉验证
+show interfaces counters
+```
+
+### 4. 验证方法与预期结果
+
+验证围绕「三条入口是否指向同一份配置」展开：CLI 侧用 `show` 回显、配置库侧用 `sonic-db-cli` 查表、gNMI 侧用 Get 返回。第二组命令已在前面给出，这里重点给 gNMI Get 的预期输出与判读。
+
+```bash
+gnmic -a <DUT管理IP>:50051 --insecure get --path /openconfig-interfaces:interfaces/interface=Ethernet1
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（外部客户端，取值仅为格式示意）
+{
+  "source": "<DUT管理IP>:50051",
+  "timestamp": 1730000000000000000,
+  "results": [
+    {
+      "path": "/openconfig-interfaces:interfaces/interface=Ethernet1",
+      "values": {
+        "name": "Ethernet1",
+        "oper-status": "DOWN",
+        "admin-status": "UP"
+      }
+    }
+  ]
+}
+```
+
+逐行判读如下。`source` 是 gNMI 服务端地址与端口，应与命令中 `-a` 指定的管理 IP 和 `GNMI` 表端口一致；若连接失败并提示超时，优先查端口监听、管理 VRF 与 TLS 设置。`timestamp` 是纳秒级时间戳，用来判断数据新鲜度，若与采集时刻相差过大，说明订阅通道可能有缓存或断连。`results[0].path` 是请求路径的回显，`openconfig-interfaces` 对应 `sonic-mgmt-common-master/models/yang/openconfig-interfaces.yang`，说明 gNMI 走的是 OpenConfig YANG 模型到 `CONFIG_DB` 的转换，路径与模型名需对照实际版本核验（模块见 07-07）。`values` 中 `name` 为 `Ethernet1` 与路径键一致；`oper-status` 为 `DOWN`、`admin-status` 为 `UP`，是「管理上启用但链路未起」的典型状态，与 03-03 前置检查里端口未接线的情形吻合，需回查 `show interfaces status`，而不是判定 gNMI 故障。最关键的一点：gNMI Get 读到的是模型/状态视图，它证明「管理面通道打通且数据可读」，既不代表配置已写入 `CONFIG_DB` 的某张具体表，也不代表 ASIC 已下发；验证写入要配合 `sonic-db-cli` 查表，验证下发要沿各库逐段核对（字段见 05-03 ｜ 参数见 04-05 ｜ 原理见 06-14 ｜ 模块见 07-07）。
+
+把三条入口的验证目标与证据来源归纳成下表，便于定位和回归；命令名、表名与模型名需对照实际版本核验。
+
+| 入口 | 验证命令 | 证据来源 | 关键判读 |
+|---|---|---|---|
+| CLI | `show version`、`show feature status` | 各 DB 与容器状态 | 服务运行、回显与配置一致 |
+| CLI 写操作 | `config ...` 配 `show ...` | `CONFIG_DB` 表项 | 写入后能在对应 `show` 中回显 |
+| gNMI | 外部客户端 Get | YANG 模型与配置库 | 路径有效、返回数据新鲜 |
+| gNMI 写操作 | 外部客户端 Set | `translib/` 与 `cvl/` | 校验通过、落库、非即下发 |
+| telemetry | 采集器订阅与 `show interfaces counters` | `COUNTERS_DB` | 计数随流量增长 |
+| 逐段核对 | `sonic-db-cli` 查库 | APPL_DB/ASIC_DB/STATE_DB | 流水线各段状态一致 |
+
+### 5. 常见失败与排错
+
+三条入口的故障可以按「通道层—校验层—落库层—下发层」四层归类。通道层包括 SSH、gNMI 监听、telemetry 采集链路，症状是连不上或订阅不到数据；校验层主要是 gNMI 的 `translib/` 与 `cvl/`，症状是请求被拒绝并返回校验错误；落库层是 `CONFIG_DB` 写入，症状是请求成功但 `sonic-db-cli` 查不到表项；下发层则是 `cfgmgr/` 之后的流水线，症状是库里有表项但 `show` 或 ASIC 无反映。把症状先归到某一层，再在该层内选命令，可以避免「连不上就改证书、库里没表项就重启整机」这类盲目操作（排障见 08-03）。
+
+第一类是 CLI 侧失败：命令不存在多半是命令名或命令树版本差异（命令全集见 04-05）；写操作报接口不存在常是命名模式不匹配；`show` 无输出可能是对应容器未起或库表为空。第二类是 gNMI 通道失败：客户端连不上时先查 `show feature status` 与容器是否运行，再查 `GNMI` 表的端口与证书字段、管理 VRF 与防火墙；TLS 握手失败通常指向 `server_crt`、`server_key`、`ca_crt` 路径或证书过期，需对照实际版本核验。第三类是 gNMI 数据失败：Get 路径报错多为 YANG 模型路径写错或该路径未实现，`cvl/` 校验失败则是配置数据不符合模型约束，二者都要回到 `models/yang/` 与 `translib/` 核查（模块见 07-07 ｜ 原理见 06-14）。第四类是 telemetry 失败：订阅无数据先查采集器地址与拨出配置，再查订阅路径是否被 `paths_blacklist.txt` 屏蔽；计数不涨时对照 `show interfaces counters` 与 `COUNTERS_DB`，并记住读取计数不编程 ASIC（原理见 06-09）。
+
+所有入口共用的排错纪律是：把「管理面是否通」与「配置是否下发」分开判读。gNMI Set 返回成功、CLI `config` 返回成功，都只代表请求被接受并落到配置环节，后续仍要走 `cfgmgr/` → `APPL_DB` → `orchagent/` → `ASIC_DB` → `syncd/` 的异步流水线；因此排错顺序应是先确认入口通道、再按库逐段核对，最后才怀疑硬件（排障见 08-03 ｜ 案例见 08-04）。收敛与下发时延类结论需在目标机型实测。
+
+按库与按容器核对可用以下命令组，库名、表名与容器名需对照实际版本核验（参数见 04-04 ）。
+
+```bash
+show feature status
+show logging | grep -i gnmi
+docker logs gnmi --tail 100
+sonic-db-cli CONFIG_DB hgetall 'GNMI|gnmi'
+sonic-db-cli CONFIG_DB hgetall 'TELEMETRY|gnmi'
+sonic-db-cli APPL_DB keys 'PORT_TABLE:*'
+show interfaces status
+```
+
+这组命令按「容器—日志—配置—状态—CLI」由外到内收窄。前两条看服务状态与日志中的 gNMI 相关报错；第三条直接看 `docker logs gnmi` 的末尾输出，是 TLS 与端口问题最直接的证据源；第四、五条确认两张监听表的字段是否符合预期；第六条查 `APPL_DB` 的端口表，验证管理面写入的配置是否已被 `cfgmgr/` 翻译成期望状态；末条回到 CLI 做端到端确认。若前三条异常，问题在管理面通道；若前六条正常而末条异常，问题在下发链路或物理层。这种分层判读把三条入口的排错统一到同一棵决策树上（排障见 08-03）。
+
+### 6. 小结
+
+本篇把三条管理面入口统一到一张图上：`show` / `config` CLI 由 `sonic-utilities/` 提供、直接读写各库；gNMI 由 `dockers/docker-sonic-gnmi/` 承载，经 `translib/` 与 `cvl/` 校验后写入 `CONFIG_DB`；telemetry 由 `dockers/docker-sonic-telemetry/` 承载，主要从 `STATE_DB`、`COUNTERS_DB` 采集推送。三者在 `CONFIG_DB` 汇合后共用同一条异步下发流水线，所以任何入口的「请求成功」都不等于 ASIC 已下发（原理见 06-14 ｜ 模块见 07-06 ｜ 模块见 07-07）。gNMI 服务端读 `GNMI` 表、telemetry 服务端读 `TELEMETRY` 表，这一区别是配置时最容易写错的地方。涉及的结构字段、命令全集、机制与模块分别见 05、04、06、07 册（字段见 05-03 ｜ 参数见 04-05 ｜ 原理见 06-14 ｜ 模块见 07-07）。
+
+03 册至此完成「能启动—能落地—能配置业务—能管理观测—能升级—能多设备运维」的闭环。下一篇 03-05 转向升级、warm reboot 与配置持久化，把本篇和 03-03 写入的配置放到版本变更与状态恢复的场景里检验；跨册引用继续使用（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）的写法，本篇涉及的 CLI 命令写「参数见 04-05」、涉及的管理面机制写「原理见 06-14」、涉及的 YANG 与 CVL 模块写「模块见 07-07」。

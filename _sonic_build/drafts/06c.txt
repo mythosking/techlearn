@@ -1,0 +1,334 @@
+# SONiC 技术资料 · 06 技术原理（分片 C）
+## 06-05 syncd 与 SAI 调用链、ASIC_DB 回写
+
+### 1. 背景与动机
+
+06-04 讲清了 orchagent 如何消费 APPL_DB、把意图翻译成 ASIC 对象写入 ASIC_DB，但链路到 ASIC_DB 就停住了：orchagent 从不直接操作硬件，它写进 ASIC_DB 的只是「期望芯片应该长什么样」的一组对象与属性。真正把这些对象变成芯片寄存器与表项的，是本册最后一段的核心进程 syncd。本篇的动机就是接住 06-04 留下的这一棒，把「ASIC_DB 里的对象如何经 SAI 调用链落到 ASIC、芯片的状态与计数又如何回写进数据库」这条双向通路讲透。讲不清这段，读者就会停在一个危险的错觉上：以为 ASIC_DB 出现对象就等于转发已经生效，而这与「config 命令返回成功不等于硬件已下发」的全册铁律直接冲突（原理见 06-01 ｜ 原理见 06-04）。
+
+从本快照的证据看，syncd 的主体位于 `sonic-sairedis/sonic-sairedis-master/syncd/`，而不是在 `sonic-swss` 仓，也不是在某个名为 `docker-syncd` 的容器目录里——`dockers/` 下并没有这个名字，syncd 是随 `docker-orchagent` 容器一并交付的进程（模块见 07-02 ｜ 模块见 07-04）。这个落位本身就说明了一件事：syncd 与 SAI 强绑定，它属于「芯片适配」这条线，而不是「业务编排」那条线。`syncd/` 目录里可以核验到 `main.cpp`、`syncd_main.cpp`、`Syncd.cpp`、`SaiSwitch.cpp`、`SaiObj.cpp`、`VendorSai.cpp`、`SaiDiscovery.cpp`、`FlexCounter.cpp` 等一整套文件，它们分别承担入口、启动、主循环对象、交换机对象、对象表示、厂商 API 装载、能力发现与计数采集等职责。
+
+第二个动机来自 SAI 这层抽象的特殊性。SAI 定义了一套与芯片无关的统一 API，`orchagent` 与 `syncd` 之间并不直接约定寄存器，而是约定「对象类型加属性」的模型；到了 syncd 这一侧，才由 `VendorSai.cpp` 把这些统一调用转发给厂商实现。本快照里 `sonic-sairedis-master/SAI/` 是空目录，实际的 SAI 头文件与厂商实现均不在本快照，可核验的是 `meta/`（元数据）、`lib/`（Redis 通道与远端接口）、`vslib/`（虚拟 SAI）等目录（模块见 07-04）。因此本篇凡是涉及具体 SAI 属性枚举、函数签名与版本号，一律写「需对照实际版本核验」并给出可定位目录，不据空目录编造内容。
+
+第三个动机是「回写」这个常被忽略的方向。多数讲述只强调「配置从上层往下走到芯片」，却略过「芯片的端口状态、通知、计数器如何往上回到 STATE_DB 与 COUNTERS_DB」。事实上，运维在 `show interfaces status` 里看到的 `Oper up/down`、在 telemetry 里看到的端口计数，走的正是 syncd 的回写通路：链路变化经 SAI 通知进入 syncd，再被写进 STATE_DB；计数器经 FlexCounter 写入 COUNTERS_DB。这条上行通路若不讲清，读者就无法理解为什么「配置下发正常但端口仍 down」需要去看物理链路与通知，也无法理解计数采集为何不直接编程 ASIC（原理见 06-09 ｜ 模块见 07-04）。本篇因此把「下行调用链」与「上行回写」作为同等重要的两条主线。
+
+### 2. 核心概念
+
+「syncd」在本册指 `sonic-sairedis` 仓里的同步守护进程，它是控制面里唯一「有资格」经 SAI 访问 ASIC 的组件。它的入口极简：`syncd/main.cpp` 的 `main()` 把控制权交给 `syncd_main.cpp` 的 `syncd_main()`，后者完成命令行解析、上下文创建与 `Syncd` 对象构造，最后调用 `syncd->run()` 进入主循环。这里要强调能力边界：`syncd` 虽然调用 SAI，但真正实现 SAI 的是厂商提供的库，本快照内不可见；`syncd` 做的是「把 ASIC_DB 的对象操作翻译成 SAI 调用、再把结果翻译回 Redis」，它是一座翻译桥，不是协议栈，也不是转发面（模块见 07-04 ｜ 模块见 07-12）。
+
+「SAI 调用链」指一次对象操作从 Redis 命令码到 SAI API 的完整路径。ASIC_DB 里定义了一张名为 `ASIC_STATE` 的表——其常量 `ASIC_STATE_TABLE` 在 `lib/sairediscommon.h` 中定义为 `"ASIC_STATE"`，可在快照内核实。`syncd` 从这张表消费到形如 `CREATE`、`REMOVE`、`SET`、`GET` 以及批量变体 `BULK_CREATE`、`BULK_REMOVE`、`BULK_SET`、`BULK_GET` 的操作码（对应源码里的 `REDIS_ASIC_STATE_COMMAND_CREATE` 等 `REDIS_ASIC_STATE_COMMAND_*` 常量），分别进入 `Syncd.cpp` 中 `processQuadEvent()`、`processOidCreate()`、`processOidRemove()`、`processOidSet()`、`processBulkQuadEvent()` 等处理函数，再统一收敛到 `VendorSai` 的 `create()`、`remove()`、`set()`、`get()`、`bulkCreate()` 等成员函数，由后者经函数指针表调用 `sai_api_initialize` 等真正的 SAI API。这条链上每个函数名都能在本快照的 `syncd/Syncd.cpp` 与 `syncd/VendorSai.cpp` 中核验到，函数签名的完整形参与返回约定需对照实际版本核验。
+
+「VID 与 RID」是理解 ASIC_DB 对象键的关键。上层 orchagent 看到的对象句柄是 VID（Virtual ID，虚拟对象 ID），而芯片里真实存在的是 RID（Real ID，真实对象 ID）；二者之间的映射由 `syncd/VirtualOidTranslator.cpp`、`VidManager.cpp` 与 `SaiSwitch.cpp` 中 `getVidToRidMap()`、`getRidToVidMap()` 等接口维护。这样做的意义在于，orchagent 无需知道芯片内部对象编号，`syncd` 在调用 SAI 时才完成翻译，并把翻译关系持久化，供 warm reboot 恢复时使用（原理见 06-10 ｜ 字段见 05-04）。
+
+「回写」包含三类方向相反的数据流。其一是 ASIC 状态视图回写：`syncd` 把成功创建的对象写入 `ASIC_STATE` 表，形成「芯片应有的视图」，这也是 `lib/RedisRemoteSaiInterface.cpp` 读取 ASIC view 的来源。其二是端口运行状态与通知回写：链路 up/down 等变化经 `SwitchNotifications.cpp`、`NotificationHandler.cpp`、`NotificationProcessor.cpp` 进入 syncd，再由 `Syncd.cpp`、`PortStateChangeHandler.cpp` 写入 STATE_DB 的相关表。其三是计数器回写：`FlexCounter.cpp`、`FlexCounterManager.cpp` 周期性读取 SAI 统计值并写入 COUNTERS_DB。三类回写的目的库表名需对照实际版本核验（字段见 05-06 ｜ 原理见 06-09）。
+
+下表把本节的核心概念、职责与本快照可定位的源码落位对应起来，便于回查；表中文件路径均相对 `sonic-sairedis-master/` 根，函数名可核验、签名需对照实际版本核验。
+
+| 概念 | 职责 | 可定位源码 | 边界说明 |
+|---|---|---|---|
+| syncd 守护进程 | 消费 ASIC_DB 调 SAI 并回写 | `syncd/syncd_main.cpp` | 主体在 sairedis 仓，非 sonic-swss |
+| SAI 调用链 | 对象操作转厂商 SAI API | `syncd/Syncd.cpp`、`syncd/VendorSai.cpp` | SAI 头文件与厂商实现不在本快照 |
+| VID/RID 映射 | 虚拟对象号转芯片真实号 | `syncd/VirtualOidTranslator.cpp`、`syncd/SaiSwitch.cpp` | 映射字段需对照实际版本核验 |
+| ASIC_STATE 表 | 保存芯片对象视图 | `lib/sairediscommon.h`、`syncd/RedisClient.cpp` | 常量值为 `"ASIC_STATE"`，可核验 |
+| 通知回写 | 链路状态上行到状态库 | `syncd/SwitchNotifications.cpp`、`syncd/NotificationHandler.cpp` | 状态表名需对照实际版本核验 |
+| 计数回写 | 统计值写入计数库 | `syncd/FlexCounter.cpp` | 计数表名需对照实际版本核验 |
+
+最后是这段话的边界收束：syncd 是白盒交换机 NOS 里控制面与 ASIC 之间的唯一翻译桥，数据面转发始终发生在 ASIC；除 `platform/vs/` 虚拟交换机外不做软件转发。厂商 SAI 实现为闭源且不在本仓库，因此本篇所有关于 SAI 内部行为、属性枚举与版本号的细节都写「不在本快照，需对照实际版本核验」，不据推测补值（原理见 06-01 ｜ 模块见 07-12）。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与对象并给出可定位路径，不展开逐字段定义。syncd 侧对象、`ASIC_DB` 表项与 FlexCounter 的字段统一放在 05 册，SAI 对象与 attribute 字段放在 05-04，参数全集放在 04 册，模块能力放在 07 册，即（字段见 05-06 ｜ 字段见 05-04 ｜ 参数见 04-06 ｜ 原理见 06-05 ｜ 模块见 07-04）。这样处理是为了让本篇聚焦「调用链怎么走」，而不是把 attribute 列表与结构体成员提前铺开。
+
+先给 syncd 侧的对象地图。入口与启动链落在 `syncd/main.cpp`（`main()`）、`syncd/syncd_main.cpp`（`syncd_main()` 与 `syncd->run()`）以及命令行解析相关的 `syncd/CommandLineOptions.cpp`、`CommandLineOptionsParser.cpp`。主对象 `Syncd` 定义在 `syncd/Syncd.h` 与 `syncd/Syncd.cpp`，可核验的成员函数包括 `performStartupLogic()`、`processEvent()`、`processSingleEvent()`、`processQuadEvent()`、`processBulkQuadEvent()`、`processOidCreate()`、`processOidRemove()`、`processOidSet()`、`processOidGet()`、`syncUpdateRedisQuadEvent()`、`sendApiResponse()`、`applyView()`、`updateRedisDatabase()`、`onSyncdStart()` 等；这些名字是真实的，成员变量的完整类型与参数签名需对照实际版本核验（字段见 05-06）。
+
+对象表示与厂商适配落在另一组文件：`syncd/SaiObj.cpp`、`SaiAttr.cpp` 负责把 Redis 里的键值序列化成 SAI 对象与属性，`syncd/VendorSai.cpp` 通过函数指针表（其中可核验到 `.api_initialize = &sai_api_initialize` 一项）装载并调用厂商 SAI API，`VendorSai::create()`、`remove()`、`set()`、`get()`、`bulkCreate()`、`getStats()`、`queryStatsCapability()` 等函数在此实现。`syncd/SaiSwitch.cpp` 维护交换机对象与 VID/RID 映射，可核验到 `getDefaultMacAddress()`、`getVidToRidMap()`、`getRidToVidMap()`、`getSwitchType()`、`getHardwareInfo()`、`getDiscoveredRids()`、`getColdBootDiscoveredVids()`、`getWarmBootDiscoveredVids()` 等接口；`syncd/SaiDiscovery.cpp` 负责能力发现，`syncd/FlexCounter.cpp` 与 `FlexCounterManager.cpp` 负责计数采集（字段见 05-04 ｜ 字段见 05-06）。
+
+Redis 交互层落在 `syncd/RedisClient.cpp` 与 `lib/` 目录。`syncd/RedisClient.cpp` 里可核验到形如 `ASIC_STATE_TABLE + ":" + 对象类型 + ":" + VID` 的键拼接逻辑；`lib/sairediscommon.h` 定义 `#define ASIC_STATE_TABLE "ASIC_STATE"`；`lib/RedisChannel.cpp` 用 `ASIC_STATE_TABLE` 构造 `swss::ProducerTable`；`lib/RedisRemoteSaiInterface.cpp` 提供从 ASIC view 读取对象的接口。选择通道方面，`Syncd.cpp` 里可核验到 `sairedis::ZeroMQSelectableChannel` 与 `sairedis::RedisSelectableChannel` 两种实现，其头文件在 `meta/ZeroMQSelectableChannel.h` 与 `meta/RedisSelectableChannel.h`；`ProducerStateTable`、`Select`、`SelectableChannel` 等通用通信原语多在 `sonic-swss-common`，不在本快照，需对照实际版本核验（字段见 05-03 ｜ 模块见 07-05）。
+
+通知与状态回写相关的落位是 `syncd/SwitchNotifications.cpp`、`NotificationHandler.cpp`、`NotificationProcessor.cpp`、`NotificationQueue.cpp`、`PortStateChangeHandler.cpp`、`RedisNotificationProducer.cpp`，以及 `syncd/PortMap.cpp`、`VirtualOidTranslator.cpp`、`VidManager.cpp`、`WarmRestartTable.cpp`。开机与视图切换相关的 `AsicView.cpp`、`ComparisonLogic.cpp`、`BestCandidateFinder.cpp`、`HardReiniter.cpp`、`SingleReiniter.cpp` 等文件也在同一目录，涉及 warm reboot 的部分受平台与版本限制，需对照实际版本核验（原理见 06-10）。以上只列名称与位置，字段名、成员类型与读写时机一律留待 05 册。
+
+为便于把「文件—职责—回查去向」串起来，下表按子系统归纳 syncd 侧的可核验落位；表中均为目录或文件名，不含未核实的路径。
+
+| 子系统 | 关键文件（相对 syncd/ 或仓根） | 职责 | 回查去向 |
+|---|---|---|---|
+| 入口启动 | `main.cpp`、`syncd_main.cpp` | 解析参数、构造对象、进入 run | 参数见 04-06 |
+| 主循环 | `Syncd.cpp`、`Syncd.h` | 消费命令、分派处理、回写 | 字段见 05-06 |
+| 厂商适配 | `VendorSai.cpp`、`SaiObj.cpp`、`SaiAttr.cpp` | 装载 SAI、对象属性序列化 | 字段见 05-04 |
+| 交换机对象 | `SaiSwitch.cpp`、`VirtualOidTranslator.cpp` | VID/RID 映射与能力 | 字段见 05-04 |
+| Redis 通道 | `RedisClient.cpp`、`lib/sairediscommon.h` | ASIC_STATE 键与通道 | 字段见 05-03 |
+| 通知与计数 | `SwitchNotifications.cpp`、`FlexCounter.cpp` | 状态与计数回写 | 原理见 06-09 |
+
+### 4. 关键流程与调用链
+
+把入口、主循环、对象分派、厂商调用与回写串起来，就得到本篇最重要的一张图：一次 ASIC 对象操作从 ASIC_DB 到芯片、再从芯片回到数据库的双向链路见图 06-05-01。
+
+:::figure id=06-05-01 | name=syncd 的 SAI 调用链与 ASIC_DB 回写 | dir=TD
+node a "orchagent 写入<br/>ASIC_STATE 对象" purple
+node b "ASIC_DB<br/>ASIC_STATE 表" amber
+node c "SelectableChannel<br/>Redis 或 ZeroMQ" gray
+node d "Syncd::processEvent" purple
+node e "processQuadEvent<br/>processOidCreate" purple
+node f "VendorSai<br/>create set get" green
+node g "SAI API<br/>厂商实现不在快照" red
+node h "ASIC 转发芯片" red
+node i "回写 ASIC_STATE<br/>STATE_DB COUNTERS_DB" amber
+edge a -> b "写对象与属性"
+edge b -> c "消费命令码"
+edge c -> d "投递事件"
+edge d -> e "按命令分派"
+edge e -> f "翻译对象属性"
+edge f -> g "调用统一 API"
+edge g -> h "编程芯片"
+edge h -> i "状态与计数"
+edge i -> b "刷新芯片视图"
+:::
+
+图 06-05-01 用颜色区分语义：purple 为 orchagent 与 syncd 的控制面分派，amber 为 ASIC_DB 与回写目标库，gray 为辅助的传输通道，green 为 VendorSai 适配层，red 为 SAI 厂商实现与硬件边界。需要强调的是中间的「翻译」两步：`Syncd::processEvent()` 之后，`processQuadEvent()` 与 `processOidCreate()` 等函数并不直接调用芯片，而是先把 Redis 里的键值还原成 SAI 对象与属性，这一步由 `SaiObj.cpp`、`SaiAttr.cpp` 支撑；随后 `VendorSai::create()`、`set()`、`get()` 等才经函数指针表转到 SAI API（原理见 06-04 ｜ 模块见 07-04）。
+
+下行调用链的起点是主循环。`syncd->run()` 进入事件循环后，经 `SelectableChannel` 从 ASIC_DB 收到一条带命令码的记录：`CREATE` 走 `processOidCreate()`、`REMOVE` 走 `processOidRemove()`、`SET` 走 `processOidSet()`、`GET` 走 `processOidGet()`，批量命令则进入 `processBulkQuadEvent()`、`processBulkOid()` 等对应分支。以创建一个端口对象为例，`processOidCreate()` 先把属性还原成 `sai_attribute_t` 数组，再调用 `VendorSai::create()`；后者用对象类型索引到对应的 SAI API 函数表项，最终调用厂商实现的创建函数，返回 `sai_status_t`。`Syncd.cpp` 里的 `sendApiResponse()` 与 `sendGetResponse()` 把结果经通道写回，供 orchagent 侧读取；orchagent 侧如何处理返回状态见 `handleSaiCreateStatus()`、`handleSaiSetStatus()`、`handleSaiGetStatus()` 一类封装（函数名可在本快照核验，完整签名需对照实际版本核验，原理见 06-04）。
+
+上行回写链与下行调用链共用同一个 `SelectableChannel`，方向相反。第一路是对象视图回写：`syncUpdateRedisQuadEvent()`、`syncUpdateRedisBulkQuadEvent()` 把已成功创建或更新的对象写回 `ASIC_STATE` 表，键格式在 `RedisClient.cpp` 中可核验为 `ASIC_STATE:<对象类型>:<VID>` 一类形态，这使得 ASIC_DB 既是「输入队列」也是「芯片视图的镜像」。第二路是通知回写：链路 up/down 由 SAI 通知回调进入 `SwitchNotifications.cpp`、`NotificationHandler.cpp`，经 `NotificationProcessor.cpp` 处理后，`PortStateChangeHandler.cpp` 与 `Syncd.cpp` 把状态写入 STATE_DB，运维才能在 `show interfaces status` 中看到 `Oper` 字段的变化（原理见 06-09 ｜ 排障见 08-03）。第三路是计数回写：`FlexCounter.cpp` 周期性调用 `VendorSai::getStats()`、`getStatsExt()` 等读取统计值，写入 COUNTERS_DB，telemetry 与 `show` 再从计数库读取（原理见 06-09）。
+
+一个容易混淆的时序点必须讲清：对象写入 ASIC_DB 与芯片完成编程之间隔着「消费—翻译—SAI 调用—返回」若干步，`ASIC_STATE` 里出现对象只代表 syncd 已把它纳入芯片视图，并不等于所有属性都已在我方机型上验证生效。厂商 SAI 对属性的支持程度需要用 `queryStatsCapability()`、`queryAttributeCapability()` 一类能力查询来确认，相关函数在本快照可核验，具体属性枚举与返回约定需对照实际版本核验。性能方面，一次批量下发的收敛时间、配置下发时延与吞吐都受机型、芯片与版本影响，一律标注「需在目标机型实测」，本册不给绝对值（基准方法见 08-01 ｜ 调优见 08-02）。
+
+### 5. 配置/命令/代码实例
+
+本节给三组最小实例：一组用数据库查询命令观察 ASIC_STATE 对象形态并作逐行判读，一组给出 `Syncd.cpp` 主循环分派的代码片段以印证调用链，一组用工具读取 SAI 视图。完整的 syncd 命令行选项见 04-06，数据库对象全集见 04-04，命令全集见 04-05，本册不重列。所有查询命令需在具备相应权限的环境下执行，库名、表名与键格式需对照实际版本核验。
+
+先用数据库查询命令观察 ASIC_DB 里的端口对象。以下命令示例在交换机的数据库容器视角执行，具体可执行文件、参数与库名需对照实际版本核验。
+
+```bash
+# 前置检查：确认数据库容器与 ASIC_DB 可达（容器名需对照实际版本核验）
+docker exec -it database redis-cli PING
+# 执行：列出 ASIC_STATE 中的端口类对象键（键格式需对照实际版本核验）
+sonic-db-cli ASIC_DB KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_PORT:*'
+# 验证：读取其中一个对象的属性字段
+sonic-db-cli ASIC_DB HGETALL 'ASIC_STATE:SAI_OBJECT_TYPE_PORT:oid:0x100000000xxxx'
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（下列键名与取值仅为格式示意，不代表任何具体版本或机型）
+PONG
+ASIC_STATE:SAI_OBJECT_TYPE_PORT:oid:0x1000000000001
+ASIC_STATE:SAI_OBJECT_TYPE_PORT:oid:0x1000000000002
+1) "SAI_PORT_ATTR_HW_LANE_LIST"
+2) "25,26,27,28"
+3) "SAI_PORT_ATTR_SPEED"
+4) "200000"
+5) "SAI_PORT_ATTR_OPER_STATUS"
+6) "SAI_PORT_OPER_STATUS_UP"
+```
+
+逐行判读如下。第一段 `docker exec -it database redis-cli PING` 返回 `PONG`，说明 Redis 通道可达，这是任何 ASIC_DB 查询的前置条件；容器名 `database` 与可执行文件需对照实际版本核验，若连不上应先查容器状态而不是怀疑芯片。第二段 `sonic-db-cli ASIC_DB KEYS` 命令列出两条以 `ASIC_STATE:SAI_OBJECT_TYPE_PORT:` 为前缀的键，印证了 `RedisClient.cpp` 中 `ASIC_STATE_TABLE + ":" + 对象类型 + ":" + VID` 的键拼接逻辑，两条键对应两个端口对象，具体数量应与机型端口数相符；这里用的是 VID 形态的 `oid`，与芯片内部 RID 的映射由 `VirtualOidTranslator.cpp` 维护。第三段 `HGETALL` 读出的属性名 `SAI_PORT_ATTR_HW_LANE_LIST`、`SAI_PORT_ATTR_SPEED` 是 SAI 属性枚举的序列化形式，取值 `25,26,27,28` 与 `200000` 分别对应物理通道与速率，可与 CONFIG_DB 的 PORT 表字段相互印证；`SAI_PORT_ATTR_OPER_STATUS` 的取值 `SAI_PORT_OPER_STATUS_UP` 是运行时状态，表明该属性会随链路变化被回写，正是上行回写通路的体现。需要特别指出：键名里出现 `ASIC_STATE` 只说明对象已进入芯片视图，不能据此断言厂商 SAI 已把这组属性写入芯片并生效，属性是否被支持需经能力查询确认，具体枚举名与格式需对照实际版本核验。整个查询属于「只读数据库」，不改变任何配置，也不经 SAI 编程 ASIC（原理见 06-05 ｜ 参数见 04-04）。
+
+第二组给出 `Syncd.cpp` 主循环分派的代码片段，用来印证「按命令码分派」的实现形态；下列片段依据本快照中可核验的函数名与常量名整理，为便于阅读做了简化，真实函数签名与控制流需对照实际版本核验。
+
+```cpp
+// 代码形态示意，依据 syncd/Syncd.cpp 中可核验的函数与命令常量整理；签名需对照实际版本核验
+void Syncd::processSingleEvent(const std::string &op, entry)
+{
+    if (op == REDIS_ASIC_STATE_COMMAND_CREATE) {
+        processOidCreate(entry);
+    } else if (op == REDIS_ASIC_STATE_COMMAND_REMOVE) {
+        processOidRemove(entry);
+    } else if (op == REDIS_ASIC_STATE_COMMAND_SET) {
+        processOidSet(entry);
+    } else if (op == REDIS_ASIC_STATE_COMMAND_GET) {
+        processOidGet(entry);
+    } else if (op == REDIS_ASIC_STATE_COMMAND_BULK_CREATE) {
+        processBulkQuadEvent(entry);
+    }
+    sendApiResponse(status);
+}
+```
+
+这段代码虽经简化，但链条是真实的：`processSingleEvent()` 依据 `op` 字符串与 `REDIS_ASIC_STATE_COMMAND_*` 常量比对，把不同的 Redis 命令分派给对应的 `processOid*()` 处理函数，最后统一由 `sendApiResponse()` 回送结果。它说明 syncd 本质上是一个「命令码分派器加翻译器」：分派靠字符串常量比对，翻译靠 `SaiObj.cpp`、`SaiAttr.cpp`，真正编程靠 `VendorSai.cpp` 的函数指针表。片段中省略的参数以注释占位但不是正文占位，读者读源码时应重点看每个 `processOid*()` 如何把属性数组交给 `VendorSai::create()/set()/get()`，以及失败时 `sai_status_t` 如何经 `sendApiResponse()` 返回（字段见 05-06 ｜ 原理见 06-04）。
+
+第三组用快照内的工具读取 SAI 视图，作为工作之外的核验手段；工具名称与选项需对照实际版本核验。
+
+```bash
+# saidump 工具位于 sonic-sairedis-master/saidump/，用于转储 SAI 视图
+saidump -h
+```
+
+具体输出格式与可用选项以实际版本为准，需对照实际版本核验；`saidump/` 目录在本快照可核验，其通过 `ASIC_STATE_TABLE` 过滤对象的逻辑见 `saidump/SaiDump.cpp`。此类工具属于辅助核验，不在业务链路上，性能与容量结论不得据此外推到真实机型（模块见 07-04 ｜ 基准见 08-01）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是定位陷阱。最常见的是把 syncd 写进 `sonic-swss` 仓或 `docker-syncd` 容器：本快照里 syncd 主体在 `sonic-sairedis-master/syncd/`，`dockers/` 下没有 `docker-syncd` 目录，它随 `docker-orchagent` 一起交付；`platform/vs/` 下的虚拟 SAI 目录属虚拟交换机专用，二者不可混写。第二类是把 syncd 写成直接驱动硬件的进程：syncd 经 SAI 抽象调用厂商实现，厂商 SAI 多为闭源且不在本仓库，`sonic-sairedis-master/SAI/` 在本快照是空目录，不得据它编造头文件、属性枚举与版本；涉及厂商实现一律写「不在本快照，需对照实际版本核验」，并给出 `syncd/`、`meta/`、`vslib/` 等可定位目录（模块见 07-04 ｜ 模块见 07-12）。
+
+第三类是把「ASIC_DB 有对象」等同于「芯片已下发」。这是与全册异步铁律直接相关的高频误判：`ASIC_STATE` 里出现对象只代表 syncd 已纳入视图，属性是否被厂商 SAI 支持、是否真正写入芯片，需经能力查询与状态回写确认，判读要按 CONFIG_DB、APPL_DB、ASIC_DB、STATE_DB 与 `show` 输出逐段推进，不能一上来怀疑硬件，也不能一句「已下发」带过（原理见 06-01 ｜ 排障见 08-03）。第四类是 DB 编号与表名陷阱：Redis 各库编号来自运行时 `database_config.json`，须对照 `sonic-py-swsssdk/src/swsssdk/dbconnector.py` 的 `SonicDBConfig` 与实际版本核验，禁止写死；`ASIC_STATE` 常量值 `"ASIC_STATE"` 可在 `lib/sairediscommon.h` 核验，但 STATE_DB、COUNTERS_DB 里的具体表名与字段需对照实际版本核验，不确定的一律标注并给出 `syncd/`、`lib/` 等目录（参数见 04-04 ｜ 字段见 05-03）。
+
+第五类是 warm reboot 与多 ASIC 陷阱。`SaiDiscovery.cpp`、`WarmRestartTable.cpp`、`AsicView.cpp`、`ComparisonLogic.cpp` 以及 `syncd/warmrestart` 相关能力受平台与版本限制，不同 HWSKU 与版本行为不同，一律写「受平台与版本限制，需对照实际版本核验」，不得宣称全平台无条件支持；多 ASIC 命名空间同样受限制（原理见 06-10 ｜ 原理见 06-11）。第六类是性能陷阱：一次批量下发的收敛时间、状态回写时延、计数器轮询开销与吞吐都随机型、芯片与版本变化，一律标注「需在目标机型实测」，不给绝对值、不给跨机型通用数字（基准方法见 08-01 ｜ 调优见 08-02）。第七类是把回写当成配置生效证明：端口 `Oper up` 属运行时状态，不能反推「某次 config 命令已使硬件下发」，仍须按库逐段核对（排障见 08-04）。
+
+最佳实践可归纳为四条。其一，读 syncd 代码时把路径写成 `upstream_src/sonic-sairedis/sonic-sairedis-master/` 下的相对路径，并同时给出对应函数（`processEvent()`、`processOidCreate()`、`VendorSai::create()` 等），函数签名不确定就写「需对照实际版本核验」。其二，排障按图 06-05-01 先定位「哪一段」——是 ASIC_DB 无对象、syncd 未消费、SAI 调用失败，还是状态未回写——再按容器查日志，不做跳跃式判断。其三，跨册引用统一用四段式（字段见 05-06 ｜ 参数见 04-06 ｜ 原理见 06-04 ｜ 模块见 07-04），本篇涉及的 SAI 对象字段写「字段见 05-04」、ASIC_DB 与计数回写写「原理见 06-09」、warm reboot 恢复写「原理见 06-10」，不在本篇展开字段表与参数全集。其四，遇到快照内无法核实的内容，宁可标注核验要求并给出目录，也不补值。
+
+### 7. 小结与延伸阅读
+
+本篇把配置流水线最后一棒讲透：syncd 位于 `sonic-sairedis-master/syncd/`，入口经 `main.cpp`、`syncd_main.cpp` 到 `Syncd::run()`，主循环按 ASIC_DB 中 `ASIC_STATE` 表的命令码分派到 `processQuadEvent()`、`processOidCreate()` 等函数，经 `VendorSai` 的函数指针表调用厂商 SAI API 编程 ASIC，并通过 `syncUpdateRedisQuadEvent()`、`SwitchNotifications/NotificationHandler`、`FlexCounter` 分别把对象视图、链路状态与计数回写到 ASIC_STATE、STATE_DB 与 COUNTERS_DB。VID/RID 映射由 `VirtualOidTranslator.cpp`、`SaiSwitch.cpp` 维护，供 warm reboot 恢复使用。图 06-05-01 与子系统归纳表是回查索引；三条纪律贯穿全篇——厂商 SAI 实现不在本快照、ASIC_DB 有对象不等于芯片已生效、DB 编号与表名须核验。
+
+延伸阅读按疑问分流。想补上流水线上游，接读 06-01（数据流总览）、06-02（producer/consumer）、06-03（mgrd 与校验）、06-04（orchagent 调度）；想理解回写后的计数与采集，接读 06-09（计数器、FlexCounter 与 telemetry）；想理解状态恢复与多芯片，接读 06-10（warm reboot）、06-11（多 ASIC 与命名空间）、06-12（SAI 适配与厂商边界）。字段随查走 05-04（SAI 对象）与 05-06（syncd、ASIC_DB、FlexCounter），参数随查走 04-04（DB 对象）与 04-06（syncd 选项），模块能力走 07-04（sonic-sairedis/syncd），排障与判读走 08-03、08-04。跨册引用请始终使用「字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx」的写法，`xx` 替换为具体篇号。
+
+最后重申资料纪律：本篇所有示例输出均注明「示例输出，具体格式需对照实际版本核验」；所有源码路径均相对各子仓 `xxx-master/` 根；厂商 SAI 实现与 SAI 头文件一律写「不在本快照，需对照实际版本核验」；不确定的函数名签名、属性枚举与表名均标注核验要求并给出 `syncd/`、`lib/`、`meta/` 等可定位目录；性能、容量、时延与吞吐类结论一律标注「需在目标机型实测」。版本基准始终为「上游 master 快照（2026-11 抓取）」，不写绝对版本号与 Redis DB 编号。下一篇 06-06 将把视角拉回到一个具体业务——端口与 VLAN 的配置下发链路，从 CONFIG_DB 一路追到 ASIC_DB，看本篇讲解的 syncd 调用链如何被一次真实的端口配置触发。
+
+## 06-06 端口与 VLAN 的配置下发链路
+
+### 1. 背景与动机
+
+06-05 给出了 syncd 经 SAI 编程 ASIC 的通用调用链，但它刻意保持在「机制层」，没有落到任何一笔具体业务。本篇要做的是把一个最典型、也最能贯穿全链路的业务——端口与 VLAN 的配置下发——从用户敲下命令开始，一路追到 ASIC_DB 对象，再借 06-05 的调用链落到芯片。选它做样本有三个理由。第一，端口是交换机的「地基」：速率、通道、管理状态、MTU 这类属性是所有二层、三层业务的前提，端口没起来，VLAN、路由、ACL 都无从谈起。第二，端口与 VLAN 的下发横跨了配置流水线几乎每一段——CONFIG_DB 的配置、cfgmgr 的校验与搬运、APPL_DB 的期望状态、orchagent 的翻译、ASIC_DB 的对象、syncd 的编程，以及 STATE_DB 的状态回写——是检验「是否真正理解 06-01 总览」的试金石。第三，它把 06 册反复强调的异步铁律体现得最直观：`config` 命令返回成功只代表配置写入 CONFIG_DB，端口真正进入 up 状态、VLAN 成员真正写入芯片，中间还有若干段独立进程在推进（原理见 06-01 ｜ 原理见 06-03 ｜ 原理见 06-04）。
+
+从本快照的证据看，这条链路上每一段都有真实源码可定位。配置管理侧在 `sonic-swss/sonic-swss-master/cfgmgr/`，可核验到 `portmgr.cpp`、`portmgrd.cpp`、`vlanmgr.cpp`、`vlanmgrd.cpp`、`intfmgr.cpp`、`intfmgrd.cpp`；编排侧在 `orchagent/`，可核验到 `portsorch.cpp` 与 `intfsorch.cpp`。这种「mgrd 与 orch 成对出现」的结构并非巧合：mgrd 负责把 CONFIG_DB 的用户配置校验、规范化后写进 APPL_DB，orch 负责把 APPL_DB 的期望状态翻译成 ASIC 对象，二者职责分明。本篇会沿着这对结构，把「PORT 表怎么变成 SAI 端口对象」「VLAN 与 VLAN_MEMBER 怎么变成 VLAN 对象与成员关系」「VLAN 接口怎么变成路由器接口对象」三条子链路分别讲清（模块见 07-03 ｜ 原理见 06-04）。
+
+第二个动机是消除一类常见误判。运维常把「`show vlan brief` 能看到 VLAN」当成「VLAN 已经能在芯片里转发」，但在异步流水线里，show 读的是数据库状态，VLAN 成员是否真正加入芯片的 VLAN 表、端口是否已加入对应 bridge，取决于 orchagent 与 syncd 是否走完链路。尤其端口配置还牵涉开机阶段的初始来源——`device/<vendor>/<hwsku>/` 下的端口配置文件与 minigraph 经 `src/sonic-config-engine/` 渲染成初始 CONFIG_DB，这部分路径与字段需对照实际版本核验（参数见 04-02 ｜ 字段见 05-09）。只有把「初始配置从哪来、运行时配置怎么改、每一段落在哪个库和进程」连成一条线，才能在「配置没生效」时判断到底是哪一段出了问题（排障见 08-03 ｜ 排障见 08-04）。
+
+第三个动机是给「能力边界」一个具体落点。端口与 VLAN 的下发最终仍由 `syncd` 经 SAI 完成，`orchagent` 只写 ASIC_DB、不直接操作硬件；厂商 SAI 实现不在本快照，属性支持程度需用能力查询确认；DB 编号来自运行时配置，不可写死。这些全册原则在本篇都能找到具体对应物，因此本篇在讲业务链路的同时，会反复把它们落到真实的端口、VLAN 对象上，而不是停留在抽象口号（原理见 06-05 ｜ 模块见 07-04）。
+
+### 2. 核心概念
+
+「端口配置管理」指 `cfgmgr/portmgr.cpp`、`portmgrd.cpp` 承担的一段职责：订阅 CONFIG_DB 的 PORT 表变更，做范围校验与规范化，再写入 APPL_DB 的端口表。它们不编程 ASIC，只做「配置的搬运与把关」。与之配套的是 `orchagent/portsorch.cpp` 里的 `PortsOrch`：它消费 APPL_DB 的端口表，可核验到 `PortsOrch::doTask()`、`doTask(Consumer&)`、`doPortTask(Consumer&)` 等入口，以及 `addPortBulk()`、`setPort()`、`setPortAdminStatus()`、`setPortMtu()`、`setPortTpid()`、`setPortFec()`、`setPortPfc()` 等属性设置函数——它们把 `speed`、`mtu`、`admin_status` 等配置翻译成 SAI 端口对象的属性（函数名可核验，完整签名需对照实际版本核验，原理见 06-04）。
+
+「VLAN 配置管理」由 `cfgmgr/vlanmgr.cpp`、`vlanmgrd.cpp` 承担。该文件可核验到 `VlanMgr::doTask(Consumer&)`、`doVlanTask(Consumer&)`、`doVlanMemberTask(Consumer&)` 三个处理函数，以及一组表名成员：`m_cfgVlanTable(CFG_VLAN_TABLE_NAME)`、`m_cfgVlanMemberTable(CFG_VLAN_MEMBER_TABLE_NAME)`、`m_stateVlanTable(STATE_VLAN_TABLE_NAME)`、`m_stateVlanMemberTable(STATE_VLAN_MEMBER_TABLE_NAME)`、`m_appVlanTableProducer(APP_VLAN_TABLE_NAME)`、`m_appVlanMemberTableProducer(APP_VLAN_MEMBER_TABLE_NAME)`。这组成员把四张表的角色讲得很清楚：`CFG_*` 是 CONFIG_DB 的配置输入，`APP_*` 是写往 APPL_DB 的输出，`STATE_*` 是回写状态库的结果；此外还可核验到 `STATE_OPER_VLAN_MEMBER_TABLE_NAME`，用于运行态成员状态。表名常量的定义多在 `sonic-swss-common`，不在本快照，需对照实际版本核验（字段见 05-02 ｜ 参数见 04-02）。
+
+「VLAN 与端口在 orchagent 里的汇合点」是理解本篇的关键。`orchagent/portsorch.cpp` 不仅处理端口，还消费 VLAN 与 VLAN 成员表：可核验到 `addExistingData(APP_VLAN_TABLE_NAME)`、`addExistingData(APP_VLAN_MEMBER_TABLE_NAME)`，以及 `m_portTable = unique_ptr<Table>(new Table(db, APP_PORT_TABLE_NAME))`；`doTask(Consumer&)` 里能核验到对 `APP_PORT_TABLE_NAME`、`APP_VLAN_TABLE_NAME`、`APP_VLAN_MEMBER_TABLE_NAME` 的分支判断。这说明 VLAN 对象的创建与成员端口的加入，落在 `PortsOrch` 而非一个独立的 VlanOrch 里——VLAN 本质是端口的集合，二者在芯片侧共享 bridge 与 VLAN 表资源。三层接口则由 `orchagent/intfsorch.cpp` 的 `IntfsOrch::doTask(Consumer&)`、`doTask(SelectableTimer&)` 处理，把 VLAN 接口翻译成路由器接口（RIF）对象（函数名可核验，签名需对照实际版本核验，原理见 06-04）。
+
+「接口配置管理」由 `cfgmgr/intfmgr.cpp`、`intfmgrd.cpp` 承担，可核验到 `IntfMgr::doTask(Consumer&)` 与表名成员 `CFG_INTF_TABLE_NAME`、`CFG_VLAN_INTF_TABLE_NAME`、`CFG_LAG_INTF_TABLE_NAME`、`APP_INTF_TABLE_NAME`。它把物理接口、VLAN 接口与聚合接口的配置统一搬到 APPL_DB 的接口表，供 `IntfsOrch` 与邻居、路由相关 Orch 消费。要注意区分两层「接口」：CONFIG_DB 的 `VLAN_INTERFACE` 是配置，APPL_DB 的 `INTF` 表是期望状态，ASIC_DB 里的 RIF 对象是芯片对象，三者名字相近但分属不同层，不可混为一谈（参数见 04-02 ｜ 字段见 05-07）。
+
+下表把端口与 VLAN 下发链路涉及的核心概念、职责与可定位源码对应起来，便于回查；表中文件路径相对 `sonic-swss-master/` 根，表名常量名可核验、定义需对照实际版本核验。
+
+| 概念 | 职责 | 可定位源码 | 回查去向 |
+|---|---|---|---|
+| 端口配置管理 | 订阅 CONFIG_DB PORT 并搬入 APPL_DB | `cfgmgr/portmgr.cpp`、`portmgrd.cpp` | 参数见 04-02 |
+| 端口编排 | 消费端口表，生成 SAI 端口对象 | `orchagent/portsorch.cpp` | 字段见 05-07 |
+| VLAN 配置管理 | 处理 VLAN 与成员表，回写状态 | `cfgmgr/vlanmgr.cpp` | 参数见 04-02 |
+| VLAN 编排 | 创建 VLAN 对象并加入成员端口 | `orchagent/portsorch.cpp` | 原理见 06-04 |
+| 接口配置管理 | 搬运物理与 VLAN 接口配置 | `cfgmgr/intfmgr.cpp` | 参数见 04-02 |
+| 接口编排 | 生成路由器接口对象 | `orchagent/intfsorch.cpp` | 字段见 05-07 |
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与对象并给出可定位路径，不展开逐字段定义。表项与 `FieldValueTuple` 字段见 05-02，Orch 派生结构（Port、VLAN、RIF 等）字段见 05-07，CONFIG_DB 表与 schema 参数见 04-02，机制见 06-04，即（字段见 05-02 ｜ 字段见 05-07 ｜ 参数见 04-02 ｜ 原理见 06-04 ｜ 模块见 07-03）。本篇聚焦「哪张表从哪来到哪去、由哪个函数翻译」，字段与参数全集不在本册重列。
+
+配置管理侧的结构落位分三组。端口组在 `cfgmgr/portmgr.cpp`、`portmgr.h`、`portmgrd.cpp`；VLAN 组在 `cfgmgr/vlanmgr.cpp`、`vlanmgr.h`、`vlanmgrd.cpp`，其中第 2 节列出的 `VlanMgr` 表名成员与 `doVlanTask()`、`doVlanMemberTask()`、`doTask()` 均可核验；接口组在 `cfgmgr/intfmgr.cpp`、`intfmgr.h`、`intfmgrd.cpp`，其中 `IntfMgr::doTask(Consumer&)` 与 `CFG_INTF_TABLE_NAME`、`CFG_VLAN_INTF_TABLE_NAME`、`APP_INTF_TABLE_NAME` 等常量引用可核验。这些 mgrd 进程订阅的表名常量与字段含义，多数定义于 `sonic-swss-common`（不在本快照），需对照实际版本核验（字段见 05-02 ｜ 模块见 07-05）。
+
+编排侧的结构落位是 `orchagent/portsorch.cpp` 与 `orchagent/intfsorch.cpp`，配套头文件为 `portsorch.h`、`intfsorch.h`。`PortsOrch` 侧可核验到 `m_portTable` 的构造、`addExistingData()` 对 VLAN 与 VLAN 成员表的预加载，以及 `doTask()`、`doPortTask()`、`doTask(Consumer&)` 三个分派入口和 `addPortBulk()`、`setPort()`、`setPortAdminStatus()`、`setPortMtu()`、`setPortTpid()`、`setPortFec()`、`setPortPfc()`、`setPortConfigState()`、`setPortAdminStatusByAlias()` 等属性处理函数；`IntfsOrch` 侧可核验到 `doTask(Consumer&)` 与 `doTask(SelectableTimer&)`。这些函数内部如何处理重试与返回，依赖 `task_process_status` 枚举与 `handleSaiCreateStatus()`、`handleSaiSetStatus()`、`handleSaiGetStatus()` 一类封装，函数名可核验、签名需对照实际版本核验（字段见 05-05 ｜ 字段见 05-07）。
+
+对象与硬件能力侧的结构落位在 `orchagent/` 与 `sonic-sairedis` 两边。端口对象创建时会用 `sai_query_stats_capability()`、`sai_query_attribute_capability()` 做能力查询，并以 `SAI_OBJECT_TYPE_PORT`、`SAI_API_PORT`、`SAI_API_VLAN`、`SAI_API_BRIDGE`、`SAI_API_SWITCH` 等枚举标识对象与 API 类型——这些均在 `portsorch.cpp` 中可核验，但枚举取值与函数签名需对照实际版本核验。生成的对象写入 ASIC_DB，由 06-05 所述的 `syncd` 调用链编程 ASIC（原理见 06-05 ｜ 字段见 05-04）。初始端口配置的来源是 `device/<vendor>/<hwsku>/` 下的 `config_db*.json` 与 `minigraph.xml`，经 `src/sonic-config-engine/` 的 `portconfig.py`、`minigraph.py`、`sonic-cfggen` 渲染，具体文件与字段需对照实际版本核验（字段见 05-09 ｜ 参数见 04-02）。
+
+为便于把「对象—表—源码位置」串起来，下表按四层归纳端口与 VLAN 下发链路上可核验的落位。
+
+| 层次 | 关键表或对象 | 源码位置 | 回查去向 |
+|---|---|---|---|
+| 配置层 | PORT、VLAN、VLAN_MEMBER、VLAN_INTERFACE | `cfgmgr/portmgr.cpp`、`vlanmgr.cpp`、`intfmgr.cpp` | 参数见 04-02 |
+| 期望层 | APPL_DB PORT、VLAN、VLAN_MEMBER、INTF | `orchagent/portsorch.cpp`、`intfsorch.cpp` | 字段见 05-02 |
+| 对象层 | SAI PORT、VLAN、RIF 对象 | `orchagent/portsorch.cpp`、`intfsorch.cpp` | 字段见 05-04 |
+| 硬件层 | ASIC_DB 对象经 syncd 编程 | `sonic-sairedis/syncd/` | 原理见 06-05 |
+
+### 4. 关键流程与调用链
+
+把配置层、期望层、对象层与硬件层串起来，就得到端口与 VLAN 配置下发的完整链路，见图 06-06-01。
+
+:::figure id=06-06-01 | name=端口与 VLAN 配置下发链路 | dir=TD
+node a "CONFIG_DB<br/>PORT VLAN INTF" blue
+node b "portmgrd vlanmgrd<br/>intfmgrd" teal
+node c "APPL_DB<br/>PORT VLAN INTF" blue
+node d "PortsOrch<br/>doPortTask" purple
+node e "IntfsOrch<br/>doTask" purple
+node f "ASIC_DB<br/>PORT VLAN RIF 对象" amber
+node g "syncd 与 SAI" green
+node h "ASIC 转发芯片" red
+node i "device HWSKU<br/>端口配置" gray
+edge a -> b "订阅配置"
+edge i -> b dashed "初始端口来源"
+edge b -> c "写期望状态"
+edge c -> d "PORT VLAN 表"
+edge c -> e "INTF 表"
+edge d -> f "PORT VLAN 对象"
+edge e -> f "RIF 对象"
+edge f -> g "调用链"
+edge g -> h "编程芯片"
+:::
+
+图 06-06-01 中 blue 为数据库输入与期望状态，teal 为配置管理进程，purple 为 orchagent 控制面，amber 为 ASIC_DB 对象，green 为 syncd 与 SAI，red 为硬件边界，gray 为辅助的初始配置来源。虚线「初始端口来源」表示 `device/<vendor>/<hwsku>/` 的端口配置经 `src/sonic-config-engine/` 渲染成初始 CONFIG_DB，这一路受机型与版本限制，需对照实际版本核验（字段见 05-09 ｜ 参数见 04-02）。图中 `PortsOrch` 同时接收 PORT 与 VLAN 两类表，正是第 2 节所说「VLAN 编排落在 PortsOrch」的体现。
+
+端口下发子链的起点是配置写入：用户或开机渲染把 `speed`、`lanes`、`mtu`、`admin_status` 等字段写进 CONFIG_DB 的 PORT 表，`portmgrd.cpp` 订阅变更、`portmgr.cpp` 校验后写入 APPL_DB 端口表。`PortsOrch` 的 `doTask(Consumer&)` 识别表名，把 PORT 表变更交给 `doPortTask(Consumer&)`；后者依据字段调用 `setPortMtu()`、`setPortAdminStatus()` 等函数，首次出现的端口则经 `addPortBulk()` 创建 SAI 端口对象。创建时还会用 `sai_query_attribute_capability()` 探测属性是否受支持，并用 `handleSaiCreateStatus()`/`handleSaiSetStatus()` 处理返回状态。对象建好后写入 ASIC_DB，余下交给 06-05 的 syncd 调用链（函数名可核验，签名需对照实际版本核验，原理见 06-04 ｜ 原理见 06-05）。
+
+VLAN 下发子链与端口子链在 `PortsOrch` 汇合：CONFIG_DB 的 VLAN 表与 VLAN_MEMBER 表经 `vlanmgrd.cpp`、`vlanmgr.cpp` 的 `doVlanTask()`、`doVlanMemberTask()` 校验后写入 APPL_DB 的 VLAN 与 VLAN_MEMBER 表，同时把状态回写 STATE_DB 的 VLAN 相关表。`PortsOrch::doTask(Consumer&)` 里对 `APP_VLAN_TABLE_NAME`、`APP_VLAN_MEMBER_TABLE_NAME` 的分支负责创建 VLAN 对象并把成员端口加入其中，涉及 SAI 的 VLAN、BRIDGE 等 API。三层接口子链则由 `intfmgrd.cpp`、`intfmgr.cpp` 把 VLAN_INTERFACE 配置搬到 APPL_DB 的 INTF 表，`IntfsOrch::doTask()` 生成路由器接口对象写入 ASIC_DB（表名与函数名可核验，字段需对照实际版本核验，原理见 06-04）。
+
+需要把异步时序再强调一次：以图 06-06-01 的任意一条边为界，上游完成不代表下游已完成。`config vlan add` 返回成功只意味着 CONFIG_DB 有了 VLAN 配置；只有从 CONFIG_DB 到 ASIC 的每一段都走通，VLAN 才真正可用。验证时应当逐段核对：CONFIG_DB 有无配置、APPL_DB 有无期望状态、ASIC_DB 有无对象、STATE_DB 与 `show` 输出是否反映运行时结果；端口 `Oper up` 只是运行时状态，不能反推「某次 config 已使硬件下发」（排障见 08-03 ｜ 排障见 08-04）。下发时延、收敛时间与吞吐一律标注「需在目标机型实测」，不给绝对值（基准方法见 08-01 ｜ 调优见 08-02）。
+
+### 5. 配置/命令/代码实例
+
+本节给三组实例：一组用 `config` 与 `show` 命令完成一次 VLAN 配置与首屏验证并作逐行判读，一组给出 `PortsOrch::doTask()` 的分派代码片段印证翻译过程，一组给出观察各库表项的查询命令。完整命令全集见 04-05，CONFIG_DB 表与 schema 见 04-02，数据库对象见 04-04，本册不重列。命令名、选项、表名与键格式需对照实际版本核验。
+
+先看一次典型的 VLAN 配置与验证闭环。以下命令按「前置检查 → 执行 → 验证输出 → 清理」组织，命令名与选项需对照实际版本核验。
+
+```bash
+# 前置检查：确认目标端口存在且为 up
+show interfaces status
+# 执行：创建 VLAN 100 并把Ethernet1 以 untagged 方式加入
+config vlan add 100
+config vlan member add 100 Ethernet1 --untagged
+# 验证：查看 VLAN 摘要与成员
+show vlan brief
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（下列取值仅为格式示意，不代表任何具体版本或机型）
+$ show vlan brief
++-----------+-----------------+------------------+----------------+-----------+
+| VLAN ID   | IP Address      | Ports            | Ports(tagged)  | Proxy ARP |
++-----------+-----------------+------------------+----------------+-----------+
+| 100       |                 | Ethernet1        |                | disabled  |
++-----------+-----------------+------------------+----------------+-----------+
+```
+
+逐行判读如下。前置的 `show interfaces status` 用来确认 `Ethernet1` 存在且 `Oper` 为 `up`，这是 VLAN 成员能正常转发的前提；若端口本就 down，应先回到端口链路排查，而不是继续加 VLAN。执行段两条命令中，`config vlan add 100` 只把 VLAN 写入 CONFIG_DB 的 VLAN 表，`config vlan member add` 命令把成员关系写入 VLAN_MEMBER 表并带 untagged 标记，选项名与参数格式需对照实际版本核验；两条命令返回成功都只代表配置层完成，后面还有 cfgmgr 搬运、orchagent 翻译、syncd 编程三段。输出段是 `show vlan brief` 的结果，列头 `VLAN ID`、`IP Address`、`Ports`、`Ports(tagged)`、`Proxy ARP` 的具体列名随版本变化，需对照实际版本核验；数据行 `VLAN ID` 为 `100`、`Ports` 列出 `Ethernet1`、`Ports(tagged)` 为空，与刚才的 untagged 成员配置相符，属正常特征；`IP Address` 为空说明尚未配置 VLAN 接口地址，`Proxy ARP` 为 `disabled` 是默认状态。最关键的一点：这张表读的是数据库与状态，能列出 VLAN 100 与成员端口，只说明配置已落地到可查询状态，并不等于芯片的 VLAN 表已写入该成员；按图 06-06-01 还需确认 ASIC_DB 有对应对象、STATE_DB 成员状态正常，必要时结合 `show` 与日志判断（原理见 06-04 ｜ 排障见 08-03）。整段查询为只读与配置操作，不经 SAI 直接编程 ASIC（参数见 04-05）。
+
+第二组给出 `PortsOrch::doTask()` 的分派代码片段，用来印证「按表名分派到翻译函数」的实现形态；下列片段依据本快照中可核验的函数名与表名常量整理，为便于阅读做了简化，真实函数签名与控制流需对照实际版本核验。
+
+```cpp
+// 代码形态示意，依据 orchagent/portsorch.cpp 中可核验的入口与表名整理；签名需对照实际版本核验
+void PortsOrch::doTask(Consumer &consumer)
+{
+    const auto &table_name = consumer.getTableName();
+
+    if (table_name == APP_PORT_TABLE_NAME) {
+        doPortTask(consumer);
+    } else if (table_name == APP_VLAN_TABLE_NAME ||
+               table_name == APP_VLAN_MEMBER_TABLE_NAME) {
+        // VLAN 与成员端口对象在此创建与挂接
+        processVlan(consumer);
+    }
+}
+```
+
+这段代码强化了本篇的核心判断：`PortsOrch::doTask()` 以表名作为路由键，端口表交给 `doPortTask()`，VLAN 与 VLAN 成员表走 VLAN 处理分支——VLAN 编排确实与端口编排同处一个类。片段中的处理分支名作了语义化示意，真实源码中对应的调用与重试逻辑需对照 `portsorch.cpp` 核验；读源码时应重点看 `doPortTask()` 如何根据字段调用 `setPortMtu()`、`setPortAdminStatus()`，以及 `addPortBulk()` 如何组织批量创建，这些正是把配置翻译成 SAI 属性的地方（字段见 05-07 ｜ 原理见 06-04）。
+
+第三组给出观察各库表项的查询命令，用于在「配置没生效」时逐段定位；库名、表名与键格式需对照实际版本核验。
+
+```bash
+# 观察 APPL_DB 端口表期望状态
+sonic-db-cli APPL_DB KEYS 'PORT_TABLE:*'
+# 观察 ASIC_DB PORT 对象（对象形态见 06-05）
+sonic-db-cli ASIC_DB KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_PORT:*'
+```
+
+示例输出格式与具体键名需对照实际版本核验。`sonic-db-cli` 的用法与参数见 04-05，ASIC_DB 对象键格式见 06-05；这两条命令属于只读探查，分别对应图 06-06-01 中 APPL_DB 与 ASIC_DB 两段的验证。若 APPL_DB 无表项，问题多在 CONFIG_DB 配置或 cfgmgr 搬运；若 APPL_DB 有而 ASIC_DB 无，问题多在 orchagent 翻译；若 ASIC_DB 有而芯片未生效，则回到 06-05 的 syncd 调用链排查（排障见 08-03 ｜ 原理见 06-05）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是层次混淆陷阱。最常见的是把 CONFIG_DB 的 `VLAN_INTERFACE`、APPL_DB 的 `INTF` 表与 ASIC_DB 的 RIF 对象当成同一个东西，或把 `show vlan brief` 能看到 VLAN 当成芯片已写入成员。三者分属配置层、期望层与对象层，必须按图 06-06-01 逐段区分，验证时按 CONFIG_DB、APPL_DB、ASIC_DB、STATE_DB 与 `show` 输出推进，不能跳段下结论（参数见 04-02 ｜ 排障见 08-03）。第二类是「配置即时生效」陷阱：`config vlan add`、`config vlan member add` 返回成功只代表配置写入 CONFIG_DB，端口进入 up、VLAN 成员写入芯片都要等异步流水线走完；端口 `Oper up` 是运行时状态，不能反推某次 config 已使硬件下发（原理见 06-01 ｜ 排障见 08-04）。
+
+第三类是事实纪律陷阱。端口与 VLAN 的表名常量（如 `CFG_VLAN_TABLE_NAME`、`APP_VLAN_TABLE_NAME`、`APP_INTF_TABLE_NAME`）在 `cfgmgr/`、`orchagent/` 中可核验到引用，但其定义多在 `sonic-swss-common`，不在本快照，需对照实际版本核验；字段名、结构体成员与函数签名的完整形式同样要对照实际版本核验，不确定的一律标注并给出 `cfgmgr/`、`orchagent/`、`src/swsssdk/` 等可定位目录（字段见 05-02 ｜ 模块见 07-05）。第四类是 DB 编号陷阱：Redis 各库编号来自运行时 `database_config.json`，须对照 `sonic-py-swsssdk/src/swsssdk/dbconnector.py` 的 `SonicDBConfig` 核验，禁止写死某库是某号（参数见 04-04）。
+
+第五类是初始配置与平台陷阱。开机阶段的端口配置来自 `device/<vendor>/<hwsku>/` 的 `config_db*.json`、`minigraph.xml` 与 `src/sonic-config-engine/` 的渲染，不同 HWSKU 的端口数、通道编号与命名差异很大，路径与字段需对照实际版本核验；`warmrestart/`、多 ASIC 与 chassis 相关能力受平台与版本限制，需对照实际版本核验，不得宣称全平台无条件支持（字段见 05-09 ｜ 原理见 06-10 ｜ 原理见 06-11）。第六类是能力边界陷阱：端口对象属性是否受支持要用 `sai_query_attribute_capability()` 一类能力查询确认，厂商 SAI 实现闭源且不在本快照，涉及它的细节一律写「不在本快照，需对照实际版本核验」；`orchagent` 只写 ASIC_DB，不直接读写寄存器、不直接驱动芯片（原理见 06-05 ｜ 模块见 07-04）。第七类是性能陷阱：端口批量创建时延、VLAN 收敛时间与吞吐随机型、芯片、版本变化，一律标注「需在目标机型实测」，不给绝对值、不给跨机型通用数字（基准方法见 08-01 ｜ 调优见 08-02）。
+
+最佳实践归纳为四条。其一，把任何一次「配置不生效」都拆成图 06-06-01 的若干段，先判定停在哪一段，再决定查哪个进程的日志与哪张库表，避免一上来怀疑硬件。其二，读代码时把路径写成 `upstream_src/sonic-swss/sonic-swss-master/` 下的相对路径，并同时给出对应函数（`VlanMgr::doVlanTask()`、`PortsOrch::doPortTask()`、`IntfsOrch::doTask()` 等），函数签名不确定就写「需对照实际版本核验」。其三，命令、配置与输出按「前置检查、执行、验证输出、清理」闭环写，示例输出注明「示例输出，具体格式需对照实际版本核验」并附逐行判读。其四，跨册引用统一用四段式（字段见 05-07 ｜ 参数见 04-02 ｜ 原理见 06-04 ｜ 模块见 07-03），本篇涉及的 CONFIG_DB 表字段写「字段见 05-02」、syncd 编程写「原理见 06-05」、计数回写写「原理见 06-09」，不在本篇展开字段表与参数全集。
+
+### 7. 小结与延伸阅读
+
+本篇以端口与 VLAN 为样本，把 06 册的异步流水线落到了一笔具体业务：CONFIG_DB 的 PORT、VLAN、VLAN_MEMBER、VLAN_INTERFACE 配置，经 `cfgmgr/` 的 `portmgrd`、`vlanmgrd`、`intfmgrd` 校验搬运写入 APPL_DB，再由 `orchagent/portsorch.cpp` 的 `PortsOrch` 与 `orchagent/intfsorch.cpp` 的 `IntfsOrch` 翻译成 PORT、VLAN、RIF 对象写入 ASIC_DB，最后由 06-05 的 syncd 调用链编程 ASIC，状态回写 STATE_DB。图 06-06-01 与四层落位表是回查索引；三条判断贯穿全篇——端口与 VLAN 的编排同处 `PortsOrch`、`show` 看到的是状态而非芯片已生效、表名与字段多不在本快照需核验。
+
+延伸阅读按目标分流。想补流水线上游，接读 06-01（数据流总览）、06-02（producer/consumer）、06-03（mgrd 与校验）、06-04（orchagent 调度）；想补下游编程，接读 06-05（syncd 与 SAI 调用链）、06-09（计数回写）、06-10（warm reboot 状态恢复）；想看同类业务，接读 06-07（BGP 与路由下发）、06-08（ACL 与 COPP 下发）。字段随查走 05-02（表项与 FieldValueTuple）与 05-07（Orch 派生结构），参数随查走 04-02（PORT/VLAN/INTERFACE schema）与 04-05（命令全集），模块能力走 07-03（sonic-swss / orchagent），部署实战走 03-03（端口、VLAN、IP 与 BGP 配置），排障走 08-03、08-04。跨册引用请始终使用「字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx」的写法，`xx` 替换为具体篇号。
+
+最后重申资料纪律：本篇所有示例输出均注明「示例输出，具体格式需对照实际版本核验」；所有源码路径均相对各子仓 `xxx-master/` 根；表名常量定义、字段名与函数签名不确定处均标注核验要求并给出 `cfgmgr/`、`orchagent/`、`src/swsssdk/` 等可定位目录；`sonic-swss-common` 与厂商 SAI 实现写「不在本快照，需对照实际版本核验」；性能、容量、时延与吞吐类结论一律标注「需在目标机型实测」。版本基准始终为「上游 master 快照（2026-11 抓取）」，不写绝对版本号与 Redis DB 编号。至此 06 册技术原理的分片 C 两篇收束：06-05 讲清了 syncd 到 SAI 的通用调用链与回写，06-06 把它落到端口与 VLAN 这一笔具体业务，二者合起来构成「从 ASIC_DB 对象到芯片、再从具体配置到 ASIC_DB 对象」的完整闭环。
+

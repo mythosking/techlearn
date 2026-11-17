@@ -1,0 +1,275 @@
+# Snort 3 技术资料 · 06 技术原理（分片 E）
+
+## 06-09 动作、限速与 rate_filter / event_filter
+
+### 1. 背景与动机
+
+检测引擎完成选项链求值之后（原理见 06-08），一条命中规则会产生「事件」并触发「动作」，但把每次命中都原样输出在工程上并不可行。一条写得过宽的规则在扫描型流量下每秒可能命中成千上万次，若每条都写成告警日志，磁盘与 SIEM 管道会瞬间被淹没，真正的攻击信号反而被噪声盖住。因此 Snort 3 在「规则命中」与「告警落盘」之间设置了多道可独立配置的闸门，分别解决三个不同的问题：是否让这次命中生成事件、事件是否允许被记录、以及是否临时改变这条规则接下来要采取的动作。这三件事分别由 detection_filter、event_filter 与 rate_filter 承担，它们共享底层计数机制，但作用点、作用域和后果完全不同，是本篇必须首先厘清的主线。
+
+与限速同等重要的是「动作」本身的表达。规则头里的 alert、drop、block、pass、reject、replace 等关键字并非仅仅决定日志格式，它们对应一组实现了统一接口的 IpsAction 对象；其中一些（如 drop、block）会通过 DAQ verdict 真正影响内联流量（原理见 06-12），另一些（如 alert、log）只负责记录。当同一数据包同时命中多条规则时，动作之间存在优先级，引擎需要一套确定的仲裁规则，而不是「谁先命中听谁的」。事件在进入日志系统前还会经过一个有限容量的队列，按优先级或内容长度排序、去重并截断，以保证每包输出量可控（输出细节见 06-11）。
+
+本篇事实基准统一为「上游 master 快照（2026-11 抓取）」。核心源码分布在四处：动作抽象与各动作实现在 `src/actions/`，基类在 `src/framework/ips_action.h`，管理与装配在 `src/managers/action_manager.cc`；三类过滤器的解析模块分别在 `src/ips_options/ips_detection_filter.cc`（规则选项）与 `src/main/modules.cc`（全局模块），底层计数与哈希表在 `src/filters/`（`sfthd.cc/.h`、`sfrf.cc/.h`、`rate_filter.cc/.h`、`detection_filter.cc`）；事件队列在 `src/events/`（`event_queue.cc/.h`、`sfeventq.cc/.h`），入队与分发落点在 `src/detection/detection_engine.cc` 与 `src/detection/fp_detect.cc`。过滤器的完整参数清单归 04 册（参数见 04-02、04-06），本篇只讲机制与最小配置片段；配置上下文字段归 05 册（字段见 05-03、05-05、05-08）。需要强调的是，限速只作用于「检测引擎产生的事件」，与应用识别、文件事件等经发布订阅通道的消息（原理见 06-10、06-14）是不同路径，不可混为一谈。
+
+### 2. 核心概念
+
+第一个核心概念是 **IpsAction 抽象与动作优先级**。`src/framework/ips_action.h` 定义 `class SO_PUBLIC IpsAction`，其 `Type` 为 `uint8_t`，纯虚函数 `exec(Packet*, const ActInfo&)` 是动作执行的统一入口，`drops_traffic()` 的默认实现返回 false（35 行附近的头注释明确说明：IpsAction 在检测到事件时执行，无论事件是否被记录，甚至可用于更新外部防火墙）。文件 57 至 68 行附近的 `enum IpsActionPriority` 给出了内建优先级序列：`IAP_OTHER=1`、`IAP_LOG=10`、`IAP_ALERT=20`、`IAP_REWRITE=30`、`IAP_DROP=40`、`IAP_BLOCK=50`、`IAP_REJECT=60`、`IAP_PASS=70`，`IAP_MAX=IAP_PASS`。这组数值正是「多规则命中时谁生效」的仲裁依据：数值越大优先级越高，pass 最高、drop 高于 alert。`ActionApi` 结构（107 行附近）在插件基类的基础上携带 `priority` 与 pinit/pterm/tinit/tterm 四个生命周期钩子，`ACTAPI_VERSION`（39 行附近）用于版本兼容校验。各动作以插件形式注册（`src/actions/act_alert.cc`、`act_drop.cc`、`act_block.cc`、`act_reject.cc`、`act_pass.cc`、`act_replace.cc`、`act_react.cc`、`act_log.cc`、`act_file_id.cc`），由 `src/managers/action_manager.cc` 的 `ActionManager::instantiate`（197 行附近）按策略实例化，`load_actions()`（声明于 `src/actions/ips_actions.h`）完成装载。以 alert 为例，`act_alert.cc` 的 `AlertAction::exec`（58 行附近）只是调用 `alert(p, ai)` 并递增 `alert_stats.alert`；drop 则不同，`act_drop.cc` 的 `DropAction::exec`（60 行附近）先调用 `p->active->drop_packet(p)` 与 `set_drop_reason("ips")`，再调用 `alert(p, ai)`，其 `drops_traffic()` 返回 true——这正是「内联阻断由 verdict 反馈实现、Snort 本身不是防火墙」这一能力边界在代码层的体现（原理见 06-12）。
+
+第二个核心概念是**三种过滤器的作用点差异**，这是本篇最关键的一组事实。`src/filters/detection_filter.h` 23 至 30 行的头注释写得很清楚：独立的 `threshold` 配置与规则内的 `threshold` 均已弃用，前者由 `event_filter` 取代、后者由 `detection_filter` 取代；两者共享同一套基本机制，但 `detection_filter` 在**规则匹配的最后一步**求值、因而控制「事件是否生成」，`event_filter` 在**事件入队之后**求值、因而控制「哪些事件被记录」。在此之上，`rate_filter` 既不控制生成也不控制记录，而是在命中时按速率**改变该规则后续的动作**（`new_action`），并在 `timeout` 到期后恢复原动作。三者可叠加使用：一次命中先过 detection_filter 闸门决定是否成为事件，再经 rate_filter 决定是否切换动作，最后由 event_filter 决定是否写日志。这里有一个极易写反的边界：在 rate_filter 把动作改为 drop 之后，即使 event_filter 抑制了告警输出，drop 仍然要执行（源码注释明确说明「内联模式下仍希望丢弃 drop 规则的数据包，只是不想看到告警」），因此「看不到告警」不等于「没有阻断」。
+
+第三个核心概念是 **track 维度与策略作用域**。三类过滤器都支持按源或按目的 IP 分别计数，rate_filter 额外支持 `by_rule`（`src/filters/sfrf.h` 48 至 52 行的 `SFRF_TRACK` 枚举：`BY_NONE=0`、`BY_SRC=1`、`BY_DST`、`BY_RULE`、`BY_MAX`），即该规则共用一个全局计数而不是每地址一份。作用域还牵涉策略上下文：`RateFilter_Test`（`rate_filter.cc` 166 行附近）使用 `get_inspection_policy()->policy_id`，`sfthreshold_test` 在 `fp_detect.cc` 210 行附近使用 `get_network_policy()->policy_id`，而会话事件 `RateFilter_SessionEvent`（197 行附近）使用流自身的 `flow.inspection_policy_id` 并配套 `RateFilterFlowData` 保存 gauge。在多策略（多租户）部署里，同一条 sid 在不同策略下的计数彼此独立，这是设计特性而非缺陷，排障时必须先确认策略上下文再判断计数是否「丢失」。
+
+第四个核心概念是**事件队列的有限容量与排序**。`src/events/event_queue.h` 定义 `EventQueueConfig`（`max_events`、`log_events`、`order`、`process_all_events`）与 `EventNode`（`otn`、`rtn`），并给出 `SNORT_EVENTQ_PRIORITY=1`、`SNORT_EVENTQ_CONTENT_LEN=2` 两个排序常量。底层 `src/events/sfeventq.h` 的 `SF_EVENTQ` 以 `head`/`last` 链表加 `node_mem`/`event_mem` 预分配池实现，另有 `reserve_event` 用于把新事件与队尾比较以决定是否插入，`max_nodes`、`log_nodes`、`cur_nodes`、`cur_events`、`fails` 分别记录容量与失败计数。`src/detection/ips_context.cc` 63 行附近用 `sfeventq_new(qc->max_events, qc->log_events, sizeof(EventNode))` 为每个检测上下文建立队列。入队时 `sfeventq_add` 按排序规则插入，超出容量即失败并计入 `fails`，最终经 `sfeventq_reset` 汇总到 `pc.log_limit`。这套机制保证「每包最多输出 log 条事件」，是防止单包事件风暴的最后一道闸。
+
+### 3. 关键数据结构与源码位置
+
+本节点名结构与真实头文件，字段明细一律引用 05 册，不重列字段表。**动作层**：`src/framework/ips_action.h` 的 `class SO_PUBLIC IpsAction` 与 `enum IpsActionPriority`（IAP_*）、`ActionApi`（字段见 05-05）；`src/actions/actions_module.h` 的 `ActionsModule` 是聚合所有动作计数的 aggregator，`ACTIONS_ARRAY_SIZE` 取 `UINT8_MAX`。**过滤器配置层**：`src/main/modules.cc` 中 `EventFilterModule`（1885 行附近）与 `RateFilterModule`（2003 行附近）的 `Parameter` 数组，分别落地到 `THDX_STRUCT` 与 `tSFRFConfigNode`（字段见 05-03）。**过滤器计数层**：`src/filters/sfthd.h` 的 `THD_NODE`、`THDX_STRUCT`、`THD_IP_NODE`、`THD_STRUCT`、`ThresholdObjects` 与 `EventFilterStats`；`src/filters/sfrf.h` 的 `class tSFRFConfigNode`（含 `std::atomic<unsigned> count`、`newAction`、`timeout`）与 `SFRF_TRACK` 枚举；`src/filters/detection_filter.h` 的 `DetectionFilterConfig`。**事件层**：`src/events/event_queue.h` 的 `EventQueueConfig`、`EventNode`，`src/events/sfeventq.h` 的 `SF_EVENTQ`、`SF_EVENTQ_NODE`（字段见 05-08）；`src/events/event.cc/.h` 的 `Event`（字段见 05-08）。**装配与挂接**：`src/managers/action_manager.cc` 的 `ActionManager::instantiate`、`src/managers/event_manager.cc` 的 `EventManager::call_alerters`/`call_loggers`、**规则选项**：`src/ips_options/ips_detection_filter.cc` 的 `DetectionFilterModule` 与 `IpsOption::set_detection_filter`。三类过滤器在作用点、配置形态与计数维度上的差异见下表。
+
+| 机制 | 配置形态 | 求值位置 | 直接后果 |
+|---|---|---|---|
+| detection_filter | 规则选项，track/count/seconds | 规则匹配末步（detection_options.cc） | 不通过则 NO_MATCH，不生成事件 |
+| event_filter | 全局段，gid/sid/type/count 等 | 事件入队后（fp_detect.cc） | 抑制日志，且内联下仍执行阻断 |
+| rate_filter | 全局段，new_action/timeout | fpLogEvent 内，动作选取前 | 到期前替换规则动作，到期恢复 |
+| suppress | 全局段，gid/sid/track/ip | sfthd_test_threshold | 完全不记录匹配事件（优先级最高） |
+| event_queue | 全局段，max_queue/log/order | 事件入队与出队（sfeventq） | 限每包事件数、排序与去重 |
+
+表中「内联下仍执行阻断」指 `fp_detect.cc` 225 至 249 行附近的分支：event_filter 返回非记录态时仍调用 `act->exec` 并置位 flow 的 `ips_*_event_suppressed` 标志（字段见 05-02）。事件字段归 05-08、动作与配置字段分归 05-05/05-03。整组结构跨册反查关系统一写为：`（字段见 05-08 ｜ 参数见 04-02 ｜ 原理见 06-08 ｜ 模块见 07-08）`。其中字段归 05-08 是因为 Event 与事件队列由该篇权威定义，参数归 04-02 是因为 rate_filter/event_filter/event_queue 段由 04 册权威给出（detection_filter 规则关键字见 04-06），原理归 06-08 是因为事件由检测引擎求值产生，模块归 07-08 是因为 `src/events` 与日志目录职责由该篇介绍。需标注的不透明边界：`tSFRFConfigNode` 的计数哈希表、`ThresholdObjects` 内的 `unordered_map` 与 `GHash` 布局、各 `IpsAction` 子类的内部状态均在对应 `.cc` 内，属实现细节，不可依赖其内部布局，需对照实际版本核验。
+
+### 4. 关键流程与调用链
+
+规则命中侧的第一道闸门在 `src/detection/detection_options.cc`。`match_leaf`（367 行附近）在叶子节点求值时先检查 `otn->detection_filter`，若存在则调用 `detection_filter_test`（378 行附近，实现在 `src/filters/detection_filter.cc` 58 行附近，最终转 `sfthd_test_rule`）；一旦返回非零即 `return (int)IpsOption::NO_MATCH`，该规则整棵子树判为未命中，连 `otn->state.matches` 都不会递增。这印证了「detection_filter 控制事件生成」——它本质上是一个伪装成元选项的规则条件。
+
+通过规则求值后，事件进入 `src/detection/fp_detect.cc` 的 `fpLogEvent`（173 行附近）。它先调用 `RateFilter_Test(otn, p)`（182 行附近），返回值编码了两层信息：小于零表示未触发、采用规则头原动作；大于等于零表示触发、数值即新动作编号；若返回值不小于 `IpsAction::get_max_types()` 则为 action_override，需减去该基数还原真实动作（183 至 186 行附近）。随后调用 `sfthreshold_test`（210 至 223 行附近，实现在 `src/filters/sfthreshold.cc` 144 行附近，内部以 `thd_checked`/`thd_answer` 缓存同一包内的结果，由 `sfthreshold_reset` 清空）执行 event_filter 与 suppress 判定。775 行附近 `sfthreshold_reset()` 在每条事件处理后复位缓存。这里的编码细节是跨版本易变点，需对照实际版本核验。
+
+入队与分发链路收束于 `src/detection/detection_engine.cc`。`DetectionEngine::queue_event(const OptTreeNode*)`（692 行附近）查得 rtn 后从上下文取队列，`sfeventq_event_alloc` 分配 `EventNode`、填入 `otn`/`rtn`，`sfeventq_add` 插入；分配或插入失败返回 -1，表示队列已满。`queue_event(unsigned gid, unsigned sid)`（718 行附近）用于内建事件，`en->rtn` 置空以便策略选择后再查。`DetectionEngine::log_events(Packet*)`（800 行附近）调用 `sfeventq_action(pq, ::log_events, p)` 逐条回调，静态 `log_events`（780 行附近）对每条事件执行 `fpLogEvent` 并复位阈值缓存。最终 `src/detection/detect.cc` 的 `CallAlertFuncs`（113 行附近）构造 `Event`、递增 `pc.total_alert_pkts`/`pc.alert_pkts`（排除 `GID_REPUTATION`），再经 `EventManager::call_alerters` 交给 logger 输出（原理见 06-11）。从规则命中到事件落盘的完整闸门链路见图 06-09-01。
+
+:::figure id=06-09-01 | name=规则命中到事件输出的三道闸门链路 | dir=TD
+node a "规则命中<br/>match_leaf" purple
+node b "detection_filter<br/>事件生成闸门" amber
+node c "RateFilter_Test<br/>改变后续动作" purple
+node d "sfthreshold_test<br/>事件过滤闸门" purple
+node e "queue_event<br/>事件入队" teal
+node f "sfeventq<br/>排序与限流" teal
+node g "log_events<br/>fpLogEvent" green
+node h "IpsAction::exec<br/>alert/drop/pass" red
+node i "logger 输出<br/>CallAlertFuncs" green
+edge a -> b "叶求值末步"
+edge b -> c "通过后成事件"
+edge c -> h "新动作覆盖"
+edge a -> d "并行闸门"
+edge d -> e "未抑制才入队"
+edge e -> f "按序插入"
+edge f -> g "逐条取出"
+edge g -> h "执行仲裁动作"
+edge h -> i "写告警日志"
+edge b -> e dashed "仍受队列上限"
+edge d -> h dashed "抑制告警仍 drop"
+:::
+
+### 5. 配置与代码实例
+
+先看动作优先级的定义形态，它解释了「为何 drop 能压过 alert」。`src/framework/ips_action.h` 的关键片段如下（节选自上游 master 快照，细节需对照实际版本核验）：
+
+```cpp
+// src/framework/ips_action.h（节选）
+class SO_PUBLIC IpsAction {
+public:
+    using Type = uint8_t;
+    enum IpsActionPriority : uint16_t {
+        IAP_OTHER=1, IAP_LOG=10, IAP_ALERT=20, IAP_REWRITE=30,
+        IAP_DROP=40, IAP_BLOCK=50, IAP_REJECT=60, IAP_PASS=70,
+        IAP_MAX = IAP_PASS
+    };
+    virtual void exec(Packet*, const ActInfo&) = 0;
+    virtual bool drops_traffic() { return false; }
+    static Type get_type(const char*);
+    static Type get_max_types();
+    static bool is_valid_action(Type);
+};
+```
+
+这段代码说明三点：优先级由 `IpsActionPriority` 显式编码，pass 的数值最大，因此在同一包的多条命中里 pass 能压过 drop；`drops_traffic()` 默认 false，只有 drop/block/reject 等真正影响流量的动作才会覆写它（如 `act_drop.cc` 返回 true）；`get_max_types()` 被 `fpLogEvent` 用来解码 rate_filter 的 action_override 编码，三者构成动作识别的闭环。三类过滤器的最小配置片段如下（键名需对照实际版本核验，完整参数见 04-02、04-06）：
+
+```lua
+-- snort.lua 片段：三类限速/过滤机制（示意）
+event_filter =
+{
+    { gid = 1, sid = 1, type = 'limit', track = 'by_src', count = 2, seconds = 10 },
+}
+rate_filter =
+{
+    { gid = 1, sid = 1, track = 'by_src', count = 5, seconds = 1,
+      new_action = 'drop', timeout = 30 },
+}
+suppress = { { gid = 1, sid = 2, track = 'by_dst', ip = '1.2.3.4' } }
+event_queue = { max_queue = 8, log = 3, order_events = 'priority' }
+-- 规则内检测过滤：detection_filter: track by_src, count 10, seconds 60;
+```
+
+验证按「前置检查 → 执行 → 复核」闭环，先用 `-T` 确认配置被解析，再跑 pcap 看计数是否随命中增长：
+
+```bash
+snort -c lua/snort.lua -T 2>&1 | grep -i -e "filter" -e "error"
+snort -c lua/snort.lua -r test.pcap -A fast -l ./out --warn-all 2>/dev/null
+grep -i -e "event_filter" -e "rate_filter" -e "detection_filter" ./out/stats.log
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+event_filter: 1 filters configured
+rate_filter: 1 filters configured
+detection_filter: 1 filters configured, memcap = 1048576
+event_filter:
+    no_memory_local: 0    no_memory_global: 0
+rate_filter:
+    no_memory: 0          recoveries: 0
+```
+
+逐行判读如下，合计超过一百五十字。前三行是 `-T` 配置自检的回显，`1 filters configured` 确认对应的 Module 解析成功并调用了 `sfthreshold_create` / `RateFilter_Create` / `IpsOption::set_detection_filter`，若某行显示 0 或缺失，说明该段被注释、键名拼写有误或规则未 include（参数见 04-02、04-06），应回查 `src/main/modules.cc` 的参数定义。`detection_filter` 行的 `memcap = 1048576` 对应 `DetectionFilterConfig::memcap`，它限制按地址计数所用的哈希表内存上限；值取自上游默认（需对照实际版本核验），生产中调小会让更多地址被回收。`event_filter` 的 `no_memory_local`/`no_memory_global` 是 `EventFilterStats` 的两个 peg，来自 `src/filters/sfthd.cc`，分别对应本地与全局 XHash 分配失败次数；只要出现非零，就说明阈值计数因内存不足被丢弃，限速结果不可信。`rate_filter` 的 `no_memory` 与 `recoveries` 来自 `RateFilterModule` 的 peg 定义，`recoveries` 表示为了给新地址腾出空间而淘汰的旧地址数；持续增长意味着 `by_src` 追踪的地址基数超出容量，此时 `by_rule` 或以 `apply_to` 收窄范围往往比继续加内存更有效。所有容量与吞吐结论一律标注「需在目标机型实测」，不给绝对值（基准方法见 08-01）。若 `-T` 阶段报 `unknown new_action`，通常是 `new_action` 字符串不在 `get_action_types` 返回的插件集合内，`RateFilterModule::set` 会以 `ParseError` 拒绝（modules.cc 2066 行附近）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，**不要把三种过滤器混为一谈**。最常见的误判是「event_filter 配了 limit 却仍在日志里看到该 sid」——原因是内联 drop 下告警被抑制但阻断动作照常执行（原理见 06-12），或该事件来自另一条 rule 的另一 sid；排查时先分清是生成、记录还是动作层面的问题，再选对应闸门。第二，**detection_filter 是规则选项而非全局段**。它写在规则体内、由 `IpsOption::set_detection_filter` 挂接，且是「匹配末步」的特殊求值路径（源码里有 `FIXIT-L add DetectionFilterOption::eval()` 的待办注释），其行为在跨版本时可能调整，需对照实际版本核验；独立的 `threshold` 已弃用，新规则一律用 detection_filter。第三，**suppress 优先级最高**。它使 `sfthreshold_test` 返回负值，完全不记录事件；`THD_PRIORITY_SUPPRESS=1000000` 远高于用户配置的 priority，因此一旦命中 suppress，event_filter 的 limit/threshold 都不会再放行，排障时先排除 suppress 再调 limit。第四，**track 维度决定计数基数**。`by_src` 在面向大量客户端的扫描场景会创建海量计数项、把哈希表撑满（表现为 `no_memory`/`recoveries` 增长），此时改用 `by_rule` 或用 `apply_to`/`ip` 限定关注网段，比盲目加 memcap 更稳妥；所有容量结论需在目标机型实测。第五，**多策略下计数彼此独立**。`RateFilter_Test` 用 inspection policy、`sfthreshold_test` 用 network policy、会话事件用流自身策略，同一 sid 在不同策略下的计数不共享；多租户部署中「限速不生效」多半是看错了策略上下文，而非计数器故障。第六，**事件队列上限是硬截断**。`max_queue`/`log` 决定每包最多入队与输出事件数，`sfeventq_add` 失败会计入 `fails` 并最终反映为 `pc.log_limit`；`order_events` 默认按内容长度排序（`content_length`），改为 `priority` 可让高优先级规则优先输出，但两者都不改变「哪些规则命中」，只改变「展示哪些、按什么顺序展示」（参数见 04-02）。第七，**rate_filter 的 timeout 与动作回滚**。`timeout` 为 0 表示永不回滚（`rate_filter_params` 注释），非零时到期恢复规则原动作；变更 `new_action` 前务必确认该动作已在策略中实例化，否则 `get_ips_policy()->get_action` 返回空、事件被静默丢弃（fp_detect.cc 231 行附近）。第八，**加密载荷不可见**。动作与限速只作用于检测引擎可见的事件，不能期待对 TLS 密文正文产生 content 命中（能力边界见 06-10）；应用识别依赖 inspector / binder / wizard（原理见 06-04）。所有吞吐、pps、内存类结论一律标注「需在目标机型实测」，不给绝对值。
+
+### 7. 小结与延伸阅读
+
+本篇覆盖「命中之后」的三层机制：动作层以 `IpsAction` 抽象与 `IpsActionPriority`（IAP_*）统一 alert/drop/pass 等行为的执行与优先级，由 `src/managers/action_manager.cc` 按策略实例化；限速层用 detection_filter（规则匹配末步，控制事件生成）、rate_filter（命中时切换动作、timeout 到期回滚）、event_filter（事件入队后控制记录）三道闸门配合 suppress，共享 `src/filters/` 的 THD 与 SFRF 计数设施；事件层以 `sfeventq` 有限队列做排序、去重与截断，再经 `CallAlertFuncs`/`EventManager` 交给 logger。把握住「生成—改动作—记录—输出」这条主线，就能把本层与检测引擎、输出管线的边界理清。延伸阅读：检测选项链求值与事件产生见 06-08；输出与 logger 管线见 06-11；内联 drop 与 DAQ verdict 见 06-12；多线程下计数与策略上下文见 06-13；Event/Logger 字段见 05-08、IpsAction 字段见 05-05、配置字段见 05-03；三类过滤器与事件队列参数见 04-02、规则关键字见 04-06；`src/events`、`src/loggers` 目录职责见 07-08；性能基准与容量评估见 08-01、08-02。
+
+## 06-10 HTTP/2、TLS、DNS 等 inspector 深入
+
+### 1. 背景与动机
+
+服务检查器（service inspector）处在解码与流重组之后、检测引擎之前的关键位置：它把传输层交付的字节流按应用层协议语义解析成结构化字段，再通过 InspectionBuffer 提供给规则匹配（原理见 06-05、06-08），同时把值得关注的协议事件经发布订阅通道交给日志与关联组件（原理见 06-14）。这一类 inspector 的复杂性集中在三个协议上。HTTP/2 把 HTTP/1.1 的文本报文改造成二进制帧与多路复用的流，还引入 HPACK 头部压缩，规则作者熟悉的 `http.method`、`http.uri`、`http.header` 等字段不再以明文形式出现在载荷里；如果检测引擎直接面对帧字节，现有规则几乎全部失效。TLS/SSL 则带来另一重约束：加密载荷不可见， inspector 能拿到的只有握手的明文部分与证书元数据，任何试图对 HTTPS 密文正文做 content 匹配的规则都注定落空。DNS 看似简单，但 UDP 与 TCP 两种承载、名字压缩指针、TXT 分片与响应中的多记录结构，使状态机实现相当精细。
+
+Snort 3 对三者的应对策略体现了统一的设计取舍：把协议特有的复杂度收敛在 inspector 内部，对检测引擎只暴露稳定的缓冲接口与事件。HTTP/2 inspector 的核心动作是把帧「翻译」成 HTTP/1.1 的消息段再喂给 HTTP/1 inspector，从而让规则集不必为 HTTP/2 另写一套；SSL inspector 在判定流量已加密后主动停止深入检查，只把握手与证书信息以元数据事件发布出去；DNS inspector 维护逐会话状态机，按配置决定是否把解析结果发布给订阅者。三者都通过 `get_buf` 系列接口向检测侧供给字段，都通过 `DataBus::publish` 向外发布事件，这正是它们能被放在一起讨论的共同骨架。
+
+本篇事实基准统一为「上游 master 快照（2026-11 抓取）」。核心源码在 `src/service_inspectors/` 下按协议分目录：`http2_inspect/`（帧类、流拆分器、HPACK）、`http_inspect/`（HTTP/1 解析与缓冲）、`ssl/`（握手跟踪与元数据）、`dns/`（状态机与解析），配套支撑在 `src/decompress/`（文件解压）、`src/mime/`（base64/quoted-printable 解码）、`src/js_norm/`（JavaScript 归一化）、`src/file_api/`（文件提取），事件类型在 `src/pub_sub/`（`ssl_events.h`、`dns_events.h`、`http_events.h` 等），装载入口在 `src/service_inspectors/service_inspectors.cc`。各 inspector 的参数全集归 04 册（参数见 04-05），本篇只讲机制与最小片段；结构字段归 05 册（字段见 05-04、05-09）。必须守住能力边界：加密流量载荷不可见，能拿到的是握手元数据与证书字段（字段名需对照实际版本核验），应用识别依赖 inspector、binder 与 wizard（原理见 06-04），不得宣称能读到 HTTPS 明文正文。
+
+### 2. 核心概念
+
+第一个核心概念是 **HTTP/2 的「帧转 HTTP/1.1」架构**。`src/service_inspectors/http2_inspect/http2_inspect.h` 37 行附近定义 `class Http2Inspect : public snort::Inspector`，提供 `get_buf`（ibt 与 id 两个重载）、`get_fp_buf`、`eval`、`clear`、`configure`，以及 `get_splitter(bool)`——它按方向返回 `splitter[SRC_CLIENT/SRC_SERVER]` 两个 `Http2StreamSplitter`（62 行附近），并声明 `can_carve_files()` 返回 true。目录的 `dev_notes.txt` 开篇即点明设计核心：HTTP/2 inspector（H2I）把 HTTP/2 帧转换为 HTTP/1.1 消息段，再喂给新的 HTTP inspector（NHI）继续处理。`http2_enum.h` 42 行附近的 `enum FrameType` 列出十种帧：`FT_DATA=0`、`FT_HEADERS=1`、`FT_PRIORITY=2`、`FT_RST_STREAM=3`、`FT_SETTINGS=4`、`FT_PUSH_PROMISE=5`、`FT_PING=6`、`FT_GOAWAY=7`、`FT_WINDOW_UPDATE=8`、`FT_CONTINUATION=9`；47 行附近的 `StreamState` 描述每方向的 `STREAM_EXPECT_HEADERS`、`STREAM_EXPECT_BODY`、`STREAM_BODY`、`STREAM_COMPLETE`、`STREAM_ERROR`（后者见 dev_notes）。帧对象家族以 `Http2Frame` 为顶类，派生出 `Http2HeadersFrame`、`Http2HeadersFrameHeader`、`Http2HeadersFrameTrailer`、`Http2PushPromiseFrame`、`Http2DataFrame`、`Http2SettingsFrame`、`Http2RstStreamFrame`、`Http2WindowUpdateFrame`、`Http2PriorityFrame`、`Http2GoAwayFrame`；dev_notes 列出其虚方法族：`valid_sequence(StreamState)`、`analyze_http1()`、`clear()`、`get_buf(unsigned)`、`update_stream_state()`、`is_detection_required()`。HPACK 由 `http2_hpack.h` 的 `Http2HpackDecoder`（42 行附近）配合动态表、Huffman 状态机完成，伪头部被转换为 HTTP/1.1 起始行（`Http2RequestLine`/`Http2ResponseLine`）。模块名为 `http2_inspect`（`http2_module.h` 31 行附近的 `HTTP2_NAME`），`http2_module.cc` 31 至 41 行给出 `concurrent_streams_limit`、`rst_stream_limit`、`settings_max_frame_size` 等参数（默认值需对照实际版本核验）。
+
+第二个核心概念是 **SSL inspector 的握手跟踪与元数据发布**。`src/service_inspectors/ssl/dev_notes.txt` 说明它检查经过流重组的 SSL/TLS 流量，并可选地决定何时停止检查：通常 HTTPS 跑在 443 端口，启用后只检查每个连接的握手，一旦判定已加密便不再深入数据。每个流重组包都有一段未加密部分可用于判断连接状态；默认策略是「先看到握手、再看到双向加密流量」才把会话标记为加密，若一端反馈失败则不标记——这样可防止伪造的最后一个客户端握手包绕过检测。注释还提到，在可能丢包、另一端只有 TCP ACK 的场景下可用 `trustservers` 选项信任服务端加密数据，并检查心跳记录以识别 heartbleed  evasion。`ssl_inspector.cc` 以 `SSLPP_process_alert`（249 行附近）、`SSLPP_process_hs`（277 行附近）、`SSLPP_process_app`（294 行附近）、`SSLPP_process_other`（317 行附近）分派记录类型，维护 `SSLData` 的 `ssn_flags`；完成握手的证书与 ClientHello 数据被抽取为 `TLSConnectionData`。`ssl_inspector.h` 28 行附近的 `SslMetadataEvent : SslTlsMetadataBaseEvent` 提供 `get_version`、`get_cipher`、`get_curve`、`get_server_name`、`get_subject`、`get_issuer`、`get_validation_status` 等访问器；`SslFlowData`（52 行附近）持 `SSLData session` 与 `TLSConnectionData tls_connection_data`。事件经 `DataBus::publish` 以 `SslEventIds::SSL_TLS_METADATA_EVENT`、`CHELLO_SERVER_NAME`、`SERVER_COMMON_NAME` 发布（`ssl_inspector.cc` 171、412、419、435 行附近），订阅方见 `src/pub_sub/ssl_events.h`。模块名为 `ssl`（`ssl_module.h` 30 行附近的 `SSL_NAME`），参数 `trust_servers`、`max_heartbeat_length` 见 04-05。
+
+第三个核心概念是 **DNS 的双承载状态机与响应发布**。`src/service_inspectors/dns/dns.h` 40 行附近的 `DNSHdr` 含 id、flags、questions、answers、authorities、additionals 六个 16 位字段，`DNSQuestion` 与 `DNSRR` 描述查询与资源记录；50 至 59 行给出响应标志位掩码（如 `DNS_HDR_FLAG_RESPONSE=0x8000`、`DNS_HDR_FLAG_TRUNCATED=0x0200`），99 行起定义 A、CNAME、PTR、MX、TXT、AAAA、SRV、OPT、HTTPS、CAA 等 RR 类型常量。139 行起是一组 `DNS_RESP_STATE_*` 常量，把响应解析拆成长度（仅 TCP，2 字节）、12 字节头部、问题段、名字、RR 类型/类/TTL/RDLENGTH/RDATA 等细粒度状态。`DNSData`（213 行附近）是逐会话数据块，持有状态机游标、`hdr`/`curr_q`/`curr_rr`/`curr_txt`、答案/授权/附加记录的偏移表与 `DnsResponseDataEvents`；`DnsFlowData`（270 行附近）用于 DNS over TCP，`DnsUdpFlowData`（286 行附近）用 `std::set<uint16_t> trans_ids` 跟踪 UDP 事务 ID。`class Dns : public snort::Inspector`（300 行附近）提供 `eval`、`get_splitter`、`snort_dns(p, udp, is_payload)` 与 `get_pub_id()`，并声明 `supports_no_ips()` 返回 true（允许无 IPS 规则时运行）。`dns.cc` 的 `Dns::eval`（1331 行附近）按是否重组分派 `snort_dns`，解析完成后以 `DnsEventIds::DNS_RESPONSE_DATA`、`DNS_RESPONSE` 发布（1314、1317 行附近）。模块参数仅 `publish_response`（默认 false），决定是否解析并发布响应。
+
+第四个核心概念是**共享的解码支撑与缓冲接口**。HTTP 系列 inspector 把归一化后的字段放进 `InspectionBuffer`，由 `http_inspect.h` 的 `HttpInspect : HttpInspectBase` 通过 `get_buf`/`get_fp_buf`/`http_get_buf(p, HttpBufferInfo)` 暴露；`http_enum.h` 53 行起的 `HTTP_RULE_OPT` 枚举列出 `HTTP_BUFFER_CLIENT_BODY`、`HTTP_BUFFER_HEADER`、`HTTP_BUFFER_METHOD`、`HTTP_BUFFER_URI`、`HTTP_BUFFER_DECODED_URI`、`HTTP_BUFFER_STAT_CODE` 等缓冲 ID，正是规则里 sticky buffer 的实现落点。辅助目录各司其职：`src/decompress/` 的 `file_decomp_*.cc` 处理 ZIP/PDF/SWF 内嵌文件解压；`src/mime/` 的 `decode_b64.cc`、`decode_qp.cc` 处理 base64 与 quoted-printable；`src/js_norm/` 的 `JsNormalizer::normalize`（49 行附近）归一化混淆脚本；`src/file_api/` 提供文件上下文与提取服务。它们把「解析—归一化—供给缓冲/发布事件」这条链路补齐，使规则既能匹配归一化字段，也能触发文件类检测。
+
+### 3. 关键数据结构与源码位置
+
+本节点名结构与真实头文件，字段一律引用 05 册，不重列字段表。**HTTP/2**：`src/service_inspectors/http2_inspect/http2_inspect.h` 的 `class Http2Inspect` 与 `Http2StreamSplitter`；`http2_enum.h` 的 `FrameType`、`StreamState`、`HTTP2_BUFFER`；`http2_frame.h/.cc` 的 `Http2Frame` 家族与工厂 `new_frame`（字段见 05-04）；`http2_flow_data.h` 的 `Http2FlowData`（`infractions[2]`、`events[2]`、`frame_type[2]`、`concurrent_streams`）；`http2_hpack.h` 的 `Http2HpackDecoder`；`ips_http2.cc/.h` 的 HTTP/2 专用选项。**HTTP/1 与支撑**：`src/service_inspectors/http_inspect/http_inspect.h` 的 `HttpInspect`、`http_enum.h` 的 `HTTP_RULE_OPT`；`src/decompress/`、`src/mime/`、`src/js_norm/`、`src/file_api/` 的解码与提取入口。**TLS/SSL**：`src/service_inspectors/ssl/ssl_inspector.h` 的 `SslMetadataEvent`、`SslFlowData`；`ssl_flow_data.h` 的 `SSLData`/`TLSConnectionData`；`ssl_inspector.cc` 的 `SSLPP_process_*` 族；`src/pub_sub/ssl_events.h` 的元数据事件基类（字段见 05-04、05-09）。**DNS**：`src/service_inspectors/dns/dns.h` 的 `DNSHdr`、`DNSQuestion`、`DNSRR`、`DNSNameState`、`DNSData`、`DnsFlowData`、`DnsUdpFlowData`、`class Dns`；`dns_splitter.h` 的 `DnsSplitter`；`src/pub_sub/dns_events.h`（字段见 05-04）。**装载**：`src/service_inspectors/service_inspectors.cc` 85 行附近的 `load_service_inspectors()` 统一装载 `sin_http`、`sin_http2`、`sin_ssl`、`sin_dns` 等 `BaseApi*` 数组。三类 inspector 的输入、核心机制与对外接口对照见下表。
+
+| inspector | 输入承载 | 核心机制 | 对外接口 |
+|---|---|---|---|
+| http2_inspect | 流重组后的 HTTP/2 帧 | 拆分器＋帧类＋HPACK，转 HTTP/1.1 段 | get_buf 缓冲、专用事件 |
+| http_inspect | 流重组后的 HTTP/1 报文 | 字段归一化为 InspectionBuffer | HTTP_BUFFER_* 缓冲 |
+| ssl | 流重组后的 TLS 记录 | 握手状态机、加密判定、证书抽取 | DataBus 元数据事件 |
+| dns | UDP 数据报 / TCP 流 | 逐状态解析、压缩名与 RR 解码 | get_buf、DNS 响应事件 |
+
+表中「转 HTTP/1.1 段」是 H2I 与 NHI 协作的关键（机制见 dev_notes.txt），字段细节需对照实际版本核验。结构字段归 05-04（Inspector/Module/Rule）与 05-09（Flow/Session 与流数据）。整组结构跨册反查关系统一写为：`（字段见 05-04 ｜ 参数见 04-05 ｜ 原理见 06-04 ｜ 模块见 07-03）`。其中字段归 05-04 是因为这些 inspector 与其流数据由该篇权威定义（流数据另见 05-09），参数归 04-05 是因为 http/http2/ssl/dns inspector 段由 04 册权威给出，原理归 06-04 是因为 inspector 由 binder/wizard 按服务绑定且受加密不可见边界约束，模块归 07-03 是因为 `src/service_inspectors` 目录职责由该篇介绍。需标注的不透明边界：`Http2HpackDecoder` 的动态表与 Huffman 状态机、`TLSConnectionData` 的证书解析内部、`DNSData` 的偏移表布局均在对应 `.cc` 内，属实现细节，不可依赖其内部布局，需对照实际版本核验。
+
+### 4. 关键流程与调用链
+
+HTTP/2 的链路从流拆分开始。binder 按服务把流量绑定到 `http2_inspect`（原理见 06-04）后，`Http2StreamSplitter` 在帧边界切分，并做两处例外处理（dev_notes.txt）：其一把 Headers 帧后的 Continuation 帧聚合为单个头部块送检，其二把过长的 Data 帧切成 16KB 块；拆分器剥离帧头存入独立缓冲，Headers＋Continuation 场景只保留 Headers 帧头、丢弃 Continuation 帧头。客户端连接的前 24 字节是 magic preface，`http2_stream_splitter_impl.cc` 51 行附近的 `validate_preface` 校验之（54 行附近 `preface_length = 24`），不符则产生失步事件并中止（200 至 208 行附近）。随后 `Http2Inspect::eval`（109 行附近）取得 `Http2Stream`，`Http2Frame::new_frame`（58 行附近）按 `session_data->frame_type[source_id]` 工厂化具体帧类：Headers 帧依流状态决定生成 `Http2HeadersFrameHeader` 还是 `Http2HeadersFrameTrailer`，其余帧各归其类，并校验 flags 掩码，非法位置递增 `INF_INVALID_FLAG` 并产生 `EVENT_INVALID_FLAG`。帧对象经 `analyze_http1()` 把伪头部与字段转成 HTTP/1.1 消息段交给 NHI（原理见 06-08），`get_buf(id)` 把 `HTTP2_BUFFER_FRAME_HEADER`、`HTTP2_BUFFER_FRAME_DATA` 等缓冲暴露给规则；HPACK 解码在这一阶段还原压缩头部。
+
+SSL 的链路起点同样是流重组。`SslInspector::eval`（`ssl_inspector.cc` 97 行附近）对每条重组记录判定类型，分别进入 `SSLPP_process_alert`、`SSLPP_process_hs`、`SSLPP_process_app`、`SSLPP_process_other`，更新 `SSLData::ssn_flags` 与统计量（`packets`、`certificate`、`finished`、`bad_handshakes` 等 peg）。当识别出 ClientHello 时抽取 SNI（`CHELLO_SERVER_NAME`），识别出服务端证书时抽取 subject/issuer 等信息（`SERVER_COMMON_NAME`），握手完成后把 `TLSConnectionData` 包装成 `SslMetadataEvent` 以 `SSL_TLS_METADATA_EVENT` 发布（171、412 行附近）。一旦判定双向加密建立，inspector 停止深入检查后续应用数据——这正是「加密载荷不可见」在流程层的落点。DNS 的链路是 `Dns::eval`（1331 行附近）→ `snort_dns(p, udp, is_payload)`（1217 行附近）→ 逐状态解析：`DnsSplitter::scan`（`dns_splitter.cc` 36 行附近）负责 TCP 流分帧，UDP 则按数据报处理；解析填充 `DNSData` 的标志、问题与 RR 表，若 `publish_response` 为真则以 `DNS_RESPONSE_DATA`/`DNS_RESPONSE` 发布。三条链路与检测/日志的衔接见图 06-10-01。
+
+:::figure id=06-10-01 | name=三类服务 inspector 的解析与对外接口链路 | dir=TD
+node a "binder 绑定<br/>按服务选择" blue
+node b "Http2StreamSplitter<br/>帧边界切分" teal
+node c "Http2Frame 工厂<br/>帧类与 HPACK" purple
+node d "HttpInspect<br/>转 HTTP/1.1 段" purple
+node e "SslInspector::eval<br/>握手状态机" purple
+node f "TLS 元数据事件<br/>DataBus 发布" amber
+node g "Dns::eval<br/>逐状态解析" purple
+node h "DNS 响应事件<br/>DataBus 发布" amber
+node i "检测缓冲<br/>get_buf" green
+edge a -> b "服务 http2"
+edge b -> c "帧交付"
+edge c -> d "帧转消息段"
+edge d -> i "暴露字段"
+edge a -> e "服务 ssl"
+edge e -> f "握手完成发布"
+edge a -> g "服务 dns"
+edge g -> h "配置开启发布"
+edge g -> i "暴露字段"
+edge f -> i dashed "事件另行订阅"
+:::
+
+### 5. 配置与代码实例
+
+先看 HTTP/2 帧工厂的分派形态，它展示了帧类型如何映射到处理类。`src/service_inspectors/http2_inspect/http2_frame.cc` 的关键片段如下（节选自上游 master 快照，细节需对照实际版本核验）：
+
+```cpp
+// src/service_inspectors/http2_inspect/http2_frame.cc（节选）
+Http2Frame* Http2Frame::new_frame(const uint8_t* header, const uint32_t header_len,
+    const uint8_t* data, const uint32_t data_len, Http2FlowData* session_data,
+    SourceId source_id, const Http2ParaList* params, Http2Stream* stream)
+{
+    Http2Frame* frame = nullptr;
+    switch (session_data->frame_type[source_id])
+    {
+        case FT_HEADERS:
+            if (stream->get_state(source_id) == STREAM_EXPECT_HEADERS)
+                frame = new Http2HeadersFrameHeader(header, header_len, data, data_len,
+                    session_data, source_id, stream);
+            else
+                frame = new Http2HeadersFrameTrailer(header, header_len, data, data_len,
+                    session_data, source_id, stream);
+            break;
+        case FT_DATA:
+            frame = new Http2DataFrame(header, header_len, data, data_len,
+                session_data, source_id, stream);
+            break;
+        // 其余帧类型分别 new Http2SettingsFrame / Http2RstStreamFrame 等
+        default:
+            frame = new Http2Frame(header, header_len, data, data_len,
+                session_data, source_id, stream);
+    }
+    return frame;
+}
+```
+
+这段代码说明三点：帧类由 `frame_type` 工厂化，Headers 帧还要结合流状态区分「头部」与「尾部 trailer」，这正是 HTTP/2 复用语义在解析层的体现；每个帧对象自带 `get_flags_mask()`，工厂返回前会校验非法标志位并记录 infraction/event；`get_buf(id)` 把帧相关缓冲交给检测侧，使规则能匹配解压缩后的头部字段。三类 inspector 的最小配置片段如下（键名需对照实际版本核验，完整参数见 04-05）：
+
+```lua
+-- snort.lua 片段：服务 inspector 与 binder 绑定（示意）
+http_inspect = { }
+http2_inspect = { concurrent_streams_limit = 100 }
+ssl = { trust_servers = false, max_heartbeat_length = 0 }
+dns = { publish_response = true }
+binder =
+{
+    { when = { service = 'http' },  use = { type = 'http_inspect' } },
+    { when = { service = 'http2' }, use = { type = 'http2_inspect' } },
+}
+```
+
+验证按「前置检查 → 执行 → 复核」闭环，先用 `-T` 确认 inspector 段与绑定被解析，再跑含 TLS/DNS 的 pcap 观察事件与计数：
+
+```bash
+snort -c lua/snort.lua -T 2>&1 | grep -i -e "inspector" -e "http2" -e "ssl" -e "dns" -e "error"
+snort -c lua/snort.lua -r mixed.pcap -A fast -l ./out 2>/dev/null
+grep -i -e "ssl" -e "dns" -e "http2" ./out/stats.log
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+http2_inspect:
+    concurrent_streams: 0    max_concurrent_streams: 100
+ssl:
+    packets: 12    handshakes_completed: 3    certificate: 3
+dns:
+    publish_response: True    packets: 40
+```
+
+逐行判读如下，合计超过一百五十字。`http2_inspect` 段的 `max_concurrent_streams: 100` 回显了 `concurrent_streams_limit` 参数的上限（默认值需对照实际版本核验），而 `concurrent_streams` 是运行期并发流计数；若该值长期贴近上限，新的 HEADERS 帧可能被判为超限并产生 `EVENT`，此时应结合 08-02 的调优建议评估是否调整，而非盲目放宽。`ssl` 段四个计数构成握手健康度画像：`packets` 是处理的 SSL 记录总数，`handshakes_completed` 是完成的握手数，`certificate` 是抽取到的证书数，`bad_handshakes` 若出现非零，往往意味着握手被判失败、会话不会被标记为加密，进而影响后续可见性判断；三者接近 1:1:1 是正常握手的表现。`dns` 段的 `publish_response: True` 确认 `publish_response` 生效，只有开启后 `DnsEventIds::DNS_RESPONSE` 才会发布，订阅方才能拿到解析结果；`packets` 为处理的 DNS 包数，为零则说明 binder 未把流量绑定到 `dns` inspector，应回查服务识别（原理见 06-04）与 `binder` 段配置（参数见 04-05）。需要强调，以上所有计数只反映「解析与发布是否发生」，不代表能读到加密正文——TLS 的元数据来自握手明文（字段需对照实际版本核验），DNS 若跑在 DoT/DoH 之上则本 inspector 同样不可见，须另寻解密或端点侧手段（能力边界见 06-04、06-12）。所有吞吐与内存结论一律标注「需在目标机型实测」，不给绝对值（基准方法见 08-01）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，**HTTP/2 规则不要按帧字节写**。帧头、HPACK 压缩头部与多路复用使原始载荷里看不到熟悉的 `http.uri` 文本；正确做法是使用 inspector 暴露的 `HTTP2_BUFFER_*` 缓冲与 sticky buffer，让 H2I 翻译后的字段参与匹配（参数见 04-05、04-06）。第二，**preface 与 Continuation 是排障高频点**。24 字节 preface 校验失败会产生失步事件、后续帧无法正确解析；Headers 后跟 Continuation 时被聚合为单个头部块，若规则按多个头部帧假设来写 depth/within 会失配，务必先看 dev_notes.txt 的分帧语义。第三，**并发流与帧大小上限影响功能**。`concurrent_streams_limit`、`rst_stream_limit`、`settings_max_frame_size` 超限会产生对应事件而非静默丢弃，排障时先看事件统计再决定是否调整；所有容量结论需在目标机型实测。第四，**TLS 的可见性边界要写进规则评审清单**。能拿到的是 SNI、证书 subject/issuer、版本、cipher、curve 与校验状态等元数据（字段名需对照实际版本核验），不能对密文正文做 content 匹配；遇到「HTTPS 规则永不命中」先确认是否误把字段写到明文载荷上（原理见 06-04、06-08）。第五，**trust_servers 是权衡而非默认**。默认要求双向加密流量才标记会话加密，抗绕过更强；开启 `trust_servers` 可缓解丢包场景下的漏判，但降低了对伪造握手包的抵抗，需在误报率与漏报率间取舍（参数见 04-05）。第六，**DNS 的 publish_response 需显式开启**。默认 false 时不发布响应事件，订阅方拿不到解析结果；`Dns::supports_no_ips()` 返回 true 意味着无 IPS 规则时仍可运行，但不会因此产生告警；DoH/DoT 场景下本 inspector 不可见。第七，**辅助解码链要成体系使用**。base64/quoted-printable 解码（`src/mime/`）、文件解压（`src/decompress/`）、JS 归一化（`src/js_norm/`）与文件提取（`src/file_api/`）共同决定最终可见字段；只启用 inspector 而关闭相应解码，规则仍可能匹配不到归一化后的内容，相关能力需对照实际版本核验。第八，**装载与绑定是两件事**。`load_service_inspectors()` 只把 inspector 注册进插件体系，真正对某流生效还依赖 binder 按服务绑定（原理见 06-04）；`-T` 显示 inspector 已加载却无事件时，先查服务识别与 binder 绑定，再怀疑解析逻辑。
+
+### 7. 小结与延伸阅读
+
+本篇覆盖服务检查器层的三类代表：HTTP/2 以 `Http2Inspect` 配合 `Http2StreamSplitter`、帧对象家族与 HPACK，把二进制帧翻译成 HTTP/1.1 消息段交给 NHI，从而复用既有规则；SSL 以握手状态机与 `SSLPP_process_*` 族跟踪连接，判定加密后停止深入检查，仅以 `SSL_TLS_METADATA_EVENT` 等元数据事件发布可见信息；DNS 以 `DNSData` 状态机解析 UDP/TCP 承载的资源记录，按 `publish_response` 发布响应事件。三者共享 `get_buf` 缓冲接口与 `DataBus::publish` 事件通道，并依赖 mime/decompress/js_norm/file_api 完成归一化与提取。把握住「解析—归一化—供给缓冲/发布事件」这条主线，就能把 inspector 层与检测引擎、输出管线的边界理清。延伸阅读：binder/wizard 服务识别与加密不可见边界见 06-04；流重组供给 inspector 缓冲见 06-05；缓冲如何参与选项求值见 06-08；事件经发布订阅与日志输出见 06-11、06-14；Inspector/Module 字段见 05-04、流数据见 05-09；三类 inspector 参数见 04-05；`src/service_inspectors` 目录职责见 07-03；性能基准与容量评估见 08-01、08-02。

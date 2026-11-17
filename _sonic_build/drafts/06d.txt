@@ -1,0 +1,361 @@
+# SONiC 技术资料 · 06 技术原理（分片 D）
+
+## 06-07 BGP 与路由下发：bgpd → fpmsyncd → APPL_DB → routeorch
+
+### 1. 背景与动机
+
+06-06 把端口与 VLAN 这一笔二层业务从 CONFIG_DB 一路追到了 ASIC_DB，走的仍是「用户配置 → mgrd → orchagent → syncd」这条以 CONFIG_DB 为起点的配置流水线。本篇要处理的是另一条起点完全不同的链路：路由。路由不是用户在 `config` 命令里逐条敲进去的静态配置，而是由动态路由协议——在 SONiC 里主要是 BGP——从对等体学来、经 FRR 计算后交给内核，再被一个专门的同步进程搬进 APPL_DB。换句话说，配置流水线的「输入」在这里换成了协议栈的运行结果，`fpmsyncd` 扮演的角色类似于配置流水线里的 mgrd，但它订阅的不是 CONFIG_DB，而是 FRR 经 FPM（Forwarding Plane Manager）推送来的 netlink 路由事件（原理见 06-01 ｜ 原理见 06-03 ｜ 模块见 07-08）。讲不清这条链路，读者就容易把「BGP peer 已 Established、路由已出现在 `show ip route`」误当成「路由已经写进 ASIC 转发表」，而这与全册反复强调的异步铁律直接冲突。
+
+从本快照的证据看，这条链路横跨两个子仓。协议侧在 `sonic-buildimage/sonic-buildimage-master/dockers/docker-fpm-frr/`，其 `frr/supervisord/supervisord.conf.common.j2` 中可以核验到一组关键进程定义：`zebra` 以 `/usr/lib/frr/zebra -P 0 -s 90000000 -M dplane_fpm_sonic ... --asic-offload=notify_on_offload` 启动，`bgpd` 以 `/usr/lib/frr/bgpd -P 0 ...` 启动，`fpmsyncd` 以 `command=fpmsyncd` 启动且 `dependent_startup_wait_for=bgpd:running`，此外还有 `staticd`、`bfdd`、`bgpcfgd`、`vtysh_b`、`bgp_eoiu_marker.py` 等配套进程。同步侧在 `sonic-swss/sonic-swss-master/fpmsyncd/`，可核验到 `fpmsyncd.cpp`、`routesync.cpp`、`fpmlink.cpp`、`macsync.cpp`、`routesendcoalescer.cpp` 一整套文件。这里必须点明能力边界：FRR / FRRouting 的源码不在本快照，`bgpd`、`zebra`、FPM 数据平面模块的内部实现一律写「不在本快照，需对照实际版本核验」，凡涉及 SAI 属性、函数调用与版本号也按同样口径处理（模块见 07-08 ｜ 模块见 07-04）。
+
+第二个动机来自这条链路与配置流水线在「去重与责任划分」上的差异。动态路由的路由表规模可能非常大、变化非常频繁，若每学一条路由就同步写一次数据库、再触发一次 orchagent 调度，控制面会被压垮。因此 `fpmsyncd` 里出现了配置流水线少见的两套机制：`RedisPipeline` 批量管道（源码中 `pipeline.flush()`、`SMALL_TRAFFIC`、`FLUSH_TIMEOUT` 可核验）与 `RouteSendCoalescer` 路由合并发送器（`routesendcoalescer.cpp`，在 `isNbZmqEnabled()` 为真时启用）。理解它们，才能理解为什么路由下发的「批」与端口配置的「条」在时延特征上完全不同，也才能理解 warm reboot 时为何要先 `retireRouteCoalescer()` 再对账（原理见 06-10 ｜ 基准方法见 08-01）。
+
+第三个动机是给「异步生效」一个最典型的反例。BGP 路由从被对端通告，到进入 zebra 的内核路由表，再经 FPM 到 `fpmsyncd`、写进 APPL_DB 的 `ROUTE_TABLE`，再由 `routeorch` 翻译成路由与下一跳组对象写入 ASIC_DB，最后经 06-05 的 syncd 调用链编程 ASIC，中间每一段都由独立进程推进。运维在 `show ip route` 里看到的路由来自 FRR 的内核视图，在 APPL_DB / ASIC_DB 里看到的才是下发进度，两者不能画等号。本篇因此把「bgpd 学到路由之后发生了什么」作为主线，把「如何在各库逐段判读」作为落点（原理见 06-05 ｜ 排障见 08-03）。
+
+### 2. 核心概念
+
+「bgpd 与 zebra 的分工」是理解起点的第一组概念。在 `docker-fpm-frr` 容器内，`bgpd` 负责 BGP 协议本身——对等体建连、路由策略、best path 选择；`zebra` 作为 FRR 的路由管理器，汇总来自 bgpd、staticd 等协议的路由，形成内核路由表（RIB）。supervisord 配置里 `zebra` 带 `-M dplane_fpm_sonic` 模块并开启 `--asic-offload=notify_on_offload`，说明 zebra 把路由变化经 FPM 数据平面推给下游，而非由 SONiC 直接读取 FRR 内存。这些进程的启动命令、依赖顺序（`dependent_startup_wait_for`）都可在本快照的 `frr/supervisord/supervisord.conf.common.j2` 中核验，但 FRR 内部的 RIB 数据结构与 FPM 消息格式不在本快照，需对照实际版本核验（模块见 07-08 ｜ 模块见 07-13）。
+
+「FPM 与 fpmsyncd」是衔接协议侧与数据库侧的关键。`FpmLink` 类定义在 `fpmsyncd/fpmlink.cpp` 与 `fpmlink.h`，`fpmsyncd.cpp` 的 `main()` 里构造 `FpmLink fpm(&sync)` 并调用 `fpm.accept()` 等待连接；`fpmlink.cpp` 中可核验到 `FpmLink::readData()`、`FpmLink::processFpmMessage(fpm_msg_hdr_t*)`、`FpmLink::send(nlmsghdr*)`、`FpmLink::isRawProcessing(struct nlmsghdr*)` 等函数，以及 `FPM_MAX_MSG_LEN`、`MSG_BATCH_SIZE` 等批量参数。Zebra 推送的 FPM 消息被还原成 netlink 消息后，经 `NetDispatcher::getInstance().registerMessageHandler(RTM_NEWROUTE, &sync)` 一类注册（在 `fpmsyncd.cpp` 中可核验到 `RTM_NEWROUTE`、`RTM_DELROUTE`、`RTM_NEWLINK`、`RTM_DELLINK` 等注册）分派给 `RouteSync`。FPM 通道本身与内核 netlink 套件的实现不在本快照，需对照实际版本核验（模块见 07-08 ｜ 字段见 05-08）。
+
+「RouteSync 与 APPL_DB 路由表」是转换的核心。`RouteSync` 类在 `fpmsyncd/routesync.cpp`、`routesync.h` 实现，其构造函数里以 `createProducerStateTable(pipeline, APP_ROUTE_TABLE_NAME, ...)` 构造 `m_routeTable`，并构造 `m_nexthop_groupTable`（`APP_NEXTHOP_GROUP_TABLE_NAME`）、`m_label_routeTable`、`m_pic_context_groupTable`、`m_vnet_routeTable` 等 producer。`RouteSync::onRouteMsg(int nlmsg_type, struct nl_object *obj, char *vrf)` 是普通路由（含 VRF 路由）的主处理函数，可核验到 `rtnl_route_get_dst()`、`nl_addr2str()`、`getProtocolString()`、`RTN_BLACKHOLE` 分支、`getNextHopList()`、`getNextHopWt()`、`installNextHopGroup()` 等调用，最终经 `setRouteWithWarmRestart()` 写入 APPL_DB 的路由表。这里有个易混淆点：`APP_ROUTE_TABLE_NAME` 对应的表名常量定义在 `sonic-swss-common`，不在本快照，需对照实际版本核验（字段见 05-02 ｜ 参数见 04-03）。
+
+「routeorch 与下一跳组」是翻译的落点。`orchagent/routeorch.cpp` 中的 `RouteOrch` 由 `orchdaemon.cpp` 以 `gRouteOrch = new RouteOrch(m_applDb, route_tables, ...)` 构造，其中 `route_tables` 注册了 `APP_ROUTE_TABLE_NAME` 与 `APP_LABEL_ROUTE_TABLE_NAME` 两个表。`RouteOrch::doTask(ConsumerBase& consumer)` 可核验到对 `gPortsOrch->allPortsReady()` 的门槛判断、对 `resync` 消息的特殊处理，以及 `addRoute()`、`addRoutePost()`、`removeRoute()`、`removeRoutePost()`、`addNextHopGroup()`、`removeNextHopGroup()` 等翻译函数；下一跳组则由 `gNhgOrch = new NhgOrch(m_applDb, APP_NEXTHOP_GROUP_TABLE_NAME)` 单独管理。函数名可核验，函数签名的完整形参需对照实际版本核验（原理见 06-04 ｜ 字段见 05-07）。
+
+下表把本节核心概念、职责与本快照可定位源码对应起来，便于回查；表中文件路径相对 `sonic-buildimage-master/` 或 `sonic-swss-master/` 根，FRR 内部实现不在本快照。
+
+| 概念 | 职责 | 可定位源码 | 边界说明 |
+|---|---|---|---|
+| bgpd / zebra | 协议计算与 RIB 汇总 | `dockers/docker-fpm-frr/frr/supervisord/` | FRR 源码不在本快照 |
+| FPM 通道 | 把内核路由推给同步进程 | `fpmsyncd/fpmlink.cpp` | FPM 格式需对照实际版本核验 |
+| RouteSync | netlink 事件转 APPL_DB 表项 | `fpmsyncd/routesync.cpp` | 表名常量定义在 swss-common |
+| routeorch | APPL_DB 转路由对象 | `orchagent/routeorch.cpp` | 完整签名需对照实际版本核验 |
+| Route coalescer | 路由批量合并发送 | `fpmsyncd/routesendcoalescer.cpp` | 启用条件见 isNbZmqEnabled |
+
+最后是边界收束：SONiC 是白盒 NOS，数据面转发始终在 ASIC，`bgpd` 只是控制面的一个协议进程；除 `platform/vs/` 虚拟交换机外不做软件转发。FRR 源码、Linux 内核 netlink 套件、`sonic-swss-common` 的表名常量均不在本快照，凡涉及它们的内部细节一律写「不在本快照，需对照实际版本核验」并给出可定位目录（模块见 07-08 ｜ 模块见 07-05）。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与对象并给出可定位路径，不展开逐字段定义。表项与 `FieldValueTuple` 字段见 05-02，`Table` / `ProducerStateTable` 字段见 05-03，Orch / Consumer 结构见 05-05，路由等 Orch 派生结构见 05-07，BGP / ROUTE 的 CONFIG_DB schema 参数见 04-03，DB 对象见 04-04，命令全集见 04-05，即（字段见 05-02 ｜ 字段见 05-03 ｜ 字段见 05-05 ｜ 字段见 05-07 ｜ 参数见 04-03 ｜ 参数见 04-04 ｜ 原理见 06-07 ｜ 模块见 07-08）。本篇聚焦「哪张表由谁写、由谁读、由谁翻译」，字段与参数全集不在本册重列。
+
+协议与容器侧的落位分两组。容器编排在 `dockers/docker-fpm-frr/`，可核验到 `Dockerfile.j2`、`docker_init.sh`、`zsocket.sh`、`frr/frr.conf.j2`、`frr/bgpd/bgpd.conf.j2`、`frr/bgpd/bgpd.main.conf.j2`、`frr/zebra/zebra.conf.j2`、`frr/staticd/staticd.conf.j2` 与 `frr/supervisord/supervisord.conf.common.j2`；这些模板由 `src/sonic-config-engine/` 与容器启动脚本渲染，具体渲染输入与输出需对照实际版本核验（参数见 04-02 ｜ 模块见 07-11）。FRR 守护进程本体不在本快照，其配置语法以实际 FRR 版本为准（模块见 07-08）。
+
+同步侧的落位在 `fpmsyncd/`。入口 `fpmsyncd.cpp` 的 `main()` 里可核验到 `RedisPipeline pipeline(&db, ROUTE_SYNC_PPL_SIZE)`、`RouteSync sync(&pipeline)`、`Table deviceMetadataTable(&cfgDb, CFG_DEVICE_METADATA_TABLE_NAME)`、`Table bgpStateTable(&stateDb, STATE_BGP_TABLE_NAME)`、`FpmLink fpm(&sync)`、`fpm.accept()` 与 `flushPipeline(pipeline)`，以及 `suppress-fib-pending` 特性开关的读取。`routesync.cpp` / `routesync.h` 中可核验到 `RouteSync::onRouteMsg()`、`onEvpnRouteMsg()`、`onLabelRouteMsg()`、`onVnetRouteMsg()`、`onSrv6SteerRouteMsg()`、`onSrv6MySidMsg()`、`onSrv6VpnRouteMsg()` 等一族消息处理函数，以及 `RouteTableFieldValueTupleWrapper::fieldValueTupleVector()`——后者集中列出了写入路由表的字段：`protocol`、`blackhole`、`nexthop`、`ifname`、`nexthop_group`、`mpls_nh`、`weight`、`vni_label`、`router_mac`、`segment`、`seg_src`。`routesendcoalescer.cpp` 提供 `RouteSendCoalescer` 的 `upsertKco()`、`upsertDel()`、`start()`、`stop()`；`macsync.cpp` 负责本地 MAC 同步（字段见 05-02 ｜ 模块见 07-03）。
+
+编排侧的落位在 `orchagent/`。`routeorch.cpp` 与 `routeorch.h` 中可核验到 `RouteOrch::RouteOrch(...)`、`doTask(ConsumerBase&)`、`doLabelTask()`、`addRoute()`、`addRoutePost()`、`removeRoute()`、`removeRoutePost()`、`addNextHopGroup()`、`removeNextHopGroup()`、`createFineGrainedNextHopGroup()`、`notifyNextHopChangeObservers()`、`isRouteExists()` 等函数，以及 `m_syncdRoutes` 等成员；`createRetryCache(APP_ROUTE_TABLE_NAME)` 表明路由有重试缓存。`orchdaemon.cpp` 中可核验到 `route_tables` 注册 `APP_ROUTE_TABLE_NAME` 与 `APP_LABEL_ROUTE_TABLE_NAME`、`gRouteOrch = new RouteOrch(m_applDb, route_tables, ...)` 与 `gNhgOrch = new NhgOrch(m_applDb, APP_NEXTHOP_GROUP_TABLE_NAME)`。这些函数内部如何调用 SAI 路由 API、如何处理返回状态，依赖 `handleSaiCreateStatus()` 一类封装，签名需对照实际版本核验（字段见 05-05 ｜ 字段见 05-07 ｜ 原理见 06-04）。
+
+为便于把「表—进程—源码位置」串起来，下表按四层归纳路由下发链路上可核验的落位。
+
+| 层次 | 关键表或对象 | 源码位置 | 回查去向 |
+|---|---|---|---|
+| 协议层 | bgpd / zebra / FPM | `dockers/docker-fpm-frr/frr/` | 模块见 07-08 |
+| 同步层 | FpmLink、RouteSync | `fpmsyncd/fpmlink.cpp`、`routesync.cpp` | 字段见 05-02 |
+| 期望层 | APPL_DB ROUTE、NEXTHOP_GROUP | `orchagent/routeorch.cpp`、`orchdaemon.cpp` | 参数见 04-04 |
+| 对象层 | 路由与 NHG 对象经 syncd 编程 | `sonic-sairedis/syncd/` | 原理见 06-05 |
+
+### 4. 关键流程与调用链
+
+把协议层、同步层、期望层与对象层串起来，就得到 BGP 路由下发的完整链路，见图 06-07-01。
+
+:::figure id=06-07-01 | name=BGP 路由下发链路 | dir=TD
+node a "bgpd<br/>FRR 路由协议" gray
+node b "zebra<br/>RIB 与 dplane" gray
+node c "FPM 通道<br/>dplane_fpm_sonic" gray
+node d "fpmsyncd<br/>RouteSync" green
+node e "APPL_DB<br/>ROUTE_TABLE" blue
+node f "routeorch<br/>doTask addRoute" purple
+node g "ASIC_DB<br/>路由与 NHG 对象" amber
+node h "syncd 与 SAI" green
+node i "ASIC 转发芯片" red
+edge a -> b "计算最佳路由"
+edge b -> c "下发内核路由"
+edge c -> d "FPM 消息还原"
+edge d -> e "批量写期望路由"
+edge e -> f "消费 ROUTE_TABLE"
+edge f -> g "生成路由与 NHG"
+edge g -> h "调用链"
+edge h -> i "编程芯片"
+:::
+
+图 06-07-01 用颜色区分语义：gray 为不在本快照的 FRR 协议侧与外部依赖，green 为 `fpmsyncd` 同步进程与 syncd 运行时，blue 为 APPL_DB 期望状态，purple 为 orchagent 控制面，amber 为 ASIC_DB 对象，red 为硬件边界。虚线语义在此图中体现为「FPM 通道」这一灰色彩节——它连接 FRR 与 SONiC，却两端都不在本快照的 SONiC 控制面源码内，需对照实际版本核验。图中 `fpmsyncd` 同时承担「收 FPM 消息」与「写 APPL_DB」两件事，是这条链路里最容易被误认为 mgrd、但实际数据源完全不同的进程（原理见 06-03 ｜ 模块见 07-08）。
+
+下行调用链的起点是协议计算。`bgpd` 从对等体收到 BGP 更新、选出最佳路径后交给 `zebra`，`zebra` 把结果写入内核路由表并经 `-M dplane_fpm_sonic` 模块、以 `--asic-offload=notify_on_offload` 语义把路由变化经 FPM 推送出去。`fpmsyncd` 的 `FpmLink::accept()` 接受连接，`FpmLink::readData()` 读取批量消息，`FpmLink::processFpmMessage()` 解析出 netlink 消息，再由 `NetDispatcher` 按 `RTM_NEWROUTE` / `RTM_DELROUTE` 分派给 `RouteSync`（函数名可核验，FPM 消息格式不在本快照，需对照实际版本核验，模块见 07-08）。
+
+`RouteSync::onRouteMsg()` 的处理有几步值得展开。它先用 `rtnl_route_get_dst()` 与 `nl_addr2str()` 得到目的前缀（VRF 路由会拼成 `Vrf 名:前缀` 形态，源码中 `VRF_PREFIX`、`MGMT_VRF_PREFIX` 常量可核验），再按 `RTM_DELROUTE` 走 `delWithWarmRestart()`、按 `RTN_BLACKHOLE` 走 `blackhole = "true"` 的分支，普通路由则用 `getProtocolString()` 记录 `protocol` 字段，用 `getNextHopList()`、`getNextHopWt()` 提取下一跳与权重，多下一跳时经 `installNextHopGroup()` 写入 `APP_NEXTHOP_GROUP_TABLE_NAME` 并在路由项里置 `nexthop_group` 字段。得到的 `RouteTableFieldValueTupleWrapper` 经 `setRouteWithWarmRestart()` 写入 APPL_DB；稳态且启用 ZMQ 时，`setTableWithWarmRestart()` 会把写入交给 `m_routeCoalescer->upsertKco()` 合并发送，warm reboot 期间则改用 `m_warmStartHelper.insertRefreshMap()` 暂存刷新项（函数名可核验，签名需对照实际版本核验，原理见 06-10）。
+
+编排侧收到 APPL_DB 变更后的动作同样清晰。`RouteOrch::doTask(ConsumerBase&)` 先检查 `gPortsOrch->allPortsReady()`，端口未就绪直接返回；随后以 `consumer.getTableName()` 区分表，`APP_LABEL_ROUTE_TABLE_NAME` 走 `doLabelTask()`，其余默认按 `APP_ROUTE_TABLE_NAME` 处理；对每条 `KeyOpFieldsValuesTuple` 以 `kfvKey()` / `kfvOp()` 取出键与操作，组织进 `RouteBulkContext` 批量上下文，再调用 `addRoute()` / `removeRoute()` 生成路由对象、`addRoutePost()` / `removeRoutePost()` 做收尾，`gNhgOrch` 负责 `APP_NEXTHOP_GROUP_TABLE_NAME` 的下一跳组。`resync` 消息会把当前路由标记为 dirty 并与新路由对账，这是 warm reboot 场景的关键分支（原理见 06-10 ｜ 字段见 05-07）。
+
+需要把异步时序再强调一次：以图 06-07-01 的任意一条边为界，上游完成不代表下游已完成。`show ip route` 看到的是 FRR / 内核视图，APPL_DB 有路由表项只说明 `fpmsyncd` 已写入期望状态，ASIC_DB 有路由对象才说明 `routeorch` 已翻译，而路由真正写进芯片还要等 06-05 的 syncd 调用链走完。验证时应当逐段核对，不能一上来怀疑硬件，也不能一句「路由已学习」带过。路由收敛时间、批量下发时延与吞吐随机型、芯片、版本影响很大，一律标注「需在目标机型实测」，本册不给绝对值（基准方法见 08-01 ｜ 调优见 08-02 ｜ 排障见 08-03）。
+
+### 5. 配置/命令/代码实例
+
+本节给三组最小实例：一组用 BGP 配置与查看命令完成一次闭环并作逐行判读，一组给出 `RouteSync::onRouteMsg()` 的分派代码片段印证转换过程，一组给出观察各库表项的查询命令。完整的 BGP / ROUTE schema 参数见 04-03，DB 对象见 04-04，命令全集见 04-05，本册不重列。所有命令需在具备相应权限的环境下执行，命令名、选项、表名与键格式需对照实际版本核验。
+
+先看一次典型的 BGP 配置与验证闭环。以下命令按「前置检查 → 执行 → 验证输出 → 清理」组织，配置入口在 `config bgp` 与 `vtysh`，命令名与选项需对照实际版本核验。
+
+```bash
+# 前置检查：确认 BGP 容器与关键进程在跑
+docker exec -it bgp supervisorctl status
+# 执行：配置 BGP ASN 与邻居（以 config 行为主，细节见 04-03）
+config bgp set 65001
+config bgp neighbor add 10.0.0.2
+# 验证：查看 BGP 摘要与内核/协议路由
+show ip bgp summary
+show ip route
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（下列取值仅为格式示意，不代表任何具体版本或机型）
+bgpd                             RUNNING   pid 123, uptime 0:12:34
+zebra                            RUNNING   pid 98,  uptime 0:12:40
+fpmsyncd                         RUNNING   pid 210, uptime 0:12:30
+BGP table version is 5, local router ID is 10.0.0.1
+Neighbor        V    AS MsgRcvd MsgSent   TblVer  UpDown State
+10.0.0.2        4 65002      40      42        5       0  Established
+Codes: K kernel, B BGP, *> best
+B>* 192.0.2.0/24 [20/0] via 10.0.0.2, Ethernet0, 00:02:11
+```
+
+逐行判读如下。前置的 `docker exec -it bgp supervisorctl status` 列出 `bgpd`、`zebra`、`fpmsyncd` 三个进程均为 `RUNNING`，这是任何路由下发的前提：容器名 `bgp`、可执行文件路径与进程名随版本变化，需对照实际版本核验；若 `fpmsyncd` 不在运行，即使 BGP 学来路由也进不了 APPL_DB。执行段两条命令中，`config bgp set 65001` 设置本地 ASN、`config bgp neighbor add 10.0.0.2` 增加邻居，二者只写 CONFIG_DB 的 BGP 相关表，更多参数见 04-03；真正把配置渲染成 `bgpd.conf` 的是 `frrcfgd` / `bgpcfgd` 一类进程，其配置文件模板在本快照可核验，渲染细节需对照实际版本核验。验证段 `show ip bgp summary` 中邻居 `10.0.0.2` 的 `State` 为 `Established`，说明 BGP 会话正常、`MsgRcvd/MsgSent` 非零说明在交换更新；这只证明协议层正常，不代表路由已进 ASIC。`show ip route` 中 `B>* 192.0.2.0/24` 的 `B` 表示路由来源是 BGP、`>` 表示最佳路径、`*` 表示有效，via `10.0.0.2` 出接口 `Ethernet0` 是下一跳与出接口。最关键的一点：这两条 `show` 读的是 FRR / 内核视图，能列出路由只说明协议层与同步层前半段正常；按图 06-07-01 还需确认 APPL_DB 有 `ROUTE_TABLE` 表项、ASIC_DB 有对应对象、STATE_DB 与芯片状态正常，必要时结合 `sonic-db-cli` 与日志判断（原理见 06-07 ｜ 排障见 08-03）。整段命令含配置写入，但只有 `config` 命令改 CONFIG_DB，`show` 为只读，均不经 SAI 直接编程 ASIC（参数见 04-05）。
+
+第二组给出 `RouteSync::onRouteMsg()` 的分派代码片段，用来印证「netlink 事件到路由表项」的实现形态；下列片段依据本快照中可核验的函数名与字段整理，为便于阅读做了简化，真实函数签名与控制流需对照实际版本核验。
+
+```cpp
+// 代码形态示意，依据 fpmsyncd/routesync.cpp 中可核验的函数与字段整理；签名需对照实际版本核验
+void RouteSync::onRouteMsg(int nlmsg_type, struct nl_object *obj, char *vrf)
+{
+    struct rtnl_route *route_obj = (struct rtnl_route *)obj;
+    struct nl_addr *dip = rtnl_route_get_dst(route_obj);
+    char destipprefix[IFNAMSIZ + MAX_ADDR_SIZE + 2] = {0};
+    nl_addr2str(dip, destipprefix, MAX_ADDR_SIZE);
+
+    if (nlmsg_type == RTM_DELROUTE) {
+        delWithWarmRestart(RouteTableFieldValueTupleWrapper{destipprefix, "", isNbZmqEnabled()}, *m_routeTable);
+        return;
+    }
+    if (nlmsg_type != RTM_NEWROUTE) return;
+
+    auto proto_str = getProtocolString(rtnl_route_get_protocol(route_obj));
+    RouteTableFieldValueTupleWrapper fvw{destipprefix, std::move(proto_str), isNbZmqEnabled()};
+    getNextHopList(route_obj, gw_list, mpls_list, intf_list);
+    fvw.nexthop = std::move(gw_list);
+    fvw.ifname  = std::move(intf_list);
+    setRouteWithWarmRestart(fvw, *m_routeTable);
+}
+```
+
+这段代码虽经简化，但链条是真实的：`onRouteMsg()` 先由 `rtnl_route_get_dst()` / `nl_addr2str()` 得到目的前缀，再按 `RTM_DELROUTE` 与 `RTM_NEWROUTE` 分派，删除走 `delWithWarmRestart()`，新增则用 `getProtocolString()` 取协议名、用 `getNextHopList()` 取下一跳，最后经 `setRouteWithWarmRestart()` 落入 `m_routeTable`。它说明 `fpmsyncd` 本质上是一个「netlink 事件翻译器」：收的是 FPM 还原出的 netlink 消息，写的是 APPL_DB 的 `ROUTE_TABLE` 字段。片段中省略的 `RTN_BLACKHOLE`、多下一跳 `installNextHopGroup()`、`weight` / `nexthop_group` / `vni_label` 等字段分支在真实源码中均有对应处理，读者读源码时应重点看 `RouteTableFieldValueTupleWrapper::fieldValueTupleVector()` 如何按 `nbZmqEnabled` 与字段非空与否拼出完整的字段向量（字段见 05-02 ｜ 原理见 06-07）。
+
+第三组给出观察各库表项的查询命令，用于在「BGP 学来路由但没生效」时逐段定位；库名、表名与键格式需对照实际版本核验。
+
+```bash
+# 观察 APPL_DB 路由表期望状态（ROUTE_TABLE 键格式需对照实际版本核验）
+sonic-db-cli APPL_DB KEYS 'ROUTE_TABLE:*'
+# 观察 ASIC_DB 路由对象（对象形态见 06-05）
+sonic-db-cli ASIC_DB KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY:*'
+```
+
+示例输出格式与具体键名需对照实际版本核验。`sonic-db-cli` 的用法与参数见 04-05，ASIC_DB 对象键格式见 06-05；这两条命令属于只读探查，分别对应图 06-07-01 中 APPL_DB 与 ASIC_DB 两段的验证。若 APPL_DB 无表项，问题多在 FPM 通道未连通、`fpmsyncd` 未消费，或路由被 `protocol` / 类型过滤；若 APPL_DB 有而 ASIC_DB 无，问题多在 `routeorch` 翻译或端口未就绪（`allPortsReady()` 门槛）；若 ASIC_DB 有而芯片未生效，则回到 06-05 的 syncd 调用链排查（排障见 08-03 ｜ 原理见 06-05）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是层次混淆陷阱。最常见的是把 `show ip route` 能看到路由当成「路由已写进 ASIC」，或把 APPL_DB 有 `ROUTE_TABLE` 表项当成「转发表已生效」。前者是 FRR / 内核视图，后者是期望状态，二者都不等于芯片已编程；必须按图 06-07-01 逐段区分，验证时按协议视图、APPL_DB、ASIC_DB、STATE_DB 与 `show` 输出推进，不能跳段下结论（参数见 04-04 ｜ 排障见 08-03）。第二类是「协议即时生效」陷阱：`config bgp neighbor add` 返回成功只代表配置写入 CONFIG_DB，BGP 会话建立、路由学习、FPM 推送、`fpmsyncd` 写库、`routeorch` 翻译、syncd 编程每段都要时间；动态路由的收敛时延与批量下发特征与端口配置完全不同（原理见 06-01 ｜ 基准见 08-01）。
+
+第三类是事实纪律陷阱。FRR 源码不在本快照，`zebra -M dplane_fpm_sonic` 的内部数据平面、`bgpd` 的 RIB 结构、FPM 消息格式都不得据印象编造，一律写「不在本快照，需对照实际版本核验」并给出 `dockers/docker-fpm-frr/` 等可定位目录；`APP_ROUTE_TABLE_NAME`、`APP_NEXTHOP_GROUP_TABLE_NAME` 等表名常量在 `fpmsyncd/`、`orchagent/` 中可核验到引用，但其定义多在 `sonic-swss-common`，不在本快照，需对照实际版本核验（字段见 05-02 ｜ 模块见 07-05）。第四类是 DB 编号与表名陷阱：Redis 各库编号来自运行时 `database_config.json`，须对照 `sonic-py-swsssdk/src/swsssdk/dbconnector.py` 的 `SonicDBConfig` 与实际版本核验，禁止写死（参数见 04-04）。
+
+第五类是 warm reboot 与多 ASIC 陷阱。`fpmsyncd.cpp` 中可核验到 `bgpStateTable.hget("IPv4|eoiu", "state", ...)` 与 `IPv6|eoiu` 的 EOIU 检测、`DEFAULT_ROUTING_RESTART_INTERVAL`、`DEFAULT_EOIU_HOLD_INTERVAL` 等定时器，以及 `retireRouteCoalescer()`、`onWarmStartEnd()` 等对账入口；这些能力受平台与版本限制，不同 HWSKU 行为不同，一律写「受平台与版本限制，需对照实际版本核验」，不得宣称全平台无条件支持；多 ASIC 与 chassis 命名空间同样受限（原理见 06-10 ｜ 原理见 06-11）。第六类是能力边界陷阱：路由对象属性是否受支持要用能力查询确认，厂商 SAI 实现闭源且不在本快照，涉及它的细节一律写「不在本快照，需对照实际版本核验」；`routeorch` 只写 ASIC_DB，不直接读写寄存器、不直接驱动芯片（原理见 06-05 ｜ 模块见 07-04）。第七类是性能陷阱：路由收敛时间、批量下发时延、coalescer 合并窗口与吞吐随机型、芯片、版本变化，一律标注「需在目标机型实测」，不给绝对值、不给跨机型通用数字（基准方法见 08-01 ｜ 调优见 08-02）。
+
+最佳实践归纳为四条。其一，把任何一次「路由不生效」都拆成图 06-07-01 的若干段，先判定停在哪一段，再决定查哪个容器的日志与哪张库表，避免一上来怀疑硬件或 ASIC。其二，读代码时把路径写成 `upstream_src/sonic-swss/sonic-swss-master/` 与 `upstream_src/sonic-buildimage/sonic-buildimage-master/` 下的相对路径，并同时给出对应函数（`RouteSync::onRouteMsg()`、`FpmLink::processFpmMessage()`、`RouteOrch::doTask()` 等），函数签名不确定就写「需对照实际版本核验」。其三，命令、配置与输出按「前置检查、执行、验证输出、清理」闭环写，示例输出注明「示例输出，具体格式需对照实际版本核验」并附逐行判读。其四，跨册引用统一用四段式（字段见 05-02 ｜ 参数见 04-03 ｜ 原理见 06-07 ｜ 模块见 07-08），本篇涉及的 APPL_DB 路由表字段写「字段见 05-02」、syncd 编程写「原理见 06-05」、warm reboot 对账写「原理见 06-10」，不在本篇展开字段表与参数全集。
+
+### 7. 小结与延伸阅读
+
+本篇把动态路由这条起点不同于配置流水线的链路讲透：`bgpd` 在 `docker-fpm-frr` 容器内计算最佳路径，`zebra` 汇总成 RIB 并经 `-M dplane_fpm_sonic` 模块、以 FPM 推送路由变化；`sonic-swss/fpmsyncd/` 的 `FpmLink` 接受 FPM 连接、把消息还原成 netlink 事件，`RouteSync::onRouteMsg()` 解析目的前缀、协议、下一跳并写入 APPL_DB 的 `ROUTE_TABLE` 与 `NEXTHOP_GROUP` 表，经 `RedisPipeline` 批量与 `RouteSendCoalescer` 合并发送优化；`orchagent/routeorch.cpp` 的 `RouteOrch` 消费 APPL_DB，经 `addRoute()`、`addNextHopGroup()` 生成路由与下一跳组对象写入 ASIC_DB，最终由 06-05 的 syncd 调用链编程 ASIC。图 06-07-01 与四层落位表是回查索引；三条判断贯穿全篇——FRR 源码不在本快照、`show ip route` 看到的是协议视图而非芯片已生效、路由表字段与收敛参数须按版本与机型核验。
+
+延伸阅读按目标分流。想补流水线上游与通用机制，接读 06-01（数据流总览）、06-02（producer/consumer）、06-03（mgrd 与校验）、06-04（orchagent 调度）；想补下游编程，接读 06-05（syncd 与 SAI 调用链）、06-09（计数回写）；想理解状态恢复，接读 06-10（warm reboot）、06-11（多 ASIC 与命名空间）；想看同类控制面下发业务，接读 06-08（ACL、COPP、QoS 与 policer）。字段随查走 05-02（表项与 FieldValueTuple）、05-03（producer）与 05-07（Orch 派生结构），参数随查走 04-03（BGP / ROUTE schema）与 04-05（命令全集），模块能力走 07-08（bgp 容器与 FRR 集成）、07-03（sonic-swss / orchagent）与 07-05（swss-common），部署实战走 03-03（端口、VLAN、IP 与 BGP 配置），排障走 08-03、08-04。跨册引用请始终使用「字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx」的写法，`xx` 替换为具体篇号。
+
+最后重申资料纪律：本篇所有示例输出均注明「示例输出，具体格式需对照实际版本核验」；所有源码路径均相对各子仓 `xxx-master/` 根；FRR 源码、Linux 内核 netlink 套件、`sonic-swss-common` 的表名常量定义写「不在本快照，需对照实际版本核验」；不确定的函数签名、字段名与表名均标注核验要求并给出 `dockers/docker-fpm-frr/`、`fpmsyncd/`、`orchagent/` 等可定位目录；性能、容量、收敛与吞吐类结论一律标注「需在目标机型实测」。版本基准始终为「上游 master 快照（2026-11 抓取）」，不写绝对版本号与 Redis DB 编号。下一篇 06-08 将把视角转向另外几类同样由 orchagent 下发、但直接来自 CONFIG_DB / APPL_DB 且最终落到 ASIC 专项表的业务——ACL、COPP、QoS 与 policer，看它们如何共享 06-04 的 orchagent 调度框架，又各自怎样翻译成 SAI 对象。
+
+## 06-08 ACL、COPP、QoS 与 policer 下发链路
+
+### 1. 背景与动机
+
+06-07 讲完了动态路由这条以协议栈为起点的下发链路，本篇回到以配置库为起点的下发，但选的是四类「专项表」业务：ACL（访问控制列表）、COPP（Control Plane Policing，控制面限速）、QoS（服务质量映射）与 policer（限速器）。它们与 06-06 的端口、VLAN 同属 orchagent 翻译范畴，却有三个显著不同。第一，它们的数据源不完全一样：ACL 可以直接从 CONFIG_DB 的 ACL_TABLE / ACL_RULE 读入，也可以从 APPL_DB 的对应表读入；COPP 由 `cfgmgr/coppmgr.cpp`、`coppmgrd.cpp` 从 CONFIG_DB 的 COPP_GROUP / COPP_TRAP 搬运到 APPL_DB；QoS 的映射表由 `QosOrch` 直接订阅 CONFIG_DB；policer 则由 `PolicerOrch` 消费自己的表集。第二，它们的终点不是普通的端口 / VLAN / 路由对象，而是 ASIC 里的 ACL 表、hostif trap 表、QOS_MAP 对象与 POLICER 对象。第三，它们彼此存在显式依赖：ACL 规则的动作可以引用 policer，COPP 的 trap 组也要挂 policer，因此 `PolicerOrch` 必须先于依赖它的 Orch 就绪（原理见 06-04 ｜ 模块见 07-03）。讲清这条链路，才能理解「配一条 ACL 丢包规则」或「给 COPP 调限速」背后究竟发生了什么。
+
+从本快照的证据看，四类业务各有专门的 Orch 实现，且都由 `orchagent/orchdaemon.cpp` 集中注册。`gAclOrch = new AclOrch(acl_table_connectors, m_stateDb, ...)`，`gCoppOrch = new CoppOrch(m_applDb, APP_COPP_TABLE_NAME)`，`gQosOrch = new QosOrch(m_configDb, qos_tables)`，`gPolicerOrch = new PolicerOrch(policer_tables, gPortsOrch)`，这些构造语句均可核验；`m_orchList` 的排列里 `gCoppOrch`、`gQosOrch`、`gPolicerOrch` 位于 `gAclOrch` 之前。ACL 的连接器里同时包含 `TableConnector confDbAclTable(m_configDb, CFG_ACL_TABLE_TABLE_NAME)` 与 `TableConnector appDbAclTable(m_applDb, APP_ACL_TABLE_TABLE_NAME)`，印证了「ACL 双来源」。这种「一个 Orch 一个专项表集」的结构与 06-04 讲的 Orch 调度框架一脉相承：每个 Orch 实现自己的 `doTask()`，由 OrchDaemon 统一轮询（模块见 07-03 ｜ 原理见 06-04）。
+
+第二个动机来自这四类业务的「安全与运维敏感性」。ACL 决定报文是否被丢弃、重定向或镜像，COPP 决定送往控制面的管理 / 协议报文是否因限速而被丢弃，QoS 决定 DSCP 到队列的映射，policer 决定风暴控制的阈值——它们配置错了会直接影响业务连通性或让控制面在攻击下失守。COPP 的默认配置由 `files/image_config/copp/copp_cfg.j2` 渲染，其中 `COPP_GROUP` 定义了 `default`、`queue4_group1`、`queue3_group1` 等组的 `cir`、`cbs`、`mode`、`meter_type`、`red_action`，`COPP_TRAP` 把 `bgp`、`lacp`、`arp`、`lldp` 等 trap 映射到组。这组默认参数是理解「为什么 BGP 报文能上送、又被限在多少速率」的钥匙，但具体取值随机型与版本而变，需对照实际版本核验（参数见 04-03 ｜ 模块见 07-11）。
+
+第三个动机是消除一类常见误判。运维常把 `show acl table` 能看到表、`show qos` 能看到映射当成「芯片已经在按此转发 / 限速」。但在异步流水线里，show 读的是数据库状态，ACL 表项是否真正写进 ASIC 的 ACL 表、trap 是否真的被创建并挂上 policer，取决于 orchagent 与 syncd 是否走完链路；此外 ACL 与 COPP 还涉及 SAI 能力查询——`copporch.cpp` 里就有「trap_id 不被厂商 SAI 支持则忽略」的日志分支，`default_supported_trap_ids` 是能力探测失败时的回退集合。本篇因此把「四类业务各自怎么下发、彼此怎么依赖、能力边界在哪」作为主线（原理见 06-05 ｜ 模块见 07-04 ｜ 排障见 08-03）。
+
+### 2. 核心概念
+
+「ACL 的双来源与三分支」是理解 ACL Orch 的起点。`aclorch.cpp` 的 `AclOrch::doTask(Consumer &consumer)` 可核验到按 `consumer.getTableName()` 的三路分支：`table_name == CFG_ACL_TABLE_TABLE_NAME || table_name == APP_ACL_TABLE_TABLE_NAME` 走 `doAclTableTask()`，`CFG_ACL_RULE_TABLE_NAME || APP_ACL_RULE_TABLE_NAME` 走 `doAclRuleTask()`，`CFG_ACL_TABLE_TYPE_TABLE_NAME || APP_ACL_TABLE_TYPE_TABLE_NAME` 走 `doAclTableTypeTask()`。`doAclTableTask()` 经 `addAclTable()` 创建 ACL 表并调 `createBindAclTable()` 绑定到端口 / LAG；`doAclRuleTask()` 经 `addAclRule()` 创建规则。ACL 表的匹配字段与动作在源码中以映射表集中定义，例如 `MATCH_SRC_IP → SAI_ACL_ENTRY_ATTR_FIELD_SRC_IP`、`MATCH_DST_IP`、`MATCH_L4_DST_PORT`、`MATCH_DSCP`，动作如 `ACTION_PACKET_ACTION → SAI_ACL_ENTRY_ATTR_ACTION_PACKET_ACTION`、`ACTION_REDIRECT_ACTION`、`ACTION_POLICER_ACTION → SAI_ACL_ENTRY_ATTR_ACTION_SET_POLICER`、`ACTION_COUNTER`，绑定点如 `BIND_POINT_TYPE_PORT → SAI_ACL_BIND_POINT_TYPE_PORT`。这些枚举名可核验，取值与签名需对照实际版本核验（字段见 05-07 ｜ 模块见 07-03）。
+
+「COPP 的两级模型」是理解控制面限速的关键。COPP 分 `COPP_TRAP`（trap 名到 trap 组的映射）与 `COPP_GROUP`（组的限速参数）两级：`copp_cfg.j2` 里 `bgp` trap 的 `trap_ids` 为 `bgp,bgpv6`、`trap_group` 为 `queue4_group1`，后者定义了 `cir`、`cbs`、`mode` 等参数。`cfgmgr/coppmgr.cpp` 的 `CoppMgr::doTask(Consumer&)` 按 `CFG_COPP_TRAP_TABLE_NAME` 与 `CFG_COPP_GROUP_TABLE_NAME` 处理，把这些配置规范化后写入 APPL_DB 的 `APP_COPP_TABLE_NAME`，同时回写 `STATE_COPP_TRAP_TABLE_NAME`、`STATE_COPP_GROUP_TABLE_NAME`。`CoppOrch::doTask(Consumer&)` 再消费 APPL_DB，经 `createGenetlinkHostIfTable()`、`applyAttributesToTrapIds()` 调用 `sai_hostif_api->create_hostif_trap()` 创建 trap，并用 `updateTrapOperStatus()` 把 `installed` 状态写回 STATE_DB（表名常量定义在 swss-common / sairedis，需对照实际版本核验，字段见 05-02 ｜ 模块见 07-03）。
+
+「QoS 映射表」是理解差分服务的基础。`qosorch.cpp` 里 `QosOrch::m_qos_maps` 按表类型维护对象引用映射，可核验到 `CFG_DSCP_TO_TC_MAP_TABLE_NAME`、`CFG_TC_TO_QUEUE_MAP_TABLE_NAME`、`CFG_PORT_QOS_MAP_TABLE_NAME` 等表，以及 `handleDscpToTcTable()`、`handleTcToQueueTable()`、`handleDot1pToTcTable()`、`handleTcToDot1pTable()`、`handleTcToPgTable()`、`handleWredProfileTable()` 等处理函数。它们构造 `SAI_QOS_MAP_ATTR_MAP_TO_VALUE_LIST`、`SAI_QOS_MAP_ATTR_TYPE` 属性，类型枚举包括 `SAI_QOS_MAP_TYPE_DSCP_TO_TC`、`SAI_QOS_MAP_TYPE_TC_TO_QUEUE`、`SAI_QOS_MAP_TYPE_DOT1P_TO_TC`、`SAI_QOS_MAP_TYPE_TC_TO_PRIORITY_GROUP` 等；端口侧再用 `SAI_PORT_ATTR_QOS_DSCP_TO_TC_MAP`、`SAI_PORT_ATTR_QOS_TC_TO_QUEUE_MAP` 把 map 对象挂到端口。QoS 由 `gQosOrch = new QosOrch(m_configDb, qos_tables)` 直接订阅 CONFIG_DB，未经单独 mgrd（字段见 05-04 ｜ 原理见 06-04 ｜ 参数见 04-06）。
+
+「policer 与引用计数」是把 ACL / COPP 串起来的纽带。`policerorch.cpp` 里 `PolicerOrch` 可核验到 `policerExists()`、`getPolicerOid()`、`increaseRefCount()`、`decreaseRefCount()`、`handlePortStormControlTable()`、`doTask(Consumer&)`，以及 `sai_policer_api->create_policer()` 调用；属性涵盖 `SAI_POLICER_ATTR_METER_TYPE`、`MODE`、`CBS`、`CIR`、`PBS`、`PIR`、`COLOR_SOURCE`、`RED/GREEN/YELLOW_PACKET_ACTION`，模式枚举有 `SAI_POLICER_MODE_SR_TCM`、`TR_TCM`、`STORM_CONTROL`，颜色源有 `SAI_POLICER_COLOR_SOURCE_AWARE`、`BLIND`。ACL 规则通过 `gPolicerOrch->getPolicerOid()` 取得 policer 对象、`increaseRefCount()` 增引用；COPP 的 `removePolicer()` / `getPolicer()` 管理 trap 组与 policer 的绑定。`aclorch.cpp` 里 `ACTION_POLICER_ACTION → SAI_ACL_ENTRY_ATTR_ACTION_SET_POLICER` 正是这层引用关系的落点（字段见 05-07 ｜ 原理见 06-04）。
+
+下表把本节核心概念、职责与本快照可定位源码对应起来，便于回查；表中文件路径相对 `sonic-swss-master/` 或 `sonic-buildimage-master/` 根。
+
+| 概念 | 职责 | 可定位源码 | 回查去向 |
+|---|---|---|---|
+| AclOrch | 创建 ACL 表与规则并绑定 | `orchagent/aclorch.cpp` | 字段见 05-07 |
+| CoppMgr / CoppOrch | 搬运 COPP 配置并建 trap | `cfgmgr/coppmgr.cpp`、`orchagent/copporch.cpp` | 参数见 04-03 |
+| QosOrch | 构造 QoS map 并挂端口 | `orchagent/qosorch.cpp` | 字段见 05-04 |
+| PolicerOrch | 创建限速器并管理引用 | `orchagent/policerorch.cpp` | 原理见 06-08 |
+| COPP 默认配置 | 定义 trap 组限速参数 | `files/image_config/copp/copp_cfg.j2` | 模块见 07-11 |
+
+最后是边界收束：四类业务都由 orchagent 翻译成 ASIC 对象、经 06-05 的 syncd 调用链编程 ASIC，orchagent 只写 ASIC_DB、不直接操作硬件；厂商 SAI 实现为闭源且不在本快照，凡涉及 trap 是否支持、属性枚举与版本号一律写「不在本快照，需对照实际版本核验」并给出可定位目录（原理见 06-05 ｜ 模块见 07-04）。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与对象并给出可定位路径，不展开逐字段定义。表项与 `FieldValueTuple` 字段见 05-02，`Table` / `ProducerStateTable` 字段见 05-03，SAI 对象与 attribute 字段见 05-04，Orch / Request / Consumer 结构见 05-05，Acl / Route 等 Orch 派生结构见 05-07，ACL / COPP 的 CONFIG_DB schema 参数见 04-03，SAI / orchagent 配置参数见 04-06，即（字段见 05-02 ｜ 字段见 05-04 ｜ 字段见 05-05 ｜ 字段见 05-07 ｜ 参数见 04-03 ｜ 参数见 04-06 ｜ 原理见 06-08 ｜ 模块见 07-03）。本篇聚焦「哪张表由谁订阅、由谁翻译成什么对象」，字段与参数全集不在本册重列。
+
+ACL 侧的结构落位在 `orchagent/aclorch.cpp` 与 `aclorch.h`。可核验到 `AclOrch::AclOrch(vector<TableConnector>&, DBConnector*, SwitchOrch*, ...)` 构造、`doTask(Consumer&)`、`doAclTableTask()`、`doAclRuleTask()`、`doAclTableTypeTask()`、`addAclTable()`、`addAclRule()`、`createBindAclTable()`、`deleteUnbindAclTable()`、`bindAclTable()` 等函数，以及 `m_aclRuleStateTable(stateDb, STATE_ACL_RULE_TABLE_NAME)` 等状态表成员；静态映射表 `match_map`、`action_map`、`bind_point_type_map` 把配置字段名映射到 SAI 枚举。`orchdaemon.cpp` 里 `acl_table_connectors` 同时挂 CONFIG_DB 与 APPL_DB 的 ACL 表 / 规则 / 表类型连接器。SAI 的 ACL 属性枚举取值与函数签名不在本快照，需对照实际版本核验（字段见 05-07 ｜ 模块见 07-03）。
+
+COPP 侧的结构落位分配置管理与编排两处。`cfgmgr/coppmgr.cpp`、`coppmgr.h`、`coppmgrd.cpp` 中可核验到 `m_cfgCoppTrapTable(cfgDb, CFG_COPP_TRAP_TABLE_NAME)`、`m_cfgCoppGroupTable(cfgDb, CFG_COPP_GROUP_TABLE_NAME)`、`m_appCoppTable(appDb, APP_COPP_TABLE_NAME)`、`m_stateCoppTrapTable`、`m_stateCoppGroupTable` 等成员，`CoppMgr::doTask(Consumer&)` 按表名分派，字段常量有 `COPP_TRAP_ID_LIST_FIELD`、`COPP_TRAP_GROUP_FIELD`。`orchagent/copporch.cpp` 中可核验到 `CoppOrch::CoppOrch(...)`、`doTask(Consumer&)`、`doTask(SelectableTimer&)`、`createGenetlinkHostIfTable()`、`applyAttributesToTrapIds()`、`removeGenetlinkHostIfTable()`、`removePolicer()`、`getPolicer()`、`bindTrapCounter()`、`updateTrapOperStatus()` 等函数，`trap_id_map` 把 `bgp`、`lacp`、`arp_req` 等字符串映射到 `SAI_HOSTIF_TRAP_TYPE_*`，`default_supported_trap_ids` 是能力回退集合，`STATE_COPP_TRAP_CAPABILITY_TABLE_NAME`、`STATE_COPP_TRAP_TABLE_NAME` 为状态表（字段见 05-02 ｜ 模块见 07-03）。
+
+QoS 与 policer 侧的结构落位在 `orchagent/qosorch.cpp`、`qosorch.h`、`policerorch.cpp`、`policerorch.h`。`QosOrch` 侧可核验到 `getTypeMap()`、`isObjectBeingReferenced()`、`objectReferenceInfo()`，以及 `handleDscpToTcTable()`、`handleTcToQueueTable()` 等一族 handler 和 `SAI_QOS_MAP_ATTR_MAP_TO_VALUE_LIST`、`SAI_QOS_MAP_TYPE_*` 属性类型；`PolicerOrch` 侧可核验到 `PolicerOrch::PolicerOrch(vector<TableConnector>&, PortsOrch*)`、`handlePortStormControlTable()`、`doTask(Consumer&)`、`increaseRefCount()` / `decreaseRefCount()`、`getPolicerOid()`，以及 `SAI_POLICER_ATTR_*` 属性与 `sai_policer_api->create_policer()` 调用。`orchdaemon.cpp` 中 `gQosOrch = new QosOrch(m_configDb, qos_tables)` 与 `gPolicerOrch = new PolicerOrch(policer_tables, gPortsOrch)` 印证二者的数据源与依赖（字段见 05-04 ｜ 字段见 05-05 ｜ 原理见 06-04）。
+
+为便于把「对象—表—源码位置」串起来，下表按四层归纳四类业务下发链路上可核验的落位。
+
+| 层次 | 关键表或对象 | 源码位置 | 回查去向 |
+|---|---|---|---|
+| 配置层 | ACL_TABLE/ACL_RULE、COPP_GROUP/COPP_TRAP、QoS map | `cfgmgr/coppmgr.cpp`、`orchagent/qosorch.cpp` | 参数见 04-03 |
+| 期望层 | APPL_DB ACL、COPP_TABLE、policer 表 | `orchagent/orchdaemon.cpp` | 字段见 05-02 |
+| 对象层 | ACL_TABLE_ENTRY、hostif trap、QOS_MAP、POLICER | `orchagent/` 各 `*orch.cpp` | 字段见 05-04 |
+| 硬件层 | ASIC_DB 对象经 syncd 编程 | `sonic-sairedis/syncd/` | 原理见 06-05 |
+
+### 4. 关键流程与调用链
+
+把配置层、期望层、对象层与硬件层串起来，就得到四类业务下发的完整链路，见图 06-08-01。
+
+:::figure id=06-08-01 | name=ACL COPP QoS 与 policer 下发链路 | dir=TD
+node a "ACL_TABLE ACL_RULE<br/>CONFIG_DB 与 APPL_DB" blue
+node b "COPP_GROUP COPP_TRAP<br/>CONFIG_DB" blue
+node c "QoS MAP 表<br/>CONFIG_DB" blue
+node d "coppmgrd<br/>搬运 COPP" teal
+node e "AclOrch<br/>doAclTableTask" purple
+node f "CoppOrch<br/>doTask" purple
+node g "QosOrch PolicerOrch<br/>doTask" purple
+node h "ASIC_DB<br/>ACL TRAP QOS POLICER" amber
+node i "syncd 与 SAI" green
+node j "ASIC 转发芯片" red
+edge a -> e "订阅 ACL 表"
+edge b -> d "订阅 COPP 配置"
+edge d -> f "写 APPL_DB COPP"
+edge c -> g "订阅 QoS 表"
+edge e -> h "ACL 表项与规则"
+edge f -> h "trap 与 policer"
+edge g -> h "QOS_MAP 与 POLICER"
+edge h -> i "调用链"
+edge i -> j "编程芯片"
+:::
+
+图 06-08-01 中 blue 为数据库输入与配置，teal 为配置管理进程，purple 为 orchagent 控制面，amber 为 ASIC_DB 对象，green 为 syncd 与 SAI，red 为硬件边界。需要强调的是三条支路的差异：ACL 支路从 CONFIG_DB 与 APPL_DB 双来源进入 `AclOrch`；COPP 支路必须经 `coppmgrd` 搬运才到 `CoppOrch`；QoS 与 policer 支路则由对应 Orch 直接订阅配置库。三条支路最终都汇入 ASIC_DB 的专项对象，再共用 06-05 的 syncd 调用链编程 ASIC（原理见 06-04 ｜ 原理见 06-05）。
+
+ACL 下发子链从配置写入开始。用户或控制面把 `ACL_TABLE`（定义 `type`、`ports`、`stage` 等）与 `ACL_RULE`（定义匹配项与动作）写入 CONFIG_DB，`AclOrch` 的连接器同时订阅 CONFIG_DB 与 APPL_DB 表，`doTask()` 按表名分派到 `doAclTableTask()` 与 `doAclRuleTask()`；前者经 `addAclTable()` 与 `createBindAclTable()` 创建并绑定 ACL 表，后者经 `addAclRule()` 把 `MATCH_*` 字段翻译成 `SAI_ACL_ENTRY_ATTR_FIELD_*` 属性、把 `ACTION_*` 翻译成 `SAI_ACL_ENTRY_ATTR_ACTION_*` 属性，涉及 `SAI_API_ACL`。若规则动作引用 policer，则通过 `gPolicerOrch->getPolicerOid()` 取对象并增引用计数。对象写入 ASIC_DB 后，余下交给 06-05 的 syncd 调用链（函数名可核验，签名需对照实际版本核验，字段见 05-07 ｜ 原理见 06-05）。
+
+COPP 下发子链有两个阶段。第一阶段是配置搬运：`CoppMgr::doTask()` 订阅 `CFG_COPP_TRAP_TABLE_NAME` 与 `CFG_COPP_GROUP_TABLE_NAME`，把 `trap_ids`、`trap_group`、`cir`、`cbs`、`mode`、`meter_type`、`red_action` 等字段规范化后写入 `APP_COPP_TABLE_NAME`，并回写 STATE_DB 的 COPP 表。第二阶段是编排：`CoppOrch::doTask()` 消费 APPL_DB，先经能力查询确认哪些 trap 被厂商 SAI 支持，不被支持的 trap 按源码日志「Ignoring the trap_id ... since not supported by vendor SAI」忽略；对支持的 trap 经 `applyAttributesToTrapIds()` 调用 `sai_hostif_api->create_hostif_trap()` 创建 hostif trap 对象，并把 trap 组挂到 policer（`removePolicer()` / `getPolicer()` 管理绑定），最后用 `updateTrapOperStatus()` 把 `installed` 状态写回 STATE_DB。默认参数来自 `copp_cfg.j2`，但具体取值随机型与版本而变，需对照实际版本核验（参数见 04-03 ｜ 模块见 07-11）。
+
+QoS 与 policer 子链相对独立。`QosOrch` 直接订阅 CONFIG_DB 的 `CFG_DSCP_TO_TC_MAP_TABLE_NAME`、`CFG_TC_TO_QUEUE_MAP_TABLE_NAME` 等表，`handle*Table()` 函数构造 `SAI_QOS_MAP_ATTR_MAP_TO_VALUE_LIST` 属性创建 QOS_MAP 对象，端口再通过 `SAI_PORT_ATTR_QOS_DSCP_TO_TC_MAP` 等属性引用它；`m_qos_maps` 维护引用计数，删除被引用对象时先置 `m_pendingRemove`。`PolicerOrch` 消费自己的表集，`handlePortStormControlTable()` 构造 `SAI_POLICER_ATTR_METER_TYPE`、`CIR`、`CBS` 等属性调用 `sai_policer_api->create_policer()`，并把对象挂到端口的 `SAI_PORT_ATTR_*_STORM_CONTROL_POLICER_ID`。两类对象写入 ASIC_DB 后同样经 syncd 编程（字段见 05-04 ｜ 原理见 06-05）。
+
+需要把异步时序与依赖顺序再强调一次：以图 06-08-01 的任意一条边为界，上游完成不代表下游已完成；`show acl table`、`show qos` 看到的是数据库状态，不等于芯片已按此处理报文。此外，`PolicerOrch` 必须先于 `AclOrch` 与 `CoppOrch` 就绪（`m_orchList` 的顺序体现了这一点），否则引用 policer 的规则会因对象不存在而失败重试。配置下发时延、ACL 表项收敛时间与 trap 创建吞吐随机型、芯片与版本变化，一律标注「需在目标机型实测」，本册不给绝对值（基准方法见 08-01 ｜ 调优见 08-02 ｜ 排障见 08-03）。
+
+### 5. 配置/命令/代码实例
+
+本节给三组最小实例：一组用 `config` 与 `show` 命令完成一次 ACL 配置与首屏验证并作逐行判读，一组给出 `AclOrch::doTask()` 的分派代码片段印证翻译过程，一组给出 COPP 配置片段与观察 ASIC_DB 对象的查询命令。完整的 ACL / COPP schema 参数见 04-03，SAI / orchagent 参数见 04-06，DB 对象见 04-04，命令全集见 04-05，本册不重列。命令名、选项、表名与键格式需对照实际版本核验。
+
+先看一次典型的 ACL 配置与验证闭环。以下命令按「前置检查 → 执行 → 验证输出 → 清理」组织，命令名与选项需对照实际版本核验。
+
+```bash
+# 前置检查：确认目标端口存在且为 up
+show interfaces status
+# 执行：创建 ACL 表并加入一条丢弃规则（参数见 04-03）
+config acl add table DROP_TCP type L3
+config acl add rule DROP_TCP DROP_22 src-ip 192.0.2.0/24 dst-port 22 protocol tcp action drop
+# 验证：查看 ACL 表与规则
+show acl table
+show acl rule
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（下列取值仅为格式示意，不代表任何具体版本或机型）
+$ show acl table
+Name      Type    Binding    Description    Stage
+-------   ------  ---------  -------------  -------
+DROP_TCP  L3      Ethernet0  drop tcp 22    ingress
+$ show acl rule
+Table     Rule      Priority  Action    Match
+--------  --------  --------  --------  -------------------------------
+DROP_TCP  DROP_22   1         DROP      SRC_IP: 192.0.2.0/24; L4_DST_PORT: 22
+```
+
+逐行判读如下。前置的 `show interfaces status` 用来确认绑定端口存在且 `Oper` 为 `up`，这是 ACL 规则能生效的前提；若端口本就 down，应先回到端口链路排查，而不是继续加 ACL。执行段两条命令中，`config acl add table DROP_TCP type L3` 创建一张 L3 类型 ACL 表，`config acl add rule ...` 加入一条规则，`src-ip`、`dst-port`、`protocol`、`action` 等参数的具体拼写与顺序需对照实际版本核验；两条命令返回成功都只代表配置写入 CONFIG_DB 的 ACL_TABLE / ACL_RULE 表，后面还有 AclOrch 翻译、syncd 编程两段。输出段 `show acl table` 中 `Name` 为 `DROP_TCP`、`Type` 为 `L3`、`Binding` 为 `Ethernet0`、`Stage` 为 `ingress`，说明 ACL 表已成功绑定在入口方向；`show acl rule` 中 `Priority` 为 `1`、`Action` 为 `DROP`、`Match` 列出 `SRC_IP` 与 `L4_DST_PORT: 22`，与配置相符，属正常特征。最关键的一点：这两张 `show` 表读的是数据库状态，能列出表与规则只说明配置已落地到可查询状态，并不等于芯片的 ACL 表已写入该规则；按图 06-08-01 还需确认 ASIC_DB 有对应 ACL 对象、STATE_DB 状态正常，必要时结合日志判断（原理见 06-08 ｜ 排障见 08-03）。整段命令中 `config` 为配置写入、`show` 为只读，均不经 SAI 直接编程 ASIC（参数见 04-05）。
+
+第二组给出 `AclOrch::doTask()` 的分派代码片段，用来印证「按表名分派到翻译函数」的实现形态；下列片段依据本快照中可核验的函数名与表名常量整理，为便于阅读做了简化，真实函数签名与控制流需对照实际版本核验。
+
+```cpp
+// 代码形态示意，依据 orchagent/aclorch.cpp 中可核验的入口与表名整理；签名需对照实际版本核验
+void AclOrch::doTask(Consumer &consumer)
+{
+    const auto &table_name = consumer.getTableName();
+
+    if (table_name == CFG_ACL_TABLE_TABLE_NAME ||
+        table_name == APP_ACL_TABLE_TABLE_NAME) {
+        doAclTableTask(consumer);
+    } else if (table_name == CFG_ACL_RULE_TABLE_NAME ||
+               table_name == APP_ACL_RULE_TABLE_NAME) {
+        doAclRuleTask(consumer);
+    } else if (table_name == CFG_ACL_TABLE_TYPE_TABLE_NAME ||
+               table_name == APP_ACL_TABLE_TYPE_TABLE_NAME) {
+        doAclTableTypeTask(consumer);
+    }
+}
+```
+
+这段代码强化了本篇的核心判断：`AclOrch::doTask()` 以表名作为路由键，且每个分支都同时接受 `CFG_*` 与 `APP_*` 两种表名，这正是「ACL 双来源」的代码体现——`doAclTableTask()`、`doAclRuleTask()`、`doAclTableTypeTask()` 三个入口分别对应表、规则、表类型三类对象。片段中省略了重试、能力查询与引用计数的细节，真实源码在 `addAclTable()` 里经 `createBindAclTable()` 绑定端口 / LAG，在 `addAclRule()` 里把 `MATCH_*` / `ACTION_*` 字段翻译成 `SAI_ACL_ENTRY_ATTR_FIELD_*` / `SAI_ACL_ENTRY_ATTR_ACTION_*` 属性，并在动作引用 policer 时调用 `gPolicerOrch->getPolicerOid()`。读者读源码时应重点看这三处，它们正是把配置翻译成 SAI 属性的地方（字段见 05-07 ｜ 原理见 06-04）。
+
+第三组给出 COPP 配置片段与观察 ASIC_DB 对象的查询命令，用于核对默认限速参数与下发结果；键名、表名与属性格式需对照实际版本核验。
+
+```json
+{
+  "COPP_GROUP": {
+    "default": {"queue": "0", "meter_type": "packets", "mode": "sr_tcm",
+                "cir": "600", "cbs": "600", "red_action": "drop"}
+  },
+  "COPP_TRAP": {
+    "bgp": {"trap_ids": "bgp,bgpv6", "trap_group": "queue4_group1"},
+    "arp": {"trap_ids": "arp_req,arp_resp,neigh_discovery", "trap_group": "queue4_group2"}
+  }
+}
+```
+
+```bash
+# 观察 ASIC_DB 的 hostif trap 对象（对象形态见 06-05）
+sonic-db-cli ASIC_DB KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_HOSTIF_TRAP:*'
+# 观察 ASIC_DB 的 policer 对象
+sonic-db-cli ASIC_DB KEYS 'ASIC_STATE:SAI_OBJECT_TYPE_POLICER:*'
+```
+
+COPP 片段来自本快照可核验的 `files/image_config/copp/copp_cfg.j2`：`"default"` 组的 `"meter_type": "packets"`、`"mode": "sr_tcm"`、`"cir": "600"`、`"cbs": "600"`、`"red_action": "drop"` 定义了默认限速 `600` 包、突发 `600`、模式为单速三色标记且超限丢弃；`COPP_TRAP` 把 `bgp`、`arp` 等 trap 映射到不同队列组，`bgp` 用 `queue4_group1`（`cir` 更高），`arp` 用 `queue4_group2`。这些数值是模板默认，实际生效值随机型与版本而变，需对照实际版本核验。两条 `sonic-db-cli` 命令属于只读探查，分别验证 trap 与 policer 对象是否已写入 ASIC_DB，对应图 06-08-01 的 ASIC_DB 段；若 ASIC_DB 无对象，应回到 CONFIG_DB / APPL_DB 与 `coppmgrd`、`CoppOrch` 日志逐段定位，若 ASIC_DB 有对象而行为不符，则回到 06-05 的 syncd 调用链排查（排障见 08-03 ｜ 原理见 06-05）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是层次混淆陷阱。最常见的是把 `show acl table`、`show qos` 能看到配置当成「芯片已按此处理报文」，或把 ASIC_DB 有对象当成「限速已生效」。show 读的是数据库状态，ASIC_DB 有对象只说明 orchagent 已翻译并写入期望状态，属性是否被厂商 SAI 支持、是否真正写入芯片需经能力查询与状态回写确认；必须按图 06-08-01 逐段区分，验证时按 CONFIG_DB、APPL_DB、ASIC_DB、STATE_DB 与 `show` 输出推进，不能跳段下结论（参数见 04-03 ｜ 排障见 08-03）。第二类是「配置即时生效」陷阱：`config acl add rule` 返回成功只代表配置写入 CONFIG_DB，ACL 表项写进 ASIC、trap 创建并挂上 policer 都要等异步流水线走完（原理见 06-01 ｜ 排障见 08-04）。
+
+第三类是事实纪律陷阱。ACL 的 `CFG_ACL_TABLE_TABLE_NAME`、`APP_ACL_RULE_TABLE_NAME` 等表名常量，以及 `COPP_TRAP_ID_LIST_FIELD`、`STATE_COPP_TRAP_TABLE_NAME` 等常量在 `aclorch.cpp`、`coppmgr.cpp`、`copporch.cpp` 中可核验到引用，但其定义多在 `sonic-swss-common` 与 `sonic-sairedis`，不在本快照，需对照实际版本核验；SAI 属性枚举取值、函数签名与结构体成员同样要对照实际版本核验，不确定的一律标注并给出 `orchagent/`、`cfgmgr/`、`src/swsssdk/` 等可定位目录（字段见 05-04 ｜ 模块见 07-05）。第四类是 DB 编号陷阱：Redis 各库编号来自运行时 `database_config.json`，须对照 `sonic-py-swsssdk/src/swsssdk/dbconnector.py` 的 `SonicDBConfig` 核验，禁止写死某库是某号（参数见 04-04）。
+
+第五类是依赖顺序陷阱。`PolicerOrch` 必须先于依赖它的 `AclOrch`、`CoppOrch` 就绪，`m_orchList` 的排列体现了这一点；若 policer 尚未创建，引用它的 ACL 规则或 COPP trap 组会失败并进入重试缓存，表现为「配置在、规则不生效」，排障时要看引用链而不是只看本表（原理见 06-04 ｜ 排障见 08-03）。第六类是能力边界陷阱：COPP 的 trap 是否能创建取决于厂商 SAI 能力，`copporch.cpp` 里明确有「不支持则忽略」的分支并以 `default_supported_trap_ids` 回退；厂商 SAI 实现闭源且不在本快照，涉及它的细节一律写「不在本快照，需对照实际版本核验」；`AclOrch`、`CoppOrch`、`QosOrch`、`PolicerOrch` 只写 ASIC_DB，不直接读写寄存器、不直接驱动芯片（原理见 06-05 ｜ 模块见 07-04）。第七类是性能与规模陷阱：ACL 表项容量、trap 创建数量、QoS map 规模与限速吞吐都随机型、芯片、版本变化，一律标注「需在目标机型实测」，不给绝对值、不给跨机型通用数字（基准方法见 08-01 ｜ 调优见 08-02）。
+
+最佳实践归纳为四条。其一，把任何一次「专项配置不生效」都拆成图 06-08-01 的若干段，先判定停在哪一段，再决定查哪个进程的日志与哪张库表，避免一上来怀疑硬件。其二，读代码时把路径写成 `upstream_src/sonic-swss/sonic-swss-master/` 下的相对路径，并同时给出对应函数（`AclOrch::doTask()`、`CoppMgr::doTask()`、`CoppOrch::doTask()`、`QosOrch::handleDscpToTcTable()`、`PolicerOrch::doTask()` 等），函数签名不确定就写「需对照实际版本核验」。其三，命令、配置与输出按「前置检查、执行、验证输出、清理」闭环写，示例输出注明「示例输出，具体格式需对照实际版本核验」并附逐行判读。其四，跨册引用统一用四段式（字段见 05-04 ｜ 参数见 04-03 ｜ 原理见 06-08 ｜ 模块见 07-03），本篇涉及的 SAI 对象字段写「字段见 05-04」、syncd 编程写「原理见 06-05」、能力边界写「模块见 07-04」，不在本篇展开字段表与参数全集。
+
+### 7. 小结与延伸阅读
+
+本篇把四类专项业务的下发链路讲透：ACL 由 `orchagent/aclorch.cpp` 的 `AclOrch` 从 CONFIG_DB 与 APPL_DB 双来源订阅，`doAclTableTask()` / `doAclRuleTask()` 经 `addAclTable()`、`addAclRule()` 把 `MATCH_*` / `ACTION_*` 字段翻译成 `SAI_ACL_ENTRY_ATTR_*` 属性并绑定端口；COPP 由 `cfgmgr/coppmgr.cpp` 把 `COPP_GROUP` / `COPP_TRAP` 配置搬到 APPL_DB，再由 `orchagent/copporch.cpp` 的 `CoppOrch` 经 `createGenetlinkHostIfTable()`、`applyAttributesToTrapIds()` 调用 `sai_hostif_api->create_hostif_trap()` 创建 trap 并挂 policer；QoS 由 `orchagent/qosorch.cpp` 的 `QosOrch` 直接订阅 CONFIG_DB 构造 QOS_MAP 对象并挂端口；policer 由 `orchagent/policerorch.cpp` 的 `PolicerOrch` 经 `sai_policer_api->create_policer()` 创建并由 ACL / COPP 引用。三类对象都写入 ASIC_DB，最终由 06-05 的 syncd 调用链编程 ASIC。图 06-08-01 与四层落位表是回查索引；三条判断贯穿全篇——四类业务数据源与终点各不相同但共用 orchagent 框架、`show` 看到的是数据库状态而非芯片已生效、表名常量与 SAI 属性多不在本快照需核验。
+
+延伸阅读按目标分流。想补 orchagent 调度框架，接读 06-01（数据流总览）、06-03（mgrd 与校验）、06-04（orchagent 调度）；想补下游编程，接读 06-05（syncd 与 SAI 调用链）、06-09（计数回写）；想看同类控制面下发业务，接读 06-06（端口与 VLAN）、06-07（BGP 与路由下发）；想理解能力边界与厂商实现，接读 06-12（平台驱动、SAI 适配与厂商实现边界）。字段随查走 05-02（表项与 FieldValueTuple）、05-04（SAI 对象与 attribute）与 05-07（Orch 派生结构），参数随查走 04-03（ACL / COPP schema）与 04-06（SAI / orchagent 配置），模块能力走 07-03（sonic-swss / orchagent）、07-04（sonic-sairedis / syncd）与 07-11（image_config / copp），部署实战走 03-03、03-04，排障走 08-03、08-04。跨册引用请始终使用「字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx」的写法，`xx` 替换为具体篇号。
+
+最后重申资料纪律：本篇所有示例输出均注明「示例输出，具体格式需对照实际版本核验」；所有源码路径均相对各子仓 `xxx-master/` 根；`sonic-swss-common`、厂商 SAI 实现写「不在本快照，需对照实际版本核验」；不确定的表名常量、字段常量、属性枚举与函数签名均标注核验要求并给出 `orchagent/`、`cfgmgr/`、`src/swsssdk/` 等可定位目录；COPP 默认限速数值来自模板、随机型与版本而变，需对照实际版本核验；性能、容量、时延与吞吐类结论一律标注「需在目标机型实测」。版本基准始终为「上游 master 快照（2026-11 抓取）」，不写绝对版本号与 Redis DB 编号。至此 06 册技术原理的分片 D 两篇收束：06-07 讲清了以协议栈为起点的 BGP 路由下发链路，06-08 讲清了四类以配置库为起点的专项业务下发链路，二者合起来与分片 C 的端口、VLAN 业务一起，构成「从各类输入到 ASIC 对象」的完整下发图景。

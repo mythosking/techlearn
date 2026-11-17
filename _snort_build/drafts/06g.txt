@@ -1,0 +1,258 @@
+# Snort 3 技术资料 · 06 技术原理（分片 G）
+
+## 06-13 多线程、进程模型与资源隔离
+
+### 1. 背景与动机
+
+Snort 3 是一个常驻进程：启动后从 `lua/snort.lua` 读入配置（参数见 04-02），经 `src/managers/` 装配模块，再由 DAQ 持续收包并走完解码、检查、检测、输出的全链路（原理见 06-01、06-02）。这条链路若只在一个执行流里串行推进，单核计算能力很快成为瓶颈；而现网往往配有多队列网卡、多核乃至多个 NUMA 节点，需要把收包与检测并行化。与此同时，规则与配置的热重载又要求「尽量不中断流量」——如果每来一个新配置就重启进程，在线 IPS 场景会出现丢包窗口。于是 Snort 3 把「包处理循环」抽象为可独立运行的 Analyzer 线程，把「配置切换」抽象为按线程局部指针完成的 Swapper 交换，把「跨进程协同」交给 MPDataBus，并用线程本地存储、CPU 亲和性、NUMA 内存策略、内存上限与特权降级把各执行流隔离开来。这套设计要同时满足三个目标：让每个包处理线程拥有独立的配置视图与检测上下文；让控制面能在运行期改动配置而不打断数据面；让多实例部署时各进程之间还能同步必要的状态。
+
+必须在一开始就划清事实边界：**线程 / 进程模型与资源隔离以实际版本为准，源码中可见的实现细节并不等于一个写死的部署拓扑**。`src/main/analyzer.cc` 的头注释明确写着 Analyzer 运行在不同线程、并提供命令设施以控制线程和交换配置（源码 23 至 25 行附近）；但「默认起几个包处理线程」不能从某处常量直接外推。`-z` / `--max-packet-threads` 的取值为 0 时表示按进程 cpuset 自动分配，见 `src/main/thread_config.cc` 92 至 101 行附近的 `instance_max = hwloc_bitmap_weight(process_cpuset)`；未显式设置时的最终取值、以及不同构建变体下的行为都需对照实际版本核验，本套资料**禁止断言「默认 N 线程」**（规范 2.1 第 6 条）。本篇事实基准为「上游 master 快照（2026-11 抓取）」，核心源码分布在 `src/main/analyzer.*`、`swapper.*`、`process.*`、`numa.*`、`thread_config.*`、`policy.*`、`src/detection/ips_context_chain.*`、`src/framework/pig_pen.*` 与 `src/framework/mp_data_bus.*`。命令行与 shell 控制的完整参数归 04 册（参数见 04-07），本篇只给机制与最小示例；结构体字段归 05 册（字段见 05-05、05-09），不重列字段表；吞吐与内存类结论一律标注「需在目标机型实测」，不给绝对值（基准方法见 08-01）。
+
+### 2. 核心概念
+
+第一个核心概念是 **Analyzer 包处理线程与状态机**。`src/main/analyzer.h` 63 行附近定义 `class Analyzer`，66 至 76 行附近的 `enum class State` 列出 `NEW`、`INITIALIZED`、`STARTED`、`RUNNING`、`PAUSED`、`STOPPING`、`STOPPED`、`FAILED`、`NUM_STATES` 九个状态，描述了线程从创建到退出的生命周期；83 行附近的构造函数接收 `SFDAQInstance*`、线程 `id`、输入 `source`、`msg_cnt` 与 `retry_timeout`。`src/main/analyzer.cc` 94 行附近的 `static THREAD_LOCAL Analyzer* local_analyzer` 与 160 行附近的 `get_local_analyzer()` 说明每个包处理线程通过线程本地变量拿到自己的 Analyzer，而 175 行附近的 `extern THREAD_LOCAL ProfileStats daqPerfStats` 把 DAQ 统计也放在线程本地。运行入口 `void operator()(Swapper*, uint16_t run_num)`（头文件 86 行附近）在线程内驱动 `analyze()`（analyzer.cc 1037 行附近）：它先检查 `state`，非 `RUNNING` 时处理命令或短暂休眠，`RUNNING` 时调用 `process_messages()`（985 行附近）从 DAQ 拉一批消息。控制面通过 `execute(AnalyzerCommand*)`（888 行附近）把命令放入 `pending_work_queue`，线程在 `handle_commands()` 中取出执行，`start`、`run`、`pause`、`resume`、`stop`、`rotate`、`reload_daq`、`reinit` 都是命令落点（头文件 106 至 117 行附近）。这种「命令入队、线程自己消费」的模型避免了跨线程直接改状态带来的竞态。
+
+第二个核心概念是**实例数、CPU 亲和性与看门狗**。`src/main/thread_config.h` 37 行附近的 `class SO_PUBLIC ThreadConfig` 是线程策略的配置中心：40 至 51 行附近给出 `init`、`validate_cpuset_string`、`set_instance_max`、`get_instance_max`、`start_watchdog`、`kick_watchdog`、`set_instance_tid` 与 `get_instance_tid` 等静态接口；54 至 58 行附近的 `apply_thread_policy`、`set_thread_affinity`、`implement_thread_affinity`、`set_named_thread_affinity` 负责把配置落到线程；84、85 行附近的 `thread_affinity` 与 `named_thread_affinity` 两张映射表按 `TypeIdPair`（线程类型加 id）或线程名保存 CPU 集。命令行 `-z` / `--max-packet-threads` 在 `src/main/snort_module.cc` 348 至 349、529 行附近定义为 `Parameter::PT_INT`，范围 `0:max32`，873 至 874 行附近调用 `ThreadConfig::set_instance_max` 落地；`src/main/thread_config.cc` 44 行附近初值为 1，92 至 101 行附近规定「传 0 表示自动、按进程 cpuset 的 CPU 数取值」。实例数随后驱动 DAQ 与内存：`src/main/snort.cc` 249 行附近 `SFDAQ::init(sc->daq_config, ThreadConfig::get_instance_max())`、176 行附近 `memory::MemoryCap::init(...)`；`src/main/snort_config.cc` 513 行附近把 `offload_threads` 与实例数相加得到上下文槽位数。这些数字都只是源码机制，**实际配置与默认值需对照实际版本核验**（参数见 04-07、04-02）。
+
+第三个核心概念是 **Swapper 与线程局部配置交换**。`src/main/swapper.h` 23 行附近的注释写明它「用于由包线程完成线程局部、基于指针的配置交换」，35 至 52 行附近的 `class Swapper` 持有 `old_conf`、`new_conf`、`new_iv` 三个指针，43、44 行附近提供 `apply(Analyzer&)` 与静态 `finish()`。`src/main/swapper.cc` 67 至 81 行附近的 `apply` 先按需 `InspectorManager::set_map(new_iv)`，再 `SnortConfig::set_conf(new_conf)`，仅当当前配置与新配置不同时调用 `analyzer.reinit(new_conf)`；83 至 86 行附近的 `finish()` 调用 `InspectorManager::thread_term_removed()` 收尾。可见「换配置」不是改对象内容，而是每个包线程在某个安全点把自己的配置指针换成新对象，旧对象的回收另走路径（swapper.cc 57 至 64 行附近用 `PluginManager::set_plugins` 与 `InspectorManager::revert_map`/`restore_map` 配合）。
+
+第四个核心概念是 **PigPen 线程本地门面与 IpsContextChain 依赖链**。`src/framework/pig_pen.h` 34 行附近的 `struct SO_PUBLIC PigPen` 把一组静态查询集中起来：37 至 55 行附近可取得 Module、binder、文件与服务的 Inspector，其中 `get_inspector` 的注释限定「只使用当前活动策略」，`get_new_inspector` 注明「只在 swap 期间有效」，`get_old_inspector` 注明「只在 configure 期间有效」；59 至 80 行附近还提供进程状态、oops handler、包序号与关闭钩子。这是一层门面，把「当前线程当前该看哪份对象」的判定收敛到一处。`src/detection/ips_context_chain.h` 24 至 27 行附近的注释说明 `IpsContextChain` 用于维护多个 `IpsContext` 之间的依赖，保证只有依赖链的末端才能被处理，从而强制严格的处理顺序；44、45 行附近的 `pop` 与 `push_back` 配合 38 至 42 行附近的 `front`/`back` 实现队列语义。这与 `IpsContext` 自身的 `IDLE`/`BUSY`/`SUSPENDED` 状态（字段见 05-05）共同构成异步继续执行时的顺序保证，模型细节需对照实际版本核验（原理见 06-08）。
+
+第五个核心概念是**多进程同步与进程级资源隔离**。`src/framework/mp_data_bus.h` 23 至 32 行附近的注释把 `MPDataBus` 定义为 `DataBus` 的多进程版本：某实例发布需要跨进程同步的 `DataEvent`，由 transport 通道通知所有已订阅的对端实例，从而实现进程间通信。52 至 54 行附近的 `DEFAULT_TRANSPORT "unix_transport"`、`DEFAULT_MAX_EVENTQ_SIZE 4096`、`WORKER_THREAD_SLEEP 100` 给出默认传输名、事件队列上限与工作线程休眠参数（这些宏值是否仍为生效默认需对照实际版本核验）；117 行附近的 `MPEventQueue` 是基于 `LocklessRing` 的无锁环，130 至 220 行附近的 `class SO_PUBLIC MPDataBus` 持有 `worker_thread`、`mp_event_queue`、`mp_pub_sub`、`queue_cv` 与 `queue_mutex`，对外提供 `subscribe`（155 行附近）、`publish`（168 行附近）、`register_event_helpers`（173 行附近，注册序列化与反序列化回调）、`receive_message`（175 行附近）与统计导出。进程级隔离则由 `src/main/process.h` 承担：31 至 42 行附近的 `enum PigSignal` 列出 `PIG_SIG_QUIT`、`PIG_SIG_TERM`、`PIG_SIG_RELOAD_CONFIG`、`PIG_SIG_DUMP_STATS` 等信号，47 至 75 行附近给出 `init_signals`、`daemonize`、`CreatePidFile`、`SetUidGid`、`EnterChroot`、`trim_heap` 等特权降级与生命周期服务；`src/main/numa.h` 31 至 38 行附近的 `NumaMemPolicy`（`DEFAULT`、`PREFERRED`、`BIND`、`LOCAL`、`UNKNOWN`）与 44 至 87 行附近的 `NumaWrapper`/`HwlocWrapper` 把内存策略与拓扑探测封装成可替换接口，是否编译进来取决于构建开关（构建见 02-02）。
+
+先按执行域把上述组件归类，对照见下表。
+
+| 组件 | 源码位置 | 职责 | 隔离边界 |
+|---|---|---|---|
+| Analyzer | src/main/analyzer.cc/.h | 包处理循环与命令执行 | 线程本地实例，state 为原子量 |
+| ThreadConfig | src/main/thread_config.cc/.h | 实例数、亲和性、看门狗、NUMA 策略 | 主线程配置，包线程应用 |
+| Swapper | src/main/swapper.cc/.h | 线程局部配置指针交换 | 包线程 apply，须配对 finish |
+| PigPen | src/framework/pig_pen.cc/.h | 线程本地 module/inspector 门面 | get_new/get_old 仅特定窗口有效 |
+| IpsContextChain | src/detection/ips_context_chain.cc/.h | 依赖链排序 | 仅链尾可被处理 |
+| MPDataBus | src/framework/mp_data_bus.cc/.h | 跨进程事件发布订阅 | 经 transport，事件需序列化 |
+| process / numa | src/main/process.cc/.h、numa.cc/.h | 信号、特权降级、绑核与内存策略 | 依赖平台与构建开关 |
+
+表中「实例数」指 `ThreadConfig::get_instance_max()`，其含义是包处理实例上限而非固定线程数；不同执行域之间的指针不可互换，否则会破坏隔离（详见第 6 节）。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实头文件路径，字段明细一律引用 05 册，不重列字段表。**线程编排层**：`src/main/analyzer.h` 的 `class Analyzer`（`State` 枚举、`operator()`、`execute`、三套命令队列与 `std::atomic<State> state`，字段见 05-09 的管理器族与 05-05 的检测上下文）；`src/main/analyzer_command.h` 的 `AnalyzerCommand` 抽象与其 `execute(Analyzer&)` 纯虚接口（45 至 57 行附近）；`src/main/thread_config.h` 的 `ThreadConfig` 与 `NumaMemPolicy`（后者定义于 `src/main/numa.h`）。**交换与策略层**：`src/main/swapper.h` 的 `class Swapper`（`old_conf`/`new_conf`/`new_iv`）；`src/main/policy.h` 的 `enum PolicyMode`（`POLICY_MODE__PASSIVE`、`POLICY_MODE__INLINE`、`POLICY_MODE__INLINE_TEST`，70 至 76 行附近）、`InspectionPolicy`、`NetworkPolicy`、`IpsPolicy`、`PolicyTuple` 与 `PolicyMap`（字段见 05-03 的策略表）。**线程本地门面层**：`src/framework/pig_pen.h` 的 `PigPen` 与 `src/framework/pig_pen.cc` 的实现；`src/detection/ips_context.h` 的 `IpsContext` 与 `src/detection/ips_context_chain.h` 的 `IpsContextChain`（字段见 05-05）。**跨进程层**：`src/framework/mp_data_bus.h` 的 `MPDataBus`、`MPDataBusStats`、`MPEventInfo`、`MPEventQueue`、`MPSerializeFunc`/`MPDeserializeFunc`（字段见 05-09）。**进程与平台层**：`src/main/process.h` 的 `PigSignal` 与服务族、`src/main/numa.h` 的 `NumaWrapper`/`HwlocWrapper`、`src/main/thread.h` 的 `THREAD_LOCAL` 与 `SThreadType`。
+
+必须标注的不透明边界：`Analyzer` 的命令队列处理、`IpsContextChain` 的链表操作、`MPDataBus` 的 `mp_pub_sub` 查表与 worker 线程主体、`NumaWrapper` 对 libnuma/hwloc 的调用都落在对应 `.cc` 内，头文件只暴露结构形态；`MPTransport` 的具体实现来自 `src/framework/mp_transport.*` 与 `src/managers/mp_transport_manager.*`，属可替换组件。这些对象一律视为不透明句柄，不可依赖其内部布局或字段偏移，需对照实际版本核验。整组结构跨册反查关系统一写为：`（字段见 05-05 ｜ 参数见 04-07 ｜ 原理见 06-01 ｜ 模块见 07-12）`。其中字段归 05-05 是因为 `IpsContext`/`DetectionEngine`/`Cursor` 由该篇权威定义（管理器与内存池另见 05-09），参数归 04-07 是因为命令行与 shell 控制由 04 册权威给出，原理归 06-01 是因为线程承载的是启动与包处理流水线，模块归 07-12 是因为 `src/main` 与 `src/control` 的目录职责由该篇介绍。
+
+### 4. 关键流程与调用链
+
+启动与线程建立的主链路自上而下如下。主线程在 `src/main.cc` 与 `src/main/snort.cc` 完成配置加载与模块装配（原理见 06-01），命令行的 `-z` / `--max-packet-threads` 经 `SnortModule` 的 `set` 回调调用 `ThreadConfig::set_instance_max`（`snort_module.cc` 873 至 874 行附近）；`ThreadConfig::set_instance_max` 在传 0 时按 `hwloc_bitmap_weight(process_cpuset)` 自动取 CPU 数（`thread_config.cc` 92 至 101 行附近）。随后 `SFDAQ::init(sc->daq_config, ThreadConfig::get_instance_max())`（`snort.cc` 249 行附近）按实例数准备 DAQ 上下文，`memory::MemoryCap::init(...)`（176 行附近）按同一上限初始化内存记账。每个包处理线程以各自 `SFDAQInstance` 构造 `Analyzer`，先经 `init_privileged`/`init_unprivileged`（`analyzer.cc` 648 行附近起）完成特权相关初始化，再由 `start()`（1091 行附近）启动 DAQ 实例、`run(bool paused)`（1105 行附近）进入 `RUNNING` 或 `PAUSED`，最终在 `analyze()`（1037 行附近）里循环 `process_messages()` 取批次并投递包进入检测流水线。
+
+控制面链路走命令队列而非直接改线程状态。来自 shell 或 Unix socket 控制面（命令名需对照实际版本核验，见 04-07）的请求被包装成 `AnalyzerCommand` 子类，经 `Analyzer::execute`（888 行附近）压入 `pending_work_queue`；`analyze()` 在状态不对或收到 `DAQ_RSTAT_INTERRUPTED` 时调用 `handle_command()`/`handle_commands()`（1037 至 1074 行附近）取出执行，`ACStart`、`ACRun`、`ACStop`、`ACPause`、`ACResume`、`ACSwap` 等分别落到 `start`、`run`、`stop`、`pause`、`resume` 与配置交换（`src/main/analyzer_command.cc` 123 至 154、313 行附近）；命令完成后移入 `completed_work_queue` 并 `finish_command()`。热重载链路是重点：`Swapper::apply`（`swapper.cc` 67 行附近）在包线程内换 `InspectorManager` 的 map 与 `SnortConfig` 指针，只有检测到 `cur_conf != new_conf` 才调用 `analyzer.reinit(new_conf)`（708 行附近），最后 `Swapper::finish()`（83 行附近）清理线程本地残留；`get_new_inspector`/`get_old_inspector` 的有效窗口正是这一段（原理见 06-01、06-10）。
+
+跨进程链路以 `MPDataBus` 为枢纽。模块通过 `MPDataBus::subscribe`（`mp_data_bus.h` 155 行附近）登记 `PubKey` 与事件 id 的处理回调，发布侧用 `publish`（168 行附近）投递 `shared_ptr<DataEvent>`；若事件需要跨进程传递，须先用 `register_event_helpers`（173 行附近）注册 `MPSerializeFunc`/`MPDeserializeFunc` 序列化对（是否启用与格式需对照实际版本核验），事件进入 `LocklessRing` 队列后由 `worker_thread_func`（216 至 219 行附近）取出，经 `transport_layer`（默认 `unix_transport`，52 行附近）送达对端；对端 `receive_message`（175 行附近）反序列化后交给本地订阅者。上述「线程建立 → 命令交换 → 跨进程同步」三条链路见图 06-13-01。
+
+:::figure id=06-13-01 | name=Analyzer 线程、命令交换与多进程同步链路 | dir=TD
+node a "主线程<br/>配置与装配" blue
+node b "ThreadConfig<br/>实例数与绑核" blue
+node c "Analyzer 线程<br/>analyze 循环" purple
+node d "DAQ 消息池<br/>收包" teal
+node e "AnalyzerCommand<br/>命令队列" amber
+node f "Swapper<br/>线程局部交换" amber
+node g "IpsContextChain<br/>依赖链排序" purple
+node h "MPDataBus<br/>跨进程发布" green
+node i "unix_transport<br/>对端进程" gray
+edge a -> b "设置实例数"
+edge b -> c "绑定线程"
+edge c -> d "拉取批次"
+edge d -> c "消息入队"
+edge a -> e "控制面下发"
+edge e -> c "execute 改状态"
+edge e -> f "换配置指针"
+edge f -> c "reinit 生效"
+edge c -> g "严格处理顺序"
+edge c -> h "发布 DataEvent"
+edge h -> i "transport 送达"
+edge i -> h dashed "订阅方回执"
+:::
+
+### 5. 配置与代码实例
+
+先看 Analyzer 线程形态的头文件骨架（节选自上游 master 快照，字段与签名需对照实际版本核验）：
+
+```cpp
+// src/main/analyzer.h（节选）
+class Analyzer
+{
+public:
+    enum class State {
+        NEW, INITIALIZED, STARTED, RUNNING,
+        PAUSED, STOPPING, STOPPED, FAILED, NUM_STATES
+    };
+    static Analyzer* get_local_analyzer();          // 取本线程 Analyzer
+    void execute(snort::AnalyzerCommand*);         // 命令入队
+    void operator()(Swapper*, uint16_t run_num);   // 线程入口
+private:
+    std::atomic<State> state;
+    std::queue<snort::AnalyzerCommand*> pending_work_queue;
+    mutable std::mutex pending_work_queue_mutex;
+};
+extern THREAD_LOCAL snort::ProfileStats daqPerfStats;
+```
+
+这段代码印证三点：`state` 是 `std::atomic<State>`，说明命令线程与数据线程之间靠原子状态配合；`execute` 只负责把命令压入 `pending_work_queue`，真正的状态变更由包线程在 `handle_commands()` 中完成，避免在控制面直接改线程状态；`get_local_analyzer()` 与 `THREAD_LOCAL` 的 `daqPerfStats` 表明 Analyzer 及其统计是线程本地资源，跨线程读取需通过命令或发布订阅（原理见 06-10）。`operator()` 的 `Swapper*` 参数说明线程启动就带着配置交换的钩子，重载路径与启动路径共用同一入口。
+
+验证按「前置检查 → 执行 → 复核」闭环：先确认 `-z` 参数与相关开关存在，再让 `-T` 与帮助输出回显，全程不假定固定线程数。
+
+```bash
+grep -n "max-packet-threads\|set_instance_max" src/main/snort_module.cc src/main/thread_config.cc
+snort --help 2>&1 | grep -i -e "max-packet-threads" -e "packet threads"
+snort -c lua/snort.lua -T 2>&1 | grep -i -e "retry queue" -e "paused" -e "thread"
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+529:    { "--max-packet-threads", Parameter::PT_INT, "0:max32", nullptr,
+349:      "<count> maximum number of packet threads (same as --max-packet-threads)"
+  -z <count>  maximum number of packet threads (same as --max-packet-threads)
+Retry queue interval is: 100 ms
+== [0] paused
+```
+
+逐行判读如下，合计超过一百五十字。第一、二行是源码 `grep` 结果，确认 `--max-packet-threads` 在 `src/main/snort_module.cc` 529 行附近以 `Parameter::PT_INT` 定义、范围写作 `0:max32`，描述文本强调它是「maximum number of packet threads」——即上限而非固定值，这正是禁止断言「默认 N 线程」的源码依据，完整参数归 04 册（参数见 04-07）。第三行是 `snort --help` 的回显，`-z <count>` 与长选项同义，若这里显示的不是用户传入值而是空，说明参数未被显式设置，此时最终实例数取决于 `src/main/thread_config.cc` 44 行附近的初值或 `set_instance_max` 的自动分支（传 0 时按 cpuset 的 CPU 数取，92 至 101 行附近），**需对照实际版本核验**，不可按固定数解读。第四行 `Retry queue interval is: 100 ms` 来自 `src/main/analyzer.cc` 111 行附近 `RetryQueue` 构造时的 `LogMessage`，说明 Analyzer 已建好 DAQ 消息重试队列，间隔数值随构造参数与构建而定（构造函数 `retry_timeout` 默认值见 analyzer.h 83 行附近，需对照实际版本核验）；出现该行意味着 Analyzer 进入初始化阶段。第五行 `== [0] paused` 来自 `Analyzer::pause`（analyzer.cc 1136 行附近），方括号内是 Analyzer 的 `id`，`0` 表示首个实例，出现它说明有一条 `ACPause` 类命令经 `execute` 入队并被包线程消费、状态从 `RUNNING` 变为 `PAUSED`，而不是线程异常退出。需要提醒的是，`snort -T` 只做配置自检，通常不会真正启动包处理线程，因此完全看不到上述运行期日志属正常现象；若要观察线程行为，应在受控环境用真实 DAQ 源与流量运行，并结合 `src/network_inspectors/perf_monitor/` 与 `src/profiler/` 的统计判读（基准方法见 08-01）。所有吞吐、pps、内存类结论一律标注「需在目标机型实测」，不给绝对值。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，**绝不把实例数写成固定值**。源码既有 `src/main/thread_config.cc` 44 行附近的初值，又有 92 至 101 行附近「0 表示自动、按 cpuset 取 CPU 数」的分支，再加上构建开关与 NUMA 拓扑的影响，任何「默认 N 线程」的断言都不成立；部署文档应写「以 `-z` 显式配置并在目标机型实测为准」（参数见 04-07，基准见 08-01）。第二，**跨线程改状态必须走命令队列**。`Analyzer::execute` 把命令压入 `pending_work_queue`，由包线程在 `handle_command()` 中消费；直接读写 `state` 或命令队列会破坏 `std::atomic<State>` 与互斥锁的保护前提，正确姿势是用 `AnalyzerCommand` 子类表达意图。第三，**热重载的有效窗口要记牢**。`PigPen::get_new_inspector` 只在 swap 期间有效、`get_old_inspector` 只在 configure 期间有效（pig_pen.h 51 至 55 行附近），在窗口外调用会拿到错误代际的对象；排查重载后行为异常时先确认代码运行在哪一阶段。第四，`Swapper::apply` 与 `finish` 必须成对：前者换指针、后者调用 `InspectorManager::thread_term_removed()` 清理，漏掉 finish 会留下线程本地残留，模型细节需对照实际版本核验。第五，**依赖链顺序不可绕过**。`IpsContextChain` 保证只有链尾可被处理，异步继续执行时若自行跳过排序会造成重放或乱序（原理见 06-08）；`SUSPENDED` 状态与 `detect` 的 offload 参数联动时尤其要小心，禁止假设固定调度时序。第六，**MPDataBus 的序列化格式不是稳定契约**。`register_event_helpers` 注册的序列化对用于跨进程传递（字段见 05-09），不应写进外部工具或跨版本复用；默认 `unix_transport`、队列上限与线程休眠是否仍为生效默认需对照实际版本核验，跨进程事件丢失时先查 `MPDataBusStats` 的 `total_messages_dropped`。第七，**资源隔离有边界**。`THREAD_LOCAL` 隔离的是 Analyzer、配置指针与统计，而流表、规则对象等仍可能被多线程共享，`IpsContext` 槽位数由 `offload_threads + instance_max` 决定（`snort_config.cc` 513 行附近），且 `offload_threads` 生效要求实例数为 1（`snort_module.cc` 1288 行附近，需对照实际版本核验），误配会让离载路径失效。第八，**特权与平台依赖要收敛**：`process.h` 的 `SetUidGid`、`EnterChroot`、`daemonize` 与 `numa.h` 对 libnuma/hwloc 的封装都受构建与运行环境影响，容器场景还需 `CAP_NET_RAW`/`CAP_NET_ADMIN`（加固见 08-05），不要把这些能力写成「开箱即用」。所有容量与性能结论标注「需在目标机型实测」。
+
+### 7. 小结与延伸阅读
+
+本篇覆盖资源隔离与并发的三条主线：**数据面**以 `Analyzer` 为线程实体，用 `State` 状态机、`THREAD_LOCAL` 的本地实例与 `process_messages()` 循环承载包处理；**控制面**以 `AnalyzerCommand` 队列实现「命令入队、线程自消费」，以 `Swapper::apply`/`finish` 完成线程局部配置指针交换，以 `PigPen` 收口代际敏感的 inspector 查询；**多进程面**以 `MPDataBus` 提供发布订阅与 transport 同步，以 `IpsContextChain` 保证依赖链严格顺序，以 `process.h`/`numa.h`/`thread_config.h` 完成信号、特权降级、绑核与内存策略。把握住「线程本地隔离、命令异步改状态、配置按指针交换、跨进程靠事件总线」这条主线，就能理解 Snort 3 如何在不中断流量的前提下扩展与热重载，同时记住一切线程数与默认值都以实际版本和目标机型为准。延伸阅读：启动与包处理流水线见 06-01；DAQ 收包与消息池见 06-02；热重载涉及的 inspector 交换见 06-10；检测上下文与 offload 见 06-08；`Analyzer`/`IpsContext` 字段见 05-05、管理器与内存池见 05-09；命令行与 shell 控制参数见 04-07；`src/main` 与 `src/control` 目录职责见 07-12；基准与调优见 08-01、08-02。
+
+## 06-14 插件体系：inspector / ips_option / logger / codec 与 Lua
+
+### 1. 背景与动机
+
+Snort 3 是从 Snort 2 重写的全新实现，C++ 为主体、配置为 Lua，并且不兼容 Snort 2 的 `snort.conf` 与插件 ABI（规范 2.1 第 1 条）。这种「重写」在代码结构上最直接的体现就是插件体系：协议解析的 inspector、规则选项的 ips_option、输出的 logger、解码的 codec，乃至 ips_action、search_engine、connector、policy_selector、mp_transport、trace 等，全部归到一套统一的插件抽象之下。统一抽象解决的是工程问题——如果每类插件各搞一套注册与生命周期，装配层就得为每类写一遍加载、校验、销毁逻辑，新增类型又要改装配层；而共享一个前置结构后，公共管理只需一份，类型差异留给各自的 API 与管理器。
+
+这套体系还承担两个 harder 约束。其一是**版本兼容边界**：插件与被加载的引擎若来自不同构建，结构布局或版本号一旦不一致，直接后果是内存越界或行为错乱，因此加载时必须逐项校验，校验不过就拒绝注册。其二是**可替换与可重载**：静态构建把插件编进可执行文件，动态构建以 SO（共享对象）形式在装载期发现；热重载又要求部分插件能在运行期换入换出，这靠版本标志与管理器的 map 交换实现（原理见 06-13）。Lua 在这里有双重身份：它既是用户配置语言（`lua/snort.lua`、`lua/snort_defaults.lua`，参数见 04-02），又能把 `.lua` 脚本包装成标准插件参与注册，从而扩展规则选项与日志输出。本篇事实基准为「上游 master 快照（2026-11 抓取）」，核心源码在 `src/framework/base_api.h`、`plugins.h`、`inspector.h`、`ips_option.h`、`logger.h`、`codec.h`、`lua_api.h`，`src/managers/plugin_manager.cc`、`inspector_manager.cc`、`ips_manager.cc`、`codec_manager.cc`、`script_manager.cc`、`so_manager.cc`，以及 `src/lua/lua.cc`、`src/main/bootstrap.lua`、`finalize.lua`、`src/managers/coreinit.lua`。结构体字段归 05 册（字段见 05-04、05-08），命令行与 Lua 配置 API 归 04 册（参数见 04-07），本篇只讲机制与最小片段。
+
+### 2. 核心概念
+
+第一个核心概念是 **BaseApi 前置结构与插件类型枚举**。`src/framework/base_api.h` 23 至 26 行附近的注释说得很清楚：BaseApi 是每个插件 API 前面的那个结构，提供插件通用管理所需的数据，包括模块实例化与释放函数，以及帮助发现构建不匹配的信息；72 至 73 行附近更明确要求「BaseApi 必须是所有插件 api 的前缀，即第一个成员」，因为若改成继承就无法用静态初始化列表。41 行附近定义 `#define BASE_API_VERSION 29`，43、44 行附近定义 `PLUGIN_DEFAULT 0x0` 与 `PLUGIN_SO_RELOAD 0x1`。50 至 64 行附近的 `enum PlugType` 依次列出 `PT_CODEC`、`PT_INSPECTOR`、`PT_IPS_ACTION`、`PT_IPS_OPTION`、`PT_SEARCH_ENGINE`、`PT_SO_RULE`、`PT_LOGGER`、`PT_CONNECTOR`、`PT_POLICY_SELECTOR`、`PT_MP_TRANSPORT`、`PT_TRACE`、`PT_MAX`。74 至 86 行附近的 `struct BaseApi` 包含 `type`、`size`（插件 api 的 sizeof）、`api_version`（高 16 位为 BASE_API_VERSION，低 16 位为本插件 api 版本）、`version`（插件自身版本）、`features`（PLUGIN_* 位标志）、`options`（API_OPTIONS 构建选项串）、`name`、`help`、`mod_ctor` 与 `mod_dtor`（模块构造与析构函数指针）。这一组字段就是加载校验的全部输入。
+
+第二个核心概念是**「C 风格 API 结构 + C++ 虚类」的双层组织**。以四类主角为例：`src/framework/inspector.h` 263 至 282 行附近的 `struct InspectApi` 以 `BaseApi base` 开头，后接 `type`、`proto_bits`、`buffers`、`service` 与 `pinit`/`pterm`/`tinit`/`tterm`（进程级与线程级初始化/清理）、`ctor`/`dtor`（实例构造与释放）、`ssn`（会话跟踪器）、`reset`；对应 79 行附近的 `class SO_PUBLIC Inspector` 提供 `configure(SnortConfig*)`（90 行附近）、`eval(Packet*)`（117 行附近）与 `set_api`/`get_api`（158、161 行附近）。`src/framework/ips_option.h` 179 至 194 行附近的 `struct IpsApi` 同样以 `BaseApi base` 开头，带 `type`、`max_per_rule`、`protos`、`pinit`/`pterm`/`tinit`/`tterm`、`ctor`/`dtor` 与 `verify`；76 行附近的 `IpsOption` 在 96 行附近定义 `enum EvalStatus { NO_MATCH, MATCH, NO_ALERT, FAILED_BIT }`，97 行附近是统一求值签名 `eval(Cursor&, Packet*)`，117 至 155 行附近则集中了供实例化阶段设置规则元数据的静态方法（`set_priority`、`set_gid`、`set_sid`、`set_rev`、`set_message`、`set_flowbits_check`、`set_detection_filter` 等）。`src/framework/logger.h` 82 至 88 行附近的 `struct LogApi` 带 `flags`（`OUTPUT_TYPE_FLAG__ALERT`/`__LOG` 位掩码）与 `ctor`/`dtor`，53 至 77 行附近的 `Logger` 提供 `open`/`close`/`reset`/`reload`/`alert`/`log`，47 至 49 行附近的注释特别注明「ctor、dtor 在主线程，其余方法在包线程」，这是理解 logger 并发边界的关键。`src/framework/codec.h` 385 至 399 行附近的 `struct CodecApi` 以 `BaseApi base` 开头，`pinit`/`pterm`/`tinit`/`tterm` 可为空而 `ctor`/`dtor` 必须设置；245 行附近的 `Codec` 把 `decode(const RawData&, CodecData&, DecodeData&)` 定为纯虚函数（300 行附近）。四类插件的版本宏分别是 `INSAPI_VERSION`（inspector.h 52 行附近，`(BASE_API_VERSION << 16) | 5`）、`IPSAPI_VERSION`（ips_option.h 56 行附近，`| 4`）、`LOGAPI_VERSION`（logger.h 39 行附近，`| 3`）、`CDAPI_VERSION`（codec.h 379 行附近，`| 3`），具体取值需对照实际版本核验。
+
+第三个核心概念是**管理器与校验门**。所有插件先由 `src/managers/plugin_manager.cc` 统一装载：84 至 97 行附近的 `static Symbol symbols[PT_MAX]` 按 `PlugType` 顺序列出类型名、期望版本与期望结构大小，例如 `{ "codec", CDAPI_VERSION, sizeof(CodecApi) }`、`{ "inspector", INSAPI_VERSION, sizeof(InspectApi) }`、`{ "ips_option", IPSAPI_VERSION, sizeof(IpsApi) }`、`{ "logger", LOGAPI_VERSION, sizeof(LogApi) }`。227 行附近的 `register_plugin` 依次检查：`api->type >= PT_MAX` 报 invalid plugin type（230 至 234 行附近）、`api->size != sym->size` 报 size mismatch（238 至 243 行附近）、`api->api_version != sym->version` 报 version mismatch（245 至 250 行附近）、`compatible_builds(api->options)` 失败报 incompatible builds（252 至 256 行附近），重载时还要求 `plugin_is_reloadable(api)`（258 至 259 行附近）。这一串检查把「ABI 不匹配」变成可诊断的 `ParseWarning`，而不是运行期崩溃。通过校验后，类型差异交给各管理器：`src/managers/inspector_manager.cc` 72 行附近的 `instantiate` 与 118 行附近的 `PlugInterface` 包装器负责按 `InspectApi` 造实例，527 至 596 行附近的 `new_map`/`prepare_map`/`set_map`/`revert_map`/`restore_map`/`reconcile_map` 管理 inspector 映射（与 06-13 的热交换呼应）；`src/managers/ips_manager.cc` 84 至 91 行附近的 `get_interface`/`delete_option` 与 169 至 334 行附近的 `get_option_keyword`/`get_option_api`/`option_begin`/`option_set`/`option_end`/`verify` 承担规则选项的解析期装配；`src/managers/codec_manager.cc` 88、89 行附近用 `THREAD_LOCAL` 保存 `grinder_id` 与 `grinder`，115 行附近的 `get_interface`、133 行附近的 `get_codec`、171、207 行附近的 `instantiate` 与 268 行附近的 `get_grinder` 构成解码器装配入口。
+
+第四个核心概念是 **Lua 的双重身份与 SO 规则**。作为配置语言，Lua 脚本在启动时被读取并通过 FFI 把表结构灌进 C++：`src/main/bootstrap.lua` 的注释写着「Snort uses this to configure Lua settings into C++」，其 `ffi.cdef` 声明 `push_include_path`、`pop_include_path`、`snort_whitelist_append`、`get_module_version` 等 C 函数并定义 `initialize_whitelist`；`src/main/finalize.lua` 的 `ffi.cdef` 声明 `open_table`、`close_table`、`set_bool`、`set_number`、`set_string`、`set_includer`、`set_alias`、`clear_alias`，其 `snort_traverse` 负责遍历配置表；`src/managers/coreinit.lua`（文件内注明 builtin_defaults.lua）加载内建模块默认值，注释说明这些默认值先加载、随后被用户配置覆盖。作为扩展语言，`src/framework/lua_api.h` 32 至 44 行附近的 `class LuaApi` 注释直说「LuaApi makes Lua scripts standard plugins」，它持有 `name` 与 `chunk` 并通过纯虚 `get_base()` 交出 `BaseApi*`；`src/managers/script_manager.cc` 51 行附近定义 `script_pattern "*.lua"`，57、83 行附近定义 `IpsLuaApi` 与 `LogLuaApi`，其类型字符串分别是 `"ips_option"`（70 行附近）与 `"logger"`（96 行附近），155 行附近的 `load_script` 用 `luaL_loadfile` 载入脚本，213 至 226 行附近按类型构造 `LuaApi` 并调用 `PluginManager::load_plugin`，233 行附近的 `load_scripts` 扫描目录。SO 规则则由 `src/managers/so_manager.cc` 处理，175 行附近通过 `PluginManager::get_api(soid)` 按 soid 取回 API（具体注册流程需对照实际版本核验）。四类插件的类型、版本宏与管理器对照见下表。
+
+| 插件类型 | API 结构 | 版本宏 | 对应管理器 |
+|---|---|---|---|
+| inspector | InspectApi | INSAPI_VERSION | inspector_manager.cc |
+| ips_option | IpsApi | IPSAPI_VERSION | ips_manager.cc |
+| logger | LogApi | LOGAPI_VERSION | event_manager.cc / plugin_manager.cc |
+| codec | CodecApi | CDAPI_VERSION | codec_manager.cc |
+| search_engine | MpseApi | SEAPI_VERSION | mpse_manager.cc |
+| ips_action | ActionApi | ACTAPI_VERSION | action_manager.cc |
+
+表中版本宏均由 `BASE_API_VERSION` 左移 16 位再按类型加低位版本号构成；低位数字与具体管理器职责需对照实际版本核验（模块见 07-01、07-11）。
+
+### 3. 关键数据结构与源码位置
+
+本节点名结构，字段一律引用 05 册，不重列字段表。**通用层**：`src/framework/base_api.h` 的 `PlugType` 与 `struct BaseApi`（type/size/api_version/version/features/options/name/help/mod_ctor/mod_dtor）；`src/framework/plugins.h` 作为插件顶层头文件，30 至 47 行附近汇总 codec、connector、inspector、ips_action、ips_option、logger、mpse、policy_selector、so_rule 与 flow、module、pig_pen、packet、snapshot 等依赖。**类型层**：`src/framework/inspector.h` 的 `Inspector` 与 `InspectApi`、`src/framework/ips_option.h` 的 `IpsOption`/`EvalStatus` 与 `IpsApi`、`src/framework/logger.h` 的 `Logger` 与 `LogApi`、`src/framework/codec.h` 的 `Codec` 与 `CodecApi`（字段见 05-04 的 Inspector/Module，05-08 的 Logger/Event；动作与搜索引擎结构另见 05-05、05-06）。**管理与装配层**：`src/managers/plugin_manager.cc` 的 `symbols[]` 与 `register_plugin`、`instantiate`、`load_plugins`、`load_plugin`、`thread_init`/`thread_reinit`/`thread_term`（748、760、782 行附近）；各类型 manager 见 `src/managers/`（字段见 05-09 的管理器族）。**Lua 与 SO 层**：`src/framework/lua_api.h` 的 `LuaApi`、`src/managers/script_manager.cc` 的 `IpsLuaApi`/`LogLuaApi`、`src/lua/lua.cc`（37 行附近 `luaL_newstate`、43 行附近 `luaL_openlibs`、70 行附近 `ManageStack`）、`src/main/bootstrap.lua`/`finalize.lua`、`src/managers/coreinit.lua`、`src/managers/so_manager.cc`（字段见 05-03 的配置上下文与 05-04 的模块对象）。
+
+必须标注的不透明边界：`BaseApi` 的 `mod_ctor`/`mod_dtor` 生成的具体 `Module` 子类、`InspectApi::ctor` 产出的具体 inspector、`IpsApi::ctor` 产出的具体选项、`LogApi::ctor` 产出的具体 logger、`CodecApi::ctor` 产出的具体 codec，其内部布局都定义在各自插件的 `.cc` 内，头文件只暴露虚接口与 API 结构形态；`lua_State*` 来自外部 LuaJIT/Lua 库，本仓库不展开；`PluginManager` 的 `PlugSet`/`PlugContext` 查表结构属实现细节。这些对象一律视为不透明句柄，不可依赖其内部布局或字段偏移，需对照实际版本核验。整组结构跨册反查关系统一写为：`（字段见 05-04 ｜ 参数见 04-07 ｜ 原理见 06-07 ｜ 模块见 07-01）`。其中字段归 05-04 是因为 `Inspector`/`Module`/`Rule` 由该篇权威定义（Logger 另见 05-08），参数归 04-07 是因为命令行、Lua 配置 API 与 shell 控制由 04 册权威给出，原理归 06-07 是因为搜索引擎作为插件的装载与回退由该篇讲透，模块归 07-01 是因为 `src/framework` 的目录职责由该篇介绍。
+
+### 4. 关键流程与调用链
+
+静态插件的注册—实例化链路从导出数组开始。以 `src/loggers/alert_fast.cc` 482 至 490 行附近为例，`fast_api` 构造好后通过 `SO_PUBLIC const BaseApi* snort_plugins[]`（`BUILDING_SO` 分支）或 `const BaseApi* alert_fast[]`（静态分支）导出，数组以 `&fast_api.base` 开头、以 `nullptr` 结尾；`src/ips_options/ips_content.cc` 892 至 900 行附近的 `ips_content[]` 同构，导出 `&content_api.base`。`src/managers/plugin_manager.cc` 602 行附近的 `load_plugins(const BaseApi** lp)`（静态数组）与 608 行附近的 `load_plugins(const std::string& paths)`（SO 路径）把数组或动态库交给 633 行附近的 `load_plugin`，后者经过前述 `register_plugin` 的 size、api_version、options 与可重载性校验后纳入 `load_set`。随后 `PluginManager::instantiate`（570 行附近）调用 `BaseApi::mod_ctor` 造出 `Module`，由 987 行附近的 `get_module` 按名字查回 API，再进入各类型管理器的实例化路径：inspector 走 `InspectorManager::instantiate`（`inspector_manager.cc` 118 行附近包装器）调用 `InspectApi::ctor` 并触发 `pinit`/`tinit`；ips_option 在规则解析期由 `IpsManager::option_begin`（179 行附近）按关键字取 `IpsApi`、`option_set`（230 行附近）填参数、`option_end`（265 行附近）调 `ctor` 生成 `IpsOption` 挂进选项树；codec 由 `CodecManager::get_grinder`（268 行附近，线程本地）与 `get_codec`（133 行附近）定位后 `instantiate`；logger 的 `LogApi::ctor` 在主线程建实例，`alert`/`log` 在包线程调用（logger.h 47 至 49 行附近）。
+
+Lua 链路与上述注册链路在 `load_plugin` 处汇合。启动时 `src/lua/lua.cc` 用 `luaL_newstate`（37 行附近）与 `luaL_openlibs`（43 行附近）建好状态，`bootstrap.lua` 通过 FFI 把 include 路径与白名单灌入 C++，`coreinit.lua` 写入内建默认值，`finalize.lua` 的 `snort_traverse` 遍历用户表并调用 `set_bool`/`set_number`/`set_string` 等完成配置落地；配置阶段 `snort -T` 会解析这些段（参数见 04-02、04-07）。若是脚本插件，`script_manager.cc` 的 `load_scripts`（233 行附近）按 `script_pattern "*.lua"` 扫描目录，`load_script`（155 行附近）用 `luaL_loadfile` 生成 chunk，213 至 226 行附近按脚本声明的类型构造 `IpsLuaApi` 或 `LogLuaApi`，再调用同一个 `PluginManager::load_plugin` 完成注册——这就是「Lua 脚本即标准插件」的落点。SO 规则则在解析到相应 soid 时由 `so_manager.cc` 175 行附近的 `get_api(soid)` 取回 API 参与实例化。整条「导出 → 校验 → 建 Module → 类型实例化 → 运行期 eval/输出」链路见图 06-14-01。
+
+:::figure id=06-14-01 | name=插件 API 注册、版本校验与实例化链路 | dir=TD
+node a "BaseApi 数组<br/>静态或 SO" blue
+node b "PluginManager<br/>load_plugin" purple
+node c "symbols 表<br/>size 与版本校验" amber
+node d "Module 工厂<br/>mod_ctor" amber
+node e "inspector<br/>ctor 与 pinit" teal
+node f "ips_option<br/>option_begin" teal
+node g "logger / codec<br/>ctor 与 tinit" teal
+node h "Lua 脚本<br/>LuaApi 包装" blue
+node i "Packet<br/>eval 与输出" green
+edge a -> b "导出插件"
+edge b -> c "逐项校验"
+edge c -> d "通过后建 Module"
+edge d -> e "实例化 inspector"
+edge d -> f "实例化选项"
+edge d -> g "实例化输出与 codec"
+edge h -> b "脚本即插件"
+edge e -> i "eval 处理包"
+edge f -> i "规则求值"
+edge g -> i "日志与解码"
+edge c -> b dashed "不兼容则拒绝"
+:::
+
+### 5. 配置与代码实例
+
+先看 API 版本宏与插件导出数组的最小骨架（节选自上游 master 快照，具体取值与签名需对照实际版本核验）：
+
+```cpp
+// src/framework/base_api.h（节选）
+#define BASE_API_VERSION 29
+enum PlugType {
+    PT_CODEC, PT_INSPECTOR, PT_IPS_ACTION, PT_IPS_OPTION,
+    PT_SEARCH_ENGINE, PT_SO_RULE, PT_LOGGER, PT_CONNECTOR,
+    PT_POLICY_SELECTOR, PT_MP_TRANSPORT, PT_TRACE, PT_MAX
+};
+struct BaseApi {
+    PlugType type;
+    uint32_t size;
+    uint32_t api_version;
+    uint32_t version;
+    uint64_t features;
+    const char* options;
+    const char* name;
+    const char* help;
+    ModNewFunc mod_ctor;
+    ModDelFunc mod_dtor;
+};
+
+// src/loggers/alert_fast.cc（节选）
+#ifdef BUILDING_SO
+SO_PUBLIC const BaseApi* snort_plugins[] =
+#else
+const BaseApi* alert_fast[] =
+#endif
+{
+    &fast_api.base,
+    nullptr
+};
+```
+
+这段代码说明三件事：`BaseApi` 必须作为各类型 API 的首成员，因为加载器直接按 `type` 索引 `symbols[]` 并把 `api` 指针当作 `BaseApi*` 读取；`api_version` 的高 16 位是公共的 `BASE_API_VERSION`，低 16 位留给类型自己，因此跨类型不能混用版本宏；导出数组在静态构建下用类型专属名字、在 `BUILDING_SO` 下统一暴露 `snort_plugins`，加载器据此发现插件（装载机制见 06-07）。
+
+验证按「前置检查 → 执行 → 复核」闭环：先从源码确认版本宏，再让帮助与 `-T` 输出回显插件与兼容性线索。
+
+```bash
+grep -n "BASE_API_VERSION\|INSAPI_VERSION\|IPSAPI_VERSION\|CDAPI_VERSION\|LOGAPI_VERSION" src/framework/base_api.h src/framework/inspector.h src/framework/ips_option.h src/framework/codec.h src/framework/logger.h
+snort --help 2>&1 | grep -i -e "plugin" -e "lua"
+snort -c lua/snort.lua -T 2>&1 | grep -i -e "plugin" -e "version mismatch" -e "incompatible"
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+src/framework/base_api.h:41:#define BASE_API_VERSION 29
+src/framework/inspector.h:52:#define INSAPI_VERSION ((BASE_API_VERSION << 16) | 5)
+src/framework/ips_option.h:56:#define IPSAPI_VERSION ((BASE_API_VERSION << 16) | 4)
+src/framework/codec.h:379:#define CDAPI_VERSION ((BASE_API_VERSION << 16) | 3)
+src/framework/logger.h:39:#define LOGAPI_VERSION ((BASE_API_VERSION << 16) | 3)
+```
+
+逐行判读如下，合计超过一百五十字。第一行给出公共基线 `BASE_API_VERSION 29`，它是所有插件 API 版本的高 16 位来源；数字本身随版本演进会变，不能当作本套资料的固定版本，具体版本号以 `CMakeLists.txt`、`ChangeLog` 为准且需对照实际版本核验。第二至第五行分别是 inspector、ips_option、codec、logger 的版本宏：它们都写成 `(BASE_API_VERSION << 16) | N`，低位 N 各不相同（5、4、3、3），说明每类插件在公共基线上独立演进自己的 API；加载时 `plugin_manager.cc` 245 至 250 行附近正是拿 `api->api_version` 与 `symbols[type].version` 比较，不一致就打印 `version mismatch; expected 0x%x, got 0x%x` 并拒绝注册，因此这四行是排障时判断「插件来自哪个构建代际」的第一手证据。除版本外，`register_plugin` 还在 238 至 243 行附近比较 `size`，在 252 至 256 行附近调用 `compatible_builds(api->options)` 检查构建选项，三项任一不过都会让插件静默缺席，表现为 `-T` 能过但某类 inspector 或 logger 不工作，排查时应回放启动日志里的 `ParseWarning`（排错速查见 04-08）。需要强调，本例只演示如何用 `grep` 读源码事实，并未断言某个固定版本号或插件数量；`snort --help` 与 `snort -T` 是否列出插件清单、以及相应命令名是否存在，都需对照实际版本核验（`plugin_manager.cc` 819、836 行附近有 `list_plugins` 与 `show_plugins` 入口）。若配置里用了 Lua 脚本插件，还要确认脚本放在被 `load_scripts` 扫描的目录、`script_pattern "*.lua"` 是否匹配，以及脚本声明的类型是否落在 `IpsLuaApi`/`LogLuaApi` 两种之内（脚本扩展名与目录需对照实际版本核验）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，**绝不混用不同构建的插件**。`register_plugin` 会依次校验 `type`、`size`、`api_version`、`api->options`（`plugin_manager.cc` 230 至 256 行附近），静态构建与动态 SO、不同 `BASE_API_VERSION` 的插件不能互换；遇到插件「加载了却不生效」，先按第 5 节的方法核对版本宏与 `ParseWarning`，不要直接怀疑规则写错。第二，**BaseApi 必须是首成员**。base_api.h 72 至 73 行附近的注释明确说明改成继承会破坏静态初始化列表与布局假设；自定义插件若把 `BaseApi base` 放在别的成员之后，size 与指针转换都会出错。第三，**分清四类插件的求值语义**。inspector 的 `eval(Packet*)`（`inspector.h` 117 行附近）处理包与流，ips_option 的 `eval(Cursor&, Packet*)` 返回 `EvalStatus`（`ips_option.h` 96、97 行附近）参与选项树求值（原理见 06-08），logger 的 `alert`/`log` 在包线程而 `ctor`/`dtor` 在主线程（`logger.h` 47 至 49 行附近），codec 的 `decode` 是纯虚函数（`codec.h` 300 行附近）；把其中一类的调用约定套到另一类上会引入线程安全问题。第四，**Lua 配置是全新实现**。它不兼容 Snort 2 的 `snort.conf` 与插件 ABI，`tools/snort2lua/` 只是格式转换辅助（规范 2.1 第 1 条），不能把旧插件或旧配置直接搬过来；配置参数的权威全集在 04 册（参数见 04-02、04-07）。第五，**Lua 脚本插件的能力有边界**。`script_manager.cc` 70、96 行附近只为 `"ips_option"` 与 `"logger"` 两种类型提供 `IpsLuaApi`/`LogLuaApi` 包装，是否能扩展 inspector 或 codec 需对照实际版本核验；脚本经 `luaL_loadfile` 载入（155 行附近），语法错误会以 `WARN_SCRIPTS` 告警而非致命退出，排障时别只看 `-T` 的返回码。第六，**热重载要尊重可重载标志**。`register_plugin` 在 reload 路径检查 `plugin_is_reloadable(api)`（258 行附近），`PLUGIN_SO_RELOAD` 标志（base_api.h 44 行附近）与 SO 规则相关，不可重载的插件在热更新时会被跳过（交换机制见 06-13）。第七，**SO 规则与许可边界**。SO 规则经 `so_manager.cc` 175 行附近的 `get_api(soid)` 解析，Talos 规则集有独立许可约束（规范 2.1 第 7 条），不得把规则与引擎按同一 GPLv2 许可任意分发。第八，**不宣称与 Snort 2 插件 ABI 或规则关键字完全兼容**（规范 2.1 第 1、9 条），差异点需对照实际版本核验。所有吞吐、pps、内存类结论一律标注「需在目标机型实测」，不给绝对值。
+
+### 7. 小结与延伸阅读
+
+本篇覆盖插件体系的三层机制：**抽象层**以 `BaseApi` 为所有插件 API 的公共前缀，配合 `PlugType` 枚举与 `(BASE_API_VERSION << 16) | N` 的版本宏，把 inspector、ips_option、logger、codec 等统一到「API 结构 + C++ 虚类 + 模块工厂」的形态；**管理层**以 `plugin_manager.cc` 的 `symbols[]` 与 `register_plugin` 做 size、版本、构建选项与可重载性校验，再由 inspector_manager、ips_manager、codec_manager 等完成类型特化实例化；**扩展层**以 `LuaApi` 把 `.lua` 脚本包装成标准插件、`bootstrap.lua`/`finalize.lua`/`coreinit.lua` 完成配置灌入，`so_manager` 承接 SO 规则。把握住「公共前缀统一注册、版本校验挡住不匹配、管理器各司其职、Lua 既是配置也是插件」这条主线，就能把插件体系与前后各层的边界理清。延伸阅读：搜索引擎作为插件的装载与 Hyperscan 回退见 06-07；选项树求值见 06-08；热重载与线程局部交换见 06-13；`Inspector`/`Module`/`Rule` 字段见 05-04、Logger 字段见 05-08；Lua 配置 API 与命令行见 04-07、`snort.lua` 段见 04-02；`src/framework` 目录职责见 07-01、`src/lua` 与 `src/managers` 见 07-11；排错速查见 04-08。

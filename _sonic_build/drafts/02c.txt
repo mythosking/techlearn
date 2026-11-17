@@ -1,0 +1,163 @@
+# SONiC 技术资料 · 02 编译与构建（分片 C）
+## 02-05 调试构建、docker 增量镜像与 CI 产物形态
+
+### 1. 背景与动机
+
+02-03 已经把「从零构建一套可安装的 ONIE 镜像」走通，02-04 又把 `device/` 与 `platform/` 的机型适配讲清，但如果据此认为 SONiC 的日常开发就是「改一行代码、全量重编一次镜像」，就完全误解了这条构建链的真实工作方式。主仓 `sonic-buildimage-master/` 是由几十个独立模块、上百个 `.deb` 包与数十个容器镜像拼装起来的系统，一次全量构建耗时极长；而工程师每天的迭代往往只改动一两个模块，CI 上每个拉取请求也要在有限时间内给出反馈。于是「如何让改动只重编受影响的目标」「如何产出一份带符号、可下断点的调试镜像」「CI 最终对外交付哪些产物形态」这三个问题，就成了 02 册收尾必须回答的内容。本篇的事实锚点仍是 `upstream_src/sonic-buildimage/sonic-buildimage-master/`，基准统一写「上游 master 快照（2026-11 抓取）」，具体版本号与取值以对应构建文件为准、需对照实际版本核验（参数见 04-01 ｜ 模块见 07-13）。
+
+第一个动机来自构建成本的现实约束。既然全量构建昂贵，构建系统就必须具备「依赖不变则复用上次产物」的能力。本快照里这套能力集中在主仓根的 `Makefile.cache`，它是一套以依赖文件内容 SHA 为键的 DPKG 缓存框架：每个目标维护 `.flags`、`.dep`、`.dep.sha`、`.smdep`、`.smsha` 等旁路文件，命中缓存时直接从 `/dpkg_cache` 或本机 `target/cache` 解出 `.tgz`，跳过整个编译过程。理解这套框架，才能解释为什么大多数增量构建「几乎什么都没编」，也才能解释为什么改了一个公共开关会导致大面积失效。需要强调的是，这里的「增量」指构建系统按内容哈希跳过未变目标的重建，而不是 docker 层的分层复用——`build_docker.sh` 在构建镜像时显式使用 `docker build --no-cache`，这一点在下文会专门澄清（原理见 06-13 ｜ 模块见 07-01）。
+
+第二个动机来自排障对调试符号的刚性需求。生产镜像为了体积与启动速度，通常把 DWARF 调试符号剥离到单独的 dbgsym 包；但一旦需要定位 `orchagent` 崩溃、`syncd` 与 SAI 交互异常这类问题，就必须有一份保留符号、未做优化的产物。本快照用 `SONIC_DEBUGGING_ON` 与 `SONIC_PROFILING_ON` 两个开关把「调试态」与「生产态」分开：前者让编译保留符号，后者在保留符号之外还关闭优化，且二者同时打开时以 profiling 为准。与之配套的还有 `INSTALL_DEBUG_TOOLS` 开关和以 `dbg` 为后缀的调试容器镜像。把「编译带符号」和「镜像里装了调试工具」这两件事混为一谈，是新手最常见的误读，本篇会在核心概念与陷阱两节反复纠正。
+
+第三个动机来自交付的可复现性。一个开源网络操作系统要被大规模采纳，CI 不能只回答「编没编过」，还要回答「产物是什么形态、能不能追溯、有没有被缓存污染」。本快照的 `azure-pipelines.yml` 把流水线拆成缓存键完整性门禁、虚拟交换机构建、多平台构建、测试与 SBOM 漏洞扫描等多个阶段，并对不同平台产出 `.bin`、`.img.gz`、`.swi`、`.bfb`、`.tar` 等形态，以及 `-dbg`、`-rpc`、`-asan`、`-session-monitor` 等变体。读懂这份流水线，才能把「某台设备上的镜像」对应到「某次构建的某个阶段产物」。最后必须立一条纪律：调试构建与各类变体镜像用于定位问题，不作生产基准；收敛时间、下发时延、转发吞吐与表项容量等一切数字，一律标注「需在目标机型实测」，本册不给绝对值（基准方法见 08-01）。
+
+### 2. 核心概念
+
+第一组概念是「内容寻址的构建缓存」。`Makefile.cache` 把每个构建目标的缓存键拆成两段二十四字节 SHA：一段由目标的环境标志文件、依赖清单文件与子模块清单文件经 `git hash-object` 与 `sha1sum` 折算，另一段取决于缓存模式——`GIT_CONTENT_SHA` 从依赖文件内容计算，`GIT_COMMIT_SHA` 对子模块取最后一次提交号。两段拼接进缓存文件名 `<target>-<依赖 SHA>-<模块 SHA>.tgz`，因此「内容变则键变、键变则缓存失效」，这与基于时间戳的构建有本质差别。缓存方法 `SONIC_DPKG_CACHE_METHOD` 可取 `none`、`cache`、`rcache`、`wcache`、`rwcache` 等值，`rcache` 只读、`wcache` 只写、`rwcache` 读写兼顾；本快照 CI 变量 `CACHE_MODE` 取 `rcache`，而部分构建任务会显式设为 `none`，具体取值与语义需对照实际版本核验（参数见 04-01 ｜ 模块见 07-13）。
+
+第二组概念是「两级缓存与公共标志」。缓存分全局与本地两级：全局缓存位于构建容器内的 `/dpkg_cache`，可被多台机器与 CI 共享；本地缓存位于 `target/cache`，用于依赖文件被改动、不宜污染全局缓存的目标。判断「哪些改动影响所有目标」靠 `SONIC_COMMON_FLAGS_LIST`，其中折叠了平台、架构、发行版构建环境、`DOCKER_DEFAULT_PLATFORM`、`SLAVE_BASE_TAG` 以及调试与性能开关等值；`SONIC_COMMON_FILES_LIST` 则枚举 `.platform`、`rules/functions`、`Makefile.cache` 这类公共文件。值得注意的是，本快照刻意没有把 `slave.mk` 全文纳入公共文件，而是用手工版本戳 `SONIC_CACHE_RECIPE_VER` 加一个基于 `slave.mk` 对象哈希的告警守卫来防止「改了构建配方却没升版本、从而误用陈旧缓存」——这是一种用人工审查换缓存命中率的取舍，实现细节需对照实际版本核验。
+
+第三组概念是「调试变体的两条独立轴」。第一条轴是编译产物是否带符号：在 `rules/config` 中打开 `SONIC_DEBUGGING_ON` 会让 `slave.mk` 把 `DEB_BUILD_OPTIONS_GENERIC` 设为 `nostrip` 并把 `SPLIT_DBGSYM` 置为 `n`，使 DWARF 留在运行期 `.deb` 里、不再单独产出 dbgsym；打开 `SONIC_PROFILING_ON` 则设为 `nostrip noopt`，同时关闭优化，且它作为 debugging 的超集优先生效。第二条轴是镜像是否随安装器交付调试工具：`SONIC_INSTALL_DEBUG_TOOLS` 决定 `INSTALL_DEBUG_TOOLS`，进而影响 CI 是否额外产出 `*-dbg.bin`、`*-dbg.img.gz` 这类镜像。两条轴彼此独立——可以编译带符号的 `.deb` 却不随安装器发布 dbg 镜像，反之亦然。调试容器镜像本身以 `DBG_IMAGE_MARK = dbg` 为标志，产物名为 `*-dbg.gz`（原理见 06-13 ｜ 字段见 05-09）。
+
+第四组概念是「docker 镜像的生成与分发」。`build_docker.sh` 以 `dockers/<目录>` 为构建上下文，先把 `deps/` 与 `files/` 拷入上下文，再 `docker build --no-cache`，随后把镜像 `docker save` 成 `target/<name>.gz`；若给出仓库参数，则调用 `push_docker.sh` 完成登录与推送。所谓「增量镜像」在这里体现为上游 `.deb` 命中缓存后跳过重编、从而不必重建镜像，而不是 docker 层被复用。分发端 `push_docker.sh` 从环境变量读取 `REGISTRY_PASSWD`，用 `--password-stdin` 登录，按标签逐个 `docker tag`、`docker push`、`docker rmi`，并从推送输出里提取 `digest: sha256:` 摘要；给定版本与平台时推送到 `sonic-dockers/<platform>/<image>:<version>` 路径，否则以日期加 `BUILD_NUMBER` 组成标签（模块见 07-02 ｜ 参数见 04-01）。
+
+第五组概念是「CI 产物形态」。CI 既有面向整机安装的 `.bin`（ONIE 安装包）、`.img.gz`（虚拟交换机磁盘镜像）、`.swi`、`.bfb`、`.tar` 等主产物，也有 `.bin.cdx.json`、`.gz.sbom.cdx.json` 等 SBOM 伴生产物，还有 `tr.xml` 这类 jUnit 测试结果。变体通过文件名后缀区分，生产用主产物与调试、RPC、ASAN、会话监控等变体在同一流水线里分别构建。所有产物名、标签规则与存储路径均随版本变化，需对照实际版本核验（模块见 07-12 ｜ 模块见 07-13）。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名缓存与调试构建相关的文件、宏与目标，不展开逐字段定义；结构体字段统一放在 05 册，构建变量全集放在 04 册，机制流程放在 06 册，模块能力放在 07 册，即（字段见 05-09 ｜ 参数见 04-01 ｜ 原理见 06-13 ｜ 模块见 07-13）。下表按「文件与目录、职责、本快照可核验要点」三列归纳，路径均相对 `sonic-buildimage/sonic-buildimage-master/` 仓库根，表名、宏名与目标名需对照实际版本核验。
+
+| 文件与目录 | 职责 | 本快照可核验要点 |
+|---|---|---|
+| `Makefile.cache` | DPKG 缓存框架总入口 | 两级缓存、SHA 键、缓存方法、清理目标 |
+| `slave.mk` | 镜像与包构建主规则 | 调试开关、dbg 镜像目标、docker 构建 |
+| `rules/config` | 构建开关样例 | 调试与性能开关以注释形式给出 |
+| `rules/*.dep` | 各目标依赖清单 | 由 `Makefile.cache` 通配包含 |
+| `build_docker.sh` | 单容器镜像构建 | no-cache 构建、save 成 gz、可选推送 |
+| `push_docker.sh` | 镜像推送 | 环境口令、password-stdin、摘要提取 |
+| `build_debug_docker_j2.sh` | 调试镜像模板生成 | 注入 dbg 包、基础层同步 |
+| `azure-pipelines.yml` | CI 总入口 | 多阶段、缓存键门禁、多平台产物 |
+| `pytest.ini` 与 `tests/` | 测试根与用例 | 空配置文件、用例文件可核验 |
+| `scripts/audit_dep_completeness.sh` | 缓存键 completeness 门禁 | PR 静态扫描、P0 阻断 |
+
+与缓存直接相关的对象集中在 `Makefile.cache`。计算 SHA 的宏有 `GET_MOD_SHA` 与 `GET_MOD_DEP_SHA`，前者按 `GIT_COMMIT_SHA` 或 `GIT_CONTENT_SHA` 取值，后者把 `DEPENDS`、`RDEPENDS`、`DBG_DEPENDS`、`DBG_IMAGE_PACKAGES`、`LOAD_DOCKERS` 等依赖一并折进依赖哈希；读取与写回分别由 `LOAD_FROM_CACHE`、`SAVE_INTO_CACHE` 完成，外层再包一层 `LOAD_CACHE`、`SAVE_CACHE` 做条件判断。`SHOW_WHY` 把重建原因写入 `<target>.log`，`MOD_LOCK` 用 `flock` 加超时保护共享缓存的并发访问。旁路文件 `.flags`、`.dep`、`.dep.sha`、`.smdep`、`.smsha` 由 `FLAGS_DEP_RULES`、`SHA_DEP_RULES`、`SMSHA_DEP_RULES` 三组规则生成。清理目标有 `cclean`（清旁路文件）、`lcclean`（清本地缓存）、`cprune`（按 `NUMDAYS` 删除陈旧 `.tgz`），另有 `listall` 与 `show-%` 用于列举目标（字段见 05-09 ｜ 参数见 04-01）。
+
+与调试变体相关的对象集中在 `slave.mk` 与 `rules/config`。`slave.mk` 中 `DBG_IMAGE_MARK = dbg`，`DOCKER_DBG_IMAGES` 目标匹配 `target/%-dbg.gz`，其配方依次调用 `LOAD_CACHE`、`build_debug_docker_j2.sh`、`j2`、`prepare_docker_buildinfo.sh`、`DOCKER_BUILD`、`collect_docker_version_files.sh`、`docker-image-save` 与 `SAVE_CACHE`；`DOCKER_DBG_IMAGE_REF` 与 `DOCKER_NO_CACHE_FLAG` 也在其中定义。`build_debug_docker_j2.sh` 生成的 Dockerfile.j2 片段以 `ARG BASE` 开头，先构造一个中间层安装 dbg 依赖包，再从基础镜像 `FROM $BASE` 用 `rsync --mount=type=bind,from=base,target=/changes-to-image` 把变更同步回基础层，达到「只保留一层差异」的效果。以上函数名、变量名与文件格式均需对照实际版本核验，本篇只给可定位的目录与名称（原理见 06-13 ｜ 模块见 07-02）。
+
+与 CI 与测试相关的对象分布在顶层与 `.azure-pipelines/`。`azure-pipelines.yml` 定义 `CACHE_MODE: rcache` 与多个阶段，`.azure-pipelines/azure-pipelines-build.yml` 按 `dbg_image`、`swi_image`、`asan_image`、`docker_syncd_rpc_image` 等参数决定构建哪些变体。`pytest.ini` 内容刻意留空，仅用于让 pytest 把当前目录识别为根目录；`tests/` 下有 `test_check_install.py`，`src/sonic-config-engine/tests/` 下则存放 minigraph、端口配置样例与 `mock_tables/` 等测试夹具。`scripts/` 下有 `audit_dep_completeness.sh`、`verify_cache_equivalence.sh` 与一整套 SBOM 脚本，承担缓存键审计与产物可追溯性工作；具体清单需对照实际版本核验（模块见 07-12 ｜ 模块见 07-13）。
+
+### 4. 关键流程与调用链
+
+把「依赖变化、缓存复用、调试注入、镜像分发、CI 门禁」串成一条链，得到本篇的核心流程；从源码改动到 CI 产物的处理链路见图 02-05-01。
+
+:::figure id=02-05-01 | name=调试构建、缓存复用与 CI 产物链路 | dir=TD
+node n1 "源码与依赖<br/>rules/*.dep" blue
+node n2 "SHA 计算<br/>Makefile.cache" teal
+node n3 "缓存命中<br/>*.tgz" amber
+node n4 "调试开关<br/>DEBUGGING_ON" teal
+node n5 "nostrip 调试包<br/>SPLIT_DBGSYM=n" amber
+node n6 "docker 构建<br/>build_docker.sh" purple
+node n7 "dbg 镜像<br/>*-dbg.gz" amber
+node n8 "镜像仓库<br/>push_docker.sh" gray
+node n9 "CI 产物<br/>bin/img.gz/swi" amber
+node n10 "门禁与扫描<br/>CacheKeyLint" red
+edge n1 -> n2 "依赖列表"
+edge n2 -> n3 "命中即复用"
+edge n4 -> n2 "开关入 key"
+edge n4 -> n5 "nostrip/noopt"
+edge n3 -> n6 " deb 就绪"
+edge n5 -> n6 "调试包注入"
+edge n6 -> n7 "生成"
+edge n7 -> n8 "推送"
+edge n7 -> n9 "镜像装配"
+edge n8 -> n10 "门禁校验"
+edge n9 -> n10 "测试与 SBOM"
+:::
+
+图 02-05-01 用颜色区分了语义：blue 为源码与依赖输入，teal 为构建配置与缓存逻辑，amber 为编译产物与缓存文件，purple 为容器构建控制面，gray 为外部镜像仓库，red 为阻断合入的门禁边界。图中「开关入 key」这条边是关键：调试与性能开关被折进 `SONIC_COMMON_FLAGS_LIST`，因此同一份源码在调试态与生产态下的缓存键不同，不会互相误用；而 `DBGOPT` 只切换脚本的 `set -x` 跟踪、不改变产物字节，故刻意不进键。门禁与扫描是 CI 的失败边界，命中问题会阻断拉取请求合入或产生告警（原理见 06-13 ｜ 模块见 07-13）。
+
+缓存复用的完整调用链是：`LOAD_CACHE` 先调 `SHOW_WHY` 把重建原因写入日志，再由 `CHECK_RCACHE_ENABLED` 判断读缓存是否开启；开启时 `LOAD_FROM_CACHE` 依次调用 `GET_MOD_DEP_SHA` 与 `GET_MOD_SHA`，拼出 `<target>-<依赖 SHA>-<模块 SHA>.tgz`，先查本地 `target/cache`、再查全局 `/dpkg_cache`，命中则 `tar -x` 解出产物并标记 `CACHE_LOADED`，否则走正常编译并由 `SAVE_CACHE` 在 `MOD_LOCK` 保护下写回。若依赖文件被改动，日志会记录「global cache skipped」并改用本地缓存，避免污染共享缓存。这条链解释了两个常见现象：其一，改一个公共文件会让大批目标同时失效；其二，缓存命中时日志里根本没有编译输出，排障不能据此判断「代码没被编进去」（原理见 06-13 ｜ 字段见 05-09）。
+
+调试镜像的生成链与普通镜像并行。`DOCKER_DBG_IMAGES` 目标在 `LOAD_CACHE` 未命中时，把 `DBG_DEPENDS`、`DBG_IMAGE_PACKAGES`、`DBG_APT_PACKAGES` 展开成环境变量，交给 `build_debug_docker_j2.sh` 生成 `Dockerfile-dbg.j2`，经 `j2` 渲染成 `Dockerfile-dbg`，再以带 `--no-cache` 的 `DOCKER_BUILD` 构建、以 `docker-image-save` 落盘为 `*-dbg.gz`，最后 `SAVE_CACHE`。`INSTALL_DEBUG_TOOLS` 决定这类 dbg 镜像是否随整机安装器交付。CI 侧在 `dbg_image: yes` 的平台额外执行 `make ... INSTALL_DEBUG_TOOLS=y target/sonic-<platform>.bin` 并改名为 `sonic-<platform>-dbg.bin`；虚拟交换机则产出 `sonic-vs-dbg.img.gz`。ASAN 变体构建后还会主动删除 `libsairedis` 与 `syncd-vs` 的中间 `.deb`，以防普通镜像的缓存键误取到 ASAN 产物。以上产物名与变量需对照实际版本核验（参数见 04-01 ｜ 模块见 07-11）。
+
+CI 的阶段链是：仅在拉取请求上运行的 `CacheKeyLint` 以静态分析扫描 `rules/*.mk`、`rules/*.dep`、`slave.mk` 与 `Makefile.cache`，用 `--base` 模式相对合并基线比较，凡本次改动新引入的完整性缺口一律以 P0 阻断；随后 `BuildVS` 与 `Build` 并行构建多平台产物，`Test` 下载 `sonic-buildimage.vs` 制品、加载 `docker-sonic-vs.gz` 并运行 py.test、发布 `tr.xml`，`VulnScan` 在产物齐备后对 `.bin.cdx.json`、`.gz.sbom.cdx.json` 等 SBOM 做漏洞扫描。需要说明的是，本快照里 `vstest` 任务与 `VulnScan` 阶段带有 `condition: false` 而处于关闭状态，这属于流水线的配置现状，不代表能力缺失；是否启用、何时启用需对照实际版本核验（模块见 07-13 ｜ 排障见 08-03）。
+
+### 5. 配置/命令/代码实例
+
+本节只给理解增量与调试构建所需的最小命令与配置片段，构建变量全集见 04-01、容器与启动参数见 04-07，本册不重列。先看一组在构建容器内查询缓存命中与重建原因的命令，它演示「为什么这次构建几乎什么都没编」该如何自证。
+
+```bash
+make show-sonic-utilities | head -20
+grep -hE "REASON|CACHE::" target/debs/bookworm/sonic-utilities*.log | tail -12
+make cprune NUMDAYS=7
+make lcclean
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（路径与哈希仅为格式示意，不代表任何具体版本）
+[target/debs/bookworm/sonic-utilities_1.0_amd64.deb]
+     sonic-utilities_1.0_amd64.deb
+     sonic-utilities-dbgsym_1.0_amd64.deb
+[ REASON ] : NEWER PREREQUISITES: rules/sonic-utilities.mk
+[ FLAGS  FILE    ] : [SONIC_DEBUGGING_ON=n SONIC_PROFILING_ON=n SLAVE_BASE_TAG=<slave-tag>]
+[ CACHE::LOADED ] /dpkg_cache/sonic-utilities-3f2a1b0c9d8e7f6a5b4c3d2e-1a2b3c4d5e6f7a8b.tgz
+File /dpkg_cache/sonic-utilities-3f2a1b0c9d8e7f6a5b4c3d2e-1a2b3c4d5e6f7a8b.tgz is loaded from cache
+[ CACHE::SKIPPED ] target/cache/sonic-utilities-3f2a1b0c9d8e7f6a5b4c3d2e-1a2b3c4d5e6f7a8b.tgz
+[ CACHE::SAVED ] target/cache/sonic-utilities-3f2a1b0c9d8e7f6a5b4c3d2e-1a2b3c4d5e6f7a8b.tgz
+```
+
+逐行判读如下。第一块命令中，`make show-sonic-utilities` 对应 `Makefile.cache` 的 `show-%` 目标，用于列举该目标及其派生包，管道截取前二十行避免刷屏；第二行用 `grep -hE` 从目标日志里筛出 `REASON` 与 `CACHE::` 两类记录，这是判断「命中缓存还是真的编译了」的直接证据；`make cprune NUMDAYS=7` 调用缓存清理，删除七天未使用的 `.tgz`，`make lcclean` 清空本地 `target/cache`。输出第二段首行是目标路径，其中 `bookworm` 是发行版构建环境目录，取值随 `BLDENV` 变化、需对照实际版本核验；第二、三行列出主包与 dbgsym 包，说明该目标在生产态下会剥离符号、单独产出 dbgsym，若这两行缺失则要怀疑 `SPLIT_DBGSYM` 是否被改。第四行 `NEWER PREREQUISITES` 指出 `rules/sonic-utilities.mk` 比产物新，是 `SHOW_WHY` 记录的重建触发原因；第五行 `FLAGS FILE` 展示进入缓存键的公共标志，`SONIC_DEBUGGING_ON=n` 与 `SONIC_PROFILING_ON=n` 表明这是生产态，`SLAVE_BASE_TAG` 体现工具链身份已折进键。第六、七行 `CACHE::LOADED` 与随后的 `is loaded from cache` 说明产物是从全局缓存 `/dpkg_cache` 解出的，构建并未真正编译该包；缓存文件名由两段哈希拼接，前段是依赖 SHA、后段是模块内容 SHA，示例哈希仅示意格式。第八行 `CACHE::SKIPPED` 说明本地缓存未参与本次命中，第九行 `CACHE::SAVED` 则记录了一次本地写回。若日志里既无 `LOADED` 也无 `SAVED`，就要检查 `CACHE_MODE` 是否被设为 `none`。输出块已注明示例与版本核验要求，取值不得当作真实构建数据引用（参数见 04-01 ｜ 排障见 08-03）。
+
+再看调试开关的配置片段，它来自 `rules/config`，以注释形式给出，启用时需按实际构建系统取消注释。
+
+```ini
+# rules/config 中的调试与性能开关（节选，需对照实际版本核验）
+#SONIC_DEBUGGING_ON = y
+#SONIC_PROFILING_ON = y
+# INSTALL_DEBUG_TOOLS - installs debugging tools in baseline docker
+# INSTALL_DEBUG_TOOLS = y
+```
+
+这段配置说明两件事：其一，`SONIC_DEBUGGING_ON` 与 `SONIC_PROFILING_ON` 默认都被注释，生产构建不带符号；注释文字明确指出二者是包含关系，profiling 是 debugging 的超集，同时启用时以 profiling 为准，因此实际使用应二选一。其二，`INSTALL_DEBUG_TOOLS` 与前面两个开关不在同一层面，它只决定调试工具是否随基线容器与整机镜像交付，与 `.deb` 是否带符号无关。把这三类开关的作用范围分清，是正确产出调试镜像的前提；取消注释后的具体取值与生效条件需对照实际版本核验（参数见 04-01 ｜ 原理见 06-13）。
+
+最后给一组调试镜像构建与推送命令，演示从开关到分发仓库的闭环。
+
+```bash
+# 构建带符号的调试容器镜像（开关按实际构建系统启用）
+make configure PLATFORM=broadcom
+make target/docker-orchagent-dbg.gz
+sudo --preserve-env=REGISTRY_PASSWD ./push_docker.sh \
+  -v 20261113 -p x86_64-broadcom \
+  target/docker-orchagent-dbg.gz registry.example.com 5000 admin latest
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（仓库地址与摘要仅为格式示意）
+Loading image target/docker-orchagent-dbg.gz
+Pushing registry.example.com:5000/docker-orchagent-dbg:latest
+Image sha256: 3f2a1b0c9d8e7f6a5b4c3d2e1a2b3c4d5e6f7a8b9c0d1e2f
+Pushing registry.example.com:5000/sonic-dockers/x86_64-broadcom/docker-orchagent:20261113
+Job completed
+```
+
+这段输出的判读要点如下。`Loading image` 对应 `push_docker.sh` 里的 `docker load`，说明脚本先把 `docker save` 出来的 gz 还原为本地镜像，再操作；若这一步失败，通常是 gz 文件损坏或架构不匹配。第二行是首个标签的推送，镜像名取自 `DOCKER_IMAGE_FILE` 的基名第一段，因此 `docker-orchagent-dbg.gz` 变成 `docker-orchagent-dbg`；`-t` 未指定时默认标签为 `latest`。第三行 `Image sha256:` 是脚本从 `docker push` 输出里用 `sed` 提取的摘要，用于校验推送内容的一致性；若摘要为空，可能是仓库未返回 digest 行，需对照实际版本核验。第四行来自 `-v` 与 `-p` 同时给定的分支，脚本把镜像推送到 `sonic-dockers/<platform>/<image>:<version>` 这一带平台与版本的路径；若只给其中一项，则走 `BUILD_NUMBER` 加日期的回退分支。末行 `Job completed` 表示脚本正常结束，此前还会用 `trap` 清理临时 `DOCKER_CONFIG` 目录并登出仓库（模块见 07-02 ｜ 参数见 04-01）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是「增量」概念陷阱。最常见的是把 SONiC 的 docker 增量镜像理解成 docker 层缓存复用：本快照的 `build_docker.sh` 与 `slave.mk` 都显式使用 `docker build --no-cache`，真正的增量来自上游 `.deb` 命中 DPKG 缓存后跳过重编，而不是镜像层被复用。第二类是把调试构建当成性能基准：`SONIC_DEBUGGING_ON` 保留符号、`SONIC_PROFILING_ON` 还关闭优化，产物体积与运行特征都不同于生产态，绝不能拿它测收敛、时延与吞吐；这类数字一律标注「需在目标机型实测」（基准方法见 08-01 ｜ 模块见 07-13）。第三类是把两条调试轴混为一谈：编译带符号由 `DEB_BUILD_OPTIONS_GENERIC` 与 `SPLIT_DBGSYM` 决定，镜像是否带调试工具由 `INSTALL_DEBUG_TOOLS` 决定，二者独立；同时打开 `SONIC_DEBUGGING_ON` 与 `SONIC_PROFILING_ON` 也属误用，profiling 会覆盖 debugging。
+
+第四类是缓存陷阱。`slave.mk` 并未整体纳入公共文件，缓存正确性依赖 `SONIC_CACHE_RECIPE_VER` 手工版本戳与一个基于 `slave.mk` 对象哈希的告警守卫；忽视告警、改了构建配方却不升版本，就可能让缓存命中陈旧产物。`DOCKER_DEFAULT_PLATFORM` 决定镜像记录的架构，`SLAVE_BASE_TAG` 标识构建容器与工具链，二者都必须折进键，否则会跨架构或跨工具链误用缓存；口令类变量则只取短指纹，避免明文落进 `<pkg>.flags` 与日志。`touch cache.skip.common` 会缩小公共文件范围、提高命中率，但也扩大陈旧风险，须谨慎使用。`cprune` 默认按七天清理，`lcclean` 只清本地缓存，二者作用不同不可混用（原理见 06-13 ｜ 字段见 05-09）。
+
+第五类是 CI 与产物陷阱。`CacheKeyLint` 只在拉取请求上运行，且以 `--base` 模式阻断本次新引入的完整性缺口，历史遗留问题不阻断，因此不能把「CI 通过」等同于「缓存键完备」。本快照中 `vstest` 任务与 `VulnScan` 阶段带 `condition: false` 而关闭，`dbg_image`、`asan_image` 等参数因平台而异，`CACHE_MODE` 在不同任务中可取 `rcache` 或 `none`；这些都是配置现状，需对照实际版本核验，不得据本快照断言全平台一律开启。产物名后缀、标签规则与仓库路径随版本变化，同样需对照实际版本核验（模块见 07-12 ｜ 模块见 07-13）。
+
+第六类是事实纪律与能力边界陷阱。唯一事实锚点是 `upstream_src/` 下八个子仓的 `xxx-master/` 仓库根，凡未列出的路径或无法用 Read 与 Grep 核实的文件一律不写进正文；不确定的宏名、函数名、目标名与命令选项一律写「需对照实际版本核验」并给出 `rules/`、`slave.mk`、`scripts/` 等可定位目录。`sonic-swss-common`、FRR / FRRouting 源码、Linux 内核与厂商 SAI 实现都不在本快照，涉及这些部分写「不在本快照，需对照实际版本核验」。还要守住全册一致的能力边界：SONiC 是白盒交换机 NOS，控制面在容器进程、数据面在 ASIC、经 SAI 下发，除 `platform/vs/` 外不做软件转发；Redis DB 编号来自运行时配置、不得写死；`config` 返回成功不代表硬件已下发；`orchagent` 不直接操作硬件；`warmrestart/`、多 ASIC 与 chassis 受平台与版本限制（原理见 06-01 ｜ 参数见 04-04）。
+
+最佳实践归纳为四条。其一，写任何缓存键、调试开关、产物名之前先 Read 与 Grep 对应源码，核实不了就按「需对照实际版本核验」成文，绝不补值。其二，判断构建是否真正生效，按「前置检查、执行、验证输出、清理」闭环操作，并用 `REASON` 与 `CACHE::` 日志自证，明确区分「命中缓存」与「重新编译」。其三，调试产物只用于定位问题，验证结论必须在生产态与目标机型上重做，性能数字一律标注「需在目标机型实测」。其四，跨册引用一律用具体篇号的四段式写法，本篇涉及的构建变量写「参数见 04-01」、平台状态结构写「字段见 05-09」、容器编排与缓存机制写「原理见 06-13」、测试与 CI 能力写「模块见 07-13」，不在本册展开变量全集与字段表。
+
+### 7. 小结与延伸阅读
+
+本篇把 SONiC 构建链里最容易被忽略的三件事落到了可核验的文件上：以 `Makefile.cache` 为核心的内容寻址缓存解释了「增量」从何而来，以 `slave.mk` 与 `rules/config` 为核心的调试开关解释了带符号产物与 dbg 镜像如何生成，以 `build_docker.sh`、`push_docker.sh` 与 `azure-pipelines.yml` 为核心的脚本与流水线解释了镜像如何分发、CI 最终交付哪些形态。图 02-05-01 给出从依赖变化到 CI 产物的链路，第三节的表格给出可回查的文件地图，两者是后续排障与追溯的索引。贯穿本篇的三条纪律是：调试构建不作生产基准、缓存命中不等于代码已重新编译、产物名与标签需对照实际版本核验。本篇涉及的交叉引用统一写为（字段见 05-09 ｜ 参数见 04-01 ｜ 原理见 06-13 ｜ 模块见 07-13）。
+
+延伸阅读按目标分三条。若要系统补齐构建知识，回读 02-01（多仓结构与子模块依赖）、02-02（Makefile、slave.mk、rules 与 sonic-slave）、02-03（从零构建与 ONIE 产物）、02-04（平台适配与虚拟交换机），本篇正是这四篇的收尾。若要动手定位真实问题，接读 04-01（构建变量全集）、06-13（容器编排与启动顺序）、07-11（镜像与安装器模块）、07-12（测试体系）与 07-13（脚本与 CI 基础设施），并记住 `vstest` 与 `VulnScan` 在本快照处于关闭状态。若要上线与评估，接读 08-01（基准方法）、08-03（诊断决策树）、08-06（上线清单），所有性能、容量、收敛与吞吐结论一律「需在目标机型实测」，调试与变体镜像不得作为生产基准。
+
+最后重申资料纪律：本篇所有源码路径均相对 `sonic-buildimage/sonic-buildimage-master/` 仓库根，示例输出均注明「示例输出，具体格式需对照实际版本核验」，哈希、仓库地址与摘要仅示意格式；所有不确定的宏名、函数名、目标名与命令选项均标注「需对照实际版本核验」并给出 `rules/`、`slave.mk`、`scripts/`、`.azure-pipelines/` 等可定位目录；`sonic-swss-common`、FRR、Linux 内核与厂商 SAI 实现一律写「不在本快照，需对照实际版本核验」。版本基准始终为「上游 master 快照（2026-11 抓取）」，不写绝对版本号。02 册至此收束，后续可按目标分流：部署走 03 全册，参数与命令随查走 04 全册，字段随查走 05 全册，机制原理走 06 全册，模块能力走 07 全册，运维、基准与排障走 08 全册。

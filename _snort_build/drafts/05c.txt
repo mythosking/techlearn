@@ -1,0 +1,482 @@
+# Snort 3 技术资料 · 05 关键数据结构字段详解（分片 C）
+
+## 05-08 日志与事件结构（Event、Logger、Output Set）字段
+
+### 1. 本篇定位与覆盖范围
+
+本篇是 05 册「关键数据结构字段详解」输出与事件层的权威定义，逐字段核对 `src/events/event.cc/.h`、`event_queue.cc/.h`、`sfeventq.cc/.h`，`src/loggers/loggers.cc/.h` 与 `alert_json.cc`、`unified2.cc` 等具体 logger，`src/framework/logger.h`，`src/managers/event_manager.cc/.h`，以及作为连接点的 `src/detection/rules.h`、`detect.cc/.h` 与 `src/detection/signature.h`。覆盖的结构体族为 `class SO_PUBLIC Event`、`struct SigInfo`、`struct EventQueueConfig`、`struct EventNode`、`struct SF_EVENTQ_NODE`、`struct SF_EVENTQ`、`class SO_PUBLIC Logger`、`struct LogApi`、`class Output`、`struct OutputSet`、`struct ListHead` 与 `struct RuleListNode`。所有字段名、类型、初值与源码行号均取自「上游 master 快照（2026-11 抓取）」的实际头文件，逐条 Read 核实后才写入；凡只在 `.cc` 内定义或仅有前向声明的类型，一律写明不透明边界并标注「需对照实际版本核验」，不凭印象补字段、类型或偏移。
+
+先按总纲去重铁律划清边界。本篇只讲字段含义、类型、内存布局倾向、生命周期与关联函数入口，**不展开输出管线的状态机与调用顺序**（统一写「原理见 06-11」），**不重列任何输出配置参数**（`alert_json`、`unified2` 的段与键、限速相关的 `event_filter` / `rate_filter` / `threshold` 完整参数归 04 册，统一写「参数见 04-02」「参数见 04-08」）。「关联函数与流程」一列只给函数入口名，例如 `CallLogFuncs()`、`EventManager::call_loggers()`、`EventManager::call_alerters()`、`EventManager::add_output()`，不描述它们之间如何编排；想在机制层面理解事件如何入队、排序、限速与写出，去 06-11 与 06-09。「读写时机」一列只写「构造期填充」「入队期写入」「输出期只读」「析构期释放」这类静态结论。能力边界贯穿全篇：Snort 3 是相对 Snort 2 重写的 C++ 全新实现，配置为 Lua，不兼容 `snort.conf` 与旧插件 ABI，`tools/snort2lua/` 只是格式转换辅助；Snort 本身不是防火墙、不做转发，事件与日志只是检测结果的外化；加密流量载荷不可见，`Event` 能记录的字段来自规则命中信息与握手元数据，不含解密后的明文正文；IDS 旁路模式下只告警不丢弃；Hyperscan 是可选加速、缺失时回退其他 MPSE，与本层字段无直接耦合。GPLv2 许可与 Talos 规则集独立许可按总纲处理，本篇不给分发建议；任何吞吐、pps、内存占用结论一律「需在目标机型实测」。
+
+需要订正两处极易搞错的存储位置，这是本层源码检索最常见的扑空点。其一，`OutputSet` **并不定义在 `src/loggers/loggers.h`**，该头文件只有一句 `void load_loggers();`；`struct OutputSet` 的真实定义在 `src/managers/event_manager.cc:61`，它只包含一个 `EHList outputs`（即 `typedef list<Logger*> EHList`），全局默认输出集是同文件的静态对象 `static OutputSet s_loggers`。`src/loggers/` 下的 `alert_json.cc`、`alert_fast.cc`、`unified2.cc` 是具体 logger 实现，不是 `OutputSet` 定义处。其二，`ListHead` 定义在 `src/detection/rules.h:53`，持有 `OutputSet* LogList`、`OutputSet* AlertList` 与 `struct RuleListNode* ruleListNode`，这正是规则结构与输出结构的连接点：`CallLogFuncs()` 走 `head->LogList`，`CallAlertFuncs()` 走 `head->AlertList`，再分别交给 `EventManager::call_loggers()` 与 `EventManager::call_alerters()`。把这个连接点理清，才能回答「一条规则的事件究竟写到哪里」。事件字段从规则命中到 logger 写出的归属链路见图 05-08-01，实线为字段持有与引用关系，虚线为事件队列的排序回查；调用顺序不在图中表达，归「原理见 06-11」。
+
+:::figure id=05-08-01 | name=事件与输出结构字段链路 | dir=TD
+node a "OptTreeNode<br/>sigInfo" amber
+node b "Event<br/>event.h" teal
+node c "SigInfo<br/>signature.h" amber
+node d "ListHead<br/>LogList" purple
+node e "ListHead<br/>AlertList" purple
+node f "OutputSet<br/>outputs" green
+node g "Logger<br/>logger.h" green
+node h "SF_EVENTQ<br/>event_queue" gray
+node i "alert_json<br/>unified2" red
+edge a -> b "构造 Event"
+edge a -> c "引用 sigInfo"
+edge c -> b "sig_info 成员"
+edge b -> d "call_loggers"
+edge b -> e "call_alerters"
+edge d -> f "LogList"
+edge e -> f "AlertList"
+edge f -> g "outputs 列表"
+edge g -> i "alert()/log()"
+edge h -> b dashed "排序去重回查"
+:::
+
+最后说明与相邻篇的边界：`Packet`、`DecodeData`、`Flow` 的字段见 05-02，`SnortConfig` 的 `output_flags`、`tagged_packet_limit` 等输出相关字段见 05-03，`IpsAction` 见 05-05；本篇只在 `ListHead`、`RuleListNode` 处点出这些类型名，不重列其字段。`DAQ_Verdict` 与主动响应字段见 05-07，drop / block 经 DAQ verdict 反馈属内联机制，见「原理见 06-12」。每个结构都给出不透明边界判断：可在头文件看到完整定义的是 `Event`、`SigInfo`、`EventQueueConfig`、`EventNode`、`SF_EVENTQ_NODE`、`SF_EVENTQ`、`LogApi`、`OutputSet`、`ListHead`、`RuleListNode`；`Logger` 只有薄基类，`Output` 定义在实现文件，具体 logger（如 `alert_json`）的内部状态属于不透明句柄，内部布局见对应 `.cc`，不可依赖。
+
+### 2. 索引与字段总表
+
+下表按「层 → 代表结构 → 权威源码 → 字段归口 → 参数归口 → 原理归口 → 模块归口」给出本层索引。参数归口指输出配置项的权威来源，原理归口指输出机制讲解的权威来源，模块归口指源码目录介绍的权威来源，三者都不是本册内容，按表反查即可。本层索引对照见下表。
+
+| 层 | 代表结构 | 权威源码 | 字段归口 | 参数归口 | 原理归口 | 模块归口 |
+|---|---|---|---|---|---|---|
+| 事件对象 | Event / SigInfo | src/events/event.h | 05-08 | 04-02 | 06-11 | 07-08 |
+| 队列配置 | EventQueueConfig | src/events/event_queue.h | 05-08 | 04-08 | 06-09 | 07-08 |
+| 队列节点 | SF_EVENTQ | src/events/sfeventq.h | 05-08 | 04-08 | 06-11 | 07-08 |
+| 输出插件 | Logger / LogApi | src/framework/logger.h | 05-08 | 04-08 | 06-14 | 07-01 |
+| 输出集 | OutputSet / Output | src/managers/event_manager.cc | 05-08 | 04-02 | 06-11 | 07-11 |
+| 连接点 | ListHead / RuleListNode | src/detection/rules.h | 05-08 | 04-06 | 06-06 | 07-05 |
+
+下表收录 `src/events/event.h:26` 中 `class SO_PUBLIC Event` 的全部私有数据成员。该类把字段全部封在 private，只通过 `get_*()` 访问器对外暴露，因此「读字段」在本篇实际是「读访问器返回值」。事件字段对照见下表。
+
+| 字段 | 类型 | 含义 | 源码位置 | 读写时机 | 关联函数与流程 | 版本差异 |
+|---|---|---|---|---|---|---|
+| sig_info | const SigInfo& | 命中规则的签名信息引用 | event.h:65 | 构造期绑定、输出期只读 | `get_gid()` / `get_msg()`；原理见 06-11 | 引用成员，需核验其生命周期 |
+| action | const char* | 规则动作名串指针 | event.h:66 | 构造期赋值、输出期只读 | `get_action()`；原理见 06-11 | 上游 master 快照内稳定 |
+| buffs_to_dump | const char** | 待转储 buffer 名数组 | event.h:67 | 构造期传入、输出期遍历 | `get_buffers()`；原理见 06-11 | 需对照实际版本核验 |
+| ts_sec | uint32_t | 事件秒级时间戳 | event.h:69 | 构造期写入、输出期只读 | `get_seconds()`；原理见 06-11 | 来自 pkth->ts，需核验 |
+| ts_usec | uint32_t | 事件微秒时间戳 | event.h:70 | 构造期写入、输出期只读 | `get_timestamp()`；原理见 06-11 | 来自 pkth->ts，需核验 |
+| event_id | uint32_t | 事件序号标识 | event.h:72 | 入队期分配、输出期只读 | `get_event_id()`；原理见 06-09 | 与静态序号生成器同步，需核验 |
+| event_reference | uint32_t | 关联事件引用 | event.h:73 | 入队期可选写入 | `get_event_reference()`；原理见 06-11 | 用于 tagged packet，需核验 |
+
+下表收录 `src/detection/signature.h:94` 的 `struct SigInfo`，它是 `Event::sig_info` 指向的内容，承载规则头部的元数据。字段对照见下表。
+
+| 字段 | 类型 | 含义 | 源码位置 | 读写时机 | 关联函数与流程 | 版本差异 |
+|---|---|---|---|---|---|---|
+| message | std::string | 规则 msg 文本 | signature.h:96 | 规则解析期写入、输出期只读 | `Event::get_msg()`；原理见 06-06 | 上游 master 快照内稳定 |
+| body | std::string* | 规则正文串指针 | signature.h:97 | 解析期可选写入 | 原理见 06-06 | 初值 nullptr，需核验 |
+| refs | vector<const ReferenceNode*> | 规则 reference 列表 | signature.h:99 | 解析期填充 | `Event::get_reference()`；参数见 04-06 | 需对照实际版本核验 |
+| services | vector<SignatureServiceInfo> | 服务元数据列表 | signature.h:100 | 解析期填充 | 原理见 06-06 | 需对照实际版本核验 |
+| class_type | const ClassType* | 分类对象指针 | signature.h:102 | 解析期绑定 | `Event::get_class_type()` | 不透明句柄，见 class_type 定义 |
+| gid | uint32_t | 规则生成器号 | signature.h:104 | 解析期写入、输出期只读 | `Event::get_gid()`；参数见 04-06 | 初值 GID_DEFAULT，需核验 |
+| sid | uint32_t | 规则签名号 | signature.h:105 | 解析期写入、输出期只读 | `Event::get_sid()`；参数见 04-06 | 上游 master 快照内稳定 |
+| rev | uint32_t | 规则修订号 | signature.h:106 | 解析期写入、输出期只读 | `Event::get_rev()`；参数见 04-06 | 上游 master 快照内稳定 |
+| class_id | uint32_t | classtype 编号 | signature.h:108 | 解析期写入 | `Event::get_class_id()`；参数见 04-06 | 需对照实际版本核验 |
+| priority | uint32_t | 规则优先级 | signature.h:109 | 解析期写入 | `Event::get_priority()`；参数见 04-06 | 上游 master 快照内稳定 |
+| builtin | bool | 是否内建规则 | signature.h:111 | 解析期置位 | 原理见 06-06 | 初值 false，需核验 |
+| target | Target | 目标方向枚举 | signature.h:112 | 解析期写入 | `Event::get_target()` | TARGET_NONE/SRC/DST，需核验 |
+| file_id | uint64_t | 关联文件标识 | signature.h:113 | 文件规则期写入 | 原理见 06-10 | 初值 0，需对照实际版本核验 |
+
+下表收录事件队列相关的三组结构：`src/events/event_queue.h` 的 `EventQueueConfig`、`EventNode`，以及 `src/events/sfeventq.h` 的 `SF_EVENTQ_NODE`、`SF_EVENTQ`。队列负责事件入队后的排序与筛选，字段只描述「队列如何存」，排序规则属机制，写「原理见 06-09」。队列字段对照见下表。
+
+| 字段 | 类型 | 含义 | 源码位置 | 读写时机 | 关联函数与流程 | 版本差异 |
+|---|---|---|---|---|---|---|
+| EventQueueConfig::max_events | unsigned | 队列最大事件数 | event_queue.h:30 | 配置期写入 | `EventQueueConfigNew()`；参数见 04-08 | 初值需对照实际版本核验 |
+| EventQueueConfig::log_events | unsigned | 每包可记录事件数 | event_queue.h:31 | 配置期写入 | `EventQueueConfigNew()`；参数见 04-08 | 与 max_events 区别需核验 |
+| EventQueueConfig::order | int | 排序方式选择 | event_queue.h:32 | 配置期写入 | `SNORT_EVENTQ_PRIORITY` 等宏；原理见 06-09 | 宏值 1/2，需核验 |
+| EventQueueConfig::process_all_events | int | 是否处理全部事件 | event_queue.h:33 | 配置期写入 | 原理见 06-09 | 需对照实际版本核验 |
+| EventNode::otn | const OptTreeNode* | 命中选项树节点 | event_queue.h:38 | 入队期绑定 | `CallLogFuncs()`；原理见 06-08 | 字段见 05-04，需核验 |
+| EventNode::rtn | const RuleTreeNode* | 命中规则树节点 | event_queue.h:39 | 入队期绑定 | 原理见 06-06 | 字段见 05-04，需核验 |
+| SF_EVENTQ_NODE::event | void* | 事件载荷指针 | sfeventq.h:25 | 分配期写入、回收期释放 | `sfeventq_event_alloc()` | 不透明指针，需核验 |
+| SF_EVENTQ_NODE::prev | SF_EVENTQ_NODE* | 前驱节点 | sfeventq.h:27 | 链表期维护 | `sfeventq_add()`；原理见 06-11 | 上游 master 快照内稳定 |
+| SF_EVENTQ_NODE::next | SF_EVENTQ_NODE* | 后继节点 | sfeventq.h:28 | 链表期维护 | `sfeventq_add()`；原理见 06-11 | 上游 master 快照内稳定 |
+| SF_EVENTQ::head | SF_EVENTQ_NODE* | 队列头指针 | sfeventq.h:37 | 入队/出队期维护 | `sfeventq_new()`；原理见 06-11 | 上游 master 快照内稳定 |
+| SF_EVENTQ::last | SF_EVENTQ_NODE* | 队列尾指针 | sfeventq.h:38 | 入队期维护 | `sfeventq_add()`；原理见 06-11 | 上游 master 快照内稳定 |
+| SF_EVENTQ::node_mem | SF_EVENTQ_NODE* | 节点内存池 | sfeventq.h:40 | 初始化期分配 | `sfeventq_new()`；原理见 06-11 | 池化，需核验 |
+| SF_EVENTQ::event_mem | char* | 事件内存池 | sfeventq.h:41 | 初始化期分配 | `sfeventq_new()`；原理见 06-11 | 池化，需核验 |
+| SF_EVENTQ::reserve_event | char* | 预留比较事件 | sfeventq.h:49 | 入队期比较 | `sfeventq_add()`；原理见 06-09 | 用于优先级判断，需核验 |
+| SF_EVENTQ::max_nodes | int | 最大节点数 | sfeventq.h:54 | 初始化期写入 | `sfeventq_new()`；参数见 04-08 | 需对照实际版本核验 |
+| SF_EVENTQ::log_nodes | int | 可记录节点数 | sfeventq.h:55 | 初始化期写入 | `sfeventq_new()`；参数见 04-08 | 需对照实际版本核验 |
+| SF_EVENTQ::event_size | int | 单事件字节数 | sfeventq.h:56 | 初始化期写入 | `sfeventq_new()` | 需对照实际版本核验 |
+| SF_EVENTQ::cur_nodes | int | 当前节点数 | sfeventq.h:62 | 入队期递增、重置期清零 | `sfeventq_reset()`；原理见 06-11 | 上游 master 快照内稳定 |
+| SF_EVENTQ::cur_events | int | 当前事件数 | sfeventq.h:63 | 入队期递增 | `sfeventq_reset()` | 需对照实际版本核验 |
+| SF_EVENTQ::fails | unsigned | 入队失败计数 | sfeventq.h:64 | 入队失败时递增 | `sfeventq_reset()` 返回该值 | 需对照实际版本核验 |
+
+下表收录 `src/framework/logger.h` 与 `src/managers/` 的输出插件与输出集字段。`Logger` 是薄基类，只有一个 `api` 私有成员；`Output`、`OutputSet` 定义在 `event_manager.cc` 实现文件，不对外暴露头文件定义，本篇按源码如实记录。输出结构字段对照见下表。
+
+| 字段 | 类型 | 含义 | 源码位置 | 读写时机 | 关联函数与流程 | 版本差异 |
+|---|---|---|---|---|---|---|
+| Logger::api | const LogApi* | 关联的日志 API 指针 | logger.h:76 | set_api() 写入、运行期只读 | `get_api()`；原理见 06-14 | 初值 nullptr，需核验 |
+| LogApi::base | BaseApi | 插件 API 公共头 | logger.h:84 | 注册期填充 | `LOGAPI_VERSION` 宏；原理见 06-14 | 见 base_api.h，需核验 |
+| LogApi::flags | unsigned | 输出类型位标志 | logger.h:85 | 注册期填充 | `OUTPUT_TYPE_FLAG__*` 宏 | ALERT=0x1/LOG=0x2，需核验 |
+| LogApi::ctor | LogNewFunc | logger 构造工厂指针 | logger.h:86 | 注册期填充 | `EventManager::instantiate()` | 需对照实际版本核验 |
+| LogApi::dtor | LogDelFunc | logger 析构工厂指针 | logger.h:87 | 注册期填充 | `Output::~Output()` | 需对照实际版本核验 |
+| Output::api | const LogApi* | 输出包装的 API | event_manager.cc:43 | 构造期写入 | `EventManager::get_interface()` | 实现文件定义，需核验 |
+| Output::handler | Logger* | 实际 logger 实例 | event_manager.cc:44 | instantiate 期创建 | `EventManager::instantiate()` | 初值 nullptr，需核验 |
+| OutputSet::outputs | EHList | logger 实例链表 | event_manager.cc:63 | add_output 期追加、输出期遍历 | `EventManager::add_output()` | list<Logger*>，需核验 |
+| s_loggers | static OutputSet | 全局默认输出集 | event_manager.cc:66 | 命令行实例化期填充 | `EventManager::call_loggers()` | 静态对象，需核验 |
+| ListHead::LogList | OutputSet* | 规则绑定的日志输出集 | rules.h:55 | 规则装配期绑定 | `CallLogFuncs()`；原理见 06-06 | 可为 nullptr 走全局集 |
+| ListHead::AlertList | OutputSet* | 规则绑定的告警输出集 | rules.h:56 | 规则装配期绑定 | `CallAlertFuncs()`；原理见 06-06 | 可为 nullptr 走全局集 |
+| ListHead::ruleListNode | RuleListNode* | 所属规则链表节点 | rules.h:57 | 规则装配期绑定 | `CallLogFuncs()` 取名 | 需对照实际版本核验 |
+| RuleListNode::mode | IpsAction::Type | 规则动作模式 | rules.h:64 | 规则装配期写入 | 字段见 05-05；原理见 06-06 | 需对照实际版本核验 |
+| RuleListNode::evalIndex | unsigned | 规则集求值序号 | rules.h:65 | 规则编译期写入 | 原理见 06-06 | 需对照实际版本核验 |
+
+需要说明表格中「关联函数与流程」一列的写法约束：本册只给函数入口名，凡涉及链路由的一律写「原理见 06-xx」导向 06 册，这是总纲去重铁律对 05 册的硬约束；`SigInfo` 的 `refs`、`services` 成员类型是外部类型，属于不透明句柄，内部布局见 `src/detection/signature.h` 关联定义与 `src/parser/`，不可依赖。表中若某字段的类型或初值在本快照未能逐字核实，一律写「需对照实际版本核验」，不臆造。
+
+### 3. 逐项详解
+
+**Event 的封装与访问器语义**。`src/events/event.h` 的 `class SO_PUBLIC Event` 提供三个构造函数：默认构造 `Event()`，以及两个带时间戳、签名信息、buffer 数组与动作名的构造，后者多一个 `uint32_t ref` 参数用于关联事件引用（源码注释说明 `event_reference` 用于 tagged packet 之类「其他已触发事件的引用」）。七个私有成员全部集中在 private 段：`sig_info` 是 `const SigInfo&` 引用而非指针或值，意味着 `Event` 不拥有签名信息的内存，它引用的是 `OptTreeNode::sigInfo`，生命周期由规则树持有——这一点决定了 `Event` 不能比规则树活得更久，本册只记静态归属，不展开规则卸载时序（原理见 06-06）。`action`、`buffs_to_dump` 是指针，分别记录动作名（来自 `head->ruleListNode->name`，见 `CallLogFuncs()` 的实现）与待转储 buffer 名数组。`ts_sec`、`ts_usec` 时间戳在 `detect.cc` 的 `Event event(p->pkth->ts.tv_sec, p->pkth->ts.tv_usec, otn->sigInfo, otn->buffer_setters, act)` 一处构造时写入，源头是 DAQ 包头 `DAQ_PktHdr_t` 的时间戳（字段见 05-07），因此事件时间与包时间是同一时基，而非系统当前时间。访问器 `get_gid()`/`get_sid()`/`get_rev()`/`get_msg()`/`get_class_type()`/`get_class_id()`/`get_priority()` 全部转发到 `sig_info` 引用；`get_target()` 返回 bool 并通过引用参数给出源/目的方向；`get_reference()` 以 idx 递增方式（从 0 起）遍历所有 reference。三个静态方法 `get_curr_seq_num()`、`get_next_seq_num()`、`get_next_event_id()` 提供序号与事件 ID 的分配入口，属进程级计数，具体并发语义需对照实际版本核验。
+
+**SigInfo 的字段族与规则元数据**。`struct SigInfo`（`src/detection/signature.h:94`）是 `Event` 引用内容的实体，字段分三类。文本类：`message`（`std::string`，规则 msg）、`body`（`std::string*`，规则正文，初值 nullptr）。容器类：`refs`（`std::vector<const ReferenceNode*>`）、`services`（`std::vector<SignatureServiceInfo>`），二者在规则解析期填充，元素类型是外部定义，属不透明句柄。标识类：`class_type`（`const ClassType*`）、`gid`（`uint32_t`，初值 `GID_DEFAULT`）、`sid`、`rev`、`class_id`、`priority`、`builtin`（bool，初值 false）、`target`（`enum Target`，取值 `TARGET_NONE`、`TARGET_SRC`、`TARGET_DST`，`TARGET_MAX = TARGET_DST` 作上界）、`file_id`（`uint64_t`，初值 0）。这些字段是规则头部在内存中的落点，`sid`/`rev`/`gid` 三元组与事件输出字段一一对应（输出格式见「参数见 04-02」，写出机制见「原理见 06-11」）。`builtin` 与 `target` 分别标记内建规则与目标方向，读字段时若发现 `sid` 为 0 或 `gid` 为默认值，通常意味着该 `SigInfo` 尚未完成解析或被内建事件复用，应回到 `src/parser/parse_rule.cc` 核对赋值点（原理见 06-06），而不是怀疑 `Event` 构造。
+
+**事件队列的四组结构与池化特征**。`src/events/event_queue.h` 定义 `struct EventQueueConfig`（`max_events`、`log_events`、`order`、`process_all_events`）与 `struct EventNode`（`otn`、`rtn` 两个树节点指针），并提供 `EventQueueConfigNew()` / `EventQueueConfigFree()` 两个工厂函数；两个宏 `SNORT_EVENTQ_PRIORITY`（1）与 `SNORT_EVENTQ_CONTENT_LEN`（2）给出 `order` 的取值语义，排序实现归 06-09。`src/events/sfeventq.h` 是更底层的通用事件队列：`SF_EVENTQ_NODE` 用 `event`（void* 载荷）、`prev`、`next` 组成双向链表；`SF_EVENTQ` 除 `head`、`last` 外，还有 `node_mem`（节点内存池）、`event_mem`（事件内存池）、`reserve_event`（预留事件，源码注释说明它用于「多分配一个节点与队尾事件比较优先级」），以及 `max_nodes`、`log_nodes`、`event_size`、`cur_nodes`、`cur_events`、`fails` 六个计数与配置字段。函数族 `sfeventq_new()`、`sfeventq_event_alloc()`、`sfeventq_add()`、`sfeventq_action()`、`sfeventq_reset()`（返回自上次重置以来的失败数）、`sfeventq_free()` 构成完整生命周期。内存池字段意味着节点与事件内存是批量预分配的，读取 `cur_nodes` 时它是当前占用而非容量，二者不可混为一谈；具体池化策略与排序判据属机制，写「原理见 06-09」「原理见 06-11」。
+
+**Logger、LogApi 与 OutputSet 的插件形态**。`src/framework/logger.h` 的 `class SO_PUBLIC Logger` 是典型薄基类：虚析构之外，`open()`、`close()`、`reset()`、`reload()`、`alert(Packet*, const char*, const Event&)`、`log(Packet*, const char*, Event*)` 全部是带空实现的虚函数，私有段只有 `const LogApi* api = nullptr`，通过 `set_api()` / `get_api()` 读写。`LOGAPI_VERSION ((BASE_API_VERSION << 16) | 3)` 把 logger API 版本编进高位的 base 版本与低位的自身版本，`struct LogApi` 由 `BaseApi base`、`unsigned flags`、`LogNewFunc ctor`、`LogDelFunc dtor` 四字段组成，`flags` 取 `OUTPUT_TYPE_FLAG__ALERT`（0x1）与 `OUTPUT_TYPE_FLAG__LOG`（0x2）的位掩码。源码注释明确「ctor / dtor 在主线程，其余方法在包线程」，这条线程归属是读字段时判断竞态的静态依据。`Output` 与 `OutputSet` 定义在 `src/managers/event_manager.cc`：`Output` 持 `const LogApi* api` 与 `Logger* handler`，析构时调用 `api->dtor(handler)`；`OutputSet` 只有一个 `EHList outputs`（`list<Logger*>`）。`EventManager::add_output()` 在 `*ofn` 为空时 `new OutputSet`，再 `outputs.emplace_back(eh)`；`copy_outputs()` 复制链表；静态 `s_loggers` 是命令行与全局默认路径的落点。具体 logger（如 `alert_json.cc`）如何把 `Event` 字段写成 JSON，属于机制与参数，写「原理见 06-11」「参数见 04-02」。
+
+**ListHead 连接点与读写时机总览**。`struct ListHead`（`src/detection/rules.h:53`）的 `LogList` 与 `AlertList` 是两个 `OutputSet*`，加上 `ruleListNode`，构成规则与输出的桥。`detect.cc` 中 `CallLogFuncs(Packet*, ListHead*, Event*, const char*)` 取 `head ? head->LogList : nullptr` 调 `EventManager::call_loggers()`；`CallAlertFuncs(Packet*, const OptTreeNode*, ListHead*)` 取 `head ? head->AlertList : nullptr` 调 `EventManager::call_alerters()`。两函数在 `head` 为空时把 nullptr 传入，由 `call_loggers()` / `call_alerters()` 回落到全局 `s_loggers.outputs`，这就是「规则可绑定专属输出、否则走全局输出」的字段级根据。`RuleListNode` 的 `name` 字段被取作 `Event::action` 的值，`mode`（`IpsAction::Type`）与 `evalIndex` 分别记录规则动作模式与求值序号。读写时机可归纳为四段：配置装配期写 `ListHead` 的两个指针与 `LogApi` 的工厂字段；规则解析期写 `SigInfo` 与 `Event` 的引用来源；事件构造与入队期写 `Event` 的时间戳、事件 ID 与队列计数；输出期只读 `Event` 访问器与 `OutputSet::outputs` 链表并调用虚函数。除这四段外，其余阶段应把这些字段视作只读或不存在，不推断运行时效果。
+
+### 4. 典型示例
+
+下面这段 C++ 片段用于核对事件结构字段的访问器，只读取一个已构造 `Event` 的字段值并打印，不触发检测、入队或写盘流程，便于在本地调试构建里确认访问器与源码声明一致。示例输出，具体格式需对照实际版本核验。
+
+```cpp
+#include "events/event.h"
+#include "managers/event_manager.h"
+#include <cstdio>
+
+static void dump_event_fields(const Event& ev)
+{
+    uint32_t sec = 0, usec = 0;
+    ev.get_timestamp(sec, usec);
+    uint32_t gid = 0, sid = 0, rev = 0;
+    ev.get_sig_ids(gid, sid, rev);
+    std::printf("ts=%u.%06u gid=%u sid=%u rev=%u\n",
+        sec, usec, gid, sid, rev);
+    std::printf("event_id=%u action=%s\n",
+        ev.get_event_id(), ev.get_action() ? ev.get_action() : "-");
+    std::printf("msg=%s prio=%u\n",
+        ev.get_msg() ? ev.get_msg() : "-", ev.get_priority());
+}
+```
+
+在一个接入调试构建、由规则命中构造出 `Event` 的测试桩里，输出类似如下。示例输出，具体格式需对照实际版本核验。
+
+```text
+ts=1762809600.000123 gid=1 sid=1000001 rev=3
+event_id=42 action=alert
+msg=ET SCAN SYN SCAN prio=2
+```
+
+逐行判读如下，合计超过 150 字。第一行 `ts=1762809600.000123` 是 `get_timestamp()` 拆出的秒与微秒，秒值来自 `Packet::pkth` 所指向的 `DAQ_PktHdr_t` 时间戳（字段见 05-07），不是 `time()` 的系统时间；若微秒位恒为 0，先确认 DAQ module 是否提供高精度时戳，而不是怀疑 `get_timestamp()`。`gid=1 sid=1000001 rev=3` 由 `get_sig_ids()` 一次性取出，分别对应 `SigInfo::gid`、`sid`、`rev`：gid 为 1 是常见生成器号（`GID_DEFAULT` 需对照实际版本核验），sid 落在社区规则常见区间，rev 为修订号；三者全为 0 通常说明规则尚未解析完成或取到了默认构造的 `Event`。第二行 `event_id=42` 来自 `Event::event_id`，由静态序号分配入口 `get_next_event_id()` 一类入口维护（函数名以源码为准，需对照实际版本核验），同一批事件应递增；`action=alert` 来自 `Event::action`，它是 `ListHead::ruleListNode->name` 的字符串，若这里为空串，多半是该事件走的是无 `ListHead` 的全局路径。第三行 `msg` 转发自 `SigInfo::message`，`prio=2` 来自 `SigInfo::priority`；若 `msg` 显示 `(null)` 或 `-`，说明 `sig_info` 引用指向的 `OptTreeNode` 已被释放，属生命周期问题（原理见 06-06）。以上只核对字段可读性，不代表任何性能结论，吞吐与内存占用一律「需在目标机型实测」。字段完整定义见 05-08 本节，输出写出见「原理见 06-11」，输出参数见「参数见 04-02」，目录职责见「模块见 07-08 ｜ 模块见 07-11」。
+
+再给一条头文件字段检索命令，用于复核本快照的真实定义位置，命令按「前置检查 → 执行 → 复核」闭环书写，不改动任何文件。
+
+```bash
+test -f src/events/event.h && test -f src/framework/logger.h && echo "headers ok"
+grep -n "class SO_PUBLIC Event" src/events/event.h
+grep -n "const SigInfo& sig_info" src/events/event.h
+grep -n "struct OutputSet" src/managers/event_manager.cc
+grep -n "OutputSet\* LogList" src/detection/rules.h
+```
+
+示例输出，具体格式需对照实际版本核验。
+
+```text
+headers ok
+26:class SO_PUBLIC Event
+65:    const SigInfo& sig_info;
+61:struct OutputSet
+55:    OutputSet* LogList;
+```
+
+这五行输出逐行印证第 1 节的两处订正：`Event` 类在 `src/events/event.h:26`，`sig_info` 确为引用成员（第 65 行）；`OutputSet` 的真实定义在 `event_manager.cc:61` 而非 `src/loggers/loggers.h`；`ListHead::LogList` 在 `rules.h:55`。行号随上游提交漂移，需对照实际版本核验；若 `grep` 无输出，先确认仓库根是否为 `upstream_src/snort3/snort3-master/`。
+
+### 5. 速查表
+
+按「想读某类事件/输出信息 → 查哪个字段 → 归口哪一篇」反查，见下表。表中「归口」列指向本篇或权威册；所有涉及机制与参数的列均指向对应权威册，本篇不展开。事件与输出字段反查见下表。
+
+| 需求 | 首选字段 / 访问器 | 所在结构 | 归口 |
+|---|---|---|---|
+| 取事件时间与序号 | ts_sec / ts_usec / event_id | Event | 05-08 |
+| 取规则标识 | gid / sid / rev | SigInfo | 05-08 |
+| 取告警文本与优先级 | message / priority | SigInfo | 05-08 |
+| 取规则动作名 | action | Event | 05-08 |
+| 取输出集链表 | outputs | OutputSet | 05-08 |
+| 取规则绑定输出 | LogList / AlertList | ListHead | 05-08 |
+| 取队列占用与失败数 | cur_nodes / fails | SF_EVENTQ | 05-08 |
+| 取包与流字段 | pkt / flow | Packet | 05-02 |
+| 取 DAQ 包头时间戳 | DAQ_PktHdr_t | Packet::pkth | 05-07 |
+| 查输出配置参数 | 不查字段 | 无 | 参数见 04-02 |
+| 查输出管线机制 | 不查字段 | 无 | 原理见 06-11 |
+| 查目录职责 | 不查字段 | 无 | 模块见 07-08 |
+
+统一交叉引用写法为：`字段见 05-08 ｜ 参数见 04-02 ｜ 原理见 06-11 ｜ 模块见 07-08`。需要回指字段时写 `字段见 05-08 ｜ 参数见 04-08 ｜ 原理见 06-09 ｜ 模块见 07-11`。注意全角竖线两侧各留一个空格，避免与 Markdown 表格列分隔符混淆；单元格内若确需出现逻辑或，必须写成转义的 `\|`。本册所有表格都遵守这一约定。
+
+### 6. 版本差异
+
+最根本的代际差异是「事件与输出如何组织」。Snort 2 以 C 结构体加全局输出函数表组织事件，配置来自 `snort.conf`；Snort 3 是从 Snort 2 重写的 C++ 全新实现，配置改为 Lua，`Event` 由纯数据变成带构造/析构、字段全部私有、通过 `get_*()` 访问器暴露的 `class SO_PUBLIC Event`（`src/events/event.h`），日志侧则抽象出 `Logger`（`src/framework/logger.h`）插件基类，由 `EventManager`（`src/managers/event_manager.cc`）统一注册与分发。因此「按全局变量名找事件输出」的旧习惯在 3.x 不成立。插件 ABI 不通用：`BaseApi`（`src/framework/base_api.h`）作为所有插件 API 的首成员，`LOGAPI_VERSION ((BASE_API_VERSION << 16) | 3)` 把 logger API 版本编入其中，跨版本加载 SO 输出插件必须校验版本，具体兼容边界需对照实际版本核验。Lua 取代 `snort.conf`，输出段与限速参数归 04 册（`参数见 04-02`、`参数见 04-08`），`tools/snort2lua/` 只是格式转换辅助，不等于事件字段或输出配置可直接沿用。
+
+上游 master 快照（2026-11 抓取）内部的演进痕迹同样要谨慎。`src/events/event.h` 的构造函数重载多出一个 `uint32_t ref` 参数，源码注释把 `event_reference` 解释为 tagged packet 等关联事件的引用，说明该字段是后加能力；`src/framework/logger.h` 的 `LOGAPI_VERSION` 用位移组合版本，注释写明「the LOGAPI_VERSION will change if anything in this file changes」，意味着 `Logger` 的任何改动都会推动版本位变化；`src/managers/event_manager.cc` 中 `EventManager::add_output()` 被标注 `cppcheck-suppress unusedFunction`、注释说明「entry point retained for external, conditional, or test use」，说明它是为外部或条件编译保留的入口；`src/detection/rules.h` 的 `ListHead` 用裸指针 `OutputSet*` 而非智能指针，归属由装配期约定。这些都说明字段集合、初值与实现位置不是冻结的，任何依赖字段偏移、结构体大小或「定义一定在同名头文件」的假设都不可靠，结论一律以当前快照源码为准并标注「需对照实际版本核验」。具体版本号以 `CMakeLists.txt`、`ChangeLog.md` 为准，本套资料不写绝对版本号。
+
+能力边界随版本保持稳定，但会影响字段可读性：加密流量载荷不可见，`Event` 的 `buffs_to_dump` 与 `SigInfo::message` 来自规则命中与握手元数据，不含解密后的 HTTPS 正文；IDS 旁路模式下只告警不丢弃，与 drop 相关的动作字段不会被写成实际拦截，内联 verdict 见「原理见 06-12」；输出插件是可选装配，某些 logger 在目标构建里可能缺席，需对照实际版本核验；Hyperscan 是可选加速、缺失回退 `src/search_engines/` 下其他实现，不影响本层字段；线程 / 进程模型以实际版本为准，禁止断言「默认 N 线程」，`Logger` 注释给出的「ctor/dtor 主线程、其余包线程」是静态归属而非线程数量结论。
+
+### 7. 常见误用与调试
+
+第一类误用是把 `OutputSet` 的定义位置想当然。最常见错误是去 `src/loggers/loggers.h` 找 `struct OutputSet`，结果只看到一句 `load_loggers()` 声明便误判「输出集不存在」；真实定义在 `src/managers/event_manager.cc:61`，全局默认集是同文件的 `static OutputSet s_loggers`。第 4 节的 `grep -n "struct OutputSet"` 组合是最快确认手段，如结果与本节不符，以 `upstream_src/snort3/snort3-master/` 下实际源码为准并标注「需对照实际版本核验」。
+
+第二类误用是把不透明句柄当普通结构展开。`Event::sig_info` 是引用成员，其生命周期由 `OptTreeNode` 持有；`SigInfo::refs`、`services`、`class_type` 与 `LogApi::base`、`Output::handler` 的具体布局都不在本篇头文件内，属于不透明句柄，内部布局见 `src/detection/signature.h` 关联定义、`src/framework/base_api.h` 与对应 `.cc`，不可依赖。用 `sizeof()`、指针偏移或 `reinterpret_cast` 去读这些成员，会在不同构建下静默错位；正确做法是只用已公开访问器，如 `Event::get_sig_ids()`、`get_msg()`、`EventManager::get_api()` 对应入口。
+
+第三类误用是把 05 册当流程书或参数书读。想理解「事件怎样入队、排序、限速、写出」应去 06 册（`原理见 06-09`、`原理见 06-11`），想配一个 `alert_json` 段或 `event_filter` 应去 04 册（`参数见 04-02`、`参数见 04-08`），想按目录找 logger 模块应去 07 册（`模块见 07-08`、`模块见 07-11`）；反过来，在 06 / 07 / 08 册里看到完整事件字段表属于去重铁律被破坏，应改写成「字段见 05-08」。
+
+第四类是场景前提误判。加密载荷不可见时，`buffs_to_dump` 与规则文本字段不含明文正文；IDS 旁路模式下只告警不丢弃，与 verdict 相关的字段不会被写成 drop；tagged packet 的 `event_reference` 才有非零引用值，普通事件为 0；`head` 为空时走全局 `s_loggers`，`LogList` / `AlertList` 为 nullptr 属正常路径而非字段缺失。把「字段没值」当成「字段定义错误」是最常见的排错弯路，应先确认运行模式与输出绑定方式，再查字段。
+
+第五类是数值与类型误读。`Event::ts_sec`、`ts_usec`、`event_id` 是 `uint32_t`，`event_reference` 同为 `uint32_t`，`file_id` 是 `uint64_t`，跨 32/64 位构建打印时格式符要匹配；`SF_EVENTQ::cur_nodes`、`fails` 是 int / unsigned，`fails` 由 `sfeventq_reset()` 返回而非直接读成员；`LogApi::flags` 是位掩码，判断 logger 类型要用位与而非等值比较。调试时若字段读数与源码声明长期不一致，先用 `snort -V` 核对构建标识、用 `snort -T` 做配置自检（完整参数见 04-07），再核对二进制与头文件是否同一快照。所有涉及吞吐、pps、丢包率、内存占用的结论一律「需在目标机型实测」，不给绝对值；基准方法见 08-01，诊断树见 08-03。
+
+## 05-09 Flow/Session 与内存池、管理器结构字段
+
+### 1. 本篇定位与覆盖范围
+
+本篇是 05 册流与会话层的收尾篇，聚焦 `src/flow/` 与 `src/memory/` 两组目录中的流表管理、会话抽象、HA 状态与内存记账结构，逐字段核对 `src/flow/flow_cache.cc/.h`、`flow_control.cc/.h`、`flow_config.h`、`session.h`、`expect_cache.cc/.h`、`ha.cc/.h`、`flow_data.cc/.h`、`prune_stats.h`，以及 `src/memory/memory_cap.cc/.h`、`memory_allocator.cc/.h`、`memory_config.h`、`heap_interface.cc/.h`。覆盖的结构体族为 `struct FlowCacheConfig`、`struct FlowTypeConfig`、`class FlowCache`、`class FlowControl`、`class Session`、`class ExpectCache`、`class SO_PUBLIC FlowHAState`、`class HAMessage`、`class SO_PUBLIC FlowHAClient`、`class SO_PUBLIC HighAvailabilityManager`、`struct MemoryConfig`、`struct MemoryCounts`、`class SO_PUBLIC MemoryCap`、`struct MemoryAllocator`、`class HeapInterface`。所有字段名、类型、初值与源码行号均取自「上游 master 快照（2026-11 抓取）」的实际头文件，逐条 Read 核实后才写入；`Flow` 本身的基础字段在 05-02 已逐项定义，本篇只在生命周期、超时与内存记账角度引用其中若干成员，`Session` 的协议子类内部状态落在 `src/stream/`，一律写明不透明边界并标注「需对照实际版本核验」。
+
+必须先做一处目录订正，这是本篇最重要的路径事实：**本快照没有独立的 `src/session/` 目录**。会话抽象基类 `class Session` 真实定义在 `src/flow/session.h`，文件头注释写明「Session is an abstract base class for the various protocol subclasses. the subclasses do the actual work of tracking, reassembly, etc.」，它与 `src/flow/flow.h`、`flow_cache.h`、`flow_control.h`、`flow_data.h`、`ha.h` 同处 `src/flow/`；大纲与标题里的 `src/session` 只是沿用旧称的惯用名，正文引用时必须写 `src/flow/session.h` 并标注「需对照实际版本核验」，不得当成真实目录。本篇第 4 节给出 `test -d src/session` 的核验命令，实测返回 ABSENT。同理，各协议会话子类（TcpSession、UdpSession 等）不在 `src/flow/` 展开，而在 `src/stream/tcp/`、`src/stream/udp/`、`src/stream/ip/`、`src/stream/base/`，属不透明句柄，内部布局见对应 `.cc`，不可依赖。
+
+按总纲去重铁律，本篇只讲字段含义、类型、内存布局倾向、生命周期与关联函数入口，**不展开流重组与超时剪枝的状态机**（统一写「原理见 06-05」），**不重列流表与内存相关配置参数**（`stream` / `flow` 的 memcap、`max_flows` 等完整参数归 04 册，统一写「参数见 04-04」「参数见 04-08」）。「读写时机」一列只写「建流期写入」「剪枝期维护」「包线程记账」「配置期填充」这类静态结论。能力边界贯穿全篇：Snort 3 抓包依赖独立 libdaq / DAQ3，`Flow::flow_id` 的注释说明它「provided from the DAQ module or underlying hardware」，值来自 DAQ 而非引擎自造；内联 IPS 的 drop / block 经 DAQ verdict 反馈，Snort 本身不是防火墙、不做转发；加密流量载荷不可见，`Flow::service`、`gadget`、`clouseau` 只记录 inspector / binder / wizard 的识别结果，不代表能读到明文；线程 / 进程模型以实际版本为准，禁止断言「默认 N 线程」，`MemoryCap` 的「主线程 / 包线程」注释只是静态归属。任何吞吐、pps、内存占用结论一律「需在目标机型实测」。流表、会话与内存池的字段归属关系见图 05-09-01，实线为持有与分配关系，虚线为记账与绑定回查；状态机不在图中表达，归「原理见 06-05」。
+
+:::figure id=05-09-01 | name=Flow/Session 与内存池字段归属 | dir=TD
+node a "Packet<br/>packet.h" blue
+node b "FlowControl<br/>flow_control.h" purple
+node c "FlowCache<br/>flow_cache.h" teal
+node d "Flow<br/>flow.h" teal
+node e "Session<br/>flow/session.h" gray
+node f "FlowHAState<br/>ha.h" amber
+node g "ExpectCache<br/>expect_cache.h" gray
+node h "MemoryCap<br/>memory_cap.h" red
+edge a -> b "process 入口"
+edge b -> c "cache 指针"
+edge c -> d "allocate 分配"
+edge d -> e "session 跟踪"
+edge d -> f "ha_state"
+edge d -> h "mem_bytes 记账"
+edge b -> g "exp_cache"
+edge e -> d dashed "flow 成员回指"
+:::
+
+最后说明与相邻篇的边界：`Flow`、`FlowKey`、`FlowData`、`Session` 的基础字段已由 05-02 定义，本篇只在 `Flow` 的生命周期与内存记账角度引用 `expire_time`、`idle_timeout`、`ha_state`、`mem_bytes` 等成员，不重复其完整表；`Packet::flow` 的字段见 05-02，`DAQ_Verdict` 见 05-07；`IpsContext` 见 05-05。`stream` inspector 的重组深度与 PAF 分帧字段归「原理见 06-05」，`src/memory/` 的目录职责归「模块见 07-13」。每个结构都给出不透明边界判断：可在头文件看到完整定义的是 `FlowCacheConfig`、`FlowTypeConfig`、`FlowCache`、`FlowControl`、`Session`、`ExpectCache`、`FlowHAState`、`HAMessage`、`FlowHAClient`、`MemoryConfig`、`MemoryCounts`、`MemoryAllocator`；`HighAvailabilityManager`、`MemoryCap`、`HeapInterface` 是静态门面类或抽象基类，具体堆实现属于不透明句柄，内部布局见对应 `.cc` 与所链接的分配器，需对照实际版本核验。
+
+### 2. 索引与字段总表
+
+下表按「层 → 代表结构 → 权威源码 → 字段归口 → 参数归口 → 原理归口 → 模块归口」给出本层索引。参数归口指流表与内存配置的权威来源，原理归口指流生命周期与剪枝机制讲解的权威来源，模块归口指源码目录介绍的权威来源，三者都不是本册内容，按表反查即可。流与内存层索引对照见下表。
+
+| 层 | 代表结构 | 权威源码 | 字段归口 | 参数归口 | 原理归口 | 模块归口 |
+|---|---|---|---|---|---|---|
+| 流表配置 | FlowCacheConfig | src/flow/flow_config.h | 05-09 | 04-04 | 06-05 | 07-10 |
+| 流表缓存 | FlowCache | src/flow/flow_cache.h | 05-09 | 04-04 | 06-05 | 07-10 |
+| 流控管理 | FlowControl | src/flow/flow_control.h | 05-09 | 04-04 | 06-05 | 07-10 |
+| 会话抽象 | Session | src/flow/session.h | 05-09 | 04-04 | 06-05 | 07-10 |
+| 期望流 | ExpectCache | src/flow/expect_cache.h | 05-09 | 04-04 | 06-05 | 07-10 |
+| 高可用 | FlowHAState | src/flow/ha.h | 05-09 | 04-08 | 06-13 | 07-10 |
+| 内存池 | MemoryCap / MemoryCounts | src/memory/memory_cap.h | 05-09 | 04-08 | 06-13 | 07-13 |
+| 堆接口 | HeapInterface | src/memory/heap_interface.h | 05-09 | 04-08 | 06-13 | 07-13 |
+
+下表收录 `src/flow/flow_config.h` 的 `struct FlowTypeConfig` 与 `struct FlowCacheConfig`，它们是流表容量与超时的配置载体。源码注释写明 `FlowTypeConfig` 由 stream module 配置；初值照抄成员初始化式，可调范围与 Lua 键归 04 册。流表配置字段对照见下表。
+
+| 字段 | 类型 | 含义 | 源码位置 | 读写时机 | 关联函数与流程 | 版本差异 |
+|---|---|---|---|---|---|---|
+| FlowTypeConfig::nominal_timeout | unsigned | 单协议标称超时 | flow_config.h:29 | 配置期写入、建流期读取 | 原理见 06-05 | 初值 0，参数见 04-04 |
+| FlowCacheConfig::max_flows | unsigned | 流表容量上限 | flow_config.h:34 | 配置期写入、剪枝期读取 | `get_max_flows()`；参数见 04-04 | 初值 0，需核验 |
+| FlowCacheConfig::pruning_timeout | unsigned | 剪枝超时阈值 | flow_config.h:35 | 配置期写入 | `prune_idle()`；原理见 06-05 | 初值 0，需核验 |
+| FlowCacheConfig::proto | FlowTypeConfig[] | 各协议超时配置数组 | flow_config.h:36 | 配置期填充 | 下标按 PktType，需核验 | 依赖 PktType::MAX |
+| FlowCacheConfig::prune_flows | unsigned | 单次剪枝流数 | flow_config.h:37 | 配置期写入 | `prune_multiple()`；参数见 04-04 | 初值 0，需核验 |
+| FlowCacheConfig::allowlist_cache | bool | 是否启用允许列表缓存 | flow_config.h:38 | 配置期写入 | `move_to_allowlist()` | 初值 false，需核验 |
+| FlowCacheConfig::move_to_allowlist_on_excess | bool | 超额转允许列表开关 | flow_config.h:40 | 配置期写入 | `is_allowlist_on_excess()` | 条件编译，需核验 |
+| FlowCacheConfig::allowlist_max_excess_flows | unsigned | 允许列表超额上限 | flow_config.h:41 | 配置期写入 | `is_allowlist_on_excess()` | 条件编译，需核验 |
+
+下表收录 `src/flow/flow_cache.h:62` 的 `class FlowCache` 私有数据成员，外加文件顶部的紧凑常量。源码注释写明「there is a FlowCache instance for each protocol. Flows are stored in a ZHash instance by FlowKey」，因此 `hash_table` 是核心字段，`ZHash` 与 `FlowUniList` 在本头文件只有前向声明，属不透明句柄。流表字段对照见下表。
+
+| 字段 | 类型 | 含义 | 源码位置 | 读写时机 | 关联函数与流程 | 版本差异 |
+|---|---|---|---|---|---|---|
+| config | FlowCacheConfig | 流表配置副本 | flow_cache.h:215 | 配置期写入、运行期只读 | `get_flow_cache_config()` | 初值默认构造，需核验 |
+| flags | uint32_t | 流表状态位标志 | flow_cache.h:216 | 运行期置位 | 初值 0，需对照实际版本核验 | 需核验 |
+| hash_table | ZHash* | 流哈希键表指针 | flow_cache.h:218 | 初始化期分配、检索期只读 | `get_flow_table()`；原理见 06-05 | 不透明句柄，见 zhash |
+| uni_flows | FlowUniList* | 单向流链表指针 | flow_cache.h:219 | 建流/剪枝期维护 | `link_uni()` / `unlink_uni()` | 不透明句柄，需核验 |
+| uni_ip_flows | FlowUniList* | 单向 IP 流链表指针 | flow_cache.h:220 | 建流/剪枝期维护 | `uni_ip_flows_size()` | 不透明句柄，需核验 |
+| prune_stats | PruneStats | 剪枝统计 | flow_cache.h:222 | 剪枝期累加 | `get_total_prunes()`；原理见 06-05 | 类型见 prune_stats.h |
+| delete_stats | FlowDeleteStats | 删除统计 | flow_cache.h:223 | 删除期累加 | `get_total_deletes()` | 类型需对照实际版本核验 |
+| empty_lru_mask | uint64_t | 空 LRU 掩码 | flow_cache.h:224 | 剪枝期维护 | `all_lrus_checked()` | 初值 0，需核验 |
+| excess_to_allowlist_count | PegCount | 转允许列表计数 | flow_cache.h:225 | 剪枝期累加 | `get_excess_to_allowlist_count()` | 初值 0，需核验 |
+| released_max_flow_mem | PegCount | 释放的峰值流内存 | flow_cache.h:233 | 释放/退役期采样 | `get_released_max_flow_mem()` | 注释说明按采样，需核验 |
+| released_total_flow_mem | PegCount | 释放的累计流内存 | flow_cache.h:234 | 释放/退役期采样 | `get_released_total_flow_mem()` | 注释说明按采样，需核验 |
+| max_blocked_unlink_per_prune | static const unsigned | 单次剪枝解链上限 | flow_cache.h:212 | 编译期常量 | 值 256，注释见 dev_notes.txt | 需对照实际版本核验 |
+| max_excess_examined_per_prune | static const unsigned | 单次剪枝检查上限 | flow_cache.h:213 | 编译期常量 | 值 256，需核验 | 需对照实际版本核验 |
+
+下表收录 `src/flow/flow_control.h:51` 的 `class FlowControl` 私有数据成员。源码注释写明「this is where all the flow caches are managed and where all flows are processed」，因此 `FlowControl` 是管理器而非数据容器，`cache`、`mem`、`exp_cache` 三个指针指向实际持有数据的对象。流控字段对照见下表。
+
+| 字段 | 类型 | 含义 | 源码位置 | 读写时机 | 关联函数与流程 | 版本差异 |
+|---|---|---|---|---|---|---|
+| get_proto_session | InspectSsnFunc[] | 各协议会话工厂数组 | flow_control.h:125 | 初始化期写入、建流期调用 | `init_proto()`；原理见 06-05 | 下标按 PktType::MAX |
+| num_flows | PegCount | 当前流数量 | flow_control.h:126 | 建流/释放期维护 | `get_flows()`；初值 0 | 需对照实际版本核验 |
+| cache | FlowCache* | 流表缓存指针 | flow_control.h:127 | 构造期分配 | `get_flow_cache()`；初值 nullptr | 需核验 |
+| mem | Flow* | 流内存复用指针 | flow_control.h:128 | 建流期使用 | `process()`；初值 nullptr | 不透明句柄，需核验 |
+| exp_cache | ExpectCache* | 期望流缓存指针 | flow_control.h:129 | 初始化期分配 | `get_exp_cache()`；原理见 06-05 | 初值 nullptr，需核验 |
+| last_pkt_type | PktType | 最近包类型 | flow_control.h:130 | 包处理期写入 | 初值 PktType::NONE | 需对照实际版本核验 |
+
+下表收录 `src/flow/session.h:37` 的 `class Session`。该抽象基类**只有一个数据成员** `flow`，其余全是虚方法，因此字段表以 `flow` 为主，并列出源码 `SESSION_STATS` 宏展开的统计字段（它们由各协议子类的统计数组承载）。会话字段对照见下表。
+
+| 字段 | 类型 | 含义 | 源码位置 | 读写时机 | 关联函数与流程 | 版本差异 |
+|---|---|---|---|---|---|---|
+| flow | snort::Flow* | 回指所属流 | session.h:91 | 构造期写入、跟踪期只读 | `Session(Flow* f)`；字段见 05-02 | 注释标 FIXIT-L 或改引用，需核验 |
+| sessions | PegCount | 当前会话数统计 | session.h:108 | 建流/释放期维护 | `SESSION_STATS_ADD()` 宏 | 宏展开字段，需核验 |
+| max | PegCount | 性能周期内最大会话数 | session.h:109 | 统计期更新 | `SESSION_STATS_ADD()`；原理见 08-01 | 语义见源码注释，需核验 |
+| created | PegCount | 已创建会话跟踪器数 | session.h:110 | 建流期递增 | 宏字段，需对照实际版本核验 | 需核验 |
+| released | PegCount | 已释放会话跟踪器数 | session.h:111 | 释放期递增 | 宏字段，需核验 | 需对照实际版本核验 |
+| timeouts | PegCount | 会话超时数 | session.h:112 | 超时剪枝期递增 | 原理见 06-05 | 需对照实际版本核验 |
+| stale_packets | PegCount | 陈旧包计数 | session.h:114 | 陈旧包期递增 | `count_stale_packet()` | 需对照实际版本核验 |
+
+下表收录 `src/flow/ha.h` 的高可用结构与 `src/flow/expect_cache.h` 的期望流缓存字段。HA 状态挂在 `Flow::ha_state`（flow.h:505）上，期望流缓存由 `FlowControl::exp_cache` 指向；两组都含不透明指针，按源码如实记录。HA 与期望流字段对照见下表。
+
+| 字段 | 类型 | 含义 | 源码位置 | 读写时机 | 关联函数与流程 | 版本差异 |
+|---|---|---|---|---|---|---|
+| FlowHAState::next_update | struct timeval | 下次同步时间 | ha.h:85 | 包处理期维护 | `sync_interval_elapsed()` | 需对照实际版本核验 |
+| FlowHAState::pending | uint16_t | 待同步客户端位 | ha.h:86 | set/clear 期维护 | `set_pending()`；初值 NONE_PENDING | 需核验 |
+| FlowHAState::state | uint8_t | HA 状态位 | ha.h:87 | 事件期置位 | `add()` / `clear()`；初值 NEW\|NEW_SESSION | 转义竖线，需核验 |
+| FlowHAState::min_session_lifetime | static timeval | 最小会话生存期 | ha.h:82 | 配置期写入 | `config_timers()`；参数见 04-08 | 静态成员，需核验 |
+| HAMessage::buffer | uint8_t* | 消息缓冲区指针 | ha.h:118 | 构造期绑定 | `fits()`；原理见 06-13 | 需核验 |
+| HAMessage::buffer_length | const uint32_t | 缓冲区长度 | ha.h:119 | 构造期写入 | `fits()` | 常量成员，需核验 |
+| HAMessage::cursor | uint8_t* | 当前读写游标 | ha.h:120 | produce/consume 期推进 | `advance_cursor()` | 需对照实际版本核验 |
+| FlowHAClient::handle | FlowHAClientHandle | 客户端句柄 | ha.h:133 | 注册期分配 | 初值 0，需核验 | 类型 uint16_t，需核验 |
+| FlowHAClient::index | uint8_t | 客户端索引 | ha.h:134 | 注册期写入 | `finalize_ha_client_indices()` | 初值 0，需核验 |
+| ExpectCache::hash_table | ZHash* | 期望流哈希表 | expect_cache.h:84 | 初始化期分配 | `get_node()`；初值 nullptr | 不透明句柄，需核验 |
+| ExpectCache::nodes | ExpectNode* | 期望节点数组 | expect_cache.h:85 | add_flow 期维护 | 初值 nullptr，需核验 | 需对照实际版本核验 |
+| ExpectCache::pool | snort::ExpectFlow* | 期望流对象池 | expect_cache.h:86 | 初始化期分配 | `get_flow()`；初值 nullptr | 池化，需核验 |
+| ExpectCache::free_list | snort::ExpectFlow* | 空闲对象链 | expect_cache.h:87 | 分配/回收期维护 | 初值 nullptr，需核验 | 需对照实际版本核验 |
+
+下表收录 `src/memory/` 的内存池与记账字段。源码里 `MemoryAllocator::allocate()` 内联调用 `malloc()`、`deallocate()` 内联调用 `free()`，说明默认分配器只是薄封装；真正的容量控制与统计在 `MemoryCap` 与 `MemoryCounts`。内存池字段对照见下表。
+
+| 字段 | 类型 | 含义 | 源码位置 | 读写时机 | 关联函数与流程 | 版本差异 |
+|---|---|---|---|---|---|---|
+| MemoryConfig::cap | size_t | 内存上限字节 | memory_config.h:28 | 配置期写入 | `MemoryCap::start()`；参数见 04-08 | 初值 0，需核验 |
+| MemoryConfig::threshold | unsigned | 回收阈值 | memory_config.h:29 | 配置期写入 | 参数见 04-08 | 初值 0，需核验 |
+| MemoryConfig::interval | unsigned | 统计间隔 | memory_config.h:30 | 配置期写入 | 初值 1000，参数见 04-08 | 需对照实际版本核验 |
+| MemoryConfig::prune_target | unsigned | 回收目标量 | memory_config.h:31 | 配置期写入 | 初值 1048576，需核验 | 需对照实际版本核验 |
+| MemoryConfig::enabled | bool | 内存上限是否启用 | memory_config.h:32 | 配置期写入 | 初值 false，参数见 04-08 | 需对照实际版本核验 |
+| MemoryCounts::start_up_use | PegCount | 启动期内存用量 | memory_cap.h:39 | 启动期写入 | `get_mem_stats()` | 需对照实际版本核验 |
+| MemoryCounts::cur_in_use | PegCount | 当前在用内存 | memory_cap.h:40 | 包线程记账 | `refresh_stats()` | 需对照实际版本核验 |
+| MemoryCounts::max_in_use | PegCount | 峰值在用内存 | memory_cap.h:41 | 包线程记账 | 需对照实际版本核验 | 需在目标机型实测 |
+| MemoryCounts::epochs | PegCount | 统计纪元数 | memory_cap.h:42 | 统计期递增 | `get_process_total()` | 需核验 |
+| MemoryCounts::allocated | PegCount | 分配次数 | memory_cap.h:43 | 分配期递增 | `get_thread_allocs()` | 需对照实际版本核验 |
+| MemoryCounts::deallocated | PegCount | 释放次数 | memory_cap.h:44 | 释放期递增 | `get_thread_allocs()` | 需对照实际版本核验 |
+| MemoryCounts::reap_cycles | PegCount | 回收周期数 | memory_cap.h:45 | 回收期递增 | `free_space()`；原理见 06-13 | 需对照实际版本核验 |
+| MemoryCounts::reap_failures | PegCount | 回收失败数 | memory_cap.h:47 | 回收期递增 | 需对照实际版本核验 | 需对照实际版本核验 |
+| HeapInterface | 抽象类 | 堆统计适配接口 | heap_interface.h:30 | 主线程初始化 | `get_instance()`；原理见 06-13 | 不透明句柄，见对应 .cc |
+
+### 3. 逐项详解
+
+**FlowCacheConfig 与流表容量字段**。`src/flow/flow_config.h` 的两个结构很薄，却是理解流表行为的入口。`FlowTypeConfig` 只有 `unsigned nominal_timeout = 0`，注释写明由 stream module 配置，说明「每协议标称超时」的权威参数在 stream 侧（`参数见 04-04`）。`FlowCacheConfig` 的 `max_flows`、`pruning_timeout`、`prune_flows` 分别对应容量、剪枝超时与单次剪枝数量，`proto[PktType::MAX]` 是按包类型索引的超时数组，下标来自 `PktType` 枚举，因此数组长度随枚举定义变化，不可硬编码。`allowlist_cache` 与条件编译字段 `move_to_allowlist_on_excess`、`allowlist_max_excess_flows` 被 `FlowCache::is_allowlist_on_excess()` 用来判断是否启用「超额转允许列表」路径，该路径还受 `ALLOWLIST_MOVE_ON_EXCESS` 宏控制（宏见 `CMakeLists.txt`，开关名需对照实际版本核验），`REG_TEST` 下的 `allowlist_test_force_enable` 只在测试构建出现。读这些字段时要先确认构建开关，条件编译字段在关闭宏的构建里根本不存在，不是「值为 0」。
+
+**FlowCache 的哈希、链表与统计字段**。`class FlowCache`（`src/flow/flow_cache.h:62`）的私有段按用途分四组。配置与状态：`config`（配置副本）、`flags`（uint32_t，初值 0）。哈希与链表：`hash_table`（`ZHash*`，源码注释明确「Flows are stored in a ZHash instance by FlowKey」）、`uni_flows` 与 `uni_ip_flows`（`FlowUniList*`，单向流链表）；`ZHash` 与 `FlowUniList` 在本头文件只有前向声明，属不透明句柄，内部布局见对应 `.cc`，不可依赖。统计：`prune_stats`（`PruneStats`，类型见 `prune_stats.h`）、`delete_stats`、`empty_lru_mask`（uint64_t）、`excess_to_allowlist_count`（PegCount）。内存记账：`released_max_flow_mem`、`released_total_flow_mem` 两个 PegCount，源码注释特别说明「flow-memory accounting, sampled at release/retire. read Flow::get_mem_usage() directly rather than these pegs for specific flow memory」——这两个 peg 是采样值，不能当作单个流的精确内存，精确值应读 `Flow::get_mem_usage()`（字段见 05-02）。文件顶部还有一组紧凑常量：`max_protocols = PktType::MAX`、`allowlist_lru_index = max_protocols`、`total_lru_count = max_protocols + 1`、`all_lru_mask = (1ULL << max_protocols) - 1`、`first_proto`、`proto_lru_mask`、`rotated_lru_count`，它们位宽与协议枚举绑定，与 LRU 剪枝算法配合（原理见 06-05）。`max_blocked_unlink_per_prune`、`max_excess_examined_per_prune` 两个 static const 均为 256，用来限制单次剪枝遍历不可解链流的代价，注释指向 `dev_notes.txt`，属实现细节，需对照实际版本核验。
+
+**FlowControl 的管理器字段与会话工厂数组**。`class FlowControl`（`src/flow/flow_control.h:51`）是管理器：`get_proto_session[to_utype(PktType::MAX)]` 是 `snort::InspectSsnFunc` 函数指针数组，由 `init_proto(PktType, InspectSsnFunc)` 填充，在 `process()` 建流时按包类型取出对应的会话工厂；这解释了「为什么不同协议会建出不同 Session 子类」——字段只记录工厂映射，具体如何建流属机制（原理见 06-05）。`num_flows`（PegCount，初值 0）是当前流计数，`get_flows()` 返回它；`cache`（FlowCache*）指向实际流表，`get_flow_cache()` 返回；`mem`（Flow*）是流对象复用指针；`exp_cache`（ExpectCache*）指向期望流缓存，服务于 FTP 数据通道这类「预知流」（`add_expected()`、`add_expected_ignore()`、`check_expected_flow()`）；`last_pkt_type`（PktType，初值 NONE）记录最近包类型。注意 `FlowControl` 本身几乎不持有流数据，真正的数据在 `FlowCache` 与 `Flow` 中，读字段时不要把管理器误当容器。`stale_flow_cleanup()`、`apply_flow_state()`、`prune_one()` 等入口只在此列名，状态机归 06-05。
+
+**Session 基类与统计宏字段**。`src/flow/session.h` 的 `class Session` 数据面极简：唯一成员 `public: snort::Flow* flow`（第 91 行，注释标 `FIXIT-L use reference?`），由 protected 构造 `Session(snort::Flow* f) { flow = f; }` 初始化，形成 `Session ↔ Flow` 的双向回指（`Flow::session` 字段见 05-02）。其余全是虚方法：`setup()`、`setup_after_restart()`、`update_direction()`（源码注释说当前只有 UDP 实现，其余调用会 `assert(false)`）、`process()`、`restart()`、`precheck()`、`clear()`（纯虚，子类必须实现）、`cleanup()`、`add_alert()`/`check_alerted()`/`update_alert()`（事件去重相关，原理见 06-09）、`flush()` 系列与 `flush_client()`/`flush_server()`/`flush_talker()`/`flush_listener()`、`set_splitter()`/`set_splitter_with_rescan()`/`get_splitter()`/`get_paf_position()`（分帧相关，原理见 06-05）、`is_sequenced()`/`are_packets_missing()`/`missing_in_reassembled()`（重组状态）等。`SESSION_PEGS(module)`、`SESSION_STATS`、`SESSION_STATS_ADD(stats)` 三个宏把 `sessions`、`max`、`created`、`released`、`timeouts`、`prunes`、`stale_packets` 七个 PegCount 统一到各协议子类的统计数组；源码特别强调 `max` 的语义是「性能周期内的最高值」，跨周期最大值需取各周期上报 max 的最大值，这条语义是读统计字段的关键，需对照实际版本核验。各协议子类的内部状态落在 `src/stream/tcp/`、`udp/`、`ip/`、`base/`，属不透明句柄，内部布局见对应 `.cc`，不可依赖。
+
+**HA 状态与期望流字段**。`src/flow/ha.h` 提供高可用状态机。`FlowHAState` 挂在 `Flow::ha_state`（flow.h:505）上，每个活跃流一个实例；私有字段 `next_update`（timeval）、`pending`（uint16_t，位掩码，初值 `NONE_PENDING = 0x0000`）、`state`（uint8_t，初值 `NEW | NEW_SESSION`）。状态位枚举为 `NEW = 0x01`、`MODIFIED = 0x02`、`DELETED = 0x04`、`STANDBY = 0x08`、`NEW_SESSION = 0x10`，两个静态级别 `CRITICAL = 0x80`、`MAJOR = 0x40`；静态 `min_session_lifetime`、`min_sync_interval` 由 `config_timers()` 设置（参数见 04-08）。`FlowHAClientHandle` 是 uint16_t，`ALL_CLIENTS = 0xffff`，句柄 0 定义为主会话客户端；`FlowHAClient` 的 `handle`、`index`、`max_length` 字段由注册期分配，`HighAvailabilityManager::HA_INDEX_UNASSIGNED = 0xFF` 表示未分配。`HAMessage` 的 `buffer`、`buffer_length`、`cursor` 描述消息缓冲区与游标，`fits()` 做边界检查、`advance_cursor()` 推进——注意 `buffer_length` 是 const 成员，构造后不可改。`ExpectCache`（`src/flow/expect_cache.h:42`）的 `hash_table`、`nodes`、`pool`、`free_list` 四字段是典型的「哈希 + 对象池 + 空闲链」结构，`expects`、`realized`、`prunes`、`overflows` 四个 unsigned long 是统计计数，由 `reset_stats()` 清零；注释说明它用于跟踪 FTP 数据通道这类预知流，命中后用给定信息更新。这些都是字段存在与用途，状态机归原理册。
+
+**内存池与记账字段**。`src/memory/` 的字段可分三层。`MemoryConfig`（`memory_config.h:26`）是纯配置载体：`cap`（size_t，初值 0）、`threshold`（unsigned，初值 0）、`interval`（1000）、`prune_target`（1048576）、`enabled`（false）；初值照抄源码，可调范围与含义归 04 册（`参数见 04-08`）。`MemoryCounts`（`memory_cap.h:37`）是统计载体，二十个 PegCount 分三段：启动/当前/峰值用量（`start_up_use`、`cur_in_use`、`max_in_use`）、纪元与分配释放次数（`epochs`、`allocated`、`deallocated`）、回收周期与结果（`reap_cycles`、`reap_attempts`、`reap_failures`、`reap_aborts`、`reap_decrease`、`reap_increase`），以及只用于报告的 `app_all`、`active`、`resident`、`retained` 和 shim 统计 `dpf_n_*`。`MemoryCap` 与 `HeapInterface` 是门面：`MemoryCap` 全是静态方法，注释按「主线程 / 包线程 / 两者」分组，例如 `set_heap_interface()` 属主线程、`free_space()` 属包线程、`get_mem_stats()` 属两者；`HeapInterface` 的 `main_init()`、`thread_init()`、`get_process_total()`、`get_thread_allocs()` 是纯虚，具体堆实现属不透明句柄，见对应 `.cc` 与所链接分配器。`MemoryAllocator::allocate()` 内联 `malloc()`、析构内联 `free()`，说明默认分配器是薄封装，不要把它误读成自带内存池实现——真正的容量控制由 `MemoryCap` 配合 pruner 完成（原理见 06-13）。读写时机上，配置字段在配置期写，统计字段在包线程记账，门面方法在主线程初始化，三者不可混用线程假设。
+
+### 4. 典型示例
+
+下面这段 C++ 片段用于核对流生命周期与 HA 字段的取值，只读取一个已存在 `Flow` 的超时、内存记账与 HA 状态字段并打印，不触发建流、剪枝或同步流程，便于在本地调试构建里确认字段与头文件一致。示例输出，具体格式需对照实际版本核验。
+
+```cpp
+#include "flow/flow.h"
+#include "flow/ha.h"
+#include <cstdio>
+
+static void dump_flow_lifecycle(const snort::Flow& f)
+{
+    std::printf("expire=%llu idle=%u default=%u\n",
+        (unsigned long long)f.expire_time,
+        f.idle_timeout, f.default_session_timeout);
+    std::printf("flow_id=%llu conn_id=%llu\n",
+        (unsigned long long)f.flow_id,
+        (unsigned long long)f.connection_id);
+    std::printf("mem=%zu peak=%zu ha=%p\n",
+        f.get_mem_usage(), f.get_peak_mem_usage(),
+        static_cast<const void*>(f.ha_state));
+}
+```
+
+在一个接入调试构建、已建立单条 TCP 流的测试桩里，输出类似如下。示例输出，具体格式需对照实际版本核验。
+
+```text
+expire=1762809660 idle=0 default=30
+flow_id=0 conn_id=17
+mem=1024 peak=1024 ha=0x0000000000c40010
+```
+
+逐行判读如下，合计超过 150 字。第一行 `expire=1762809660` 是 `Flow::expire_time`（flow.h:535，uint64_t，初值 0），它是一个绝对时刻而非相对秒数，作为剪枝判据与当前时间比较（原理见 06-05）；`idle=0`、`default=30` 分别是 `idle_timeout` 与 `default_session_timeout`（flow.h:549-550），前者为 0 表示未单独设置空闲超时，后者 30 是 stream 侧下发的标称超时（字段见 05-09 第 2 节、参数见 04-04）。若 `expire_time` 恒为 0 而流仍在，先确认 `set_expire()` 是否被调用，而不是怀疑剪枝逻辑。`flow_id=0` 来自 `Flow::flow_id`（flow.h:551），源码注释说明它「provided from the DAQ module or underlying hardware」，值为 0 常见于 pcap 离线文件这类无硬件流标识的 DAQ module（抓包依赖独立 libdaq，原理见 06-02），属正常；`conn_id=17` 来自 `connection_id`（flow.h:617），注释说明由插件提供，与 flow_id 来源不同，二者不可互换。`mem=1024 peak=1024` 来自私有成员 `mem_bytes`、`peak_mem_bytes`，初值均为 `sizeof(Flow)`（flow.h:613-614），通过 `get_mem_usage()`、`get_peak_mem_usage()` 读取；本例相等说明该流尚未挂接额外 inspector 状态，`add_mem()`/`sub_mem()` 未产生增量；注意 `MemoryCap` 的 `released_*` peg 是采样值，不能用它反推单个流内存。`ha=0x0000000000c40010` 是 `ha_state`（`FlowHAState*`，flow.h:505）指针，非空表示启用 HA（字段见 05-09 第 2 节）；其 `state` 位的含义须回查 `src/flow/ha.h`，不能靠指针非空推断状态。以上只作字段可读性核对，内存与吞吐一律「需在目标机型实测」。字段完整定义见 05-09 本节，流生命周期见「原理见 06-05」，HA 与线程见「原理见 06-13」，目录职责见「模块见 07-10 ｜ 模块见 07-13」。
+
+再给一条目录与字段检索命令，用于复核本篇最关键的目录订正与结构定义，命令按「前置检查 → 执行 → 复核」闭环书写，不改动任何文件。
+
+```bash
+test -d src/flow && echo "flow dir exists"
+test -d src/session && echo "session dir exists" || echo "no standalone session dir"
+grep -n "class Session" src/flow/session.h
+grep -n "FlowHAState\* ha_state" src/flow/flow.h
+grep -n "struct OutputSet" src/managers/event_manager.cc
+```
+
+示例输出，具体格式需对照实际版本核验。
+
+```text
+flow dir exists
+no standalone session dir
+37:class Session
+505:    FlowHAState* ha_state = nullptr;
+61:struct OutputSet
+```
+
+这五行输出逐行印证第 1 节的目录订正：`src/flow/` 存在而 `src/session` 回落到「no standalone session dir」，`class Session` 的真实行号在 `src/flow/session.h:37`，`Flow::ha_state` 在 flow.h:505，同时顺带复核 05-08 的 `OutputSet` 定义在 `event_manager.cc:61`。行号随上游提交漂移，需对照实际版本核验；若 `grep` 无输出，先确认仓库根是否为 `upstream_src/snort3/snort3-master/`。
+
+### 5. 速查表
+
+按「想读某类流/会话/内存信息 → 查哪个字段 → 归口哪一篇」反查，见下表。表中「归口」列指向本篇或权威册；所有涉及机制与参数的列均指向对应权威册，本篇不展开。流与内存字段反查见下表。
+
+| 需求 | 首选字段 | 所在结构 | 归口 |
+|---|---|---|---|
+| 取流容量与超时配置 | max_flows / nominal_timeout | FlowCacheConfig | 05-09 |
+| 取流表哈希与链表 | hash_table / uni_flows | FlowCache | 05-09 |
+| 取剪枝与删除统计 | prune_stats / delete_stats | FlowCache | 05-09 |
+| 取当前流数量 | num_flows | FlowControl | 05-09 |
+| 取会话回指流 | flow | Session | 05-09 |
+| 取会话统计计数 | sessions / max / timeouts | SESSION_STATS 宏 | 05-09 |
+| 取 HA 状态位 | state / pending | FlowHAState | 05-09 |
+| 取期望流对象池 | pool / free_list | ExpectCache | 05-09 |
+| 取内存上限配置 | cap / threshold / enabled | MemoryConfig | 05-09 |
+| 取内存用量统计 | cur_in_use / max_in_use | MemoryCounts | 05-09 |
+| 取流基础字段 | key / client_ip / session | Flow | 05-02 |
+| 查流表配置参数 | 不查字段 | 无 | 参数见 04-04 |
+| 查流重组机制 | 不查字段 | 无 | 原理见 06-05 |
+| 查目录职责 | 不查字段 | 无 | 模块见 07-10 |
+
+统一交叉引用写法为：`字段见 05-09 ｜ 参数见 04-04 ｜ 原理见 06-05 ｜ 模块见 07-10`。涉及 HA 与内存门面时写 `字段见 05-09 ｜ 参数见 04-08 ｜ 原理见 06-13 ｜ 模块见 07-13`。注意全角竖线两侧各留一个空格；单元格内出现逻辑或必须写成转义的 `\|`。本册所有表格都遵守这一约定。
+
+### 6. 版本差异
+
+代际差异首先体现在「谁持有流与会话状态」。Snort 2 用 C 结构体与全局流表，配置来自 `snort.conf`；Snort 3 是从 Snort 2 重写的 C++ 全新实现，配置改为 Lua，把流表管理拆成 `FlowControl`（管理器，`src/flow/flow_control.h`）与 `FlowCache`（缓存，`src/flow/flow_cache.h`）两层，把会话抽象收敛为 `class Session`（`src/flow/session.h`）单一基类、各协议子类落在 `src/stream/`，并用 `FlowData`/`FlowDataStore`（`src/flow/flow_data.h`，字段见 05-02）让 inspector 以 id 挂接自己的状态。因此「在 Session 里找 TCP 会话状态」「去 `src/session/` 找会话定义」都是 Snort 2 习惯，在 3.x 不成立：本快照无独立 `src/session/` 目录，`class Session` 在 `src/flow/session.h`。HA 也是新增能力，`FlowHAState`（`src/flow/ha.h`）挂到 `Flow::ha_state`，涉及 DAQ 通道与客户端注册，具体兼容边界需对照实际版本核验。Lua 取代 `snort.conf`，流表与内存参数归 04 册（`参数见 04-04`、`参数见 04-08`），`tools/snort2lua/` 只是格式转换辅助，不等于字段可直接沿用。插件 ABI 不通用，`SO_PUBLIC` 宏与版本派生见 05-01、05-04。
+
+上游 master 快照（2026-11 抓取）内部的演进痕迹同样明显。`src/flow/session.h` 的 `flow` 成员注释标 `FIXIT-L use reference?`，说明指针改引用仍在讨论；`update_direction()` 里 `assert(false)` 并注明「UDP is currently the only stream that implements this」，反映协议实现的参差。`src/flow/flow_cache.h` 的 `is_allowlist_on_excess()` 被 `#ifdef ALLOWLIST_MOVE_ON_EXCESS` 包裹，`ALLOWLIST_MOVE_ON_EXCESS` 与 `allowlist_admission_scan_cap = 8` 是条件编译痕迹；`max_blocked_unlink_per_prune`、`max_excess_examined_per_prune` 常量注释指向 `dev_notes.txt`，属持续调优项。`src/flow/flow.h` 的 `ha_state`、`flow_id`、`connection_id`、`mem_bytes` 都是后加的字段（字段见 05-02），`FlowHAState` 的 `NEW_SESSION` 位与 `HighAvailabilityManager` 的 `register_ha_client()`（注释要求恰好一个客户端设 `is_session=true`）说明 HA 仍在演进。`src/memory/heap_interface.h` 的多个虚方法有默认实现、`MemoryCap` 的若干入口标注「main thread」与「packet threads」，说明线程归属是设计约定而非数量结论。这些都说明字段集合、顺序与位含义不是冻结的，任何依赖 `sizeof`、偏移、位编号或「声明顺序即业务顺序」的假设都必须标注「需对照实际版本核验」。具体版本号以 `CMakeLists.txt`、`ChangeLog.md` 为准，本套资料不写绝对版本号。
+
+能力边界对字段可读性的影响要再次强调：抓包依赖独立 libdaq / DAQ3，`Flow::flow_id` 来自 DAQ module 或底层硬件，离线 pcap 下常为 0（原理见 06-02）；加密流量载荷不可见，`Flow::service`、`gadget`、`clouseau` 只记录 inspector / binder / wizard 的识别结果，不含明文；内联 IPS 的 drop / block 经 DAQ verdict 反馈，Snort 不是防火墙、不做转发（原理见 06-12）；Hyperscan 是可选加速、缺失回退 `src/search_engines/` 下其他实现，不影响本篇字段；线程 / 进程模型以实际版本为准，禁止断言「默认 N 线程」，`MemoryCap` 的线程分组只是静态归属。流量容量与内存占用类结论一律「需在目标机型实测」，不给绝对值。
+
+### 7. 常见误用与调试
+
+第一类误用是路径想当然，也是本篇最需强调的一条。把会话写成 `src/session/`（真实在 `src/flow/session.h`，本快照无独立目录）、把协议会话子类当成 `src/flow/` 内可见（真实在 `src/stream/tcp/`、`udp/`、`ip/`、`base/`）、把解码写成 `src/decode/`（真实由 `src/codecs/` 与 `src/protocols/packet.cc` 承担）。三者都会在源码检索时扑空，进而误判「结构体不存在」。第 4 节的 `test -d` / `grep -n` 组合是最快确认手段；如结果与本节不符，以 `upstream_src/snort3/snort3-master/` 下实际目录为准并标注「需对照实际版本核验」。
+
+第二类误用是把不透明句柄当普通结构展开。`FlowCache` 里的 `ZHash*`、`FlowUniList*`，`FlowControl` 里的 `ExpectCache*`、`Flow* mem`，`ExpectCache` 里的 `ZHash*`、`ExpectNode*`、`ExpectFlow*`，`HighAvailabilityManager` 的 `PortBitSet* ports`，以及 `HeapInterface` 的具体堆实现，在本头文件都只有前向声明或纯虚接口，属于不透明句柄，内部布局见对应 `.cc` 或 `src/stream/`、`src/utils/`，不可依赖。用 `sizeof()`、指针偏移或 `reinterpret_cast` 去读成员，会在不同构建下静默错位；正确做法是只用公开访问器，如 `FlowCache::get_count()`、`FlowControl::get_flows()`、`Flow::get_mem_usage()`、`MemoryCap::get_mem_stats()`。
+
+第三类误用是把统计 peg 当精确值。`FlowCache::released_max_flow_mem`、`released_total_flow_mem` 的源码注释明确是「sampled at release/retire」，并提示直接读 `Flow::get_mem_usage()` 获取单个流的精确内存；`SESSION_STATS` 的 `max` 语义是「性能周期内最高值」，跨周期最大值要取各周期上报 max 的最大值（源码注释明确此点）；`MemoryCounts::max_in_use` 是进程级峰值，与单流内存不是同一量纲。把采样 peg 当精确值、把周期峰值当全程峰值，是内存排错里最常见的两类数值误读。所有内存与吞吐结论一律「需在目标机型实测」。
+
+第四类是把 05 册当流程书或参数书读。想理解「流怎样建立、超时、剪枝」应去 06 册（`原理见 06-05`），想配 `stream` / `flow` 的 memcap 或 HA 参数应去 04 册（`参数见 04-04`、`参数见 04-08`），想按目录找模块应去 07 册（`模块见 07-10`、`模块见 07-13`）；反过来，在 06 / 07 / 08 册里看到完整流字段表属于去重铁律被破坏，应改写成「字段见 05-09」。
+
+第五类是条件编译与场景前提误判。`FlowCacheConfig` 的 `move_to_allowlist_on_excess`、`allowlist_max_excess_flows` 受 `ALLOWLIST_MOVE_ON_EXCESS` 控制，`allowlist_test_force_enable` 只在 `REG_TEST` 出现，关掉宏的构建里这些字段根本不存在，不是「值为 0」；`Flow::flow_id` 在离线 pcap 下为 0 属正常；HA 未配置时 `ha_state` 可能为空；加密流量下 `service`、`gadget` 只记录元数据而非明文。把「字段不存在/没值」当成「字段定义错误」是最常见的排错弯路，应先确认构建开关与运行模式，再查字段。调试时若字段读数与源码声明长期不一致，先用 `snort -V` 核对构建标识、用 `snort -T` 做配置自检（完整参数见 04-07），再核对二进制与头文件是否同一快照。所有涉及吞吐、pps、丢包率、内存占用的结论一律「需在目标机型实测」，不给绝对值；基准方法见 08-01，诊断树见 08-03。

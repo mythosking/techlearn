@@ -1,0 +1,325 @@
+# SONiC 技术资料 · 03 集成与部署（分片 A）
+## 03-01 最小可用部署：虚拟交换机镜像启动与基本配置
+
+### 1. 目标与拓扑
+
+本篇要完成一件很具体的事：在一台普通的 x86 主机或虚拟机监控器上，把一个 SONiC 虚拟交换机（virtual switch，简称 vs）从镜像启动到能够登录、能够读到首屏状态、能够接受一条最基础的端口配置，并且每一步都给出可核对的预期输出与判读要点。这里的「最小可用」有明确边界：不追求转发性能，不追求业务协议齐全，只要求容器起来、配置库落地、命令行可读、端口状态可观察。之所以选 vs 作为部署教学的起点，是因为它是本套资料反复强调的唯一例外——SONiC 是白盒交换机网络操作系统，数据面在 ASIC，除 `platform/vs/` 虚拟交换机外不做软件转发；vs 用软件模拟转发，让没有真实交换 ASIC 的读者也能把整条启动链路走通，但它的性能数字绝不能外推到真实机型，一切吞吐、时延、收敛结论都需在目标机型实测（基准方法见 08-01）。
+
+从本快照能核实到，虚拟交换机的全部素材集中在 `sonic-buildimage-master/platform/vs/`：这里有 `README.vsvm.md`、`README.vsdocker.md`、`README.gns3.md` 三份启动说明，`create_vnet.sh` 负责在宿主机上造出虚拟网卡与网络命名空间，`docker-sonic-vs.mk`、`docker-sonic-vs.dep`、`docker-syncd-vs.mk`、`docker-gbsyncd-vs.mk` 定义虚拟交换机与虚拟 syncd 镜像的构建规则，`sonic.xml` 与 `sonic_multiasic.xml` 是 libvirt 的虚拟机定义文件，`platform.conf` 与 `one-image.mk`、`raw-image.mk`、`kvm-image.mk` 决定镜像落盘形态。设备侧对应 `device/virtual/x86_64-kvm_x86_64-r0/`，其中有 `asic.conf`、`installer.conf` 与 `vs/platform.json`。也就是说，vs 不是一个凭空出现的软件，而是同一套构建体系在 `PLATFORM=vs` 下的产物；构建环节本身见 02-03 与 02-04，本篇只从「镜像已经具备」往下讲。
+
+拓扑要分两种形态理解，它们共享同一份容器内部逻辑，只是外层承载不同。第一种是 Docker 形态：`README.vsdocker.md` 给出的路径是先用 `create_vnet.sh -n 2 sw` 造出两个前面板端口及对应的 `sw-srv0`、`sw-srv1` 网络命名空间，再用 `docker run --privileged --network container:sw` 启动 `docker-sonic-vs` 容器，使容器共享那组虚拟网卡；第二种是虚拟机形态：`README.vsvm.md` 给出的路径是用 libvirt 的 `virsh create sonic.xml` 创建域，通过 `telnet 127.0.0.1 7000` 的控制台或 `ssh -p 3040 admin@127.0.0.1` 登录，多 ASIC 场景还要先在 `asic.conf` 中写 `NUM_ASIC` 与 `DEV_ID_ASIC_*` 并准备 `topology.sh`。两种形态进入系统之后，看到的都是同一套容器化控制面与 Redis 分层库。
+
+把从镜像到可判读状态的完整链路画出来，虚拟交换机最小部署的处理流程见图 03-01-01。图中 amber 是构建产物，gray 是宿主机侧的外部辅助，teal 是容器与配置管理入口，blue 是输入与数据库，purple 是控制面编排，green 是 syncd 与 SAI，red 是虚拟转发边界。
+
+:::figure id=03-01-01 | name=虚拟交换机最小部署启动与首屏判读链路 | dir=TD
+node n1 "构建 vs 镜像<br/>platform/vs" amber
+node n2 "create_vnet.sh<br/>veth 与 netns" gray
+node n3 "docker-sonic-vs<br/>容器启动" teal
+node n4 "config_db.json<br/>初始化" blue
+node n5 "sonic-cfggen<br/>配置生成" teal
+node n6 "CONFIG_DB" blue
+node n7 "mgrd 与 orchagent" purple
+node n8 "syncd 与 SAI" green
+node n9 "show version<br/>show interfaces" teal
+node n10 "虚拟 ASIC<br/>软件转发" red
+edge n1 -> n2 "准备网络"
+edge n2 -> n3 "共享命名空间"
+edge n3 -> n4 "读取初始配置"
+edge n4 -> n5 "渲染"
+edge n5 -> n6 "写入配置"
+edge n6 -> n7 "订阅消费"
+edge n7 -> n8 "下发对象"
+edge n8 -> n10 "SAI 编程"
+edge n9 -> n6 dashed "只读核对"
+edge n3 -> n9 "提供 CLI"
+:::
+
+图 03-01-01 的关键在于末尾那段虚线：`show version`、`show interfaces` 这类命令只是从各库读状态，并不参与把配置送到虚拟 ASIC。真实生效要走 teal 到 blue 到 purple 到 green 再到 red 的异步流水线，命令返回成功不代表转发已就绪（原理见 06-01 ｜ 排障见 08-03）。本篇所有示例输出均注明「示例输出，具体格式需对照实际版本核验」，取值不得当作真实设备数据引用。
+
+### 2. 前置条件与环境
+
+第一类是镜像与源码前提。按能力边界，镜像构建必须在 `sonic-slave-*/` 构建容器内完成并经 ONIE 安装器产出，普通主机裸 `make` 得不到可安装镜像；vs 形态则按 `platform/vs/one-image.mk`、`kvm-image.mk`、`raw-image.mk` 产出可直接加载的虚拟磁盘或容器镜像。本篇假设读者已经拿到与「上游 master 快照（2026-11 抓取）」对应的镜像，具体版本号以对应构建文件为准、需对照实际版本核验。核验镜像来源是否混杂的一个简单办法是登录后执行 `show version` 看构建提交与时间是否同批，这类内容属于 04-05 的命令全集，本篇只用最小必要子集。
+
+第二类是宿主机能力。Docker 形态需要宿主机具备 `docker` 命令、允许 `--privileged`，并能创建网络命名空间（`ip netns`）；`create_vnet.sh` 会用 `ip link` 建 veth 对并挂到命名空间，因此执行者需要 root 或等价权限。虚拟机形态需要 `libvirt-clients`、`qemu-kvm`、`libvirt-bin`（`README.vsvm.md` 第 3 行给出了 `sudo apt-get install libvirt-clients qemu-kvm libvirt-bin` 的安装示例），并确认 CPU 虚拟化已开启。两种形态都占用不少磁盘与内存，容量与资源规划需在目标机型实测，本篇不给绝对值。
+
+第三类是配置与库前提。系统启动时会读取 `/etc/sonic/config_db.json`（这一默认路径可在 `sonic-utilities-master/config/main.py` 中核实，常量 `DEFAULT_CONFIG_DB_FILE = '/etc/sonic/config_db.json'`），必要时再由 `src/sonic-config-engine/sonic-cfggen` 从 `minigraph.xml` 渲染。Redis 各逻辑库的编号来自运行时 `/var/run/redis/sonic-db/database_config.json`，由 `sonic-py-swsssdk-master/src/swsssdk/dbconnector.py` 的 `SonicDBConfig` 解析，因此本篇不写死「某库是某号」，需要定位时写「参数见 04-04」并注明需对照实际版本核验。`swsscommon` 的实现本体、`sonic-swss-common`、Linux 内核与厂商 SAI 实现均不在本快照，涉及这些部分一律写「不在本快照，需对照实际版本核验」。
+
+第四类是交叉引用约定，先把本篇会反复回查的坐标摆出来，避免后文重复展开：CONFIG_DB 表与 schema 的完整参数见 04-02、04-03，Redis 库对象见 04-04，`show` / `config` 命令全集见 04-05，容器与 supervisord 启动参数见 04-07；`FieldValueTuple`、`SonicDBConfig` 等结构字段见 05-02、05-03；配置流水线与容器编排原理见 06-01、06-13；vs 镜像与容器模块的职责见 02-04、07-02、07-11。统一写成（字段见 05-03 ｜ 参数见 04-05 ｜ 原理见 06-13 ｜ 模块见 07-02），实际行文按具体篇号替换。
+
+### 3. 分步操作
+
+整套操作按「前置检查 → 执行 → 验证输出 → 清理」闭环写，下面以 Docker 形态为主线，虚拟机形态在注释中给出对应动作。所有命令都在宿主机或容器内执行，示例中的镜像名、端口名与地址需对照实际版本与现场规划核验。
+
+第一步，前置检查。在宿主机确认 `docker` 可用、镜像已加载、`create_vnet.sh` 存在且可执行，并检查没有同名容器或命名空间残留。对应 `platform/vs/` 目录应能列出 `create_vnet.sh`、`docker-sonic-vs.mk` 等文件；若镜像尚未构建，回到 02-03、02-04 处理。
+
+第二步，造虚拟网络。执行 `create_vnet.sh -n 2 sw` 创建两个前面板端口，参数 `-n` 指定端口数、`sw` 是容器与命名空间的名字前缀，随后用 `ip netns list` 确认出现 `sw-srv0`、`sw-srv1`。这一步只在 Docker 形态需要；虚拟机形态跳过，改由 `virsh create sonic.xml` 创建域并按 `README.vsvm.md` 用控制台或 SSH 登录。
+
+第三步，启动 vs 容器。用 `docker run --privileged --network container:sw --name vs -d docker-sonic-vs` 启动，`--network container:sw` 让容器共享第二步建好的网络命名空间，前面板端口因此在容器内表现为 `Ethernet0`、`Ethernet4` 等接口（端口编号与命名需对照实际版本核验）。`docker ps` 应看到 `vs` 处于 Up 状态。若使用虚拟机形态，则以 `sudo virsh` 进入交互终端后 `create sonic.xml` 启动，多 ASIC 还需按 `asic.conf` 与 `topology.sh` 先行配置并 `sudo systemctl start topology`。
+
+第四步，进入容器做最小配置。`docker exec -it vs bash` 进入后，`README.vsdocker.md` 给出的两条最小配置是 `config interface ip add Ethernet0 10.0.0.0/31` 与 `config interface startup Ethernet0`，对 `Ethernet4` 做同样配置。这里要注意能力边界：`config` 写入的是 `CONFIG_DB`，后续要经各 `*mgrd` 到 `APPL_DB`、经 `orchagent` 到 `ASIC_DB`、再由 `syncd` 经 SAI 编程，命令返回不等于硬件已下发（原理见 06-01）。
+
+第五步，核对配置落地。用 `show version` 看软件与平台标识，用 `show interfaces status` 看端口的管理态与操作态；必要时再在命名空间侧配好服务器地址，例如 `ip netns exec sw-srv0 ifconfig eth0 10.0.0.1/31`，然后用 `ping` 验证连通。若刚开机或刚做过配置加载，可用 `show platform summary` 辅助查看平台信息，命令名与输出格式需对照实际版本核验。
+
+第六步，清理。教学或验证结束后，按「先停容器、再删网络命名空间」的顺序回收：宿主机上 `docker rm -f vs` 删除 vs 容器，`ip netns del sw-srv0`、`ip netns del sw-srv1` 删除命名空间，`docker rm -f sw` 清理承载网络名的 Debian 容器；虚拟机形态用 `virsh destroy sonic` 与 `virsh undefine sonic` 回收域。清理前确认没有还在跑的验证脚本，避免误删他人环境。
+
+### 4. 验证方法与预期结果
+
+验证分三层：登录与版本层、容器与库层、端口与连通层。只有三层都符合预期，才算「最小可用」达成。下面给出两组带输出的判读示例，每组都按「示例输出，具体格式需对照实际版本核验」标注。
+
+第一组是首屏版本。执行 `show version`。
+
+```bash
+# 前置检查：确认已进入 vs 容器或已通过控制台登录
+which show
+# 执行：读取版本与平台标识
+show version
+# 验证输出见下方 text 块
+# 清理：无需清理，只读命令
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（取值仅为格式示意，不代表任何具体版本）
+SONiC Software Version: SONiC.HEAD.000000-00000000
+Distribution: Debian GNU/Linux 12 (bookworm)
+Kernel: 6.1.0-0-amd64
+Build commit: 0123456789abcdef
+Build date: 2026-11-13 00:00:00 UTC
+Built by: build-host
+Platform: x86_64-kvm_x86_64-r0
+HwSKU: vs
+ASIC: vs
+Uptime: 0 days, 00:07:12
+```
+
+逐行判读如下。第一行是软件版本标识，取值由构建产物决定，本套资料统一以「上游 master 快照（2026-11 抓取）」为基准，示例里的 `SONiC.HEAD.000000-00000000` 只是格式示意，不得当作真实版本号引用，具体版本号以对应构建文件为准、需对照实际版本核验；第二行发行版与第三行内核属于宿主基础系统，Linux 内核源码不在本快照，需对照实际版本核验；第四行构建提交与第五行构建时间用于把当前实例与某次构建对应，同批设备若这两项不一致，通常说明镜像来源混杂；第六行构建主机是排障线索；第七行 `Platform` 为 `x86_64-kvm_x86_64-r0`，与本快照 `device/virtual/x86_64-kvm_x86_64-r0/` 目录对应，说明机型文件加载方向正确；第八行 `HwSKU` 为 `vs`、第九行 `ASIC` 为 `vs`，共同表明这是虚拟交换机而非真实 ASIC，因此转发由软件模拟、性能数字需在目标机型实测，不能拿 vs 的吞吐外推真机；第十行 `Uptime` 反映启动后运行时长，若刚启动却显示很长，往往意味着连到了别的实例。整个输出来自 `sonic-utilities-master/show/main.py` 的 `version` 命令，它经 `swsscommon` 的连接器读取版本与平台信息，属于「CLI 只读状态、不编程 ASIC」的典型体现；`swsscommon` 本体在 `sonic-swss-common`，不在本快照，需对照实际版本核验（模块见 07-06 ｜ 参数见 04-05）。
+
+第二组是端口状态。执行 `show interfaces status`。
+
+```bash
+# 前置检查：确认前面板端口已按第四步配置
+show interfaces status
+# 如需逐端口核对配置来源，可只读查询配置库变量（选项行为需对照实际版本核验）
+sonic-cfggen -d -v "PORT"
+# 清理：只读命令，无需清理
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（取值仅为格式示意）
+Interface   Lanes        Speed   MTU   Alias        Oper  Admin
+Ethernet0   0,1,2,3      40000   9100  Eth1/1       up    up
+Ethernet4   4,5,6,7      40000   9100  Eth1/2       down  up
+```
+
+逐行判读如下。第一行是列头：`Interface` 为端口名，`Lanes` 为物理通道编号，`Speed` 为速率，`MTU` 为最大传输单元，`Alias` 为面板别名，`Oper` 为操作状态，`Admin` 为管理状态；列名与顺序随版本变化，需对照实际版本核验。第二行 `Ethernet0` 的 `Oper` 与 `Admin` 同为 `up`，说明管理上启用且链路已起，是正常的期望结果。第三行 `Ethernet4` 的 `Admin` 为 `up` 但 `Oper` 为 `down`，是「管理已启用、链路未起」的典型特征，在 vs 环境里常因为对端命名空间侧接口未配置或未启用，也可能是 `CONFIG_DB` 的 `PORT` 表未写入、`APPL_DB` 未生成期望状态；正确排障顺序是按库逐段核对，而不是直接判定虚拟 ASIC 故障。示例中的 `Lanes`、`Speed`、`MTU` 数值要与 `device/tencent/x86_64-tencent_tcs8400-r0/config_db.TCS8400-24CC8CD.json` 里 `PORT` 表的 `lanes`、`speed`、`mtu` 字段对应理解，字段名与取值需对照实际版本核验、逐字段含义见 05-02；本快照没有 vs HWSKU 的 `config_db.json`，上面的端口取值仅为格式示意。第二块 `sonic-cfggen -d -v "PORT"` 只读打印配置库里的 `PORT`，`-d` 表示从配置库读取、`-v` 打印变量值，选项可在 `src/sonic-config-engine/sonic-cfggen` 的 `argparse` 段核实；若输出为空，说明 `PORT` 表尚未落地，应回到配置加载环节（原理见 06-03 ｜ 参数见 04-02）。
+
+三种形态的判读结论小结如下：Docker 形态以 `ip netns list` 出现 `sw-srv0`、`sw-srv1`、`docker ps` 显示 `vs` 为 Up、容器内 `show interfaces status` 有端口行、命名空间侧 `ping` 通为最低通过线；虚拟机形态以 `virsh list` 域在运行、控制台或 `ssh -p 3040` 能登录、`show version` 与 `show platform summary` 有正常输出为最低通过线。二者共同的深层判据是配置库确实有表项、期望库与对象库按流水线推进，而不仅是命令行「看起来正常」（排障见 08-03）。
+
+### 5. 常见失败与排错
+
+vs 部署的失败面集中在容器、网络、配置三层，下面按「现象 → 可能原因 → 验证命令 → 修复要点」列出，表中命令名与日志路径需对照实际版本核验，单元格只写语义化简述。
+
+| 现象 | 可能原因 | 验证命令 | 修复要点 |
+|---|---|---|---|
+| `docker run` 报权限错 | 未加 privileged 或用户不在 docker 组 | `docker ps -a` | 按 README 加 privileged |
+| `ip netns list` 无命名空间 | create_vnet.sh 未执行或权限不足 | `ip netns list` | root 重跑脚本 |
+| 容器起来但无 Ethernet0 | 未共享 sw 的网络命名空间 | `docker inspect vs` | 检查 network container 参数 |
+| `show interfaces status` 无端口行 | PORT 表未落到配置库 | `sonic-cfggen -d -v PORT` | 重做配置加载 |
+| 端口 Admin up 但 Oper down | 对端命名空间接口未配或未起 | `ip netns exec sw-srv0 ifconfig` | 配好服务器侧地址并启用 |
+| ping 不通 | 地址掩码或默认路由写错 | `ip netns exec sw-srv0 ip route` | 按 README 修路由 |
+| `config` 返回成功但状态不变 | 异步流水线尚未推进 | 逐段查 APPL_DB 与 ASIC_DB | 按库核对，勿判硬件故障 |
+| `show version` 取值异常 | 镜像来源混杂或连错实例 | `show version`、`uptime` | 核对构建提交与 Uptime |
+
+第一类失败是容器层。`docker run` 若缺少 `--privileged`，虚拟交换机无法操作宿主机网络资源，往往直接失败；`--network container:sw` 漏写则容器看不到前面板端口，表现为 `show interfaces status` 没有期望的 `Ethernet0`、`Ethernet4`。修复要点是回到 `README.vsdocker.md` 逐字核对命令，而不是改镜像。若容器反复重启，要用 `docker logs vs` 看启动日志，日志格式与路径需对照实际版本核验（参数见 04-08）。
+
+第二类失败是网络层。`create_vnet.sh -n 2 sw` 依赖 `ip link` 与命名空间能力，权限不足或宿主机缺少 `iproute2` 都会导致 `ip netns list` 为空；命名空间建好后若服务器侧接口未配置，`README.vsdocker.md` 示例里的 `10.0.0.1/31` 与默认路由缺失，就会出现端口 `Oper down` 或 `ping` 不通。修复顺序是先确认命名空间存在，再确认容器内端口存在，最后确认两侧地址与路由成对出现。
+
+第三类失败是配置层，也是最容易误判的一类。`config interface ip add` 返回成功只表示配置写进 `CONFIG_DB`，若等一会儿 `show interfaces status` 仍无变化，正确做法是按 `CONFIG_DB`、`APPL_DB`、`ASIC_DB`、`STATE_DB` 顺序逐段核对，并确认各 `*mgrd`、`orchagent`、`syncd` 进程在跑；不能把「命令成功」等同于「硬件已下发」。`config_db.json` 若为非法 JSON，配置加载会在 `sonic-cfggen -j ... --write-to-db` 环节失败，此时应先用 `python -m json.tool` 校验文件格式，再核对字段名；表结构见 04-02、04-03，字段含义见 05-02。需要强调的是，Redis 库编号须对照 `sonic-py-swsssdk/src/swsssdk/dbconnector.py` 的 `SonicDBConfig` 与实际版本核验，本篇一律不写死编号（原理见 06-02）。
+
+第四类是事实边界陷阱。排障时不得把 vs 的软件转发等同于真实 ASIC 转发，也不得把 `orchagent` 写成直接读写寄存器；厂商 SAI 实现、FRR 协议源码、`sonic-swss-common` 与 Linux 内核都不在本快照，涉及这些部分写「不在本快照，需对照实际版本核验」，不得编造文件与版本。`warmrestart/`、多 ASIC 命名空间与 chassis 能力受平台与版本限制，vs 上的表现不能代表真机，需对照实际版本核验（模块见 07-04 ｜ 原理见 06-10 ｜ 06-11）。
+
+### 6. 小结
+
+本篇把虚拟交换机从镜像到最小可用走成了闭环：先按 `platform/vs/` 与 `device/virtual/x86_64-kvm_x86_64-r0/` 确认镜像与机型前提，再以 Docker 形态的 `create_vnet.sh`、`docker-sonic-vs` 或虚拟机形态的 `virsh create sonic.xml` 启动，用 `config interface ip add` 与 `config interface startup` 做最小配置，最后用 `show version`、`show interfaces status` 与按库核对完成判读，并以 `docker rm -f`、`ip netns del` 或 `virsh destroy` 收尾。图 03-01-01 与两张表把启动链路、失败面与判读顺序固定下来，核心结论只有一句：命令返回不等于生效，状态要按库逐段查。
+
+需要再次提醒的是能力边界：SONiC 是白盒交换机 NOS，控制面容器化、数据面在 ASIC，vs 只是用于开发与测试的软件转发例外，性能数字需在目标机型实测；Redis 库编号来自运行时 `database_config.json` 而非源码常量，须对照 `SonicDBConfig` 核验；CLI 只读写各库、不编程 ASIC；构建依赖 `sonic-slave-*/` 与 ONIE 安装器，普通主机裸 `make` 得不到可安装镜像。本篇涉及的命令全集见 04-05、容器启动参数见 04-07（字段见 05-03 ｜ 参数见 04-05 ｜ 原理见 06-13 ｜ 模块见 07-02）。
+
+下一篇 03-02 将把本篇里一带而过的「配置从哪来」展开：讲清 `/etc/sonic/config_db.json` 的落位、`minigraph.xml` 经 `src/sonic-config-engine/` 转换为配置库的全过程，以及 `config save` / `config load` / `config load_minigraph` 的闭环用法；表结构留在 04-02、04-03，字段含义留在 05 册，原理留在 06 册，跨册引用统一用（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）的写法，其中 `xx` 替换为具体篇号。版本基准始终为「上游 master 快照（2026-11 抓取）」，不写绝对版本号与 Redis DB 编号。
+
+## 03-02 CONFIG_DB 与 minigraph / config_db.json 落地
+
+### 1. 目标与拓扑
+
+本篇要回答部署环节最容易被含糊带过的问题：配置到底从哪里来、以什么形态落在哪里、落地之后又怎样变成运行状态。所谓「落地」在本套资料里有两层含义。第一层是把人的意图写成 `CONFIG_DB` 里的表项，载体可以是开机时预置的 `/etc/sonic/config_db.json`，也可以是描述整机拓扑的 `minigraph.xml` 经配置生成引擎渲染后的结果；第二层是这些表项被后续进程逐段翻译，经各 `*mgrd` 到 `APPL_DB`、经 `orchagent` 到 `ASIC_DB`、再由 `syncd` 经 SAI 编程，最终反映到 `STATE_DB` 与 `show` 输出。只完成第一层就说「配置已生效」是错误的，因为 SONiC 的配置链路是异步流水线，`config` 返回成功不代表硬件已下发（原理见 06-01 ｜ 排障见 08-03）。
+
+先明确三份关键输入各自的职责。`minigraph.xml` 是拓扑与设备关系的描述文件，本快照可在 `device/inventec/x86_64-inventec_d6254qs-r0/minigraph.xml` 等机型目录核实其存在；`port_config.ini` 一类端口文件描述端口到通道的映射，由 `src/sonic-config-engine/portconfig.py` 解析；`config_db.json` 则是可以直接写进配置库的 JSON 文件，本快照在 `device/tencent/x86_64-tencent_tcs8400-r0/config_db.TCS8400-24CC8CD.json` 中能核实到 `DEVICE_METADATA`、`PORT` 等表及字段。三者不是互斥关系：`minigraph.xml` 加端口文件经 `sonic-cfggen` 可以渲染出 `config_db.json`，`config_db.json` 经 `sonic-cfggen -j ... --write-to-db` 写进 `CONFIG_DB`；反过来，`config save` 又可以把当前配置库导出为 `config_db.json`，形成双向闭环。
+
+落地的落点需要精确。本快照 `sonic-utilities-master/config/main.py` 中可核实的常量是 `SONIC_CFGGEN_PATH = '/usr/local/bin/sonic-cfggen'` 与 `DEFAULT_CONFIG_DB_FILE = '/etc/sonic/config_db.json'`，`save()` 的逻辑是执行 `sonic-cfggen -d --print-data > 文件`，`load()` 的逻辑是执行 `sonic-cfggen -j 文件 --write-to-db`，多 ASIC 时还会有 `/etc/sonic/config_db{NS}.json` 对应各命名空间。这一实现细节说明两件事：其一，`config_db.json` 的默认路径是配置库导出的「快照文件」，不是芯片配置本身；其二，真正把 JSON 变成库表项的是 `sonic-cfggen`。Redis 各逻辑库的编号来自运行时 `/var/run/redis/sonic-db/database_config.json`，由 `sonic-py-swsssdk-master/src/swsssdk/dbconnector.py` 的 `SonicDBConfig` 解析，本篇不写死编号（参数见 04-04）。
+
+从输入到可判读状态的完整落地链路见图 03-02-01。图中 blue 是输入与数据库，teal 是配置管理与生成工具，amber 是中间状态库，green 是运行时状态与只读判读；虚线表示 `config save` 从配置库反向导出文件。
+
+:::figure id=03-02-01 | name=minigraph 与 config_db.json 到 CONFIG_DB 的落地链路 | dir=TD
+node n1 "minigraph.xml<br/>拓扑描述" blue
+node n2 "port_config.ini<br/>端口映射" blue
+node n3 "sonic-cfggen<br/>minigraph.py" teal
+node n4 "config_db.json<br/>/etc/sonic" blue
+node n5 "config load<br/>写库" teal
+node n6 "CONFIG_DB" blue
+node n7 "config save<br/>导出备份" teal
+node n8 "各 mgrd<br/>cfgmgr" teal
+node n9 "APPL_DB 与 ASIC_DB" amber
+node n10 "STATE_DB<br/>show 判读" green
+edge n1 -> n3 "解析拓扑"
+edge n2 -> n3 "端口映射"
+edge n3 -> n4 "渲染 JSON"
+edge n4 -> n5 "加载"
+edge n5 -> n6 "写入表项"
+edge n6 -> n8 "订阅变更"
+edge n8 -> n9 "逐段翻译"
+edge n9 -> n10 "回写状态"
+edge n6 -> n7 dashed "读取配置"
+edge n7 -> n4 dashed "导出到文件"
+:::
+
+图 03-02-01 里最容易写反的是「config_db.json → CONFIG_DB」这一条：它是把文件内容写进配置库，不是把配置直接送到 ASIC。真正的变化要沿 teal、teal、amber、green 继续往下走，且每一步都由不同进程异步驱动（原理见 06-02 ｜ 原理见 06-03）。本篇所有示例输出均注明「示例输出，具体格式需对照实际版本核验」，取值不得当作真实设备数据引用。
+
+### 2. 前置条件与环境
+
+第一类是生成引擎的可核验文件。`sonic-buildimage-master/src/sonic-config-engine/` 下有 `minigraph.py`、`minigraph_ext.py`、`portconfig.py`、`sonic-cfggen`、`config_samples.py` 与 `tests/` 等。其中 `minigraph.py` 可核实到 `parse_device()`、`parse_dpg()`、`parse_cpg()`、`parse_png()`、`parse_chassis_deviceinfo()` 等解析入口，并 `from portconfig import get_port_config`；`minigraph_ext.py` 提供 `parse_xml()`；`portconfig.py` 提供 `get_port_config()`、`parse_port_config_file()`、`get_system_port_config()`、`parse_platform_json_file()`、`get_breakout_mode()`、`get_child_ports()`。`sonic-cfggen` 顶部导入了 `minigraph_encoder`、`parse_device_desc_xml`、`get_port_config` 与 `swsscommon.swsscommon` 的 `ConfigDBConnector`、`SonicDBConfig`、`ConfigDBPipeConnector`，说明它同时具备「解析输入」与「写配置库」两种能力。`swsscommon` 本体在 `sonic-swss-common`，不在本快照，需对照实际版本核验（模块见 07-05 ｜ 参数见 04-02）。
+
+第二类是 `sonic-cfggen` 的选项。其 `argparse` 段可核实到 `-m/--minigraph`（带 `const='/etc/sonic/minigraph.xml'`）、`-Y/--yang`（默认 `/etc/sonic/config_yang.json`）、`-k/--hwsku`、`-p/--port-config`（注释写明 used with -m or -k）、`-n/--namespace`、`-j/--json`、`-d/--from-db`、`-t/--template`、`-v/--var`、`--var-json`、`--print-data`、`-w/--write-to-db`、`-T/--template_dir`、`-a/--additional-data`、`-y/--yaml`、`-s/--redis-unix-sock-file`、`-K/--key`。脚本注释还给出三条典型用法：`sonic-cfggen -m -t /usr/share/template/bgpd.conf.j2` 渲染模板、`sonic-cfggen -d --print-data > db_dump.json` 导出配置库、`sonic-cfggen -j db_dump.json --write-to-db` 把 JSON 写回。本篇只使用这几条的最小子集，完整参数见 04-02 与 04-05。
+
+第三类是文件与目录前提。系统侧应有 `/etc/sonic/minigraph.xml`（`-m` 的默认值）、`/etc/sonic/config_db.json`（配置导出默认文件）与 `/usr/local/bin/sonic-cfggen`（`config main.py` 中的路径）；机型侧的本快照可核验样例包括 `device/tencent/x86_64-tencent_tcs8400-r0/config_db.TCS8400-24CC8CD.json` 与 `device/inventec/x86_64-inventec_d6254qs-r0/minigraph.xml`，虚拟交换机侧则是 `device/virtual/x86_64-kvm_x86_64-r0/vs/platform.json`。要注意：vs 的 HWSKU 目录里没有 `config_db.json`，因此本文示例中的端口取值只作格式示意，真实字段需对照实际版本核验；`DEVICE_METADATA`、`PORT` 等表名可在上述腾讯机型文件中核实。
+
+第四类是交叉引用与事实纪律。CONFIG_DB 表与 schema 全集见 04-02、04-03，Redis 库对象见 04-04，`show` / `config` 命令全集见 04-05；`FieldValueTuple` 与 `SonicDBConfig` 字段见 05-02、05-03；配置流水线、mgrd 校验与 orchagent 调度原理见 06-01、06-02、06-03、06-04；YANG 与 translib 管理面见 06-14、07-07。涉及 FRR 协议源码、Linux 内核、厂商 SAI 实现与 `sonic-swss-common` 时写「不在本快照，需对照实际版本核验」，涉及库编号时写「参数见 04-04」并注明需对照实际版本核验。统一写成（字段见 05-03 ｜ 参数见 04-02 ｜ 原理见 06-03 ｜ 模块见 07-05）。
+
+### 3. 分步操作
+
+所有操作按「前置检查 → 执行 → 验证输出 → 清理」闭环写。为便于对照，下面把三条路径并列：从已有 `config_db.json` 加载、从 `minigraph.xml` 重新生成、手工调用 `sonic-cfggen` 渲染并写库。命令名、路径与选项需对照实际版本核验。
+
+第一步，前置检查。确认 `sonic-cfggen` 在 `/usr/local/bin/sonic-cfggen`，确认 `/etc/sonic/config_db.json` 存在且为合法 JSON（可用 `python -m json.tool /etc/sonic/config_db.json > /dev/null` 校验），确认 `minigraph.xml` 与端口文件存在。若文件缺失，不要凭印象补写字段，应回到 `src/sonic-config-engine/` 与 `device/<vendor>/<hwsku>/` 核对来源。
+
+第二步，从已有 JSON 加载。执行 `config load`，它默认读取 `/etc/sonic/config_db.json`，内部按 `config main.py` 的逻辑调用 `sonic-cfggen -j /etc/sonic/config_db.json --write-to-db`；带 `-y` 可跳过确认提示，指定文件名则读指定文件，多 ASIC 场景需要按命名空间提供多个文件，文件数量不匹配会直接报错。执行前系统会提示现有配置将被覆盖，生产中应先备份（参数见 04-05）。
+
+第三步，从 minigraph 重新生成。执行 `config load_minigraph`，`config main.py` 中该命令的文档字符串是 Reconfigure based on minigraph，它会停止相关服务、按命名空间从 minigraph 生成配置再写库；若带 `--override-config` 一类选项还会先做 golden config 的校验与依赖检查，选项行为需对照实际版本核验。这条路径适合机型或拓扑变更后的重新落地，但会中断业务，须在维护窗口执行（原理见 06-13）。
+
+第四步，手工渲染并写库。执行 `sonic-cfggen -m /etc/sonic/minigraph.xml -k <hwsku> -p <port_config.ini> --print-data > /tmp/config_db.json`，先用 `-m` 指定拓扑、`-k` 指定 HwSKU、`-p` 指定端口文件，把渲染结果落到临时文件；核对无误后再执行 `sonic-cfggen -j /tmp/config_db.json --write-to-db` 写入配置库。`-p` 与 `-m` 或 `-k` 配套使用是脚本注释中写明的约束，`<hwsku>` 与 `<port_config.ini>` 的具体取值需对照现场机型目录核验。
+
+第五步，验证输出。用 `sonic-cfggen -d -v "DEVICE_METADATA.localhost.hostname"` 只读打印某个变量，确认目标字段已进入配置库；用 `sonic-cfggen -d --print-data | head` 查看配置库导出的前几行；再用 `show interfaces status` 观察端口是否按配置呈现管理态。若字段为空，说明第二到第四步没有真正写库，应按第六步的排错顺序定位。
+
+第六步，清理与持久化。删除临时文件 `rm -f /tmp/config_db.json`；若希望把当前运行状态固化，执行 `config save` 导出到 `/etc/sonic/config_db.json`（其内部是 `sonic-cfggen -d --print-data > 文件`），这样下次 `config load` 可复现；验证结束后用只读命令复核即可，无需清理配置库本身。要特别区分：`config save` 导出的是配置库快照，不是 ASIC 状态，不能作为「硬件已编程」的证据（原理见 06-01）。
+
+### 4. 验证方法与预期结果
+
+验证的核心是回答三个问题：渲染是否产出合法 JSON、JSON 是否真的进了配置库、进库之后是否按流水线推进。下面给出两组带输出的判读示例。
+
+第一组是 minigraph 渲染。执行并观察输出。
+
+```bash
+# 前置检查：确认输入文件存在
+ls -l /etc/sonic/minigraph.xml /usr/local/bin/sonic-cfggen
+# 执行：渲染为 JSON 并落临时文件
+sonic-cfggen -m /etc/sonic/minigraph.xml -k sample-hwsku -p /usr/share/sonic/hwsku/port_config.ini --print-data > /tmp/config_db.json
+# 验证输出见下方 text 与 json 块
+python -m json.tool /tmp/config_db.json > /dev/null && echo JSON_OK
+# 清理：核对后删除临时文件
+rm -f /tmp/config_db.json
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（下列取值仅为格式示意）
+-rwxr-xr-x 1 root root 45120 Nov 13 20:14 /usr/local/bin/sonic-cfggen
+-rw-r--r-- 1 root root 18234 Nov 13 20:14 /etc/sonic/minigraph.xml
+JSON_OK
+```
+
+```json
+{
+    "DEVICE_METADATA": {
+        "localhost": {
+            "hwsku": "sample-hwsku",
+            "platform": "x86_64-kvm_x86_64-r0",
+            "hostname": "sonic"
+        }
+    },
+    "PORT": {
+        "Ethernet0": {
+            "lanes": "0,1,2,3",
+            "alias": "Eth1/1",
+            "speed": "40000",
+            "admin_status": "up",
+            "mtu": "9100"
+        }
+    }
+}
+```
+
+逐行判读如下。第一块前两行是 `ls -l` 的结果，确认 `sonic-cfggen` 可执行且 `minigraph.xml` 非空；若其中任一文件缺失，`-m` 使用的默认路径 `/etc/sonic/minigraph.xml` 就取不到输入，渲染必然失败，此时应回到 `device/<vendor>/<hwsku>/` 与 `src/sonic-config-engine/` 核验来源，而不是改命令行硬凑。第三行 `JSON_OK` 来自 `python -m json.tool` 的成功返回，说明渲染产物是合法 JSON；这一步只用标准 Python 工具，不依赖 SONiC 组件，是隔离「渲染逻辑错」与「JSON 格式错」的有效手段。第二块是渲染结果的结构示意：`DEVICE_METADATA` 表以 `localhost` 为键，`hwsku`、`platform`、`hostname` 描述整机身份，其中 `platform` 取值指向本快照 `device/virtual/x86_64-kvm_x86_64-r0/` 一类目录；`PORT` 表以端口名为键，`lanes`、`alias`、`speed`、`admin_status`、`mtu` 与 `device/tencent/x86_64-tencent_tcs8400-r0/config_db.TCS8400-24CC8CD.json` 中可核实的字段同名，表名与字段需对照实际版本核验，逐字段含义见 05-02。这里最关键的判读要点是：`--print-data` 只是把渲染结果打印到标准输出并重定向到文件，它还没有写进配置库，必须再经 `config load` 或 `-j ... --write-to-db` 才完成落地；把「渲染出 JSON」当成「配置已生效」是常见误判。示例中 `sample-hwsku`、`Ethernet0` 与具体数值均为格式示意，需对照实际版本核验（参数见 04-02 ｜ 模块见 07-05）。
+
+第二组是配置库落地与导出。执行并观察提示。
+
+```bash
+# 前置检查：确认 JSON 合法且已备份当前配置
+cp /etc/sonic/config_db.json /etc/sonic/config_db.json.bak
+# 执行：把 JSON 写进配置库
+config load -y /etc/sonic/config_db.json
+# 验证：只读查询配置库变量与导出前几行
+sonic-cfggen -d -v "DEVICE_METADATA.localhost.hostname"
+sonic-cfggen -d --print-data | head -n 5
+# 清理与持久化：导出当前配置库快照
+config save -y
+rm -f /etc/sonic/config_db.json.bak
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（下列取值仅为格式示意）
+Loading config from '/etc/sonic/config_db.json'...
+sonic
+{
+    "DEVICE_METADATA": {
+        "localhost": {
+            "hostname": "sonic",
+```
+
+逐行判读如下。第一行是 `config load` 的提示，表明命令读取了指定文件；`config main.py` 中 `load()` 的真实动作是拼出 `sonic-cfggen -j 文件 --write-to-db` 并执行，因此这条提示只说明「开始加载」，并不代表所有表项已写入，更不能代表 ASIC 已编程。第二行 `sonic` 是 `sonic-cfggen -d -v "DEVICE_METADATA.localhost.hostname"` 的返回值，`-d` 表示从配置库读取、`-v` 打印变量值，能取到值说明该字段确实落进了 `CONFIG_DB`；若返回空行，往往是文件未写库、字段名拼写不符或查询的库与写入的命名空间不一致，需按 `CONFIG_DB`、`APPL_DB`、`ASIC_DB` 顺序逐段核对（原理见 06-01 ｜ 排障见 08-03）。第三到第六行是 `sonic-cfggen -d --print-data | head -n 5` 的截断输出，能看到 `DEVICE_METADATA` 与 `localhost` 键已经开始出现，说明导出链路正常；`--print-data` 的选项行为可在 `src/sonic-config-engine/sonic-cfggen` 的 `argparse` 段核实。需要强调两点：一是 `config save` 内部执行的是 `sonic-cfggen -d --print-data > /etc/sonic/config_db.json`，它导出的是配置库快照，不是运行状态，也不是芯片状态；二是 `config load` 之后若 `show interfaces status` 长时间没有反映，应检查各 `*mgrd` 是否把表项翻译成 `APPL_DB` 意图、`orchagent` 是否消费并写入 `ASIC_DB`，而不是反复执行 `config load`（原理见 06-03 ｜ 06-04）。示例中的提示文字与输出格式需对照实际版本核验（参数见 04-05）。
+
+三种落地方式的差异可归纳为一张对照表，表中命令与选项需对照实际版本核验，单元格只写语义化简述。
+
+| 落地方式 | 输入来源 | 内部动作 | 适用场景 | 风险提示 |
+|---|---|---|---|---|
+| config load | config_db.json | sonic-cfggen -j 写库 | 已有配置快照需恢复 | 覆盖现有配置 |
+| config load_minigraph | minigraph 与端口文件 | 停服务后重新生成写库 | 机型或拓扑变更 | 中断业务 |
+| 手工 sonic-cfggen | minigraph 与端口文件 | 先 print-data 再 -j 写库 | 需要先审渲染结果 | 选项需核验 |
+| config save | 当前配置库 | sonic-cfggen -d 导出 | 备份与持久化 | 非芯片状态 |
+
+第一种 `config load` 最常用，适合把已知正确的配置快照恢复进来，但会覆盖当前配置，生产环境必须先备份。第二种 `config load_minigraph` 会按 `config main.py` 的逻辑先停止相关服务再重新生成，适合整机拓扑或 HWSKU 变化后的重新落地，必须在维护窗口执行；其 `--override-config` 一类选项会触发 golden config 校验，具体名称与行为需对照实际版本核验。第三种手工方式把渲染与写库拆成两步，优点是可以在写库前审 `--print-data` 的结果，适合排障与教学，缺点是 `-m`、`-k`、`-p` 的组合必须正确，脚本注释明确 `-p` 要与 `-m` 或 `-k` 配套。第四种 `config save` 是反向导出，用于备份与持久化，务必记住它导出的是配置库内容而非 ASIC 状态（排障见 08-03 ｜ 上线清单见 08-06）。
+
+### 5. 常见失败与排错
+
+落地环节的失败可以按「渲染、写库、生效、事实边界」四层定位，下表按「现象 → 可能原因 → 验证命令 → 修复要点」列出，命令名与路径需对照实际版本核验。
+
+| 现象 | 可能原因 | 验证命令 | 修复要点 |
+|---|---|---|---|
+| --print-data 输出为空 | minigraph 或 HWSKU 不匹配 | ls 与 -v 变量 | 核对 device 目录 |
+| JSON 校验失败 | 手工编辑破坏格式 | python -m json.tool | 从配置库重新导出 |
+| config load 报文件不存在 | 路径或文件名不符 | ls /etc/sonic | 核对默认路径 |
+| 写库后 -v 取值为空 | 未真正写库或字段错 | sonic-cfggen -d -v | 重做 -j 写库 |
+| 端口状态无变化 | 流水线尚未推进 | 逐段查 APPL_DB 与 ASIC_DB | 按库核对 |
+| 多 ASIC 报文件数不符 | 命名空间文件不齐 | 检查 config_db*.json | 补齐各 ASIC 文件 |
+| config save 导出为空 | 配置库无表项 | sonic-cfggen -d --print-data | 先完成落地 |
+| 引用了不存在的字段 | 凭印象补表名 | 对照 config_db 样例 | 标注需核验 |
+
+第一类失败在渲染层。`--print-data` 输出为空或报解析错，通常是 `-m` 指向的 `minigraph.xml` 与 `-k` 指定的 HwSKU、`-p` 指定的端口文件不匹配，或机型目录根本没有相应文件。这里要回到 `src/sonic-config-engine/minigraph.py`、`portconfig.py` 与 `device/<vendor>/<hwsku>/` 核对，而不是改字段名硬凑。`minigraph.py` 的 `parse_device()`、`parse_dpg()`、`parse_cpg()` 与 `portconfig.py` 的 `get_port_config()`、`parse_port_config_file()` 是解析主入口，函数名后缀与签名需对照实际版本核验（字段见 05-09 ｜ 模块见 07-10）。
+
+第二类失败在写库层。`config load` 报文件不存在，多半是默认路径 `/etc/sonic/config_db.json` 与现场实际路径不一致，或多 ASIC 场景下只给了一个文件而系统期望多个。本快照 `config main.py` 的 `save()` 与 `load()` 都按 `num_cfg_file` 计算期望文件数量，单 ASIC 为一个、多 ASIC 为宿主加各命名空间多个，文件数量不匹配会直接提示并 return；具体数量与命名需对照实际版本核验。若 JSON 校验失败，说明文件被手工编辑破坏，最稳妥的修复是从配置库重新 `config save` 导出，而不是逐字段猜测修复。
+
+第三类失败在生效层，也是最容易写反的一层。`config load` 返回成功且 `-v` 能取到值，只说明配置库有表项；若 `show interfaces status` 长时间没有按配置呈现，必须按 `CONFIG_DB`、`APPL_DB`、`ASIC_DB`、`STATE_DB` 顺序核对，并确认 `cfgmgr/` 下各 `*mgrd` 已订阅、`orchagent/` 已消费、`syncd/` 已编程。任何把「写库成功」写成「硬件已下发」的表述都是错误的（原理见 06-01 ｜ 06-03 ｜ 06-04 ｜ 06-05）。收敛时间、配置下发时延等一切数字需在目标机型实测，本篇不给绝对值。
+
+第四类是事实边界陷阱。Redis 库编号须对照 `sonic-py-swsssdk/src/swsssdk/dbconnector.py` 的 `SonicDBConfig` 与运行时 `database_config.json` 核验，不得写死；CONFIG_DB 表名与字段只能引用本快照可核实的文件，例如 `device/tencent/x86_64-tencent_tcs8400-r0/config_db.TCS8400-24CC8CD.json` 中的 `DEVICE_METADATA`、`PORT`，其余写「需对照实际版本核验」并给出 `src/sonic-config-engine/`、`cfgmgr/` 等目录。YANG 模型与 translib 转换在 `sonic-mgmt-common-master/models/yang/`、`translib/`，它们最终同样落到 `CONFIG_DB`，但键名与转换规则需对照实际版本核验（原理见 06-14 ｜ 模块见 07-07）。FRR 协议源码、Linux 内核、厂商 SAI 实现与 `sonic-swss-common` 不在本快照，涉及时写「不在本快照，需对照实际版本核验」；`warmrestart/`、多 ASIC 与 chassis 能力受平台与版本限制，需对照实际版本核验，不得宣称全平台无条件支持（模块见 07-04 ｜ 原理见 06-10 ｜ 06-11）。
+
+### 6. 小结
+
+本篇把配置落地讲成了一条可核对的链路：`minigraph.xml` 与端口文件经 `src/sonic-config-engine/` 的 `minigraph.py`、`portconfig.py`、`sonic-cfggen` 渲染为 `config_db.json`，再由 `config load` 或 `-j ... --write-to-db` 写进 `CONFIG_DB`，继而经各 `*mgrd`、`orchagent`、`syncd` 异步翻译成 ASIC 状态；反向的 `config save` 用 `-d --print-data` 把配置库导出为快照。图 03-02-01 与两张表把输入输出、三条落地路径和失败面固定下来，核心结论仍是那句：写库成功不等于硬件已下发，状态要按库逐段核对。
+
+需要重申的事实纪律：默认路径 `/etc/sonic/config_db.json` 与 `/usr/local/bin/sonic-cfggen` 可在 `sonic-utilities-master/config/main.py` 核实，`DEVICE_METADATA`、`PORT` 等表可在腾讯机型 `config_db.json` 核实，`sonic-cfggen` 的选项可在其 `argparse` 段核实；其余表名、字段、命令选项与函数签名一律写「需对照实际版本核验」并给出可定位目录。Redis 库编号来自运行时配置、须对照 `SonicDBConfig` 核验；CLI 只读写各库、不编程 ASIC；性能与容量数字需在目标机型实测。本篇涉及的完整参数与命令见 04-02、04-03、04-05（字段见 05-02 ｜ 参数见 04-02 ｜ 原理见 06-03 ｜ 模块见 07-05）。
+
+下一篇 03-03 将在这份落地配置之上做端口、VLAN、IP 与 BGP 的基础配置实战，并把下发链路回指 06-06、06-07；管理面与 telemetry、gNMI 接入见 03-04，升级与配置持久化见 03-05，多设备与多 ASIC 见 03-06。跨册引用请始终使用（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）的写法，`xx` 替换为具体篇号。版本基准始终为「上游 master 快照（2026-11 抓取）」，不写绝对版本号与 Redis DB 编号。

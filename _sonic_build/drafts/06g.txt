@@ -1,0 +1,377 @@
+# SONiC 技术资料 · 06 技术原理（分片 G）
+## 06-13 容器编排、服务依赖与启动顺序
+
+### 1. 背景与动机
+
+从 06-01 到 06-12，本册沿着 CONFIG_DB → 各 `*mgrd` → APPL_DB → `orchagent` → ASIC_DB → `syncd` → SAI 这条异步流水线，把控制面每一段「做什么、怎么翻译、失败在哪里」讲了一遍。这些讲述都有一个未言明的前提：相关进程已经在运行。但 SONiC 的进程并不直接跑在宿主机上，而是分装进 `dockers/` 下的各个容器，由容器内的 supervisord 拉起并守护；容器之间、容器内部的进程之间，还存在一张必须遵守的启动依赖网。本篇要补的正是这段「进程之前」的基线：一个容器何时被拉起、容器内哪些进程先起、谁等谁、为什么不能随意调换顺序。不讲清这段，读者对流水线的理解会悬在半空——知道每段职责，却不知道这些段凭什么会按时就位（原理见 06-01 ｜ 模块见 07-02）。
+
+从本快照的证据看，容器化不是包装上的讲究，而是由控制面的运行形态决定的。各 `*mgrd`、`orchagent`、`syncd`、BGP、teamd、LLDP、SNMP、telemetry 与 gNMI 等进程各司其职、故障域需要隔离、升级需要按容器粒度进行，于是被分别放进 `dockers/docker-orchagent/`、`dockers/docker-database/`、`dockers/docker-fpm-frr/`、`dockers/docker-teamd/`、`dockers/docker-lldp/`、`dockers/docker-snmp/`、`dockers/docker-sonic-telemetry/`、`dockers/docker-sonic-gnmi/` 等目录定义的镜像里。每个容器内部都有 supervisord 作为进程管理器，负责按配置启动、监控与重启所辖进程。这里要先立住一条边界：supervisord 管的是「容器内进程」，容器本身的生命周期则由宿主侧的镜像服务与 `files/image_config/containercfgd/` 一类开机配置协同管理，二者层级不同，不能混为一谈（模块见 07-02 ｜ 模块见 07-11）。
+
+第二个动机来自依赖本身。整条控制面流水线有一个物理前提：所有进程都要连到 Redis，而 Redis 跑在 `docker-database/` 容器里。因此 database 容器必须先就绪，其它容器里的进程才可能读写 CONFIG_DB、APPL_DB 与 ASIC_DB。在同一容器内部，依赖同样存在：本快照中 `dockers/docker-orchagent/supervisord.conf.common.j2` 明确写了 `orchagent` 等待 `portsyncd:running`、`swssconfig` 等待 `orchagent:running`、一批 `*mgrd` 等待 `swssconfig:exited`。这些等待不是装饰，而是保证「配置搬运工在翻译官之后启动、翻译官在端口发现之后启动」的顺序约束。若顺序颠倒，轻则进程反复重启，重则配置被写到尚未就绪的表里，表现为「命令返回成功但业务不通」——这正是全册反复强调的异步铁律在启动阶段的翻版（原理见 06-04 ｜ 排障见 08-03）。
+
+第三个动机是给「启动失败定位」一个可操作的抓手。运维最常见的一类事故不是功能 bug，而是「重启后某个服务没起来」：容器在跑，但关键进程不在；或者进程在跑，却因为前置依赖没就绪而空转。如果不知道依赖图，就会在容器日志里乱翻，甚至误判为硬件故障。本篇把依赖链显式画出来（图 06-13-01），给出「沿依赖链逆推」的定位方法：先看 database 容器与 Redis，再看 rsyslogd 这个根依赖，再逐层看 portsyncd、orchagent、swssconfig 与各 `*mgrd`。同时把事实纪律落到这篇：容器名、进程名、`dependent_startup_wait_for` 的具体值可在本快照的配置模板中核验，但宿主侧 systemd 单元名、FEATURE 表字段与镜像版本相关细节不在本快照或受版本限制，一律写「需对照实际版本核验」（参数见 04-07 ｜ 模块见 07-02）。
+
+### 2. 核心概念
+
+「容器」在本册指由 `dockers/` 下各子目录定义、以 supervisord 为进程管理器的运行单元。以 swss 容器为例，它对应源码目录 `dockers/docker-orchagent/`，但容器内进程名的标识却是 `swss`——本快照 `supervisord.conf.j2` 里 `supervisor-proc-exit-listener-rs --container-name swss` 一行可核验这一点。容器目录名与运行时标识名不一致是常态，写作与排障时要区分「源码落位」与「运行标识」两个名字，不能因为目录叫 `docker-orchagent` 就断言容器名也是 `orchagent`（模块见 07-02 ｜ 参数见 04-07）。
+
+「supervisord」是容器内的进程管理器。它的配置文件以段为单位：本节涉及的段有三类。其一是 `[supervisord]` 全局段，本快照中 `nodaemon=true` 表示以前台方式运行，符合容器 PID 1 的行为。其二是 `[eventlistener:*]`，包括 `dependent-startup` 与 `supervisor-proc-exit-listener` 两项：前者执行 `python3 -m supervisord_dependent_startup`，并订阅 `events=PROCESS_STATE`，是实现依赖启动的核心；后者执行 `supervisor-proc-exit-listener-rs --container-name ...`，监听 `PROCESS_STATE_EXITED`、`PROCESS_STATE_RUNNING`、`PROCESS_STATE_FATAL` 等事件，负责把进程退出上报宿主。其三是 `[program:*]`，每个被管理的进程一段，带 `command`、`priority`、`autostart`、`autorestart`、`startsecs`、`startretries`、`stdout_logfile` 等项。这些配置项的具体取值与全集属于 04 册权威范围，本篇只讲到理解依赖所需的程度（参数见 04-07 ｜ 模块见 07-02）。
+
+「依赖启动」是本篇最核心的概念，靠两个配套项表达：`dependent_startup=true` 声明本进程受依赖约束，`dependent_startup_wait_for=<进程>:<状态>` 指明等待谁、等到什么状态。状态语法里最常见的是 `running` 与 `exited`：前者等目标进程进入运行态，后者等目标进程正常退出。本快照中 `swssconfig` 是一个「跑完即退」的初始化程序，所以下游 `*mgrd` 等的是 `swssconfig:exited` 而不是 `running`；`portsyncd`、`orchagent` 是常驻进程，所以等的是 `:running`。此外 `supervisord` 段的 `exitcodes=0,3` 与 `autorestart=unexpected` 组合，使依赖启动监听器在特定退出码下不误触发重启——这类细节属于配置参数全集，需对照实际版本核验（参数见 04-07）。
+
+「根依赖」指几乎所有进程最终都回指的那一个：rsyslogd。本快照里 swss 容器、database 容器、gnmi 容器的 supervisord 配置都把 `rsyslogd` 设为 `priority=1`，并让下游进程以 `dependent_startup_wait_for=rsyslogd:running` 开头。原因很直接：日志通道必须先通，后续进程的 stdout/stderr 才经 `stdout_syslog=true`、`stderr_syslog=true` 汇入系统日志，排障才有证据可查。把 rsyslogd 当成「最底层的地基」而不是「一个普通日志进程」，是理解依赖图的第一把钥匙（原理见 06-01 ｜ 参数见 04-08）。
+
+「database 容器先起」是跨容器层面的依赖。本快照 `dockers/docker-database/supervisord.conf.j2` 遍历 `INSTANCES` 字典，为每个 Redis 实例生成 `[program:<redis_inst>]`，`command` 里以 `/usr/bin/redis-server /etc/redis/redis.conf` 启动，带 `--bind`、`--port`、`--unixsocket`、`--pidfile`、`--dir` 等参数，`priority=2`、`autostart=true`。其它容器里的进程只有在这组 Redis 就绪后才能读写数据库。至于宿主侧由哪个 systemd 单元、依据哪张 FEATURE 表按序拉起这些容器，本快照只提供 `files/image_config/containercfgd/containercfgd.conf` 这类配置片段，完整单元名与字段需对照实际版本核验，不得凭印象补写（模块见 07-11 ｜ 参数见 04-07）。
+
+下表把容器编排涉及的核心概念、职责与可定位源码对应起来，便于回查；表中路径相对 `sonic-buildimage-master/` 根，配置项名可核验、取值全集需对照实际版本核验。
+
+| 概念 | 职责 | 可定位源码 | 回查去向 |
+|---|---|---|---|
+| 容器与运行标识 | 镜像目录名与容器内标识名区分 | `dockers/docker-orchagent/` | 模块见 07-02 |
+| supervisord 全局段 | 前台运行与日志轮转 | `dockers/docker-orchagent/supervisord.conf.j2` | 参数见 04-07 |
+| dependent-startup | 按事件实现依赖启动 | `supervisord.conf.j2` 的 eventlistener 段 | 参数见 04-07 |
+| 退出监听 | 上报进程退出到宿主 | `supervisor-proc-exit-listener-rs` 配置项 | 参数见 04-08 |
+| 根依赖 rsyslogd | 日志通道先于业务进程 | 各容器 supervisord 配置的 rsyslogd 段 | 参数见 04-08 |
+| database 先起 | Redis 实例先于所有消费者 | `dockers/docker-database/supervisord.conf.j2` | 原理见 06-02 |
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构、对象并给出可定位路径，不展开逐字段定义。本章讨论的「结构」不是 C++/Go 结构体，而是 supervisord 配置段与进程状态事件；配置项全集属于 04-07，进程事件相关字段随查 05-08，开机与状态结构随查 05-09，机制见 06-13，模块能力见 07-02，即（字段见 05-08 ｜ 字段见 05-09 ｜ 参数见 04-07 ｜ 原理见 06-13 ｜ 模块见 07-02）。这样处理是为了让本篇聚焦「谁等谁、顺序为什么这样排」，而不是把配置参数表提前铺开。
+
+swss 容器的结构落位分两个文件。`dockers/docker-orchagent/supervisord.conf.j2` 是入口模板，可核验到 `[supervisord]` 全局段、`[eventlistener:dependent-startup]`（含 `command=python3 -m supervisord_dependent_startup`、`exitcodes=0,3`、`events=PROCESS_STATE`、`buffer_size=1024`）、`[eventlistener:supervisor-proc-exit-listener]`（含 `--container-name swss`）以及一个 `rsyslogd` 段，末尾以 `{% include "supervisord.conf.common.j2" %}` 引入公共部分。`dockers/docker-orchagent/supervisord.conf.common.j2` 才是进程清单主体，可核验到 `gearsyncd`、`portsyncd`、`orchagent`、`swssconfig`、`restore_neighbors`、`coppmgrd`、`neighsyncd`、`vlanmgrd`、`intfmgrd`、`portmgrd`、`fabricmgrd`、`buffermgrd`、`enable_counters`、`vrfmgrd`、`nbrmgrd`、`vxlanmgrd`、`tunnelmgrd`、`fdbsyncd` 等一整组 `[program:*]` 段，以及 `swss_priority_base`、`include_swssconfig`、`is_fabric_asic`、`orchagent_dependent_startup_wait_for`、`portsyncd_dependent_startup_wait_for`、`gearsyncd_dependent_startup` 等 Jinja 变量。这些变量让同一份模板适配独立 swss 容器与 `docker-sonic-vs`，取值逻辑需对照实际版本核验（字段见 05-08 ｜ 参数见 04-07）。
+
+database 容器的结构落位在 `dockers/docker-database/supervisord.conf.j2`，可核验到 Redis 实例循环、`flushdb` 段（`command=/bin/bash -c "sleep 300 && /usr/local/bin/flush_unused_database"`，`dependent_startup_wait_for=rsyslogd:running`）以及 `redis_inst_bmc_bind` 这类按 `bmc_link_ip`、`bmc_link_if` 条件生成的段。gnmi 容器的结构落位在 `dockers/docker-sonic-gnmi/supervisord.conf`，这里是把静态配置写全的样本，含 `rsyslogd`、`start`、`gnmi-native`、`dialout` 四段，依赖链为 `start:exited`、`gnmi-native:running` 等。外围容器的 supervisord 也各有模板，如 `dockers/docker-teamd/supervisord.conf.j2`、`dockers/docker-lldp/supervisord.conf.j2`、`dockers/docker-snmp/supervisord.conf.j2`，其进程项名与参数需对照实际版本核验（模块见 07-02 ｜ 参数见 04-07）。
+
+宿主侧与开机侧的结构落位在 `files/image_config/`。本快照可核验到 `files/image_config/containercfgd/containercfgd.conf`，其 `[program:containercfgd]` 段为 `command=python3 /usr/local/bin/containercfgd`、`priority=99`、`dependent_startup=true`、`dependent_startup_wait_for=rsyslogd:running`，说明容器配置守护进程被放在很低的优先级、且同样以 rsyslogd 为根依赖。开机配置还可见 `files/image_config/config-setup/`、`files/image_config/interfaces/`、`files/image_config/hostname/`、`files/image_config/proc/`、`files/image_config/monit/` 等目录，其中 `monit/container_checker`、`monit/restart_service` 与容器健康相关。这些脚本与单元的具体名称、执行顺序及与 FEATURE 表的关联受版本与平台限制，需对照实际版本核验（模块见 07-11 ｜ 参数见 04-07 ｜ 原理见 06-13）。
+
+为便于把「子系统—文件—回查去向」串起来，下表按子系统归纳可核验的落位；表中均为目录或文件名，不含未核实的路径。
+
+| 子系统 | 关键文件（相对 sonic-buildimage-master/） | 职责 | 回查去向 |
+|---|---|---|---|
+| swss 入口 | `dockers/docker-orchagent/supervisord.conf.j2` | 全局段与依赖监听器 | 参数见 04-07 |
+| swss 进程集 | `dockers/docker-orchagent/supervisord.conf.common.j2` | 列出各 program 与依赖 | 字段见 05-08 |
+| database | `dockers/docker-database/supervisord.conf.j2` | 拉起 Redis 实例 | 原理见 06-02 |
+| gnmi | `dockers/docker-sonic-gnmi/supervisord.conf` | 启动 gnmi 容器进程链 | 原理见 06-14 |
+| 宿主开机 | `files/image_config/containercfgd/containercfgd.conf` | containercfgd 启动项 | 模块见 07-11 |
+| 容器健康 | `files/image_config/monit/container_checker` | 容器监控与重启辅助 | 参数见 04-08 |
+
+### 4. 关键流程与调用链
+
+把容器拉起、根依赖、容器内进程依赖串起来，就得到启动阶段最重要的一张图：从宿主侧到容器内各进程的依赖链见图 06-13-01。
+
+:::figure id=06-13-01 | name=容器编排与进程启动依赖链 | dir=TD
+node a "宿主 systemd 与<br/>containercfgd" gray
+node b "docker-database<br/>redis-server" blue
+node c "rsyslogd<br/>各容器根依赖" gray
+node d "portsyncd<br/>gearsyncd" teal
+node e "orchagent.sh<br/>控制面核心" purple
+node f "swssconfig.sh" amber
+node g "各 mgrd<br/>port vlan intf nbr" teal
+node h "coppmgrd 与<br/>enable_counters" teal
+node i "各 DB<br/>CONFIG APPL ASIC" blue
+node j "syncd 与 SAI<br/>同容器交付" green
+edge a -> b "先拉起数据库容器"
+edge a -> c "拉起业务容器"
+edge c -> b "redis 等待 rsyslogd"
+edge b -> d "数据库可达后启动"
+edge c -> d "rsyslogd:running"
+edge d -> e "portsyncd:running"
+edge e -> f "orchagent:running"
+edge f -> g "swssconfig:exited"
+edge f -> h "swssconfig:exited"
+edge e -> j "同容器编排"
+edge g -> i "搬运配置"
+:::
+
+图 06-13-01 用颜色区分语义：gray 为宿主侧编排与辅助依赖，blue 为数据库与数据库容器，teal 为 `*mgrd` 等配置管理进程，purple 为 orchagent 控制面，amber 为 `swssconfig` 这类一次性初始化程序，green 为随同容器交付的 syncd 与 SAI，red 在本图未出现——硬件边界不在启动依赖链的表达范围内（原理见 06-05 ｜ 模块见 07-02）。图中 `containercfgd` 指向 database 与业务容器两条虚线般的先序关系，表达的是「数据库容器先于其它容器就绪」这一跨容器约束；宿主侧具体单元名与 FEATURE 表字段不在本快照，需对照实际版本核验（参数见 04-07）。
+
+swss 容器内部的依赖链是可逐条核验的。入口模板把 `rsyslogd` 设为 `priority=1` 并置 `dependent_startup=true`；公共模板里 `gearsyncd` 与 `portsyncd` 以 `swss_priority_base + 3` 为优先级，等待 `rsyslogd:running`（`portsyncd` 的等待目标由 `portsyncd_dependent_startup_wait_for` 变量决定，注释里说明虚拟交换机场景可改为等 `syncd`，以避免 CONFIG_DB 的 PORT 表尚未加载时过早启动）；`orchagent` 以 `+4` 为优先级，等待目标由 `orchagent_dependent_startup_wait_for` 决定，默认 `portsyncd:running`；`swssconfig` 以 `+5` 为优先级，等 `orchagent:running`；随后 `restore_neighbors`、`coppmgrd`、`neighsyncd`、`vlanmgrd`、`intfmgrd`、`portmgrd`、`fabricmgrd`、`buffermgrd`、`vrfmgrd`、`nbrmgrd`、`vxlanmgrd`、`tunnelmgrd`、`fdbsyncd` 等按各自优先级依次等待 `swssconfig:exited` 或 `orchagent:running`，`enable_counters` 等 `swssconfig:exited`。这条链把「先发现端口、再启动翻译官、再由初始化程序铺底、最后批量启动搬运工」的顺序固化下来（原理见 06-03 ｜ 原理见 06-04 ｜ 参数见 04-07）。
+
+两个分支必须单独说明。其一，`is_fabric_asic` 为真时，`orchagent_dependent_startup_wait_for` 被改写为 `rsyslogd:running`，且 `gearsyncd`、`portsyncd`、`neighsyncd`、`vlanmgrd`、`intfmgrd`、`portmgrd` 等一批程序被条件跳过——这是 fabric 型 ASIC 与普通交换机在启动形态上的实质差异，受平台与版本限制，需对照实际版本核验，不得宣称全平台一致（原理见 06-11 ｜ 模块见 07-10）。其二，`autostart=false` 配合 `dependent_startup=true` 的含义是「不由 supervisord 直接立即启动，而交给依赖启动监听器择机启动」，把它读成「该进程被禁用」是典型误判；`autorestart` 的取值在各段并不相同（如 `swssconfig` 为 `unexpected`、`orchagent` 为 `false`），反映的是「一次性任务」与「常驻服务」的区别，具体语义以 supervisord 版本为准，需对照实际版本核验（参数见 04-07）。
+
+database 容器内部是另一条短链：Redis 实例以 `priority=2`、`autostart=true` 直接启动，是真正不依赖其它业务进程的「第一推动」；`flushdb` 等 `rsyslogd:running` 后延时执行，`redis_inst_bmc_bind` 等目标 Redis 实例 `running` 后再绑定 BMC 链路地址。gnmi 容器则是 `rsyslogd` → `start:exited` → `gnmi-native:running` → `dialout` 的四段链，说明「依赖启动」不是某个容器的特技，而是全镜像族统一的编排范式（原理见 06-14 ｜ 模块见 07-02）。需要强调时序：图 06-13-01 上每一条边都对应一个等待条件，上游就绪不代表下游已开始处理业务；即便所有进程都 `running`，`config` 命令返回成功仍不等于 ASIC 已下发，配置还要走完 06-01 的异步流水线（原理见 06-01 ｜ 排障见 08-03）。
+
+### 5. 配置/命令/代码实例
+
+本节给三组实例：一组用命令观察容器与进程状态并作逐行判读，一组给出依赖启动的配置片段印证「谁等谁」，一组给出启动失败时的日志取证命令。完整的容器与 supervisord 参数见 04-07，日志与返回码见 04-08，命令全集见 04-05，本册不重列。命令名、容器名、进程名与输出格式需对照实际版本核验。
+
+先看一次典型的容器与进程状态检查。以下命令按「前置检查 → 执行 → 验证输出 → 清理」组织，容器名与可执行文件名需对照实际版本核验。
+
+```bash
+# 前置检查：确认相关容器处于运行状态（容器名需对照实际版本核验）
+docker ps --format '{{.Names}}\t{{.Status}}'
+# 执行：进入 swss 容器查看 supervisor 管理的进程状态
+docker exec -it swss supervisorctl status
+# 验证：单独查看 orchagent 一项，确认其为 RUNNING
+docker exec -it swss supervisorctl status orchagent
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（下列取值仅为格式示意，不代表任何具体版本或机型）
+database                        Up 3 days
+swss                            Up 3 days
+gnmi                            Up 3 days
+gearsyncd                        RUNNING   pid 312, uptime 3 days
+portsyncd                        RUNNING   pid 318, uptime 3 days
+orchagent                        RUNNING   pid 341, uptime 3 days
+swssconfig                       EXITED    Tue Nov 17 03:12:04 2026
+portmgrd                         RUNNING   pid 402, uptime 3 days
+neighsyncd                       RUNNING   pid 405, uptime 3 days
+enable_counters                  EXITED    Tue Nov 17 03:12:06 2026
+```
+
+逐行判读如下。第一段 `docker ps --format` 列出 `database`、`swss`、`gnmi` 三个容器均为 `Up`，说明容器层正常；若 database 未 `Up`，应先回到数据库容器排查，而不是继续看业务进程，因为所有进程都要连 Redis。第二段 `supervisorctl status` 的输出里，`gearsyncd`、`portsyncd`、`orchagent`、`portmgrd`、`neighsyncd` 为 `RUNNING`，与图 06-13-01 的依赖链一致；`orchagent` 有 `pid 341`，是常驻服务，其 `autorestart=false` 意味着退出后不会自动拉起，需要上层机制介入。`swssconfig` 与 `enable_counters` 显示 `EXITED` 并带时间戳，这是「一次性初始化任务跑完即退」的正常特征，不是故障——把 `EXITED` 误判为「进程挂了」是高频误判；真正异常的是依赖它们的下游进程没有进入 `RUNNING`。第三段单独查 `orchagent`，用于确认翻译官在运行；若它为 `FATAL` 或 `STARTING` 长期滞留，按依赖链逆推：先确认 `portsyncd` 是否 `RUNNING`、rsyslogd 是否就绪、database 容器是否可达，再看 `orchagent` 自身日志。最后提醒：以上状态只证明「进程被拉起」，并不能证明配置已下发到 ASIC，业务是否通仍要按 06-01 逐段核对 CONFIG_DB、APPL_DB、ASIC_DB 与 `show` 输出（原理见 06-01 ｜ 排障见 08-03 ｜ 参数见 04-07）。
+
+第二组给出依赖启动的配置片段，用来印证「谁等谁」的实现形态；下列片段依据本快照中可核验的配置项整理，为便于阅读做了简化，完整配置项与取值需对照实际版本核验。
+
+```ini
+; 代码形态示意，依据 dockers/docker-orchagent/ 下可核验的配置项整理；完整项需对照实际版本核验
+[eventlistener:dependent-startup]
+command=python3 -m supervisord_dependent_startup
+events=PROCESS_STATE
+exitcodes=0,3
+autostart=true
+
+[program:rsyslogd]
+priority=1
+dependent_startup=true
+stdout_syslog=true
+
+[program:portsyncd]
+command=/usr/bin/portsyncd
+autostart=false
+priority=3
+dependent_startup=true
+dependent_startup_wait_for=rsyslogd:running
+
+[program:orchagent]
+command=/usr/bin/orchagent.sh
+autostart=false
+priority=4
+dependent_startup=true
+dependent_startup_wait_for=portsyncd:running
+
+[program:swssconfig]
+command=/usr/bin/swssconfig.sh
+autostart=false
+priority=5
+dependent_startup=true
+dependent_startup_wait_for=orchagent:running
+
+[program:portmgrd]
+command=/usr/bin/portmgrd
+autostart=false
+priority=10
+dependent_startup=true
+dependent_startup_wait_for=swssconfig:exited
+```
+
+这段配置把图 06-13-01 的依赖链逐字落地：`rsyslogd` 无等待目标、优先级最低；`portsyncd` 等 `rsyslogd:running`；`orchagent` 等 `portsyncd:running`；`swssconfig` 等 `orchagent:running`；`portmgrd` 等 `swssconfig:exited`。读这类配置时，重点看三处：`dependent_startup_wait_for` 的目标与状态、`priority` 的相对大小、`autostart` 与 `autorestart` 的组合。真实模板还包含 gearsyncd、neighsyncd、vlanmgrd、intfmgrd、fabricmgrd、buffermgrd、vrfmgrd 等更多段，以及 `ENABLE_ASAN` 相关环境变量、Jinja 条件分支与 `swss_priority_base` 偏移，本篇不重列（参数见 04-07 ｜ 模块见 07-02）。
+
+第三组给出启动失败时的日志取证命令，用于沿依赖链定位；日志路径与命令名需对照实际版本核验。
+
+```bash
+# 查看 swss 容器日志尾部，关注进程启动与退出记录
+docker logs swss 2>&1 | tail -n 80
+# 跟随查看 orchagent 进程的 stdout（若该日志通道已配置）
+docker exec -it swss supervisorctl tail -f orchagent stdout
+# 对照 database 容器是否可达
+docker exec -it database redis-cli PING
+```
+
+示例输出格式与日志路径需对照实际版本核验。三条命令分别对应图 06-13-01 的三个层次：`docker logs` 看容器级事件、`supervisorctl tail` 看单进程输出、`redis-cli PING` 看根依赖是否可达。若 `PING` 不通，先修 database 容器；若通而 orchagent 仍 `FATAL`，再按 `portsyncd`、`rsyslogd` 顺序回溯。此类取证属于运行时诊断，具体命令与路径以实际版本为准（参数见 04-08 ｜ 排障见 08-03）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是「priority 等于启动顺序」的误读。本快照里 `priority` 确实有大小，但真正决定谁先就绪的是 `dependent_startup_wait_for` 的等待条件；把 priority 当成唯一顺序依据，会在 fabric ASIC 或虚拟交换机这类改变等待目标的场景下判断失误。正确读法是：priority 决定候选顺序，等待条件决定实际放行时机，二者要结合看（参数见 04-07 ｜ 原理见 06-13）。第二类是 `autostart=false` 陷阱：它常被误读为「进程被禁用」，实际是「交给 dependent-startup 择机启动」；判断进程是否启用要看它是否最终进入 `RUNNING`，而不是看 `autostart` 一个字段（参数见 04-07）。
+
+第三类是名字混淆陷阱。`dockers/docker-orchagent/` 是源码目录，容器内标识却是 `swss`；`docker-sonic-gnmi/` 目录对应的容器标识为 `gnmi`，而同族还有 `docker-gnmi-sidecar/`、`docker-gnmi-watchdog/` 等辅助容器，功能不同不可互指。写文档与排障命令时要明确「当前说的是源码落位还是运行标识」（模块见 07-02 ｜ 参数见 04-07）。第四类是状态误判：`swssconfig`、`enable_counters`、`start` 这类一次性任务的 `EXITED` 是正常终态，应以等待它们的下游进程是否 `RUNNING` 为准；反之，常驻进程长期停在 `STARTING` 或反复 `FATAL` 才是需要处理的异常（排障见 08-03）。
+
+第五类是事实纪律陷阱。依赖启动的核心实现 `supervisord_dependent_startup` 在本快照中以 `python3 -m supervisord_dependent_startup` 的形式被引用，其源码属于 supervisord 生态、不在本快照，不据此编造其实现细节；宿主侧 systemd 单元名、FEATURE 表字段、镜像版本与容器拉起脚本同样需对照实际版本核验，凡不确定一律标注并给出 `dockers/`、`files/image_config/` 等可定位目录（模块见 07-02 ｜ 模块见 07-11 ｜ 参数见 04-07）。第六类是能力边界陷阱：容器编排属于控制面进程的生命周期管理，不能把「容器都在跑」写成「数据面已转发」；数据面转发始终在 ASIC，除 `platform/vs/` 虚拟交换机外不做软件转发（原理见 06-01 ｜ 模块见 07-10）。第七类是性能与容量陷阱：容器启动耗时、依赖收敛时间、进程重启间隔都随机型、芯片、版本与资源配置变化，一律标注「需在目标机型实测」，不给绝对值、不给跨机型通用数字（基准方法见 08-01 ｜ 调优见 08-02）。
+
+最佳实践归纳为四条。其一，把任何「重启后服务没起来」都拆成图 06-13-01 的若干层，按 database → rsyslogd → portsyncd → orchagent → swssconfig → 各 `*mgrd` 的顺序逆推，先判停在哪一层，再决定查哪个容器、哪个进程的日志，避免跳跃式怀疑硬件。其二，读配置时把路径写成 `upstream_src/sonic-buildimage/sonic-buildimage-master/` 下的相对路径，并同时给出关键等待项（`dependent_startup_wait_for=portsyncd:running` 等），取值不确定就写「需对照实际版本核验」。其三，取证命令按「前置检查、执行、验证输出、清理」闭环写，示例输出注明「示例输出，具体格式需对照实际版本核验」并附逐行判读，尤其要说明 `EXITED` 对一次性任务意味着正常完成。其四，跨册引用统一用四段式（字段见 05-08 ｜ 参数见 04-07 ｜ 原理见 06-13 ｜ 模块见 07-02），本篇涉及的进程事件写「字段见 05-08」、supervisord 参数写「参数见 04-07」、数据库分层写「原理见 06-02」、镜像模块写「模块见 07-02」，不在本篇展开字段表与参数全集。
+
+### 7. 小结与延伸阅读
+
+本篇把控制面流水线之外的启动基线补齐：容器由 `dockers/` 各目录定义、由容器内 supervisord 管理进程；跨容器层面 database 先起，所有消费者依赖 Redis；容器内部以 rsyslogd 为根依赖，swss 容器沿 `rsyslogd → portsyncd/gearsyncd → orchagent → swssconfig → 各 *mgrd` 逐层放行，fabric ASIC 另有分支；gnmi 容器则是 `rsyslogd → start → gnmi-native → dialout` 的四段链。图 06-13-01 与两张归纳表是回查索引；三条判断贯穿全篇——`autostart=false` 不等于禁用、`EXITED` 对一次性任务属正常、进程都在跑不等于配置已下发到 ASIC。
+
+延伸阅读按疑问分流。想补流水线上游与下游，接读 06-01（数据流总览）、06-02（数据库分层）、06-03（mgrd 与校验）、06-04（orchagent 调度）、06-05（syncd 与 SAI）；想看同一套管理面范式在 gNMI 上的落地，接读 06-14（gNMI/REST/CLI 与 YANG）；想看镜像与容器模块的职责边界，接读 07-02（dockers 容器族）、07-11（image_config/onie/installer）；想看启动失败如何进入排障流程，接读 08-03（诊断决策树）、08-04（故障案例库）。字段随查走 05-08（进程与事件结构）、05-09（开机与状态结构），参数随查走 04-07（容器服务与启动参数）、04-08（日志与返回码），模块能力走 07-02、07-11。跨册引用请始终使用「字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx」的写法，`xx` 替换为具体篇号。
+
+最后重申资料纪律：本篇所有示例输出均注明「示例输出，具体格式需对照实际版本核验」；所有源码路径均相对 `sonic-buildimage-master/` 仓根；`supervisord_dependent_startup` 实现、宿主侧 systemd 单元、FEATURE 表字段与镜像版本等不确定处均标注核验要求并给出 `dockers/`、`files/image_config/` 等可定位目录；启动耗时、依赖收敛与重启间隔一律标注「需在目标机型实测」。版本基准始终为「上游 master 快照（2026-11 抓取）」，不写绝对版本号与 Redis DB 编号。下一篇 06-14 将从「进程按什么顺序起来」转到「进程起来之后，管理面怎样把用户的 YANG/gNMI 请求变成 CONFIG_DB 配置」，把管理入口与模型转换这条线讲清。
+
+## 06-14 gNMI / REST / CLI 管理面与 YANG 模型
+
+### 1. 背景与动机
+
+06-13 讲清了控制面进程「按什么顺序起来」，本篇要回答紧接着的问题：这些进程起来之后，外部系统怎样把一条配置请求送进设备。SONiC 对外提供三类管理入口——gNMI（含 gNOI 一类运维 RPC）、REST 与传统的 `show` / `config` CLI。它们形态不同、协议不同、使用者不同，但有一个共同归宿：最终都把用户的意图变成 CONFIG_DB 里的表项与字段，再交给 06-01 的异步流水线逐级下发。讲清这三类入口如何收敛到同一处、中间靠什么保持语义一致，是本篇的主线（原理见 06-01 ｜ 参数见 04-05 ｜ 模块见 07-07）。
+
+第一个动机是「统一模型」的必要性。如果每个入口各自定义配置形状，同一件事——比如改一个接口的 MTU——在 CLI、REST 与 gNMI 里就会有三套字段命名、三套取值范围、三套错误提示，配置漂移与互相覆盖几乎不可避免。SONiC 的解决办法是把数据结构契约外置到 YANG 模型里：YANG 描述「有哪些对象、对象有哪些字段、字段什么类型、对象之间有什么约束」，各入口都围绕这套模型工作。本快照的 `sonic-mgmt-common/sonic-mgmt-common-master/models/yang/` 下可核验到 `common/`、`annotations/`、`sonic/` 三类目录，分别承载通用模型、注解与 SONiC 原生模型；`config/transformer/models_list` 则是一份显式列出需要加载哪些模型的清单。模型文件与清单可核验，但具体字段定义与版本差异需对照实际版本核验（字段见 05-09 ｜ 模块见 07-07）。
+
+第二个动机是划清管理面与数据面的边界。三类入口都只做「配置写入」与「状态读取」：gNMI Set、REST PUT/PATCH、CLI `config` 写的是 CONFIG_DB；gNMI Get、REST GET、CLI `show` 读的是各数据库与状态。它们都不直接编程 ASIC，也不经 SAI 操作硬件；真正让配置在芯片里生效的是 `*mgrd` → `orchagent` → `syncd` → SAI 这条链路。因此「gNMI Set 返回成功」与「`config` 返回成功」含义完全相同——都只代表配置已落库，不代表硬件已下发。把这条边界讲清，可以避免把管理面的成功回执误当成业务生效证据（原理见 06-01 ｜ 原理见 06-03 ｜ 排障见 08-03）。
+
+第三个动机是给管理面排障建立层次感。管理面的问题常表现为两类截然不同的故障：一类是「请求根本没被接受」，原因多在模型校验、字段类型、leafref 约束或权限；另一类是「请求被接受但业务没生效」，原因多在下游异步流水线或容器依赖。若分不清这两类，就会把 CVL 校验失败当成芯片问题，或把流水线卡住当成 gNMI 服务故障。本篇按「入口 → 模型 → 校验 → 转换 → 落库 → 异步流水线」的顺序拆解，让读者能定位问题落在哪一层。事实纪律照旧：凡本快照无法核实的对外 API 名、键名与版本细节，一律写「需对照实际版本核验」并给出 `models/yang/`、`cvl/`、`translib/` 等可定位目录（模块见 07-07 ｜ 参数见 04-05 ｜ 基准见 08-01）。
+
+### 2. 核心概念
+
+「YANG 模型」在本册指 `sonic-mgmt-common/sonic-mgmt-common-master/models/yang/` 下的一组数据建模文件。本快照可核验到三个层次：`common/` 下是通用与 OpenConfig 系列模型，如 `ietf-inet-types.yang`、`ietf-interfaces.yang`、`openconfig-interfaces.yang`（及其扩展）、`openconfig-acl.yang`、`openconfig-platform.yang` 等；`annotations/` 下是注解模型，如 `openconfig-interfaces-annot.yang`、`openconfig-acl-annot.yang`、`sonic-extensions.yang`、`sonic-showtech-annot.yang`；`sonic/` 下是 SONiC 原生模型，本快照可核验到 `sonic-port.yang`、`sonic-interface.yang`、`sonic-acl.yang`、`sonic-show-techsupport.yang`。注解模型的作用是补充 OpenConfig 模型与 Redis 表之间的映射信息，具体映射规则与扩展语句语义需对照实际版本核验（字段见 05-09 ｜ 模块见 07-07）。
+
+「CVL」是 Common Validation Library，负责在配置写入前做语法与语义校验。本快照 `cvl/` 目录可核验到 `cvl.go`、`cvl_api.go`、`cvl_syntax.go`、`cvl_semantics.go`、`cvl_cache.go`、`cvl_hint.go` 及配置文件 `conf/cvl_cfg.json`、`custom_validation/common.go`。`cvl_api.go` 中可核验到 `Initialize()`、`ValidationSessOpen()`、`ValidationSessClose()` 以及 CVL 上的方法 `ValidateConfig()`、`ValidateIncrementalConfig()`、`ValidateEditConfig()`、`ValidateKeys()`、`ValidateFields()`；`cvl.go` 中可核验到 `loadSchemaFiles()`、`translateToYang()`、`validateSyntax()`、`validate()`、`doCustomValidation()` 等函数。这套分工说明校验分两层：语法层检查类型、必填与 leaf-list 约束，语义层检查 leafref、must/when 等跨字段约束，自定义校验由 `custom_validation/` 补充。函数签名与返回约定需对照实际版本核验（字段见 05-09 ｜ 模块见 07-07）。
+
+「translib」是转换层，也是三类入口在进程内的汇聚点。本快照 `translib/app_interface.go` 可核验到 `register()`、`addModel()`、`getAppModuleInfo()`、`getModels()`、`getAppInterface()` 等注册与分派函数；`common_app.go`、`acl_app.go`、`lldp_app.go`、`pfm_app.go`、`sys_app.go`、`yanglib_app.go`、`api_tests_app.go` 各自实现一组 `translateCreate()`、`translateReplace()`、`translateDelete()`、`translateGet()`、`processCreate()`、`processReplace()`、`processDelete()`、`processGet()`，返回 `GetResponse` 或 `SetResponse`，并用到 `TranslibFmtType`、`generateGetResponse()` 等类型与函数。`authorize.go` 中可核验到 `isAuthorizedForGet()`、`isAuthorizedForSet()`，说明鉴权也在这一层收口。`db/` 子目录提供 Redis 访问封装（`db.go`、`db_get.go`、`db_cache.go`、`db_lock.go` 等）；`tlerr/` 定义 `TranslibCVLFailure`、`TranslibTransactionFail`、`TranslibSyntaxValidationError` 等错误类型。对外 API 的固定名称与完整签名在本快照中未能直接锁定，需对照实际版本核验（字段见 05-08 ｜ 模块见 07-07）。
+
+「transformer」指 YANG 树与 Redis 表项之间的双向转换。本快照 `config/transformer/models_list` 可核验到一份模型清单，逐行列出需要加载的 YANG 模型，包括 `openconfig-acl-annot.yang`、`openconfig-interfaces.yang`、`openconfig-interfaces-annot.yang`、`openconfig-vlan.yang`、`gnsi-authz.yang`、`gnsi-pathz.yang`、`gnsi-certz.yang`、`gnsi-credentialz.yang` 等。这份清单说明「哪些模型参与转换」是可核验的事实，但 transformer 的具体转换实现、注解映射细节与字段命名规则不在本快照的可核验范围内，需对照实际版本核验——不要据清单反推实现（字段见 05-09 ｜ 模块见 07-07）。
+
+「三类入口」的落位各不相同。gNMI 由 `dockers/docker-sonic-gnmi/` 容器承载，本快照 `supervisord.conf` 可核验到 `rsyslogd → start → gnmi-native → dialout` 的依赖链，其中 `gnmi-native.sh`、`dialout.sh` 是实际启动脚本；同族还有 `docker-gnmi-sidecar/`、`docker-gnmi-watchdog/` 等辅助容器。REST 由 `dockers/docker-sonic-restapi/`、`docker-restapi-sidecar/`、`docker-restapi-watchdog/`、`docker-sonic-mgmt-framework/` 等容器承载。CLI 则来自 `sonic-utilities/` 的 `show/`、`config/`、`utilities_common/` 与 `generic_config_updater/`，后者提供配置更新的事务化能力。命令名、选项与 RPC 路径需对照实际版本核验（模块见 07-06 ｜ 模块见 07-09 ｜ 参数见 04-05）。
+
+下表把管理面涉及的核心概念、职责与可定位源码对应起来，便于回查；表中路径相对各自 `xxx-master/` 仓根，函数名可核验、签名与对外 API 名需对照实际版本核验。
+
+| 概念 | 职责 | 可定位源码 | 回查去向 |
+|---|---|---|---|
+| YANG 模型 | 定义配置数据结构与约束 | `models/yang/common/`、`sonic/`、`annotations/` | 字段见 05-09 |
+| 模型加载清单 | 声明参与转换的模型 | `config/transformer/models_list` | 模块见 07-07 |
+| CVL 校验 | 语法与语义两层校验 | `cvl/cvl_api.go`、`cvl/cvl.go` | 字段见 05-09 |
+| translib 分派 | 注册模型与按类型分派 | `translib/app_interface.go` | 模块见 07-07 |
+| 转换与落库 | YANG 树转 Redis 表项 | `translib/common_app.go`、`translib/db/` | 原理见 06-14 |
+| gNMI 容器 | 承载 gNMI 服务与拨号 | `dockers/docker-sonic-gnmi/supervisord.conf` | 原理见 06-13 |
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与对象并给出可定位路径，不展开逐字段定义。YANG 模型的数据结构（leaf、leaf-list、list、container、annotation）字段随查 05-09，translib 的请求与响应结构（`GetRequest`、`SetRequest`、`GetResponse`、`SetResponse`）随查 05-08，CONFIG_DB 表项与字段随查 05-02，命令全集随查 04-05，机制见 06-14，模块能力见 07-07，即（字段见 05-08 ｜ 字段见 05-09 ｜ 参数见 04-05 ｜ 原理见 06-14 ｜ 模块见 07-07）。本篇聚焦「请求经过哪几层、在哪一层变成表项」，字段表与参数全集不在本册重列。
+
+YANG 模型的结构落位在 `models/yang/`。本快照可核验到 `models/yang/common/`（通用与 OpenConfig 模型）、`models/yang/annotations/`（注解模型）与 `models/yang/sonic/`（SONiC 原生模型）三个子目录，具体文件见第 2 节。需要强调：模型文件是数据结构的权威定义，但逐字段含义属于 05-09 的范围，本篇不展开。另有 `tools/pyang/` 目录可用于模型检查，工具的具体用法与版本需对照实际版本核验（字段见 05-09 ｜ 模块见 07-07）。
+
+CVL 的结构落位在 `cvl/`。除第 2 节列出的核心文件外，还可核验到 `common/cvl_types.go`、`common/db_access.go`、`common/db_utils.go`、`internal/yparser/yparser.go`、`internal/yparser/ly_path.go`、`internal/util/luascript_util.go`、`jsondata_test.go` 以及 `testdata/` 下大量示例（如 `testdata/config_db.json`、`testdata/port_table.json`、`testdata/acltable.json`、`testdata/schema/sonic-acl.yang`）。`testdata/schema/` 下的 YANG 文件说明 CVL 的测试与模型加载紧密绑定；`custom_validation/common.go` 与 `cvl_luascript.go` 说明存在脚本化扩展点。字段名、错误码枚举与校验时机留待 05-09（字段见 05-09 ｜ 模块见 07-07）。
+
+translib 的结构落位在 `translib/`。顶层可核验到 `app_interface.go`、`app_utils.go`、`authorize.go`、`common_app.go`、`acl_app.go`、`lldp_app.go`、`pfm_app.go`、`sys_app.go`、`yanglib_app.go`、`api_tests_app.go`；`db/` 子目录含 `db.go`、`db_get.go`、`db_cache.go`、`db_lock.go`、`db_datastore.go`、`cvl_db_access.go` 等；`cs/` 子目录是一组以 `cs_` 开头的文件（`cs_start.go`、`cs_commit.go`、`cs_abort.go`、`cs_getdb.go` 等），形态上对应配置会话能力；`tlerr/` 子目录定义错误类型。请求与响应结构的字段属于 05-08，本篇不展开（字段见 05-08 ｜ 模块见 07-07）。
+
+入口侧与 CLI 侧的结构落位分三处。gNMI 容器见 `dockers/docker-sonic-gnmi/supervisord.conf` 与同目录的启动脚本；REST 见 `dockers/docker-sonic-restapi/`、`dockers/docker-restapi-sidecar/`、`dockers/docker-restapi-watchdog/`、`dockers/docker-sonic-mgmt-framework/`；CLI 见 `sonic-utilities/sonic-utilities-master/show/`、`config/`、`utilities_common/` 与 `generic_config_updater/`。这三处的命令名、RPC 路径、端口与选项需对照实际版本核验，不据印象补值（模块见 07-06 ｜ 模块见 07-09 ｜ 参数见 04-05）。
+
+为便于把「层次—对象—源码位置」串起来，下表按层次归纳管理面链路上可核验的落位。
+
+| 层次 | 关键对象或文件 | 源码位置 | 回查去向 |
+|---|---|---|---|
+| 模型层 | OpenConfig 与 SONiC 原生 YANG | `models/yang/common/`、`sonic/` | 字段见 05-09 |
+| 校验层 | CVL 会话与校验方法 | `cvl/cvl_api.go`、`cvl/cvl.go` | 字段见 05-09 |
+| 转换层 | translib 应用与分派 | `translib/` 各 `*_app.go` | 模块见 07-07 |
+| 转换清单 | 加载哪些模型 | `config/transformer/models_list` | 模块见 07-07 |
+| 入口层 | gNMI 容器与 REST 容器 | `dockers/docker-sonic-gnmi/` 等 | 原理见 06-13 |
+| CLI 层 | show/config 与配置更新 | `sonic-utilities/show/`、`config/` | 参数见 04-05 |
+
+### 4. 关键流程与调用链
+
+把三类入口、模型、校验、转换与落库串起来，就得到管理面最重要的一张图：一次 gNMI Set 从客户端到 CONFIG_DB、再进入异步流水线的路径见图 06-14-01。
+
+:::figure id=06-14-01 | name=gNMI REST 与 CLI 管理面到 CONFIG_DB 的路径 | dir=TD
+node a "gNMI 与 REST<br/>客户端请求" gray
+node b "gnmi 容器<br/>gnmi-native.sh" green
+node c "translib<br/>app_interface" purple
+node d "YANG 模型<br/>models/yang" amber
+node e "CVL 校验<br/>ValidateEditConfig" teal
+node f "transformer<br/>YANG 转表项" teal
+node g "CONFIG_DB<br/>配置落库" blue
+node h "mgrd 与 orchagent<br/>异步流水线" purple
+node i "syncd 与 ASIC<br/>硬件生效" red
+node j "CLI show config<br/>sonic-utilities" gray
+edge a -> b "gNMI RPC"
+edge j -> g dashed "CLI 读写配置"
+edge b -> c "转 translib 请求"
+edge c -> d "按模型寻址"
+edge d -> e "语法与语义校验"
+edge e -> f "通过后转换"
+edge f -> g "写 CONFIG_DB"
+edge g -> h "mgrd 搬运"
+edge h -> i "编程 ASIC"
+:::
+
+图 06-14-01 用颜色区分语义：gray 为外部客户端与 CLI，green 为 gNMI 容器这一运行时入口，purple 为 translib 与下游控制面，amber 为 YANG 模型这类「编译期契约产物」，teal 为校验与转换，blue 为配置落库目标，red 为硬件边界。虚线「CLI 读写配置」表示 CLI 主要经 `sonic-utilities` 与 DB 封装直接读写 CONFIG_DB，与 gNMI 经 translib 的路径并不完全重合——二者是否共用同一转换层取决于命令与版本，需对照实际版本核验（模块见 07-06 ｜ 参数见 04-05）。
+
+gNMI Set 的正向链路可分六步。第一步，客户端向 gnmi 容器发起 RPC，容器内的 `gnmi-native.sh` 所启动的服务接收请求；容器进程按 `rsyslogd → start → gnmi-native → dialout` 顺序就绪，这一点与 06-13 的编排范式一致（原理见 06-13）。第二步，请求进入 translib，由 `app_interface.go` 中的注册与分派逻辑按路径找到对应应用模块，`getAppInterface()` 一类函数承担「按类型取应用接口」的职责。第三步，translib 依据目标 URI 在 YANG 模型树中寻址，确定这次更新对应哪个 list、哪个 leaf。第四步，CVL 介入校验：`ValidationSessOpen()` 开启会话，`ValidateEditConfig()` 或 `ValidateIncrementalConfig()` 检查语法与语义约束，`cvl_syntax.go`、`cvl_semantics.go` 与 `custom_validation/` 分别承担结构与自定义规则，校验失败时经 `tlerr/` 中的错误类型回送。第五步，校验通过后由 transformer 把 YANG 树翻译成 Redis 表项变更，`config/transformer/models_list` 声明参与转换的模型。第六步，变更写入 CONFIG_DB，余下交给图 06-14-01 右半段的异步流水线（函数名可核验，签名与对外 API 名需对照实际版本核验，模块见 07-07 ｜ 原理见 06-03）。
+
+读路径与写路径方向相反但层次相同。gNMI Get 同样经 gnmi 容器进入 translib，由各应用的 `processGet()` 读取数据库，`translateGet()` 把表项还原成模型树，最终由 `generateGetResponse()` 生成 `GetResponse` 返回。`TranslibFmtType` 决定响应的编码格式，具体枚举取值需对照实际版本核验。值得注意的是，Get 读到的可能是 CONFIG_DB 的用户配置，也可能是 STATE_DB 的运行时状态，二者含义不同：前者回答「配了什么」，后者回答「当前是什么」，把两者混为一谈是判读大忌（原理见 06-02 ｜ 排障见 08-03）。
+
+最后把管理面成功与业务生效严格区分。图 06-14-01 中 g 节点（CONFIG_DB 落库）是管理面职责的终点，也是异步流水线的起点；从 g 到 h 到 i 的每一段都可能失败或延迟。因此「gNMI Set 成功」「REST 200」「`config` 返回 0」都只说明配置已落库，不能推出 ASIC 已下发。另有一类混淆要避免：CVL 校验失败发生在图的前半段（e 节点），表现为请求被拒绝、错误码来自 `tlerr/` 中的校验相关类型；流水线下发失败发生在后半段（h、i 节点），表现为配置已落库但业务不通。两类问题的排查入口完全不同，前者查模型与字段，后者查 DB 表项与容器日志（原理见 06-01 ｜ 排障见 08-03 ｜ 排障见 08-04）。
+
+### 5. 配置/命令/代码实例
+
+本节给三组实例：一组用 gNMI 客户端完成一次读写闭环并作逐行判读，一组给出 translib 应用的代码片段印证分派与翻译，一组给出查看模型清单与落库结果的命令。完整命令与 RPC 路径见 04-05，YANG 模型字段见 05-09，配置表字段见 05-02，本册不重列。命令名、选项、路径与端口需对照实际版本核验。
+
+先看一次 gNMI 读写闭环。以下命令按「前置检查 → 执行 → 验证输出 → 清理」组织，客户端命令名与选项需对照实际版本核验。
+
+```bash
+# 前置检查：确认 gnmi 容器与其进程就绪（容器名需对照实际版本核验）
+docker ps --format '{{.Names}}\t{{.Status}}'
+docker exec -it gnmi supervisorctl status
+# 执行：向目标地址发起 Set，更新一个接口描述字段（命令名与选项需对照实际版本核验）
+gnmi_cli -address 127.0.0.1:50051 -set -update /openconfig-interfaces:interfaces/interface=Ethernet0/config/description -value desc-by-gnmi
+# 验证：读取同一路径，确认配置已落库（选项需对照实际版本核验）
+gnmi_cli -address 127.0.0.1:50051 -get -xpath /openconfig-interfaces:interfaces/interface=Ethernet0/config/description
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（下列取值仅为格式示意，不代表任何具体版本或机型）
+gnmi                            Up 3 days
+gnmi-native                      RUNNING   pid 220, uptime 3 days
+dialout                          RUNNING   pid 235, uptime 3 days
+SetResponse:
+  path: /openconfig-interfaces:interfaces/interface=Ethernet0/config/description
+  op: UPDATE
+GetResponse:
+  notification:
+    prefix: /openconfig-interfaces:interfaces/interface=Ethernet0/config
+    path: description
+    val: desc-by-gnmi
+```
+
+逐行判读如下。前置的 `docker ps` 显示 `gnmi` 容器为 `Up`，`supervisorctl status` 显示 `gnmi-native` 与 `dialout` 均为 `RUNNING`，与图 06-13-01 所述 `rsyslogd → start → gnmi-native → dialout` 的依赖链一致；若 `dialout` 未就绪，应先按 06-13 的方法回溯容器依赖，而不是怀疑模型。执行段的 `gnmi_cli -set -update` 把 `Ethernet0` 的 `description` 更新为 `desc-by-gnmi`，路径中的 `/openconfig-interfaces:interfaces/...` 是 YANG 模型路径而非 Redis 键，说明入口是按模型寻址、由图 06-14-01 的 transformer 完成到表项的转换；命令名、`-address` 端口与 `-value` 选项需对照实际版本核验，不得据本例生搬。`SetResponse` 里的 `op: UPDATE` 表明这是增量更新而非整体替换，对应事务语义中的更新操作。验证段的 `GetResponse` 里 `prefix` 与 `path` 拼出同一个模型路径，`val: desc-by-gnmi` 与刚才写入的值一致，说明配置已可从管理面读回；但读回成功只证明配置落库，不等于该描述字段相关的硬件状态已生效——接口描述这类字段本身不下发 ASIC，若换成 MTU、admin status 一类字段，就还要按 06-06 逐段核对 APPL_DB、ASIC_DB 与 `show` 输出（原理见 06-06 ｜ 参数见 04-05 ｜ 排障见 08-03）。
+
+第二组给出 translib 应用的代码片段，用来印证「分派—翻译—生成响应」的实现形态；下列片段依据本快照中可核验的函数名与类型整理，为便于阅读做了简化，真实签名与控制流需对照实际版本核验。
+
+```go
+// 代码形态示意，依据 translib/ 下可核验的函数与类型整理；签名与对外 API 名需对照实际版本核验
+package translib
+
+func (app *CommonApp) processGet(dbs [db.MaxDB]*db.DB, fmtType TranslibFmtType) (GetResponse, error) {
+    // 依据请求路径选择模型与目标表，从各 DB 读取表项
+    var root *ygot.GoStruct
+    return generateGetResponse(targetUri, root, fmtType)
+}
+
+func (app *CommonApp) translateCreate(d *db.DB) ([]db.WatchKeys, error) {
+    // 把模型树翻译成 Redis 表项变更，并给出需要监视的键
+    var watchKeys []db.WatchKeys
+    return watchKeys, nil
+}
+```
+
+这段代码强化了本篇的核心判断：translib 的应用以 `process*` 与 `translate*` 成对出现，前者负责读写与响应，后者负责把模型树翻译成 Redis 变更；`GetResponse`、`SetResponse`、`TranslibFmtType`、`generateGetResponse()` 与 `db.WatchKeys` 都是本快照可核验的名字。片段省略了请求解析、鉴权（`isAuthorizedForGet()`/`isAuthorizedForSet()`）与 CVL 校验的调用位置，这些正是图 06-14-01 中 c、e 两节点的实际内容；读源码时应重点看 `translateCreate()` 如何把模型字段映射到表名与字段名，以及校验失败时 `tlerr/` 里的错误类型如何回送（字段见 05-08 ｜ 模块见 07-07 ｜ 原理见 06-14）。
+
+第三组给出查看模型清单与落库结果的命令，用于在「请求被拒」与「配置没生效」之间分流；文件路径、表名与字段名需对照实际版本核验。
+
+```bash
+# 查看参与转换的模型清单（文件路径需对照实际版本核验）
+head -n 12 config/transformer/models_list
+# 验证配置是否落入 CONFIG_DB（表名字段需对照实际版本核验）
+sonic-db-cli CONFIG_DB HGET 'INTERFACE|Ethernet0' description
+```
+
+示例输出格式与具体键名需对照实际版本核验。若 gNMI 请求在校验阶段就被拒绝，先看模型清单与字段约束，确认请求的路径与字段在受支持模型内；若请求成功而 `HGET` 读不到值，说明 CONFIG_DB 未落库，问题在图 06-14-01 的前半段；若 `HGET` 有值而业务不通，问题在后半段的异步流水线。这类分流把管理面问题与转发面问题切开，避免一上来怀疑硬件（字段见 05-02 ｜ 排障见 08-03）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是「YANG 与 CONFIG_DB 一一对应」的误判。OpenConfig 模型与 Redis 表之间并非天然同构，二者靠注解模型与 transformer 建立映射；同一个模型字段可能落到不同表，同一张表也可能由多个模型共同贡献。因此不能按字段名猜表名，也不能按表名反推模型路径，应以 `models/yang/annotations/` 与 `config/transformer/models_list` 的可核验内容为线索，细节需对照实际版本核验（字段见 05-09 ｜ 模块见 07-07）。第二类是入口名字混淆：`docker-sonic-gnmi/` 与 `docker-gnmi-sidecar/`、`docker-gnmi-watchdog/` 是不同容器，前者承载 gNMI 服务、后两者为辅助角色；REST 侧同样有 `docker-sonic-restapi/`、`docker-restapi-sidecar/`、`docker-restapi-watchdog/` 之分；CLI 则来自 `sonic-utilities/`。把辅助容器当成主服务、或把 CLI 归入 translib 容器，都会造成定位方向错误（模块见 07-06 ｜ 模块见 07-09）。
+
+第三类是校验失败与下发失败混淆。前者是「请求没被接受」，错误来自 CVL 的语法/语义规则或 `tlerr/` 中的校验错误类型，修复方向是改字段、改路径或补依赖数据；后者是「请求被接受但业务不通」，修复方向是查 DB 表项与容器日志。两类问题的证据来源完全不同，不能互相套用（原理见 06-03 ｜ 排障见 08-04）。第四类是「管理面成功即业务生效」陷阱：gNMI Set、REST 200、`config` 返回 0 都只代表配置落库，与 ASIC 是否下发无关；把管理面回执当成生效证据，会掩盖整条异步流水线的问题（原理见 06-01 ｜ 排障见 08-03）。
+
+第五类是事实纪律陷阱。本篇多次出现的 `ValidationSessOpen()`、`ValidateEditConfig()`、`getAppInterface()`、`processGet()`、`translateCreate()`、`generateGetResponse()` 等名字可在本快照核验，但对外 API 的固定名称、函数签名、RPC 路径、端口与键名未能全部锁定，一律写「需对照实际版本核验」并给出 `cvl/`、`translib/`、`models/yang/`、`config/transformer/` 等可定位目录；transformer 的实现细节不在本快照可核验范围，不据 `models_list` 反推实现（模块见 07-07 ｜ 参数见 04-05）。第六类是 DB 编号陷阱：Redis 各库编号来自运行时 `database_config.json`，须对照 `sonic-py-swsssdk/src/swsssdk/dbconnector.py` 的 `SonicDBConfig` 与实际版本核验，禁止写死；CONFIG_DB 的 HTTP 暴露面与安全加固属于 08 册范围，本篇不展开（参数见 04-04 ｜ 加固见 08-05）。第七类是能力边界陷阱：管理面只配置与读状态，不编程 ASIC；SONiC 是白盒交换机 NOS，除 `platform/vs/` 外不做软件转发，不得把 gNMI/REST/CLI 写成通用主机配置接口或软件路由栈（原理见 06-01 ｜ 模块见 07-10）。
+
+第八类是性能与容量陷阱：管理面请求的处理时延、批量配置收敛时间、CVL 校验开销与并发容量都随机型、芯片与版本变化，一律标注「需在目标机型实测」，不给绝对值、不给跨机型通用数字（基准方法见 08-01 ｜ 调优见 08-02）。
+
+最佳实践归纳为四条。其一，把任何管理面问题先按图 06-14-01 分层：入口层查容器与进程状态，模型与校验层查路径字段与错误类型，转换落库层查 `HGET` 结果，流水线层查 APPL_DB、ASIC_DB 与 `show` 输出，先判停在哪一层再动手。其二，读代码时把路径写成 `upstream_src/sonic-mgmt-common/sonic-mgmt-common-master/` 与 `upstream_src/sonic-utilities/sonic-utilities-master/` 下的相对路径，并同时给出关键函数（`ValidateEditConfig()`、`processGet()`、`translateCreate()` 等），签名不确定就写「需对照实际版本核验」。其三，命令与输出按「前置检查、执行、验证输出、清理」闭环写，示例输出注明「示例输出，具体格式需对照实际版本核验」并附逐行判读，尤其要说明「读回一致只证明落库」。其四，跨册引用统一用四段式（字段见 05-09 ｜ 参数见 04-05 ｜ 原理见 06-14 ｜ 模块见 07-07），本篇涉及的模型字段写「字段见 05-09」、请求与响应结构写「字段见 05-08」、命令写「参数见 04-05」、容器编排写「原理见 06-13」，不在本篇展开字段表与参数全集。
+
+### 7. 小结与延伸阅读
+
+本篇把管理面这条线讲透：gNMI、REST 与 CLI 三类入口形态不同，却都把用户意图变成 CONFIG_DB 的表项；YANG 模型（`models/yang/` 的 `common/`、`annotations/`、`sonic/` 三类）提供统一的数据契约，CVL（`cvl/cvl_api.go`、`cvl/cvl.go` 等）做语法与语义两层校验，translib（`translib/` 各 `*_app.go` 与 `app_interface.go`）负责分派、翻译与响应生成，transformer 借 `config/transformer/models_list` 声明的清单完成模型到表项的转换。图 06-14-01 与两张归纳表是回查索引；三条判断贯穿全篇——模型路径不是 Redis 键、管理面成功不等于 ASIC 已下发、校验失败与下发失败分属链路前后两段。
+
+延伸阅读按疑问分流。想补管理面上游的容器基础，接读 06-13（容器编排与启动顺序）；想补落库之后的逐级下发，接读 06-01（数据流总览）、06-02（数据库分层）、06-03（mgrd 与校验）、06-04（orchagent 调度）、06-05（syncd 与 SAI）；想看具体业务如何落到芯片，接读 06-06（端口与 VLAN）、06-07（BGP 与路由）、06-08（ACL、COPP 与 QoS）；想看模块边界，接读 07-06（sonic-utilities CLI）、07-07（sonic-mgmt-common、YANG 与 CVL）、07-09（外围容器）；想看接入实战与安全加固，接读 03-04（CLI 与 telemetry、gNMI 接入）、08-05（安全加固）。字段随查走 05-08（请求与事件结构）、05-09（模型与状态结构）、05-02（表项字段），参数随查走 04-05（命令全集）、04-04（DB 对象与编号），排障走 08-03、08-04。跨册引用请始终使用「字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx」的写法，`xx` 替换为具体篇号。
+
+最后重申资料纪律：本篇所有示例输出均注明「示例输出，具体格式需对照实际版本核验」；所有源码路径均相对各子仓 `xxx-master/` 根；对外 API 名、函数签名、RPC 路径、键名与 transformer 实现等不确定处均标注核验要求并给出 `models/yang/`、`cvl/`、`translib/`、`config/transformer/`、`show/`、`config/` 等可定位目录；DB 编号以 `SonicDBConfig` 为准，不写死；性能、容量与时延类结论一律标注「需在目标机型实测」。版本基准始终为「上游 master 快照（2026-11 抓取）」，不写绝对版本号与 Redis DB 编号。至此 06 册技术原理的十四篇全部收束：06-01 至 06-05 搭起 CONFIG_DB 到 ASIC 的通用流水线，06-06 至 06-08 落到端口、BGP、ACL 等具体业务，06-09 至 06-12 补齐计数、warm reboot、多 ASIC 与平台边界，06-13 与 06-14 则分别交代「进程按什么顺序起来」与「管理面怎样把请求变成配置」。四组内容合起来，构成从管理入口到芯片、从开机启动到运行恢复的完整机制图景。

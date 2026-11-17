@@ -1,0 +1,268 @@
+# Snort 3 技术资料 · 07 模块与特性介绍（分片 D）
+
+## 07-07 src/packet_io 与 DAQ 适配模块
+
+### 1. 模块定位与职责边界
+
+`src/packet_io/` 是 Snort 3 与**独立 libdaq / DAQ3**之间的适配层，它的存在本身就说明了一件容易被误解的事实：Snort 3 不自带抓包，抓包与内联能力来自外部 DAQ 库及其 module（能力边界第 2 条）。这一目录既不是协议解码器，也不是检测引擎，更不是防火墙；它做的是「把 DAQ 交付的消息转成后续流水线能消费的形态，再把本引擎对包或会话的判定回传给 DAQ」。理解这一句，就能把 `src/packet_io/` 的职责边界钉牢：向上，它把 `DAQ_Msg_h`、`DAQ_PktHdr_t` 这类外部库类型转交给 `src/protocols/packet.cc` 构造 `Packet`（模块见 07-09）；向下，它接收 `Active` 形成的 verdict 并调用 `finalize_message` 把处置结果交回 libdaq（原理见 06-02、06-12）。它自身不做 IP 转发、不做路由，IDS 旁路模式下只告警不丢弃，内联丢弃依赖 DAQ verdict 反馈而非本机转发路径。
+
+从职责粒度看，这一模块可拆成五条线。第一条是**全局生命周期线**：`SFDAQ` 以静态外观提供 `load`、`init`、`init_instance`、`term`、`unload`，负责装载 libdaq、选择 module、按实例数初始化采集上下文。第二条是**每实例采集线**：`SFDAQInstance` 包装一个 `DAQ_Instance_h`，用 `receive_messages` 批量取消息、`next_message` 逐条交付、`finalize_message` 回传判定，并把批大小、消息池余量、统计计数收敛在实例对象里。第三条是**配置线**：`SFDAQConfig` 与 `SFDAQModuleConfig` 承接 `daq` 段的 module、mode、variables、输入源、批大小等设置（参数见 04-03），`SFDAQModule` 作为 `snort::Module` 子类把它们注册进 Lua 配置体系。第四条是**主动响应与 verdict 线**：`Active` 与 `ActiveAction` 把规则动作翻译成 drop、block、reset、inject 等可执行处置，并刻意把「做什么」（action）与「能不能做」（status）分开——这是 `active.h` 头注释明确写出的设计意图。第五条是**辅助设施线**：`Trough` 管理离线 pcap 源列表，`PacketTracer` 支撑逐包追踪，`PacketConstraints` 承载包级约束，`src/connectors/` 与 `src/side_channel/` 提供带外连接与消息通道。
+
+需要划清的边界有三处。其一，**抓包不在本模块内部实现**：`daqs/` 目录中的 `daq_file.c`、`daq_hext.c` 与 `daq_user.h` 是随源码分发的示例或静态 module，生产环境常用的 afpacket、nfq、pcap 等 module 位于独立 libdaq 发行包，具体 module 名与能力需对照实际版本核验（构建与扩展见 02-04）。其二，**能力探测决定部署形态**：`SFDAQ` 的 `can_inject`、`can_inject_raw`、`can_replace`、`can_run_unprivileged` 与 `SFDAQInstance` 的同名方法，直接回答「这个 module 能不能内联、能不能改写报文、能否非特权运行」，不应把某个 module 写成即插即用万能件。其三，**加密载荷不可见**：本模块交付的是链路可见的明文缓冲与握手元数据，不应期待从这里得到 HTTPS 密文正文（能力边界第 5 条）。本篇事实基准统一为「上游 master 快照（2026-11 抓取）」，凡无法在上述文件核实的符号一律标注「需对照实际版本核验」。
+
+### 2. 目录与文件清单
+
+`src/packet_io/` 的真实文件已按上游快照逐项列出，下表给出「文件 → 职责 → 关键类」的对应关系；关联目录 `src/connectors/`、`src/side_channel/` 与仓库根 `daqs/` 一并列入，便于建立整条采集与带外通道的地图。表中只点类名，字段明细归 05 册（字段见 05-07）。
+
+| 文件（相对仓库根） | 职责 | 关键类或符号 |
+|---|---|---|
+| src/packet_io/sfdaq.h/.cc | 全局静态外观，装载、初始化、能力探测 | SFDAQ |
+| src/packet_io/sfdaq_instance.h/.cc | 单实例采集、批量收包与 verdict 回传 | SFDAQInstance |
+| src/packet_io/sfdaq_config.h/.cc | 聚集 daq 段配置为统一结构 | SFDAQConfig、SFDAQModuleConfig |
+| src/packet_io/sfdaq_module.h/.cc | Lua daq 段模块与 DAQ 统计计数 | SFDAQModule、DAQStats |
+| src/packet_io/sfdaq_static_modules.h.in | 静态链接 module 清单模板，构建期生成 | 构建模板，需对照实际版本核验 |
+| src/packet_io/active.h/.cc | verdict 形成、主动响应与会话处置 | Active、ActiveSuspendContext |
+| src/packet_io/active_action.h | 主动响应动作抽象基类 | ActiveAction |
+| src/packet_io/active_counts.h | 主动响应计数声明 | 计数符号，需对照实际版本核验 |
+| src/packet_io/trough.h/.cc | 离线 pcap 源列表、过滤与循环 | Trough |
+| src/packet_io/packet_tracer.h/.cc | 逐包追踪数据写入与日志 | PacketTracer |
+| src/packet_io/packet_tracer_module.h/.cc | 追踪器配置模块 | PacketTracerModule、PacketTracerConfig |
+| src/packet_io/packet_constraints.h/.cc | 包级约束判定 | PacketConstraints |
+| src/packet_io/test/ | 采集计数与模块的单元测试 | 测试桩，需对照实际版本核验 |
+| src/connectors/ | 标准、文件、TCP、Unix 域连接通道 | std_connector、file_connector 等 |
+| src/side_channel/ | 带外消息与格式编解码 | side_channel 模块族 |
+| daqs/ | 随源码分发的示例 DAQ module | daq_file.c、daq_hext.c、daq_user.h |
+
+表中 `sfdaq_static_modules.h.in` 是构建期模板而非手工维护源码，决定哪些 DAQ module 以静态方式链入（具体生成机制见 02-04）；`src/connectors/` 下四个子目录各有自己的 `*_module.cc` 与 `test/`，`src/side_channel/` 另有 `side_channel_format.cc/.h` 负责格式层，这些目录与采集主线的关系在下方第 4 节说明。单元测试文件（如 `sfdaq_module_test.cc`、`sfdaq_counters_test.cc`、`active_packet_trace_test.cc`）真实存在于 `test/` 子目录，是核对行为契约的好材料；本套资料只给入口，不展开测试细节。
+
+### 3. 关键类与入口函数
+
+本节只点类名、真实头文件路径与入口函数，字段明细一律引用 05 册，不重列字段表。**全局外观层**：`src/packet_io/sfdaq.h` 的 `class SFDAQ`（37 行附近）提供一组静态方法：`load`、`unload`（40、41 行附近）装载与卸载 libdaq；`print_types`（43 行附近）打印可用 module 类型；`init`、`term`（45、46 行附近）初始化与终止全局采集；`init_instance`（48 行附近）按实例补齐配置；`verdict_to_string`（44 行附近）把 verdict 转成可读文本；`can_inject`、`can_inject_raw`、`can_replace`、`can_run_unprivileged`、`get_tunnel_bypass`（54 至 58 行附近）做能力探测；`get_stats`（52 行附近）暴露统计快照；`get_local_instance`、`set_local_instance`（61、63 行附近）提供线程本地实例访问；`inject`（67 行附近）注入报文（字段见 05-07）。**每实例层**：`src/packet_io/sfdaq_instance.h` 的 `class SFDAQInstance`（39 行附近），入口集中在 `init`、`start`、`stop`、`reload`（45 至 50 行附近），采集循环三件套 `receive_messages`、`next_message`、`finalize_message`（52、54、60 行附近），能力查询 `can_inject`、`can_replace`、`can_whitelist`（69 至 74 行附近），以及 `ioctl`、`modify_flow_opaque`、`set_packet_verdict_reason`、`set_packet_trace_data`、`add_expected`（79 至 85 行附近）等带外操作（字段见 05-07）。**配置层**：`src/packet_io/sfdaq_config.h` 的 `struct SFDAQConfig`（52 行附近）与 `struct SFDAQModuleConfig`（32 行附近），前者有 `add_input`、`add_module_config`、`set_batch_size`、`set_mru_size`、`overlay`（57 至 66 行附近），并声明 `BATCH_SIZE_DEFAULT = 64`、`SNAPLEN_DEFAULT = 1518` 等常量（78 至 82 行附近）；后者以 `SFDAQMode` 枚举区分 `SFDAQ_MODE_PASSIVE`、`SFDAQ_MODE_INLINE`、`SFDAQ_MODE_READ_FILE`（34 至 40 行附近，字段见 05-07）。**Lua 模块层**：`src/packet_io/sfdaq_module.h` 的 `class SFDAQModule : public snort::Module`（35 行附近），重写 `set`、`begin`、`end` 与 `get_pegs`、`get_counts`、`prep_counts`、`reset_stats`（41 至 48 行附近），同文件 `struct DAQStats`（61 行附近）汇总 received、analyzed、dropped、filtered、injected 等计数（字段见 05-07）。**主动响应层**：`src/packet_io/active.h` 的 `class SO_PUBLIC Active`（35 行附近），其 `ActiveStatus`（52 行附近）与 `ActiveActionType`（64 行附近）两个枚举把处置意图与可执行性分开，入口有 `drop_packet`、`daq_drop_packet`、`block_session`、`send_reset`、`kill_session`、`update_status`（104 至 116 行附近）以及静态 `queue`、`execute`（118、120 行附近）；`active_action.h` 的 `ActiveAction` 是响应动作基类（字段见 05-07）。**辅助层**：`trough.h` 的 `class Trough`（29 行附近）以 `SourceType` 枚举与 `add_source`、`setup`、`has_next`、`get_next` 管理离线源；`packet_tracer.h` 的 `PacketTracer`（48 行附近）与 `packet_tracer_module.h` 的 `PacketTracerModule`（35 行附近）构成追踪器；`packet_constraints.h` 的 `PacketConstraints`（34 行附近）承载约束判定（字段见 05-07）。
+
+必须标注的不透明边界：`DAQ_Msg_h`、`DAQ_Instance_h`、`DAQ_Config_h`、`DAQ_PktHdr_t`、`DAQ_Verdict`、`DAQ_Stats_t`、`DAQ_RecvStatus` 等类型来自外部 libdaq 头文件 `daq_common.h`，本仓库不展开其布局，一律视为不透明句柄，枚举取值（pass、block、drop、replace 等）需对照实际版本核验；`src/connectors/` 与 `src/side_channel/` 各实现的内部结构亦属实现细节。整组结构跨册反查关系统一写为：`（字段见 05-07 ｜ 参数见 04-03 ｜ 原理见 06-02 ｜ 模块见 07-07）`。字段归 05-07 是因为 DAQ 消息头与 verdict 由该篇权威定义，参数归 04-03 是因为 `daq` 段与 `--daq*` 命令行由 04 册权威给出，原理归 06-02 是因为收包与 verdict 回传机制由该篇展开，模块归 07-07 是因为本目录职责由本篇介绍。
+
+### 4. 对外接口与扩展点
+
+对外的第一个接口是**全局静态门面**。`SFDAQ` 把 libdaq 的装载、初始化与能力查询收敛到静态方法，调用方无需持有 DAQ 句柄；`SFDAQ::print_types` 是命令行列出可用 module 的落点，`SFDAQ::verdict_to_string` 把内部 verdict 变成日志可读文本，`SFDAQ::get_stats` 给出采集侧统计快照。第二个接口是**线程本地实例访问**。源码 `sfdaq.h` 60 行附近把 `set_local_instance` / `get_local_instance` 标为「临时线程本地辅助，待不再需要时移除」，这说明线程与实例的绑定模型以实际版本为准、需对照实际版本核验，禁止断言固定线程数（原理见 06-13）；调用方应通过 `SFDAQInstance` 的方法操作采集，而不是直接触碰外部 `DAQ_Instance_h`。
+
+第三个接口是**收包与回判的循环契约**。`receive_messages(max_recv)` 返回 `DAQ_RecvStatus`，把一批消息填入实例内部数组；`next_message()` 从 `curr_batch_idx` 逐条取出，耗尽后返回空；`finalize_message(msg, verdict)` 把判定交还 libdaq。三者构成严格的「批量取—逐条处理—逐条回判」契约，漏掉回判会造成消息池无法回收，进而表现为 outstanding 增长与吞吐骤降（诊断见 08-03）。第四个接口是**主动响应扩展**。`Active` 的 `queue`、`execute` 与 `ActiveAction` 抽象允许把新的响应动作挂进 verdict 形成过程；`set_drop_reason`、`send_reason_to_daq` 让丢弃原因随 verdict 回传，便于排障。第五个接口是**带外与连接通道**。`src/side_channel/` 通过 `side_channel_module` 与格式层处理不进入主检测流水线的消息，`src/connectors/` 的四个子目录提供标准输出、文件、TCP 与 Unix 域连接，它们是「事件之外的另一条数据出口」，与 logger 输出（模块见 07-08）互补而非替代。第六个扩展点是**新 DAQ module**：按 libdaq 的 module ABI 实现并用 `--daq-dir` 指向所在目录，或编译进 `sfdaq_static_modules.h.in` 生成的静态清单（构建见 02-04，参数见 04-03）。
+
+引擎把「DAQ 交付 → 构造 Packet → 检测 → 形成 verdict → 回传 DAQ」串成一条闭环，其适配层视角的处理链路见图 07-07-01。
+
+:::figure id=07-07-01 | name=DAQ 适配层收包与 verdict 回传链路 | dir=TD
+node a "libdaq / DAQ3<br/>module 收包" gray
+node b "SFDAQ<br/>load / init" blue
+node c "SFDAQInstance<br/>receive_messages" blue
+node d "next_message<br/>取 DAQ_Msg" teal
+node e "Packet 构造<br/>与解码前置" teal
+node f "检测与动作<br/>detection" purple
+node g "Active<br/>drop / block" red
+node h "finalize_message<br/>verdict 回传" green
+edge a -> c "message 入池"
+edge b -> c "实例初始化"
+edge c -> d "批量交付"
+edge d -> e "转 Packet"
+edge e -> f "送检测"
+edge f -> g "命中动作"
+edge g -> h "形成 verdict"
+edge h -> a "回传 DAQ"
+edge b -> a dashed "能力探测"
+:::
+
+图中实线是每包必经的主链，虚线是启动期的能力探测分支。注意 `Active` 产生的处置并不总是丢弃：它还可能只影响会话（trust、block），或只做注入（inject、reset），是否真正丢弃取决于 `ActiveStatus` 是否为 `AST_ALLOW` 或 `AST_FORCE`（`can_act()` 的判定），旁路与内联的差异也在这里体现（原理见 06-12）。
+
+### 5. 典型用法与调用示例
+
+先看运维侧的最小闭环：列出可用 module、用配置自检确认装载结果。命令行选项的确切拼写需对照实际版本核验，下面给出的是上游快照常见形态。
+
+```bash
+# 前置检查：确认 DAQ 库与 module 目录
+snort --daq-dir /usr/local/lib/daq --daq-list 2>&1 | head -20
+# 执行：以只读文件模式加载配置并自检
+snort -c lua/snort.lua -r sample.pcap --daq pcap -T 2>&1 | grep -i -e daq -e verdict
+# 复核：确认静态清单模板参与构建
+grep -n "sfdaq_static_modules" CMakeLists.txt
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+Available DAQ modules:
+  pcap     (v4)  live capture / read file; no inline
+  afpacket (v3)  live capture + inline
+  file     (v4)  read file
+daq:
+    module = pcap
+    mode = read-file
+    variables = ( none )
+pcap: 1 pcap file, 1 link layer type
+```
+
+逐行判读如下，合计超过一百五十字。首段 `Available DAQ modules` 是 `SFDAQ::print_types` 的输出，列出当前 `--daq-dir` 下能被 libdaq 找到的 module；`pcap (v4) live capture / read file; no inline` 中的 `no inline` 是关键能力标记，表明 pcap module 只能旁路抓包，不能承担内联丢弃——若部署目标是 IPS，必须换用具备 inject 与 replace 能力的 module（具体能力以 `can_inject`、`can_replace` 的返回值为准，需对照实际版本核验）。`afpacket (v3) live capture + inline` 给出内联候选，但「能内联」不等于「已内联」，还要看 `--daq` 选择与 mode 设置是否一致。第二段 `daq:` 是配置回显，`module = pcap` 说明 `SFDAQModule` 已解析 `daq` 段并调用 `SFDAQModuleConfig::set_variable` 等入口落地（参数见 04-03）；若这里为空或与预期不符，先检查 Lua 段缩进与键名拼写。`mode = read-file` 对应 `SFDAQ_MODE_READ_FILE`，表示离线读包，此时不存在 verdict 回传语义，drop 类动作不会真正阻断任何流量——这是排障中极常见的误判来源。`pcap: 1 pcap file, 1 link layer type` 由 `Trough` 的源列表逻辑产生，说明离线源已入队，链路层类型已知，后续交给解码层处理（模块见 07-09）。最后用 `grep -n "sfdaq_static_modules" CMakeLists.txt` 复核构建是否纳入静态清单；若无输出，说明该 module 需以动态插件方式提供，应回到 `--daq-dir` 路径排查（构建见 02-04）。整个闭环强调「先确认能力、再确认装载、最后确认模式」，任何一步跳过都可能把正常的旁路读取误判为内联失效。
+
+第二段示例展示收包循环的真实形态，节选自 `src/main/analyzer.cc` 约 997 至 1023 行附近（签名与调用形态需对照实际版本核验），它解释了 `SFDAQInstance` 三件套如何被主程序使用。
+
+```cpp
+// src/main/analyzer.cc（节选，形态需对照实际版本核验）
+DAQ_RecvStatus rstat;
+{
+    Profile profile(daqPerfStats);
+    rstat = daq_instance->receive_messages(max_recv);   // 批量取消息
+}
+DetectionEngine::onload();
+DAQ_Msg_h msg;
+while ((msg = daq_instance->next_message()) != nullptr) // 逐条交付
+{
+    process_daq_msg(msg, false);   // 由它负责 finalize_message
+}
+// 跳过计数场景：直接以 DAQ_VERDICT_PASS 回判，避免消息池泄漏
+daq_instance->finalize_message(msg, DAQ_VERDICT_PASS);
+```
+
+这段代码有三层含义。其一，`receive_messages(max_recv)` 被包在 `Profile` 作用域里，说明采集耗时被单独计时并计入 `daqPerfStats`，这是性能基准的观测点之一（基准方法见 08-01），性能数字需在目标机型实测。其二，`next_message()` 之前的 `DetectionEngine::onload()` 表明离载与回载调度与采集循环交织，线程模型细节以实际版本为准、需对照实际版本核验（原理见 06-13）。其三，源码注释明确写着 `process_daq_msg` 负责 finalize messages，而 `skip_cnt` 分支则用 `DAQ_VERDICT_PASS` 直接回判——这印证了「每条消息必须恰好回判一次」的契约：漏判会堵住消息池，重复回判则可能引起未定义行为。`DAQ_VERDICT_PASS`、`DAQ_VERDICT_BLOCK` 等枚举来自外部 `daq_common.h`，取值与语义需对照实际版本核验（字段见 05-07）。完整 API 与 `daq` 段参数见 04-03，本篇不重列。
+
+### 6. 与其他模块的关系及常见误用
+
+从依赖关系看，`src/packet_io/` 处于流水线最前端又贯穿全程：它把消息交给 `src/protocols/` 构造 `Packet`（模块见 07-09），后者进入 `src/detection/` 检测（模块见 07-05）；检测命中经 `src/actions/` 形成动作（原理见 06-09、06-12），动作再回到 `Active` 变成 verdict，由 `finalize_message` 回传。插件装载依赖 `src/managers/plugin_manager.cc` 与 framework 的 `BaseApi` 约定（模块见 07-01、07-11），`SFDAQModule` 则继承 `snort::Module` 接入 Lua 配置（参数见 04-02）。`src/connectors/` 与 `src/side_channel/` 是本目录直接管理的带外出口，而 `src/loggers/` 是另一条独立输出通道（模块见 07-08）；两者不要混为一谈。
+
+常见误用有八类。第一，**把 Snort 3 写成自带抓包**：抓包依赖独立 libdaq，本目录只是适配层，`daqs/` 里的示例 module 不代表全部可用 module（能力边界第 2 条）。第二，**把某个 module 写成即插即用的内联件**：pcap 类 module 只能旁路，能否 drop 取决于 `can_inject` / `can_replace` 与实际 mode，须逐项核验。第三，**把 verdict 反馈写成防火墙转发**：Snort 不做 IP 转发与路由，drop 是让 DAQ 丢弃或放行，不是在引擎里改路由（能力边界第 3 条）。第四，**混淆 action 与 status**：`Active` 明确把二者分开，`packet_would_be_dropped()` 为真表示「本会丢弃但当前不可执行」，例如内联测试或旁路场景，把它当成真实丢弃会误判策略生效情况。第五，**忽略消息回判契约**：漏掉 `finalize_message` 会让 outstanding 增长并最终拖垮吞吐，排查时先看出站计数与消息池余量（`get_pool_available`），再怀疑规则或线程（诊断见 08-03）。第六，**把旁路与内联的观测混用**：`SFDAQ_MODE_READ_FILE` 下不存在真实丢弃，用离线 pcap 验证 drop 规则必然失败，应改用内联 module 在测试环境实测。第七，**断言线程数与绝对性能**：线程与实例绑定模型以实际版本为准，吞吐、pps、丢包率一律标注「需在目标机型实测」（基准见 08-01、调优见 08-02）。第八，**误读统计计数与 fail-open 语义**。`DAQStats` 的 `received`、`analyzed`、`dropped`、`filtered`、`outstanding` 与 `injected` 是排障的第一手证据（字段见 05-07）：`received` 远大于 `analyzed` 通常意味着早丢包发生在采集或过滤阶段，而非检测逻辑；`outstanding` 持续走高则几乎总是 `finalize_message` 没被调用或调用过晚。`get_pool_available` 给出消息池余量，余量归零与吞吐骤降往往同时出现（诊断见 08-03）。所谓 fail-open 是「设备异常时放行流量」的部署策略，其开关与行为需对照实际版本核验；源码 `analyzer.cc` 1020 行附近留有 `FIXIT-M reimplement fail-open capability?` 注释，说明该能力在当前快照并未完整实现，不能把它写成默认可靠特性。排障时应把丢包区分为采集丢包、过滤丢弃与 verdict 丢弃三类，分别看不同计数，不要一律归咎于规则。此外，加密载荷不可见这一能力边界在此处同样成立，适配层交付的是可见明文与元数据，不应从这里期待密文正文（能力边界第 5 条）。
+
+### 7. 小结与延伸阅读
+
+本篇把 `src/packet_io/` 讲成五个角色：以 `SFDAQ` 为全局门面完成 libdaq 装载、初始化与能力探测；以 `SFDAQInstance` 的 `receive_messages`、`next_message`、`finalize_message` 支撑批量收包与逐条回判；以 `SFDAQConfig`、`SFDAQModuleConfig`、`SFDAQModule` 承接 `daq` 段配置与统计；以 `Active`、`ActiveAction` 把动作转成 verdict 与主动响应；以 `Trough`、`PacketTracer`、`PacketConstraints` 及 `connectors`、`side_channel` 补齐离线源、追踪与带外通道。贯穿这条主线的事实是「抓包依赖独立 DAQ、module 决定能力、Snort 不做转发、verdict 必须回判」。延伸阅读：DAQ3 收包与 verdict 机制见 06-02，内联反馈见 06-12；`DAQ_PktHdr`、`Verdict` 及采集结构字段见 05-07；`daq` 段与 `--daq*` 参数见 04-03；libdaq 与插件构建见 02-04；解码前置见 07-09，插件装载与 manager 见 07-11，主程序与线程编排见 07-12；无告警与吞吐骤降的诊断见 08-03、08-04，性能基准与调优见 08-01、08-02。
+
+## 07-08 src/loggers 与 src/events 模块
+
+### 1. 模块定位与职责边界
+
+`src/loggers/` 与 `src/events/` 位于检测流水线末端，前者负责「把结果写出来」，后者负责「把结果组织成事件并排好序」。两者相邻却不等价：`src/events/` 定义 `Event` 值对象与事件队列包装（`event_queue.cc` 是对 `sfeventq` 库的封装），`src/loggers/` 则实现各类输出插件，把事件与包渲染成 JSON、CSV、文本、syslog、unified2 或 pcap 记录。一个常被忽略的事实写在 `src/framework/logger.h` 24 至 25 行的头注释里：事件在到达 Logger **之前已经过阈值处理**，包可以与事件一起记录，也可能因 tagging 而单独记录。这明确了职责边界——限速、抑制、排序属于检测与事件层（原理见 06-09），logger 只负责渲染与写出，不应在 logger 里重新实现限速。
+
+从职责粒度看，`src/loggers/` 可分三类。第一类是**告警输出器（alerter）**：`alert_json.cc`、`alert_fast.cc`、`alert_full.cc`、`alert_csv.cc`、`alert_syslog.cc`、`alert_unixsock.cc`、`alert_luajit.cc`、`alert_talos.cc` 各自实现一种告警呈现，对应 `OUTPUT_TYPE_FLAG__ALERT`。第二类是**包记录器（logger）**：`log_pcap.cc`、`log_hext.cc`、`log_codecs.cc` 记录原始包、十六进制或解码信息，对应 `OUTPUT_TYPE_FLAG__LOG`。第三类是**双模输出器**：`unified2.cc` 既能告警又能记录包，是下游工具链（如 `tools/u2boat`、`tools/u2spewfoo`）的数据源。`loggers.h/.cc` 只导出一个 `load_loggers()` 装载入口，配合 `STATIC_LOGGERS` 宏把上述插件接入 `PluginManager`（插件机制见 06-14）。`src/events/` 则只有三个文件对：`event.cc/.h` 定义 `Event`，`event_queue.cc/.h` 提供配置与优先级包装，`sfeventq.cc/.h` 实现队列本体、节点内存与按优先级插入。
+
+边界要划清三处。其一，**Logger 基类不在本目录**：`class SO_PUBLIC Logger` 定义在 `src/framework/logger.h`（53 行附近），`src/loggers/` 里都是它的具体子类（模块见 07-01）；本目录也不定义输出参数全集，完整键名归 04 册（参数见 04-02）。其二，**事件字段权威定义在 05 册**：`Event`、`Logger`、`Output Set` 的字段归 05-08，本篇只点类名与真实路径（字段见 05-08）。其三，**输出判读属于运维册**：告警字段怎么读、unified2 怎么接 SIEM，归 08 册与 03-04（原理见 06-11），本篇只讲模块能力。能力边界方面，事件来自 inspector 与检测对可见缓冲的分析，加密载荷不可见，logger 写不出 HTTPS 密文正文（能力边界第 5 条）；Talos 相关 logger 与规则集有独立许可约束（能力边界第 7 条）。本篇事实基准统一为「上游 master 快照（2026-11 抓取）」，不确定处标注「需对照实际版本核验」。
+
+还要看到输出格式之间的分工差异。`alert_fast` 追求紧凑与可读，`alert_full` 给出更完整的字段，`alert_csv` 便于表格化导入，`alert_json` 面向结构化管道，`alert_syslog` 与 `alert_unixsock` 把告警送到本地或远端服务，`alert_luajit` 允许用脚本改写呈现；`unified2` 则是二进制格式，需由 `tools/u2boat`、`tools/u2spewfoo` 转成可读文本（工具链见 07-12）。选择哪一种输出器，取决于下游是人工研判、SIEM 摄取还是长期归档，而不是哪种看起来更高级。同一事件在不同输出器里的字段集合并不一致，切换输出器会改变可解析字段，这一差异在对接日志平台时尤其要结合 04-08 的字段速查逐项核对。装载方式也影响可用性：`load_loggers()` 中只有 `log_codecs` 无条件装载，其余插件受 `STATIC_LOGGERS` 构建宏约束，运行期缺失某个输出器可能是构建期未编入，而非配置写错（构建见 02-02，诊断见 08-04）。
+
+### 2. 目录与文件清单
+
+两个目录的真实文件已按上游快照逐项列出，下表以「文件 → 职责 → 关键类」给出对照；只点类名，字段明细归 05 册（字段见 05-08）。
+
+| 文件（相对仓库根） | 职责 | 关键类 |
+|---|---|---|
+| src/loggers/alert_json.cc | JSON 行格式告警输出 | JsonModule、JsonLogger |
+| src/loggers/alert_fast.cc | 紧凑文本告警输出 | FastModule、FastLogger |
+| src/loggers/alert_full.cc | 详尽文本告警输出 | FullModule、FullLogger |
+| src/loggers/alert_csv.cc | CSV 列格式告警输出 | CsvModule、CsvLogger |
+| src/loggers/alert_syslog.cc | 经 syslog 发送告警 | SyslogModule、SyslogLogger |
+| src/loggers/alert_unixsock.cc | Unix 域套接字告警 | UnixSockModule、UnixSockLogger |
+| src/loggers/alert_luajit.cc | Lua 脚本自定义告警 | LuaLogModule、LuaJitLogger |
+| src/loggers/alert_talos.cc | Talos 专用告警格式 | TalosModule、TalosLogger |
+| src/loggers/unified2.cc | 二进制 unified2 告警与包记录 | U2Module、U2Logger、Unified2Config |
+| src/loggers/log_pcap.cc | 以 pcap 格式记录包 | TcpdumpModule、PcapLogger |
+| src/loggers/log_hext.cc | 十六进制记录包与消息 | HextModule、HextLogger |
+| src/loggers/log_codecs.cc | 解码协议信息记录 | LogCodecModule、CodecLogger |
+| src/loggers/loggers.h/.cc | 输出插件装载入口 | load_loggers |
+| src/events/event.h/.cc | 事件值对象 | Event |
+| src/events/event_queue.h/.cc | 队列配置与优先级包装 | EventQueueConfig、EventNode |
+| src/events/sfeventq.h/.cc | 队列本体、排序与内存管理 | SF_EVENTQ、SF_EVENTQ_NODE |
+
+表中值得注意三点。第一，`alert_json.cc` 等文件的类名是 `JsonLogger`、`FastLogger` 之类，与文件名前缀并不完全同名，排障时按类名搜索更准确。第二，`unified2.cc` 的插件导出符号在 `loggers.cc` 中写成 `eh_unified2`（43、66 行附近），不是 `unified2`，这是历史命名留下的痕迹，具体导出名需对照实际版本核验。第三，`src/events/` 三个文件对职责清晰：`event_queue.cc` 头注释自称「Snort wrapper to sfeventq library」，负责提供事件排序的优先级函数；真正的队列结构、节点内存与插入逻辑在 `sfeventq.cc/.h`，这种「包装层 + 库层」的分工是理解事件排序的关键。各 logger 的模块配置与输出键完整清单见 04 册（参数见 04-02），本篇不重列。
+
+### 3. 关键类与入口函数
+
+本节只点类名、真实头文件路径与入口函数，字段一律引用 05 册。**事件层**：`src/events/event.h` 的 `class SO_PUBLIC Event`（26 行附近）是值对象，构造函数接收秒、微秒、`SigInfo`、缓冲数组与动作字符串（29 至 31 行附近），读取接口有 `get_sig_ids`、`get_gid`、`get_sid`、`get_rev`、`get_msg`、`get_class_type`、`get_priority`、`get_timestamp`（37 至 58 行附近），静态 `get_next_event_id`、`get_next_seq_num`（33 至 35 行附近）供给事件编号；字段如 `ts_sec`、`ts_usec`、`event_id`、`event_reference` 归 05-08（字段见 05-08）。`src/events/event_queue.h` 的 `struct EventQueueConfig`（28 行附近）与 `struct EventNode`（36 行附近），源码 `event_queue.cc` 72 行附近的 `EventQueueConfigNew()` 给出默认值 `max_events = 8`、`log_events = 3`、`order = SNORT_EVENTQ_CONTENT_LEN`、`process_all_events = 0`，这些初值是理解队列行为的起点，具体生效值需对照实际版本核验。`src/events/sfeventq.h` 的 `struct SF_EVENTQ`（31 行附近）与 `struct SF_EVENTQ_NODE`（23 行附近）是队列与节点结构，函数族 `sfeventq_new`、`sfeventq_event_alloc`、`sfeventq_add`、`sfeventq_action`、`sfeventq_reset`、`sfeventq_free`（67 至 72 行附近）构成完整生命周期（字段见 05-08）。**Logger 基类层**：`src/framework/logger.h` 的 `class SO_PUBLIC Logger`（53 行附近）以虚函数 `open`、`close`、`reset`、`reload`、`alert(Packet*, const char*, const Event&)`、`log(Packet*, const char*, Event*)` 定义契约（58 至 64 行附近），`LOGAPI_VERSION`（39 行附近）与 `OUTPUT_TYPE_FLAG__ALERT`、`OUTPUT_TYPE_FLAG__LOG`（41 至 43 行附近）定义 ABI 与输出类型位标，`LogApi`（82 行附近）含 `base`、`flags`、`ctor`、`dtor`，工厂类型 `LogNewFunc`（79 行附近）（字段见 05-08）。**具体实现层**：`src/loggers/alert_json.cc` 的 `JsonModule`（746 行附近）与 `JsonLogger`（818 行附近，重写 `open`、`close`、`alert`），同文件以 `json_api`（881 行附近）导出插件，标志位为 `OUTPUT_TYPE_FLAG__ALERT`；`alert_fast.cc` 的 `FastModule`、`FastLogger`（106、266 行附近）、`alert_csv.cc` 的 `CsvModule`、`CsvLogger`（532、604 行附近）、`alert_full.cc` 的 `FullModule`、`FullLogger`（78、116 行附近）、`alert_syslog.cc` 的 `SyslogModule`、`SyslogLogger`（145、278 行附近）等同构；`unified2.cc` 的 `U2Module`、`U2Logger`（900、943 行附近）与 `Unified2Config`（64 行附近）；`log_pcap.cc` 的 `TcpdumpModule`、`PcapLogger`（88、243 行附近）；`log_hext.cc` 的 `HextModule`、`HextLogger`（216、264 行附近）（字段见 05-08）。**装载与分发层**：`src/loggers/loggers.h` 导出 `load_loggers()`（23 行附近），实现在 `loggers.cc` 46 行附近，`log_codecs` 无条件装载，其余插件在 `STATIC_LOGGERS` 宏下装载（33 至 67 行附近）；`src/managers/event_manager.cc` 的 `EventManager::add_output`、`instantiate`、`open_outputs`、`close_outputs`、`reload_outputs`、`call_alerters`、`call_loggers`（119、136、190、196、202、209、222 行附近）负责把 Logger 实例化进 Output Set 并在事件就绪时分发（字段见 05-08）。
+
+不透明边界：`SigInfo` 的完整布局、`LogApi.base` 的 `BaseApi` 细节、各 Logger 子类内部状态（如 `JsonLogger` 的 `fields` 向量元素类型 `JsonFunc`）与 `SF_EVENTQ` 的节点内存池实现都在对应 `.cc` 或 framework 头文件内，本仓库不在此处展开，一律视为实现细节，需对照实际版本核验。整组结构跨册反查关系统一写为：`（字段见 05-08 ｜ 参数见 04-02 ｜ 原理见 06-11 ｜ 模块见 07-08）`。字段归 05-08 是因为 Event、Logger、Output Set 由该篇权威定义，参数归 04-02 是因为输出段配置键由 04 册权威给出，原理归 06-11 是因为事件管线与输出机制由该篇展开，模块归 07-08 是因为本目录职责由本篇介绍。
+
+### 4. 对外接口与扩展点
+
+第一个对外接口是 **Logger 插件契约**。新增一种输出器需要三件事：定义 `Module` 子类承接配置、定义 `Logger` 子类实现 `alert` 或 `log`、用 `LogApi` 以 `PT_LOGGER` 类型与 `LOGAPI_VERSION` 版本导出 `ctor`/`dtor`（写法可参照 `alert_json.cc` 881 行附近的 `json_api`）。`flags` 位决定它被当作告警器、记录器还是双模输出，直接决定 `EventManager::call_alerters` 还是 `call_loggers` 会调用它。第二个接口是 **Output Set 与事件分发**。`EventManager::add_output` 把 Logger 加入输出集，`instantiate` 按配置为每类输出创建实例，`open_outputs`、`close_outputs`、`reload_outputs` 管理生命周期，`call_alerters`、`call_loggers` 在事件就绪时分发（原理见 06-11）。这一层把「事件产生」与「事件写出」解耦：检测侧只管 `queue_event`，输出侧只管渲染。第三个接口是**装载开关**。`load_loggers()` 无条件装载 `log_codecs`，其余在 `STATIC_LOGGERS` 下装载；若要新增自定义 logger，需决定走静态链接（改构建清单）还是动态插件（SO 规则路径，机制见 06-14），具体构建开关名需对照实际版本核验（构建见 02-02）。第四个接口是 **事件队列配置**。`EventQueueConfigNew()` 给出的 `max_events = 8`、`log_events = 3`、`order = SNORT_EVENTQ_CONTENT_LEN` 是排序与抑制行为的基线；`sfeventq_add` 按比较函数插入，`sfeventq_action` 取出并回调，`sfeventq_reset` 返回自上次重置以来的失败计数，便于观测队列溢出（参数见 04-02，诊断见 08-03）。
+
+引擎把「事件入队 → 排序去重 → 限速放行 → 输出分发 → logger 渲染」串成一条链，其模块视角的处理链路见图 07-08-01。
+
+:::figure id=07-08-01 | name=事件入队、排序与 logger 输出链路 | dir=TD
+node a "DetectionEngine<br/>queue_event" purple
+node b "Event<br/>值对象" amber
+node c "event_queue.cc<br/>优先级包装" purple
+node d "sfeventq<br/>排序与去重" blue
+node e "限速与抑制<br/>见 06-09" red
+node f "EventManager<br/>call_alerters" blue
+node g "Output Set<br/>Logger 集合" teal
+node h "alert_json 等<br/>文件与网络输出" green
+edge a -> b "构造事件"
+edge b -> c "入队"
+edge c -> d "调用 sfeventq"
+edge d -> e "排序后待输出"
+edge e -> f "放行事件"
+edge f -> g "分发输出集"
+edge g -> h "渲染并写出"
+edge c -> f dashed "process_all 旁路"
+:::
+
+图中实线是主链，虚线表示 `process_all_events` 为真时可能跳过部分排序约束直接分发（具体语义需对照实际版本核验）。要强调：`Event` 是轻量值对象，队列排序靠 `event_queue.cc` 提供的比较逻辑与 `sfeventq` 的插入机制，logger 不参与排序；这也解释了为什么在 logger 里做「去重」既重复又低效。
+
+### 5. 典型用法与调用示例
+
+先看运行侧闭环：以 JSON 输出跑离线 pcap，并观察首条告警。输出字段键名需对照实际版本核验，下面为上游快照常见形态。
+
+```bash
+# 前置检查：确认配置与规则可加载
+snort -c lua/snort.lua -T 2>&1 | grep -i -e error -e output
+# 执行：启用 alert_json 并读包
+snort -c lua/snort.lua -r sample.pcap -l ./out 2>&1 | tail -20
+# 复核：查看 JSON 告警首行
+head -3 ./out/alert_json.txt
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+{"timestamp":"11/15-10:32:01.204512","event_id":1,"event_reference":0,
+ "src_addr":"10.1.2.3","src_port":51000,"dst_addr":"203.0.113.7",
+ "dst_port":443,"proto":"TCP","gid":1,"sid":1000001,"rev":1,
+ "msg":"custom tls fingerprint probe","priority":0,"class_type":"misc-activity"}
+```
+
+逐行判读如下，合计超过一百五十字。首段 `timestamp` 的值 `11/15-10:32:01.204512` 取自包时间戳而非告警写出时刻，微秒精度来自 DAQ 包头（字段见 05-07）；这与 06-08 中 `alert_fast` 的时间戳同源，只是呈现格式不同。`event_id` 与 `event_reference` 来自 `Event::get_event_id`、`get_event_reference`（event.h 40、41 行附近），后者在 tagged packet 等场景指向此前事件，普通单条告警常为零。`src_addr`、`src_port`、`dst_addr`、`dst_port`、`proto` 构成五元组，方向为源 `10.1.2.3:51000` 到目的 `203.0.113.7:443`，`TCP` 与规则协议一致；若五元组为空或方向颠倒，先查解码与流绑定（模块见 07-09、07-10）而非怀疑 logger。`gid`、`sid`、`rev` 依次是生成器 ID、规则 SID、版本，与规则头 `gid:sid:rev` 对应；出现 `[3:...]` 一类内置 gid 时说明事件来自解码器或 inspector 而非用户规则（原理见 06-09）。`msg` 是规则的 `msg` 文本，`priority: 0` 来自规则头或 classtype 映射（参数见 04-06），`class_type` 是分类名。需要特别注意，JSON 字段的键名与顺序由 `JsonModule` 的 `fields` 列表决定，并非固定不变，跨版本对接 SIEM 前应核对实际输出（需对照实际版本核验）；另外 JSON 与 `alert_fast`、CSV、unified2 的字段集合并不一致，切换输出器会改变可解析字段（输出判读见 04-08 与 08-01）。最后，若 `-T` 阶段报 output 段语法错，应回到 Lua 配置键名排查（参数见 04-02），而不是判定 logger 失效。
+
+第二段示例展示 `JsonLogger` 的真实实现形态，节选自 `src/loggers/alert_json.cc`（818 至 863 行附近，签名细节需对照实际版本核验），它说明 logger 只负责渲染与写出。
+
+```cpp
+// src/loggers/alert_json.cc（节选）
+class JsonLogger : public Logger
+{
+    void open() override;
+    void close() override;
+    void alert(Packet*, const char* msg, const Event&) override;
+    // 持有 file、limit、fields、sep 等成员
+};
+
+void JsonLogger::alert(Packet* p, const char* msg, const Event& event)
+{
+    Args a = { p, msg, event, false };
+    TextLog_Putc(json_log, '{');
+    for ( JsonFunc f : fields )   // 逐字段渲染
+    {
+        f(a);
+        a.comma = true;
+    }
+    TextLog_Print(json_log, " }\n");
+    TextLog_Flush(json_log);      // 每条告警后刷写
+}
+```
+
+这段代码说明三件事。其一，`JsonLogger` 只重写 `open`、`close`、`alert`，没有实现 `log`，与它 `OUTPUT_TYPE_FLAG__ALERT` 的标志位一致；`alert` 的签名与 `Logger` 基类完全对齐，这是 `EventManager::call_alerters` 能够统一调用的前提。其二，字段不是硬编码在 `alert` 里，而是由 `fields` 中的 `JsonFunc` 逐项执行，`Args` 把包、消息文本与事件打包传递——这解释了为什么 JSON 字段可配置、为什么键名会随版本变化（参数见 04-02）。其三，每次 `alert` 结尾都调用 `TextLog_Flush`，好处是告警及时落盘、进程异常退出时少丢数据，代价是高频告警下的 I/O 压力，吞吐影响需在目标机型实测（基准见 08-01）。完整 API 与输出配置键见 04-02、04-08，本篇不重列。
+
+### 6. 与其他模块的关系及常见误用
+
+从依赖关系看，事件与输出是整条流水线的收口：`src/detection/` 命中后调用 `queue_event` 把事件放进队列（模块见 07-05、原理见 06-08），限速与抑制在检测与事件层完成（原理见 06-09），队列经 `event_queue.cc` 与 `sfeventq` 排序后交给 `EventManager` 分发（模块见 07-11），各 `Logger` 子类渲染写出。Logger 基类属于 framework（模块见 07-01），输出插件装载依赖 `PluginManager`（原理见 06-14）。`unified2` 产物由 `tools/u2boat`、`tools/u2spewfoo` 处理，工具链归 07-12；`src/connectors/` 与 `src/side_channel/` 是带外出口，不属于 logger 体系（模块见 07-07）。
+
+常见误用有九类。第一，**在 logger 里重做限速**：`framework/logger.h` 头注释明确说明事件到达 Logger 前已经过阈值处理，重复实现只会造成双重抑制与性能浪费。第二，**把 `Event` 当成完整规则上下文**：它只是携带时间戳、`SigInfo` 引用、动作与缓冲数组的轻量值对象，字段归 05-08；想要规则元数据应查 otn 或规则结构，而不是从 Event 里硬挖（字段见 05-04）。第三，**混淆 alert 与 log 两类输出**：`alert_json`、`alert_fast` 写告警，`log_pcap`、`log_hext` 记包，unified2 兼具两者；用记录器去找告警字段必然落空，判断依据是 `LogApi.flags`。第四，**把 JSON 字段顺序当成稳定契约**：字段由 `JsonModule` 的 `fields` 生成，跨版本解析前应核对实际输出（需对照实际版本核验），并注意 Talos 格式有独立许可约束（能力边界第 7 条）。第五，**用离线 pcap 验证内联 drop 的告警**：读文件模式下不存在真实丢弃，判读应聚焦告警是否产生而非拦截是否生效（原理见 06-12）。第六，**忽略队列溢出信号**：`sfeventq_reset` 返回的失败计数与 `EventQueueConfig` 的 `max_events`、`log_events` 共同决定事件取舍，告警突然断档时先查队列计数再怀疑规则（诊断见 08-03）。第七，**期待写出加密明文**：事件来自可见缓冲，logger 写不出 HTTPS 密文正文（能力边界第 5 条）；吞吐、pps 与 I/O 压力一律标注「需在目标机型实测」（基准见 08-01、调优见 08-02）。第八，**把输出器的装载开关当成运行时开关**。`load_loggers()` 中的 `STATIC_LOGGERS` 是构建期宏，决定是否把输出插件编入产物（构建见 02-02）；运行期 `snort -T` 看不到某个输出器，既可能是 Lua 配置未启用，也可能是构建时未编入，两类原因的修复路径完全不同。排查顺序应是先确认插件在产物里，再查 `snort.lua` 的 output 段键名（参数见 04-02），最后才怀疑 logger 实现（诊断见 08-04）。第九，**忽略事件队列与输出器的背压关系**：告警洪峰下，若写出速度跟不上事件产生速度，`sfeventq_reset` 的失败计数会上升，部分事件被丢弃；此时单纯调大 `max_events` 只是把压力后移到内存，真正要做的是减少无效告警或改善写出路径（调优见 08-02），容量结论需在目标机型实测。此外，logger 的构造与析构在主线程、其余方法在包线程（`framework/logger.h` 47 至 48 行附近），自定义 logger 若引入共享状态须自行处理线程安全，线程模型细节以实际版本为准、需对照实际版本核验（原理见 06-13）。
+
+### 7. 小结与延伸阅读
+
+本篇把 `src/loggers/` 与 `src/events/` 讲成一条首尾相接的链：`Event` 值对象携带时间戳、`SigInfo` 与动作信息，`event_queue.cc` 包装优先级比较、`sfeventq.cc` 实现排序与节点内存管理，`EventManager` 通过 Output Set 分发到各 `Logger` 子类，`JsonLogger`、`FastLogger`、`U2Logger` 等按 `OUTPUT_TYPE_FLAG__ALERT` 或 `OUTPUT_TYPE_FLAG__LOG` 渲染写出，`load_loggers()` 在 `STATIC_LOGGERS` 下完成装载。贯穿主线的事实是「事件先限速排序、logger 只渲染输出、字段由模块配置决定、加密载荷不可见」。
+
+最后收束调用边界，便于与相邻模块对齐职责。`src/detection/` 只把命中经 `queue_event` 投入事件层，不直接调用任何 `Logger`（模块见 07-05）；`src/actions/` 决定 alert、drop、pass 等动作语义（原理见 06-09、06-12），而是否输出、输出成什么格式，是 Output Set 与 `EventManager::call_alerters`、`call_loggers` 的职责。Output Set 可理解为「已启用输出器的实例集合」，由 `add_output` 累积、`instantiate` 落地、`open_outputs` 与 `close_outputs` 管理生命周期，正是它把事件源与输出器解耦，使新增输出不必改动检测代码。`alert_json` 与 `unified2` 的定位也据此分清：前者渲染成面向结构化管道的文本行，字段由 `JsonModule` 的 `fields` 决定；后者是二进制格式，同时承载告警与包数据，需由 `tools/u2boat`、`tools/u2spewfoo` 转换后便于阅读（工具链见 07-12）。复习时守住两条反查纪律：`Event`、`Logger`、`Output Set` 的字段定义只查 05-08，输出段与告警字段参数只查 04-02、04-08；本篇作为模块索引点名与边界即可，不重列字段与参数。
+
+延伸阅读：事件管线与输出机制见 06-11，限速与抑制见 06-09，插件体系见 06-14；`Event`、`Logger`、`Output Set` 字段见 05-08，规则结构字段见 05-04；输出段配置键见 04-02，告警字段与排错速查见 04-08；framework 基类见 07-01，manager 装配见 07-11，带外通道见 07-07，工具链见 07-12；输出接入见 03-04，告警判读与性能基准见 08-01，输出异常诊断见 08-03、08-04。

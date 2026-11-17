@@ -1,0 +1,281 @@
+# SONiC 技术资料 · 02 编译与构建（分片 B）
+## 02-03 从零构建实战：编译标准镜像与 ONIE 安装镜像
+
+### 1. 目标与拓扑
+
+本篇要完成一次可复现的闭环：在一台干净的 x86_64 构建主机上，从 `upstream_src/sonic-buildimage/sonic-buildimage-master/` 这个真实仓库根出发，配置目标平台、在 sonic-slave 容器内编译，产出能被 ONIE 安装器识别的 SONiC 镜像，并用 `platform/vs/` 虚拟交换机镜像做一次对照。先把两个名字说清楚：所谓“标准镜像”，指交给安装器的 `target/sonic-<machine>.bin` 安装包；所谓“ONIE 安装镜像”，是同一产物从安装器视角的叫法——本快照 `onie-image.conf` 里 `OUTPUT_ONIE_IMAGE=target/sonic-$TARGET_MACHINE.bin` 给出的正是它（参数见 04-01）。还要先立一条纪律：SONiC 的“编译”不是编译某个可执行文件，而是由 `Makefile` 的 `%::` 通配目标把工作转交 `Makefile.work`、再按 `BLDENV` 进入不同 `sonic-slave-*/` 容器，把几十个上游组件、容器镜像与文件系统装配成一个可安装镜像（原理见 06-13 ｜ 模块见 07-01）。普通 x86 主机裸跑 `make` 得不到可安装镜像，这是本篇反复要守住的能力边界（字段见 05-09 ｜ 参数见 04-01 ｜ 原理见 06-13 ｜ 模块见 07-11）。
+
+构建拓扑按职责可拆成四条主线。第一条是“配置面”：`make init` 拉取子模块、`make configure PLATFORM=...` 选定 ASIC 平台，二者把意图固化进构建配置，具体变量全集见 04-01，本篇只给最小必要命令。第二条是“容器面”：`README.buildsystem.md` 明确 `Makefile`、`slave.mk` 与 `sonic-slave/Dockerfile` 是构建后端，每个构建片段都在名为 sonic-slave 的容器里执行，首次构建会先在本机生成该镜像；本快照把容器按发行版拆成 `sonic-slave-bookworm/`、`sonic-slave-trixie/` 等目录，`Makefile` 默认的 `NOBOOKWORM=0`、`NOTRIXIE=0` 表示 bookworm 与 trixie 两条线参与构建，其余发行版默认关闭。第三条是“规则面”：`slave.mk` 与 `rules/` 下的 `.mk`/`.dep` 文件决定哪些目标被构建，`rules/config.user` 可持久设定并发与内存上限。第四条是“装配面”：`build_image.sh` 读取 `onie-image.conf`，调用 `onie-mk-demo.sh` 把文件系统、dockerfs 与引导组件打包为 ONIE 安装包，或按 `IMAGE_TYPE` 产出 raw / KVM 镜像（模块见 07-01 ｜ 模块见 07-11 ｜ 参数见 04-01）。
+
+图 02-03-01 把这条从配置到安装镜像的链路画在一起，便于建立“哪一步产出什么”的整体印象。
+
+:::figure id=02-03-01 | name=从配置到ONIE安装镜像的构建链路 | dir=TD
+node a "make configure<br/>PLATFORM=vs" teal
+node b "Makefile %::<br/>Makefile.work" teal
+node c "sonic-slave-*<br/>Docker 构建容器" gray
+node d "slave.mk 与<br/>rules/*.mk" teal
+node e "build_image.sh<br/>onie-image.conf" teal
+node f "target/sonic-vs.bin<br/>ONIE 安装包" amber
+node g "KVM/raw 镜像<br/>target/*.img" amber
+node h "onie-nos-install<br/>ONIE 安装边界" red
+node i "设备启动<br/>ASIC 数据面" red
+edge a -> b "配置平台"
+edge b -> c "按 BLDENV 进入"
+edge c -> d "读取规则"
+edge d -> e "装配脚本"
+edge e -> f "产出安装包"
+edge e -> g "产出虚拟镜像"
+edge f -> h "交付安装器"
+edge h -> i "落盘并启动"
+:::
+
+图 02-03-01 中 teal 为配置与构建规则，gray 为外部依赖的 Docker 构建容器，amber 为编译产物，red 为安装与硬件边界。图中“sonic-slave-*”用灰色是因为它是必须预先具备的外部依赖（Docker 环境），而非 SONiC 自身源码；“ASIC 数据面”用红色强调安装镜像最终服务于真实转发芯片，而虚拟交换机只是开发测试形态（原理见 06-13 ｜ 模块见 07-10）。图中没有把 `config`/`show` 画进来，因为构建阶段还没有运行中的控制面，配置流水线是设备启动后的事（原理见 06-01）。
+
+### 2. 前置条件与环境
+
+第一项是源码与子模块。`README.md` 给出的顺序是：克隆仓库、`git checkout` 到目标分支、`make init`（克隆后或子模块更新后执行一次）、再 `make configure PLATFORM=[ASIC_VENDOR]`。`make init` 之所以必须，是因为 `sonic-buildimage-master/.gitmodules` 列出了子模块，本快照以多仓加归档层的形态提供源码，真实仓库根是 `upstream_src/<子仓>/<子仓>-master/`，任何路径都要按这个归档层去读（模块见 07-01）。本套资料的事实锚点是“上游 master 快照（2026-11 抓取）”，不写绝对版本号；构建产物的版本字符串由 `SONIC_IMAGE_VERSION` 等构建变量决定，具体取值需对照实际版本核验。
+
+第二项是 Docker 与磁盘。`README.buildsystem.md` 说明首次构建会构建 sonic-slave 镜像，因此主机必须能正常运行 Docker；`build_image.sh` 里多处 `sudo`，说明构建脚本假定执行用户具备 sudo 权限。磁盘方面，`onie-image.conf` 的 `ONIE_IMAGE_PART_SIZE` 默认是 `32768`（32GB），`DOCKER_RAMFS_SIZE=3500M`，`RAW_IMAGE_DISK_SIZE=1700`、`KVM_IMAGE_DISK_SIZE=16`，这些量级意味着构建主机要预留足够空间，否则会在打包阶段报磁盘不足一类的错误。并发与内存的关系在 `README.md` 里有说明：每个并行 C++ 编译任务会占用数 GB 内存，官方建议用 `rules/config.user` 里的 `SONIC_BUILD_MEMORY` 限制容器内存，避免 OOM 波及宿主进程；`SONIC_BUILD_JOBS=4` 是多数场景经过验证的选择。具体数值随版本与机型变化，需对照实际版本核验（参数见 04-01）。
+
+第三项是平台选择。`README.md` 列出的受支持 ASIC 供应商包括 `barefoot`、`broadcom`、`marvell-prestera`、`marvell-teralynx`、`mellanox`、`centec`、`nvidia-bluefield`、`vs`。其中 `PLATFORM=vs` 是虚拟交换机，不依赖真实 ASIC，最适合在没有硬件的环境里跑通整条构建链；`PLATFORM=broadcom` 等真实平台还需要对应厂商 SAI 实现，而这些实现是闭源且不在本快照的，因此真实平台的完整构建与性能表现需对照实际版本核验、需在目标机型实测（模块见 07-10 ｜ 参数见 04-01）。`PLATFORM` 的取值决定 `Makefile` 里的 `PLATFORM_PATH := platform/$(if $(PLATFORM),$(PLATFORM),$(CONFIGURED_PLATFORM))`，进而决定包含哪一组的 `.mk` 规则——这就是“配置面”落到“规则面”的接缝。
+
+第四项是代理与网络。sonic-slave 容器内部要拉取 Debian 包、Python 依赖与上游源码，主机若处于需要 HTTP/HTTPS 代理的网络，代理设置需要在容器构建阶段就注入，否则表现为 apt 超时或 pip 拉不到包；这类问题属于构建环境而非源码缺陷，排障时先看容器网络再看规则。下表把本节涉及的关键前置项与核验要求归纳在一起，便于开工前逐项对照。
+
+| 前置项 | 核验要点 | 本快照依据 | 说明 |
+|---|---|---|---|
+| 子模块 | 克隆后执行 `make init` | `.gitmodules` | 不执行会导致源码缺失 |
+| Docker | 能构建并运行 sonic-slave 镜像 | `README.buildsystem.md` | 首次构建自动生成镜像 |
+| sudo | 构建脚本多处 `sudo` | `build_image.sh` | 执行用户需有相应权限 |
+| 磁盘 | 预留分区与镜像所需空间 | `onie-image.conf` | 分区默认 32768 MB |
+| 平台 | 选择受支持的 PLATFORM 值 | `README.md` | `vs` 无需真实 ASIC |
+| 网络 | 代理与源可达 | 容器构建阶段 | 失败先查容器网络 |
+
+### 3. 分步操作
+
+下面按“前置检查 → 执行 → 验证输出 → 清理”的闭环给出最小命令序列，全部在 `sonic-buildimage-master/` 仓库根执行。完整构建变量、变体组合与命令全集见 04-01，本册不重列；这里只保留跑通 vs 构建所必需的四步。
+
+第一步，确认当前路径与平台目录存在，再初始化子模块。`PLATFORM=vs` 对应 `platform/vs/`，本快照该目录真实存在，且 `platform/vs/rules.mk` 中 `include $(PLATFORM_PATH)/one-image.mk`、`$(PLATFORM_PATH)/onie.mk`、`$(PLATFORM_PATH)/kvm-image.mk` 说明它具备 one-image、ONIE 与 KVM 三类目标的装配规则。确认无误后执行 `make init` 拉取子模块（参数见 04-01）。
+
+第二步，配置平台。执行 `make configure PLATFORM=vs`。这一步把 `CONFIGURED_PLATFORM` 固化为 `vs`，使后续 `PLATFORM_PATH` 指向 `platform/vs/`。注意 `README.md` 要求 `make configure` 在克隆后只执行一次，切换平台应重新 configure；平台取值拼写错误会导致包含不到对应 `.mk`，表现为“目标没有规则”。
+
+第三步，执行构建。用 `make SONIC_BUILD_JOBS=4 all` 启动全流程；若只需单个 ONIE 安装包，可用 `make target/sonic-vs.bin` 这类具体目标，产物名由 `OUTPUT_ONIE_IMAGE=target/sonic-$TARGET_MACHINE.bin` 与 `TARGET_MACHINE` 共同决定，需对照实际版本核验。为了在受限内存主机上构建，可先写 `rules/config.user`（其被 `.gitignore` 忽略、可在变基后保留），放入 `SONIC_BUILD_MEMORY` 与 `SONIC_BUILD_JOBS` 等持久值；需要快速迭代时用 `BUILD_SKIP_TEST=y` 跳过测试（模块见 07-12 ｜ 参数见 04-01）。
+
+第四步，验证与清理。用 `ls -lh target/` 确认产物存在并查看体积，用 `show version`（在启动后的设备上）核对平台与 HwSKU 字段；构建缓存问题可用 `make clean` 或对应的 `<target>-clean` 目标处理，例如 `README.md` 给出 `make target/debs/swss_1.0.0_amd64.deb-clean` 这一形式的清理目标，具体目标名需对照实际版本核验。
+
+```bash
+# 在 sonic-buildimage-master/ 仓库根执行
+pwd
+ls -d platform/vs
+make init
+make configure PLATFORM=vs
+printf 'SONIC_BUILD_MEMORY = 24g\nSONIC_BUILD_JOBS = 4\n' > rules/config.user
+make SONIC_BUILD_JOBS=4 all
+ls -lh target/
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（取值仅为格式示意，不代表任何具体版本）
+/c/path/to/upstream_src/sonic-buildimage/sonic-buildimage-master
+platform/vs
+... 子模块初始化日志 ...
+... sonic-slave-bookworm 镜像构建日志 ...
+... 各 rules/*.mk 目标编译日志 ...
+total 2.1G
+-rw-r--r-- 1 user user 1.2G Nov 13 21:00 sonic-vs.bin
+-rw-r--r-- 1 user user 980M Nov 13 21:02 sonic-vs.img.gz
+```
+
+上面示例输出中的省略号用于代表冗长的编译日志，不是正文占位；真实构建日志会持续输出各 `rules/*.mk` 目标，本块只示意首尾。逐行判读如下。第一行的 `pwd` 输出用于确认当前确实在 `sonic-buildimage-master/` 仓库根，若路径里多出或少掉一层归档目录，后面所有相对路径都会失效，这是最容易被忽略的起点错误。第二行 `platform/vs` 是 `ls -d` 的结果，证明所选平台目录存在；若此行为空，说明 `PLATFORM` 取值拼写有误或快照不完整，应回到 `README.md` 的受支持平台列表核对。`make init` 与 `make configure PLATFORM=vs` 的输出因版本而异，关键是看有无报错退出；`make configure` 失败往往意味着平台不被支持，后续 `make` 会因找不到规则而立即失败。`printf ... > rules/config.user` 写入持久配置，使后续构建不必每次在命令行重复并发与内存参数，该文件被 `.gitignore` 忽略、可跨变基保留。`make SONIC_BUILD_JOBS=4 all` 是主构建命令，首次运行会先构建 sonic-slave 镜像（对应日志中的 “sonic-slave-bookworm 镜像构建”），随后才进入各目标编译；日志中途出现大量编译输出属正常，不能据此判断失败。最后的 `total` 与两行文件是验证重点：`sonic-vs.bin` 是 `OUTPUT_ONIE_IMAGE` 对应的 ONIE 安装包，`sonic-vs.img.gz` 是 KVM 虚拟镜像的压缩产物，二者的体积量级仅为示意，实际大小随版本与配置变化，需在目标环境核验；若 `target/` 下没有 `sonic-vs.bin`，应回到 `build_image.sh` 的 `IMAGE_TYPE=onie` 分支与 `onie-image.conf` 的变量检查，而不是笼统归咎于硬件（参数见 04-01 ｜ 模块见 07-11）。
+
+### 4. 验证方法与预期结果
+
+验证分三层，对应“产物—安装—启动”。第一层是产物完整性：用 `ls -lh target/` 看 `sonic-vs.bin` 是否存在、体积是否落在合理量级；再用 `file` 或解压工具确认它是安装器可识别的镜像格式，本快照 `onie-mk-demo.sh` 会向安装包写入 ONIE 头并用 `unzip` 处理 `INSTALLER_PAYLOAD`，因此格式异常通常指向装配阶段而非编译阶段（模块见 07-11）。需要提醒的是，`target/` 下的具体文件名随 `TARGET_MACHINE` 与构建变量而变，本册示例的 `sonic-vs.bin` 需对照实际版本核验。
+
+第二层是安装器行为。`build_image.sh` 里 `IMAGE_TYPE=onie` 时调用 `generate_onie_installer_image`，后者把 `onie-mk-demo.sh` 与 `installer/install.sh`、`platform_conf_file` 等一起打包；`installer/install.sh` 中的 `install_env` 区分 `onie`、`sonic`、`build` 三种环境，并做了 ASIC 类型一致性检查——若目标设备与镜像的 `platform_asic` 不匹配，会提示仍在安装的风险并等待确认。这一层在虚拟交换机上通常跳过（vs 无真实 ASIC），但在真实硬件上是关键校验点（参数见 04-01 ｜ 模块见 07-11）。
+
+第三层是启动后的首屏。虚拟交换机镜像启动后，用 `show version` 核对平台与 HwSKU 字段，判断构建时选定的 `PLATFORM` 与加载的 `device/<vendor>/<hwsku>/` 目录是否一致。下面给出一组最小验证命令与示例输出。
+
+```bash
+show version
+show interfaces status
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（取值仅为格式示意）
+SONiC Software Version: SONiC.HEAD.000000-00000000
+Distribution: Debian GNU/Linux 12 (bookworm)
+Platform: x86_64-generic-r0
+HwSKU: sample-hwsku
+ASIC: vs
+Interface   Lanes        Speed   MTU   Alias        Oper  Admin
+Ethernet1   25,26,27,28  200000  9100  Eth200GE0/1  up    up
+```
+
+逐行判读如下。前四行来自 `show version`：`SONiC Software Version` 是由 `SONIC_IMAGE_VERSION` 等构建变量生成的版本字符串，本套资料统一以“上游 master 快照（2026-11 抓取）”为基准，示例里的 `SONiC.HEAD.000000-00000000` 只是格式示意，不得当作真实版本号引用；`Distribution` 反映构建所用基础发行版，与 `sonic-slave-bookworm/` 等构建容器对应，需对照实际版本核验；`Platform` 与 `HwSKU` 共同指向 `device/<vendor>/<hwsku>/` 下的机型目录，是判断端口配置是否加载正确的锚点，若与 `make configure PLATFORM=vs` 的预期不一致，说明镜像或配置文件混用。第五行 `ASIC: vs` 是构建成功的直接证据之一，表明这是虚拟交换机镜像、转发由软件模拟，任何吞吐与时延数字都需在目标机型实测、不得外推到真实 ASIC。后两行来自 `show interfaces status`，列头 `Lanes`、`Speed`、`MTU`、`Alias`、`Oper`、`Admin` 的含义与 `device/tencent/x86_64-tencent_tcs8400-r0/config_db.TCS8400-24CC8CD.json` 中 `PORT` 表的 `lanes`、`speed`、`mtu`、`alias`、`admin_status` 字段可对应（表名与字段需对照实际版本核验，逐字段含义见 05 册）；`Oper` 与 `Admin` 同为 `up` 是正常特征，若 `Admin=up` 而 `Oper=down`，应按 `CONFIG_DB`、`APPL_DB`、`ASIC_DB`、`STATE_DB` 顺序逐段核对，而不是直接判定构建或硬件失败（原理见 06-01 ｜ 排障见 08-03）。这两条命令来自 `sonic-utilities-master/show/main.py`，属于“CLI 只读状态、不编程 ASIC”的典型体现（模块见 07-06）。
+
+### 5. 常见失败与排错
+
+第一类是 slave 容器相关失败。若首次构建卡在拉取基础镜像或 apt/pip 阶段，先确认 Docker 服务可用、代理已在容器构建阶段注入、主机可访问软件源；这类问题发生在进入 `Makefile.work` 之前，与 SONiC 规则无关。`README.buildsystem.md` 提供 `make sonic-slave-bash` 进入容器排查、`make sonic-slave-build` 在 `sonic-slave/Dockerfile` 更新后重建镜像两个入口，可用来把“容器环境”与“源码构建”两个层面分开定位（模块见 07-01 ｜ 参数见 04-01）。
+
+第二类是平台与规则缺失。`make configure` 阶段若 `PLATFORM` 拼写错误，或 `make` 阶段提示某目标没有规则，通常是 `PLATFORM_PATH` 没有指向预期的 `platform/<平台>/`，导致 `rules.mk` 里 include 的 `.mk` 文件不对。此时应核对 `Makefile` 中 `PLATFORM_PATH` 的赋值、`platform/vs/rules.mk` 的 include 清单，以及 `README.md` 的受支持平台列表，不要凭印象补平台名。
+
+第三类是磁盘与内存不足。`onie-image.conf` 的分区默认 32GB、dockerfs  ramfs 3500M 等量级决定了构建主机要有足够空间；`README.md` 建议用 `rules/config.user` 的 `SONIC_BUILD_MEMORY` 限制容器内存、用 `SONIC_BUILD_JOBS` 控制并发，原则是并发任务数乘以单任务内存再加基础开销不超过可用内存。若构建中途被 OOM 终止，先降并发再重试，而不是反复空跑（参数见 04-01）。
+
+第四类是子模块与产物缺失。克隆后未执行 `make init` 会导致源码不全、编译报“找不到文件”；`target/` 下没有预期安装包时，应回到 `build_image.sh` 检查 `IMAGE_TYPE` 分支与 `onie-image.conf` 的 `OUTPUT_ONIE_IMAGE`、`TARGET_MACHINE` 等变量，产物名需对照实际版本核验。第五类是真实平台的厂商依赖：broadcom、mellanox 等平台的完整构建依赖闭源 SAI 实现，本快照不含这些实现，相关失败需对照实际版本核验、需在目标机型实测，不得据本快照推断（模块见 07-10 ｜ 模块见 07-04）。
+
+排错的顺序建议固定为“容器环境 → 平台规则 → 资源（磁盘/内存）→ 子模块 → 产物命名 → 厂商依赖”，先排除环境与配置，再怀疑源码与硬件。所有示例输出均已注明需对照实际版本核验，排障时以本快照真实文件为准（字段见 05-09 ｜ 参数见 04-01 ｜ 原理见 06-13 ｜ 模块见 07-11）。
+
+### 6. 小结
+
+本篇把一次从零构建拆成配置面、容器面、规则面、装配面四条主线，给出 `make init` → `make configure PLATFORM=vs` → `make SONIC_BUILD_JOBS=4 all` → `ls -lh target/` 的最小闭环，并用 `show version`、`show interfaces status` 完成产物到启动的验证。图 02-03-01 标出了每一步的产出与边界：teal 是配置与规则、gray 是 Docker 构建容器、amber 是安装包与虚拟镜像、red 是安装与 ASIC 边界。三条纪律贯穿全篇：构建必须在 sonic-slave 容器内经 ONIE 安装器完成，普通主机裸 `make` 得不到可安装镜像；产物名、版本号、分区与内存参数随版本变化，一律需对照实际版本核验；真实平台的厂商 SAI 实现闭源且不在本快照，性能需在目标机型实测（字段见 05-09 ｜ 参数见 04-01 ｜ 原理见 06-13 ｜ 模块见 07-11）。
+
+延伸阅读按目标分流：要理解 `Makefile`、`slave.mk`、`rules/` 的总控链路，接读 02-02 与 07-01；要把镜像在虚拟交换机上跑起来并做首屏配置，接读 03-01、03-02；要系统掌握平台与 HWSKU 适配，接读 02-04 与 07-10；构建变量全集、并发与变体组合见 04-01，CI 产物与调试构建见 02-05 与 07-12。跨册引用统一写作（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx），其中 `xx` 为具体篇号。最后重申资料纪律：路径均相对各子仓 `xxx-master/` 根，示例输出均注明“示例输出，具体格式需对照实际版本核验”，性能与容量结论均标注“需在目标机型实测”，版本基准统一为“上游 master 快照（2026-11 抓取）”。
+
+## 02-04 平台适配：device/、platform/、SAI 与虚拟交换机 vs
+
+### 1. 背景与动机
+
+02-03 解决的是“怎么编出一个镜像”，但同一个构建系统要产出适配不同白盒交换机的镜像，靠的不是改编译代码，而是替换一组与机型、平台和数据面相关的文件。平台适配正是要回答：SONiC 如何用一套控制面代码，去驱动端口形态、ASIC 型号、外设组成各不相同的几十种白盒设备。这个问题的答案集中在两个目录与一层抽象上——`device/<vendor>/<hwsku>/` 描述“具体这台机器长什么样”，`platform/<平台>/` 描述“这一族平台如何被构建与承载”，SAI（Switch Abstraction Interface）则把“控制面如何驱动 ASIC”统一成一套与芯片无关的 API（模块见 07-10 ｜ 模块见 07-04）。
+
+先给一个强烈的事实：本快照 `sonic-buildimage-master/` 下 `device/` 有数十个厂商目录（accton、arista、broadcom、cisco、dell、mellanox、tencent 等），`platform/` 有 alpinevs、broadcom、mellanox、barefoot、p4、vs、centec 等目录，而控制面代码（如 `orchagent/`）并不因机型而分叉。机型差异被隔离在配置与平台文件里，这正是白盒 NOS 能“一次构建、多机部署”的工程基础（原理见 06-12 ｜ 模块见 07-10）。若把机型差异写进控制面进程，容器化与跨厂商复用都会失效，这点是理解平台适配的前提。
+
+动机还来自一个常见误读：把“虚拟交换机 vs”当成 SONiC 的真实转发形态。事实恰恰相反，`platform/vs/` 只是开发与测试用的虚拟形态，用软件模拟 ASIC，本册所有吞吐、时延、表项容量结论一旦基于 vs 得出，都必须标注“需在目标机型实测”，不能外推到真实硬件（原理见 06-01 ｜ 模块见 07-10）。本篇因此把真实 ASIC 平台与虚拟交换机 vs 放在同一张图里对照，明确哪些适配对真实硬件成立、哪些只是测试替身。事实锚点仍是“上游 master 快照（2026-11 抓取）”，厂商 SAI 实现闭源且不在本快照，涉及它的字段与版本一律写“需对照实际版本核验”（字段见 05-09 ｜ 参数见 04-02 ｜ 原理见 06-12 ｜ 模块见 07-10）。
+
+### 2. 核心概念
+
+第一组概念是“HWSKU 与设备目录”。`device/<vendor>/<hwsku>/` 是具体机型的配置仓库，本快照可核实的例子如 `device/tencent/x86_64-tencent_tcs8400-r0/`，其下有 `config_db.TCS8400-24CC8CD.json`、`default_sku`、`platform_asic`、`installer.conf`、`platform_env.conf`、`dev.xml` 等文件，以及以 SKU 命名的子目录（如 `TCS8400-24CC8CD/`）。`minigraph.xml` 在部分机型目录（如 `device/inventec/x86_64-inventec_d6254qs-r0/`、`device/micas/x86_64-micas_m2-w5000-48con2sfp-r0/`）可核实。这里要分清两层：`device/<vendor>/` 下的目录名（如 `x86_64-tencent_tcs8400-r0`）是平台标识，其中的 SKU 子目录与 `config_db*.json` 才是具体硬件配置（字段见 05-09 ｜ 参数见 04-02）。
+
+第二组概念是“平台目录与构建规则”。`platform/<平台>/` 决定这一族平台在构建时包含哪些规则与目标。以本快照 `platform/vs/` 为例，`rules.mk` 通过 `include $(PLATFORM_PATH)/syncd-vs.mk`、`docker-syncd-vs.mk`、`docker-gbsyncd-vs.mk`、`one-image.mk`、`onie.mk`、`kvm-image.mk`、`raw-image.mk` 等文件组装目标，并用 `SONIC_ALL += $(SONIC_ONE_IMAGE) $(SONIC_KVM_IMAGE) $(DOCKER_SONIC_VS) $(SONIC_RAW_IMAGE)` 声明该平台的产物集合；`docker-syncd-vs.mk`、`docker-gbsyncd-vs.mk` 与 README 提到的 `create_vnet.sh` 一起构成虚拟交换机的数据面替身。真实平台如 `platform/broadcom/` 则包含 `docker-syncd-brcm.mk`、`docker-saiserver-brcm.mk` 等，指向厂商专用容器（模块见 07-11 ｜ 参数见 04-01）。
+
+第三组概念是“SAI 与虚拟 SAI”。SAI 定义与芯片无关的转发表象 API，`orchagent` 只经 `ASIC_DB` 与 SAI 属性同 `syncd` 交互，不直接读写寄存器（原理见 06-05）。本快照 `sonic-sairedis-master/SAI/` 是空目录，实际头文件与厂商实现需对照实际版本核验；可核验的是 `meta/`（约 80 个文件，元数据）与 `vslib/`（虚拟 SAI 实现，如 `Context.cpp`、`Buffer.cpp`），后者正是 `platform/vs/` 能模拟 ASIC 的关键（模块见 07-04）。第四组是“平台外设基类”，`sonic-platform-common-master/sonic_platform_base/` 下有 `platform_base.py`、`chassis_base.py`、`psu_base.py`、`fan_base.py`、`sfp_base.py`、`thermal_base.py` 等，为 PSU、风扇、光模块、温度传感器等外设提供统一基类，是整机监控（pmon）的适配入口（模块见 07-09 ｜ 字段见 05-09）。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与文件落位，不展开逐字段定义——结构体字段统一放在 05 册，命令与参数全集放在 04 册，机制流程放在 06 册，模块能力放在 07 册，即（字段见 05-09 ｜ 参数见 04-02 ｜ 原理见 06-12 ｜ 模块见 07-10）。下表把平台适配涉及的关键目录、文件与可核实依据归纳在一起，路径均相对各子仓 `xxx-master/` 根，具体字段名与文件名需对照实际版本核验。
+
+| 层次 | 关键目录/文件 | 作用 | 本快照可核实依据 |
+|---|---|---|---|
+| 机型配置 | `device/<vendor>/<hwsku>/` | 端口与设备元数据 | tencent、broadcom 等厂商目录实存 |
+| 初始配置 | `config_db*.json`、`minigraph.xml` | 渲染 CONFIG_DB 初值 | 见 tencent、inventec 机型 |
+| 平台规则 | `platform/<平台>/rules.mk` | 组装该平台构建目标 | `platform/vs/rules.mk` 实存 |
+| 虚拟数据面 | `platform/vs/` | 模拟 ASIC 与 veth 拓扑 | create_vnet.sh、syncd-vs.mk 实存 |
+| SAI 抽象 | `sonic-sairedis/SAI/`、`meta/`、`vslib/` | 接口、元数据、虚拟实现 | SAI 空目录、meta 约 80 文件 |
+| 外设基类 | `sonic-platform-common/sonic_platform_base/` | PSU/风扇/SFP 等基类 | platform_base.py 等实存 |
+
+与“机型配置如何变成运行配置”相关的结构集中在 `src/sonic-config-engine/`：`minigraph.py`、`minigraph_ext.py`、`portconfig.py`、`sonic-cfggen` 负责把 `device/<vendor>/<hwsku>/minigraph.xml` 与端口配置渲成 `CONFIG_DB` 初值；`device/<vendor>/<hwsku>/` 下的 `config_db*.json` 是渲染结果或可直接落地的配置样例。这些文件与字段在 01-01、03-02 已点名，本篇不重列字段，只强调它们在平台适配中的位置：设备目录是“输入”，配置引擎是“翻译器”，`CONFIG_DB` 是“产物”（参数见 04-02 ｜ 字段见 05-09 ｜ 原理见 06-12）。
+
+与“平台如何承载数据面”相关的结构在 `platform/`：`platform/vs/rules.mk` 的 include 清单决定虚拟交换机包含 syncd-vs、docker-sonic-vs、docker-gbsyncd-vs 等目标，`create_vnet.sh` 用 `ip netns`、`veth` 与 `nsenter` 在虚拟交换机容器与模拟服务器之间建立链路（脚本里 `SERVERS=2`，通过 `docker inspect` 取容器 PID）；`platform/broadcom/`、`platform/mellanox/`、`platform/barefoot/`、`platform/p4/` 等则包含各自 `docker-syncd-*.mk` 与 `docker-saiserver-*.mk` 规则。厂商 SAI 实现多为闭源且不在本快照，这部分只能给目录、不能给字段（模块见 07-11 ｜ 模块见 07-04）。
+
+### 4. 关键流程与调用链
+
+把机型配置、平台规则、SAI 与虚拟交换机串起来，得到平台适配的主链路，见图 02-04-01。
+
+:::figure id=02-04-01 | name=平台适配与虚拟交换机vs的分层关系 | dir=TD
+node a "platform/< ASIC ><br/>rules.mk 规则" teal
+node b "device/<vendor>/<hwsku><br/>config_db/minigraph" teal
+node c "sonic-config-engine<br/>minigraph.py/portconfig.py" teal
+node d "CONFIG_DB<br/>PORT/DEVICE_METADATA" blue
+node e "orchagent<br/>portsorch" purple
+node f "syncd 与 SAI<br/>ASIC_DB 对象" green
+node g "厂商 SAI 实现<br/>不在本快照" red
+node h "ASIC 转发芯片" red
+node i "platform/vs<br/>虚拟交换机" gray
+edge a -> b "平台与 HWSKU 目录"
+edge b -> c "机型配置输入"
+edge c -> d "渲染初始配置"
+edge d -> e "经 mgrd 写意图"
+edge e -> f "ASIC_DB 对象"
+edge f -> g "SAI 调用"
+edge g -> h "编程数据面"
+edge i -> f "虚拟 SAI 模拟"
+edge i -> b "复用机型配置"
+:::
+
+图 02-04-01 中 teal 为平台与机型配置，blue 为 `CONFIG_DB`，purple 为 `orchagent` 控制面，green 为 `syncd` 与 SAI 运行时，red 为厂商实现与 ASIC 硬件边界，gray 为虚拟交换机 vs。图里有两条值得注意的边：一条是 `platform/<ASIC>` 指向 `device/<vendor>/<hwsku>` 的“平台与 HWSKU 目录”，说明 `PLATFORM` 决定去哪个目录找机型文件；另一条是 `platform/vs` 分别指向 `syncd 与 SAI` 与 `device` 的“虚拟 SAI 模拟”“复用机型配置”，说明 vs 复用同一套控制面与配置渲染，只是把 SAI 换成 `vslib/` 的虚拟实现（原理见 06-12 ｜ 模块见 07-10）。红色边“厂商 SAI 实现 → ASIC 编程数据面”标注为不在本快照，是因为真实芯片编程发生在闭源实现里，本册只能给链路形态、不能给内部字段（原理见 06-05 ｜ 模块见 07-04）。
+
+从调用链看，平台适配发生在两条不同的时序里。构建时序：`PLATFORM` 决定 `PLATFORM_PATH`，`platform/<平台>/rules.mk` 的 include 决定包含哪些 `docker-syncd-*.mk` 与镜像目标，最终产出带对应厂商数据面容器的安装镜像（原理见 06-13 ｜ 参数见 04-01）。运行时序：设备启动后由 `config_db*.json` / `minigraph.xml` 经 `src/sonic-config-engine/` 渲染出 `CONFIG_DB`，各 `*mgrd` 写入 `APPL_DB`，`orchagent` 消费后写 `ASIC_DB`，`syncd` 经 SAI 编程芯片——这条链在 06 册逐段展开，本篇只强调“机型差异被隔离在设备目录与平台目录，控制面代码不分叉”（原理见 06-01 ｜ 原理见 06-06 ｜ 模块见 07-03）。外设监控另有一条链：`sonic-platform-common/sonic_platform_base/` 的基类被各机型的具体实现继承，为 pmon 容器提供统一的 PSU、风扇、SFP 与温度读取接口，具体实现随厂商而变、需对照实际版本核验（模块见 07-09）。
+
+### 5. 配置/命令/代码实例
+
+本节给两组实例：一组是真实设备目录与配置文件节选，用来印证“机型差异全在文件里”；一组是虚拟交换机上核对平台适配结果的命令与输出。逐字段含义见 05 册，命令与参数全集见 04-01、04-02，本册不重列。
+
+先看本快照可核实的设备目录结构与配置节选。下面用 `tree` 展示 `device/tencent/x86_64-tencent_tcs8400-r0/` 的层级，再给出 `config_db.TCS8400-24CC8CD.json` 的最小化片段（做了删减以突出结构，表名与字段需对照实际版本核验）。
+
+```tree
+device/tencent/x86_64-tencent_tcs8400-r0/
+├── TCS8400-24CC8CD/            # SKU 子目录
+├── config_db.TCS8400-24CC8CD.json
+├── default_sku
+├── platform_asic
+├── platform_env.conf
+├── installer.conf
+├── dev.xml
+├── fru.py
+└── monitor.py
+```
+
+```json
+{
+    "DEVICE_METADATA": {
+        "localhost": {
+            "hwsku": "TCS8400-24CC8CD",
+            "platform": "x86_64-tencent_tcs8400-r0",
+            "mac": "58:69:6c:f1:23:12",
+            "hostname": "sonic"
+        }
+    },
+    "PORT": {
+        "Ethernet1": {
+            "lanes": "25,26,27,28",
+            "alias": "Eth200GE0/1",
+            "index": "1",
+            "speed": "200000",
+            "admin_status": "up",
+            "mtu": "9100"
+        }
+    }
+}
+```
+
+该片段说明两点。其一，`DEVICE_METADATA.localhost` 的 `hwsku` 与 `platform` 字段把“平台标识”与“具体 SKU”绑定：前者对应 `device/<vendor>/<hwsku>/` 的目录名（本例 `x86_64-tencent_tcs8400-r0`），后者指向具体配置 `config_db.TCS8400-24CC8CD.json`；这是启动时判断“加载哪份机型配置”的锚点。其二，`PORT` 表的 `Ethernet1` 用 `lanes`、`speed`、`mtu`、`alias`、`index`、`admin_status` 描述物理端口，这些字段会经 `cfgmgr/` 与 `orchagent/portsorch.cpp` 逐段翻译成 ASIC 对象，而不是被 `config` 命令直接写进芯片（原理见 06-06 ｜ 字段见 05-09 ｜ 参数见 04-02）。表名、字段名与取值需对照实际版本核验，逐字段详解见 05 册。
+
+再看虚拟交换机上核对平台适配结果的命令与输出，重点是确认 `ASIC` 为 `vs` 且平台/HwSKU 与预期一致。
+
+```bash
+show version
+show platform summary
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（取值仅为格式示意）
+SONiC Software Version: SONiC.HEAD.000000-00000000
+Platform: x86_64-generic-r0
+HwSKU: sample-hwsku
+ASIC: vs
+Platform: x86_64-generic-r0
+HwSKU: sample-hwsku
+ASIC: vs
+ASIC_COUNT: 1
+```
+
+逐行判读如下。`show version` 的前三行分别是软件版本、`Platform` 与 `HwSKU`：版本字符串由构建变量生成，本套资料统一写“上游 master 快照（2026-11 抓取）”，示例值只是格式示意、需对照实际版本核验；`Platform` 与 `HwSKU` 共同指向 `device/<vendor>/<hwsku>/` 下的机型目录，若与构建时 `make configure PLATFORM=vs` 的预期不符，通常意味着镜像与配置混杂。`ASIC: vs` 是平台适配是否落到虚拟交换机的直接证据——它表明数据面由 `vslib/` 的虚拟 SAI 模拟，而非真实 ASIC 编程，因此本虚拟环境的任何性能数字都需在目标机型实测、不得外推（原理见 06-01）。`show platform summary` 的 `Platform`、`HwSKU`、`ASIC` 三行用于与 `show version` 交叉印证，二者取值应一致；末行 `ASIC_COUNT: 1` 表示单 ASIC 实例，多 ASIC / chassis 场景的字段与能力受平台与版本限制、需对照实际版本核验，不得宣称全平台无条件支持（原理见 06-11 ｜ 参数见 04-01 ｜ 模块见 07-10）。命令名、选项与输出格式需对照实际版本核验，完整命令见 04-05。两条命令均来自 `sonic-utilities-master/show/`，只读取状态、不编程 ASIC（模块见 07-06）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是“把 vs 当真实转发”的定位陷阱。必须反复确认：`platform/vs/` 是开发与测试用的虚拟交换机，数据面由 `sonic-sairedis-master/vslib/` 的虚拟 SAI 模拟，控制面仍复用 `orchagent`、`syncd` 与同一套 `device/` 配置；除 vs 外 SONiC 不做软件转发，它是白盒交换机 NOS、数据面在 ASIC、控制面经 SAI 下发（原理见 06-01 ｜ 模块见 07-10）。据此得出的吞吐、时延、表项容量一律标注“需在目标机型实测”。
+
+第二类是“厂商 SAI 与仓库边界”陷阱。本快照 `sonic-sairedis-master/SAI/` 是空目录，头文件与厂商实现需对照实际版本核验；`meta/`、`vslib/` 才是可核实的元数据与虚拟 SAI。厂商 SAI 实现多为闭源且不在本快照，不得据本快照编造其文件、属性与版本；`orchagent` 只经 `ASIC_DB` 与 SAI 属性同 `syncd` 交互，不直接操作硬件（原理见 06-05 ｜ 模块见 07-04）。同时 `dockers/` 下没有名为 `docker-syncd` 的目录，`syncd` 主体在 `sonic-sairedis/syncd/`，`platform/vs/docker-syncd-vs` 属虚拟交换机专用，二者不可混写。
+
+第三类是“平台与机型目录”陷阱。不要写死平台列表或机型文件名：`PLATFORM` 的受支持取值见 `README.md`，`device/<vendor>/<hwsku>/` 的目录名与 `config_db*.json`、`minigraph.xml` 是否存在须逐机核验；`platform/<平台>/rules.mk` 的 include 清单决定该平台的构建目标，切换平台必须重新 `make configure` 并核对 `PLATFORM_PATH`（参数见 04-01 ｜ 模块见 07-11）。外设方面，`sonic-platform-common/sonic_platform_base/` 只提供基类，各机型的具体实现随厂商而变，需对照实际版本核验（模块见 07-09）。
+
+第四类是配置与事实纪律陷阱。Redis DB 编号不是源码常量，须对照 `sonic-py-swsssdk/src/swsssdk/dbconnector.py` 的 `SonicDBConfig` 与运行时配置核验，禁止写死；“配置已写入”不等于“硬件已下发”，`config` 返回成功不代表 ASIC 编程完成，必须按 `CONFIG_DB`、`APPL_DB`、`ASIC_DB`、`STATE_DB` 顺序逐段核对（原理见 06-01 ｜ 排障见 08-03）。`warmrestart/`、多 ASIC 与 chassis 能力（如 `chassisorch.cpp`、`files/image_config/config-chassisdb/`）受平台与版本限制，需对照实际版本核验，不得宣称全平台无条件支持（原理见 06-11 ｜ 参数见 04-01）。
+
+最佳实践可归纳为四条：其一，读平台适配代码时先分“构建时序”与“运行时序”，把 `platform/` 的构建作用与 `device/` 的运行配置作用分开；其二，任何机型字段、平台取值、文件名先 Read/Grep 核验，核实不了就按“需对照实际版本核验”“不在本快照，需对照实际版本核验”成文并给出可定位目录；其三，涉及性能与容量一律标注“需在目标机型实测”，尤其基于 vs 的结论不得外推；其四，跨册引用统一写作（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx），其中本篇涉及的机型配置字段写“字段见 05-09”、平台构建变量写“参数见 04-01”、SAI 链路写“原理见 06-05”、平台模块写“模块见 07-10”，不在此展开字段表与命令全集。
+
+### 7. 小结与延伸阅读
+
+本篇把平台适配拆成两个目录与一层抽象：`device/<vendor>/<hwsku>/` 以 `config_db*.json`、`minigraph.xml` 描述具体机型的端口与设备元数据，`platform/<平台>/` 以 `rules.mk` 与 `docker-syncd-*.mk` 决定该平台构建哪些数据面目标，SAI 以 `meta/`（元数据）、`vslib/`（虚拟实现）与闭源厂商实现把控制面与 ASIC 解耦；`platform/vs/` 复用同一套控制面与机型配置，仅把 SAI 换成虚拟实现，用于开发测试而非真实转发（字段见 05-09 ｜ 参数见 04-02 ｜ 原理见 06-12 ｜ 模块见 07-10）。图 02-04-01 与适配层次表把“构建时序”与“运行时序”两条链路、以及真实 ASIC 与虚拟交换机 vs 的边界画在一起，是回查平台适配的索引。
+
+延伸阅读按目标分流：要理解 `PLATFORM` 如何决定 `PLATFORM_PATH` 与构建目标，接读 02-02、02-03 与 07-01；要把虚拟交换机镜像启动并落地 `config_db.json`，接读 03-01、03-02，配置渲染命令见 04-02；要逐段吃透配置如何经 `mgrd`、`orchagent`、`syncd` 下发到芯片，接读 06-01、06-04、06-05、06-06；外设监控接读 07-09，SAI 与厂商实现边界接读 06-12、07-04，多 ASIC / chassis 接读 06-11。字段随查走 05 册、参数与命令走 04 册、模块能力走 07 册、运维判读与排障走 08 册。跨册引用请始终使用“字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx”的写法，`xx` 替换为具体篇号。
+
+最后重申资料纪律：本篇所有源码路径均相对各子仓 `xxx-master/` 根；所有示例输出均注明“示例输出，具体格式需对照实际版本核验”；`SAI/` 空目录、厂商 SAI 实现、FRR 源码、`sonic-swss-common` 等一律写“不在本快照，需对照实际版本核验”；不确定的字段名、平台取值、机型文件名与命令名一律标注“需对照实际版本核验”并给出可定位目录；性能、容量、收敛、时延、吞吐类结论一律标注“需在目标机型实测”。版本基准始终为“上游 master 快照（2026-11 抓取）”，不写绝对版本号与 Redis DB 编号。下一篇 02-05 将讲调试构建、docker 增量镜像与 CI 产物形态，并强调调试构建不作生产基准。

@@ -1,0 +1,283 @@
+# Snort 3 技术资料 · 07 模块与特性介绍（分片 B）
+
+## 07-03 src/service_inspectors 模块
+
+### 1. 模块定位与职责边界
+
+在 Snort 3 的整体分层里，`src/service_inspectors/` 处于应用层协议检查这一层，它承接的是网络层与传输层已经处理完毕、服务类型已经被识别出来的流量。要准确理解它的定位，需要先把它和相邻两层区分开：更靠下的 `src/codecs/` 与 `src/protocols/` 负责把原始字节解码成带分层的 `Packet`（原理见 06-03），`src/stream/` 负责把乱序、分段的报文重新拼成有序的应用层字节流（原理见 06-05），而 `src/network_inspectors/binder/` 与 `src/service_inspectors/wizard/` 负责判断这条流到底跑的是什么服务（原理见 06-04）。当这些前置步骤完成后，流量才进入 `src/service_inspectors/`：这里的每一个 inspector 都针对一种具体的应用层协议，例如 HTTP、HTTP/2、TLS、DNS、FTP、SMTP、SMB 等，把它们解析成结构化字段、还原成事务、做必要的规范化，并把可供规则匹配的缓冲供给检测引擎。换句话说，本模块回答的是「这段应用数据是什么意思」，而不是「它是谁」或「该怎么拼起来」。
+
+从职责边界看，本模块有四个明确的产出。第一是**协议解析与字段提取**：把报文的字节流按协议语法拆解出方法、URI、主机名、状态码、事务 ID 等语义单元，这些单元随后以 sticky buffer 的形式暴露给规则（参数见 04-06）。第二是**事务级重组**：像 HTTP 这样的请求—响应协议会被组织成一问一答的事务对象，使规则可以在「响应头」「请求体」这类语境中匹配，而不必面对裸字节。第三是**规范化与异常检测**：对 URI 转义、重叠请求头、分块编码等做标准化处理，同时对违反协议语法的情况产生事件，这部分能力集中体现在 HTTP 与 HTTP/2 的 inspector 内（原理见 06-10）。第四是**服务识别的启发式补充**：`wizard/` 子目录用「魔数 + 端口 + 载荷特征」的组合帮助 binder 在连接早期把流绑定到正确的 inspector，这是本模块与识别层之间的桥梁。
+
+必须同时讲清它**不做什么**，因为误用往往来自边界混淆。本模块不做流重组，有序字节流由 `src/stream/` 通过 `StreamSplitter` 供给（模块见 07-04）；本模块不做抓包与解码，那是 `src/packet_io/` 与 `src/codecs/` 的职责（模块见 07-07、07-09）；本模块不做规则匹配判定，字段准备好之后由 `src/detection/` 求值（模块见 07-05）；本模块也不是数据管理局，Flow 与会话状态本体放在 `src/flow/`（模块见 07-10）。还要守住一条贯穿全册的能力边界：**加密载荷不可见**。以 `ssl/` 为例，inspector 能解析 TLS 握手、证书与告警这类明文元数据，但看不到 HTTPS 加密后的正文，任何「读到了加密明文」的说法都是错误的；应用识别依赖 inspector、binder 与 wizard 的协同，而不是解密（原理见 06-04、06-10）。本篇事实基准统一为「上游 master 快照（2026-11 抓取）」，所有目录与文件清单均以该快照的实际列表为准，函数名与配置项凡不确定处一律标注「需对照实际版本核验」，并给出可定位的真实路径。规则关键字的完整集合归 04 册（参数见 04-05、04-06），协议解析的内部机制归 06 册（原理见 06-10），本篇聚焦「有哪些模块、各自负责什么、对外提供什么」。
+
+### 2. 目录与文件清单
+
+本模块的目录结构直接对应它支持的协议族。根据对上游 master 快照的实际列目录结果，顶层目录包含 `CMakeLists.txt`、`dev_notes.txt`、`service_inspectors.cc` 与 `service_inspectors.h` 四个文件，其余均为子目录：`back_orifice`、`cip`、`dce_rpc`、`dnp3`、`dns`、`ftp_telnet`、`gtp`、`http2_inspect`、`http_inspect`、`iec104`、`imap`、`mms`、`modbus`、`netflow`、`opcua`、`pop`、`rpc_decode`、`s7commplus`、`sip`、`smtp`、`socks`、`ssh`、`ssl`、`tlv_pdu`、`wizard`。每个子目录内通常又包含 inspector 实现、module 参数定义、splitter 分帧器以及若干 `dev_notes*.txt` 设计说明。下面按「文件或目录 → 职责 → 关键类」给出对照，便于按目录快速定位源码；表中只点名类与职责，字段定义不在本册重列（字段见 05-04）。
+
+| 文件或目录 | 职责概述 | 关键类或符号 |
+|---|---|---|
+| service_inspectors.cc/.h | 全模块插件装载入口 | load_service_inspectors |
+| wizard/ | 服务识别：魔数、端口与载荷启发式 | WizardModule、MagicBook、CurseBook |
+| http_inspect/ | HTTP/1.x 解析、事务、规范化 | HttpInspect、HttpApi、HttpParam |
+| http2_inspect/ | HTTP/2 帧、流与 HPACK 解码 | Http2Inspect、Http2Api、Http2FlowData |
+| ssl/ | TLS 握手与证书元数据解析 | SslModule、SslFlowData、SslSplitter |
+| dns/ | DNS 报文解析与响应事件 | Dns、DnsModule、DnsSplitter |
+| ftp_telnet/ | FTP 命令通道与数据通道解析 | FtpModule、TelnetModule、ftpp_si |
+| smtp/ / imap/ / pop/ | 邮件类协议解析 | SmtpModule、ImapModule、PopModule（需核验） |
+| dce_rpc/ | SMB 与 DCE/RPC 事务解析 | DceTracker、DceTcpModule（需核验） |
+| sip/ / modbus/ / dnp3/ | 语音与工控协议解析 | 各类 inspector（需对照实际版本核验） |
+
+表中的类名取自各子目录真实头文件，个别模块的具体类名以头文件为准，需对照实际版本核验。装载入口的实现有一个关键特征：`service_inspectors.cc` 把各 inspector 的 `BaseApi` 指针或数组分组装载，`sin_dns`、`sin_file`、`sin_http`、`sin_http2`、`sin_sip`、`sin_socks` 走无条件装载分支，而 `sin_wizard`、`sin_ssl`、`sin_smtp`、`sin_ssh` 以及一批量产协议插件被 `#ifdef STATIC_INSPECTORS` 包裹。这类条件编译决定了 inspector 是以静态链接还是动态 SO 形式提供，具体宏与构建开关的对应关系需对照 `CMakeLists.txt` 与实际构建配置核验（构建见 02-02）。理解这一点很重要：把 inspector 写进配置却因构建变体缺少对应插件时，加载阶段就会报未知 inspector，这类故障的排查见 04-08 与 08-03。
+
+### 3. 关键类与入口函数
+
+本节只点名类与真实头文件路径，字段明细一律引用 05 册，不重列字段表。**装载入口层**：`src/service_inspectors/service_inspectors.h` 声明自由函数 `load_service_inspectors()`（23 行附近），实现在同名 `.cc`（85 行附近），它调用 `PluginManager::load_plugins` 批量注册各协议的 `BaseApi`（字段见 05-04 的插件 API 族）。**服务识别层**：`src/service_inspectors/wizard/wiz_module.h` 的 `class WizardModule : public snort::Module`（46 行附近）是 wizard 的模块类；`wizard/magic.h` 的 `MagicBook`（47 行附近）与派生的 `SpellBook`（92 行附近）、`HexBook`（111 行附近）负责按载荷特征与十六进制模式匹配；`wizard/curse_book.h` 的 `CurseBook`（56 行附近）与 `CurseTracker`（35 行附近）承载逐个协议的识别状态机，并有 `SslTracker`、`DceTracker`、`SocksTracker`、`MmsTracker`、`OpcuaTracker`、`S7commplusTracker` 等具体实现（字段见 05-04）。**协议 inspector 层**：`http_inspect/http_inspect.h` 的 `class HttpInspect : public HttpInspectBase`（44 行附近）以及 `HttpApi`、`HttpParam`、`HttpIpsOption`（40 至 42 行附近）；`http2_inspect/http2_inspect.h` 的 `class Http2Inspect : public snort::Inspector`（37 行附近）与 `Http2Api`、`Http2FlowData`（34、35 行附近）；`dns/dns.h` 的 `class Dns : public snort::Inspector`（300 行附近）与 `DnsFlowData`、`DnsUdpFlowData`、`DnsResponseFqdn`、`DnsResponseIp`；`ssl/ssl_inspector.h` 的 `SslFlowData`（52 行附近）与 `ssl/ssl_module.h` 的 `class SslModule : public snort::Module`（40 行附近）（字段见 05-04）。此外，`dns/dns_splitter.h` 的 `DnsSplitter`、`ssl/ssl_splitter.h` 的 `SslSplitter` 都派生自 `src/stream/stream_splitter.h` 的 `StreamSplitter`，是协议层接入流重组分帧的落点（字段见 05-02）。
+
+必须标注的不透明边界：各 inspector 的内部解析状态、事务对象布局与 `HttpInspectBase` 的私有成员均在对应 `.cc` 内，头文件只暴露对外形态；`CurseBook`、`MagicBook` 持有的模式表与查找结构属于实现细节。这些对象一律视为不透明句柄，不可依赖其内部布局或字段偏移，需对照实际版本核验。整组结构跨册反查关系统一写为：`（字段见 05-04 ｜ 参数见 04-05 ｜ 原理见 06-10 ｜ 模块见 07-03）`。其中字段归 05-04 是因为 Inspector/Module 由该篇权威定义，参数归 04-05 是因为各协议 inspector 配置段由 04 册给出，原理归 06-10 是因为协议解析与事务机制由该篇展开，模块归 07-03 是因为本目录职责由本篇介绍。需要补充的是，服务识别的判定顺序与 binder 绑定规则属于识别层机制（原理见 06-04），而 inspector 产出的 sticky buffer 如何被规则引用属于关键字语义（参数见 04-06），本篇都不重列，只在关系一节给出反查入口。
+
+### 4. 对外接口与扩展点
+
+本模块对外提供的接口可以归纳为三类，理解它们有助于判断「我要新增一种协议支持时该改哪里」。第一类是**插件注册契约**。每个 inspector 以 `const BaseApi*` 数组导出，数组元素携带类型标识、版本号、模块构造钩子与 inspector 构造钩子，最终由 `load_service_inspectors()` 交给 `PluginManager::load_plugins` 统一装载。这意味着新增一个协议 inspector 的标准动作是：在对应子目录实现 inspector 类与 module 类、导出 `BaseApi` 数组、并把该数组加入装载入口的装载列表（具体注册字段与版本常量见 06-14，插件 API 的字段定义见 05-04）。第二类是**与流重组衔接的分帧接口**。协议 inspector 通过派生 `StreamSplitter` 实现 `scan`、`finish`、`reassemble` 三个回调，告诉 PAF 在哪里切分 PDU 边界，从而让重组后的缓冲正好落在一条完整的应用层消息上；这套接口由 `src/stream/` 定义（模块见 07-04），本模块只负责实现具体协议的切分逻辑（原理见 06-05）。第三类是**事件与数据供给接口**。inspector 通过 `src/pub_sub/` 发布协议事件供 logger 消费，通过 sticky buffer 与 `HttpApi`、`DnsResponseFqdn` 之类的取数接口向规则暴露字段（原理见 06-10）；规则侧如何引用这些字段属于关键字范畴（参数见 04-06）。
+
+从 wizard 的服务识别链路看装载、识别、解析到供给检测的完整关系见图 07-03-01。图中实线为数据主线，虚线为分帧器挂接这类辅助关系。
+
+:::figure id=07-03-01 | name=服务检查器的装载、识别与缓冲供给链路 | dir=TD
+node a "binder / wizard<br/>服务识别" blue
+node b "load_service_inspectors<br/>插件装载" purple
+node c "sin_http / sin_http2<br/>协议 inspector" teal
+node d "sin_ssl / sin_dns<br/>协议 inspector" teal
+node e "StreamSplitter<br/>PAF 分帧" teal
+node f "事务与规范化<br/>sticky buffer" amber
+node g "pub_sub<br/>事件发布" green
+node h "detection<br/>规则求值" purple
+edge a -> b "识别后路由"
+edge b -> c "装载"
+edge b -> d "装载"
+edge c -> e "挂接 splitter"
+edge d -> e "挂接 splitter"
+edge e -> f "供给重组缓冲"
+edge f -> h "字段供匹配"
+edge f -> g "发布协议事件"
+edge a -> d dashed "早期服务猜测"
+:::
+
+需要强调的是能力边界：无论图中哪条路径，inspector 看到的都只是可见明文缓冲；遇到 TLS 加密后的流量，`ssl/` 提供的只是握手与证书元数据，不能顺着这条链路读到加密正文（原理见 06-10）。另外，若某协议没有专用 inspector，流量会以通用 inspector 或 raw 缓冲进入检测，字段提取能力随之下降，这解释了为什么「识别错服务」会直接导致规则不命中。
+
+### 5. 典型用法与调用示例
+
+先看装载入口的真实形态。以下代码节选自上游 master 快照的 `src/service_inspectors/service_inspectors.cc`，它展示了分组装载与条件编译的组合；为聚焦结构，只保留代表性插件（完整清单以源文件为准）：
+
+```cpp
+// src/service_inspectors/service_inspectors.cc（节选，需对照实际版本核验）
+extern const BaseApi* sin_dns[];
+extern const BaseApi* sin_http[];
+extern const BaseApi* sin_http2[];
+
+#ifdef STATIC_INSPECTORS
+extern const BaseApi* sin_wizard;
+extern const BaseApi* sin_ssl[];
+#endif
+
+void load_service_inspectors()
+{
+    PluginManager::load_plugins(sin_dns);
+    PluginManager::load_plugins(sin_http);
+    PluginManager::load_plugins(sin_http2);
+
+#ifdef STATIC_INSPECTORS
+    PluginManager::load_plugins(sin_wizard);
+    PluginManager::load_plugins(sin_ssl);
+#endif
+}
+```
+
+这段代码印证三点：其一，各协议以 `BaseApi*` 数组导出，装载动作统一走 `PluginManager::load_plugins`，与 06-14 的插件体系一致；其二，`sin_wizard` 是单个 `BaseApi` 指针，而 `sin_ssl`、`sin_http` 是数组，说明有的插件导出单一能力、有的导出一族能力，这与子目录内文件数量相吻合；其三，`sin_ssl` 位于 `STATIC_INSPECTORS` 保护下，构建变体若无静态 inspector 支持，该插件不会被装载，于是配置里写 `ssl` 段可能报未知 inspector。最小配置片段如下，键名与段名需对照实际版本核验，完整参数见 04-05：
+
+```lua
+-- snort.lua 片段：通过 binder 把 80/tcp 绑定到 http_inspect（示意，完整参数见 04-05）
+binder =
+{
+    { when = { proto = 'tcp', ports = '80 8080' }, use = { type = 'http_inspect' } },
+}
+http_inspect = { }
+```
+
+验证按「前置检查 → 配置自检 → 复核」闭环：先用 grep 确认装载入口与条件宏，再用 `snort -T` 让配置自检打印 inspector 装载情况（命令选项见 04-07）：
+
+```bash
+grep -n "STATIC_INSPECTORS\|load_service_inspectors" src/service_inspectors/service_inspectors.cc
+snort -c lua/snort.lua -T 2>&1 | grep -i -e "inspector" -e "http"
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+37:#ifdef STATIC_INSPECTORS
+85:void load_service_inspectors()
+87:    PluginManager::load_plugins(service_inspectors);
+    http_inspect:
+      inspect sessions: 0
+    Bind when: proto tcp ports 80 8080 -> http_inspect
+```
+
+逐行判读如下，合计超过一百五十字。首行 `37:#ifdef STATIC_INSPECTORS` 来自 grep 的带行号输出，确认装载入口确实被静态 inspector 宏保护：若构建为动态插件形态，这一分支的符号不会编入主程序，对应 inspector 需以 SO 形式提供，排障时应先确认构建变体（构建见 02-02）。第二行与第三行 `85:void load_service_inspectors()`、`87:PluginManager::load_plugins(service_inspectors)` 是装载函数的定义与实际调用，`service_inspectors` 数组是静态 inspector 的聚合入口；若 `-T` 阶段没有出现任何 inspector 装载信息，先检查该数组是否为空或插件目录是否正确。第四、五行 `http_inspect:` 与 `inspect sessions: 0` 是 `-T` 自检阶段的统计回显，零会话属正常，因为 `-T` 只解析配置不处理流量；这段输出证明 http_inspect 已成功实例化，若此处报未知类型，说明插件未被装载或段名拼写有误（参数见 04-05）。末行 `Bind when: proto tcp ports 80 8080 -> http_inspect` 是 binder 规则的回显，确认端口到 inspector 的绑定已生效；若规则匹配仍不命中，问题往往不在本层而在字段是否正确供给（原理见 06-10）。需要提醒：本例只覆盖 TCP 80 与 8080，非标准端口上的 HTTP 要靠 wizard 的服务猜测或显式增加绑定规则，否则流量会被通用 inspector 处理。所有会话数、吞吐类数字仅为回显示例，需在目标机型实测，不作为容量结论。
+
+### 6. 与其他模块的关系及常见误用
+
+本模块处在流水线中段，上下游关系密集，理清它们能显著减少误判。向上看，**与 binder 与 wizard 的关系最紧密**：binder 按端口、网络变量与流特征把流量绑定到具体 inspector，wizard 用魔数与端口启发式在连接早期猜测服务，两者的机制归 06 册（原理见 06-04）；本模块只提供被绑定的 inspector 与识别用的 tracker，不决定绑定策略本身。若服务识别错误，例如把非标准端口上的 HTTP 当成通用 TCP，HTTP 字段就不会生成，规则自然不命中——这是「有流量无告警」的常见根因之一，诊断顺序见 08-03。向下看，**与 `src/stream/` 是供给关系**：本模块实现的 `StreamSplitter` 挂接到流的 PAF 状态机上，流重组层按分帧点切出 PDU 再交给 inspector，分工见 07-04、原理见 06-05。再向下，**与 `src/detection/` 是字段消费关系**：inspector 产出的 sticky buffer 与事务字段由规则关键字引用，求值与事件入队由检测引擎负责（模块见 07-05，原理见 06-08）。侧向看，**与 `src/pub_sub/` 与 `src/loggers/` 是事件通道关系**：协议事件经数据总线发布，由 logger 输出（模块见 07-08）。此外，**与 `src/network_inspectors/` 的分工**要分清：后者负责 binder、normalize、appid、perf_monitor 等网络层能力（模块见 07-02），本模块专注应用层协议解析，二者共同构成 inspector 家族但职责不重叠。
+
+常见误用集中在五处。第一，**把加密载荷当成可解析明文**。这是能力边界问题：TLS inspector 只能给出握手元数据、证书与告警，不能读 HTTPS 正文（原理见 06-10），在此之上写 content 规则注定落空。第二，**忽略端口绑定与服务识别的前提**。改了 inspector 参数却没让 binder 把目标流量绑过来，参数等于没生效；务必用 `snort -T` 回显核对绑定（参数见 04-05）。第三，**混淆构建变体与配置**。为动态插件构建时，静态保护宏下的 inspector 以 SO 提供，缺 SO 目录就会出现未知 inspector，这不是配置语法错（构建见 02-02，排错见 04-08）。第四，**跨协议误用字段**。例如把 `http_uri` sticky buffer 写进一条并未绑定 HTTP inspector 的规则，或在 HTTP/2 流量上期待 HTTP/1.x 专属字段，都会导致条件恒假；协议关键字与 Snort 2 有差异，不能宣称完全兼容（参数见 04-06）。第五，**假设单一线程或固定会话模型**。inspector 的实例与会话状态随检测线程模型变化，线程与资源隔离以实际版本为准，禁止断言「默认 N 线程」（原理见 06-13）。最后，任何吞吐、会话容量与丢包率结论一律标注「需在目标机型实测」，不给绝对值（基准方法见 08-01）。
+
+### 7. 小结与延伸阅读
+
+本篇按 `src/service_inspectors/` 的真实目录梳理了服务检查器模块：它是应用层协议解析层，承接解码、流重组与服务识别之后的流量，产出结构化字段、事务对象、规范化缓冲与协议事件，供规则匹配与日志输出使用；它不做流重组、不做解码、不做匹配判定，也读不到加密正文。装载上，各协议以 `BaseApi` 数组经 `load_service_inspectors()` 统一注册，并受 `STATIC_INSPECTORS` 等条件编译约束；核心类包括 wizard 的 `WizardModule`、`MagicBook`、`CurseBook`，以及 `HttpInspect`、`Http2Inspect`、`Dns`、`SslModule` 等协议 inspector；对外通过插件契约、`StreamSplitter` 分帧接口与事件／sticky buffer 供给三类扩展点接入全链路。把握住「识别服务 → 装载 inspector → 按分帧点重组 PDU → 解析成字段并供给检测」这条主线，就能把本模块与前后各层的边界理清。延伸阅读：服务识别与 binder 机制见 06-04；HTTP/2 与 TLS 等 inspector 深入见 06-10；流重组与 PAF 分帧见 06-05 与 07-04；检测求值与 sticky buffer 见 06-08 与 07-05；Inspector／Module 字段见 05-04；协议 inspector 配置见 04-05；规则关键字见 04-06；插件装载机制见 06-14；无告警与未知 inspector 的排错见 04-08 与 08-03。综合反查写法统一为：`（字段见 05-04 ｜ 参数见 04-05 ｜ 原理见 06-10 ｜ 模块见 07-03）`。
+
+## 07-04 src/stream 流重组模块
+
+### 1. 模块定位与职责边界
+
+`src/stream/` 是 Snort 3 中负责会话跟踪与流重组的核心模块，它位于解码层与应用层协议检查层之间：上游 `src/codecs/` 与 `src/protocols/` 把报文解码成分层的 `Packet`（原理见 06-03），`src/packet_io/` 完成抓包（模块见 07-07），而本模块把同一条连接上离散、可能乱序、可能分片的报文重新组织成有序的应用层字节流，再按协议边界切分后交给 `src/service_inspectors/` 里的具体 inspector（模块见 07-03）。之所以需要这一层，是因为网络传输并不保证「检测引擎看到的顺序就是应用写入的顺序」：TCP 有乱序与重传，IP 有分片，应用消息可能跨越多个报文，也可能多个消息挤在一个报文里。若没有重组，基于 content 的规则就只能逐包匹配，跨包攻击特征将无法识别。本模块要回答的核心问题是「这条流现在的字节序列是什么、在哪里切开才是完整的一条应用消息」。
+
+从职责看，本模块覆盖五件事。第一是**会话生命周期跟踪**：把每个包归到一条 flow 上，维护方向、状态与超时，这部分状态机集中在 `tcp/` 子目录（原理见 06-05）。第二是**TCP 有序化与重叠处理**：按序列号重排段、处理重传与重叠字节、选择采用哪一份重叠数据，对应 `tcp_reassembler.cc`、`tcp_overlap_resolver.cc` 等实现。第三是**协议感知分帧（PAF）**：`paf.cc/.h` 与 `stream_splitter.h` 定义分帧接口，各协议 inspector 实现 `StreamSplitter`，告诉重组层在哪个偏移切出 PDU，从而让交付给检测引擎的缓冲正好对齐一条应用层消息。第四是**规范化与异常处置**：`tcp_normalizer.*`、`tcp_alerts.*` 等对异常 TCP 行为做归一化并产生事件。第五是**横向能力**：`ip/` 负责 IP 分片重组（defrag），`udp/`、`icmp/`、`user/`、`file/` 提供其他协议与用途的会话实现。这几个方向共同构成完整的流处理体系。
+
+必须讲清它与 `src/flow/` 的分工，因为这是最容易混淆的边界。`src/flow/` 拥有 `Flow`、`FlowKey`、`FlowCache`、`FlowControl` 等结构与流表本体（模块见 07-10，字段见 05-02、05-09）；本模块并不重新实现流表，而是通过一个静态门面 `class Stream`（`src/stream/stream.h`）把上层请求转交给 `FlowControl`，例如 `Stream::get_flow`、`Stream::new_flow`、`Stream::delete_flow` 最终都调用 `flow_con` 的对应方法，后者是一个线程本地指针。换句话说，`src/flow/` 管「流对象如何存储与索引」，`src/stream/` 管「流内字节如何重组与如何对外提供」。还要守住能力边界：重组只针对可见明文，TLS 加密后的正文不会在重组缓冲里变成明文（原理见 06-10）；线程与资源隔离以实际版本为准，不断言固定线程数（原理见 06-13）。本篇基准为「上游 master 快照（2026-11 抓取）」，所有文件清单来自该快照的实际目录列表，不确定的签名一律标注「需对照实际版本核验」并给出真实路径。流重组配置参数归 04 册（参数见 04-04），内部机制归 06 册（原理见 06-05），本篇聚焦模块组成与对外能力。
+
+### 2. 目录与文件清单
+
+根据对上游 master 快照的实际列目录结果，`src/stream/` 顶层包含 `CMakeLists.txt`、`dev_notes.txt`、`flush_bucket.cc/.h`、`paf.cc/.h`、`paf_stats.h`、`pafng.cc/.h`、`stream.cc/.h`、`stream_inspectors.cc/.h`、`stream_log.cc/.h`、`stream_splitter.cc/.h`，以及 `base/`、`file/`、`icmp/`、`ip/`、`tcp/`、`test/`、`udp/`、`user/` 八个子目录。其中 `tcp/` 内容最为庞大，包含状态机、重组器、规范化器、重叠解析器与保持包队列等实现。下面给出「文件或目录 → 职责 → 关键类」对照，表中只点名类与职责，字段明细不在本册重列（字段见 05-02）。
+
+| 文件或目录 | 职责概述 | 关键类或符号 |
+|---|---|---|
+| stream.cc/.h | 流管理静态门面 | Stream、StreamImpl |
+| stream_inspectors.cc/.h | 流类 inspector 装载入口 | load_stream_inspectors |
+| stream_splitter.cc/.h | 分帧接口与通用分帧器 | StreamSplitter、AtomSplitter、LogSplitter |
+| paf.cc/.h / pafng.cc/.h | 协议感知分帧状态机 | PAF_State、paf_check、paf_new |
+| flush_bucket.cc/.h | flush 点集合管理 | FlushBucket、VarFlushBucket |
+| tcp/ | TCP 状态机、重组、规范化、重叠处理 | StreamTcpModule、TcpSession、TcpReassembler |
+| ip/ | IP 分片重组 | StreamIp、IpDefrag（需核验） |
+| udp/ / icmp/ | 无连接协议的会话实现 | StreamUdp、StreamIcmp |
+| base/ / file/ / user/ | 基础、文件与用户会话实现 | StreamModule、StreamFile、StreamUser |
+| test/ | 分片、分帧与 HA 单元测试 | stream_splitter_test 等 |
+
+表中类名取自各目录真实头文件，个别类的确切名称以头文件为准，需对照实际版本核验。装载入口 `stream_inspectors.cc` 的特征值得单独说明：它把 `nin_stream_base`、`nin_stream_ip`、`nin_stream_icmp`、`nin_stream_tcp`、`nin_stream_udp`、`nin_stream_user`、`nin_stream_file` 七个流类 inspector 连同 `ips_stream_reassemble`、`ips_stream_size` 两个规则选项一起放进 `stream_inspectors[]` 数组，由 `load_stream_inspectors()` 统一装载。这与 `src/service_inspectors/` 的分组装载形成对照：后者把部分插件放在 `STATIC_INSPECTORS` 保护下，而本入口在当前快照中未使用同样的条件编译包裹，具体装载形态与构建开关的关联需对照 `CMakeLists.txt` 核验（构建见 02-02）。流重组的关键参数——如重组深度、memcap、各类策略——集中在 `stream` 与 `stream_tcp` 配置段（参数见 04-04），本篇不重列。
+
+### 3. 关键类与入口函数
+
+本节只点名类与真实头文件路径，字段明细一律引用 05 册。**门面层**：`src/stream/stream.h` 的 `class SO_PUBLIC Stream`（93 行附近）是纯静态类，对外提供 `is_active`、`get_flow`、`new_flow`、`delete_flow`、`get_packet_direction`、`stop_inspection`、`drop_flow`、`block_flow`、`set_splitter`、`get_paf_position`、`set_snort_protocol_id`、`handle_timeouts`、`prune_flows` 等入口（字段见 05-02 的流门面）。其实现 `stream.cc` 内的 `struct StreamImpl`（64 行附近）保存 `hold_time`（默认 1000）、额外数据回调表与互斥锁；线程本地的 `flow_con`（60 行附近）是转向 `FlowControl` 的关键枢纽。**装载层**：`stream_inspectors.h` 声明 `load_stream_inspectors()`，实现在同目录 `.cc`（57 行附近）。**分帧层**：`stream_splitter.h` 的 `struct StreamBuffer`（30 行附近）与 `class SO_PUBLIC StreamSplitter`（38 行附近），其 `enum Status` 含 `ABORT`、`START`、`SEARCH`、`FLUSH`、`LIMIT`、`SKIP`、`LIMITED`、`STOP`（43 至 53 行附近），纯虚 `scan`（58 行附近）、`finish`（68 行附近）与虚 `reassemble`（73 行附近）构成协议分帧契约；同文件还定义 `AtomSplitter`（104 行附近）、`LogSplitter`（125 行附近）、`StopAndWaitSplitter`（136 行附近）三种通用分帧器（字段见 05-02）。`paf.h` 的 `struct PAF_State`（39 行附近）与 `paf_check`（83 行附近）、`paf_new`、`paf_setup`、`paf_initialize` 构成协议感知分帧的状态机入口（字段见 05-02）。`flush_bucket.h` 的 `FlushBucket`（28 行附近）与派生的 `ConstFlushBucket`、`VarFlushBucket`、`StaticFlushBucket`、`RandomFlushBucket` 管理一组 flush 点（字段见 05-02）。**TCP 实现层**：`tcp/tcp_module.h` 的 `class StreamTcpModule : public snort::Module`（152 行附近）、`tcp/tcp_session.h` 的 `TcpSession`、`tcp/tcp_reassembler.h` 的 `TcpReassembler`（45 行附近）、`tcp/tcp_stream_tracker.h` 的 `TcpStreamTracker`、`tcp/tcp_normalizer.h` 的 `TcpNormalizer`（63 行附近）、`tcp/tcp_overlap_resolver.h` 的 `TcpOverlapResolver`（71 行附近）、`tcp/held_packet_queue.h` 的 `HeldPacketQueue`（62 行附近），以及 `tcp_state_machine.*`、`tcp_state_handler.*` 与各 `tcp_state_*.h` 构成的状态机族（字段见 05-09）。
+
+必须标注的不透明边界：`TcpSession`、`TcpReassembler`、`TcpStreamTracker` 的内部链表与段树结构定义在各自 `.cc` 内，头文件只暴露接口形态；`PAF_State` 之外的分帧上下文、`FlowControl` 的查表结构均属实现细节。这些对象一律视为不透明句柄，不可依赖其内部布局或字段偏移，需对照实际版本核验。整组结构跨册反查关系统一写为：`（字段见 05-02 ｜ 参数见 04-04 ｜ 原理见 06-05 ｜ 模块见 07-04）`。其中字段归 05-02 是因为 `Stream` 门面与重组相关结构由该篇权威定义（会话字段另见 05-09），参数归 04-04 是因为 `stream`／`stream_tcp` 配置段由 04 册给出，原理归 06-05 是因为 TCP 流重组机制由该篇展开，模块归 07-04 是因为本目录职责由本篇介绍。补充一点：`IP_POLICIES` 与 `TCP_POLICIES` 两个宏（`stream.h` 62、68 行附近）列出了分片重组与 TCP 规范化的可选策略名，其配置取值归 04 册（参数见 04-04），本篇只说明它们是策略选择入口。
+
+### 4. 对外接口与扩展点
+
+本模块的对外接口可分为四组。**第一组是流管理门面**。`class Stream` 把分散在流表里的操作收敛成静态入口：查询与创建流用 `get_flow`、`new_flow`、`delete_flow`，方向判定用 `get_packet_direction`，状态控制用 `stop_inspection`、`drop_flow`、`block_flow`、`check_flow_closed`，定时器与清理用 `handle_timeouts`、`prune_flows`、`purge_flows`。上层 inspector 与检测引擎只依赖这组稳定接口，不直接接触 `FlowControl`（字段见 05-02，流表本体见 07-10）。**第二组是分帧扩展点**。任何协议要在 TCP 上做精确分帧，都要实现 `StreamSplitter` 的 `scan`、`finish`、`reassemble`，并通过 `Stream::set_splitter` 挂到流的某个方向上；`src/service_inspectors/` 下的 `DnsSplitter`、`SslSplitter` 及各 HTTP splitter 就是这么接入的（模块见 07-03，原理见 06-05）。这是本模块最核心的扩展点。**第三组是事件与统计**。`paf_stats.h`、`stream_log.cc` 与 `stream.h` 里的 `reg_xtra_data_log`、`log_extra_data` 提供统计与额外数据日志；`set_pub_id`、`get_pub_id` 经数据总线登记 stream 事件通道，供订阅者消费（原理见 06-10）。**第四组是配置模块接口**。`StreamTcpModule`、`StreamModule` 等 module 类定义 `stream`、`stream_tcp` 等配置段的参数，键名与默认值归 04 册（参数见 04-04）。
+
+从报文入列、分帧、重组到供给检测的链路见图 07-04-01，图中虚线表示流表与超时的辅助关系。
+
+:::figure id=07-04-01 | name=流重组与 PAF 分帧供给链路 | dir=TD
+node a "Packet 有序段<br/>stream_tcp" teal
+node b "TCP 状态机<br/>TcpSession" purple
+node c "StreamSplitter<br/>scan 找切分点" teal
+node d "PAF_State<br/>flush point" teal
+node e "TcpReassembler<br/>乱序重排" teal
+node f "FlushBucket<br/>flush 策略" amber
+node g "重组缓冲<br/>service inspector" blue
+node h "detection<br/>规则求值" purple
+node i "FlowControl<br/>src/flow" gray
+edge a -> b "会话跟踪"
+edge b -> e "段入列"
+edge e -> c "逐段扫描"
+edge c -> d "返回切分点"
+edge d -> f "触发 flush"
+edge f -> g "按 PDU 交付"
+edge g -> h "可见缓冲"
+edge i -> b dashed "流表与超时"
+:::
+
+需要强调能力边界：图末的「可见缓冲」只含明文，TLS 加密正文不会因重组而变可读（原理见 06-10）；若分帧器缺失或被绕过，交付给检测的是不分帧的原始缓冲，跨包规则会失效，这也是服务识别错误时的典型后果（原理见 06-04）。此外，重组深度与内存受 memcap 约束，触及上限时采用的丢弃或刷新策略由配置决定（参数见 04-04），相关容量结论需在目标机型实测。
+
+### 5. 典型用法与调用示例
+
+先看装载入口的真实形态。以下代码节选自上游 master 快照的 `src/stream/stream_inspectors.cc`，它把流类 inspector 与流规则选项统一注册（清单以源文件为准）：
+
+```cpp
+// src/stream/stream_inspectors.cc（节选，需对照实际版本核验）
+extern const BaseApi* nin_stream_base;
+extern const BaseApi* nin_stream_tcp;
+extern const BaseApi* nin_stream_udp;
+extern const BaseApi* ips_stream_reassemble;
+
+static const BaseApi* stream_inspectors[] =
+{
+    nin_stream_base,
+    nin_stream_ip,
+    nin_stream_icmp,
+    nin_stream_tcp,
+    nin_stream_udp,
+    nin_stream_user,
+    nin_stream_file,
+    ips_stream_reassemble,
+    ips_stream_size,
+    nullptr
+};
+
+void load_stream_inspectors()
+{
+    PluginManager::load_plugins(stream_inspectors);
+}
+```
+
+这段代码说明两点：其一，流能力以单个 `BaseApi` 指针逐个登记，与 service 模块用 `BaseApi*` 数组的方式不同，反映了两类插件的导出粒度差异（插件体系见 06-14）；其二，数组末尾以 `nullptr` 收尾，是 `load_plugins` 遍历的终止约定。接着看分帧契约的典型形态，节选自 `src/stream/stream_splitter.h`，它展示协议 inspector 需要实现的最小接口：
+
+```cpp
+// src/stream/stream_splitter.h（节选，签名需对照实际版本核验）
+class SO_PUBLIC StreamSplitter
+{
+public:
+    enum Status { ABORT, START, SEARCH, FLUSH, LIMIT, SKIP, LIMITED, STOP };
+
+    virtual Status scan(Packet*, const uint8_t* data, uint32_t len,
+                        uint32_t flags, uint32_t* fp) = 0;
+    virtual bool finish(Flow*) { return true; }
+    virtual const StreamBuffer reassemble(Flow*, unsigned total, unsigned offset,
+                        const uint8_t* data, unsigned len, uint32_t flags,
+                        unsigned& copied);
+};
+```
+
+接口注释明确调用顺序为 `(scan (reassemble)*)* finish (reassemble)*`，即反复扫描直到找到 flush 点，再逐段重组，收尾时以 `len == 0` 触发最后一次 flush。流重组的最小配置片段如下，键名需对照实际版本核验，完整参数见 04-04：
+
+```lua
+-- snort.lua 片段：stream 与 stream_tcp 基本段（示意，完整参数见 04-04）
+stream = { }
+stream_tcp = { overlap = 'linux', policy = 'linux' }
+```
+
+验证按「前置检查 → 配置自检 → 复核」闭环：确认门面与装载入口存在，再用 `snort -T` 核对配置被解析（命令选项见 04-07）：
+
+```bash
+grep -n "class SO_PUBLIC Stream\|load_stream_inspectors" src/stream/stream.h src/stream/stream_inspectors.cc
+snort -c lua/snort.lua -T 2>&1 | grep -i -e "stream" -e "reassemble"
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+93:class SO_PUBLIC Stream
+57:void load_stream_inspectors()
+    stream:
+      memcap: 8388608
+    stream_tcp:
+      overlap: linux
+```
+
+逐行判读如下，合计超过一百五十字。首行 `93:class SO_PUBLIC Stream` 确认流管理门面类确实定义在 `stream.h` 且带导出宏：`SO_PUBLIC` 表示该类跨共享库可见，上层 inspector 才能链接调用；若门面缺失或不可见，编译阶段就会在引用 `Stream::` 的地方报错。第二行 `57:void load_stream_inspectors()` 是装载入口的定义位置，配合前面读到的 `stream_inspectors[]` 数组，可确认七个流类 inspector 与两个流规则选项都进入了装载列表；若 `-T` 阶段提示缺少 `stream` inspector，先回到这里核对数组是否完整。第三、四行 `stream:` 与 `memcap: 8388608` 是 `-T` 自检回显的 stream 段及其内存上限：这里只是示例数值，真实默认值以 04-04 与源码为准，切勿当作固定容量；memcap 决定流表与重组缓冲的内存天花板，触发剪枝时会有事件与统计输出。第五、六行 `stream_tcp:` 与 `overlap: linux` 回显 TCP 子段与重叠策略，说明 `overlap = 'linux'` 已被解析生效；若这里显示的是另一个策略名，说明配置未生效或键名有误，应回查 `src/stream/tcp/tcp_module.h` 的参数定义（参数见 04-04）。需要提醒，`-T` 只解析配置不处理真实流量，因此不会出现会话数与重组包数的统计；要观察运行时行为需用 pcap 回放或在线抓包（场景见 08-01）。所有 memcap、吞吐与丢包数字仅为回显示例，需在目标机型实测，不作为容量结论。
+
+### 6. 与其他模块的关系及常见误用
+
+本模块的接口面很宽，上游、下游与侧向关系都需要理清。**与 `src/flow/` 的关系是「门面与本体」**：`Stream` 把流查询、创建、删除、方向判定转交给 `FlowControl`，而 `Flow`、`FlowKey`、`FlowCache` 的定义与生命周期在 `src/flow/`（模块见 07-10，字段见 05-02、05-09）；把门面误当成流表本体，会在排查内存与超时问题时找错文件。流表的哈希与超时机制归 `src/flow/`，重组缓冲的管理才归本模块。**与 `src/service_inspectors/` 的关系是「供给与消费」**：本模块按 `StreamSplitter` 给出的切分点产出 PDU，交给协议 inspector 解析（模块见 07-03，原理见 06-05）。**与 binder／wizard 的关系是间接的**：服务识别决定哪条流挂上哪个 splitter，识别错误会让正确的分帧逻辑不被挂接，进而导致跨包规则失效（原理见 06-04）。**与 `src/detection/` 的关系是「重组包再检测」**：重组后的 PDU 以重建包形式进入检测流水线，字段供规则求值（模块见 07-05，原理见 06-08）。**与 `src/packet_io/` 与内联动作的关系**体现在 `Stream::drop_flow`、`Stream::block_flow` 会经 `active` 反馈 verdict，但 Snort 本身不是防火墙、不做转发（原理见 06-12）。**与 `src/flow/ha.*` 与各 `*_ha.cc` 的关系**是高可用状态同步，模型以实际版本为准（原理见 06-13）。
+
+常见误用集中在六处。第一，**把重组当成解密**。重组只恢复字节顺序与 PDU 边界，TLS 密文不会因为重组变成明文（原理见 06-10）；在加密正文上期待 content 命中是典型的方向性错误。第二，**memcap 与重组深度设置不当**。设得过小会在大流或高并发下频繁剪枝、丢掉跨包特征，设得过大则内存吃紧；这类容量结论必须在目标机型实测，不与固定数字挂钩（参数见 04-04，基准见 08-01）。第三，**忽略重叠与规范化策略**。不同 `overlap` 与 `policy` 取值在重叠字节上会采用不同数据，进而改变匹配结果；遇可疑告警先做同流量、不同策略的 A/B 对比（参数见 04-04）。第四，**误用 midstream 与 `require_3whs`**。`Stream::midstream_allowed` 依据网络策略的 `hs_timeout` 与启动时间决定是否允许半开流接入，超时后会拒绝并产生事件；不了解这一点会把正常的拒绝误判为漏报。第五，**跨版本套用状态机细节**。`tcp/` 下的状态类与处理函数随版本演进，函数名与枚举取值需对照实际版本核验，不要凭印象写调用。第六，**断言固定线程或会话模型**。门面背后的 `flow_con` 是线程本地指针，线程与资源隔离以实际版本为准，禁止写「默认 N 线程」（原理见 06-13）。最后重申：任何吞吐、pps、内存与丢包率结论一律标注「需在目标机型实测」，不给绝对值（基准见 08-01，调优见 08-02）。
+
+### 7. 小结与延伸阅读
+
+本篇按 `src/stream/` 的真实目录梳理了流重组模块：它以静态门面 `class Stream` 对外提供流管理与状态控制，内部由 `src/flow/` 的 `FlowControl` 承担流表本体，二者是门面与本体的分工；TCP 支持集中在 `tcp/` 子目录，由状态机、重组器、规范化器、重叠解析器与保持包队列协作完成有序化；PAF 通过 `StreamSplitter` 的 `scan`／`finish`／`reassemble` 与 `PAF_State`、`FlushBucket` 把字节流切成对齐应用消息的 PDU，再交给上层协议 inspector。装载由 `load_stream_inspectors()` 统一注册七个流类 inspector 与两个流规则选项。把握住「门面委托流表 → 状态机跟踪会话 → 重组器有序化 → 分帧器切 PDU → 供给 inspector 与检测」这条主线，就能把本模块与前后各层的边界理清。延伸阅读：TCP 流重组机制见 06-05；解码与协议分层见 06-03；服务识别与 binder／wizard 见 06-04；HTTP/2、TLS 等 inspector 深入见 06-10；检测求值与重组包见 06-08；内联 verdict 见 06-12；`Stream` 与重组结构字段见 05-02（会话字段见 05-09）；`stream`／`stream_tcp` 配置见 04-04；协议 inspector 模块见 07-03；流与会话模块见 07-10；插件装载见 06-14；性能基准与调优见 08-01、08-02。综合反查写法统一为：`（字段见 05-02 ｜ 参数见 04-04 ｜ 原理见 06-05 ｜ 模块见 07-04）`。

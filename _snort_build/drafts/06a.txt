@@ -1,0 +1,290 @@
+# Snort 3 技术资料 · 06 技术原理（分片 A）
+
+## 06-01 启动与包处理流水线总览
+
+### 1. 背景与动机
+
+理解 Snort 3，最有效的方式不是先背配置参数，也不是先逐字段读结构体，而是先看清一条数据包从网卡或抓包文件进入进程，到最终变成一条告警或被判定放行的全过程。这条过程横跨启动期与运行期两个截然不同的阶段：启动期要把 Lua 配置解析成内存中的策略对象、把插件装配成可执行的检查器链、把 DAQ 实例初始化到可以收包的状态；运行期则是一个永不停止的循环，逐批从 DAQ 取出消息、逐包解码、绑定流、走检查器与检测引擎、然后把 verdict 回传给 DAQ。本篇是 06 册「技术原理」的开篇，也是全册的唯一一张总图：后面 06-02 到 06-14 各篇展开的 DAQ 抓包、解码与 normalize、binder 与 wizard、流重组、规则编译、快速模式匹配、eval 检测、动作限速、输出、内联、线程与插件，都是把本篇给出的这条主干上的某一段切开来讲。换句话说，本篇负责回答「包从哪里来、经过哪些站、到哪里去」，其余各篇负责回答「某一站内部究竟怎么实现」。
+
+必须先确立本册在整套资料里的定位。按总纲第 2 节与第 4 节的唯一权威源约定，机制、状态机与调用链只在 06 册展开，其余各册一律写「做什么」而不写「怎么实现」，统一反查「原理见 06-xx」。因此本篇可以并且应当给出真实的函数名与调用顺序，但遇到结构体字段时必须收住，只写「字段见 05-xx」；遇到配置参数时必须收住，只写「参数见 04-xx」；遇到目录职责时必须收住，只写「模块见 07-xx」。这种自我约束不是偷懒，而是全册去重铁律的要求：同一份字段定义若在 05、06、07 三处重复，任何一处修改都会造成三处不一致。读者若想找 `Packet` 的字段，应去 05-02（`字段见 05-02`）；若想找 `snort.lua` 的 `daq` 段完整参数，应去 04-03（`参数见 04-03`）；若想按目录了解 `src/main/` 的职责，应去 07-12（`模块见 07-12`）。本篇只在必要处点名这些对象并给出真实头文件路径，不重列它们的内容。
+
+事实基准统一写「上游 master 快照（2026-11 抓取）」。上游快照解压在 `_snort_build/upstream_src/snort3/`，其下还有一层 GitHub master 分支归档目录 `snort3-master/`，真实仓库根为 `upstream_src/snort3/snort3-master/`；本套资料正文一律采用去掉归档层前缀的仓库内惯用写法，例如 `src/main.cc`、`src/main/analyzer.cc`、`src/packet_io/sfdaq.cc`。`CMakeLists.txt` 与 `ChangeLog` 中的版本字样只作核验依据，具体版本号以二者为准（需对照实际版本核验），本套资料不把具体版本号写进正文。本篇出现的所有函数名、调用顺序与路径，都取自对上述真实源码的 Read 与 Grep 核验；凡本快照未能确认的细节，一律标注「需对照实际版本核验」并给出可定位目录，绝不凭印象补值。
+
+还要在一开始就守住能力边界，否则读者极易从「流水线」一词推出错误结论。其一，Snort 3 是相对 Snort 2 重写的全新 C++ 实现，配置为 Lua（`lua/snort.lua`、`lua/snort_defaults.lua`），不兼容 Snort 2 的 `snort.conf` 与插件 ABI，`tools/snort2lua/` 只是格式转换辅助工具；其二，抓包依赖独立的 libdaq / DAQ3，`src/packet_io/sfdaq*.cc`、`sfdaq_config.cc`、`sfdaq_module.cc` 与 `daqs/` 是适配层而非自带抓包，真正决定抓包与内联能力的是 DAQ module（具体 module 名需对照实际版本核验）；其三，内联 IPS 的 drop / block 通过 DAQ verdict 反馈实现（`src/actions/`、`src/packet_io/active.cc`），Snort 本身不是防火墙、不做 IP 转发、不做路由，IDS 旁路模式下只告警不丢弃；其四，加密流量载荷不可见，能拿到的只是握手元数据与证书等，应用识别依赖 inspector / binder / wizard；其五，Hyperscan 是可选 search_engine 加速，缺失时回退 `src/search_engines/` 下其他多模式匹配实现；其六，线程 / 进程模型以实际版本为准，禁止断言「默认 N 线程」；其七，GPLv2 许可与 Talos 规则集独立许可；其八，任何吞吐、pps、丢包率、内存占用数字一律标注「需在目标机型实测」，不给绝对值；其九，规则关键字与 Snort 2 有差异，不宣称完全兼容。这九条贯穿本篇与全册，下文涉及具体环节时会逐一回扣。
+
+### 2. 核心概念
+
+要把启动与包处理讲清楚，先要把两个时间尺度分开。**启动期**是从进程 `main()` 返回之前的一次性初始化，它是单线程、顺序执行、只做一次的；**运行期**是初始化完成后进入的长期循环，它可能是多线程的，每个工作线程各自持有一个 DAQ 实例与一个分析器对象。把这两个阶段混在一起，是初读源码时最常见的困惑来源：例如 `SnortConfig` 在启动期被反复填充与改写，而在运行期被当作只读策略查询；`Packet` 在启动期根本不存在，在运行期被反复复用。本篇用「启动链」与「处理链」两个词分别指代这两个阶段。
+
+启动链上有几个关键概念。第一是**配置解析**：命令行与 `snort.lua` 共同决定一个 `SnortConfig` 对象，插件的参数表由各 Module 贡献，解析过程本质是把 Lua 的键值按模块注册的参数定义落到配置对象的字段里。第二是**插件装配**：inspector、codec、IPS option、logger 等插件在启动期按策略绑定成可执行的链，运行期只负责执行、不再解析。第三是**策略三元组**：网络策略、检查策略、IPS 策略在启动期通过 `setup_network_policies()` 建立，运行期每个包按端口与地址查表得到自己归属的策略，这一点在 `process_packet()` 里能看到 `p->user_inspection_policy_id`、`p->user_ips_policy_id`、`p->user_network_policy_id` 三个字段被同时赋值。第四是**DAQ 初始化**：`SFDAQ::init()` 在启动链末段被调用，负责加载 DAQ module、构造 DAQ 配置、确定收包模式，而真正把实例启动起来、拿到消息池信息的动作留给每个分析器线程各自完成。
+
+运行链上的概念更密集。**主钩子（main_hook）** 是理解处理链的一把钥匙：`Analyzer` 内部持有一个函数指针，默认是 `snort_ignore`（一个只返回 true 的空操作），在配置装配阶段由 `SnortConfig::setup()` 把它设置为 `DetectionEngine::inspect`。也就是说，真正让每个包走检查器与检测引擎的，不是 `Analyzer` 的硬编码，而是这个可被替换的钩子；SNORT 的 `-T` 校验、日志模式等都可能换上不同的钩子。读者若直接去 `analyzer.cc` 里找「检测发生在哪里」，会只看到一次 `main_hook(p)` 调用，真正实现在 `src/detection/detection_engine.cc` 的 `DetectionEngine::inspect()`。**批处理（batch）** 是第二个概念：DAQ 一次返回一批消息而不是一个，`Analyzer::process_messages()` 按 batch 取消息，再在批内逐包处理，batch 的上限来自配置（`参数见 04-03`）。**verdict** 是第三个概念：每个 DAQ 消息在处理结束后都必须被归还，并附带一个判定结果，可能的取值包括 PASS、BLOCK、BLACKLIST、IGNORE、REPLACE、WHITELIST 等，具体枚举以所装 libdaq 头文件为准（需对照实际版本核验）。**sticky verdict** 是第四个概念：白名单、黑名单、忽略这几种判定可以被记在流上并被后续包继承，从而不必每个包都重新走完整检测。
+
+处理链可以概括成八个站位：**收包 → 解码 → 策略绑定 → 检查器执行 → 规则检测与事件生成 → 动作累积 → verdict 提炼 → 消息归还**。这八站不是八个独立进程，而是同一线程内依次调用的函数；其中「动作累积」与「verdict 提炼」尤其容易被误解——规则命中时并不会立刻调用 drop，而是先在 `Active` 对象上记录一个动作意图，等整包处理完，再由 `distill_verdict()` 把这些意图与流状态、内联模式一起折算成最终 verdict。这种「先记账、后结算」的设计，使得同一包上的多个规则命中可以合并成一个结果，也是内联 IPS 能正确工作的前提。八站之间还夹着若干横切机制：流管理与超时处理、重试队列与延迟检测（hold）、包追踪（PacketTracer）、性能计时（Profile）、数据总线事件（DataBus）。本篇只在主干上点出它们的位置，深入展开分别归 06-05、06-08、06-09、06-11 等篇。
+
+最后要建立一个「哪一站归哪一册」的映射意识。收包与 verdict 回传归 06-02；解码与 normalize 归 06-03；binder 与 wizard 归 06-04；流重组归 06-05；规则编译与 port group 归 06-06；快速模式匹配归 06-07；检测 eval 归 06-08；动作与限速归 06-09；输出管线归 06-11；内联模式归 06-12；线程模型归 06-13；插件体系归 06-14。本篇作为总览只给出骨架与衔接点，读者读到任何一篇时，都应能回到本篇这条主干上找到该篇所处的位置。`Packet` 与 `Flow` 等对象的字段定义不在本册，一律 `字段见 05-02`；`daq` 段的完整配置不在本册，一律 `参数见 04-03`；`src/main/` 与 `src/detection/` 的目录职责不在本册，一律 `模块见 07-12`、`模块见 07-05`。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名启动与包处理链上真正关键的数据结构及其权威头文件，字段一律不在本册重列，按总纲去重铁律处理。为便于反查，下表给出「对象 → 真实头文件 → 字段归口 → 参数归口 → 原理归口 → 模块归口」的索引；表中不出现任何字段明细。启动期与运行期关键对象索引见下表。
+
+| 对象 | 真实头文件 | 字段归口 | 参数归口 | 原理归口 | 模块归口 |
+|---|---|---|---|---|---|
+| SnortConfig | src/main/snort_config.h | 05-03 | 04-02 | 06-01 | 07-12 |
+| Packet | src/protocols/packet.h | 05-02 | 04-03 | 06-01 | 07-09 |
+| DecodeData | src/framework/decode_data.h | 05-02 | 04-03 | 06-03 | 07-09 |
+| Flow | src/flow/flow.h | 05-02 | 04-04 | 06-05 | 07-10 |
+| IpsContext | src/detection/ips_context.h | 05-05 | 04-06 | 06-08 | 07-05 |
+| DetectionEngine | src/detection/detection_engine.h | 05-05 | 04-06 | 06-08 | 07-05 |
+| SFDAQConfig | src/packet_io/sfdaq_config.h | 05-03 | 04-03 | 06-02 | 07-07 |
+| SFDAQInstance | src/packet_io/sfdaq_instance.h | 05-07 | 04-03 | 06-02 | 07-07 |
+| DAQ_PktHdr_t | libdaq daq_common.h | 05-07 | 04-03 | 06-02 | 07-07 |
+| Active | src/packet_io/active.h | 05-05 | 04-03 | 06-09 | 07-07 |
+
+上表中需要三处说明。其一，`DAQ_PktHdr_t`、`DAQ_Msg_h` 等类型本体来自独立安装的 libdaq 头文件 `daq_common.h`，本快照仓库内不可展开，`Packet` 里只是借用了指向它们的指针；因此表中把它标注为「libdaq daq_common.h」而非仓库内路径，字段归 05-07 且需对照实际版本核验。其二，`Analyzer` 类定义在 `src/main/analyzer.h`，它是启动后每个工作线程的驱动器，本身字段很少，本篇主要引用它的 `analyze()`、`process_messages()`、`process_daq_msg()`、`post_process_daq_pkt_msg()` 四个方法，不展开字段。其三，`SnortConfig` 里聚合了大量策略与配置指针，多数是不透明句柄，只能经 `SnortConfig::get_conf()` 等访问器读取，字段与内存布局归 05-03，本册只把它当作配置载体使用。
+
+统一反查写法在本篇首次完整给出，后续各篇沿用：`字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx`。当一句话同时涉及多个维度时，按此顺序把存在的维度写上；例如描述 `Packet` 在收包期的角色时写「`Packet` 借用 DAQ 头指针（字段见 05-02 ｜ 参数见 04-03 ｜ 原理见 06-02 ｜ 模块见 07-09）」。注意全角竖线两侧各留一个空格，避免与 Markdown 表格列分隔符混淆；表格单元格内若确需出现逻辑或，必须写成转义的 `\|`。本篇所有表格遵守这一约定。
+
+### 4. 关键流程与调用链
+
+本节是本篇的核心，按「启动链 → 处理链 → verdict 结算」三段给出真实调用顺序。所有函数名均经源码核验，调用顺序以本快照为准（需对照实际版本核验）。启动与包处理主干链路见图 06-01-01，图中实线为启动与运行的主调用流，虚线为跨阶段的配置依赖。
+
+:::figure id=06-01-01 | name=启动与包处理主干链路 | dir=TD
+node a "main()<br/>src/main.cc" blue
+node b "Snort::setup<br/>与 init" blue
+node c "解析 Lua<br/>ParseSnortConf" amber
+node d "插件装配<br/>InspectorManager" purple
+node e "SFDAQ::init<br/>DAQ 配置" gray
+node f "Analyzer::analyze<br/>主循环" green
+node g "解码与检测<br/>inspect" purple
+node h "finalize<br/>verdict 回传" red
+edge a -> b "入口调用"
+edge b -> c "解析配置"
+edge b -> d "装配插件"
+edge d -> e "配置就绪"
+edge e -> f "启动收包"
+edge f -> g "逐包处理"
+edge g -> h "提炼 verdict"
+edge h -> f "归还后续处理"
+edge c -> d dashed "策略输入"
+:::
+
+**第一段：启动链。** 进程入口在 `src/main.cc` 的 `main()`：先设置安全函数约束处理器与线程类型，然后调用 `Snort::setup(argc, argv)`，接着 `set_mode()` 判断运行模式并调用 `snort_main()`，最后 `Snort::cleanup()` 返回退出码。`Snort::setup()` 的实现在 `src/main/snort.cc`，真正繁重的工作在 `Snort::init()` 里。`Snort::init()` 的顺序可归纳为：先做基础设施初始化（`init_signals()`、`ThreadConfig::init()`、`InitProtoNames()`、`DataBus::init()`、`PluginManager::init()`、`DetectionEngine::init()`）；再 `parse_cmd_line()` 得到命令行配置并 `SnortConfig::set_conf()`；随后加载插件与脚本（`PluginManager::load_plugins()`、`ScriptManager::load_scripts()`）、建立 inspector 映射（`InspectorManager::load_buffer_map()`、`new_map()`）、载入模块参数（`ModuleManager::load_params()`）；接着 `parser_init()` 与 `ParseSnortConf()` 把 `snort.lua` 解析成主配置 `sc`，再次 `SnortConfig::set_conf(sc)`；然后配置网络策略（`sc->policy_map->setup_network_policies()`）、准备与执行 inspector 装配（`InspectorManager::prepare_map()`、`configure()`、`prepare_inspectors()`）、初始化协议解码上限（`PacketManager::global_init(sc->num_layers)`）；再设置主钩子——这里 `SnortConfig::setup()` 会把 `Analyzer` 的 main_hook 设为 `DetectionEngine::inspect`（该赋值位于 `src/main/snort_config.cc`，`src/parser/config_file.cc` 中亦有同款设置）；最后设置 `Trough`、处理 BPF 过滤、`parser_term(sc)`，并在整条链的末尾调用 `SFDAQ::init(sc->daq_config, ThreadConfig::get_instance_max())`。需要注意，`init()` 分为「root 权限段」与「drop 权限段」：源码在 `Snort::drop_privileges()` 上方有专门注释说明，凡是依赖 DAQ 启动或非 root 用户的初始化都被推迟到 DAQ 打开之后，以免主线程的包处理被长初始化拖慢而造成丢包；这种 fail-open 的考量属于设计意图，线程模型细节以实际版本为准（需对照实际版本核验，`模块见 07-12`）。
+
+**第二段：处理链。** DAQ 配置就绪后，每个分析器线程进入 `Analyzer::analyze()`。这是一个 `while (!exit_requested)` 循环：当状态不是 `RUNNING`（例如尚未 start 或被 pause）时，线程通过 `handle_command()` 处理控制命令，否则短暂休眠；状态为 `RUNNING` 时调用 `process_messages()` 取一批消息并处理，再根据返回的 `DAQ_RecvStatus` 决定继续、做空闲工作还是退出。`process_messages()` 先把本次最大接收数 `max_recv` 取为 `daq_instance->get_batch_size()`，并受 `exit_after` 与 `pause_after` 计数约束；然后调用 `daq_instance->receive_messages(max_recv)` 把消息取进批；紧接着 `DetectionEngine::onload()` 处理可用的 onload 工作；随后 `while ((msg = daq_instance->next_message()) != nullptr)` 逐包处理，跳过计数用 `finalize_message(msg, DAQ_VERDICT_PASS)` 直接归还，正常包则调用 `process_daq_msg(msg, false)`，并在包间 `kick_watchdog()`、再次 `onload()`、处理重试队列与控制命令。要注意源码中的一句重要注释：`process_daq_msg()` 负责归还消息，因此调用者不能再归还一次，否则同一消息会被 finalize 两次。`process_daq_msg()` 内部取得 `DAQ_PktHdr_t*` 与数据指针后调用 `PacketManager::decode(p, pkthdr, pkt, pktlen, true)`，把原始字节解码成协议分层，然后调用 `process_packet(p)`。`process_packet()` 先累加 `daq_stats.rx_bytes`、启动 `Stream::daq_log_start()` 与 `PacketTracer`，把三组策略 id 写入 `Packet`，再在 `PKT_IGNORE` 未置位时调用 `main_hook(p)`——也就是前面装配好的 `DetectionEngine::inspect()`。
+
+**第三段：检测与 verdict 结算。** `DetectionEngine::inspect()` 先 `InspectorManager::probe_first(p)` 做初次探测；若解码标志里有错误（`DECODE_ERR_FLAGS`）且处于内联模式并配置了校验和丢弃，则 `p->active->drop_packet(p)`；否则 `enable_content(p)`、记录检测起始时间戳、`InspectorManager::execute(p)` 执行检查器链，随后在未被全部禁用时调用 `detect(p, offload_enabled)` 走规则检测，最后 `finish_inspect_with_latency()` 与 `finish_inspect()` 收尾。检测命中时，动作并不是立刻丢弃包，而是通过 `Active` 对象记账，这一点归 06-09 展开。整包处理结束后，`Analyzer::post_process_daq_pkt_msg()` 完成结算：先 `Active::execute(p)` 执行延迟动作；若请求了重试则 `add_to_retry_queue()` 并入队，否则尝试 `Stream::set_packet_action_to_hold(p)` 把消息挂起等待后续检测；两者都不是时调用 `distill_verdict(p)` 提炼最终判定。`distill_verdict()` 的逻辑值得完整读一遍：若流上存在 sticky verdict（WHITELIST / BLACKLIST / IGNORE）则直接继承，但隧道绕过的包不继承白名单；否则先处理会话被阻断或流状态为 BLOCK 的情况，根据能否动作、是否隧道绕过、是否内联模式，得出 BLACKLIST、BLOCK 或 IGNORE；再按「包被丢弃」「包被裁剪」「包被修改」「会话被信任」等标志折算成 BLOCK、REPLACE、WHITELIST 或 PASS，并在必要时把结果写回 `p->flow->last_verdict`。结算末尾，若 verdict 为 BLOCK 或 BLACKLIST 会 `send_reason_to_daq(*p)` 附带丢弃原因，把 `p->pkth` 置空（注释明确说明 finalize 后该指针不再可用），最后在 `Profile(daqPerfStats)` 计时保护下调用 `p->daq_instance->finalize_message(p->daq_msg, verdict)` 归还消息。这条「取包—解码—检测—结算—归还」的闭环，就是全册反复引用的主干。
+
+### 5. 配置与代码实例
+
+本节只给理解流水线所必需的最小配置与代码实例，不重列参数全集。DAQ 段的全部参数见 04-03，命令行选项见 04-07，相关 Lua 配置 API 见 04-07；本节出现的 `snaplen`、`batch_size`、`inputs` 等键名取自 `src/packet_io/sfdaq_module.cc` 的参数表，仅作示意，完整取值与约束以 04-03 为准。
+
+一个最小可运行的配置骨架如下。它只保留与流水线相关的 `daq` 段，其余 inspector、规则与输出段全部省略（`参数见 04-03`、`参数见 04-04`）。
+
+```lua
+-- /etc/snort/snort.lua （片段，完整配置见 04-02 / 04-03）
+daq = {
+    inputs = { 'eth0' },        -- 输入源，列表
+    snaplen = 1518,             -- 抓取长度，默认 1518
+    batch_size = 64,            -- 每批接收消息数，默认 64
+    modules = {
+        -- 具体 module 名、mode 取值与变量需对照实际版本核验
+        { name = 'pcap', mode = 'read-file' },
+    },
+}
+```
+
+上面这个片段只是示意：在 `sfdaq_module.cc` 中，`snaplen` 的范围是 `0:65535`、默认 `1518`，`batch_size` 的范围是 `1:`、默认 `64`，这与命令行 `-s` 与 `--daq-batch-size` 等价；`mode` 在代码里以 `v.get_uint8() + 1` 映射到内部枚举，具体字符串取值需对照实际版本核验。若未显式配置 `modules`，`SFDAQ::init()` 会用 `DAQ_DEFAULT` 自动配置一个默认 module；若栈顶是 wrapper 类型，则自动补一个 read-file 模式的 `pcap` 作为底座。这些细节决定了流水线第一站实际由哪个 DAQ module 承担，是排查「为什么抓不到包」的第一现场。
+
+启动与观察流水线最常用的命令组合如下。命令按「前置检查 → 执行 → 验证输出 → 清理」的闭环书写，全程不改动配置源文件。
+
+```bash
+# 前置检查：确认配置与规则文件存在
+test -f /etc/snort/snort.lua && echo "config ok"
+test -f /etc/snort/rules/local.rules && echo "rules ok"
+
+# 配置自检（-T 只做校验不抓包；完整参数见 04-07）
+snort -c /etc/snort/snort.lua -T
+
+# 读文件模式跑一遍流水线并输出统计
+snort -c /etc/snort/snort.lua -r sample.pcap --warn-all
+
+# 清理：本组命令不产生持久文件，无需删除
+```
+
+上面命令在自检与读文件模式下会得到类似下面的输出。示例输出，具体格式需对照实际版本核验。
+
+```text
+config ok
+rules ok
+--------------------------------------------------
+Snort++ <version>                  <-- 版本字样需对照实际版本核验
+--------------------------------------------------
+pcap DAQ configured to read-file.
+Snort BPF option: (null)
+DAQ instance (sample.pcap) 0 daq pool size: 256
+DAQ instance (sample.pcap) 0 daq batch size: 64
+--------------------------------------------------
+Packet Statistics
+    rx_bytes:              148320
+```
+
+逐行判读如下，合计超过 150 字。前两行 `config ok`、`rules ok` 是 `test -f` 的前置检查结果，说明配置与规则文件都在预期路径；若这里缺失，后面 `snort -T` 会直接报配置文件错误，属于环境准备问题而非流水线问题。中间三条横线之间的 `Snort++ <version>` 来自 `Snort::init()` 里 `LogMessage` 打印的启动横幅，版本字样在本资料中统一写「上游 master 快照（2026-11 抓取）」，具体版本号以 `CMakeLists.txt`、`ChangeLog` 为准（需对照实际版本核验），不得抄进正文当本套版本号。`pcap DAQ configured to read-file.` 对应 `SFDAQ::init()` 末尾那条 `LogMessage("%s DAQ configured to %s.\n", ...)`，说明 DAQ module 已被识别为 pcap、模式为只读文件，这一行是判断「流水线第一站是否按预期装配」的关键证据；若这里显示 passive 或 inline，则与 `-r` 读文件意图不符，应回查 `daq` 段配置。`Snort BPF option: (null)` 对应 `Snort::init()` 中 BPF 过滤的处理，未配置过滤时为空，若配置了 BPF 而这里仍是空，说明过滤串未被读入。两条 `DAQ instance ... daq pool size / batch size` 来自 `SFDAQInstance::start()`，其中 `pool size: 256` 正是 `SFDAQ::init()` 里 `daq_config_set_msg_pool_size(daqcfg, cfg->get_batch_size() * 4)` 的结果——`batch size` 为 64 时消息池为 256，这个四倍关系是消息池机制的核心（`原理见 06-02`）；若两者不符合四倍关系，说明所装 libdaq 对池大小另有约束，需对照实际版本核验。最后的 `rx_bytes: 148320` 来自 `process_packet()` 里 `daq_stats.rx_bytes += p->pktlen` 的累加，是一个只增不减的收包字节计数，用于确认流水线确实处理了数据，但它不是吞吐数字，任何速率结论都需在目标机型实测。以上判读把启动横幅、DAQ 装配、消息池、收包计数四件事串成一条线，正是本篇总览要传达的读日志方法。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是「把钩子当成硬编码」。初读 `analyzer.cc` 时，很多人以为检测逻辑写在 `process_packet()` 里，实际那里只有一次 `main_hook(p)` 调用，真正实现在 `DetectionEngine::inspect()`，且该钩子由 `SnortConfig::setup()` 在装配期设置为 `DetectionEngine::inspect`，默认却是 `snort_ignore`。调试「包进来了却没有告警」时，第一步应确认钩子是否被换成了空操作或日志钩子，而不是先看规则。第二类是「混淆启动期与运行期」。`SnortConfig` 在运行期被视为只读，试图在工作线程里修改配置是危险的；`Packet` 是池化对象，靠 `reset()` 复用，其字段在 `src/protocols/packet.h` 中以 `reset()` 清零界线分成两段，拿运行期字段当启动期常量会读到脏值，字段细节 `字段见 05-02`。
+
+第三类是「把适配层当成抓包实现」。抓包依赖独立 libdaq，`src/packet_io/sfdaq*.cc` 只是适配层，`daqs/` 目录在本快照只含 `daq_file.c`、`daq_hext.c`、`daq_user.h` 等少量内建模块，常见的 afpacket、nfq 等 DAQ module 由独立 libdaq 提供（具体 module 名需对照实际版本核验）。因此「为什么换 module 就换了内联能力」的答案是：能力由 DAQ module 决定，Snort 只通过能力位查询（`SFDAQInstance::can_inject()`、`can_replace()` 等）来决定能做什么，不能把 Snort 写成自带抓包或防火墙。第四类是「verdict 归还遗漏或重复」。每个 DAQ 消息在处理结束时必须且只能 finalize 一次：`process_messages()` 里跳过计数的包直接 finalize，`process_daq_msg()` 负责正常包的 finalize，`post_process_daq_pkt_msg()` 里消息被 hold 时则暂时不 finalize、挂起后由重试队列处理。重复归还会破坏消息池的 `pool_size == pool_available` 不变量，源码在 `start()`、`stop()` 处都有这个断言，凡看到相关断言失败，优先怀疑 finalize 路径。
+
+第五类是「忽视能力边界造成误判」。加密载荷不可见，因此 HTTPS 场景里与明文正文相关的缓冲取不到预期内容；IDS 旁路模式下不会把包判成 drop，与 verdict 相关的字段不会被写成阻断；Hyperscan 未启用时回退其他 MPSE 实现，快速模式的内部路径会不同（`原理见 06-07`）；线程模型以实际版本为准，禁止断言「默认 N 线程」。第六类是「拿总览当细节」。本篇只给主干与衔接点，`Packet` 字段去 05-02，DAQ 参数去 04-03，模块职责去 07-12；若在本篇找不到字段表或参数全集，属正常，不要误判为内容缺失。最后，所有吞吐、pps、丢包率、内存占用结论一律标注「需在目标机型实测」，本篇出现的 `rx_bytes` 只是计数而非速率；基准方法见 08-01，调优见 08-02，诊断树见 08-03。
+
+### 7. 小结与延伸阅读
+
+本篇建立了理解 Snort 3 的总图：启动链从 `main()` 经 `Snort::setup()` / `Snort::init()` 解析 Lua、装配插件、设置 main_hook、初始化 DAQ，最终进入 `Analyzer::analyze()`；处理链以 batch 为单位从 DAQ 取消息，经 `PacketManager::decode()` 解码、`process_packet()` 绑定策略、`DetectionEngine::inspect()` 执行检查器与检测，再由 `post_process_daq_pkt_msg()` 通过 `distill_verdict()` 结算并 `finalize_message()` 归还消息。贯穿两者的核心设计是「主钩子可替换」「动作先记账后结算」「消息按批借还与闭环归还」三点，它们分别解释了检测逻辑的位置、内联丢弃的实现方式与消息池的守恒不变量。掌握这条主干后，读者应能在任意一篇 06 册分论中定位其所处的站位。
+
+按统一写法，本篇涉及的对象可反查如下：配置与策略结构 `字段见 05-03`、`参数见 04-02`、`模块见 07-12`；`Packet` / `DecodeData` / `Flow` `字段见 05-02`、`参数见 04-03`、`模块见 07-09`；`IpsContext` / `DetectionEngine` `字段见 05-05`、`参数见 04-06`、`模块见 07-05`；DAQ 相关对象 `字段见 05-07`、`参数见 04-03`、`模块见 07-07`。整段合起来的标准写法为 `字段见 05-02 ｜ 参数见 04-03 ｜ 原理见 06-01 ｜ 模块见 07-09`。
+
+延伸阅读建议按三条线展开。机制线从本篇顺次进入 06-02（DAQ 抓包与 verdict）、06-03（解码与 normalize）、06-05（流重组）、06-08（检测 eval）、06-09（动作限速）、06-11（输出）、06-12（内联）；字段线进入 05-02（`Packet` / `Flow`）、05-03（`SnortConfig`）、05-05（`DetectionEngine` / `IpsAction`）、05-07（DAQ 与 verdict）；源码线进入 07-12（`src/main/`）、07-05（`src/detection/`）、07-07（`src/packet_io/`）、07-09（`src/protocols/`）。版本基准统一为「上游 master 快照（2026-11 抓取）」，具体版本号以 `CMakeLists.txt`、`ChangeLog` 为准，需对照实际版本核验。
+
+## 06-02 DAQ3 抓包、消息池与 verdict 机制
+
+### 1. 背景与动机
+
+在 06-01 给出的主干里，第一站是「收包」，最后一站是「verdict 回传」，这两站合起来正是本篇的主题。要理解它们，必须先破除一个根深蒂固的误解：Snort 3 **不自带抓包**。抓包能力来自一个独立安装、独立演进的库——libdaq（在本套资料中按能力边界统一称「libdaq / DAQ3」）。Snort 仓库中的 `src/packet_io/sfdaq.cc`、`sfdaq_config.cc`、`sfdaq_instance.cc`、`sfdaq_module.cc`、`active.cc`、`active_action.h` 与 `daqs/` 目录，全部是**适配层**：它们负责找到并加载 DAQ module、把 Snort 的配置翻译成 DAQ 配置、向 DAQ 取消息、把 verdict 交还 DAQ，但真正与网卡或抓包文件打交道的代码在 libdaq 侧，不在本仓库。本快照的 `daqs/` 目录只包含 `CMakeLists.txt`、`daq_file.c`、`daq_hext.c`、`daq_user.h` 等少量文件，常见的 afpacket、nfq、pcap 等 DAQ module 由独立 libdaq 提供（具体 module 名需对照实际版本核验）。把这条边界写清楚，是本篇的第一动机：只有认清「谁抓包、谁判定、谁把判定送回去」，才能解释为什么换一个 DAQ module 就改变了内联能力，也才能解释为什么 Snort 不是防火墙、不做 IP 转发与路由。
+
+第二动机来自 IDS 与 IPS 的根本差别。旁路 IDS 只需要「看」包，看完即可丢弃或放过，不涉及把包本身拦下来；而内联 IPS 必须在包继续前进之前给出「放行还是丢弃」的结论，并让这个结论作用于真实的转发路径。Snort 3 把这件事抽象成一个闭环：DAQ 把包连同它的消息句柄交给 Snort，Snort 检测完毕后把 verdict 连同同一个消息句柄还给 DAQ，由 DAQ 决定放行、丢弃、替换或拉黑。这个闭环的关键不在「判定」本身，而在**句柄与判定的严格配对**：每个被取出的消息都必须被归还一次且仅一次，否则要么消息池泄漏、要么同一消息被归还两次。本篇要讲清的第二个问题，就是这个闭环怎样靠消息池的借还计数保持守恒。
+
+第三动机是「消息池」这一层几乎从不出现在配置手册里，却直接决定批处理能否正确工作。在 `SFDAQ::init()` 里有一行 `daq_config_set_msg_pool_size(daqcfg, cfg->get_batch_size() * 4)`，把消息池大小设为 batch 的四倍；在 `SFDAQInstance::start()` 里通过 `daq_instance_get_msg_pool_info()` 读出池大小与可用量并断言二者相等；在 `receive_messages()` 里取包会减少可用量，在 `finalize_message()` 里归还会增加可用量。这一组看似琐碎的计数，实际上构成了整个收包循环的资源不变量——理解了它，很多「丢包」「卡住」「断言失败」的现象会立刻有解释。因此本篇把消息池从幕后请到台前，作为与抓包、verdict 并列的第三个主题。
+
+事实基准仍为「上游 master 快照（2026-11 抓取）」，路径采用去掉 `snort3-master/` 归档层前缀的仓库内写法，例如 `src/packet_io/sfdaq.cc`、`daqs/`。本篇所有函数名与调用顺序均经 Read / Grep 核验；DAQ 的枚举取值（如 `DAQ_Verdict`、`DAQ_RecvStatus`、`DAQ_CAPA_*`、`DAQ_Msg_h`）来自独立 libdaq 头文件 `daq_common.h`，本快照仓库内不可展开，一律标注「需对照实际版本核验」。性能、吞吐、丢包率一律标注「需在目标机型实测」，不给绝对值。按去重铁律，本篇只讲机制，结构体字段一律 `字段见 05-07`（DAQ 头与 verdict）、`字段见 05-03`（DAQ 配置）、`字段见 05-02`（`Packet` 借用指针），配置参数一律 `参数见 04-03`，模块职责一律 `模块见 07-07`。
+
+### 2. 核心概念
+
+本篇需要先把六个概念界定清楚，它们分别属于 libdaq 侧、适配层侧与检测结算侧。**DAQ module** 是 libdaq 提供的抓包实现单元，决定抓包来源（网卡、文件、用户态注入）与能力（能否注入、能否替换、能否阻断）；Snort 通过 `daq_find_module()`、`daq_module_get_type()`、`daq_module_get_capabilities()` 一类 API 查询它，本快照 `SFDAQ::print_types()` 就是枚举并打印所有已加载 module 的入口。**DAQ instance** 是一次抓包会话的句柄，`SFDAQInstance::init()` 通过 `daq_instance_instantiate()` 创建它，多实例场景下还会设置 `instance_id`；能力位查询（`can_inject()`、`can_replace()`、`can_whitelist()` 等）都作用在这个实例上。**DAQ message** 是一个待处理的包或控制消息，用不透明句柄 `DAQ_Msg_h` 表示；`Packet` 只借用这个句柄与 `DAQ_PktHdr_t*` 头指针，不拥有其内存（`字段见 05-02`、`字段见 05-07`）。
+
+**消息池（message pool）** 是 DAQ instance 持有的一组可复用消息对象，用 `daq_config_set_msg_pool_size()` 配置大小，用 `daq_instance_get_msg_pool_info()` 查询信息。适配层维护三个关键计数：`pool_size`（池容量）、`pool_available`（当前可用消息数）、`batch_size`（每批最大接收数）。源码呈现的守恒关系是：`start()` 时断言 `pool_size == pool_available`，`receive_messages()` 取走 `curr_batch_size` 条后 `pool_available -= curr_batch_size`，`finalize_message()` 成功归还后 `pool_available++`。这组计数是本篇最重要的机制，后面第 4、6 节会反复回扣。
+
+**verdict** 是 Snort 对每个消息给出的最终处置判定，类型 `DAQ_Verdict` 来自 libdaq（需对照实际版本核验）。源码中出现的取值包括 `DAQ_VERDICT_PASS`、`DAQ_VERDICT_BLOCK`、`DAQ_VERDICT_BLACKLIST`、`DAQ_VERDICT_WHITELIST`、`DAQ_VERDICT_IGNORE`、`DAQ_VERDICT_REPLACE`，以及 `MAX_DAQ_VERDICT` 这个用作「尚未决定」哨兵的边界值。verdict 通过 `SFDAQInstance::finalize_message()` 交还，字符串形式可由 `SFDAQ::verdict_to_string()`（内部转 `daq_verdict_string()`）得到。
+
+**sticky verdict** 是可被流继承的判定。`Analyzer` 里的 `is_sticky_verdict()` 把 WHITELIST、BLACKLIST、IGNORE 三类判为 sticky；`distill_verdict()` 开头若发现 `p->flow->last_verdict` 是 sticky，就直接让后续包继承，省去重复检测，但隧道绕过（tunnel bypass）的包不继承白名单。这里要特别强调能力边界：drop / block 必须通过 DAQ verdict 反馈才能生效，`src/actions/act_drop.cc`、`act_block.cc`、`act_reject.cc` 与 `src/packet_io/active.cc` 负责记账与送达，Snort 自身不转发、不路由，IDS 旁路模式下只告警不丢弃（`原理见 06-12`）。
+
+除了这六个概念，还有三个横切机制需要预先认识。**能力位（capabilities）**：`SFDAQInstance::can_inject()`、`can_inject_raw()`、`can_replace()`、`can_whitelist()`、`can_invoke_inject_drop()` 等直接查询 `daq_instance_get_capabilities()` 的位掩码，内联模式配置但 DAQ 不支持阻断时会通过 `ParseWarning(WARN_DAQ, ...)` 告警。**隧道解码能力位**：`get_tunnel_capabilities()` 把 `DAQ_CAPA_DECODE_GTP`、`DAQ_CAPA_DECODE_VXLAN`、`DAQ_CAPA_DECODE_GRE` 等映射到内部 `TUNNEL_*` 掩码，决定哪些隧道由 DAQ 直接解封装。**工作模式**：`SFDAQ::init()` 依据 `adaptor_inline_mode()`、`read_mode()` 把默认模式设为 `DAQ_MODE_INLINE`、`DAQ_MODE_READ_FILE` 或 `DAQ_MODE_PASSIVE`，模式决定 verdict 是否真能作用于转发路径。三个机制共同解释了「同一份规则在不同 DAQ 下行为不同」的现象。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名 DAQ 抓包与 verdict 链上的关键对象与真实头文件，字段一律按去重铁律不在本册重列。DAQ 相关对象索引见下表；表中「字段归口」为 05-07 的，其类型本体来自独立 libdaq，需对照实际版本核验。
+
+| 对象 | 真实头文件 | 字段归口 | 参数归口 | 原理归口 | 模块归口 |
+|---|---|---|---|---|---|
+| SFDAQ | src/packet_io/sfdaq.h | 05-07 | 04-03 | 06-02 | 07-07 |
+| SFDAQInstance | src/packet_io/sfdaq_instance.h | 05-07 | 04-03 | 06-02 | 07-07 |
+| SFDAQConfig | src/packet_io/sfdaq_config.h | 05-03 | 04-03 | 06-02 | 07-07 |
+| SFDAQModuleConfig | src/packet_io/sfdaq_module.h | 05-03 | 04-03 | 06-02 | 07-07 |
+| DAQ_Config_h / DAQ_Msg_h | libdaq daq_common.h | 05-07 | 04-03 | 06-02 | 07-07 |
+| DAQ_PktHdr_t | libdaq daq_common.h | 05-07 | 04-03 | 06-03 | 07-07 |
+| DAQ_Verdict / DAQ_RecvStatus | libdaq daq_common.h | 05-07 | 04-03 | 06-02 | 07-07 |
+| DAQ_Stats_t | libdaq daq_common.h | 05-07 | 04-03 | 06-11 | 07-07 |
+| Active / ActiveAction | src/packet_io/active.h / active_action.h | 05-05 | 04-03 | 06-09 | 07-07 |
+
+上表有三点需要展开说明。其一，`SFDAQInstance` 的私有成员里能看到 `DAQ_Instance_h instance`、`DAQ_Msg_h* daq_msgs`、`curr_batch_size`、`curr_batch_idx`、`batch_size`、`pool_size`、`pool_available`、`dlt`、`daq_instance_stats`、`daq_tunnel_mask`，其中 `daq_msgs` 正是当前批的消息数组，`pool_available` 正是消息池可用计数；这些字段的定义与含义归 05-07，本篇只引用它们在机制中的角色，不重列字段表。其二，`DAQ_Msg_h`、`DAQ_PktHdr_t`、`DAQ_Verdict`、`DAQ_RecvStatus`、`DAQ_Stats_t` 的类型本体都在 libdaq 的 `daq_common.h`，本快照不可展开，凡涉及枚举取值与字段布局都写「需对照实际版本核验」。其三，`Active` 与 `ActiveAction` 属于动作记账层，`src/packet_io/active_action.h` 里能看到 `enum ActionPriority` 的取值族（AP_LOCAL、AP_MODIFY、AP_PROXY、AP_RESET、AP_REMOTE、AP_MAX 一类），动作如何折算成 verdict 归 06-09，本篇只在 verdict 提炼处引用其判定函数。
+
+统一反查写法为 `字段见 05-07 ｜ 参数见 04-03 ｜ 原理见 06-02 ｜ 模块见 07-07`。当同一处同时涉及配置与结构时，按「字段 → 参数 → 原理 → 模块」顺序写全；表格单元格内若需出现逻辑或，写成转义的 `\|`，全角竖线两侧各留一个空格。本篇所有表格遵守该约定。
+
+### 4. 关键流程与调用链
+
+本节按「加载与配置 → 实例启动与消息池 → 批处理与 verdict 闭环」三段给出真实调用顺序。DAQ 消息池与 verdict 闭环链路见图 06-02-01，图中实线为消息与判定的主流转，虚线为计数归还关系。
+
+:::figure id=06-02-01 | name=DAQ 消息池与 verdict 回传闭环 | dir=TD
+node a "SFDAQ::init<br/>配置消息池" blue
+node b "SFDAQInstance<br/>start" blue
+node c "消息池<br/>pool_available" gray
+node d "receive_messages<br/>批量借出" teal
+node e "next_message<br/>逐包取出" teal
+node f "检测引擎<br/>判定动作" purple
+node g "distill_verdict<br/>提炼判定" amber
+node h "finalize_message<br/>归还并回传" red
+edge a -> b "配置就绪"
+edge b -> c "查询池信息"
+edge c -> d "可用额度"
+edge d -> e "当前批"
+edge e -> f "解码后检测"
+edge f -> g "动作记账"
+edge g -> h "verdict"
+edge h -> c "归还入池"
+edge h -> d dashed "下一批借出"
+:::
+
+**第一段：加载与配置。** `SFDAQ::load()`（`src/packet_io/sfdaq.cc`）调用 `daq_load_static_modules(static_daq_modules)` 与 `daq_load_dynamic_modules(dirs)` 分别加载静态与动态 DAQ module；卸载走 `daq_unload_modules()`。`SFDAQ::init(cfg, total_instances)` 先按 `SnortConfig` 决定默认模式：内联适配器 → `DAQ_MODE_INLINE`，读文件 → `DAQ_MODE_READ_FILE`，其余 → `DAQ_MODE_PASSIVE`；然后 `daq_config_new()` 创建配置，紧接着配置消息池与抓包参数：`daq_config_set_msg_pool_size(daqcfg, cfg->get_batch_size() * 4)`、`daq_config_set_snaplen(daqcfg, cfg->get_mru_size())`、`daq_config_set_timeout(daqcfg, cfg->timeout)`，多实例时再 `daq_config_set_total_instances()`。若未配置任何 module，则用 `DAQ_DEFAULT` 自动补一个；若栈顶 module 带 `DAQ_TYPE_WRAPPER` 标志，则自动补一个 read-file 模式的 `pcap` 作为底座；随后逐个 `AddDaqModuleConfig()`，其中 `daq_module_config_new()`、`daq_module_config_set_mode()`、`daq_module_config_set_variable()` 把参数写进 module 配置，`daq_config_push_module_config()` 推进 DAQ 配置栈。配置阶段全部失败路径都调用 `daq_config_destroy()` 释放资源，这是适配层的基本纪律。
+
+**第二段：实例启动与消息池。** `SFDAQ::init_instance()` 创建 `SFDAQInstance` 并交给 `SFDAQInstance::init()`：先 `daq_config_set_input()` 写入输入源、`daq_config_set_instance_id()` 写入实例号，再 `daq_instance_instantiate()` 拿到 `DAQ_Instance_h instance`，`DAQ_ValidateInstance()` 校验配置与预期操作兼容，若有 BPF 串则 `daq_instance_set_filter()` 设置过滤。`start()` 调用 `daq_instance_start()` 真正启动抓包，随后 `daq_instance_get_msg_pool_info(instance, &mpool_info)` 读出池信息，把 `mpool_info.size` 与 `mpool_info.available` 分别存入 `pool_size`、`pool_available`，并断言 `pool_size == pool_available`；verbose 模式下会打印池大小与 batch 大小。`get_tunnel_capabilities()` 再读取能力位建立隧道掩码，`dlt` 由 `daq_instance_get_datalink_type()` 缓存。至此消息池处于「满额可用」状态，可以开始收包。
+
+**第三段：批处理与 verdict 闭环。** `Analyzer::process_messages()` 把 `max_recv` 设为 `get_batch_size()`（受 `exit_after` / `pause_after` 约束），调用 `daq_instance->receive_messages(max_recv)`。`SFDAQInstance::receive_messages()` 先断言 `max_recv <= batch_size`，并把 `max_recv` 收敛到 `pool_available` 以内，再调用 `daq_instance_msg_receive(instance, max_recv, daq_msgs, &rstat)` 把消息填进数组，返回实际条数写入 `curr_batch_size`，随后 `pool_available -= curr_batch_size`、`curr_batch_idx = 0`。主循环用 `next_message()` 逐条取出——这是一个内联函数，只要 `curr_batch_idx < curr_batch_size` 就返回 `daq_msgs[curr_batch_idx++]`。每条消息经 `process_daq_msg()` 解码、检测（`原理见 06-01`、`原理见 06-08`），跳过计数的包直接以 `DAQ_VERDICT_PASS` 归还，正常包在 `post_process_daq_pkt_msg()` 里结算：`Active::execute()` 执行延迟动作后，或入重试队列、或被 `Stream::set_packet_action_to_hold()` 挂起，否则 `distill_verdict()` 折算判定，BLOCK / BLACKLIST 时 `send_reason_to_daq()` 附带原因，`p->pkth = nullptr` 后调用 `finalize_message()`。`finalize_message()` 先检查 `msg` 非空（否则返回 `DAQ_ERROR_INVAL`），再 `daq_instance_msg_finalize(instance, msg, verdict)`，成功后 `pool_available++`，消息回到池中。
+
+`distill_verdict()` 的折算顺序值得单独拆解，它是 verdict 机制的实质。第一步处理 sticky：若 `p->flow->last_verdict` 为 WHITELIST / BLACKLIST / IGNORE，直接继承，但隧道绕过且继承白名单时改判 PASS 并累加 `daq_stats.internal_whitelist`。第二步「first pass」处理会话阻断：若 `act->session_was_blocked()` 或流状态为 BLOCK，则按能否动作、是否隧道绕过、是否 `ips_inline_mode()` 或包被强制丢弃，分别得出 PASS、BLOCK、BLACKLIST 或 IGNORE。第三步「second pass，带副作用」：包被丢弃且能动作时把 PASS 升为 BLOCK；`PKT_RESIZED` 时 `PacketManager::encode_update()` 后 `p->inject()`，成功则 BLOCK；`PKT_MODIFIED` 时 `encode_update()` 后判 REPLACE；会话被信任或 `PKT_IGNORE` 等情形判 WHITELIST；`DECODE_PKT_TRUST` 时设置忽略方向并判 WHITELIST；其余判 PASS。第四步收尾：WHITELIST 若遇 `cannot_trust()` 或隧道绕过则回退 PASS，否则 `RateFilter_SessionRelease()` 与 `handle_allowlist()`；最后把结果写回 `p->flow->last_verdict`。这套顺序解释了为什么「同一条规则在旁路只告警、在内联会丢弃」——判定的关键变量是能否动作与是否内联模式，而不是规则本身（`原理见 06-09`、`原理见 06-12`）。
+
+### 5. 配置与代码实例
+
+本节只给与抓包、消息池、verdict 直接相关的最小配置与核验代码，不重列参数全集。DAQ 段全部参数见 04-03，命令行选项见 04-07。
+
+DAQ 配置骨架如下。键名 `module_dirs`、`inputs`、`snaplen`、`batch_size`、`modules` 取自 `src/packet_io/sfdaq_module.cc` 的参数表；`snaplen` 范围 `0:65535`、默认 `1518`，`batch_size` 范围 `1:`、默认 `64`，与命令行 `-s`、`--daq-batch-size` 等价。mode 的字符串取值在源码中以 `v.get_uint8() + 1` 映射内部枚举，需对照实际版本核验。
+
+```lua
+-- snort.lua 的 daq 段（片段，完整参数见 04-03）
+daq = {
+    module_dirs = { '/usr/local/lib/daq' },
+    inputs = { 'eth0' },
+    snaplen = 1518,
+    batch_size = 64,          -- 消息池大小按此值 *4 配置
+    modules = {
+        -- module 名与 mode 取值需对照实际版本核验
+        { name = 'afpacket', mode = 'inline' },
+    },
+}
+```
+
+第二段实例展示如何用能力位与消息池计数做一次只读核验。它只是演示适配层暴露了哪些查询入口，不触发任何收包与检测动作，具体返回值需在目标环境实测。
+
+```cpp
+#include "packet_io/sfdaq_instance.h"
+#include "packet_io/sfdaq.h"
+#include <cstdio>
+
+void probe_daq(const snort::SFDAQInstance& i)
+{
+    std::printf("batch=%u pool_avail=%u\n",
+        i.get_batch_size(), i.get_pool_available());
+    std::printf("inject=%d replace=%d whitelist=%d\n",
+        i.can_inject(), i.can_replace(), i.can_whitelist());
+    std::printf("verdict BLOCK -> %s\n",
+        snort::SFDAQ::verdict_to_string(DAQ_VERDICT_BLOCK));
+}
+```
+
+在把上述函数接入调试构建并接好 DAQ 实例的测试桩里，会得到类似下面的输出。示例输出，具体格式需对照实际版本核验。
+
+```text
+batch=64 pool_avail=256
+inject=1 replace=1 whitelist=0
+verdict BLOCK -> BLOCK
+```
+
+逐行判读如下，合计超过 150 字。第一行 `batch=64 pool_avail=256` 同时印证了消息池机制的两条源码事实：batch 来自 `SFDAQConfig` 的 `batch_size`，而可用数 256 正是 `SFDAQ::init()` 中 `cfg->get_batch_size() * 4` 的结果，二者保持四倍关系；若在 `start()` 之后读到 `pool_avail` 不等于 `pool_size`，说明有消息被取出却未归还，应回查 `finalize_message()` 路径（`原理见 06-02` 本节第 4 段），而不是怀疑打印函数。第二行 `inject=1 replace=1 whitelist=0` 来自 `can_inject()`、`can_replace()`、`can_whitelist()`，1 表示能力位存在、0 表示不存在；`whitelist=0` 说明该 DAQ 不支持白名单判定，此时 `distill_verdict()` 里判出的 WHITELIST 会在适配或 DAQ 侧被降级为 PASS，这是能力边界影响 verdict 实效的直接例证，具体降级行为需对照实际版本核验。第三行 `verdict BLOCK -> BLOCK` 是 `SFDAQ::verdict_to_string()` 转 `daq_verdict_string()` 的字符串结果，用于确认所用 libdaq 的枚举与字符串表可用；若这里出现空串或未知字面量，通常意味着枚举取值与本快照预期不一致，需对照实际版本核验。以上判读只覆盖适配层对外可见的查询值，`SFDAQInstance` 的字段定义见 05-07，DAQ 配置参数见 04-03，判定折算的完整逻辑见本节第 4 段与 06-09、06-12。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是「把适配层当抓包实现」。抓包依赖独立 libdaq，`src/packet_io/sfdaq*.cc` 与 `daqs/` 是适配层，DAQ module 决定抓包与内联能力（具体 module 名需对照实际版本核验）。配置内联 IPS 时若所选 DAQ 不支持阻断，`SFDAQInstance::init()` 会用 `ParseWarning(WARN_DAQ, "inline mode configured but DAQ can't block packets.")` 告警；忽略这条告警会导致「规则命中却不丢包」。正确做法是在启动日志里确认 `pcap DAQ configured to inline` 一类装配信息，并用第 5 节的能力位查询复核，而不是想当然。
+
+第二类是「消息池不变量被破坏」。源码在 `start()` 与 `stop()` 处都有 `assert(pool_size == pool_available)`，在正常闭环下，所有消息被 finalize 后应回到满额。`receive_messages()` 会把 `max_recv` 收敛到 `pool_available`，因此池空时取不到新消息；若某条消息被取出后既未 finalize 也未挂起到重试队列，可用数会永久少一，累积到零后收包停摆。反之，重复 finalize 同一消息会让可用数虚高，可能让断言在停止时失败。排查时优先检查三条 finalize 路径：跳过计数、`post_process_daq_pkt_msg()` 正常结算、控制消息的 `process_daq_sof_eof_msg()` 路径。
+
+第三类是「verdict 与 action 混为一谈」。规则命中时写入 `Active` 的是动作意图，最终 verdict 由 `distill_verdict()` 统一折算；在 `post_process_daq_pkt_msg()` 之前读 verdict 是没有意义的。尤其要注意 sticky verdict 的双刃剑：它提升了性能，但 `p->flow->last_verdict` 一旦被写成 BLACKLIST 或 IGNORE，后续包会直接继承，排障时若只看当前包很容易误判「规则没匹配」；应结合 `p->flow` 的历史状态与 `daq_stats.internal_whitelist`、`internal_blacklist` 一类计数一起看（`字段见 05-02`、`字段见 05-07`）。
+
+第四类是「忽视隧道与数据链路边界」。`get_tunnel_capabilities()` 只对 DAQ 明确声明的隧道类型建立掩码，未声明的隧道不会被 DAQ 解封装，会落到 Snort 的解码器处理（`原理见 06-03`）；`dlt` 由 DAQ 的 datalink type 决定并缓存，用于日志与shutdown，换抓包源后若 dlt 不匹配会出现解码异常。第五类是「不透明句柄误用」。`DAQ_Msg_h`、`DAQ_Instance_h`、`DAQ_PktHdr_t` 都是不透明句柄，内部布局见 libdaq 的 `daq_common.h` 与所装版本，不可依赖；用 `sizeof()`、指针偏移或 `reinterpret_cast` 去读其成员会在不同 libdaq 版本下静默错位，只能用适配层公开的访问器与 API。第六类是「能力边界误判」：内联 drop 通过 verdict 反馈实现，Snort 不是防火墙、不做转发与路由；加密载荷不可见，证书与握手元数据之外的明文读不到；IDS 旁路只告警不丢弃；Hyperscan 可选、缺失时回退其他 MPSE；线程模型以实际版本为准，禁止断言「默认 N 线程」。所有吞吐、pps、丢包率、内存占用结论一律标注「需在目标机型实测」，本节的 batch 与池大小是配置量而非性能量；调优见 08-02，诊断树见 08-03，内联部署见 03-05。
+
+### 7. 小结与延伸阅读
+
+本篇把 06-01 主干的第一站与最后一站展开成完整机制：抓包依赖独立 libdaq，`src/packet_io/sfdaq*.cc` 与 `daqs/` 只是适配层；`SFDAQ::init()` 配置 DAQ 栈与消息池（池大小为 batch 的四倍），`SFDAQInstance::start()` 启动实例并校验池满额；`receive_messages()` 按批借出消息、`next_message()` 逐包取出，`distill_verdict()` 把动作意图与流状态折算成判定，`finalize_message()` 把判定连同消息归还入池，从而维持 `pool_size == pool_available` 的资源不变量。三个要点——适配层与抓包实现的边界、消息池的借还守恒、verdict 的先记账后结算——是理解内联 IPS 为何能丢弃包、以及旁路模式为何只告警的关键。
+
+按统一写法，本篇对象的反查关系为：DAQ 头与 verdict `字段见 05-07 ｜ 参数见 04-03 ｜ 原理见 06-02 ｜ 模块见 07-07`；DAQ 配置 `字段见 05-03 ｜ 参数见 04-03 ｜ 原理见 06-02 ｜ 模块见 07-07`；`Packet` 借用的 DAQ 指针 `字段见 05-02 ｜ 参数见 04-03 ｜ 原理见 06-03 ｜ 模块见 07-09`；动作与判定 `字段见 05-05 ｜ 参数见 04-03 ｜ 原理见 06-09 ｜ 模块见 07-07`。
+
+延伸阅读建议顺着 verdict 的去向展开：`原理见 06-03` 看解码如何处理 DAQ 交付的原始字节、`原理见 06-12` 看内联模式如何把 verdict 变成实际丢弃、`原理见 06-09` 看动作限速如何改变判定、`原理见 06-11` 看 `daq_stats` 如何进入统计输出；字段线进入 05-07（DAQ 与 verdict）、05-05（`Active` / `IpsAction`）、05-02（`Packet`）；模块线进入 07-07（`src/packet_io/` 与 DAQ 适配）。版本基准统一为「上游 master 快照（2026-11 抓取）」，DAQ 枚举取值与 module 名以所装 libdaq 头文件为准，需对照实际版本核验。

@@ -1,0 +1,319 @@
+# SONiC 技术资料 · 06 技术原理（分片 A）
+## 06-01 控制面数据流总览：CONFIG_DB → APPL_DB → ASIC_DB → SAI
+
+### 1. 背景与动机
+
+要理解 SONiC 的配置为什么常常「命令返回了却没生效」，先要放弃一个来自封闭网络设备的直觉：配置是一条同步调用。在传统一体机里，用户在命令行输入一条指令，命令进程直接调用设备驱动，把寄存器或转发表改完再返回，因此「命令成功」与「硬件已改」几乎是一回事。SONiC 不是这样。它把一台交换机的软件拆成容器化控制面与 ASIC 数据面两层，控制面内部又用 Redis 逻辑库把用户意图、业务期望状态与待编程对象切成若干段，各段由不同容器里的不同进程独立驱动。于是从用户敲下命令到芯片真正转发，中间要经过多次跨进程、跨容器的状态交接，每一次交接都是异步的。本篇的任务就是把这条链路完整讲清楚，让读者拿到任何一次「配置不生效」的现象时，能够先定位到是哪一段没走通，而不是笼统地怀疑硬件。
+
+这条链路的入口是配置库，出口是 SAI 与 ASIC。用户在 `sonic-utilities-master/config/main.py` 里执行的配置命令，经 Python 侧的 DB 封装写入 `CONFIG_DB`；`sonic-swss-master/cfgmgr/` 下的各 `*mgrd` 进程订阅配置变更，做语义校验后写入 `APPL_DB`；`sonic-swss-master/orchagent/` 的 `Orch` 框架消费 `APPL_DB`，把业务意图翻译成 SAI 对象写入 `ASIC_DB`；`sonic-sairedis-master/syncd/` 消费 `ASIC_DB`，调用 SAI 完成芯片编程，并把运行时状态回写到 `STATE_DB` 与计数器库。四个环节、三段数据库、两组翻译，中间没有任何一个函数把它们串成一次同步调用。图 06-01-01 会在第 4 节把这条链路固定下来，本篇其余内容都是对这张图的逐段解释。
+
+从本快照能直接看到这种分段的工程证据。`dockers/docker-database/database_config.json.j2` 用 `INSTANCES` 与 `DATABASES` 两个段落声明各逻辑库的名字、编号、分隔符与所属实例，`SONIC_DB_CONFIG_FILE` 指定的运行时 `database_config.json` 是真正被读取的配置；`sonic-py-swsssdk-master/src/swsssdk/dbconnector.py` 的 `SonicDBConfig.get_dbid(db_name)` 从 `["DATABASES"][db_name]["id"]` 取编号，`SonicV2Connector.connect()` 再据此建连。换言之，库不是源码里写死的常量，而是一份运行时配置；而配置从库到库的搬运，则依赖 `sonic-swss-common` 提供的 `ProducerStateTable` / `ConsumerStateTable` 模型——该子仓不在本快照，需对照实际版本核验，但大量调用点可在 `cfgmgr/`、`fpmsyncd/`、`orchagent/` 中核实。本篇只讲机制与调用链，结构体字段与参数全集分别留给 05、04 两册。
+
+还有一个必须开篇明确的边界：SONiC 是白盒交换机网络操作系统，控制面全部是容器里的 Linux 进程，数据面始终在 ASIC，控制面经 SAI 下发，除虚拟交换机 `platform/vs/` 外不做软件转发。`orchagent` 从不直接读写寄存器，`show` / `config` 也从不直接编程芯片；把这两点写反，链路的每一段都会被误解。本节确立的动机在后续各篇反复出现：06-03 讲第一段校验、06-04 讲 Orch 调度、06-05 讲 syncd 到 SAI，本篇负责把它们装进同一条总览链路（原理见 06-03 ｜ 原理见 06-04 ｜ 原理见 06-05 ｜ 模块见 07-03）。
+
+### 2. 核心概念
+
+第一个概念是「配置」与「状态」的分离。`CONFIG_DB` 保存的是用户与开机的配置意图，例如某个端口的管理状态、速率与 MTU；`APPL_DB` 保存的是经 `*mgrd` 校验整理后的业务期望状态；`ASIC_DB` 保存的是待编程的 ASIC 对象；`STATE_DB` 保存运行时状态；`COUNTERS_DB` 保存计数器。把它们分成不同的库，不是为了增加复杂度，而是为了让每一段都有明确的写入方、消费方与可观测点：配置可以重放、期望状态可以重建、对象可以重下发，排障时可以逐段比对而不是面对一个黑盒。DB 编号与表名须对照 `sonic-py-swsssdk/src/swsssdk/dbconnector.py` 的 `SonicDBConfig` 与实际版本核验，本套资料不写死「某库是某号」（字段见 05-03 ｜ 参数见 04-04）。
+
+第二个概念是「异步流水线」。链路上的每一段都是独立的生产者—消费者关系：前一段把带操作类型的表项写进 Redis，后一段订阅并消费。生产者写入后即可返回，不等待消费者处理完成；消费者按自己的调度节奏取出任务，必要时重试。这带来两个直接后果：其一，`config` 命令返回成功只代表意图写进了配置库，不代表硬件已下发；其二，链路中段状态可作为排障证据，`CONFIG_DB` 有表项而 `APPL_DB` 没有，问题就锁定在第一段；`APPL_DB` 有而 `ASIC_DB` 没有，问题锁定在第二段。判断「是否生效」的正确姿势是按库逐段核对并结合 `show` 输出，而不是看单条命令的返回码（原理见 06-02 ｜ 排障见 08-03）。
+
+第三个概念是「SAI 作为抽象边界」。SAI 定义一组与芯片无关的对象与属性 API，`sonic-sairedis-master/meta/` 提供元数据，`vslib/` 提供虚拟 SAI；本快照里 `SAI/` 是空目录，实际头文件与厂商实现均需对照实际版本核验。`orchagent` 只按 SAI 属性把意图编码进 `ASIC_DB`，真正的 API 调用发生在 `syncd` 侧；厂商 SAI 实现多为闭源且不在本仓库。因此 `orchagent` 是「控制面编排者」而不是「芯片驱动」，这是第五条能力边界的核心。
+
+第四个概念是「生产者和消费者模型」。表项在库与库之间传递时，携带键、操作类型与字段值三要素，`ProducerStateTable` 负责写入、`ConsumerStateTable` 负责取出，二者配合 Redis 机制形成有状态的表项队列。这个模型的具体实现属于 `sonic-swss-common`，不在本快照，需对照实际版本核验；但在 `sonic-swss-master/cfgmgr/portmgr.h` 可见 `ProducerStateTable m_appPortTable` 成员，在 `sonic-swss-master/fpmsyncd/routesync.cpp` 可见 `createProducerStateTable(pipeline, APP_ROUTE_TABLE_NAME, ...)` 调用，在 `sonic-swss-master/orchagent/orch.h` 可见 `ConsumerBase`、`SyncMap` 与 `m_toSync` 等消费侧结构（字段见 05-02 ｜ 字段见 05-05 ｜ 原理见 06-02）。
+
+第五个概念是「可观测面」。`show` 与各类查询命令只读取各库的状态，不参与编程；`STATE_DB` 与 `COUNTERS_DB` 是链路的回写侧，反映芯片编程后的结果。于是同一件事存在两种视角：协议或配置视角说「已配置」，运行时视角说「已下发」，二者在异步流水线上天然存在时间差，这个时间差不是缺陷而是模型的一部分。理解这一点，才能解释为什么 `show ip bgp summary` 的会话状态正常、却仍需要在 `APPL_DB`、`ASIC_DB` 中确认路由是否已走完链路。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构、对象与目录并给出真实路径，不展开逐字段定义；字段统一留待 05 册、参数留待 04 册、机制留待本篇与 06 册其余篇、模块能力留待 07 册，即（字段见 05-03 ｜ 参数见 04-04 ｜ 原理见 06-01 ｜ 模块见 07-03）。下表按链路顺序把「阶段—载体—本快照可定位源码位置—边界说明」四列列出，路径均相对各子仓 `xxx-master/` 仓库根，函数名与表名需对照实际版本核验。
+
+| 阶段 | 载体 | 本快照源码位置 | 边界说明 |
+|---|---|---|---|
+| 配置入口 | CLI 与配置库 | `sonic-utilities/config/main.py`、`dockers/docker-database/database_config.json.j2` | 命令名与库编号需核验 |
+| 连接与编号解析 | Python DB 封装 | `sonic-py-swsssdk/src/swsssdk/dbconnector.py` | `SonicDBConfig` 字段见 05-03 |
+| 配置读写封装 | Python DB 封装 | `sonic-py-swsssdk/src/swsssdk/configdb.py` | `ConfigDBConnector` 方法见 05-03 |
+| 配置到期望态 | 各 `*mgrd` | `sonic-swss/cfgmgr/`、`cfgmgr/portmgr.h` | 表项经 ProducerStateTable 写 APPL_DB |
+| 路由侧输入 | fpmsyncd | `sonic-swss/fpmsyncd/routesync.cpp`、`lib/orch_zmq_config.cpp` | 生产者助手函数在此定义 |
+| 期望态到对象 | Orch 框架 | `sonic-swss/orchagent/orch.h`、`orch.cpp`、`orchdaemon.cpp` | 消费侧结构字段见 05-05 |
+| 对象编程 | syncd 与 SAI | `sonic-sairedis/syncd/Syncd.cpp`、`SaiSwitch.cpp`、`VendorSai.cpp` | 厂商实现不在本快照 |
+| 状态回写 | 状态与计数器库 | `sonic-sairedis/syncd/`、`sonic-swss/orchagent/flexcounterorch.cpp` | 回写表名需核验 |
+
+连接与编号解析集中在 `sonic-py-swsssdk-master/src/swsssdk/dbconnector.py`。`SonicDBConfig` 定义 `SONIC_DB_GLOBAL_CONFIG_FILE` 与 `SONIC_DB_CONFIG_FILE` 两个路径常量，`load_sonic_db_config()` 解析运行时 `database_config.json`，`get_dbid()`、`get_separator()`、`get_instance()` 分别取编号、分隔符与实例信息；`SonicV2Connector.connect()` 先根据 unix socket 或 host/port 设置连接参数，再取 `db_id` 调用 `dbintf.connect()`。函数签名以源码为准，字段与成员见 05 册（字段见 05-03 ｜ 参数见 04-04）。`configdb.py` 的 `ConfigDBConnector` 继承 `SonicV2Connector`，提供 `connect`、`set_entry`、`mod_entry`、`get_entry`、`get_table` 与 `subscribe` / `listen` 等方法，是 CLI 落地配置的主要封装。
+
+翻译侧的结构分三组。配置管理侧在 `sonic-swss-master/cfgmgr/`，`portmgrd.cpp`、`intfmgrd.cpp`、`vlanmgrd.cpp`、`buffermgrd.cpp`、`coppmgrd.cpp` 等各自订阅 `CONFIG_DB` 的一类表，`portmgr.h` 中可见 `ProducerStateTable m_appPortTable` 这种生产者成员；路由侧在 `sonic-swss-master/fpmsyncd/`，`routesync.cpp` 通过 `createProducerStateTable` 建立 `APP_ROUTE_TABLE_NAME` 的生产者，该助手函数定义在 `sonic-swss-master/lib/orch_zmq_config.cpp`；编排侧在 `sonic-swss-master/orchagent/`，`orch.h` 定义 `Executor`、`ConsumerBase`、`ConsumerMap`、`SyncMap` 与 `m_toSync`，`orch.cpp` 实现 `addConsumer`、`addToSync`、`addToRetry` 与任务派发，`orchdaemon.cpp` 完成各业务 Orch 注册，`main.cpp` 引入 `sai.h`、`sairedis.h`、`warm_restart.h` 并进入主循环（字段见 05-05 ｜ 原理见 06-04）。 syncd 侧 `sonic-sairedis-master/syncd/syncd_main.cpp` 创建 `VendorSai` 与 `Syncd` 实例并调用 `syncd->run()`，核心实现分布在 `Syncd.cpp`、`SaiSwitch.cpp`、`SaiObj.cpp`、`VendorSai.cpp`（字段见 05-06 ｜ 原理见 06-05 ｜ 模块见 07-04）。
+
+### 4. 关键流程与调用链
+
+把上述对象串起来，就得到本篇最重要的一张总览图。控制面从配置库到芯片的处理链路见图 06-01-01，图中每一条边都对应一段真实的跨进程状态交接。
+
+:::figure id=06-01-01 | name=控制面数据流总览 CONFIG_DB 到 SAI | dir=TD
+node n1 "用户配置意图<br/>config CLI" teal
+node n2 "CONFIG_DB" blue
+node n3 "各 mgrd<br/>cfgmgr" teal
+node n4 "APPL_DB" blue
+node n5 "orchagent<br/>Orch 调度" purple
+node n6 "ASIC_DB" amber
+node n7 "syncd 与 SAI<br/>运行时" green
+node n8 "ASIC 转发芯片" red
+edge n1 -> n2 "写入配置"
+edge n2 -> n3 "订阅变更"
+edge n3 -> n4 "写入期望态"
+edge n4 -> n5 "消费任务"
+edge n5 -> n6 "写入对象"
+edge n6 -> n7 "消费并调用 SAI"
+edge n7 -> n8 "编程下发"
+:::
+
+图 06-01-01 的色调遵循本套资料约定：teal 为管理面与配置管理，blue 为配置与期望态数据库，purple 为控制面编排，amber 为 `ASIC_DB`，green 为 `syncd` 与 SAI 运行时，red 为硬件边界。需要强调，图中每一条边都是「写库即返回、下游自行消费」，整条链没有任何同步等待；因此从第一条边到最后一条边之间存在可观测的时间差，这个时间差正是排障时要测量的对象（基准方法见 08-01）。
+
+第一段是配置入口到 `CONFIG_DB`。`sonic-utilities-master/config/main.py` 经 `ConfigDBConnector` 的 `set_entry` / `mod_entry` 等方法把键与字段写进配置库后即返回，`sonic-py-swsssdk-master/src/swsssdk/configdb.py` 是这条调用的实现载体。配置库还负责持久化：`config/main.py` 中可见 `DEFAULT_CONFIG_DB_FILE = '/etc/sonic/config_db.json'`，说明磁盘配置与 Redis 配置之间存在落地关系；具体落位与命令选项需对照实际版本核验（参数见 04-02 ｜ 参数见 04-05）。这一段最常见的失败是配置本身写不进库，例如 JSON 格式错误、字段不合法或目标表不存在，表现为 `CONFIG_DB` 查不到表项。
+
+第二段是 `CONFIG_DB` 到 `APPL_DB`，由 `cfgmgr/` 下的 `*mgrd` 完成。它们订阅配置库的表项变更，做语义校验与字段转换，再经 `ProducerStateTable` 写入期望态库；`cfgmgr/portmgr.h` 的 `m_appPortTable` 成员、`fpmsyncd/routesync.cpp` 的 `createProducerStateTable` 调用是这一类生产者的直接证据。路由输入是一条并行支线：`dockers/docker-fpm-frr/` 内的协议进程产生路由，`sonic-swss-master/fpmsyncd/` 的 `routesync.cpp` 把路由写进 `APPL_DB` 的路由表，FRR 源码不在本快照、需对照实际版本核验（原理见 06-03 ｜ 原理见 06-07 ｜ 模块见 07-08）。这一段失败时，`CONFIG_DB` 有配置而 `APPL_DB` 无期望态，典型原因包括校验未通过、订阅未建立或对应 `mgrd` 进程未运行。
+
+第三段是 `APPL_DB` 到 `ASIC_DB`，由 `orchagent` 完成。`orchdaemon.cpp` 注册各业务 Orch，`orch.cpp` 的 `addConsumer` 把消费者挂到目标表，`ConsumerBase::addToSync` 把消费到的 `KeyOpFieldsValuesTuple` 按键归并进 `m_toSync`，再由 `Orch` 的 `doTask` 逐任务处理；处理成功的意图被翻译成 SAI 对象写进 `ASIC_DB`。需要特别指出：`orchagent` 不直接操作硬件，它只生成对象与属性，且失败任务可进入 `addToRetry` 重试队列（字段见 05-05 ｜ 原理见 06-04）。这一段失败时 `APPL_DB` 有意图而 `ASIC_DB` 无对象，应查 `orchagent` 是否消费、派生 Orch 是否支持该属性。
+
+第四段是 `ASIC_DB` 到 SAI 与 ASIC，由 `syncd` 完成。`sonic-sairedis-master/syncd/syncd_main.cpp` 构造 `VendorSai` 与 `Syncd` 并调用 `syncd->run()`，`Syncd.cpp` 消费 `ASIC_DB` 的对象、`SaiObj.cpp` 表示对象、`VendorSai.cpp` 装载厂商 SAI API，最终经 SAI 把对象编程进芯片，同时把运行时状态写回 `STATE_DB` 与计数器库。厂商实现闭源且不在本快照，`orchagent` 与 `syncd` 之间只通过 `ASIC_DB` 与 SAI 属性协作（字段见 05-04 ｜ 字段见 05-06 ｜ 原理见 06-05）。这一段失败时 `ASIC_DB` 有对象而芯片状态未变，往往涉及 SAI 返回错误、属性不被平台支持或厂商实现问题。
+
+### 5. 配置/命令/代码实例
+
+本节只给理解总览链路所需的最小实例，完整命令全集、配置 schema 与组件参数分别见 04-05、04-02、04-01，本册不重列。示例按「前置检查 → 执行 → 逐段验证」的闭环组织，`sonic-db-cli` 的用法可在 `sonic-utilities-master/scripts/route_check_test.sh` 中核实，命令选项需对照实际版本核验。
+
+先用一条最小配置触发第一段链路，再按库逐段核对。`sonic-db-cli` 直接接受库名，不必写回编号，因此不违反「不写死 DB 编号」的纪律。
+
+```bash
+# 前置检查：确认查询工具可用
+command -v sonic-db-cli
+# 执行：给端口配置一个 IP（命令名与选项需对照实际版本核验）
+config interface ip add Ethernet1 10.0.0.1/31
+# 逐段验证：配置库 → 期望态库 → 对象库 → 状态库
+sonic-db-cli CONFIG_DB HGET "PORT|Ethernet1" admin_status
+sonic-db-cli APPL_DB KEYS "INTF_TABLE:*"
+sonic-db-cli ASIC_DB KEYS "ASIC_STATE:SAI_OBJECT_TYPE_ROUTER_INTERFACE:*"
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（取值仅为格式示意，不代表任何具体版本）
+/usr/local/bin/sonic-db-cli
+up
+INTF_TABLE:Ethernet1:10.0.0.1/31
+ASIC_STATE:SAI_OBJECT_TYPE_ROUTER_INTERFACE:oid:0x60000000000a1
+```
+
+逐行判读如下。第一段输出 `/usr/local/bin/sonic-db-cli` 是前置检查的结果，说明查询工具可解析；若此处为空，后续按库核对都无从谈起，应先确认所在容器与 PATH，命令路径需对照实际版本核验。第二行 `up` 来自 `sonic-db-cli CONFIG_DB HGET "PORT|Ethernet1" admin_status`，键用 `|` 分隔是配置库键的典型形式，取自本快照 `dockers/docker-database/database_config.json.j2` 中该库 `separator` 的声明，需对照实际版本核验；该值只证明配置库里端口管理状态为 up，不代表链路已走完。第三行 `INTF_TABLE:Ethernet1:10.0.0.1/31` 来自期望态库查询，键用 `:` 分隔，说明 `*mgrd` 已把配置转成期望态并写入 `APPL_DB`；这里出现表项是第二段走通的直接证据，若为空则应查对应 `mgrd` 是否运行、校验是否通过（原理见 06-03）。第四行 `ASIC_STATE:SAI_OBJECT_TYPE_ROUTER_INTERFACE:oid:0x...` 来自对象库查询，说明 `orchagent` 已生成 SAI 对象；注意这里只有 `oid` 与对象类型，没有芯片是否完成的结论，要确认下发结果还须看 `STATE_DB` 与 `show` 输出（原理见 06-04 ｜ 原理见 06-05）。整组输出演示了「同一配置在三段库里的三种形态」：配置库是字段、期望态库是业务表项、对象库是 SAI 对象；三者齐全才说明流水线走通，缺任何一段都应就地定位而不是跳到硬件结论。输出块已注明示例输出与版本核验要求，取值不得当作真实设备数据引用。
+
+下面再看一段 Python 侧的读取代码，说明第一段链路在源码里是怎么写的。方法名取自 `sonic-py-swsssdk-master/src/swsssdk/configdb.py`，具体签名需对照实际版本核验，完整参数见 04-04。
+
+```python
+from swsssdk import ConfigDBConnector
+
+config_db = ConfigDBConnector()
+config_db.connect(wait_for_init=True, retry_on=False)
+port = config_db.get_entry("PORT", "Ethernet1")
+print(port.get("admin_status"))
+```
+
+这段代码先构造 `ConfigDBConnector`，`connect(wait_for_init=True, retry_on=False)` 等待数据库初始化完成后建立连接；`get_entry("PORT", "Ethernet1")` 读取配置库 `PORT` 表 `Ethernet1` 键的字段字典，再打印其中的 `admin_status`。它与上一条 `sonic-db-cli` 命令读到的是同一份数据，区别只在于前者是外部查询工具、后者是 CLI 内部走的封装路径。由此可确认第一段的写入方确实是 `sonic-utilities` 经 `swsssdk` 访问配置库，而不是直接编程芯片；`swsssdk` 的字段级说明见 05 册（字段见 05-03 ｜ 参数见 04-04 ｜ 模块见 07-05）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类陷阱是把 `config` 命令返回成功等同于硬件已下发。这是本篇反复强调的核心：链路是异步流水线，`config` 只写配置库，后续三段由各自进程独立驱动。正确的验证顺序是查 `CONFIG_DB` 有无表项、`APPL_DB` 有无期望态、`ASIC_DB` 有无对象、最后看 `STATE_DB` 与 `show` 输出并做时间差测量；「配置即时生效」的说法在任何平台都不成立（原理见 06-01 ｜ 排障见 08-03）。
+
+第二类是数据库编号与表名陷阱。DB 编号来自运行时 `database_config.json`，由 `SonicDBConfig.get_dbid()` 解析，本快照 `dockers/docker-database/database_config.json.j2` 只是生成模板；不得凭印象写死「某库是某号」，也不得凭印象补 CONFIG_DB 表名与字段名，一律标注「需对照实际版本核验」并给出 `dockers/docker-database/`、`src/swsssdk/`、`cfgmgr/` 等可定位目录（字段见 05-03 ｜ 参数见 04-04）。
+
+第三类是角色边界陷阱。`orchagent` 是编排者而非芯片驱动，只经 `ASIC_DB` 与 SAI 属性同 `syncd` 交互；`show` / `config` 只读写各库，不编程 ASIC；除 `platform/vs/` 外不做软件转发。把这三句话写反，整条链路的解释都会失真（原理见 06-04 ｜ 原理见 06-05 ｜ 模块见 07-06）。
+
+第四类是仓库与事实纪律陷阱。本快照是主仓加七个子仓的多仓结构，不是单一仓库；FRR / FRRouting 源码、Linux 内核、各厂商 SAI 实现与 `sonic-swss-common` 均不在本快照，涉及 `ProducerStateTable` / `ConsumerStateTable` 类定义、`KeyOpFieldsValuesTuple` 字段、`Select` 事件结构时一律写「不在本快照，需对照实际版本核验」，不得据调用点反推其实现。本快照 `sonic-sairedis-master/SAI/` 是空目录，不得据它编造头文件、属性与版本；可核验的是 `meta/`、`vslib/`、`syncd/`（模块见 07-04 ｜ 模块见 07-05）。
+
+第五类是启动与性能陷阱。数据库容器必须先起，`orchagent` 之前要有 `portsyncd`，各 `*mgrd` 又依赖 `orchagent` 或 `swssconfig`，这些依赖在 `dockers/docker-orchagent/supervisord.conf.common.j2` 中定义，链路不通有时是进程没起来而非配置问题（原理见 06-13 ｜ 参数见 04-07）。配置下发时延、收敛时间与表项容量一律标注「需在目标机型实测」，不给绝对值、不给跨机型通用数字（基准方法见 08-01 ｜ 调优见 08-02）。
+
+最佳实践可归纳为四条：其一，把图 06-01-01 当作排障导航，先定「哪一段」再查进程与库；其二，任何验证都按「前置检查、执行、验证输出、清理」闭环写，示例输出注明「示例输出，具体格式需对照实际版本核验」并附逐行判读；其三，跨册引用统一用（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx），其中 `xx` 为具体篇号；其四，遇到快照内无法核实的内容，宁可标注「需对照实际版本核验」并给出目录，也不补值。
+
+### 7. 小结与延伸阅读
+
+本篇确立了控制面数据流的总览：配置经 `CONFIG_DB` → `APPL_DB` → `ASIC_DB` → SAI 四段异步流水线到达 ASIC，四段分别由 CLI 与 `swsssdk`、`cfgmgr/` 各 `*mgrd`、`orchagent/` 的 `Orch` 框架、`sonic-sairedis/syncd/` 驱动，中间没有同步调用，`config` 返回不等于硬件已下发。图 06-01-01 给出链路与色调语义，阶段—载体表给出每段的可定位源码，命令行与 Python 两组实例说明「同一配置在三段库中的三种形态」。三条纪律贯穿全篇：DB 编号来自运行时配置而非源码常量；`orchagent` 不直接操作硬件；不在本快照的内容一律标注核验要求。
+
+延伸阅读按疑问分流。要深入第一段，接读 06-03（`cfgmgr/` 与配置校验）与 06-14（gNMI / YANG 管理面）；要深入第二段与生产者消费者模型，接读 06-02、06-04；要深入第三段与芯片编程，接读 06-05 与 06-06、06-07、06-08 的具体业务下发链路；要理解进程为何按此顺序启动，接读 06-13；计数器回写见 06-09。字段与参数随查走 05、04 两册，模块能力走 07 册，诊断树与案例走 08-03、08-04。跨册引用始终使用（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx），本篇涉及的 `SonicDBConfig` 字段写「字段见 05-03」、库编号写「参数见 04-04」、`mgrd` 机制写「原理见 06-03」、容器模块写「模块见 07-02」。
+
+最后重申版本与核验约定：版本基准统一为「上游 master 快照（2026-11 抓取）」，不写绝对版本号与 Redis DB 编号；所有源码路径相对各子仓 `xxx-master/` 根；所有示例输出注明「示例输出，具体格式需对照实际版本核验」；性能、容量、收敛、时延、吞吐类结论一律标注「需在目标机型实测」。下一篇 06-02 将把本篇略过的数据库分层语义与 producer / consumer 模型展开，说明这条流水线为什么以「库 + 表项队列」而非函数调用的方式实现。
+
+## 06-02 数据库分层与 producer / consumer 模型
+
+### 1. 背景与动机
+
+06-01 把配置从 `CONFIG_DB` 到 ASIC 的四段链路摆了出来，但留下一个更根本的问题没有回答：为什么 SONiC 要用「库 + 表项队列」而不是一次函数调用把配置送下去？如果控制面是一个进程内的程序，最直观的写法显然是调用链——把端口对象构造好，直接传给驱动，驱动返回成功即结束。SONiC 偏偏不这么做：每一段都把带操作类型的表项写进一个 Redis 逻辑库，由另一个容器里的进程自行取走。本篇的任务就是解释这个选择，并把支撑它的两个机制——数据库分层与生产者/消费者模型——讲清楚（原理见 06-01 ｜ 模块见 07-05）。
+
+分层的动机不是「把简单事情复杂化」，而是让每一段都有明确的写入方、消费方与可观测点。配置意图、业务期望状态、ASIC 对象、运行时状态、计数器被放进不同的逻辑库，于是配置可以重放、期望状态可以重建、对象可以重下发；排障时也能逐段比对，而不是面对一个「命令返回成功但芯片没动」的黑盒。本快照里这套分层的工程证据在 `dockers/docker-database/database_config.json.j2`：它用 `INSTANCES` 声明 Redis 实例，用 `DATABASES` 声明各逻辑库的名字、编号、分隔符与所属实例，运行时由 `SONIC_DB_CONFIG_FILE` 指定的 `/var/run/redis/sonic-db/database_config.json` 被真正读取。需要说明一处事实边界：本快照 `files/image_config/` 下未见 `redis/` 子目录，库配置模板落在 `dockers/docker-database/`，这与一些发行版布局可能不同，需对照实际版本核验；因此本篇不从「某目录应当存在」出发，只从可核实的文件出发（参数见 04-04 ｜ 模块见 07-11）。
+
+生产者/消费者模型的动机则是解耦时间。生产者写入后即可返回，不等待消费者处理；消费者按自己的调度节奏取出任务，必要时重试。这带来两个直接后果：其一，`config` 命令返回成功只代表意图写进了配置库，绝不代表硬件已编程；其二，链路中段的表项本身就是排障证据——`CONFIG_DB` 有而 `APPL_DB` 无，问题在第一段；`APPL_DB` 有而 `ASIC_DB` 无，问题在第二段。可以说，理解了「表项在队列里等待被消费」，就理解了 SONiC 为什么没有「即时生效」这个词（原理见 06-01 ｜ 排障见 08-03）。
+
+最后明确本篇在 06 册中的位置与边界。06 册是机制、状态机与调用链的唯一权威源，本篇负责数据库分层与 producer / consumer 的语义，06-03 讲第一段校验、06-04 讲 Orch 调度、06-05 讲 syncd 到 SAI、06-10 讲 warm reboot 的状态恢复。结构体逐字段不在本篇展开，`ProducerStateTable`、`ConsumerStateTable`、`KeyOpFieldsValuesTuple`、`Select` 的定义多在 `sonic-swss-common`，不在本快照，需对照实际版本核验；本篇只引用可核实的调用点。全篇涉及的库编号、表名与字段一律不写死，统一写「需对照实际版本核验」（字段见 05-02 ｜ 参数见 04-04 ｜ 模块见 07-05）。
+
+### 2. 核心概念
+
+第一个概念是「逻辑库分层」。模板 `dockers/docker-database/database_config.json.j2` 的 `DATABASES` 段落里，`CONFIG_DB` 保存用户与开机配置意图，`APPL_DB` 保存经各 `*mgrd` 校验整理后的业务期望状态，`ASIC_DB` 保存待编程的 ASIC 对象，`STATE_DB` 保存运行时状态，`COUNTERS_DB` 保存计数器；此外还能看到 `FLEX_COUNTER_DB`、`PFC_WD_DB`、`CHASSIS_APP_DB`、`CHASSIS_STATE_DB`、`APPL_STATE_DB`、`BMP_STATE_DB`、`EVENT_DB` 以及 DPU 相关扩展库，说明分层是可按场景扩展的。模板同时声明每个库的 `separator`：`APPL_DB`、`ASIC_DB`、`COUNTERS_DB` 用 `:`，`CONFIG_DB`、`STATE_DB` 用 `|`，这就是「配置库键形如 `PORT|Ethernet1`、期望态库键形如 `PORT_TABLE:Ethernet1`」的来源。编号也要强调：模板里确实写了 `id` 字段，但它是运行时配置的一部分，不是源码常量，本套资料一律不把编号抄进正文，须对照 `sonic-py-swsssdk/src/swsssdk/dbconnector.py` 的 `SonicDBConfig` 与实际版本核验（参数见 04-04 ｜ 字段见 05-03）。
+
+五个核心逻辑库的分工、分隔符与可定位源码见下表；表中「编号」相关的具体数字刻意不填，正是分层纪律的体现。
+
+| 逻辑库 | 语义角色 | 主要写入方 | 主要消费方 | 键分隔符 | 源码位置 |
+|---|---|---|---|---|---|
+| CONFIG_DB | 用户与开机配置意图 | CLI、config-setup | 各 mgrd | \| | `dockers/docker-database/` |
+| APPL_DB | 校验后的业务期望状态 | 各 mgrd、fpmsyncd | orchagent | : | `sonic-swss/cfgmgr/`、`fpmsyncd/` |
+| ASIC_DB | 待编程 ASIC 对象 | orchagent | syncd | : | `sonic-swss/orchagent/`、`syncd/` |
+| STATE_DB | 运行时状态与回写 | syncd、各 syncd | show、监控 | \| | `sonic-sairedis/syncd/` |
+| COUNTERS_DB | 计数器与统计 | syncd、FlexCounter | telemetry、show | : | `orchagent/flexcounterorch.cpp` |
+| CHASSIS_APP_DB 等 | chassis 等场景扩展 | 受平台与版本限制 | 受平台与版本限制 | \| | `files/image_config/config-chassisdb/` |
+
+表中路径相对各子仓 `xxx-master/` 根，分隔符取自上述模板的声明；半角管道符在表中写作转义形式，避免被解析为列分隔。chassis 与多 ASIC 相关库受平台与版本限制，需对照实际版本核验，不得宣称全平台无条件支持（原理见 06-11 ｜ 模块见 07-02）。
+
+第二个概念是「实例与命名空间」。同一个 `DATABASES` 段落里，各库通过 `instance` 指向 `INSTANCES` 中的 `redis`、`redis_chassis`、`remote_redis`、`redis_bmp` 等实例，实例各自有 `hostname`、`port`、`unix_socket_path` 与 `persistence_for_warm_boot` 声明。这说明「分层」不仅是库名的划分，还包含实例隔离：chassis 场景可以把状态放到独立实例，DPU 场景可以把部分库指向远端实例。这些能力受平台与版本限制，需对照实际版本核验；本篇只讲「分层可以跨实例」这一机制，不罗列具体部署拓扑（原理见 06-11 ｜ 参数见 04-04）。
+
+第三个概念是「生产者与消费者是相对角色」。同一个进程完全可能既是消费者又是生产者：`cfgmgr/` 下的 `portmgrd` 消费 `CONFIG_DB` 的 `PORT` 表，校验后作为生产者把期望态写进 `APPL_DB`；`orchagent` 消费 `APPL_DB` 的业务表，作为生产者把 SAI 对象写进 `ASIC_DB`；`syncd` 消费 `ASIC_DB`，再把运行时状态回写 `STATE_DB` 与计数器库。因此「某库有表项」只能证明上一棒已经交接，不能证明下一棒已经完成。角色链上每一段都是「写库即返回、下游自行消费」，整条链没有任何一处同步等待（原理见 06-03 ｜ 原理见 06-04 ｜ 原理见 06-05）。
+
+第四个概念是「表项三要素：键、操作、字段值」。生产者写入的不是一行普通数据，而是 `KeyOpFieldsValuesTuple` 这样的三元组：键标识对象，操作取 `SET_COMMAND` 或 `DEL_COMMAND` 一类值，字段值是若干字段名与取值的集合。在 `sonic-swss-master/cfgmgr/portmgr.cpp` 的 `doTask` 里可以看到 `kfvKey(t)`、`kfvOp(t)`、`kfvFieldsValues(t)` 的取用，以及 `op == SET_COMMAND` 走写入、`op == DEL_COMMAND` 走 `m_appPortTable.del(alias)` 的分支；`fvField(i)` 与 `fvValue(i)` 则逐个读字段。该元组与访问函数的定义属于 `sonic-swss-common`，不在本快照，需对照实际版本核验；本篇只依据这些可核实的调用点陈述其语义（字段见 05-02 ｜ 字段见 05-03）。
+
+第五个概念是「有状态队列，而不是纯消息队列」。消费者的本地结构 `m_toSync` 在 `sonic-swss-master/orchagent/orch.h` 中定义为 `std::multimap<std::string, swss::KeyOpFieldsValuesTuple>`，同名键允许多个值；`orch.cpp` 的 `addToSync` 对新键直接插入、对 `DEL` 覆盖旧值、对 `SET` 按字段合并已有 `SET`，并维持「每键最多两个值（先 DEL 后 SET）」的不变式，还会与 retry 缓存去重。这意味着短时间内对同一对象的多次修改会被折叠成「最新状态加操作」，是「状态表」而非「事件流」的语义；有序场景另有 `m_toSyncQueue`，该路径在 Orch2 中不受支持，需对照实际版本核验（字段见 05-05 ｜ 原理见 06-04）。
+
+第六个概念是「事件驱动的消费」。消费者不是轮询数据库，而是挂在一个可等待对象上，由 `Select` 机制在新表项到达时唤醒，再调用 `doTask` 处理；`orchagent/orch.h` 的 `Executor` 继承 `swss::Selectable`，`ConsumerBase` 又继承 `Executor`，`Consumer` 再继承 `ConsumerBase`，`ConsumerMap` 把这些消费者按名字登记，`Orch::doTask()` 遍历它们逐个派发。`Select` 的定义同样属于 `sonic-swss-common`，不在本快照，需对照实际版本核验（字段见 05-08 ｜ 模块见 07-03）。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构、对象与真实路径，不展开任何逐字段定义；字段留待 05 册、参数留待 04 册、机制留待 06 册、模块能力留待 07 册，即（字段见 05-02 ｜ 参数见 04-04 ｜ 原理见 06-01 ｜ 模块见 07-05）。下表按「对象—本快照源码位置—作用—边界说明」列给出，路径均相对各子仓 `xxx-master/` 根，凡定义不在本快照的一律注明核验要求。
+
+| 对象 | 本快照源码位置 | 作用 | 边界说明 |
+|---|---|---|---|
+| `database_config.json.j2` | `dockers/docker-database/` | 声明库名、编号、分隔符与实例 | 编号不抄进正文，需核验 |
+| `SonicDBConfig`、`SonicV2Connector` | `sonic-py-swsssdk/src/swsssdk/dbconnector.py` | 解析运行时配置并建连 | 字段见 05-03 |
+| `ProducerStateTable`、`ConsumerStateTable` | `sonic-swss-common`（不在本快照） | 生产写入与消费取出 | 需对照实际版本核验 |
+| `KeyOpFieldsValuesTuple`、`Select`、`Table` | `sonic-swss-common`（不在本快照） | 三元组与等待机制 | 字段见 05-02、05-08 |
+| `m_appPortTable` 等生产成员 | `sonic-swss/cfgmgr/portmgr.h`、`buffermgr.h`、`coppmgr.h` | 各 mgrd 的写表句柄 | 字段见 05-02 |
+| `createProducerStateTable` | `sonic-swss/lib/orch_zmq_config.h`、`orch_zmq_config.cpp` | 按 ZMQ 开关建生产者 | 签名需对照实际版本核验 |
+| `ConsumerStateTable` 构造点 | `sonic-swss/cfgmgr/nbrmgr.cpp` | 消费端直接构造订阅 | 字段见 05-08 |
+| `SyncMap`、`ConsumerBase`、`Consumer`、`m_toSync` | `sonic-swss/orchagent/orch.h`、`orch.cpp` | 消费后归并待处理任务 | 字段见 05-05 ｜ 原理见 06-04 |
+| `ProducerStateTables`、`registerAppTable` | `sonic-swss/warmrestart/warmRestartAssist.h` | 生产表注册与恢复辅助 | 原理见 06-10 |
+
+生产侧的可核验证据集中在 `cfgmgr/` 与 `lib/`。`cfgmgr/portmgr.h:28` 可见 `ProducerStateTable m_appPortTable;`，同类成员还出现在 `cfgmgr/intfmgr.h`、`coppmgr.h`、`buffermgr.h`、`natmgr.h`、`fabricmgr.h`、`sflowmgr.h`、`tunnelmgr.h` 与 `neighsyncd/neighsync.h`、`natsyncd/natsync.h` 中，说明「一个业务一个生产者句柄」是通用写法。`lib/orch_zmq_config.cpp` 的 `createProducerStateTable` 有两个重载，分别接受 `DBConnector*` 与 `RedisPipeline*`；其实现在 `zmqClient` 非空时构造 `ZmqProducerStateTable`，否则构造普通 `ProducerStateTable`，具体签名与开关名需对照实际版本核验（参数见 04-06 ｜ 模块见 07-03）。
+
+消费侧的可核验证据集中在 `cfgmgr/nbrmgr.cpp` 与 `orchagent/orch.h`、`orch.cpp`。前者用 `swss::ConsumerStateTable` 针对 `APP_NEIGH_RESOLVE_TABLE_NAME` 构造消费表并配合 `Select` 使用（构造参数需对照实际版本核验）；后者定义 `SyncMap`、`ConsumerMap`、`ConsumerBase`、`Consumer`、`Executor` 以及 `m_toSync`、`m_toSyncQueue`、`addToSync`，`orch.cpp` 的 `addToSync` 实现键折叠、DEL 覆盖、SET 按字段合并与 retry 去重。此外 `warmrestart/warmRestartAssist.h` 定义 `typedef std::map<std::string, ProducerStateTable *> ProducerStateTables` 与 `registerAppTable`，把生产表纳入 warm reboot 的恢复辅助，能力受平台与版本限制、需对照实际版本核验（字段见 05-05 ｜ 原理见 06-10 ｜ 模块见 07-03）。
+
+### 4. 关键流程与调用链
+
+把生产者、表项队列与消费者放在同一张图上，就是本篇最核心的模型。以一次端口配置为例，同一套生产/消费机制在链路上被复用了三次，其角色关系见图 06-02-01。
+
+:::figure id=06-02-01 | name=生产者消费者模型与分层表项队列 | dir=TD
+node n1 "生产者进程<br/>各 mgrd fpmsyncd" teal
+node n2 "ProducerStateTable<br/>库封装 不在本快照" gray
+node n3 "APPL_DB 表项队列<br/>KEY OP FVS" blue
+node n4 "ConsumerStateTable<br/>库封装 不在本快照" gray
+node n5 "orchagent<br/>Orch 与 m_toSync" purple
+node n6 "ASIC_DB 表项队列" amber
+node n7 "syncd 消费侧" green
+node n8 "STATE_DB 回写" blue
+node n9 "排障查询<br/>sonic-db-cli" gray
+edge n1 -> n2 "set del 调用"
+edge n2 -> n3 "写入三元组"
+edge n3 -> n4 "pop 表项"
+edge n4 -> n5 "喂入 m_toSync"
+edge n5 -> n6 "set 对象"
+edge n6 -> n7 "消费对象"
+edge n7 -> n8 "回写结果"
+edge n9 -> n3 dashed "逐段查询"
+edge n9 -> n6 dashed "逐段查询"
+:::
+
+图 06-02-01 的色调沿用本套约定：teal 是配置管理与生产进程，gray 是库封装与辅助查询（两个 `StateTable` 类不在本快照，故用 gray 表示「外部依赖」），blue 是配置与状态数据库，purple 是 `orchagent` 控制面，amber 是 `ASIC_DB`，green 是 `syncd`。图中最值得注意的是同一模型出现两次：`n1 → n2 → n3 → n4 → n5` 是「配置到期望态」的一次交接，`n5 → n6 → n7` 是「期望态到对象」的另一次交接，后者由 `orchagent` 同时扮演消费者与生产者。虚线边表示排障时可以从外部按库查询，查询本身不参与编程（原理见 06-01 ｜ 排障见 08-03）。
+
+一次表项从生产到消费要经历四步。第一步，生产者调用 `ProducerStateTable::set(key, fvs)` 或 `del(key)`，把「键、操作、字段值」写进目标库，这一步即返回；`cfgmgr/portmgr.cpp` 的 `writeConfigToAppDb` 正是封装了 `m_appPortTable.set(alias, field_values)`。第二步，表项以带操作记录的形式驻留在逻辑库中，同一键的多次写入会被消费者侧折叠，而不是简单排队。第三步，消费者由 `Select` 唤醒，`ConsumerStateTable` 取出表项，`ConsumerBase::addToSync` 按键归并进 `m_toSync`。第四步，派生 Orch 的 `doTask(Consumer&)` 遍历 `m_toSync`，用 `kfvKey`、`kfvOp`、`kfvFieldsValues` 解析，成功后翻译为 SAI 对象写进 `ASIC_DB`，失败则进入 retry 缓存等待下一轮（字段见 05-05 ｜ 原理见 06-04）。
+
+折叠语义值得单独说明，因为它决定了「队列里到底是什么」。`sonic-swss-master/orchagent/orch.cpp` 的 `addToSync` 对 `m_toSync` 这个 multimap 做了明确处理：新键直接 `emplace`；`DEL` 到来时先 `erase(key)` 再写入，使删除覆盖旧的待处理值；`SET` 到来时若已有同键 `SET`，则按字段合并取值；代码注释明确「每键最多两个值，且有值时为 DEL 加 SET」。同一段还处理 retry 缓存：若某键已在 retry 中且新任务完全相同则跳过，若新任务是 `DEL` 而旧任务是 `SET` 则淘汰旧任务。这说明表项队列是「按对象键收敛状态」的结构，不是逐条透传的消息流；短时间内反复改同一端口，最终被消费的是收敛后的状态（原理见 06-04 ｜ 字段见 05-05）。
+
+两段之间还有两个变体要交代。其一是有序队列：当 `m_orderedQueue` 置位时，`addToSync` 改向 `std::deque` 类型的 `m_toSyncQueue` 追加，以保持请求顺序；`orch.h` 注释指出该路径在 Orch2 中不受支持，是否启用需对照实际版本核验。其二是 ZMQ 变体：`createProducerStateTable` 在 `zmqClient` 非空时构造 `ZmqProducerStateTable`，否则用普通 `ProducerStateTable`；日志中可见 `Create ZmqProducerStateTable` 与 `Create ProducerStateTable` 两种分支，是否启用取决于特性配置，需对照实际版本核验。无论哪种变体，对上层都是「写入三元组、下游自行消费」的同一语义（参数见 04-06 ｜ 模块见 07-03）。
+
+需要再次强调异步性：从 `set()` 返回到消费者 `doTask` 完成之间存在时间差，从 `ASIC_DB` 对象写入到 `syncd` 调用 SAI 完成又有一段。因此判断一次配置是否生效，必须按库逐段核对并结合 `show` 输出，而不是看单条命令的返回码（原理见 06-05 ｜ 排障见 08-04）。
+
+### 5. 配置/命令/代码实例
+
+本节给两组最小实例：一组用 `sonic-db-cli` 按库观察表项队列，一组用真实的 C++ 调用点说明生产与消费是怎么写的。完整命令全集见 04-05、库对象全集见 04-04、字段见 05-02，本册不重列。示例输出均注明「示例输出，具体格式需对照实际版本核验」（参数见 04-05 ｜ 字段见 05-02）。
+
+先按「前置检查 → 执行 → 逐段验证」观察一次端口配置在三层库中的形态；`sonic-db-cli` 直接接受库名，不必写编号，因此不违反「不写死库编号」的纪律。
+
+```bash
+# 前置检查：确认运行时库配置与查询工具
+ls /var/run/redis/sonic-db/database_config.json
+command -v sonic-db-cli
+# 执行：由 config 命令写入端口意图（命令名与选项需对照实际版本核验）
+config interface ip add Ethernet1 10.0.0.1/31
+# 逐段验证：配置库 → 期望态库 → 对象库 → 状态库
+sonic-db-cli CONFIG_DB KEYS "PORT|*"
+sonic-db-cli APPL_DB KEYS "PORT_TABLE:*"
+sonic-db-cli ASIC_DB KEYS "ASIC_STATE:SAI_OBJECT_TYPE_PORT:*"
+sonic-db-cli STATE_DB KEYS "PORT_TABLE|*"
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（键名仅为格式示意）
+/var/run/redis/sonic-db/database_config.json
+/usr/local/bin/sonic-db-cli
+PORT|Ethernet1
+PORT|Ethernet2
+PORT_TABLE:Ethernet1
+ASIC_STATE:SAI_OBJECT_TYPE_PORT:oid:0x100000000000a
+PORT_TABLE|Ethernet1|oper_status
+```
+
+逐行判读如下。前两行是前置检查：`/var/run/redis/sonic-db/database_config.json` 存在说明运行时库配置已就绪，这正是 `SonicDBConfig` 读取的文件、也是「编号来自配置而非常量」的落点；`/usr/local/bin/sonic-db-cli` 说明查询工具可解析，若为空则先确认所在容器与 PATH，路径需对照实际版本核验。第三、四行 `PORT|Ethernet1`、`PORT|Ethernet2` 来自 `CONFIG_DB`，键以 `|` 分隔，与模板中该库 `separator` 的声明一致，说明配置意图已写入；若为空，应回到第一段查 config 命令与 JSON 格式，而非怀疑芯片。第五行 `PORT_TABLE:Ethernet1` 来自 `APPL_DB`，键以 `:` 分隔，是各 `*mgrd` 消费配置库后经生产者写入的期望态；出现该行证明「第一次交接」已完成，若为空则应查对应 `mgrd` 是否运行、订阅是否建立。第六行 `ASIC_STATE:SAI_OBJECT_TYPE_PORT:oid:0x100000000000a` 来自 `ASIC_DB`，说明 `orchagent` 已把期望态翻译为 SAI 对象并写入「第二次交接」的目标库；这里只有对象类型与 `oid`，不含芯片是否编程完成的结论。第七行 `PORT_TABLE|Ethernet1|oper_status` 来自 `STATE_DB`，键以 `|` 分隔，反映运行时回写，是排障时与 `show` 输出并列看的证据。整组输出的要点是「同一件事在三层库里有三种键形态」：配置库是字段、期望态库是业务表项、对象库是 SAI 对象；三者齐全才说明两次交接都走通，缺任何一段都应就地定位。输出块已注明示例输出与版本核验要求，键名与取值不得当作真实设备数据引用（原理见 06-01 ｜ 排障见 08-03）。
+
+再看生产与消费在源码里怎么写。下列片段节选并简化自 `sonic-swss-master/cfgmgr/portmgr.cpp` 的 `doTask`，保留 SET / DEL 分支与 `m_toSync` 遍历结构；字段解析与端口就绪判断在完整实现中另有分支，函数签名需对照实际版本核验。
+
+```cpp
+// 节选并简化自 sonic-swss-master/cfgmgr/portmgr.cpp
+void PortMgr::doTask(Consumer &consumer)
+{
+    auto it = consumer.m_toSync.begin();
+    while (it != consumer.m_toSync.end())
+    {
+        KeyOpFieldsValuesTuple t = it->second;
+        string alias = kfvKey(t);
+        string op = kfvOp(t);
+
+        if (op == SET_COMMAND)
+        {
+            vector<FieldValueTuple> field_values;
+            field_values.emplace_back("mtu", mtu);
+            field_values.emplace_back("admin_status", admin_status);
+            writeConfigToAppDb(alias, field_values);
+        }
+        else if (op == DEL_COMMAND)
+        {
+            m_appPortTable.del(alias);
+            m_portList.erase(alias);
+        }
+        it = consumer.m_toSync.erase(it);
+    }
+}
+```
+
+这段代码把第 4 节的模型落到了具体调用上：入参 `Consumer &consumer` 说明本进程是消费侧，`consumer.m_toSync` 是已经折叠好的待处理表项，`kfvKey(t)` 取出对象键、`kfvOp(t)` 取出操作；`SET_COMMAND` 分支把 `mtu`、`admin_status` 组织成 `FieldValueTuple` 列表后交给 `writeConfigToAppDb`，后者内部调用 `m_appPortTable.set(alias, field_values)`，于是本进程同时变成生产侧；`DEL_COMMAND` 分支调用 `m_appPortTable.del(alias)`，对应带删除操作的表项下发；循环末尾 `erase(it)` 表示表项已被消费。注意 `writeConfigToAppDb`、`m_appPortTable`、`m_portList` 都是 `PortMgr` 的成员，完整实现里 `mtu` 与 `admin_status` 来自对 `kfvFieldsValues(t)` 的遍历与端口是否就绪的判断，这里为聚焦生产/消费结构没有铺开；真实签名与分支需对照实际版本核验（字段见 05-02 ｜ 原理见 06-03 ｜ 模块见 07-03）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是库编号与表名陷阱。模板 `database_config.json.j2` 里确实有 `id` 字段，但它是运行时 `database_config.json` 的一部分，会随平台与版本变化；把它抄进正文当作「CONFIG_DB 是某号库」是最常见的硬伤。正确做法是写「编号须对照 `sonic-py-swsssdk/src/swsssdk/dbconnector.py` 的 `SonicDBConfig` 与实际版本核验」，表名与字段同理，一律给出 `cfgmgr/`、`orchagent/`、`src/swsssdk/`、`dockers/docker-database/` 等可定位目录（参数见 04-04 ｜ 字段见 05-03）。
+
+第二类是「把表项队列当普通哈希表」的陷阱。`APPL_DB` 与 `ASIC_DB` 中的表项携带操作类型，消费侧还会按对象键折叠 SET 与 DEL；因此「查到一个键」不等于「有一次独立的变更待处理」，也不能用普通哈希的语义去推断消费次数。判断下游是否走通，应看目标库有没有对应对象，而不是数上游写了几次（原理见 06-04 ｜ 字段见 05-05）。
+
+第三类是仓库边界陷阱。`ProducerStateTable`、`ConsumerStateTable`、`KeyOpFieldsValuesTuple`、`Table`、`Select` 的定义都在 `sonic-swss-common`，该子仓不在本快照，需对照实际版本核验；本快照只有调用点，如 `cfgmgr/portmgr.h` 的成员、`cfgmgr/nbrmgr.cpp` 的构造、`orchagent/orch.h` 的 `SyncMap` 与 `m_toSync`。不得据调用点反推类定义、字段表或内部实现，也不得凭印象写出不存在的头文件路径（字段见 05-02 ｜ 字段见 05-08 ｜ 模块见 07-05）。
+
+第四类是角色与能力边界陷阱。要把「生产/消费是相对角色」写对：同一个 `mgrd` 先消费后生产，`orchagent` 同时是消费者与生产者，CLI 只写配置库与读状态、`show` / `config` 从不编程 ASIC，`orchagent` 从不直接读写寄存器而是经 `ASIC_DB` 与 SAI 属性同 `syncd` 交互。把任何一句写反，整条链路的解释都会失真（原理见 06-01 ｜ 原理见 06-05 ｜ 模块见 07-06）。
+
+第五类是同步化陷阱。生产者 `set()` 返回只表示三元组已写入，消费者 `doTask` 何时执行取决于调度与 `Select` 唤醒；把「`config` 返回成功」写成「硬件已下发」是本套明令禁止的。正确姿势是按 `CONFIG_DB`、`APPL_DB`、`ASIC_DB`、`STATE_DB` 顺序逐段核对并结合 `show`，这与 06-01 的排障顺序一致但原因不同：本篇强调的是「队列等待消费」这一机制本身（原理见 06-01 ｜ 排障见 08-03）。
+
+第六类是特性与性能陷阱。有序队列 `m_toSyncQueue`、ZMQ 生产者变体、retry 去重与 warm reboot 的表项恢复都受版本与平台限制，是否启用需对照实际版本核验，不得宣称全平台无条件支持；配置下发时延、队列积压、收敛时间与吞吐一律标注「需在目标机型实测」，不给绝对值、不给跨机型通用数字（原理见 06-10 ｜ 基准方法见 08-01 ｜ 调优见 08-02）。
+
+最佳实践可归纳为四条：其一，把图 06-02-01 当作理解交接的骨架，先分清「谁生产、谁消费、哪一段库」，再谈进程与命令；其二，凡涉及字段、参数、机制、模块一律按（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx）交叉引用，本篇的字段写「字段见 05-02」、编号写「参数见 04-04」、折叠机制写「原理见 06-04」、库封装模块写「模块见 07-05」；其三，命令示例按「前置检查、执行、逐段验证」闭环写，输出注明核验要求并附逐行判读；其四，遇到快照内无法核实的内容，宁可标注「需对照实际版本核验」并给出可定位目录，也不补值。
+
+### 7. 小结与延伸阅读
+
+本篇把 06-01 略过的两个机制补齐。数据库分层方面：`dockers/docker-database/database_config.json.j2` 以 `INSTANCES` 与 `DATABASES` 声明实例、库名、编号、分隔符与所属关系，`CONFIG_DB`、`APPL_DB`、`ASIC_DB`、`STATE_DB`、`COUNTERS_DB` 分别承载配置意图、期望态、ASIC 对象、运行时状态与计数器，编号来自运行时配置而非源码常量，须对照 `SonicDBConfig` 核验。生产者/消费者方面：生产者用 `ProducerStateTable` 写入「键、操作、字段值」三元组，消费者经 `ConsumerStateTable` 与 `Select` 取出并按键折叠进 `m_toSync`，`doTask` 解析后继续生产下一库的表项，同一模型在链路上复用三次；`sonic-swss-common` 的类定义不在本快照，本篇只依据 `cfgmgr/`、`fpmsyncd/`、`orchagent/` 的可核实调用点陈述语义。图 06-02-01 与两张表把「分层语义」和「角色关系」固定下来，是本册后续各篇反复回查的索引。
+
+延伸阅读按疑问分流。要接续第一段的校验细节，读 06-03；要深入 `m_toSync` 折叠、`doTask` 派发与 retry，读 06-04；要看 `ASIC_DB` 对象如何经 SAI 编程并回写，读 06-05；要理解 warm reboot 下生产表如何恢复，读 06-10；要看实例隔离与 chassis 扩展，读 06-11 与 07-02；要看进程按什么顺序启动，读 06-13。字段随查走 05-02、05-03、05-05、05-08，参数与命令全集走 04-04、04-05、04-06，库封装模块走 07-05，排障判读走 08-03、08-04。跨册引用始终使用（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx），其中 06 册是机制与调用链的唯一权威源，本篇涉及的库编号写「参数见 04-04」、`SonicDBConfig` 字段写「字段见 05-03」、`KeyOpFieldsValuesTuple` 字段写「字段见 05-02」、折叠机制写「原理见 06-04」、库封装写「模块见 07-05」。
+
+最后重申版本与事实纪律：版本基准统一为「上游 master 快照（2026-11 抓取）」，不写绝对版本号与 Redis DB 编号；所有源码路径相对各子仓 `xxx-master/` 根；示例输出注明「示例输出，具体格式需对照实际版本核验」；`sonic-swss-common`、FRR、Linux 内核与厂商 SAI 实现一律写「不在本快照，需对照实际版本核验」；有序队列、ZMQ 变体、warm reboot 与多 ASIC 写「受平台与版本限制，需对照实际版本核验」；性能、容量、时延、吞吐类结论写「需在目标机型实测」。下一篇 06-03 将进入第一段，讲 `cfgmgr/` 各 `*mgrd` 如何订阅 `CONFIG_DB`、做语义校验，并把结果经生产者写进 `APPL_DB`。

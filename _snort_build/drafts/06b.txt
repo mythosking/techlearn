@@ -1,0 +1,371 @@
+# Snort 3 技术资料 · 06 技术原理（分片 B）
+
+## 06-03 解码、normalize 与协议分层
+
+### 1. 背景与动机
+
+DAQ 层交付给引擎的是一份原始字节帧和与之伴随的 `DAQ_PktHdr_t` 头部（原理见 06-02），它们本质上只是「某一时刻在某张网卡上抓到的一串字节」。而规则检测需要的却是高度结构化的语义：这是以太网还是原始 IP，VLAN 标签是多少，内层是不是 IPv6 分片，传输层源端口与目的端口各是什么，载荷从哪个字节开始、有多长。把「没有语义的字节」变成「带层次、带边界、带协议标记的结构」，正是解码层（decoder）的职责。在 Snort 3 中，这一步由 `PacketManager::decode()` 主导，它驱动一组可插拔的 Codec 逐层剥离协议头，每剥一层就把该层的起点、长度和协议标识压入 `Packet::layers` 数组，最终把剩余部分登记为载荷（`p->data`、`p->dsize`）。没有这一步，后面的 binder、流重组、快速模式匹配与检测引擎都无从取得可用的端口、协议与缓冲（原理见 06-04、06-05、06-08）。
+
+第二个动机是**解耦与可插拔**。Snort 3 把每一种协议的解析做成一个独立 Codec 插件，它们统一遵守 `src/framework/codec.h` 定义的 `Codec` 接口。源码目录 `src/codecs/dev_notes.txt` 对这组插件的职责边界写得非常克制：这些 Codec「只做基础的逐帧校验，不承载超出逐帧范围的处理」（"do not perform processing beyond basic per-frame validation"），覆盖从链路层到传输层的协议。换言之，Codec 不负责重组、不负责规范化改写、不负责应用层会话理解——这些分别交给 stream（06-05）、normalize（本篇后段）与 service inspector（06-04、06-10）。这种分工让「新增一种隧道协议解析」变成「新增一个 Codec 文件并在装载表里登记一行」，而不必触动检测引擎。装载入口是 `src/codecs/codec_api.cc` 的 `load_codecs()`，它通过 `PluginManager::load_plugins` 把各 Codec 的 `BaseApi` 数组逐个注册（插件装配机制见 06-14）。
+
+第三个动机，也是本套资料必须反复订正的事实锚点：**本快照并不存在独立的 `src/decode/` 目录**。`SPEC.txt` 与总纲第 7 节已经明确这一点，这里给出正面结论：解码职责由 `src/codecs/`（内部再分 `root/`、`link/`、`ip/`、`misc/` 四个子目录）与 `src/protocols/packet.cc`、`src/protocols/packet_manager.cc` 共同承担；`Codec` 的抽象接口定义在 `src/framework/codec.h`，而 `Packet`、`Layer`、`DecodeData` 的字段分别在 `src/protocols/packet.h`、`src/protocols/layer.h`、`src/framework/decode_data.h`（字段见 05-02）。`src/framework/` 下并没有 `packet.h`，这是查阅源码时最容易扑空的一处。大纲与部分历史文档里出现的 `src/decode` 属于惯用名，凡遇到一律标注「需对照实际版本核验」，不得当成真实路径引用。本篇事实基准统一写「上游 master 快照（2026-11 抓取）」，不抄具体版本号。
+
+第四，协议分层与隧道递归是解码层最见功力的部分。一个普通以太网帧大致沿 eth → vlan（可选）→ ipv4/ipv6 → 扩展头或分片（可选）→ tcp/udp/icmp 逐层展开；而 GRE、VXLAN、Geneve、GTP、TEREDO 等隧道协议会让解码器在剥完外层后「回到」链路层或 IP 层重新开始，形成递归。`src/codecs/ip/cd_gre.cc`、`src/codecs/misc/cd_vxlan.cc`、`cd_geneve.cc`、`cd_gtp.cc`、`cd_teredo.cc` 都是这类实现。分层信息最终以 `Layer` 数组的形式留在 `Packet` 上，供 `PacketManager::log_protocols()` 逐层打印；一旦嵌套深度超过 `PacketManager::get_max_layers()`，源码注释写明「继续解码但不再记录层」，并置 `CODEC_LAYERS_EXCEEDED` 相关标志，这是防御深层封装耗尽资源的重要护栏。
+
+最后必须把 normalize 的定位说清楚，避免与解码混淆。解码层的 Codec **只校验、不改写**：它读出头部、设置指针与长度，但不会为了消除二义性而去修改报文。normalize 是另一个独立的网络检查器，位于 `src/network_inspectors/normalize/`，它的目标是把「端到端不一致的报文」变成「检测侧与对端理解一致的报文」，从而封堵 evasion（例如 IP 选项的歧义、TCP 保留位、SYN 携带数据等）。关键点在于：normalize 的改写只在**内联（inline）策略**下真正生效，旁路 IDS 模式只进入测试模式、报告「如果归一化会怎样」而不动报文。这与能力边界一致——Snort 本身不是防火墙、不做 IP 转发，内联丢弃靠 DAQ verdict 反馈（06-12）。本篇按「解码 → 分层记录 → normalize 一致性处理」的顺序展开，配置参数的最小必要片段见第 5 节，完整参数归 04 册（参数见 04-03、参数见 04-04）。
+
+各协议层与代表 Codec 文件的对应关系见下表（路径为去掉 `snort3-master/` 前缀的仓库内写法，字段见 05-02）。
+
+| 协议层 | 代表 Codec 文件 | 该层核心产出 |
+|---|---|---|
+| 链路 / root | src/codecs/root/cd_eth.cc | 以太头长度、next_prot_id |
+| VLAN / MPLS | src/codecs/link/cd_vlan.cc | VLAN 协议位、标签索引 |
+| IPv4 / IPv6 | src/codecs/ip/cd_ipv4.cc | ip_api 指针、分片标志 |
+| 扩展头 / 分片 | src/codecs/ip/cd_hop_opts.cc | 扩展头计数、顺序校验 |
+| 传输层 | src/codecs/ip/cd_tcp.cc | 源目端口、TCP 头指针 |
+| 隧道解封 | src/codecs/ip/cd_gre.cc | 内层协议、解封标志 |
+| 兜底 | src/codecs/misc/cd_default.cc | PROTO_BIT__OTHER |
+
+表中「该层核心产出」一列只给语义化简述，完整字段以 05-02 为准；同一目录下还有 ICMP、IGMP、PPPoE、ERSPAN、Geneve、VXLAN、GTP 等大量实现，凡本表未列出的一律以 `src/codecs/` 实际文件为准并标注「需对照实际版本核验」。
+
+### 2. 核心概念
+
+**Codec 插件与 CodecManager。** `src/framework/codec.h` 定义 `class SO_PUBLIC Codec`，其纯虚方法 `decode(const RawData&, CodecData&, DecodeData&)` 是每种协议解析器必须实现的入口；此外还有 `log()` 用于逐层打印、`encode()`/`update()`/`format()` 用于主动响应时反向构造报文。插件通过 `struct CodecApi` 导出工厂函数 `CdNewFunc ctor` 与销毁函数 `CdDelFunc dtor`，API 版本宏为 `CDAPI_VERSION ((BASE_API_VERSION << 16) | 3)`，意味着 `Codec` 接口变更会连带提升版本号、影响 SO 插件兼容性（插件体系见 06-14）。注册中心是 `src/managers/codec_manager.h` 的 `CodecManager`，它以 `static CodecManager* get_instance()` 单例形式存在，内部维护协议 ID 到 Codec 索引的映射（源码中可见 `grinder`、`grinder_id`、`s_proto_map` 等成员），`decode()` 主循环正是靠 `cm->get_codec(mapped_prot)` 取得当前应调用的 Codec。
+
+**三块数据分工。** 解码过程围绕三个结构展开，它们职责清晰、不可混用。`RawData` 携带 `const struct _daq_msg* daq_msg`、当前待解码数据指针 `data` 与剩余长度 `len`，随着逐层剥离，`data` 前移、`len` 缩短。`CodecData` 是 Codec 之间以及 Codec 与 `PacketManager` 之间的「控制块」，源码注释明确它的一部分字段「每次 decode() 调用前重置」，另一部分「每个包开始解码前重置」；其中 `next_prot_id` 告诉主循环下一层是什么协议，`lyr_len` 是本层有效长度，`invalid_bytes` 是本层无效部分长度，`proto_bits` 汇总本层及内层的协议位，`codec_flags` 携带封装回退等控制位。`DecodeData`（`src/framework/decode_data.h`）则是解码结果向检测侧交付的「便利指针集合」，内嵌于 `Packet::ptrs`，承载 `tcph`、`udph`、`icmph` 等协议头指针与端口等信息；源码注释写着「NOTHING else should be added」，因为它被高频引用。三者的字段定义归 05 册（字段见 05-02），本篇只讲职责与流转。
+
+**状态机：next_prot_id 驱动的逐层剥离。** `PacketManager::decode()` 的核心是一个 `while` 循环：只要当前 Codec 的 `decode()` 返回 `true`，就用 `codec_data.next_prot_id` 换算出下一个 Codec 的索引 `mapped_prot`，同时把 `raw.data += lyr_len + invalid_bytes`、`raw.len -= (lyr_len + invalid_bytes)`，把窗口收缩到内层起点。当 `next_prot_id` 落在终止值 `ProtocolId::FINISHED_DECODE` 上时，循环退出。每一层成功后，该层的 `proto_bits` 通过 `p->proto_bits |= codec_data.proto_bits` 累积到包级协议位图上；这个位图（例如 `PROTO_BIT__ETH`、`PROTO_BIT__IP`、`PROTO_BIT__TCP`、`PROTO_BIT__VLAN`）后来被 binder 与检测引擎用来判定包类型（原理见 06-04、06-08）。`lyr_len` 与 `invalid_bytes` 的区分很关键：源码以 IP 选项为例说明——若存在 20 字节选项但只有 12 字节有效，则应设 `lyr_len = MIN_IP_HEADER_LEN + 12`、`invalid_bytes = 8`，这样既保留了对无效部分的告警能力，又不会把无效字节当成下一层起点。若二者之和超过当前剩余长度，主循环置 `DECODE_ERR_LEN` 并提前返回，这是一道防止越界读取的护栏。
+
+**Layer 与协议分层记录。** 每成功解出一层，`push_layer()` 就把该层的起始指针、协议 ID 与长度压入 `Packet::layers`，并递增 `num_layers`。对于 VLAN（含 Q-in-Q），源码专门缓存索引：`vlan_idx` 始终指向最内层 VLAN，`vlan_idx_outer` 保存最外层 VLAN（第一次出现内层时把旧的 `vlan_idx` 转存为 `vlan_idx_outer`）。`Layer` 的定义在 `src/protocols/layer.h`，只有寥寥数个字段（字段见 05-02），`layer::set_packet_pointer(p)` 在解码开始前把包指针注入 layer 命名空间，供各 Codec 写入。`PacketManager::log_protocols()` 则反向遍历这些层做逐层日志输出，是排查「为什么这包没按预期分层」的直接手段。
+
+**封装回退与隧道解封。** 隧道与封装天然带有不确定性，`codec_flags` 为此提供了一套精巧机制。`CODEC_ENCAP_LAYER` 是 `CODEC_SAVE_LAYER` 与 `CODEC_UNSURE_ENCAP` 的组合：某个 Codec 若怀疑下一层可能是错误封装，可标记保存点；若随后解码失败，源码注释说明 PacketManager 会「回退到前一层」（back out to the previous layer），并恢复此前保存的 `DecodeData` 快照（主循环中的 `unsure_encap_ptrs`）。`CODEC_TEREDO_SEEN`、`CODEC_NON_IP_TUNNEL`、`PROTO_BIT__ANY_UDP_TUNNEL` 等标记协同工作；当 UDP 隧道 Codec 或 TEB（Transparent Ethernet Bridging）载荷成功解出内层 IP 时，主循环会置 `PROTO_BIT__TUNNEL_DECAP`，通知流层以解封后的内层元组建立流键——源码特别指出，普通 IP-in-GRE 不经过 TEB 分派，因此保持原有流键行为（流键见 06-05）。
+
+**normalize 的位标志与双模式。** `src/network_inspectors/normalize/normalize.h` 定义 `enum NormFlags`：IPv4 侧有 `NORM_IP4_BASE`、`NORM_IP4_DF`（清 DF 位）、`NORM_IP4_RF`、`NORM_IP4_TTL`（保证最小 TTL）、`NORM_IP4_TOS`、`NORM_IP4_TRIM`；IPv6 侧有 `NORM_IP6_BASE`、`NORM_IP6_TTL`；ICMP 侧有 `NORM_ICMP4`、`NORM_ICMP6`；TCP 侧最丰富，包括 `NORM_TCP_ECN_PKT`、`NORM_TCP_ECN_STR`、`NORM_TCP_URP`、`NORM_TCP_OPT`、`NORM_TCP_IPS`、`NORM_TCP_TRIM_SYN/RST/WIN/MSS`、`NORM_TCP_RSV`、`NORM_TCP_PAD`、`NORM_TCP_REQ_URG/PAY/URP`，并用 `NORM_TCP_BLOCK` 作为索引锚点。模式由 `enum NormMode { NORM_MODE_TEST, NORM_MODE_ON, NORM_MODE_MAX }` 表达。全局入口函数为 `Normalize_IsEnabled(NormFlags)` 与 `Normalize_GetMode(NormFlags)`：两者都先检查当前检查策略是否为 `POLICY_MODE__INLINE`，非内联时 `Normalize_GetMode` 返回 `NORM_MODE_TEST`，只有内联且策略掩码命中才返回 `NORM_MODE_ON`。这从代码层面坐实了「旁路只测不改、内联才真正改写」的边界。
+
+**三者边界小结。** 解码（Codec + PacketManager）回答「这包由哪些协议层组成、载荷在哪」；协议分层记录（Layer 数组）把答案结构化保存；normalize 回答「要不要为了消除二义性而改写报文」。流重组（06-05）则回答「跨多个包的字节流如何还原成有序数据」。四者依次衔接但职责不重叠，理解这条边界是避免「在 Codec 里找重组逻辑」「在 normalize 里找端口解析」这类误判的前提。所有吞吐、pps 与深度封装下的性能结论一律标注「需在目标机型实测」，不给绝对值。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实头文件路径，字段明细一律引用 05 册，不在此重列。
+
+**接口与数据载体族。** `src/framework/codec.h` 定义 `class Codec`、`struct RawData`、`struct CodecData`、`struct EncState`、`struct Buffer` 与 `struct CodecApi`——其中 `Codec::decode()` 是纯虚入口，`CodecApi` 提供 `ctor`/`dtor` 工厂，`CDAPI_VERSION` 标定插件 ABI；这几个结构的字段与职责见 `（字段见 05-02 ｜ 参数见 04-03 ｜ 原理见 06-14 ｜ 模块见 07-01）`。`src/framework/decode_data.h` 的 `struct DecodeData` 内嵌于 `Packet::ptrs`，是解码结果向检测侧交付的指针集合（字段见 05-02）。`src/protocols/packet.h` 的 `struct SO_PUBLIC Packet` 与 `src/protocols/layer.h` 的 `struct Layer` 承载分层记录，字段见 05-02。
+
+**调度与管理族。** `src/protocols/packet_manager.h` 声明 `class SO_PUBLIC PacketManager`，它提供 `decode`、`encode_update`、`encode_format`、`format_tcp`、`encode_response`、`encode_reject`、`get_proto_name`、`log_protocols`、`proto_idx` 等静态接口，并封装 `push_layer`、`get_layer_codec`、`handle_decode_failure` 等私有辅助；其状态统计用 `Stats` 数组与 `total_processed`、`other_codecs`、`discards`、`depth_exceeded` 等固定下标（字段见 05-09 的管理器族）。`src/managers/codec_manager.h` 的 `CodecManager` 是插件注册中心（模块见 07-01）。
+
+**归一化族。** `src/network_inspectors/normalize/normalize.h` 定义 `enum NormFlags`、`enum NormMode` 与 `Normalize_IsEnabled()`、`Normalize_GetMode()` 两个函数声明；`src/network_inspectors/normalize/norm.h` 定义 `NormalizerConfig` 及其 `normalizer_flags`，`src/network_inspectors/normalize/normalize.cc` 定义 `class Normalizer`（`configure`、`show`、`eval`）与 `nin_normalize` API；这些配置结构经 `NetworkPolicy::normal_mask` 落到策略上（字段见 05-03，模块见 07-02）。
+
+**真实目录分布（已核验）。** `src/codecs/root/`（`cd_eth.cc`、`cd_raw.cc`）、`src/codecs/link/`（`cd_vlan.cc`、`cd_mpls.cc`、`cd_pppoe.cc` 等）、`src/codecs/ip/`（`cd_ipv4.cc`、`cd_ipv6.cc`、`cd_tcp.cc`、`cd_udp.cc`、`cd_frag.cc`、`cd_hop_opts.cc`、`cd_gre.cc` 等）、`src/codecs/misc/`（`cd_vxlan.cc`、`cd_geneve.cc`、`cd_gtp.cc`、`cd_teredo.cc`、`cd_default.cc` 等）四个子目录覆盖链路到传输；注意本快照无独立 `src/decode/` 目录，标题中的 `src/decode` 是惯用名，需对照实际版本核验。整体反查关系为：`（字段见 05-02 ｜ 参数见 04-03 ｜ 原理见 06-03 ｜ 模块见 07-09）`。
+
+源码中还有若干不透明边界需要标注：`DAQ_Msg_h`、`DAQ_PktHdr_t` 的类型本体来自 libdaq 头文件，本仓库只以指针/句柄形式引用，内部布局不可依赖（字段见 05-07）；`CodecManager` 内部映射表在 `.cc` 中实现，头文件只暴露访问接口，跨版本偏移不可假设，需对照实际版本核验。
+
+### 4. 关键流程与调用链
+
+**装载期。** 引擎启动、配置上下文建立后（06-01），`load_codecs()` 被调用：`src/codecs/codec_api.cc` 先无条件装载 `cd_default`、`cd_ipv4`、`cd_ipv6`、`cd_tcp`、`cd_hopopts` 五个基础 Codec（源码注释分别说明原因——default 保证 omnipresent、ipv4/ipv6 依赖 fpdetect、tcp 提供特定符号、hopopts 提供 IPv6 选项检查符号），再在 `STATIC_CODECS` 构建分支下装载 `cd_eth`、`cd_vlan`、`cd_gre`、`cd_gtp`、`cd_vxlan`、`cd_teredo` 等其余实现。每条 `PluginManager::load_plugins(cd_xxx)` 把一个 `BaseApi` 数组交给插件管理器登记（06-14）；构建选项与静态/动态 Codec 的差异见 04-01，需对照实际版本核验。
+
+**每包解码主链。** `PacketManager::decode(Packet*, const DAQ_PktHdr_t*, const uint8_t* pkt, uint32_t pktlen, bool cooked, bool retry)` 的链路是：`Profile profile(decodePerfStats)` 开启耗时统计 → 构造 `RawData raw(p->daq_msg, pkt, pktlen)` 与 `CodecData codec_data(p->context->conf, ProtocolId::FINISHED_DECODE)` → 若 `cooked` 为真则置 `CODEC_STREAM_REBUILT`（标记这是流重组后的伪包，06-05）→ `p->reset()` 复位包对象、`p->pkth`、`p->pkt`、`p->pktlen` 赋值、`layer::set_packet_pointer(p)` → `s_stats[total_processed]++`。随后进入 `while (cm->get_codec(mapped_prot)->decode(raw, codec_data, p->ptrs))` 循环：每个 Codec 填充 `next_prot_id`、`lyr_len`、`invalid_bytes`、`proto_bits`，主循环据 `CODEC_COMPOUND` 分支处理复合层（如 VLAN 堆叠）或普通层，调用 `push_layer()` 记录层、缓存 VLAN 索引、累计 `p->proto_bits`，处理 `tunnel_bypass` 与 `CODEC_ETHER_NEXT` 合法性检查，再更新 `mapped_prot = cm->s_proto_map[to_utype(codec_data.next_prot_id)]`、收缩 `raw` 窗口、并把 `codec_data` 的易变字段复位，进入下一轮。
+
+**结束与失败处理。** 循环退出后，若 `prev_prot_id != ProtocolId::FINISHED_DECODE` 或 `num_layers == 0`，说明有 Codec 失败，调用 `handle_decode_failure()` 依 `CODEC_UNSURE_ENCAP` 等标志决定告警还是回退；若载荷相对 DAQ 记录的偏移不一致（`payload_offset_from_daq_mismatch`），置 `set_tunnel_bypass()`。最后固定收尾：`p->data = raw.data`、`p->dsize = (uint16_t)raw.len`、`p->proto_bits |= codec_data.proto_bits`，若协议位图仍为空则兜底为 `PROTO_BIT__OTHER`。这段收尾直接决定了后续检测引擎看到的载荷起点与长度（06-08）。
+
+**主动响应编码链。** 当内联模式需要构造响应包时，走的是相反方向：`PacketManager::encode()` 从最内层向外层嵌套调用各 Codec 的 `encode()`（`Buffer::allocate()` 先分配再写），`encode_format()` 与 `format_tcp()` 负责把伪包格式化为可检测形态，`encode_update()` 在 Snort 改动报文后重算校验和与长度，`encode_response()`、`encode_reject()` 生成 TCP RST/FIN 或 ICMP 不可达。源码注释强调编码「从最内层开始向外工作」，每层写完后外层才知道内层长度。动作触发与 DAQ verdict 见 06-12。
+
+**normalize 链。** `Normalizer::configure()` 从网络策略读取 `new_ttl`/`min_ttl`，若配置使 TTL 归一化生效则对 `NORM_IP4_BASE`、`NORM_IP6_BASE` 叠加对应的 `_TTL` 标志，把 `config.normalizer_flags` 写入 `nap->normal_mask` 并调用 `Norm_SetConfig()`。运行期 `Normalizer::eval(Packet*)` 每次检查 `!p->is_rebuilt() && !p->active->packet_was_dropped()`，满足才调用 `Norm_Packet(&config, p)`；真正改写前再由 `Normalize_IsEnabled()` 校验内联策略与掩码，`Normalize_GetMode()` 给出 TEST 或 ON。normalizer 的 `nin_normalize` API 把它登记为 `IT_PASSIVE` 检查器。整条「装载 → 逐层解码 → 分层记录 → 失败回退 → 载荷定界 → 条件归一化」链路见图 06-03-01。
+
+:::figure id=06-03-01 | name=包解码分层与 normalize 处理链路 | dir=TD
+node a "DAQ 原始帧<br/>RawData" blue
+node b "PacketManager::decode<br/>主循环" teal
+node c "CodecManager<br/>proto_map 选路" teal
+node d "各层 Codec<br/>link/ip/transport" teal
+node e "push_layer<br/>Packet::layers" teal
+node f "handle_decode_failure<br/>与载荷定界" red
+node g "Normalizer::eval<br/>Norm_Packet" amber
+node h "载荷<br/>p->data / dsize" green
+edge a -> b "帧与头部交付"
+edge b -> c "mapped_prot"
+edge c -> d "get_codec 选择"
+edge d -> e "next_prot 驱动"
+edge e -> b "推进 raw 窗口"
+edge b -> f "解码结束"
+edge f -> h "确定载荷边界"
+edge g -> h dashed "内联下改写"
+:::
+
+图 06-03-01 中实线为逐包解码的主链，虚线为 normalize 对载荷的可选改写路径；后者只有在内联策略下才真正生效。
+
+### 5. 配置与代码实例
+
+先给一段展示解码主循环真实形态的 C++ 节选，便于读者按图索骥到源码位置（节选自上游 master 快照，需对照实际版本核验）。
+
+```cpp
+// src/protocols/packet_manager.cc（节选）
+void PacketManager::decode(Packet* p, const DAQ_PktHdr_t* pkthdr,
+    const uint8_t* pkt, uint32_t pktlen, bool cooked, bool retry)
+{
+    RawData raw(p->daq_msg, pkt, pktlen);
+    CodecData codec_data(p->context->conf, ProtocolId::FINISHED_DECODE);
+    if (cooked)
+        codec_data.codec_flags |= CODEC_STREAM_REBUILT;
+
+    p->reset();
+    p->pkth = pkthdr; p->pkt = pkt; p->pktlen = pktlen;
+    layer::set_packet_pointer(p);
+
+    // 循环直到协议 ID 不再是有效值
+    while (cm->get_codec(mapped_prot)->decode(raw, codec_data, p->ptrs))
+    {
+        push_layer(p, codec_data, prev_prot_id, raw.data, codec_data.lyr_len);
+        p->proto_bits |= codec_data.proto_bits;
+        mapped_prot = cm->s_proto_map[to_utype(codec_data.next_prot_id)];
+        prev_prot_id = codec_data.next_prot_id;
+
+        const uint16_t curr_lyr_len = codec_data.lyr_len + codec_data.invalid_bytes;
+        if (curr_lyr_len > raw.len) { /* 置 DECODE_ERR_LEN 并返回 */ }
+        raw.len -= curr_lyr_len;
+        raw.data += curr_lyr_len;
+    }
+
+    if (prev_prot_id != ProtocolId::FINISHED_DECODE || p->num_layers == 0)
+        handle_decode_failure(p, raw, codec_data, unsure_encap_ptrs, prev_prot_id);
+
+    p->data = raw.data;
+    p->dsize = (uint16_t)raw.len;
+}
+```
+
+这段代码印证了三个机制事实：其一，`CodecData` 的初值指向 `ProtocolId::FINISHED_DECODE`，说明「终止态」由协议 ID 显式表达而非靠返回值约定；其二，`mapped_prot` 由 `s_proto_map` 按 `next_prot_id` 更新，解码是「协议 ID → Codec 索引」的表驱动分派，而不是硬编码的 `switch`；其三，载荷边界由 `raw.data`/`raw.len` 在循环收缩后一次性写入 `p->data`/`p->dsize`，因此任何一层的 `lyr_len` 计算错误都会直接污染检测缓冲（缓冲定位见 06-08）。
+
+再给一组最小 normalize 配置片段与核验命令。配置只给 mechanism 所需的最小键，完整参数与默认值见 04-04。
+
+```lua
+-- snort.lua 片段：normalizer 最小挂接（示意，完整参数见 04-04）
+normalizer = {
+    ip4 = { base = true, df = false, tos = false },
+    tcp = { base = false, ips = true, ecn = 'off' },
+}
+```
+
+```bash
+# 前置检查 → 执行 → 复核
+test -f src/protocols/packet_manager.cc && echo "decoder source ok"
+test -d src/decode && echo "decode dir exists" || echo "no standalone decode dir"
+snort -c lua/snort.lua -T 2>&1 | grep -i -e "normaliz" -e "codec"
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+decoder source ok
+no standalone decode dir
+Normalizer config:
+    ip4: base
+    tcp: ips
+```
+
+逐行判读如下，合计超过 150 字。第一行 `decoder source ok` 确认 `src/protocols/packet_manager.cc` 存在，这是解码主循环的真正所在，避免按惯用名去 `src/decode/` 检索而扑空。第二行 `no standalone decode dir` 由 `test -d src/decode` 的失败分支回显，正面印证本快照无独立解码目录——这正是第 1 节与 `SPEC.txt` 第 0.1 节的结论，若在你的版本里该命令回显 `decode dir exists`，则说明版本形态不同，须以 `upstream_src/snort3/snort3-master/` 下实际目录为准并标注「需对照实际版本核验」。`Normalizer config:` 段表明 normalizer 模块已被实例化并完成 `configure()`，其下 `ip4: base` 对应 `NORM_IP4_BASE` 已启用、`tcp: ips` 对应 `NORM_TCP_IPS` 已启用；这两行是 `Normalizer::show()` 的输出形态，若配置写了 `ip4 = { base = true }` 却在此缺失，先查 Lua 段缩进与键名拼写（Lua 语法错误会在更早阶段报出，见 04-08）。需要特别强调：这里只是「配置已加载」的证据，并不表示改写一定发生——`Normalize_IsEnabled()` 还会检查当前检查策略是否为 `POLICY_MODE__INLINE`，旁路模式下 `Normalize_GetMode()` 返回 `NORM_MODE_TEST`，报文不会被改动。真实改写效果与性能影响需在目标机型实测；解码深度、隧道层数对吞吐的影响同样需实测。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，**路径想当然是头号陷阱**。把解码写成 `src/decode/`、把 `Packet` 定义写成 `src/framework/packet.h`（真实在 `src/protocols/packet.h`），是检索源码时最常犯的两处错误；第 5 节的 `test -f` / `test -d` 组合是最快确认手段。凡遇惯用名与真实目录不一致，一律以仓库快照为准并标注「需对照实际版本核验」。
+
+第二，**不要把「解码」误当「重组」或「改写」**。Codec 只做逐帧校验，不懂跨包顺序；它不会替你拼接 TCP 分段，也不会消除 IP 选项歧义。把 evasion 检测的期待寄托在 Codec 上会落空——前者属于 normalize（本篇），后者属于 stream（06-05）。同理，normalize 只在内联下真正改写，IDS 旁路下它只输出测试结论，不要把「配了 normalizer」写成「流量已被规范化」。
+
+第三，**关注 `lyr_len` 与 `invalid_bytes` 的边界**。二者之和超过剩余长度会触发 `DECODE_ERR_LEN` 并提前结束解码；写自定义 Codec 时若把无效字节误算进有效长度，后续所有层的起点都会错位，表现为「端口解析对但内容匹配不到」。这类问题应回查该 Codec 的 `decode()` 实现与 `PacketManager::log_protocols()` 的逐层日志。
+
+第四，**深层封装与层数上限**。`push_layer()` 在超过 `get_max_layers()` 后仍继续解码但停止记录层，并置 `CODEC_LAYERS_EXCEEDED` 相关标志；这意味着极端嵌套下 `Packet::layers` 不再是完整协议栈。排查「层信息缺失」先看该标志与配置上限（参数见 04-03），深层封装的处理开销需在目标机型实测。
+
+第五，**封装回退依赖标志位组合**。`CODEC_ENCAP_LAYER`/`CODEC_UNSURE_ENCAP` 的语义有严格前提，源码注释明确「只有在先前设置过 DECODE_ENCAP_LAYER 时才能设置 UNSURE_ENCAP」。自定义 Codec 若误置这些位，可能导致错误地回退到保存的 `DecodeData` 快照，掩盖真正的解析失败。
+
+第六，**插件 ABI 与版本**。`CDAPI_VERSION` 随 `codec.h` 改动而提升，跨版本加载 SO Codec 必须校验版本（插件机制见 06-14）；DAQ 头类型来自独立 libdaq，随其版本变化（字段见 05-07）。依赖 `sizeof(Layer)`、`offsetof(Packet, ...)` 的外部工具在字段紧凑化与条件编译下会失效，需对照实际版本核验。
+
+第七，**能力边界不可写反**。加密载荷不可见，解码层只能看到 TLS 记录的明文头部，无法触达 HTTPS 正文；Hyperscan 是否启用不影响解码；许可按 GPLv2 处理，Talos 规则集另有独立许可约束。所有吞吐、pps、内存数字一律标注「需在目标机型实测」，不给绝对值；基准方法见 08-01，诊断树见 08-03。
+
+### 7. 小结与延伸阅读
+
+本篇沿「装载 → 逐层解码 → 分层记录 → 失败回退 → 载荷定界 → 条件归一化」讲清了解码机制：插件入口是 `src/framework/codec.h` 的 `Codec::decode()`，装载在 `src/codecs/codec_api.cc` 的 `load_codecs()`，调度在 `src/protocols/packet_manager.cc` 的 `PacketManager::decode()` 主循环，结果落在 `Packet::layers` 与 `p->data`/`p->dsize`；normalize 由 `src/network_inspectors/normalize/` 承担，以 `NormFlags` 位标志与 `NormMode` 双模式表达，只有内联策略才真正改写。必须再次明确：本快照无独立 `src/decode/` 目录，解码由 `src/codecs/` 与 `src/protocols/` 共同承担。
+
+延伸阅读：DAQ 收包与 verdict 见 06-02；解码得到的端口与协议位如何驱动 inspector 绑定见 06-04；重组后的伪包如何再次进入解码见 06-05；规则编译与检测求值见 06-06、06-08；插件装载与 ABI 见 06-14；`Packet`/`Layer`/`DecodeData` 字段见 05-02，`NormalizerConfig` 字段见 05-03；解码与 normalize 配置见 04-03、04-04；`src/codecs` 与 `src/protocols` 目录职责见 07-09；深度封装与解码异常的排障见 08-03。
+
+## 06-04 binder、wizard 与服务识别
+
+### 1. 背景与动机
+
+解码层（06-03）给出了包的协议类型、端口与载荷边界，但仅凭这些还不足以决定「由谁来读懂这个包的应用层」。现实网络里端口与服务早已不是一一对应：80 端口可能跑 HTTP/1、HTTP/2 明文或 WebSocket，443 端口后面可能是 TLS、HTTPS 或其他基于 TLS 的协议，企业内网还大量存在非标准端口上的自定义服务。如果引擎把「端口等于服务」写死，就会在流量稍微偏离教科书时立刻失准。Snort 3 为此把「选择哪个 inspector 来处理这条流」独立成一个机制：**binder** 依据一组可配置的匹配条件，在流建立时把流绑定（bind）到相应的 stream、service 或 passive inspector，并在服务信息后续明确时重新绑定；而 **wizard** 则在端口无法确定性判定的场合，用报文开头的字节前缀启发式地猜出「最可能的服务」，让正确的 inspector 尽早介入。二者配合，构成 Snort 3 的服务识别前置层。源码事实基准统一为「上游 master 快照（2026-11 抓取）」。
+
+必须先把能力边界钉死。wizard 的 `src/service_inspectors/wizard/dev_notes.txt` 开宗明义：wizard 用 hexes、spells 与 curses「判断流上最可能的服务」，它**并不确定地判定服务**——那是 service inspector 或 AppId 的职责（模块见 07-03）；它的目标只是「让最可能的 service inspector 尽快介入」。一旦匹配成功，或判定「再无可能匹配」，wizard 就从流上脱离。更重要的是，加密边界不变：加密流量载荷不可见，wizard 只能看到 TLS 记录等明文前缀，无法读取 HTTPS 正文；应用层识别依赖 inspector / binder / wizard 以及 appId 的协同（`src/network_inspectors/appid/`，原理见 06-10、模块见 07-02）。任何「从加密正文识别服务」的期待都不成立。
+
+第三个动机是**将配置与执行分离**。`src/network_inspectors/binder/dev_notes.txt` 说明：`BinderModule` 把 Lua `binder` 表转换成 `std::vector<Binding>`，在构造 `Binder` 时移交给它；流开始时遍历这个向量寻找适用绑定，绑定类型覆盖 stream inspector、service inspector 与 passive inspector。同一份文档还给出两条重要设计事实：其一，若未显式配置 binder 但配置了 wizard，`inspector_manager` 会为「除 wizard 自身以外的每个已配置 service inspector」创建一套默认绑定；其二，绑定是**可递归**的——一个策略可以自带 binder，层层嵌套。这些机制让「按资产、按网段、按 VLAN、按租户分配不同检测策略」成为配置层面的事，而不必改动引擎代码（策略结构字段见 05-03，配置见 04-02、04-04）。
+
+第四，服务识别是一个**事件驱动的状态迁移过程**，而非一次性的查表。binder 在 `configure()` 中通过 `DataBus::subscribe` 订阅一组内部事件：`PKT_WITHOUT_FLOW`、`FLOW_STATE_SETUP`、`FLOW_SERVICE_CHANGE`、`FLOW_ASSISTANT_GADGET`、`FLOW_STATE_RELOADED`，外加 AppId 的 `ANY_CHANGE` 与 stream 的 `HA_NEW_FLOW`。事件到达后由相应的 `DataHandler` 回调触发 `handle_packet()`、`handle_flow_setup()`、`handle_flow_service_change()` 等处理函数，重新计算绑定。这里有一处需要以源码为准的订正：`dev_notes.txt` 沿用了「eval 方法 / exec 方法」的旧表述，而在本快照的 `binder.cc` 中，`Binder` 类**没有**声明 `eval`/`exec` 覆盖方法，实际承担这一职责的是上述 `handle_*` 回调族与 `Stuff::apply_*`。凡与旧文档描述不一致处，一律以当前快照源码为准并标注「需对照实际版本核验」。本篇只讲机制，配置键全集归 04 册（参数见 04-04、参数见 04-05）。
+
+### 2. 核心概念
+
+**Binding：when + use 的一对配置结构。** `src/network_inspectors/binder/binding.h` 定义 `struct BindWhen`、`struct BindUse` 与 `struct Binding`（字段见 05-04）。从机制角度看，`when` 是一组「匹配条件」的集合，涵盖 IPS 策略号、协议、服务名、源/目的网络、源/目的端口、VLAN、接口、组、地址空间、租户，以及 client/server/either 角色；源码用 `criteria_flags` 位图（`BWC_IPS_ID`、`BWC_PROTO`、`BWC_SVC`、`BWC_NETS`、`BWC_PORTS`、`BWC_VLANS`、`BWC_INTFS`、`BWC_GROUPS`、`BWC_ADDR_SPACES`、`BWC_TENANTS` 等）记录到底给了哪些条件，`has_criteria()` 据此判断该条件是否参与匹配——这意味着「没写某个条件」和「写了 but 通配」是两回事。`use` 则描述匹配后的动作：动作语义有 `BA_RESET`、`BA_BLOCK`、`BA_ALLOW`、`BA_INSPECT` 四种；挂载目标有 `BW_PASSIVE`、`BW_CLIENT`、`BW_SERVER`、`BW_STREAM`、`BW_WIZARD`、`BW_GADGET` 等，分别对应 passive 数据检查器、客户端/服务端流检查器、双向流检查器、wizard 与最终的服务检查器（gadget）。`Binding::check_all()` 及各 `check_*()` 方法逐条件比对 `Flow` 或 `Packet`。
+
+**Binder 是被动检查器，靠事件驱动。** `binder.cc` 末尾的 `bind_api` 把 `Binder` 注册为 `IT_PASSIVE`、`PROTO_BIT__ANY_TYPE`，导出符号 `nin_binder`；工厂 `bind_ctor()` 从 `BinderModule` 取出两个 binding 向量构造对象。`Binder` 内部持有 `bindings` 与 `policy_bindings` 两个向量，以及 `default_ssn_inspectors[]` 数组——`configure()` 会按 `PktType` 取默认会话检查器：`stream_ip`、`stream_tcp`、`stream_udp`、`stream_icmp`、`stream_user`、`stream_file`。这意味着 stream 检查器的选择也被纳入了同一套绑定机制，`stream_tcp` 等名字是真实 inspector 名（细节见 06-05）。事件处理器里可见 `InspectorManager::get_binder()` 取全局 binder，再调用对应 `handle_*`。`handle_flow_setup()` 还先查询 `HostAttributesManager::get_host_attributes()`，依据主机属性表预设分片/TCP 策略，再做绑定查找——这是因为服务信息会影响绑定结果，必须前置（源码有 FIXIT 注释说明这段逻辑的归属仍待重构）。
+
+**clouseau 与 gadget：两阶段检查器。** 这是理解 binder 与 wizard 关系的关键。`dev_notes.txt` 指出：`Flow` 虽同时保留 `clouseau` 与 `gadget` 两个槽位，但任一时刻只绑定其中一个。wizard 作为 clouseau（临时的「侦探」）先挂上，用前缀探测服务；一旦服务确定，clouseau 被移除，正式的 service inspector 作为 gadget 安装。`Stuff::apply_service()` 把这条规则写成代码：优先使用 gadget（必要时按 `flow.ssn_state.snort_protocol_id` 用 `get_gadget()` 兜底），设置 `flow.set_gadget()`，并在协议 ID 仍为 `UNKNOWN_PROTOCOL_ID` 时用 gadget 的 service 回填；随后发布 `SERVICE_INSPECTOR_CHANGE` 事件。若没有 gadget 而有 wizard，则 `flow.set_clouseau(wizard)`；若两者都没有，则发布 `FLOW_NO_SERVICE`（且用 `svc_event_generated` 标志保证只发一次）。`Stuff::apply_session()` 则通过 `flow.set_client()` / `set_server()` 绑定双向会话检查器。
+
+**wizard 的三类探测手段。** `src/service_inspectors/wizard/` 目录提供三种服务猜测方式，差异见下表。
+
+| 方式 | 匹配规则 | 大小写 | 跨包状态 | 典型用途 |
+|---|---|---|---|---|
+| spells | `*` 通配任意长字节 | 不敏感 | `bookmark` 保存通配位置 | 文本协议命令前缀 |
+| hexes | `?` 通配单个字节 | 敏感 | 无跨包通配 | 二进制协议魔数 |
+| curses | 自定义 FSM 算法 | 依算法而定 | `CurseTracker` 维护状态 | 复杂二进制协议 |
+
+三类手段各有侧重：`spells` 与 `hexes` 都是模式前缀匹配，但源码明确二者差异——spells 允许通配任意个连续字符、大小写不敏感、在流起始处自动跳过前导空白；hexes 只允许单个通配字符、大小写敏感、直接处理原始字节。`curses` 用于「仅靠短前缀难以区分」的二进制协议，内置自定义状态机，配置可选值在 `wiz_module.cc` 中可见 `dce_smb`、`dce_udp`、`dce_tcp`、`mms`、`opcua`、`s7commplus`、`socks`、`sslv2`（完整清单与语义需对照实际版本核验，参数见 04-05）。
+
+**MagicBook / MagicPage / Wand。** `src/service_inspectors/wizard/magic.h` 定义 `struct MagicPage`（trie 的叶子节点，含 `next[256]` 转移数组、`any` 通配指针、`value` 命中值）与 `class MagicBook`（trie 本身，提供 `add_spell()`、`find_spell()`、`page1()`），派生出 `SpellBook` 与 `HexBook`；`enum class ArcaneType { TCP, UDP, ANY, MAX = ANY }` 区分协议族。每条流按方向持有一个 `MagicSplitter`（client-to-server 与 server-to-client 各一），其中 `Wand` 保存当前匹配进度——指向 hex/spell trie 当前页的指针，以及 curse 跟踪器向量。`Wizard::cast_spell()` 按 hexes → spells → curses 的顺序依次尝试，命中后写 `flow->service` 并返回真。
+
+**TCP 与 UDP 两条不同路径。** TCP 走 stream splitter：`MagicSplitter::scan()` 在有序数据可用时调用 `cast_spell()`，命中返回 `STOP` 并设置服务，随后 service inspector 的 splitter 被激活、流回卷到起点重新开始（这正是 `dev_notes.txt` 描述的行为）；未命中且 `wizard->finished(wand)` 或扫描字节数达到 `max(flow)` 时返回 `ABORT`、发布 `FLOW_NO_SERVICE`。UDP 没有流的概念，`Wizard::eval()` 只处理 UDP「meta-flow」的第一个包，不维护 bookmark，失败即 `flow->clear_clouseau()` 并累加 `udp_misses`。统计方面 `wizard.cc` 定义了 `tcp_scans/tcp_hits/tcp_misses`、`udp_scans/udp_hits/udp_misses` 等计数器，是判断「wizard 是否频繁放弃」的观测入口。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实头文件路径，字段明细引用 05 册，不重列。
+
+**binder 族。** `src/network_inspectors/binder/binding.h` 定义 `struct BindWhen`、`struct BindUse`、`struct Binding`，三者承载「条件 + 动作 + 检查方法」（字段见 05-04）。`src/network_inspectors/binder/binder.cc` 定义 `struct Stuff`（绑定结果的临时汇聚体，含 action、client、server、wizard、gadget、data 槽位与 `update()`/`apply_action()`/`apply_session()`/`apply_service()` 等方法）、`class Binder : public Inspector` 及一组 `DataHandler` 子类（`NonFlowPacketHandler`、`FlowStateSetupHandler`、`FlowServiceChangeHandler`、`AppIDServiceChangeHandler`、`AssistantGadgetHandler`、`StreamHANewFlowHandler`、`RebindFlow`）。`src/network_inspectors/binder/bind_module.h` 定义 `class BinderModule : public snort::Module`（模块见 07-02）。绑定表的解析在 `src/network_inspectors/binder/bind_module.cc`，API 导出在 `binder.cc` 末尾（符号 `nin_binder`）。
+
+**wizard 族。** `src/service_inspectors/wizard/magic.h` 定义 `struct MagicPage`、`class MagicBook`、`class SpellBook`、`class HexBook` 与 `enum class ArcaneType`（字段见 05-08）；`src/service_inspectors/wizard/magic.cc` 实现 `MagicBook::find_spell()` 的 trie 遍历。`src/service_inspectors/wizard/curse_book.h` 定义 `CurseDetails`、`CurseBook`、`CurseServiceTracker` 等 curse 结构；`dce_curse.h`、`mms_curse.h`、`opcua_curse.h`、`s7commplus_curse.h`、`socks_curse.h`、`ssl_curse.h` 是各类 curse 算法实现。`src/service_inspectors/wizard/wizard.cc` 定义 `class Wizard : public Inspector`、`class MagicSplitter : public StreamSplitter` 与 `struct Wand`，实现 `eval`、`scan`、`cast_spell`、`spellbind`、`cursebind`、`finished`、`reset` 等关键流程。`src/service_inspectors/wizard/wiz_module.h` 定义 `class WizardModule`（模块见 07-03）。
+
+**协同侧。** `src/flow/flow.h` 的 `Flow` 提供 `service`、`clouseau`、`gadget`、`ssn_state.snort_protocol_id` 等槽位与 `set_client()`/`set_server()`/`set_gadget()`/`set_clouseau()`/`clear_clouseau()` 接口（字段见 05-02）；`src/framework/data_bus.h` 的 `DataBus`/`DataHandler`/`DataEvent` 承载事件订阅发布（字段见 05-04，机制见 06-10）；`src/managers/inspector_manager.cc` 负责 inspector 注册与 `get_binder()`、`get_service_inspector()` 查找（装配见 06-01、06-14）；`src/network_inspectors/appid/` 提供 AppId 服务变更事件（模块见 07-02）。本节点名结构的整体反查为：`（字段见 05-04 ｜ 参数见 04-04 ｜ 原理见 06-04 ｜ 模块见 07-02）`。
+
+需注意的不透明边界：`CurseTracker` 的具体状态机在 `*_curse.cc` 内实现，头文件只暴露算法入口；AppId 的服务判定结构在 `src/network_inspectors/appid/` 内，本套资料不展开其字段；二者的内部布局均不可依赖，需对照实际版本核验。
+
+### 4. 关键流程与调用链
+
+**配置期装配。** Lua 配置加载后（06-01），`BinderModule` 把 `binder` 表解析成两个向量——普通 `bindings` 与 `policy_bindings`（后者对应递归策略绑定）；`bind_ctor(Module*)` 用它们构造 `Binder`。`Binder::configure()` 做四件事：`check_user_ids()` 校验策略 user id 唯一性（重复则 `ParseError`）；对每个 `Binding` 调 `Binding::configure(sc)`；按 `PktType` 填充 `default_ssn_inspectors[]`；订阅上述七类 DataBus 事件。若未配置 binder 但配置了 wizard，`inspector_manager` 会构造默认绑定（源码行为与 `dev_notes.txt` 一致），这批默认绑定把各 service inspector 挂到其常见端口上。
+
+**流开始时的绑定。** 事件 `FLOW_STATE_SETUP`（或 `PKT_WITHOUT_FLOW`、`HA_NEW_FLOW`）到达 → 对应 `DataHandler::handle()` 取 `InspectorManager::get_binder()` → `handle_flow_setup(Flow&, bool standby)`：先查 `HostAttributesManager` 预设策略，再 `get_policy_bindings(flow, service)` 与 `get_bindings(flow, stuff, service)` 逐条比对 `when` 条件 → `Stuff::update()` 把命中的 `use` 合并进结果（注意 `BW_WIZARD`、`BW_GADGET` 命中时直接返回，优先级高于普通槽位）→ `Binder::apply()` → `Stuff::apply_action(flow)` 把 `flow_state` 设为 `RESET`/`BLOCK`/`ALLOW`/`INSPECT` 之一（若不是 INSPECT 则后续不再挂检查器）→ `apply_session()` 绑定 client/server → `apply_service()` 决定 gadget 或 clouseau。对于无流包，`handle_packet()` 走 `get_bindings(Packet*, Stuff&)` 分支，再 `apply_action(Packet*)`：BA_RESET 调 `DetectionEngine::disable_all(p)` 与 `reset_session()`，BA_BLOCK 调 `disable_all(p)` 与 `block_session()`，BA_ALLOW 调 `trust_session()`。这几条直接体现了「binder 能决定跳过检测或放行会话」的能力，但真正的丢包仍需 DAQ verdict（06-12）。
+
+**服务识别与重绑定。** wizard 命中后设置 `flow->service`，服务变更可能由 service inspector、AppId 或 wizard 触发 → `FLOW_SERVICE_CHANGE`（或 AppId `ANY_CHANGE`）→ `handle_flow_service_change()` / `handle_appid_service_change()` → 再次 `get_bindings()` + `Binder::apply()` → gadget 被替换为更精确的 service inspector，`apply_service()` 发布 `SERVICE_INSPECTOR_CHANGE`。`is_ssl_transport_service()` 在流处理中识别 `https`、`smtps`、`imaps`、`pop3s`、`ftps`、`telnets`、`nntps`、`ldaps` 等加密传输服务，用于选择相应处理路径——注意这里只识别「服务类型」，不解密载荷。`FLOW_ASSISTANT_GADGET` 事件则走 `handle_assistant_gadget()` → `Stuff::apply_assistant()` → `InspectorManager::get_service_inspector(service)` → `flow.set_assistant_gadget()`，用于挂载辅助服务检查器。
+
+**wizard 探测链。** TCP 路径：流被绑定到 wizard（作为 clouseau）后，其 `get_splitter(c2s)` 返回 `MagicSplitter`；stream 在有序数据可用时调用 `MagicSplitter::scan()` → `count_scan()` → `wizard->cast_spell(wand, flow, data, len, wizard_processed_bytes)`。后者先把 `len` 截到 `max_search_depth - wizard_processed_bytes` 之内，再依次尝试 `spellbind(w.hex, ...)`（hex trie）、`spellbind(w.spell, ...)`（spell trie，内部调用 `MagicBook::find_spell()`）、`cursebind(...)`（各 curse 算法）；任一命中即写 `flow->service` 并返回真，scan 返回 `STOP`。若 `finished(wand)`（hex 与 spell 指针皆空且 curse 跟踪器清空）或累计字节达上限，则清空跟踪器、返回 `ABORT` 并发布 `FLOW_NO_SERVICE`。UDP 路径则由 `Wizard::eval()` 对首包直接调用 `cast_spell()`，失败即 `clear_clouseau()`。`max_search_depth` 默认 8192、范围 0:65535（参数见 04-05）。整条链路见图 06-04-01。
+
+:::figure id=06-04-01 | name=binder 绑定与 wizard 服务识别链路 | dir=TD
+node a "流建立事件<br/>FLOW_STATE_SETUP" blue
+node b "Binder get_bindings<br/>匹配 when" purple
+node c "Stuff update<br/>合并 use" purple
+node d "apply_session<br/>client / server" teal
+node e "Wizard 作 clouseau<br/>前缀探测" amber
+node f "service 命中<br/>FLOW_SERVICE_CHANGE" amber
+node g "gadget 安装<br/>service inspector" green
+node h "SERVICE_INSPECTOR<br/>_CHANGE 事件" green
+edge a -> b "事件驱动"
+edge b -> c "候选 binding"
+edge c -> d "设置会话"
+edge c -> e "端口不明确"
+edge e -> f "设置 flow.service"
+edge f -> b "触发重新绑定"
+edge b -> g "按服务选 inspector"
+edge g -> h "发布变更"
+edge e -> d dashed "未命中则解绑"
+:::
+
+图 06-04-01 中实线为「事件 → 绑定 → 识别 → 重绑定」的主链，虚线表示 wizard 放弃探测后从流上解绑、退回无服务状态。
+
+### 5. 配置与代码实例
+
+先给 `Stuff::apply_service()` 的真实源码节选，它是「clouseau 让位给 gadget」这一机制最直接的证据（节选自上游 master 快照，需对照实际版本核验）。
+
+```cpp
+// src/network_inspectors/binder/binder.cc（节选）
+void Stuff::apply_service(Flow& flow)
+{
+    if (data)
+        flow.set_data(data);
+
+    if (!gadget)
+        gadget = get_gadget(flow.ssn_state.snort_protocol_id);
+
+    if (gadget)
+    {
+        if (gadget != flow.gadget)
+        {
+            flow.set_gadget(gadget);
+            if (flow.ssn_state.snort_protocol_id == UNKNOWN_PROTOCOL_ID)
+                flow.ssn_state.snort_protocol_id = gadget->get_service();
+
+            DataBus::publish(intrinsic_pub_id,
+                IntrinsicEventIds::SERVICE_INSPECTOR_CHANGE,
+                DetectionEngine::get_current_packet());
+        }
+    }
+    else if (wizard)
+        flow.set_clouseau(wizard);
+    else if (!flow.flags.svc_event_generated)
+    {
+        DataBus::publish(intrinsic_pub_id,
+            IntrinsicEventIds::FLOW_NO_SERVICE,
+            DetectionEngine::get_current_packet());
+        flow.flags.svc_event_generated = true;
+    }
+}
+```
+
+这段代码说明了三件事：其一，gadget 优先于 wizard——只要 gadget 存在，就走 `set_gadget()` 并发布变更事件，wizard（clouseau）自然被替换；其二，当协议 ID 仍是 `UNKNOWN_PROTOCOL_ID` 时，用 gadget 的 service 回填，保证流键与服务信息一致；其三，`FLOW_NO_SERVICE` 只在首次触发（`svc_event_generated` 防重复），否则同一条流会反复发布同一事件干扰 AppId 等订阅者。注意 `get_gadget()` 在 `Stuff` 没给出 gadget 时按 `snort_protocol_id` 兜底查找，这说明「协议 ID → inspector」的映射也是绑定链路的一环。
+
+再给一组最小配置示例。配置键只给机制说明所需的最小集合，完整参数与默认值见 04-04、04-05。
+
+```lua
+-- snort.lua 片段：binder 与 wizard 最小挂接（示意，完整键见 04-04 / 04-05）
+wizard = {
+    spells = {
+        { service = 'http', proto = 'tcp', to_server = {
+            { spell = 'GET' }, { spell = 'POST' } } },
+    },
+    hexes = {
+        { service = 'ssl', proto = 'tcp', to_server = {
+            { hex = '16 03 ?? ??' } } },
+    },
+    curses = { 'socks', 'sslv2' },
+    max_search_depth = 8192,
+}
+binder = {
+    { when = { proto = 'tcp', ports = '80 8080' },
+      use  = { type = 'http_inspect' } },
+    { when = { proto = 'tcp', ports = '443' },
+      use  = { type = 'ssl' } },
+}
+```
+
+```bash
+# 前置检查 → 执行 → 复核
+test -f src/network_inspectors/binder/binder.cc && echo "binder source ok"
+test -f src/service_inspectors/wizard/wizard.cc && echo "wizard source ok"
+snort -c lua/snort.lua -T 2>&1 | grep -i -e "binder" -e "wizard" -e "bindings"
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+binder source ok
+wizard source ok
+bindings:
+   when = { proto = tcp, ports = 80 8080, ...
+   use = { type = http_inspect, action = inspect }
+   when = { proto = tcp, ports = 443, ...
+   use = { type = ssl, action = inspect }
+```
+
+逐行判读如下，合计超过 150 字。前两行 `binder source ok`、`wizard source ok` 是前置检查，确认两份核心源码存在，避免把目录名写错（`binder` 在 `src/network_inspectors/`，`wizard` 在 `src/service_inspectors/`，二者分属不同模块，模块见 07-02、07-03）。第三行 `bindings:` 来自 `Binder::show()`，它遍历 `bindings` 与 `policy_bindings` 两个向量并打印 `when`/`use` 对；若该行完全缺失，说明 binder 段未被解析或 binder 未被实例化，应回查 `lua/snort.lua` 的段名拼写与 inspector_manager 装配（06-01）。其后两组 `when/use` 条目与配置顺序一致，印证了「自上而下、先匹配先采用」的语义——源码中 `get_bindings()` 就是顺序遍历并在命中时累加进 `Stuff`，因此 `ports = '80 8080'` 的宽泛条目若写在 443 之前且端口有交集，会把本该进 TLS 的流截胡。`use` 里的 `action = inspect` 对应 `BA_INSPECT`，是默认值，表示流状态设为 INSPECT 并继续挂检查器；若写成 `block`，`apply_action()` 会把流状态设为 BLOCK 并调用 `disable_all()`，行为完全不同，排障时务必核对。`max_search_depth = 8192` 只是上限配置，不代表每条流都会扫描这么深——`cast_spell()` 用 `min()` 逐包截断，命中即停。示例中 `when` 行尾的省略号仅表示日志字段节选，非占位。所有识别准确率与吞吐影响需在目标机型实测。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，**binder 顺序敏感**。绑定向量自上而下遍历，`when` 命中即采用，宽泛条件写在前面会截胡后续精确条件；新增绑定时应把最具体的放前面，或用 `service` 条件区分。修改端口映射后必须同步更新 binder，否则流会被绑定到错误 inspector，表现为「规则加载正常但事件恒不出现」。
+
+第二，**clouseau 与 gadget 互斥，不要同时期待两者生效**。`Stuff::apply_service()` 明确「有 gadget 就用 gadget，否则退而用 wizard」。若为了调试把 wizard 与某个 service inspector 同时挂上，真正处理流的只会是后者；wizard 的 `tcp_hits` 不增长属于正常现象，而非 wizard 失效。
+
+第三，**wizard 只是猜测，不是权威结论**。它会在匹配或无可能匹配时主动脱离流（这正是 `dev_notes.txt` 强调的生命周期）。不要把 `flow.service` 的 wizard 结果当成确定服务——service inspector 或 AppId 后续仍可能通过 `FLOW_SERVICE_CHANGE` 触发重绑定。加密流量下 wizard 看不到明文正文，只能依赖 TLS 握手等可见前缀，这一点必须写进任何服务识别方案的前提。
+
+第四，**spells 与 hexes 的差异要用对场景**。文本协议命令前缀适合 spells（大小写不敏感、`*` 通配任意长度）；二进制魔数适合 hexes（`?` 通配单字节、大小写敏感）。`dev_notes.txt` 还揭示了一个已知限制：wizard 不能在模式上回退，符号优先级高于通配，因此 `"foobar"` 与 `"foo*"` 共存时，内容 `"foobaz"` 不会命中 `foo*`；二进制协议多个短模式交叉时也只取第一个匹配。设计模式集时要预留这种漏判，必要时改用 curses（自定义 FSM）。
+
+第五，**`max_search_depth` 是权衡点**。值过小会在前缀较长或非首包才出现特征时漏识别；值过大则延迟绑定、增加前缀扫描开销，并推迟 AppId 声明未知服务的时机（源码注释指出 AppId 依赖 wizard 尽早声明未知服务，以免 IPS 阻断被延迟）。取值需结合协议特征与实测确定（参数见 04-05，性能需在目标机型实测）。
+
+第六，**事件驱动带来的重入与竞态**。binder 同时订阅流建立、服务变更、AppId 变更、HA 新流、重载等多个事件，同一条流在一次会话中可能被多次 `get_bindings()`。自定义 inspector 若假设「只会绑定一次」，在服务变更重绑定后可能持有过期状态；应通过 `SERVICE_INSPECTOR_CHANGE` 等事件刷新，相关并发模型见 06-13 且需对照实际版本核验。
+
+第七，**能力边界与版本纪律**。Snort 3 是相对 Snort 2 重写的全新实现，配置为 Lua、不兼容 `snort.conf` 与插件 ABI，`tools/snort2lua/` 只是格式转换辅助；服务识别相关的 inspector 名、curses 清单、事件 ID 均以当前快照为准并标注「需对照实际版本核验」。IDS 旁路下 binder 的 `block`/`reset` 动作不会真正丢包，丢弃依赖 DAQ verdict（06-12）；Hyperscan 是否启用不影响服务识别；规则关键字与 Snort 2 有差异、不宣称完全兼容。所有吞吐与准确率结论需在目标机型实测，基准方法见 08-01，诊断树见 08-03。
+
+### 7. 小结与延伸阅读
+
+本篇讲清了服务识别的前置机制：binder 以 `BindWhen` + `BindUse` 组成的 `Binding` 向量为配置基础，在流建立与服务变更等事件驱动下，经 `Stuff::update()` 汇总、`apply_action()`/`apply_session()`/`apply_service()` 落地，决定流状态、会话检查器以及 gadget 或 clouseau；wizard 作为临时 clouseau，用 spells、hexes、curses 三类手段经 `MagicSplitter::scan()`（TCP）或 `Wizard::eval()`（UDP）猜测最可能服务，命中即写 `flow.service` 并触发重绑定，失败则解绑并发布 `FLOW_NO_SERVICE`。二者配合实现了「先按配置快速分流、再按报文特征精调」的两阶段识别，而加密载荷不可见与「wizard 非权威」是必须同时守住的两条边界。
+
+延伸阅读：解码得到的端口与协议位如何喂给绑定见 06-03；绑定后的 TCP 流如何重组见 06-05；规则如何按服务名路由到 service port group 见 06-06；检测求值中的缓冲与 `PduSection` 见 06-08；service inspector 如何用 splitter 与 FlowData 做协议解析见 06-10；事件总线与发布订阅见 06-10、06-14；`BindWhen`/`BindUse`/`MagicPage` 字段见 05-04、05-08；`Flow` 的 service/clouseau/gadget 槽位见 05-02；binder 与 wizard 配置见 04-04、04-05；`src/network_inspectors` 与 `src/service_inspectors` 目录职责见 07-02、07-03；服务识别异常的排障见 08-03、08-04。

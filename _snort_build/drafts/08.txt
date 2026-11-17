@@ -1,0 +1,837 @@
+# Snort 3 技术资料 · 08 运维、性能基准与排障
+
+## 08-01 性能基准方法与实测
+
+### 1. 背景与动机
+
+在运维与选型讨论里，最容易被脱口而出、也最容易误导人的一句话，就是抛开测试条件谈「Snort 3 能跑多快」。同一份规则集、同一台机器，在离线 pcap 回放、在线旁路与内联 IPS 三种形态下得到的数字可能相去甚远：前者没有网卡中断、NAPI 轮询与内核协议栈的开销，后两者则把抓包、队列调度与 verdict 回传全部计入链路。一旦缺少对测量条件的交代，所谓吞吐成绩既无法复现，也不能用于容量规划，甚至会把引擎本身的瓶颈与抓包路径、日志落盘或规则集的差异混为一谈。性能基准篇的动机，正是把「怎么测、测什么、怎么判读」这套方法论固定下来，让每次测量都可复现、可归因、可对照，而不是追求一个看起来漂亮的绝对值。
+
+Snort 3 的包处理是一条跨多层的流水线：从 `src/packet_io/sfdaq.cc` 收包，经 `src/codecs/` 与 `src/protocols/packet.cc` 解码、`src/network_inspectors/` 与 `src/service_inspectors/` 解析、流重组与检测求值，最后由 `src/loggers/` 输出（原理见 06-01）。这条链路上任一环节都可能成为瓶颈，因此基准不能只盯着一个总吞吐数字，而要同时观察吞吐、抓包丢包、包处理时延、内存占用与告警率等多个指标，并把它们与采集到的计数器一一对应。本篇的事实基准统一写「上游 master 快照（2026-11 抓取）」，所有示例中的数值都只是用来演示判读方法的**示意值，需本机实测替换**，绝不作为官方成绩引用；任何吞吐、pps、丢包率、内存占用结论一律标注「需在目标机型实测」。需要反复强调的是，测量行为本身也会扰动被测系统：打开 profiler 与逐包统计会带来额外开销，因此基准配置要单独固化，不能与生产配置混用，具体开销需在目标机型实测。
+
+这里还要点明基准产物的归档要求。一次可追溯的测量应保留四样东西：构建产物及其来源（版本基准写「上游 master 快照（2026-11 抓取）」，具体版本号以 `CMakeLists.txt`、`ChangeLog` 为准但需对照实际版本核验）、完整的配置与规则文件、流量样本的校验值与时长、以及采集到的原始计数器输出。缺任何一样，事后都无法回答「当时到底测了什么」，也无法在规则集或构建变化后做有效回归。尤其在多人协作的容量评估里，常常出现同一份报告里的两个数字其实来自不同构建变体的情况；把 Hyperscan 是否启用、DAQ module 是否一致一并归档，能避免把正常的引擎回退误判为性能倒退。归档本身不改变被测系统，却是让基准结论可被质疑、可被复现的前提。
+
+### 2. 核心概念
+
+第一个概念是**指标定义与口径**。吞吐通常有两个口径：按字节计与按包计（pps），二者不能互相替代——小包密集流量下 pps 先撞上限，大包流量下带宽先撞上限，因此基准必须同时记录两者。除吞吐外还必须看抓包丢包（capture loss，反映收包与处理能力是否匹配）、包处理时延（区分平均与尾部，尾部更能暴露卡顿）、内存占用（随流表与重组缓冲增长）以及告警率（告警写出本身也是负载）。这些指标的采集点分散在不同模块，口径不统一时很容易得出互相矛盾的结论，所以第一步是固定口径，再谈数值。
+
+第二个概念是**离线 pcap 基准与在线 DAQ 基准的分野**。用 `snort -r` 回放脱敏 pcap 的好处是可重复、环境干净、便于做 A/B；缺点是它绕过了真实网卡的中断聚合、队列与内核协议栈，也绕过了内联 verdict 回传，因此得到的是引擎处理上限而非线上实际吞吐。在线基准则通过 DAQ module（module 名需对照实际版本核验）接真实或打流流量，能反映抓包与内联路径的真实成本，但可复现性更差，需要固定打流速率与时长。两种基准各有用途：离线用于回归与快速对比，在线用于上线前容量确认，不能拿离线数字直接承诺线上表现。
+
+采样窗口的选择同样属于口径问题。窗口太短，偶发的回收、日志轮转或流表老化会被放大成趋势；窗口太长，则配置漂移与环境噪声更难察觉。实践上按 `packets` 与 `seconds` 双周期同时设值，让计数器在包数先到或时间先到时输出，便于交叉核对；汇总类选项还能给出整场总计，用来验证分段报告是否累加正确。无论采用哪种窗口，都要把预热段与采样段分开，并在报告里注明是否需要 `--pcap-loop` 把短样本拉长到足够长度。
+
+第三个概念是**基线、对照与单变量原则**。一次严谨的测量先建立基线配置，记录完整配置与版本来源（版本基准写「上游 master 快照（2026-11 抓取）」，具体版本号以 `CMakeLists.txt`、`ChangeLog` 为准但需对照实际版本核验），然后每次只改变一个变量——线程数、DAQ 批处理大小、搜索引擎、规则集规模等——其余条件保持不动。每轮应预热后再采样，并重复多次取中位数，避免把偶然的抖动当成结论。第四个概念是**采集面与产物**：`perf_monitor` 提供周期性计数器快照，`profiler` 给出时间与规则级开销分布，`latency` 记录超时与 fastpath 事件，三者互补。第五个概念是**示意值纪律**：示例数字仅用于演示如何读字段，标注「示意值，需本机实测替换」，不得当成官方成绩或跨机型通用值。最后要守住能力边界：加密载荷不可见，基准流量里的 TLS 密文正文不参与内容匹配（原理见 06-04）；线程与进程模型以实际版本为准，本套资料不断言固定线程数（原理见 06-13）。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实源码路径，字段明细一律引用 05 册，不重列字段表。**统计与计数层**：`src/network_inspectors/perf_monitor/` 下 `perf_module.cc` 定义配置参数与周期报告逻辑，`perf_monitor.cc`、`perf_tracker.cc`、`flow_tracker.cc`、`cpu_tracker.cc` 是采集主体，`perf_pegs.h` 列出计数器项（如 `packets`、`flow_tracker_creates`），`text_formatter.cc`、`json_formatter.cc`、`csv_formatter.cc` 决定输出形态，`perf_reload_tuner.h` 涉及热重载时的参数调整；计数器的字段与类型见 05-09。**开销剖析层**：`src/profiler/profiler_module.cc` 暴露 `modules`、`rules`、`memory` 三张剖析表，`time_profiler.cc`、`rule_profiler.cc`、`memory_profiler.cc` 是各自实现，`profiler_defs.h` 定义统计口径，字段见 05-05。**时延护栏层**：`src/latency/latency_module.cc` 与 `packet_latency.cc`、`rule_latency.cc`、`latency_stats.h` 记录包级与规则级超时，字段见 05-03。**输出格式与入口**：`src/main/stats_output_format.h` 的 `enum class StatsOutputFormat { Text, Json }` 决定统计输出是文本还是 JSON；命令行开关定义在 `src/parser/cmd_line.cc` 与 `src/main/snort_module.cc`（如 `-T`、`-r`、`-z`、`--daq*`），配置入口在 `lua/snort.lua`。**线程与收包**：`src/main/analyzer.cc`、`numa.cc` 与 `src/packet_io/trough.cc`、`sfdaq.cc` 涉及编排与收包（模块见 07-12、07-07）。
+
+三类采集面的定位、关键键与判读用途对照见下表，完整参数仍归 04 册（参数见 04-02、04-07）：
+
+| 采集面 | 源码位置 | 关键键或计数器 | 判读用途 |
+|---|---|---|---|
+| perf_monitor | src/network_inspectors/perf_monitor/ | packets、seconds、format | 周期吞吐与流创建计数 |
+| profiler 规则 | src/profiler/profiler_module.cc | rules.show、count、sort | 定位高耗时规则 |
+| profiler 时间与内存 | src/profiler/ | modules、memory 表 | 分层耗时与内存热点 |
+| latency | src/latency/latency_module.cc | max_time、packet_timeouts | 超时与 fastpath 事件 |
+| memory | src/memory/memory_module.cc | cap、allocated、reap_failures | 内存占用与回收失败 |
+
+表中 `format`、`sort` 等键的完整取值见 04 册；`allocated`、`reap_failures` 为计数器名而非配置键，需对照实际版本核验。
+
+必须标注的不透明边界：各计数器内部聚合结构、`perf_tracker` 的私有状态、`profiler` 节点树的具体布局都在对应 `.cc` 内，头文件仅暴露形态，属不透明句柄，不可依赖内部字段偏移，需对照实际版本核验。整组结构跨册反查统一写为：`（字段见 05-09 ｜ 参数见 04-07 ｜ 原理见 06-13 ｜ 模块见 07-13）`。其中字段归 05-09 是因为计数器与追踪器结构由该篇定义，参数归 04-07 是因为命令行与统计开关由 04 册权威给出，原理归 06-13 是因为线程与编排模型由该篇讲解，模块归 07-13 是因为 `src/profiler/`、`src/latency/`、`src/utils/` 的目录职责由该篇介绍。
+
+### 4. 关键流程与调用链
+
+一次可复现的基准按「校验 → 选型 → 加载 → 采集 → 对照 → 判读」六步展开。校验阶段先用 `snort -V` 确认构建产物、`snort --help` 核对选项是否存在，再用 `snort -T` 做配置与规则自检（`src/parser/cmd_line.cc`、`src/main/snort_module.cc` 的选项经 `src/parser/parse_conf.cc` 落地）；`-T` 只解析不抓包，能把配置错误挡在正式测量之前。选型阶段决定用离线 pcap 还是在线 DAQ：离线用 `snort -r`，在线用 `--daq` 加 `--daq-mode`（取值 passive、inline、read-file，见 `src/main/snort_module.cc` 与 `src/packet_io/sfdaq_module.cc`），DAQ module 名需对照实际版本核验。加载阶段固化基线配置，必要时用 `--pcap-loop` 让短 pcap 循环回放以获得稳定采样窗口。采集阶段由 `perf_monitor` 按 `packets` 或 `seconds` 周期输出计数器，`profiler` 在结束时给出时间与规则分布，`latency` 持续监听超时与 fastpath 事件；三者的输出格式由 `src/main/stats_output_format.h` 与各自的 `format` 键决定。对照阶段固定流量与配置，只改一个变量并重复多轮。判读阶段把吞吐、丢包、时延、内存、告警率放到一起看：吞吐上不去时先看抓包丢包判断瓶颈是否在收包侧，再看 profiler 热点判断是否在规则匹配侧，最后看 latency 是否频繁触发 fastpath——触发意味着部分包跳过检测，结果语义已改变。完整闭环见图 08-01-01。
+
+:::figure id=08-01-01 | name=性能基准的可复现测量闭环 | dir=TD
+node a "确定指标与目标<br/>吞吐 丢包 时延" blue
+node b "选择流量样本<br/>脱敏 pcap 或在线" blue
+node c "固定配置基线<br/>snort -T 自检" amber
+node d "施加负载<br/>snort -r 或 DAQ" teal
+node e "采集计数器<br/>perf_monitor" teal
+node f "单变量 A/B 对照<br/>线程 队列 引擎" purple
+node g "判读与记录结果" green
+node h "瓶颈定位<br/>profiler 与 latency" red
+edge a -> b "明确输入"
+edge b -> c "样本就绪"
+edge c -> d "基线配置"
+edge d -> e "运行中采集"
+edge e -> f "更换对照变量"
+edge f -> g "差异归因"
+edge e -> h dashed "异常触发"
+edge h -> f dashed "回到对照"
+:::
+
+### 5. 配置与代码实例
+
+先看采集面最小配置。下列键名均已在上游对应模块的 `Parameter` 表中核实，完整参数归 04 册（参数见 04-02、04-07），本篇只给基准场景所需片段：
+
+```lua
+-- snort.lua 片段：性能采集最小配置（完整参数见 04-02、04-07）
+perf_monitor = {
+    base = true, cpu = true,
+    packets = 10000, seconds = 60,
+    output = 'console', format = 'csv', summary = true
+}
+profiler = { rules = { show = true, count = 10, sort = 'total_time' } }
+latency = { packet = { max_time = 500 }, rule = { max_time = 500, suspend = true } }
+```
+
+执行按「前置校验 → 回放 → 复核」闭环，`-T` 先挡配置错，`--pcap-loop` 让短样本循环到足够长度：
+
+```bash
+snort -c lua/snort.lua -T 2>&1 | tail -20
+snort -c lua/snort.lua -r sample.pcap -A fast -l ./out --pcap-loop 3
+```
+
+示例输出如下，具体格式需对照实际版本核验；其中数值均为示意值，需本机实测替换：
+
+```text
+Perfmon: sample interval 60 seconds, packet count 10000
+perf_monitor: packets=10000 flow_tracker_creates=1287
+latency: max_usecs=312 packet_timeouts=0 rule_eval_timeouts=2
+rule profile: top rules by total_time (示意值，需本机实测替换)
+sid=1000001 total_time=12345 us checks=9012 matches=12
+```
+
+逐行判读如下，合计超过一百五十字。首行回显采样口径：既设了按包周期又设了按秒周期，说明 `packets` 与 `seconds` 两个键都被解析，实际以先到者触发报告；若这行缺失，先确认 `perf_monitor` 段未被 `-T` 之前的配置错误阻断。第二行 `packets=10000` 是本次窗口处理的包数，应与回放 pcap 的包数乘 `--pcap-loop` 次数相符，明显偏小说明有包被解码丢弃或未进入检测；`flow_tracker_creates=1287` 反映新建流追踪器数量，与流量五元组多样性正相关，数值为示意值、需本机实测替换。第三行 `max_usecs=312` 是窗口内观测到的最大包处理微秒数，尾部值比均值更能暴露卡顿；`packet_timeouts=0` 表示没有包触发 fastpath，而 `rule_eval_timeouts=2` 说明有两次规则求值超时，若 `suspend = true` 生效，应能在日志中看到对应规则树被暂时挂起与恢复的事件——fastpath 与挂起都会改变检测语义，不能拿它换吞吐。第四、五行是规则剖析 Top N，`total_time` 高而 `matches` 低的规则最值得优化，通常是 fast pattern 选得不好或 pcre 回溯过重（原理见 06-07、06-08）；`count = 10` 决定只打印前十条，排查时应结合 `sort = 'total_time'` 与 `sort = 'total_used'` 交叉看。所有数值均为示意值，需在目标机型实测替换，不得作为官方成绩。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，**不要把离线 pcap 数字当线上承诺**。`snort -r` 绕过了网卡中断、队列与 verdict 回传，只能反映引擎处理上限；上线容量结论必须补一轮在线 DAQ 基准。第二，**测量本身有开销**。打开 `perf_monitor` 的 `cpu`/`flow`/`flow_ip` 与 profiler 的细粒度表都会扰动结果，基准配置应独立固化，并把采集开销作为单变量单独评估，需在目标机型实测。第三，**冷启动与预热要分开**。规则编译期的 fast pattern 构建与自动机编译是一次性成本（原理见 06-06、06-07），首次加载耗时不能混进稳态吞吐；每轮应先预热再采样。第四，**日志路径可能是真瓶颈**。基准里把 `alert_fast` 写到本地磁盘，I/O 会先于检测饱和；把日志输出当变量隔离测试，或按 03-04 的输出管道接到内存缓冲。第五，**校验和开关要显式固定**。`-k` 的可选值为 `all|noip|notcp|noudp|noicmp|none`（见 `src/main/snort_module.cc`），默认 `all`；校验和错误会让包在解码阶段被丢弃，若不统一该值，A/B 对比会失真。第六，**示意值纪律不可破**。任何吞吐、pps、时延数字都要标注「需在目标机型实测」，绝不写成官方成绩。第七，**单变量与重复采样**。一次只改一个变量、每轮多次取中位数，才能把抖动与真实差异分开。第八，**fastpath 与挂起改变语义**。`latency` 的 `fastpath`/`suspend` 是为过载保护设计的（见 08-02），一旦触发，被跳过的包不再完整求值，拿这种状态做功能或吞吐结论都不成立。第九，**调试构建不可作基准**。带 Sanitizer 或单测的构建性能代价极高（见 02-05），基准必须用生产构建。第十，**能力边界**：加密载荷不可见，TLS 密文正文不参与内容匹配；线程与进程模型以实际版本为准，本套资料不断言固定线程数。第十一，**构建变体要一致**。Hyperscan 是否编译进去、是否为调试构建，都会改变性能画像；A/B 必须在同一构建产物上进行，否则比较的是两套不同引擎实现。第十二，**先判定预热是否结束**。观察 `flow_tracker_creates` 是否趋于稳定、计数器是否进入平台期，再开始正式采样，把一次性编译成本排除在稳态结论之外。
+
+### 7. 小结与延伸阅读
+
+本篇把性能基准收敛为一套可复现的方法：先固定指标口径与版本基准，再在离线 pcap 与在线 DAQ 之间按用途选型，用 `snort -T` 挡住配置错误，由 `perf_monitor`、`profiler`、`latency` 三类采集面取数，最后按单变量对照与多轮中位数判读。核心心法是「数字必须带条件、示例必须标示意、结论必须本机实测」，把吞吐、丢包、时延、内存与告警率放在一起看，先定位瓶颈属于收包侧还是匹配侧，再决定调优动作（见 08-02）。延伸阅读：包处理流水线总览见 06-01；抓包与 verdict 见 06-02；应用识别与加密载荷边界见 06-04；规则编译与 fast pattern 见 06-06、06-07；检测 eval 见 06-08；线程与进程模型见 06-13；计数器与追踪器字段见 05-09、05-05、05-03；命令行与统计开关见 04-07，Lua 顶层段见 04-02；`src/profiler/`、`src/latency/`、`src/utils/` 目录职责见 07-13，`src/main`、`src/control` 见 07-12，`src/packet_io` 见 07-07。
+
+## 08-02 性能调优：线程、规则集、内存与 DAQ
+
+### 1. 背景与动机
+
+有了可复现的基准方法（见 08-01），调优才从「凭感觉改配置」变成「针对瓶颈下药」。Snort 3 的性能并非由某一个开关决定，而是线程编排、规则集规模、内存上限与 DAQ 收包四个维度共同作用的结果：线程数决定并发度，却也带来锁竞争与跨 NUMA 节点访问的代价；规则集越大，编译期的自动机构建与运行期的候选集越多；流表与重组缓冲的内存上限设得过低会让长连接被提前老化，设得过高又会把内存吃满；DAQ 的批处理大小与抓包模式直接影响每次系统调用能收多少包。更棘手的是这四类杠杆彼此耦合——加线程可能把内存带宽打满，放大 DAQ 批处理可能降低单包时延的确定性，换搜索引擎可能改变编译期内存峰值。因此调优的目标不是找到某个「最优参数」，而是在目标机型与真实流量下，用单变量对照把每一类杠杆的边际收益测出来，再按瓶颈位置组合使用。本篇坚持同一条事实纪律：所有示例数值均为示意值、需本机实测替换，任何吞吐、pps、内存结论一律标注「需在目标机型实测」，不给绝对值；线程与进程模型以实际版本为准，本套资料不断言固定线程数。事实基准仍为「上游 master 快照（2026-11 抓取）」。
+
+这四个维度之所以必须放在一起看，是因为它们共享同一份内存带宽与同一组缓存。单独把线程数拉高，在流表哈希竞争激烈时并不会线性提升吞吐；单独把规则集裁到很小，若 DAQ 侧仍在丢包，总吞吐也不会改善。调优的顺序因此重要：先确认收包侧没有丢包，再处理内存是否够用，最后才动规则与线程，否则很容易在错误的位置反复试错。另一个常被忽略的前提是，调优只能在功能正确的前提下谈——若某次改动让本应命中的规则不再命中，无论吞吐提升多少都必须回退。
+
+### 2. 核心概念
+
+第一个概念是**并发与绑核维度**。`src/main/snort_module.cc` 中 `-z`／`--max-packet-threads` 定义包线程数上限，`--max-procs` 定义进程数，二者配合 `src/main/numa.cc`、`analyzer.cc` 决定并行度与 NUMA 亲和性；其帮助文本对默认值有说明，但线程与进程模型以实际版本为准，需对照实际版本核验，本套资料不断言固定线程数。并发度过小浪费核，过大则因共享流表锁与缓存抖动反而变慢，因此要按核数与 NUMA 拓扑实测。
+
+第二个概念是**规则集与搜索引擎维度**。规则条数、fast pattern 的选择共同决定候选 otn 数量（原理见 06-06、06-07）；`search_engine` 段的 `search_method` 在上游默认为 `ac_bnfa`，Hyperscan 是可选加速、受构建开关保护，缺失时回退 AC/BNFA（能力边界见 06-07）；`split_any_any`、`max_pattern_len` 等键影响 any-any 组拆分与超长模式处理（键名已核实，完整参数见 04-02）。`detection` 段的 `offload_limit`、`offload_threads` 涉及离载执行，模型细节以实际版本为准。
+
+这里还要理解候选集规模的乘数效应。fast pattern 选得过于宽泛时，单包会命中大量候选 otn，后续 eval 阶段被迫逐条求值，规则条数的增长会放大成候选数量的更快增长；反之选得过于苛刻会让真正该命中的规则漏掉首轮筛选。这个权衡只能通过 profiler 的 `total_time` 与 `matches` 两列联合观察，任何「规则数减半性能翻倍」式的口号都不成立，需在目标机型实测。
+
+第三个概念是**内存维度**。这里有两层：一是 `stream`／`flow` 侧的流表与重组内存上限（键名需对照实际版本核验，见 `src/stream/`、`src/flow/`），二是 `src/memory/` 提供的全局内存治理，`memory` 段有 `cap`、`interval`、`prune_target`、`threshold` 等键；内存上限过低会误伤正常长连接，过高则放大 GC／回收压力，需在目标机型实测。`latency` 段的包级／规则级 `max_time`、`fastpath`、`suspend` 是过载护栏而非提速开关，触发即意味着语义被牺牲。
+
+第四个概念是**DAQ 收包维度**。`daq` 段的 `batch_size`（对应 `--daq-batch-size`）、`snaplen`、`modules` 与 `mode` 决定每次收包批量、抓包截断长度与内联能力；DAQ module 名需对照实际版本核验，module 决定抓包与内联能力（见 06-02）。批处理大能摊薄系统调用成本，却增加排队时延；snaplen 截短会丢失载荷尾部，直接导致依赖尾部的规则漏报。第五个概念是**越调越慢**：任何调优都必须回到 08-01 的同一套基准复测，只有在目标机型上被重复观测到的改善才算有效。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实源码路径，字段明细一律引用 05 册，不重列字段表。**并发编排层**：`src/main/analyzer.cc`、`numa.cc`、`process.cc`、`swapper.cc` 涉及线程编排、绑核、进程与热重载；命令行与守护参数定义在 `src/main/snort_module.cc`（`-z`、`--max-procs`、`--daq-batch-size` 等），模型以实际版本为准（字段见 05-03）。**规则与匹配层**：`src/detection/fp_config.cc`、`detection_module.cc` 承载 `search_engine` 与 `detection` 段参数（参数见 04-02）；`src/framework/mpse.h`、`src/search_engines/hyperscan.cc` 与 AC/BNFA 回退实现决定匹配路径；fast pattern 中间产物与分组见 `src/detection/fp_create.cc`（原理见 06-06、06-07，字段见 05-06）。**内存治理层**：`src/memory/memory_module.cc`、`memory_cap.cc`、`memory_allocator.cc` 实现 `memory` 段；流表与重组侧在 `src/flow/flow_cache.cc`、`src/stream/`（字段见 05-09、05-02，键名需对照实际版本核验）。**收包适配层**：`src/packet_io/sfdaq.cc`、`sfdaq_config.cc`、`sfdaq_instance.cc`、`sfdaq_module.cc` 与 `daqs/` 构成 DAQ 适配（字段见 05-07，模块见 07-07）。**护栏与观测层**：`src/latency/latency_module.cc` 与 `src/profiler/profiler_module.cc` 分别提供护栏与剖析数据（字段见 05-03、05-05）。
+
+四类杠杆的入口、作用点与主要风险对照见下表，参数全集归 04 册（参数见 04-02、04-03）：
+
+| 杠杆 | 配置或命令入口 | 源码作用点 | 主要风险 |
+|---|---|---|---|
+| 并发 | -z、--max-procs | src/main/analyzer.cc、numa.cc | 锁竞争、跨 NUMA 访存 |
+| 规则集 | search_engine、fast_pattern | src/detection/fp_config.cc、src/search_engines/ | 候选膨胀、编译期内存 |
+| 内存 | memory、stream 与 flow 上限 | src/memory/、src/flow/ | 长连接提前老化 |
+| DAQ | batch_size、snaplen、mode | src/packet_io/sfdaq_module.cc | 排队时延、截断漏报 |
+| 护栏 | latency.max_time、suspend | src/latency/latency_module.cc | 语义被跳过 |
+
+表中 stream 与 flow 侧内存上限的键名需对照实际版本核验；各杠杆的实测收益需在目标机型实测，不给绝对值。
+
+必须标注的不透明边界：`numa.cc` 的拓扑结构、`memory_cap` 的内部记账、`Mpse` 内部自动机与 `sfdaq_instance` 的私有状态都在对应 `.cc` 内，头文件仅暴露形态，属不透明句柄，不可依赖内部字段偏移，需对照实际版本核验。整组结构跨册反查统一写为：`（字段见 05-06 ｜ 参数见 04-02 ｜ 原理见 06-13 ｜ 模块见 07-12）`。其中字段归 05-06 是因为搜索引擎与 fast pattern 结构由该篇权威定义，参数归 04-02 是因为 `search_engine`、`memory`、`daq` 等 Lua 段由 04 册给出，原理归 06-13 是因为线程与资源隔离模型由该篇讲解，模块归 07-12 是因为 `src/main`、`src/control` 的目录职责由该篇介绍。
+
+### 4. 关键流程与调用链
+
+调优遵循「先测后调、单变量复测」的闭环，起点永远是 08-01 的基准数据。第一步用 profiler 定位瓶颈：若时间主要花在收包与解码，问题偏向 DAQ 侧，应检查 `batch_size`、`snaplen` 与 module 选择；若热点集中在 fast pattern 命中与规则 eval，问题偏向规则集侧，应回看 fast pattern 质量、`search_method` 与 `split_any_any`。第二步按瓶颈选杠杆：并发侧用 `-z`／`--max-packet-threads` 与绑核做 A/B，内存侧调整 `memory` 段与 `stream`／`flow` 上限，规则侧精简冗余规则、显式指定 `fast_pattern`、在确认 Hyperscan 已进入可选集后再切换引擎。第三步用 `latency` 的 `max_time`、`suspend` 设护栏，避免个别慢规则拖垮整体；注意护栏触发会改变语义，不能当作提速手段。第四步回到完全相同的基准条件复测，只保留被重复观测到改善的改动，其余回退。每轮改动都应连同基准输出一起归档，形成可回退的变更记录：改了哪个键、旧值新值分别是什么、在哪台机器哪份流量上测的、改善幅度是否在重复轮次中稳定。没有这份记录，多轮调优后很难说清当前配置为何是这样，上线出问题时也无法快速回退到上一个已知良好状态。回滚路径应在调优开始前就明确，而不是等到指标劣化后才临时组织。各类杠杆的作用点与相互制约见图 08-02-01。
+
+:::figure id=08-02-01 | name=性能调优的杠杆、作用点与相互制约 | dir=TD
+node a "线程与绑核<br/>-z 与 numa" blue
+node b "DAQ 队列与<br/>批处理大小" blue
+node c "规则集规模与<br/>fast pattern" amber
+node d "搜索引擎<br/>Hyperscan 与 AC" purple
+node e "stream 与 flow<br/>内存上限" teal
+node f "latency 护栏<br/>fastpath 挂起" red
+node g "profiler 实证<br/>先测后调" green
+node h "吞吐与内存变化" green
+edge a -> h "并行度"
+edge b -> h "收包效率"
+edge c -> d "模式规模"
+edge d -> h "匹配速度"
+edge e -> h "重组内存"
+edge f -> h dashed "过载保护"
+edge g -> a dashed "指导线程"
+edge g -> c dashed "指导规则"
+edge g -> e dashed "指导内存"
+:::
+
+### 5. 配置与代码实例
+
+先看调优相关的配置骨架。下列键名均在上游对应模块的 `Parameter` 表中核实，完整参数归 04 册（参数见 04-02、04-03），本篇只给调优场景所需片段：
+
+```lua
+-- snort.lua 片段：调优示例（完整参数见 04-02、04-03）
+search_engine = { search_method = 'ac_bnfa', split_any_any = true, max_pattern_len = 0 }
+detection = { offload_limit = 99999, offload_threads = 0 }
+-- DAQ module 名需对照实际版本核验，此处 afpacket 仅作示意
+daq = { batch_size = 64, snaplen = 1518,
+        modules = { { name = 'afpacket', mode = 'passive' } } }
+memory = { cap = 0, interval = 50, prune_target = 1048576, threshold = 100 }
+latency = { packet = { max_time = 500, fastpath = false },
+            rule = { max_time = 500, suspend = false } }
+```
+
+执行同样按「校验 → 应用 → 复核」闭环；`-z 4` 是示例线程数而非默认值，需按实际核数与 NUMA 拓扑替换：
+
+```bash
+snort -c lua/snort.lua -T 2>&1 | grep -i -e 'thread' -e 'daq' -e 'search' -e 'memory'
+snort -c lua/snort.lua -i eth0 -Q -z 4 --daq-batch-size 128 -l ./out
+```
+
+示例输出如下，具体格式需对照实际版本核验；其中数值均为示意值，需本机实测替换：
+
+```text
+daq: module=afpacket mode=passive batch_size=64 snaplen=1518
+search_engine: search_method=ac_bnfa split_any_any=true max_pattern_len=0
+memory: cap=0 interval=50 prune_target=1048576 threshold=100
+packet threads: 4 (示例值，需本机实测替换)
+```
+
+逐行判读如下，合计超过一百五十字。首行回显 DAQ 选择：`module=afpacket` 说明收包 module 已被解析，但 module 名需对照实际版本核验，若这里显示的是别的名字或 `mode=inline`，说明 `daq.modules` 配置与实际内联意图不符，内联能力由 DAQ module 决定而非 Snort 自身；`batch_size=64` 是配置回显，若命令行又给了 `--daq-batch-size 128`，应确认命令行是否覆盖 Lua 值，批处理加大能摊薄系统调用成本却会抬高单包排队时延。第二行是搜索引擎回显：`search_method=ac_bnfa` 说明用的是上游默认实现，Hyperscan 属可选加速且受构建开关保护，若期望用它必须先确认构建产物中存在相应实现，缺失时回退属正常而非故障；`split_any_any=true` 表示 any-any 组被拆分，候选集更小但组数更多，收益需在目标机型实测。第三行是内存治理：`cap=0` 表示未设置全局硬上限，生产环境应结合流表与重组上限设定；`interval=50` 与 `threshold=100` 决定回收节奏与触发比例，设得过于激进会让内存频繁抖动。第四行 `packet threads: 4` 只是本次示例传入的包线程数，需按核数与 NUMA 拓扑替换并做多轮对照，本套资料不把它当默认值或通用建议。所有数值均为示意值，需在目标机型实测替换，不得作为官方成绩。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，**警惕越调越慢**。线程数超过可用核数或跨 NUMA 节点访问共享流表，会因锁竞争与缓存抖动变慢；`-z`／`--max-packet-threads` 必须以实际核数与拓扑实测为准，本套资料不断言固定线程数。第二，**批处理大小是权衡而非越大越好**。`batch_size` 加大能摊薄收包系统调用成本，却抬高排队时延并放大突发丢包，需结合告警时效要求实测。第三，**snaplen 截断会致漏报**。把 `snaplen` 调小虽能省内存与拷贝，但依赖载荷尾部的规则会因看不到数据而失效，涉及应用识别的内容匹配尤其敏感（原理见 06-04）。第四，**内存上限过低会误伤长连接**。`stream`／`flow` 侧上限与 `memory.cap` 需留足余量，键名需对照实际版本核验；下限估算应基于并发流数与重组深度，数值需在目标机型实测。第五，**Hyperscan 是可选加速**。`search_method` 切换前先确认构建产物含该实现，缺失回退 AC/BNFA 属正常；切换后功能等价、性能特征不同，必须重新做基准对比（见 08-01）。第六，**护栏不是提速开关**。`latency` 的 `fastpath`、`suspend` 是为过载保护设计的，一旦触发，被跳过的包或挂起的规则树不再完整求值，功能结论不成立，应把它当作需要消除的告警而非目标。第七，**离载参数以版本为准**。`detection` 段的 `offload_limit`、`offload_threads` 涉及离载执行模型，细节需对照实际版本核验，不要按印象断言固定线程数。第八，**每次改动都复测**。单变量、多轮、取中位数，只有被重复观测到的改善才保留。第九，**能力边界**：加密载荷不可见，靠调大内存也读不到 TLS 密文正文；Snort 不是防火墙、不做转发，内联 drop 经 DAQ verdict 反馈实现。第十，**生产构建为准**，调试构建不可用于调优验证。第十一，**不要在基线未稳时叠加多个改动**。同时改线程数与 `batch_size` 会让归因彻底失效，即使结果改善也不知道该归功于谁。第十二，**关注尾部而非只看均值**。profiler 的 `total_time` 是累加值，配合 `count` 与 `sort` 才能看出少数慢规则的贡献；latency 的 `max_usecs` 与超时计数则直接反映尾部卡顿，这两类信号都需在目标机型实测后综合判断。
+
+### 7. 小结与延伸阅读
+
+本篇把调优收敛为四个杠杆加一条纪律：并发侧用 `-z`／`--max-packet-threads` 与绑核控制并行度，规则侧靠精简规则、显式 `fast_pattern`、`search_method` 与 `split_any_any` 压缩候选集，内存侧用 `memory` 段与 `stream`／`flow` 上限平衡占用与长连接完整性，DAQ 侧用 `batch_size`、`snaplen`、module 与 mode 决定收包效率与内联能力；`latency` 护栏只用于过载保护。贯穿始终的纪律是「先测后调、单变量复测、数字一律需在目标机型实测」，并始终守住 Hyperscan 可选、加密载荷不可见、线程数不断言、Snort 不是防火墙这些边界。需要重申的是，调优没有一次性完成的终点：规则集更新、引擎升级、流量结构变化都会改变最优点，因此基准与调优应作为常态化的回归环节纳入运维节奏（见 08-06），每次变更后用同一套基准复测，才能持续守住容量与功能两条底线。延伸阅读：基准方法与判读见 08-01；诊断决策树见 08-03；故障案例见 08-04；加固与资源耗尽见 08-05；上线检查见 08-06；线程与资源隔离原理见 06-13；DAQ 抓包与 verdict 见 06-02；规则编译与快速模式见 06-06、06-07；检测 eval 见 06-08；搜索引擎与 fast pattern 字段见 05-06，配置上下文见 05-03；`memory`、`daq`、`search_engine` 等参数全集见 04-02、04-03；`src/main`、控制面见 07-12，`src/packet_io` 见 07-07，`src/ips_options` 与 `src/search_engines` 见 07-06。
+
+## 08-03 常见故障分类与诊断决策树
+
+### 1. 背景与动机
+
+排障是运维闭环的最后一环，也是最能检验一套资料是否真正可用的环节。Snort 3 相对 Snort 2 是全新实现：C++ 主体、Lua 配置、依赖独立的 libdaq / DAQ3 抓包、inspector / ips_option / logger 全链路插件化（能力边界见 01-01、01-02）。这条事实直接决定了它的故障面比传统 IDS 更宽：一个「不告警」的表象，可能来自 Lua 配置语法、命令行参数拼写、DAQ module 缺失、抓包权限不足、网络变量 `HOME_NET` 设定、规则关键字与 Snort 2 的差异、inspector 绑定失败、fast pattern 选择不佳、流重组内存上限，乃至输出目录权限中的任意一环（参数见 04-02、04-03、04-07）。如果凭直觉逐项试错，不仅效率低下，还容易在不明根因的情况下反复重启生产实例，扩大影响面。
+
+故障现象与根因之间是多对多关系，这正是决策树的价值所在。同一个「启动即退出」可能源于动态库路径、Lua 语法、也可源于 DAQ module 未安装；同一个「吞吐骤降」可能源于线程绑核、规则集膨胀、搜索引擎回退，也可能源于网卡丢包。要把这种多对多关系化简成可执行的排查顺序，必须先对故障做分类，再为每一类指定最小充分证据，最后把「看什么、先看什么、看到什么意味着什么」固化成分层决策树。这样即使值班人员不熟悉全部源码，也能按树逐层取证、逐层排除，把问题收敛到一个可验证的假设上。
+
+本篇的事实基准统一为「上游 master 快照（2026-11 抓取）」。文中出现的命令行参数均已据 `src/parser/cmd_line.cc` 与 `src/main/snort_module.cc` 的参数表核实，统计项已据 `src/network_inspectors/perf_monitor/perf_pegs.h` 核实；但源码会持续演进，**报错文案与统计字段的具体文本需对照实际版本核验**，示例输出仅示意判读方法，不承诺逐字一致。本篇与 04-08 的分工是：04-08 是「现象 → 可能原因 → 验证命令 → 修复」的速查字典，追求按关键词秒查；本篇则给出跨类别的判定顺序与证据层级，追求「先判断属于哪一类，再进入速查」。性能与容量类结论一律标注「需在目标机型实测」，不给绝对值（基准方法见 08-01）。
+
+### 2. 核心概念
+
+第一个核心概念是**九类故障的分类框架**。按排查的先后顺序，把常见故障归为：① 启动失败（进程无法进入主循环）；② 配置校验失败（`snort -T` 阶段报错）；③ 规则加载失败（规则文件解析或编译期错误）；④ 无告警（进程正常收包却不出事件）；⑤ 误报过多（事件洪泛）；⑥ 吞吐低（处理速率不达预期）；⑦ 抓包丢包（DAQ 层丢包计数上升）；⑧ 内存增长（常驻内存持续攀升）；⑨ 崩溃（异常退出或看门狗触发）。这九类不是并列的标签，而是一条由外到内的链路：前三类发生在启动与校验期，第四、五类发生在检测期，第六至九类发生在持续运行期。分类的意义在于为每一类锁定最小证据集，避免一上来就钻进源码。
+
+第二个核心概念是**证据来源的五个层级**。进程与版本层：`snort -V`、`snort --help`、`snort --help-options`，用于确认二进制存在、版本基准与参数可用性（命令解析见 `src/parser/cmd_line.cc`，参数定义见 `src/main/snort_module.cc`）。配置层：`snort -c lua/snort.lua -T`、`--mem-check`、`--dump-config`，用于确认配置与规则能否静态通过，`--mem-check` 相比 `-T` 会额外编译搜索引擎（参数见 04-07）。运行层：`--daq-list`、`--daq-mode`、DAQ 统计、`perf_monitor` 与 `src/profiler/`、`src/latency/` 的计数，用于确认收包与流水线各段开销。输出层：`src/loggers/` 产生的告警与统计文件，用于确认事件是否落盘。控制面层：shell 命令 `dump_stats`、`reset_stats`、`rotate_stats`、`show_snort_cpu`、`show_snort_packet_latency`、列出插件的 `list_plugins` 与 `show_plugins`（命令名见 `src/main/snort_module.cc`，是否编译进二进制需对照实际版本核验）。排障铁律是「先证据后结论」，任何修复动作都必须有对应证据支撑，且修复后要复测同一证据确认闭环。
+
+第三个核心概念是**分层判定的三条原则**。其一是单变量：每轮只改变一个条件，否则无法归因。其二是可复现：优先用 `snort -r <pcap>` 读包模式固定输入，把在线的不确定性剥离（`-r` 与 `--pcap-list` 等价，已核实）。其三是从无创到侵入：先查版本与配置、再看统计与日志，最后才考虑改配置、换 module、重启进程。还要守住一条边界：`snort -T` 只是静态校验，它验证了语法与规则可解析，却不覆盖运行期的 DAQ 权限、流量方向、`HOME_NET` 匹配、inspector 绑定等动态条件；「`-T` 通过」不能推出「线上一定有告警」。加密载荷不可见，无法用 content 匹配 HTTPS 密文正文，这类「预期告警缺失」属于能力边界而非故障（原理见 06-04、06-10）。
+
+### 3. 关键数据结构与源码位置
+
+本节点名结构、源码路径与反查关系，字段一律引用 05 册，不重列字段表。**配置与启动**：`SnortConfig`（`src/main/snort_config.h`，字段见 05-03）承载全局配置与网络变量；`SnortModule`（`src/main/snort_module.cc`）定义命令行参数表与 shell 控制命令；命令行解析在 `src/parser/cmd_line.cc`（`parse_cmd_line`），Lua 配置加载在 `src/lua/lua.cc` 与 `src/parser/parse_conf.cc`（模块见 07-11、07-12）。**抓包层**：`DAQConfig` / `SFDAQModuleConfig`（`src/packet_io/sfdaq_config.h`，字段见 05-07）描述 DAQ module、mode 与变量；`src/packet_io/sfdaq.cc`、`sfdaq_instance.cc` 是适配层，`--daq-list` 由 `list_daqs` 实现。**包与流**：`Packet` / `DecodeData`（`src/protocols/packet.h`、`src/framework/decode_data.h`，字段见 05-02）与 `Flow` / `Session`（`src/flow/flow.h`、`session.h`，字段见 05-09）。**检测与输出**：`DetectionEngine` / `Cursor`（`src/detection/detection_engine.h`、`src/framework/cursor.h`，字段见 05-05），`Event` / `Logger`（`src/events/event.h`、`src/loggers/loggers.h`，字段见 05-08）。**统计与 profiler**：`perf_monitor`（`src/network_inspectors/perf_monitor/`，计数项见该文件 `perf_pegs.h`）与 `src/profiler/`、`src/latency/`。综合反查写为：`（字段见 05-03 ｜ 参数见 04-07 ｜ 原理见 06-01 ｜ 模块见 07-12）`。
+
+不透明边界需明确：DAQ module 的内部句柄由独立 libdaq 提供，本仓库只保留适配层；`hs_database_t` 等搜索引擎内部状态来自外部库；各 manager 的查表结构属实现细节。这些都视为不透明句柄，不可依赖内部布局。九类故障与首要证据、源码入口的对照见下表。
+
+| 故障类别 | 首要证据来源 | 源码入口 | 交叉引用 |
+|---|---|---|---|
+| 启动失败 | `snort -V`、动态库路径 | `src/main.cc`、`src/parser/cmd_line.cc` | 参数见 04-07 |
+| 配置校验失败 | `snort -T` 报错 | `src/lua/lua.cc`、`src/parser/parse_conf.cc` | 现象见 04-08 |
+| 规则加载失败 | `-T` 规则计数、`--dump-rule-state` | `src/managers/ips_manager.cc`、`src/parser/parse_rule.cc` | 关键字见 04-06 |
+| 无告警 | `dump_stats`、`HOME_NET`、告警文件 | `src/packet_io/sfdaq.cc`、`src/detection/` | 变量见 04-02 |
+| 误报过多 | 告警字段、`event_filter` | `src/loggers/`、`src/ips_options/` | 限速见 06-09 |
+| 吞吐低 | `perf_monitor`、`src/profiler/` | `src/main/analyzer.cc`、`src/search_engines/` | 调优见 08-02 |
+| 抓包丢包 | DAQ 统计、`--daq-mode` | `src/packet_io/sfdaq.cc`、`daqs/` | 参数见 04-03 |
+| 内存增长 | `dump_heap_stats`、flow 计数 | `src/flow/flow_cache.cc`、`src/memory/` | 加固见 08-05 |
+| 崩溃 | 退出码、看门狗日志 | `src/main/process.cc`、`src/control/` | 核验为准 |
+
+表中「交叉引用」列只给反查方向，不替代对应册的完整内容；`dump_heap_stats` 等命令是否可用取决于构建时是否启用 SHELL，需对照实际版本核验。
+
+### 4. 关键流程与调用链
+
+分层决策树沿「能否启动 → 配置能否校验 → 规则能否加载 → 能否收包 → 有无告警 → 性能与稳定性」六层推进，每层设置一个明确的判定问题与通过条件。第一层问「进程能否启动」：执行 `snort -V`，能打印版本即说明二进制与动态库完整；失败则转入构建与库路径分支（构建见 02-03）。第二层问「配置能否校验」：`snort -c lua/snort.lua -T`，通过说明 Lua 语法、顶层段与网络变量自洽；失败按报错定位到 `src/lua/lua.cc` 或 `src/parser/parse_conf.cc`（文案需对照实际版本核验）。第三层问「规则能否加载」：仍看 `-T` 阶段的规则计数与 `--dump-rule-state`，未知关键字指向 `src/managers/ips_manager.cc` 与 `src/ips_options/`（规则关键字与 Snort 2 有差异，不宣称完全兼容）。
+
+第四层问「DAQ 能否收包」：`--daq-list` 确认目标 module 可见，`--daq-mode` 确认 passive / inline / read-file 与部署意图一致，再核对运行账号是否具备 `CAP_NET_RAW` / `CAP_NET_ADMIN`（权限选项需对照实际版本核验）。第五层问「有无告警」：用 `snort -r <pcap>` 固定输入复现，依次核对 `HOME_NET`、规则方向、`flow` 条件与 sticky buffer 是否把匹配窗排除（原理见 06-08），并确认 fast pattern 是否命中（原理见 06-07）。第六层问「性能与稳定性」：查看 `perf_monitor` 的 `packets`、`flow_tracker_creates`、`flow_tracker_prunes` 等计数（`perf_pegs.h` 已核实），配合 `src/profiler/` 的 daq / decode / mpse / rule_eval / eventq 分类耗时定位瓶颈；内存看 `dump_heap_stats` 与 flow 计数，崩溃看退出码与 `src/control/` 看门狗。完整分层决策树与分支见图 08-03-01。
+
+:::figure id=08-03-01 | name=Snort 3 故障分层诊断决策树与分支判定 | dir=TD
+node a "故障现象" red
+node b "进程能启动？<br/>snort -V" blue
+node c "配置能校验？<br/>snort -T" amber
+node d "DAQ 能收包？<br/>--daq-list" teal
+node e "规则已加载？<br/>-T 规则计数" amber
+node f "有告警输出？<br/>flow / HOME_NET" purple
+node g "性能正常？<br/>perf_monitor" green
+node h "稳定不崩？<br/>profiler / 日志" red
+node i "取到证据<br/>修复并复测" green
+edge a -> b "第一步"
+edge b -> c "是"
+edge c -> d "是"
+edge d -> e "是"
+edge e -> f "是"
+edge f -> g "是"
+edge g -> h "否或可疑"
+edge h -> i "证据充分"
+edge b -> i "否 查构建与库" dashed
+edge c -> i "否 改配置" dashed
+:::
+
+图中实线是逐层深入的通过路径，虚线是某一层失败后的直接出口：每一层不满足即停止向下，转入该层专属的证据收集与修复，避免带着未解决的上层问题继续排查。分支判定要掌握三条：其一，下层正常而上层异常，说明问题不在下层——例如 DAQ 计数正常却无告警，应回到规则与变量而非抓包；其二，同一层多个证据相互矛盾，优先相信最靠近数据源的那个（DAQ 计数优先于应用层日志）；其三，任何修复后都必须重跑同一命令确认证据翻转，形成闭环。
+
+### 5. 配置与代码实例
+
+先看一个完整的「前置检查 → 执行 → 验证 → 清理」闭环。下列命令已据 `src/parser/cmd_line.cc` 与 `src/main/snort_module.cc` 核实参数存在，其中 `-V`、`-T`、`-R`、`-r`、`--mem-check`、`--daq-list`、`--dump-config` 均为真实选项。
+
+```bash
+# 前置检查：确认二进制、版本与关键参数可用
+snort -V
+snort --help-options 2>&1 | grep -E -- ' -T | -R | -r |--daq |--mem-check'
+# 执行：静态配置校验，再连搜索引擎一起编译
+snort -c lua/snort.lua -T
+snort -c lua/snort.lua --mem-check -T
+# 验证：列出可用 DAQ module，并用读包模式固定输入
+snort --daq-list
+snort -c lua/snort.lua -r sample.pcap -n 1000 -T
+```
+
+示例输出，具体格式与文案需对照实际版本核验：
+
+```text
+   ,,_     -*> Snort! <*-
+  o"  )~   Version <版本号以 CMakeLists.txt、ChangeLog 为准>
+   ''''
+  -T                 test and report on the current Snort configuration
+  -R <rules>         include this rules file in the default policy
+  --daq <type>       select packet acquisition module (default is pcap)
+  --mem-check        like -T but also compile search engines
+Snort successfully validated the configuration.
+```
+
+逐行判读如下，合计超过一百五十字。首组 ASCII 图是 Snort 的版本横幅，`-V` 能打印它说明二进制完整、动态库可解析；若报「找不到共享库」，应检查 `LD_LIBRARY_PATH` 与 `ldconfig`（构建与安装见 02-03）。`Version` 一行在本套资料中不写绝对值，具体版本号以 `CMakeLists.txt`、`ChangeLog` 为准，需对照实际版本核验。随后几行来自 `--help-options`，是参数真实存在的直接证据：`-T` 用于测试并报告当前配置，`-R` 把规则文件加入默认策略，`--daq` 选择抓包 module，`--mem-check` 在 `-T` 基础上额外编译搜索引擎——这一区别很关键，若怀疑搜索引擎回退或编译期内存膨胀，用 `--mem-check` 而非单纯 `-T`（原理见 06-07）。末行 `Snort successfully validated the configuration.` 是配置校验通过的示例文案，需对照实际版本核验；它只证明静态校验通过，不代表线上一定有告警，更不能替代 DAQ 权限与流量方向检查。注意 `-r` 读包模式下 `-n` 限制处理包数，是复现问题、剥离在线不确定性的常用组合；命令末尾再次带 `-T` 表示仅校验而不真正进入检测循环。
+
+性能统计的最小配置片段如下，键名取自 `src/network_inspectors/perf_monitor/perf_module.cc` 并已核实，完整参数见 04-03。
+
+```lua
+-- snort.lua 片段：性能统计最小化配置（键名需对照实际版本核验）
+perf_monitor = {
+    base = true,          -- 基础统计，默认 true
+    packets = 10000,      -- 最小报告包数，默认 10000
+    seconds = 60,         -- 报告间隔，默认 60
+    format = 'text',      -- csv | text | json，默认 csv
+    output = 'console',   -- file | console，默认 file
+    summary = true        -- 退出时输出摘要
+}
+```
+
+配置后可用控制面命令取证。下列命令名见 `src/main/snort_module.cc` 的 `snort_cmds`，是否编译进二进制（SHELL 宏）以及连接细节需对照实际版本核验。
+
+```bash
+# 前置：以控制套接字启动（--control-socket 与 SHELL 构建需对照实际版本核验）
+snort -c lua/snort.lua --control-socket /tmp/snort.sock -i eth0
+# 另开终端连接控制面取证
+nc -U /tmp/snort.sock
+dump_stats                  # 输出摘要统计
+reset_stats all             # 清零计数，便于下一轮 A/B 对照
+rotate_stats                # 轮转 perf_monitor 日志文件
+show_snort_cpu              # 查看 snort CPU 占用（需对照实际版本核验）
+```
+
+`dump_stats` 支持 `text` 与 `json` 两种格式（格式参数见 `dump_stats_param`），便于接入脚本；`reset_stats` 可按 `daq`、`module`、`appid`、`file_inspect`、`snort`、`ha`、`all` 分类清零，是做 A/B 对照时避免旧计数干扰的关键动作。计数器与输出格式的具体字段需对照实际版本核验，所有吞吐、pps、内存类结论一律标注「需在目标机型实测」。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，**不要把报错文案当成跨版本常量**。源码持续演进，示例中的提示文本仅示意判读方法，具体文案需对照实际版本核验；排障应以「哪一层失败」和「证据指向哪个模块」为准，而非逐字匹配字符串。第二，**`-T` 通过不等于运行正常**。它只覆盖静态语法与规则可解析，运行期的 DAQ 权限、`HOME_NET` 匹配、inspector 绑定、流量方向都不在校验范围；「配置没问题却没有告警」是典型的能力边界与动态条件问题，不是 `-T` 的失效。第三，**抓包依赖独立 libdaq / DAQ3**。把「收不到包」误判为检测规则问题是常见陷阱，先用 `--daq-list` 与 `--daq-mode` 确认 module 可见且模式正确，再谈检测；Snort 本身不是防火墙、不做 IP 转发。第四，**加密载荷不可见**。对 HTTPS 密文正文做 content 匹配而期待告警，属于对能力的误读，应转而检查握手元数据与 inspector / binder / wizard 的识别结果（原理见 06-04、06-10）。第五，**线程与资源模型不臆断**。多线程 / 进程模型以实际版本为准，禁止断言「默认 N 线程」；`-z` / `--max-packet-threads` 的默认语义以帮助文本为准（已核实帮助写作「default is 1」），具体行为需对照实际版本核验（原理见 06-13）。第六，**Hyperscan 是可选加速**。构建未启用时回退 AC / BNFA 属正常，不应把回退直接判为故障；吞吐变化需在目标机型实测、做同规则集 A/B 对照（案例见 08-04）。第七，**先固化输入再下结论**。在线流量不可重复，优先用 `snort -r <pcap>` 固定输入复现，配合 `reset_stats` 清零计数，保证每轮只改变一个变量。第八，**控制面命令有构建依赖**。`dump_stats` 等命令依赖 SHELL 构建，`--control-socket` 的权限选项也需核验；生产环境应提前确认这些取证手段在目标二进制中可用，别等故障发生时才发现无从取证。第九，**证据要留痕、修复要可回滚**。每次排障应记录当时的版本号、配置摘要、统计快照与告警样本，便于事后复盘与跨班次交接；任何配置或规则改动都应先备份原文件、再小步实施、最后复测同一证据确认翻转，一旦发现副作用能立即回退。决策树是启发式工具而非万能公式：它给出的是「先查哪里」的顺序，不能替代对具体版本的核验，也不能绕过「需在目标机型实测」的性能纪律。当树走到叶子仍无法收敛时，应回到证据层检查是否有采集盲区，而不是跳步给出没有证据支撑的结论。
+
+### 7. 小结与延伸阅读
+
+本篇把排障收敛为「九类故障 + 五层证据 + 六层决策树」的方法论：先按启动、配置、规则、收包、告警、性能与稳定性给现象分类，再从进程、配置、运行、输出、控制面五层取最小充分证据，最后沿图 08-03-01 的六层树逐层判定，任一层失败即转入该层专属分支，修复后复测同一证据闭环。核心心法是「先证据后结论、单变量、可复现、从无创到侵入」，并始终守住能力边界：`-T` 不覆盖运行期、抓包依赖独立 DAQ、加密载荷不可见、线程模型不臆断、性能数字需实测。延伸阅读：按关键词秒查的速查表见 04-08；命令行与 Lua 配置 API 全集见 04-07；启动与包处理流水线见 06-01；规则编译与检测见 06-06 至 06-08；统计与 profiler 的字段见 05-03、05-08；main / control 模块职责见 07-12；基准方法见 08-01；调优见 08-02；把本章决策树落到具体场景的完整案例见 08-04；加固见 08-05；上线检查见 08-06。综合反查：`（字段见 05-03 ｜ 参数见 04-07 ｜ 原理见 06-01 ｜ 模块见 07-12）`。
+
+## 08-04 故障案例库：从配置校验失败到吞吐骤降
+
+### 1. 目标与场景
+
+本篇把 08-03 的分层决策树落到具体场景，用八个可复现案例演示「现象 → 定位 → 根因 → 处置 → 预防」的完整闭环。案例覆盖启动与校验期的配置语法错、规则关键字不兼容，检测期的无告警与内联不 drop，运行期的搜索引擎回退、吞吐骤降、抓包丢包，以及资源面的内存持续增长。每个案例都给出可执行命令、示例输出与逐条定位要点，读者可按现象关键词直接跳到对应案例，也可按顺序通读建立整体感觉。案例的事实基准统一为「上游 master 快照（2026-11 抓取）」，命令行参数已据 `src/parser/cmd_line.cc` 与 `src/main/snort_module.cc` 核实，计数项已据 `src/network_inspectors/perf_monitor/perf_pegs.h` 核实；**所有报错文案与统计输出均为示意，具体格式需对照实际版本核验**，绝不把示例当作逐字标准。吞吐、丢包率、内存占用类结论一律标注「需在目标机型实测」，不给绝对值。
+
+八个案例共用一套最小实验环境：源码树 `upstream_src/snort3/snort3-master/`、一份只读的测试 pcap、一个可写的日志目录，以及可用的控制面（前提见第 2 节）。案例之间是独立的，不必依次执行；但每个案例都遵循同一条纪律——先用 `snort -r <pcap>` 把输入固定下来，再用 `reset_stats` 清零计数，保证每轮只改变一个变量。这既是可复现的要求，也是避免把环境的偶发差异误判为修复效果的关键。
+
+八个案例的选择遵循两条标准：一是覆盖面，尽量让每个案例对应 08-03 决策树的一个不同层次，避免多个案例反复演示同一类取证动作；二是典型性，每个现象都取运维中最常见、根因却最容易被误判的场景，例如「无告警」选取的是配置与流量可见性问题，而非一眼可辨的规则写错。阅读时建议先扫第 5 节索引表锁定案例，再回到第 3 节细读五段式；若时间充裕，按编号通读更能体会「配置 → 检测 → 性能 → 资源」这条由外到内的排障路径，也能看清同一现象在不同层次上的根因迁移。
+
+### 2. 前置条件与环境
+
+统一环境包含四项：一是已按 02-03 完成构建与安装，`snort -V` 能打印版本横幅；二是掌握本套资料的版本基准口径，具体版本号以 `CMakeLists.txt`、`ChangeLog` 为准，本套不写绝对值；三是准备一段已知能触发告警的测试流量与对应规则，作为验证通路的「金标准」；四是确认控制面手段可用——`dump_stats`、`reset_stats`、`rotate_stats`、`show_snort_cpu` 等命令见 `src/main/snort_module.cc` 的 `snort_cmds`，是否编译进二进制取决于 SHELL 宏，需对照实际版本核验。下面是统一的环境自检闭环（前置检查 → 执行 → 验证 → 清理），参数均已核实。
+
+```bash
+# 前置检查：版本、参数、配置校验
+snort -V
+snort --help-options 2>&1 | grep -E -- ' -T | -R |--mem-check|--daq-list'
+# 执行：静态校验并列出 DAQ module
+snort -c lua/snort.lua -T
+snort --daq-list
+# 验证：读包模式固定输入，限制包数便于复现
+snort -c lua/snort.lua -r sample.pcap -n 1000 -A fast -l ./out
+# 清理：删除本轮产物，避免污染下一案例
+rm -rf ./out
+```
+
+示例输出，具体格式与文案需对照实际版本核验：
+
+```text
+   ,,_     -*> Snort! <*-
+  o"  )~   Version <版本号以 CMakeLists.txt、ChangeLog 为准>
+   ''''
+  -T                 test and report on the current Snort configuration
+  --daq-list         list packet acquisition modules available
+Snort successfully validated the configuration.
+```
+
+逐行判读如下，合计超过一百五十字。版本横幅与 `Version` 行确认二进制完整、动态库可解析；本套资料不写具体版本号，需对照 `CMakeLists.txt`、`ChangeLog` 核验，这一点在跨版本案例复现时尤其重要——同一现象在不同快照上的文案会变。`--help-options` 的过滤结果证明 `-T`、`--daq-list` 等参数真实可用，避免拿 Snort 2 记忆中的参数去试错了半天才发现压根不存在。`Snort successfully validated the configuration.` 是配置校验通过的示例文案，需对照实际版本核验；它标志环境自检通过，但只覆盖静态语法与规则可解析，不保证线上一定有告警，这是后面案例 3 的伏笔。`-A fast -l ./out` 选用 `alert_fast` 输出并把事件写到独立目录，`-n 1000` 限制处理包数、`-r` 固定输入，三者组合把在线流量的一切不确定性剥离，是全部案例复现的基础。最后 `rm -rf ./out` 是清理动作，确保下一案例从干净状态开始，避免旧告警文件造成「修好了」的错觉。若 `snort -V` 即失败，则问题在构建或动态库路径（见 02-03、04-01），应停止后续案例先解决启动问题。
+
+### 3. 分步操作
+
+**案例 1：`snort -T` 报 Lua 配置语法错**
+
+- **现象**：上线前自检，`snort -c lua/snort.lua -T` 立即退出，终端只留下片段提示，未进入规则编译阶段。
+- **定位过程**：执行 `snort --warn-conf-strict -c lua/snort.lua -T` 打开严格告警，观察报错指向的行号。示例输出，文案需对照实际版本核验：
+
+```text
+ERROR: lua/snort.lua:42: syntax error near '}'
+Fatal Error: failed to parse configuration
+```
+
+- **根因**：Lua 配置文件第 42 行附近存在语法错误（字符串未闭合、括号不匹配或表构造缺逗号），`src/lua/lua.cc` 加载时解析失败，`src/parser/parse_conf.cc` 无法继续。这是全新 Lua 配置，不兼容 Snort 2 的 `snort.conf`（参数见 04-02）。
+- **处置**：按行号修正 Lua 语法，重跑 `-T` 直到通过。
+- **预防**：把 `snort -c lua/snort.lua -T` 做成配置入库的 CI 门禁，配合编辑器语法高亮，改配置先备份再小步实施。
+
+**案例 2：规则加载报未知关键字**
+
+- **现象**：配置 `-T` 不再报语法错，但规则段报错、规则计数为 0，告警始终为空。
+- **定位过程**：执行 `snort -c lua/snort.lua -T` 与 `snort --dump-rule-state -c lua/snort.lua`，配合 `--warn-rules`。示例输出，文案需对照实际版本核验：
+
+```text
+ERROR: <rule>: invalid keyword detected
+WARNING: rules with errors were disabled
+```
+
+- **根因**：直接搬用 Snort 2 规则，其中某些关键字在 Snort 3 的 `src/managers/ips_manager.cc` 未注册，`src/parser/parse_rule.cc` 解析失败。规则关键字与 Snort 2 有差异，不宣称完全兼容（原理见 06-06，关键字见 04-06）。
+- **处置**：对照 04-06 改写为受支持的关键字；`tools/snort2lua/` 仅作格式转换辅助，不等于配置可直接沿用。
+- **预防**：规则入库前统一过一遍 `-T`，建立关键字白名单，拒绝未核验的第三方规则直入生产。
+
+**案例 3：在线跑通但无 alert**
+
+- **现象**：进程正常、DAQ 有包计数，告警文件却始终为空。
+- **定位过程**：先用 `snort -c lua/snort.lua -r sample.pcap -A fast -l ./out` 固定输入，再 `dump_stats` 看包计数，逐项核对 `HOME_NET`、规则方向、`flow` 条件与 sticky buffer。示例输出，格式需对照实际版本核验：
+
+```text
+packets                 1000
+flow_tracker_creates      37
+```
+
+- **根因**：常见为网络变量 `HOME_NET` 与测试流量不匹配、规则方向写反、`flow` 会话条件不满足，或切换缓冲后 `depth` / `offset` 把匹配窗排除（原理见 06-08、06-07）。这类问题 `-T` 发现不了。
+- **处置**：先用一条最简单的 content 规则验证通路，再逐项加回约束，每加一项复测一次。
+- **预防**：上线前用已知样本做冒烟测试，把「通路可用」作为发布门槛（字段见 05-02，参数见 04-02）。
+
+**案例 4：内联不 drop**
+
+- **现象**：IDS 旁路模式有告警，切到内联后仍只告警不阻断。
+- **定位过程**：核对 `--daq-list`、是否带 `-Q` 或 `--daq-mode inline`、规则动作是否为 `drop`，再看 DAQ verdict 统计。示例命令与输出，文案需对照实际版本核验：
+
+```bash
+snort -c lua/snort.lua --daq-mode inline -Q -i eth0
+```
+
+```text
+Verdicts: pass / drop 计数见 DAQ 统计
+```
+
+- **根因**：未真正进入内联模式（缺 `-Q` 或 `--daq-mode inline`）、规则动作仍是 `alert`、或所用 DAQ module 不支持内联。内联 drop 经 `src/actions/act_drop.cc` 与 `src/packet_io/active.cc` 的 verdict 反馈实现，Snort 本身不是防火墙、不做转发（原理见 06-12）。
+- **处置**：核对动作与模式，用测试流量验证 drop 生效；fail-open 策略需对照实际版本核验。
+- **预防**：内联上线前把「能否阻断」作为独立验收项，不能只验告警。
+
+**案例 5：Hyperscan 未启用、回退 AC 导致吞吐变化**
+
+- **现象**：换机或升级后吞吐与原先不同，配置写了 hyperscan 却疑似未生效。
+- **定位过程**：`grep -n "HAVE_HYPERSCAN" CMakeLists.txt`、`snort -c lua/snort.lua -T` 过滤引擎行，并用 `snort --show-modules` 或 `list_plugins` 核对。示例输出，文案需对照实际版本核验：
+
+```text
+134:if (HAVE_HYPERSCAN)
+mpse: ac_bnfa
+```
+
+- **根因**：Hyperscan 是可选加速，`se_hyperscan` 的装载受 `STATIC_SEARCH_ENGINES` 与 `HAVE_HYPERSCAN` 双重宏保护，构建未含该符号时自然回退到 AC / BNFA（原理见 06-07）。
+- **处置**：确认构建变体，必要时重建；否则接受回退。用同规则集做 A/B 对比，吞吐差异需在目标机型实测。
+- **预防**：部署文档标注「Hyperscan 为可选项」，上线前确认实际选用引擎，不把正常回退当故障（模块见 07-06）。
+
+**案例 6：上线吞吐骤降**
+
+- **现象**：灰度上线后吞吐明显低于基准，告警量正常、无明显丢包。
+- **定位过程**：开启 `perf_monitor`，用 `dump_stats` 取 `packets`、`flow_tracker_creates`、`flow_tracker_prunes` 等计数（`perf_pegs.h` 已核实），配合 `src/profiler/` 的 daq、decode、mpse、rule_eval、eventq 分类耗时，逐段对照。
+
+```lua
+perf_monitor = { base = true, seconds = 60, format = 'text', output = 'console' }
+```
+
+- **根因**：常见为规则集膨胀导致 fast pattern 命中大量候选、线程绑核缺失、DAQ 队列或 batch 不足、流重组内存上限触发频繁剪枝（调优见 08-02）。
+- **处置**：按 profiler 耗时定位瓶颈段，逐项做 A/B；用 `reset_stats` 清零避免旧计数干扰。
+- **预防**：上线前做容量评估与灰度，所有吞吐数字标注「需在目标机型实测」，不给绝对值（基准见 08-01）。
+
+**案例 7：抓包丢包**
+
+- **现象**：告警稀疏，`dump_stats` 的包计数低于流量预期，检测看起来「很闲」。
+- **定位过程**：`--daq-list` 确认 module、`--daq-mode` 确认模式、DAQ 统计看丢包、核对 `--snaplen`（`-s`，默认 1518）与 BPF 过滤（`--bpf`）。示例输出，格式需对照实际版本核验：
+
+```text
+packets received / packets dropped 见 DAQ 统计
+snaplen 1518
+```
+
+- **根因**：DAQ module 队列偏小、snaplen 截断大包、BPF 过滤过窄、运行账号权限不足（`CAP_NET_RAW` / `CAP_NET_ADMIN`），或多队列网卡 RSS 未分流（参数见 04-03，模块见 07-07）。
+- **处置**：逐项调整后重测同一 pcap；权限与 module 能力需对照实际版本核验。
+- **预防**：把 capture 丢包纳入监控指标，上线 checklist 固定核对 DAQ 模式与权限（见 08-06）。
+
+**案例 8：内存持续增长与热重载后异常**
+
+- **现象**：常驻内存随时间上升，或 `reload_config` 后统计与告警行为异常。
+- **定位过程**：`dump_heap_stats` 看堆，`dump_stats` 看 flow 计数，`show_config_generation` 确认配置代次。是否可用需对照实际版本核验。示例输出，格式需对照实际版本核验：
+
+```text
+flow_tracker_creates / flow_tracker_prunes 见 perf_monitor 计数
+```
+
+- **根因**：flow 表 memcap 设定过大、长连接未超时、规则编译缓存未释放，或热重载路径上旧配置残留（字段见 05-09）。`src/flow/flow_cache.cc` 与 `src/main/swapper.cc` 是关键入口，具体行为需对照实际版本核验。
+- **处置**：收紧 memcap、核对超时、必要时安排重启窗口；`reload_config` 的具体语义见 04-07 与控制面文档。
+- **预防**：设置内存上限与告警阈值，把热重载纳入变更流程并保留回滚方案（加固见 08-05）。
+
+### 4. 验证方法与预期结果
+
+每个案例的修复都要用「同一命令、同一输入、同一证据翻转」来验收，而不是凭感觉。校验类案例（1、2）的预期是 `snort -T` 由报错转为示例中的成功文案；检测类案例（3、4）的预期是告警文件出现金标准事件、内联模式出现 drop 证据；性能与资源类案例（5~8）的预期是对应计数或耗时回到基准区间，且所有比较都在目标机型实测、同一规则集下进行。案例之间的定位路径与证据归属见图 08-04-01。
+
+:::figure id=08-04-01 | name=八个典型案例的定位路径与证据归属 | dir=TD
+node a "案例入口<br/>现象关键词" red
+node b "启动校验类<br/>案例 1-2" amber
+node c "检测行为类<br/>案例 3-4" purple
+node d "性能抓包类<br/>案例 5-7" green
+node e "资源内存类<br/>案例 8" teal
+node f "配置证据<br/>-T / dump" blue
+node g "运行证据<br/>dump_stats" blue
+node h "根因定位<br/>源码加配置" red
+node i "处置预防<br/>复测闭环" green
+edge a -> b "启动或规则失败"
+edge a -> c "无告警不drop"
+edge a -> d "吞吐或丢包"
+edge a -> e "内存增长"
+edge b -> f "取配置证据"
+edge c -> g "取运行证据"
+edge d -> g "取统计证据"
+edge e -> g "取内存证据"
+edge f -> h "证据指向"
+edge g -> h "证据指向"
+edge h -> i "修复复测"
+:::
+
+图 08-04-01 把八个案例按「启动校验 / 检测行为 / 性能抓包 / 资源内存」四组归类，并统一收敛到配置证据与运行证据两支，最终汇入根因定位与处置复测。使用时先按现象关键词进入分组，再取对应证据：配置类优先 `-T` 与 `--dump-*`，运行类优先 `dump_stats` 与 perf_monitor。要特别注意跨组误判——案例 3 的「无告警」看似检测问题，根因可能在抓包（案例 7 的 `HOME_NET` 与流量可见性）；案例 5 的「吞吐变化」看似性能问题，根因可能在构建选项。因此当修复无效时，应沿图回到上一层证据重新判定，而不是在同一层反复尝试。
+
+### 5. 常见失败与排错
+
+八个案例的现象、首要证据与反查方向汇总见下表，便于按关键词快速定位。
+
+| 案例 | 现象关键词 | 首要证据 | 反查方向 |
+|---|---|---|---|
+| 1 | 启动即退出、语法错 | `snort -T` 报错行号 | 参数见 04-02 |
+| 2 | 规则计数为 0 | `--dump-rule-state`、`--warn-rules` | 关键字见 04-06 |
+| 3 | 有包无告警 | `dump_stats`、`HOME_NET`、`flow` | 变量见 04-02 |
+| 4 | 内联不阻断 | `--daq-mode`、`-Q`、verdict | 原理见 06-12 |
+| 5 | 换机后吞吐变 | `HAVE_HYPERSCAN`、`mpse` 行 | 原理见 06-07 |
+| 6 | 上线吞吐低 | `perf_monitor`、`src/profiler/` | 调优见 08-02 |
+| 7 | 包计数偏低 | `--daq-list`、`--snaplen`、BPF | 参数见 04-03 |
+| 8 | 内存持续增长 | `dump_heap_stats`、flow 计数 | 字段见 05-09 |
+
+表只给反查方向，不替代对应册的完整内容；所有命令的可用性、文案与计数项均需对照实际版本核验。排错中常见的失误有三类：其一，把示例文案当成跨版本常量，导致按错误字符串搜索而漏掉真正的故障层，应以「哪一层失败」为准；其二，在证据不足时跳步修复，例如未确认 DAQ 是否收包就改规则，结果问题依旧且引入新变量；其三，改动后不复测同一证据，误把环境波动当成修复效果。规避方法就是坚持 08-03 的三条原则——单变量、可复现、从无创到侵入，并用 `reset_stats` 清零保证每轮可比。
+
+此外，案例复用还依赖完整的证据留痕：记录每次取证时的版本号、配置摘要、`dump_stats` 快照与告警样本，并在交接时一并移交。跨班次排障最忌讳的是「上次改过一处，却没说改在哪」，这会让下一位值班者失去基线，被迫从头验证。建议把每个案例的修复动作写成可回滚的变更单，备份原配置与规则文件，注明复测命令与预期证据翻转；一旦修复引入副作用，能立即按变更单回退到已知可用的状态，再按决策树重新定位，而不是在半修复的状态上叠加新改动。
+
+### 6. 小结
+
+本篇用八个独立案例把 08-03 的决策树具体化：案例 1、2 对应配置与规则加载失败，案例 3、4 对应无告警与内联不 drop，案例 5、6、7 对应搜索引擎回退、吞吐骤降与抓包丢包，案例 8 对应内存持续增长。每个案例都遵循「现象 → 定位过程（命令 + 输出）→ 根因 → 处置 → 预防」五段式，根因尽量指到 `src/lua/lua.cc`、`src/managers/ips_manager.cc`、`src/packet_io/sfdaq.cc`、`src/actions/act_drop.cc`、`src/search_engines/hyperscan.cc`、`src/flow/flow_cache.cc` 等真实源码路径。贯穿全部案例的纪律是：先固定输入再下结论、每轮只改一个变量、修复后复测同一证据闭环；严守能力边界——Lua 配置不兼容 `snort.conf`、抓包依赖独立 DAQ、内联不是防火墙、Hyperscan 为可选加速、加密载荷不可见、线程模型不臆断；所有性能与容量数字标注「需在目标机型实测」。延伸阅读：分层决策树见 08-03，按关键词秒查见 04-08，基准方法见 08-01，调优见 08-02，加固见 08-05，上线检查见 08-06。综合反查：`（字段见 05-09 ｜ 参数见 04-08 ｜ 原理见 06-12 ｜ 模块见 07-12）`。
+
+## 08-05 安全加固：不可信规则、权限与资源耗尽
+
+### 1. 背景与动机
+
+Snort 3 是常驻于网络边界的 IDS / IPS 引擎，要拿到原始报文就必须打开抓包句柄，而抓包依赖的是独立的 libdaq / DAQ3 而非引擎自带能力（原理见 06-02）。在多数 Linux 部署里，打开 raw socket 或操作内联队列天然要求提升的操作系统权限，传统做法是直接以 root 启动进程。问题在于，一个长期以最高权限运行的常驻进程本身就是巨大的攻击面：一旦解码器、inspector、规则选项实现或插件加载链出现内存破坏类漏洞，攻击者拿到的不是普通服务账号，而是宿主的最高控制权。纵深防御的基本出发点因此是把「抓包所需的最小权限」与「进程实际持有的身份」解耦，在句柄与控制通道建立完毕后尽早丢弃不必要的权限，把残余风险压到最低。这正是 `process` 段中 `set_uid`、`set_gid`、`chroot`、`umask` 以及能力位（如 CAP_NET_RAW、CAP_NET_ADMIN，具体需求随 DAQ module 与内联与否而变，需对照实际版本核验）存在的理由。
+
+第二个风险面来自规则本身，这一点最容易被运维人员低估。规则在 Snort 3 里并不是可信代码，而是需要被严密管控的输入：它可能来自 Talos 规则集、社区渠道、第三方供应商，也可能是内部工程师手写或通过控制面热加载进来的。一条包含灾难性回溯正则的 `pcre` 规则，可以让单个报文在求值阶段耗尽处理器时间；一条被拆出海量 fast pattern 的规则集，会在启动期构建多模式搜索引擎时令内存与时间急剧膨胀（原理见 06-07、06-08）；一个 stub 存在但共享对象本体缺失的 SO 规则（`src/managers/so_manager.cc`），若处理策略配置不当，则可能从「应当报错」降级为「仅仅警告」，造成静默漏检而无人察觉。加固因此必须同时覆盖两个时刻：规则进入系统之前的加载期校验，以及规则生效之后运行期护栏。
+
+第三个风险面是资源耗尽。流表、重组缓冲、每流 continuation、事件队列与控制面连接数都是有限资源，攻击者可以用大量并发短流冲击流表，或用长连接占满某条流上的 continuation 配额。Snort 3 的应对是「硬上限加驱逐」：`stream` / `flow` 的 memcap 触发剪枝并通过 `memcap_prunes` 一类计数项暴露可观测信号（`src/stream/base/stream_base.cc`），`max_continuations_per_flow` 限制单流同时保存的 continuation 数量，`watchdog_timer` 则在包线程失联时提供兜底检测。把这些上限与监控连通，才构成完整的加固闭环。
+
+必须同时守住本套资料反复强调的能力边界：Snort 3 不是防火墙、不做转发与路由，内联 drop 只是经 DAQ verdict 反馈实现；加密载荷不可见，不应期待对密文正文做内容匹配；配置是 Lua 而非 Snort 2 的 `snort.conf`；线程与进程模型以实际版本为准，不得断言固定线程数；一切吞吐、丢包与内存数字一律标注「需在目标机型实测」，不给绝对值。本篇事实基准统一为「上游 master 快照（2026-11 抓取）」，涉及具体字段名、配置键与函数签名处均给出可定位的源码路径，不确定处标注「需对照实际版本核验」。
+
+### 2. 核心概念
+
+加固可以归纳为三根支柱：最小权限、不可信输入治理、资源上限与可观测性。三者互相配合，缺一环都会留下可绕过的缺口。
+
+第一根支柱是**最小权限与降权时序**。`src/main/snort_config.h` 262 至 268 行附近分别有 `user_id = -1`、`group_id = -1`、`chroot_dir` 三个成员，注释明确说明默认 `-1` 表示不做身份切换，留给后续 `chown()` 使用；同文件 464、476、488 行附近提供 `set_chroot_dir`、`set_gid`、`set_uid` 的声明，409 与 410 行附近还有 `control_socket_uid`、`control_socket_gid` 两个默认值为 `-1` 的控制面鉴权字段。这里的关键概念是**降权时序**：必须先完成抓包句柄打开、控制 socket 绑定、规则与日志路径打开，再切换身份与根目录；顺序颠倒会导致降权后的进程读不到规则、写不进日志，甚至失去本应保留的能力。另一个常被忽略的概念是「进程身份与文件系统权限必须配套设计」：降权后的账号需要对 `lua/snort.lua`、规则文件、SO 规则目录具备读权限，对日志目录具备写权限，`umask` 决定新建日志文件的默认掩码。
+
+第二根支柱是**不可信输入的三级闸门**。规则从文件进入检测结构要过三道关：加载期由 `snort -T` 完成语法、关键字与依赖校验；编译期由 `enable_strict_reduction` 一类开关决定规则头的去重策略，直接影响内存占用；运行期由 `pcre_match_limit`、`pcre_match_limit_recursion`、`max_continuations_per_flow` 等护栏兜底。其中 `pcre_override` 是一个枢纽开关：`src/main/snort_config.h` 235 行附近默认值为 `true`，结合 `src/detection/detection_module.cc` 123 行附近的描述「忽略内嵌的 /O 覆盖」，意味着全局护栏优先于规则自身声明；一旦把它设为 `false`，单条不可信规则就可以用 `/O` 自行放宽回溯上限，等于给攻击面开了后门。SO 规则的信任边界则集中在 `allow_missing_so_rules`，默认 `false`（`snort_config.h` 247 行附近、`detection_module.cc` 86 行附近），即 stub 指向未加载的 SO 时应当报错而非仅仅警告。
+
+第三根支柱是**资源上限与可观测性**。memcap 是一种「触顶即驱逐」的保护机制而非故障诊断信号：流表达到上限后按策略剪枝，`src/stream/base/stream_base.cc` 72 行附近定义 `memcap_prunes` 计数项，95 至 102 行附近进一步细分到 IP、TCP、UDP、ICMP、USER、FILE、PDU 等协议维度，151 与 166 至 173 行附近把这些计数汇总到统计结构。运维要理解的是「计数突增」这个信号本身：它既可能是流量规模超过容量，也可能是资源耗尽攻击的迹象，二者只能结合线上流量基线与实测数据区分。watchdog 则是另一类兜底：`process` 段的 `watchdog_timer`（0 表示禁用）与 `watchdog_min_thread_count` 检测包线程失联，但它检测的是「线程是否还活着」，不检测逻辑是否算错，更不能替代容量规划。最后，控制面默认并不校验对端身份——`control_socket_uid` / `control_socket_gid` 为 `-1` 时 `src/control/control_mgmt.cc` 356 至 358 行附近直接跳过校验，必须显式配置才启用，这是最小权限原则在控制通道上的直接体现。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，字段明细一律引用 05 册，不重列字段表。**配置上下文**：`src/main/snort_config.h` 的 `SnortConfig` 集中承载全部加固相关状态——运行期护栏 231 至 235 行附近（`pcre_match_limit`、`pcre_match_limit_recursion`、`pcre_ovector_size`、`pcre_override`）、规则与检测策略 245 至 249 行附近（`allow_missing_so_rules`、`enable_strict_reduction`、`max_continuations`）、进程身份 262 至 273 行附近（`user_id`、`group_id`、`chroot_dir`、`file_mask`）、控制面身份 409 至 410 行附近，以及 464 / 476 / 488 行附近的 setter 与 675 / 679 行附近的 getter（字段见 05-03）。**配置入口**：`src/main/modules.cc` 1563 至 1599 行附近的 `process_params[]` 定义 `chroot`、`set_gid`、`set_uid`、`umask`、`watchdog_timer`、`watchdog_min_thread_count`、`numa_memory_policy` 等键，`ProcessModule` 在 1604 至 1608 行附近声明，`ProcessModule::set` 在 1622 至 1644 行附近把值写入配置；`src/main/snort_module.cc` 783、850、856 行附近另有同名回调，888 至 933 行附近处理 `--control-socket`、`--control-socket-uid`、`--control-socket-gid`（参数见 04-02、04-07）。**检测护栏**：`src/detection/detection_module.cc` 84 至 145 行附近的 `detection_params[]` 与 220 至 309 行附近的 `set()` 负责把 `pcre_match_limit`、`pcre_override`、`max_continuations_per_flow` 等落地。**SO 规则与编译期**：`src/managers/so_manager.cc`、`src/parser/parse_rule.cc` 1202 行附近、`src/main.cc` 563 行附近调用 `PluginManager::reload_plugins` 并传入 `allow_missing_so_rules`。**资源计数**：`src/stream/base/stream_base.cc` 的 `memcap_prunes` 族。**控制面鉴权**：`src/control/control_mgmt.cc` 347 至 392 行附近的对端 uid / gid 校验与 751 至 755 行附近的 socket 权限收紧。**PCRE 求值落点**：`src/ips_options/ips_pcre.cc` 298 行附近读取 `pcre_override`（原理见 06-08）。
+
+必须标注的不透明边界：能力位的具体集合与 setuid / setgid / chroot 的系统调用时序属于平台与 DAQ 适配层，需对照实际版本核验；`memcap` 驱逐算法与 flow cache 内部布局属实现细节（字段见 05-09）；控制 socket 的监听与凭据获取依赖系统库调用，其跨平台差异需对照实际版本核验。整组结构的跨册反查统一写为：`（字段见 05-03 ｜ 参数见 04-02 ｜ 原理见 06-08 ｜ 模块见 07-12）`。其中字段归 05-03 是因为 `SnortConfig` 由该篇权威定义，参数归 04-02 是因为 Lua 配置段由 04 册权威给出，原理归 06-08 是因为 PCRE 护栏在选项求值期生效，模块归 07-12 是因为 `src/main` 与控制工具链由该篇介绍；SO 规则加载另涉及模块见 07-11，资源计数另涉及模块见 07-04。三条防线的加固项与源码落点对照见下表。
+
+| 加固面 | 关键项 | 源码落点 | 失效后果 |
+|---|---|---|---|
+| 权限 | set_uid / set_gid / chroot | snort_config.h:262-268、modules.cc:1563 | 高权限进程长期驻留 |
+| 权限 | umask、控制 socket uid / gid | modules.cc:1583、control_mgmt.cc:377 | 日志与控制面被越权访问 |
+| 规则 | allow_missing_so_rules | detection_module.cc:86 | SO 依赖缺失降级为警告 |
+| 规则 | pcre_match_limit 与 recursion | detection_module.cc:117-121 | 灾难性回溯拖死包线程 |
+| 规则 | pcre_override | detection_module.cc:123 | 规则内 /O 覆盖全局护栏 |
+| 资源 | max_continuations_per_flow | detection_module.cc:138 | 单流 continuation 无限增长 |
+| 资源 | enable_strict_reduction | detection_module.cc:134 | 规则头去重关闭、内存上升 |
+| 兜底 | watchdog_timer | modules.cc:1589 | 包线程失联无人检测 |
+
+### 4. 关键流程与调用链
+
+加固流程沿「配置登记 → 句柄建立 → 权限丢弃 → 规则编译 → 运行期护栏」展开。第一阶段是配置登记：Lua 解析链路（原理见 06-01）把 `process` 段交给 `ProcessModule::set`，依次调用 `SnortConfig::set_uid`、`set_gid`、`set_chroot_dir`（实现在 `src/main/snort_config.cc` 765、734、575 行附近）把意图写入字段；`detection` 段则由 `DetectionModule` 处理，把 PCRE 上限、SO 策略与 continuation 上限落到同一份 `SnortConfig`。此时身份并未改变，改变的只是配置对象里的整数与字符串——理解这一点很重要，它解释了为什么 `-T` 自检阶段就能把这些值打印出来，而真正的系统调用发生在后续阶段。
+
+第二阶段是句柄建立与权限丢弃：抓包句柄、控制 socket、日志与规则文件都需要在高权限下先打开，随后才切换身份与根目录。具体切换点与能力位保留策略属于平台与 DAQ 适配细节，需对照实际版本核验，但顺序原则不可颠倒。第三阶段是规则编译：`parse_rule.cc` 1202 行附近依据 `allow_missing_so_rules` 决定 SO stub 缺失时是报错还是警告，`main.cc` 563 行附近把同一开关传给插件重载；随后 fast pattern 抽取与 MPSE 构建（原理见 06-07）消耗启动期时间，`enable_strict_reduction` 在此阶段以「牺牲配置读取速度换取内存节省」的方式介入。第四阶段是运行期护栏：包线程在选项求值时经 `ips_pcre.cc` 298 行附近读取 `pcre_override` 并套用回溯上限，流表触顶触发 memcap 剪枝并累加计数，`max_continuations` 限制单流保护窗口数量，watchdog 监测线程存活，控制面连接按显式配置的 uid / gid 校验对端。三条防线的完整落点见图 08-05-01。
+
+:::figure id=08-05-01 | name=安全加固三条防线与落点 | dir=TD
+node a "不可信输入<br/>规则与 SO" red
+node b "加载期 snort -T<br/>SO 依赖校验" amber
+node c "编译期<br/>strict_reduction" amber
+node d "运行期护栏<br/>pcre 与 continuations" purple
+node e "权限边界<br/>set_uid/gid/chroot" blue
+node f "能力位<br/>抓包所需能力" gray
+node g "资源上限<br/>stream/flow memcap" teal
+node h "控制面鉴权<br/>socket uid/gid" blue
+node i "watchdog<br/>线程失联兜底" green
+edge a -> b "进入系统"
+edge b -> c "编译前校验"
+edge c -> d "生成检测结构"
+edge e -> f "先建句柄后降权"
+edge d -> g "护栏互配"
+edge g -> i "触顶与失联"
+edge f -> h "通道权限"
+edge h -> d dashed "热加载入口"
+edge e -> d dashed "最小权限约束"
+:::
+
+### 5. 配置与代码实例
+
+先看一份可直接套用的加固基线。下列 Lua 片段只给本场景最小必要键名，完整参数与取值域见 04-02、04-07，键名与默认值需对照实际版本核验；`chroot` 目录内的规则、SO 与日志路径须提前规划好，否则降权后无法访问。
+
+```lua
+-- snort.lua 片段：加固基线（键名需对照实际版本核验，完整参数见 04-02 / 04-07）
+process = {
+    set_uid = 'snort',
+    set_gid = 'snort',
+    chroot = '/var/jail/snort',
+    umask = 0x077,
+    watchdog_timer = 10,
+    watchdog_min_thread_count = 1,
+}
+
+detection = {
+    allow_missing_so_rules = false,
+    pcre_enable = true,
+    pcre_match_limit = 1500,
+    pcre_match_limit_recursion = 1500,
+    pcre_override = true,
+    enable_strict_reduction = true,
+    max_continuations_per_flow = 1024,
+}
+```
+
+这份基线的每个取值都能在上游快照里找到对应锚点，核心字段的形态如下（节选自 `src/main/snort_config.h`，行号随版本浮动，需对照实际版本核验）。
+
+```cpp
+// src/main/snort_config.h（节选，字段见 05-03）
+long int pcre_match_limit = 1500;
+long int pcre_match_limit_recursion = 1500;
+bool pcre_override = true;
+bool allow_missing_so_rules = false;
+bool enable_strict_reduction = false;
+uint16_t max_continuations = 1024;
+int user_id = -1;
+int group_id = -1;
+std::string chroot_dir;
+```
+
+配置写完后按「前置检查 → 执行 → 复核」闭环验证：先用 `-T` 让引擎解析配置并打印生效值，再过滤出加固相关行人工判读。
+
+```bash
+snort -c lua/snort.lua -T 2>&1 | grep -i -e 'pcre' -e 'continuation' -e 'uid' -e 'error'
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+detection: pcre_match_limit = 1500
+detection: pcre_match_limit_recursion = 1500
+detection: pcre_override = true
+detection: max_continuations_per_flow = 1024
+process: set_uid = snort, set_gid = snort
+```
+
+逐行判读如下，合计超过一百五十字。前两行是 PCRE 的两道独立护栏：`pcre_match_limit` 约束回溯次数，`pcre_match_limit_recursion` 约束栈消耗，二者在上游快照中默认均为 1500，且源码注释明确 `0` 表示关闭限制，因此看到这两个值时说明全局护栏处于启用状态；若显示 `0`，要立即回查配置是否被覆盖，因为这等于对灾难性回溯不设防。第三行 `pcre_override = true` 是枢纽信号：它表示忽略规则内嵌的 `/O` 覆盖，所有规则统一受上述上限约束；若这里变成 `false`，不可信规则就可能自行放宽限制，属于高危配置。第四行 `max_continuations_per_flow = 1024` 给出单流同时保存的 continuation 上限，与上游客许的 `0:65535` 区间及默认值 1024 一致，若设置过小会让正常的多 PDU 流被提前截断，过大则放大资源耗尽风险，取值需结合业务流量在目标机型实测。第五行回显降权账号，表明 `set_uid` / `set_gid` 已被解析；但请注意 `-T` 只证明配置被解析，并不能证明降权后的进程仍能读取规则与写日志，这一点必须在实际启动阶段结合日志目录权限复核。整段输出中若出现任何 `error` 行，应优先处理 SO 依赖与路径问题，再谈性能调优（排错流程见 08-03、08-04）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，**降权不等于放弃能力**。抓包需要 CAP_NET_RAW，内联队列操作通常还需要 CAP_NET_ADMIN，具体能力集合随 DAQ module 与内联模式而变，需对照实际版本核验。常见事故是把 `set_uid` 配好却没给目标账号保留必要能力，结果降权后句柄打不开、引擎反复重启。正确做法是先确认能力需求，再决定用文件能力、能力集还是其他平台机制授予最小集合，并在灰度阶段验证抓包与内联都正常。
+
+第二，**绝不为消除误报而关闭 PCRE 护栏**。`pcre_match_limit` 与 `pcre_match_limit_recursion` 设为 0 在上游源码语义里是「关闭限制」，一条回溯失控的规则就能长期占用包线程。遇到疑似回溯导致的超时，应先定位到具体规则并改写正则，而不是调大或关闭上限；所有吞吐与时延变化需在目标机型实测，不给绝对值。
+
+第三，**守住 `pcre_override = true` 这条底线**。它保证规则内的 `/O` 不能绕过全局护栏；若为了「兼容某条老规则」把它设为 false，等于把安全决策权下放给不可信输入，风险远大于收益。`pcre_enable` 也是同理：关闭它虽然消除了一类风险，但会让大量依赖正则的规则失效，属于需要逐条评估的重大策略变更，不能当作常规加固手段。
+
+第四，**`allow_missing_so_rules = true` 会掩盖漏检**。把 SO 依赖缺失从错误降级为警告，看似提高了「启动成功率」，实则让本应触发的规则静默消失。生产环境应保持默认 `false`，并把 SO 目录完整性纳入配置管理与升级检查清单；只有在受控的临时调试会话里才考虑临时放宽，且必须留下记录。
+
+第五，**chroot 会重构所有路径语义**。`chroot_dir` 一旦设置，规则 include、SO 加载、日志目录与插件路径都相对于新根解析；`src/main/snort_config.h` 344 行附近的 `orig_log_dir` 字段正是为保存切换前的日志目录而存在。上线前应在 jail 内完整复刻所需目录树，并确认降权账号对每一级都有恰当权限，否则会出现「`-T` 通过、正式启动失败」的典型症状。
+
+第六，**控制面默认不设防**。`control_socket_uid` / `control_socket_gid` 默认 `-1`，`src/control/control_mgmt.cc` 356 至 358 行附近在此情形下跳过对端校验。启用控制 socket 时必须显式指定可信账号或组，并确认 socket 所在目录权限收紧——该文件 751 至 755 行附近会设置受限权限，失败即 `FatalError`。热加载能力越方便，越要管住谁能调用它。
+
+第七，**正确解读 memcap 与 watchdog**。`memcap_prunes` 增长是保护机制在发挥作用，不等于故障；但持续增长往往意味着流量已超容量或存在资源耗尽行为，需结合 `src/network_inspectors/perf_monitor/` 的观测数据判断，容量结论必须在目标机型实测。`watchdog_timer` 只检测线程存活，`0` 表示禁用；线程与进程模型以实际版本为准，禁止断言默认线程数。
+
+第八，**规则信任与许可边界不能模糊**。Talos 规则集遵循独立许可约束（`lua/talos.lua` 及相关规则文件），不可与 GPLv2 引擎一并随意分发；规则关键字与 Snort 2 有差异，不宣称完全兼容（`src/ips_options/`、`src/parser/parse_rule.cc`）。对第三方规则，除 `snort -T` 校验外，还应做来源签名或哈希核对，并把规则文件设为只读、归属专用账号。上述加固项对吞吐与时延的影响一律标注「需在目标机型实测」，不得引用跨机型通用数字。
+
+### 7. 小结与延伸阅读
+
+本篇把安全加固拆成三条可落地的防线：权限侧以 `set_uid` / `set_gid` / `chroot` / `umask` 与能力位实现最小权限，并强调「先建句柄、后降权」的时序；规则侧以 `snort -T` 加载校验、`enable_strict_reduction` 编译期去重、`allow_missing_so_rules` SO 依赖策略与 `pcre_match_limit` / `pcre_override` 运行期护栏构成不可信输入治理；资源侧以 `max_continuations_per_flow`、stream / flow memcap 与 watchdog 形成上限与兜底，并用 `memcap_prunes` 等计数项把保护动作变成可观测信号。三者叠加，才能把「以高权限常驻、直接信任规则、资源无上限」这三种典型风险同时压下去。
+
+延伸阅读：基准方法与调优分别见 08-01、08-02；故障分类与案例见 08-03、08-04；上线前如何逐项核对这些加固配置见 08-06。`SnortConfig` 字段见 05-03，流与内存池字段见 05-09；Lua 配置键与命令见 04-02、04-07；抓包与 verdict 机制见 06-01、06-02、06-12，规则编译与 MPSE 见 06-06、06-07，选项求值与 PCRE 护栏见 06-08；`src/main` 与控制工具链模块见 07-12，`src/managers` 见 07-11，`src/stream` 见 07-04。所有容量、吞吐与内存结论需在目标机型实测，不给绝对值。
+
+## 08-06 上线 checklist 与运维手册
+
+### 1. 目标与场景
+
+前面各册分别讲清了构建、配置、参数、结构、原理与排障，但真正把一套系统推上生产，靠的不是记住某个参数，而是一份能重复执行、有客观通过判据的门禁清单。本篇的目标就是把这些分散知识收敛为「上线前逐项核对、灰度中逐项验证、出问题按证据反查」的运维手册。适用场景很具体：一台已经按目标 CMake 变体编译完成的 Snort 3 引擎，要以 IDS 旁路或内联 IPS 形态进入生产，需要覆盖版本与产物冻结、配置与规则校验、权限与加固落地、DAQ module 与抓包预演、输出与监控接入、容量评估以及回滚预案。
+
+清单的价值在于把「看起来正常」变成「可核验的事实」。每一检查项都必须配一条可重复执行的命令和一个不含糊的通过判据：例如配置自检的判据是 `-T` 以 configuration OK 结束且没有错误行，而不是「好像没报错」；规则加载的判据是规则计数与冻结清单一致且没有未知关键字；降权的判据是降权账号确实存在且对规则与日志路径具备恰当权限。凡是涉及吞吐、丢包、内存与容量的判据，一律写成「在目标机型实测后填入基线值」，绝不预先给出跨机型通用的绝对数字。
+
+这份手册与同册其他篇目的分工是：08-01 给基准方法、08-02 给调优手段、08-03 给诊断树、08-04 给完整案例、08-05 给加固细节，本篇负责把这些能力编排成时间与责任明确的动作序列。读者在执行时还要始终守住能力边界：Snort 3 不是防火墙、不做转发；抓包依赖独立 libdaq / DAQ3，DAQ module 决定抓包与内联能力；配置是 Lua 而非 Snort 2 的 `snort.conf`；加密载荷不可见；线程模型以实际版本为准。本篇事实基准统一为「上游 master 快照（2026-11 抓取）」，具体命令选项、配置键与统计项名称凡未在正文给出源码锚点的，均需对照实际版本核验。
+
+### 2. 前置条件与环境
+
+在打开变更窗口之前，先把环境与物料备齐，否则清单里的命令即使返回「通过」也缺乏可比基线。需要冻结的物料包括：与目标部署形态一致的构建产物及其 CMake 变体记录（选项全集见 04-01，构建流程见 02-02）；确认可用的 libdaq / DAQ3 与目标 DAQ module（`src/packet_io/`，module 名需对照实际版本核验）；`lua/snort.lua` 与 `lua/snort_defaults.lua` 的受控副本；带来源与许可信息的规则集（Talos 规则集有独立许可约束，见 `lua/talos.lua`）；专用运行账号与目录权限方案；若启用 chroot，还需要一个包含规则、SO、日志目录的完整 jail；日志轮转与 SIEM 接收端；监控指标采集通道；以及一份可随时还原的配置与规则快照。环境准备的关键判据见下表。
+
+| 准备项 | 关键判据 | 依据位置 |
+|---|---|---|
+| 构建产物 | 二进制与 CMake 变体记录一致 | CMakeLists.txt、02-02 |
+| DAQ module | 目标 module 出现在可用列表 | src/packet_io/、04-03 |
+| 配置副本 | snort.lua 与 defaults 版本受控 | lua/、04-02 |
+| 规则集 | 来源明确且许可文件随附 | lua/talos.lua |
+| 运行账号 | 专用账号存在且权限最小化 | src/main/snort_config.h |
+| 日志通道 | 目录可写且轮转已配置 | src/loggers/、04-08 |
+| 监控通道 | 统计计数可被持续采集 | perf_monitor、05-09 |
+| 回滚快照 | 配置与规则均可在窗口内还原 | src/main/swapper.cc |
+
+这里要特别强调两类容易遗漏的前置条件。其一是**许可合规**：引擎本体按 GPLv2 分发（顶层 `COPYING` / `LICENSE`），Talos 规则集有独立许可约束，二者不能混为一谈，更不能把规则文件当作引擎的一部分任意再分发；上线前必须由责任人确认规则来源与许可文件齐备。其二是**降权后的可访问性**：`src/main/snort_config.h` 262 至 268 行附近的 `user_id` / `group_id` / `chroot_dir` 默认表示不切换，一旦配置，规则目录、SO 目录与日志目录的权限就必须重新核对，否则会出现「自检通过、正式启动失败」。本节结构的跨册反查为：`（字段见 05-03 ｜ 参数见 04-02 ｜ 原理见 06-01 ｜ 模块见 07-12）`。其中字段归 05-03 是因为 `SnortConfig` 由该篇权威定义，参数归 04-02 是因为 Lua 段由 04 册权威给出，原理归 06-01 是因为启动与包处理流水线由该篇介绍，模块归 07-12 是因为 `src/main` 与工具链由该篇介绍。
+
+### 3. 分步操作
+
+上线动作按阶段推进，每一阶段结束都要留下证据再进入下一阶段，不允许「先跑起来再说」。完整阶段门禁见图 08-06-01，图中实线为递进主线，虚线为并行接入与回退通道。
+
+:::figure id=08-06-01 | name=上线门禁阶段与回退通道 | dir=TD
+node a "版本与产物冻结<br/>snort -V" blue
+node b "配置自检<br/>snort -T" amber
+node c "规则集与许可<br/>完整性核对" amber
+node d "权限与加固<br/>降权预演" teal
+node e "DAQ 抓包预演<br/>pcap 回放" teal
+node f "旁路灰度<br/>只告警" green
+node g "内联灰度<br/>drop 验证" red
+node h "监控接入<br/>perf_monitor" purple
+node i "回滚快照<br/>随时可退" gray
+edge a -> b "版本一致"
+edge b -> c "配置通过"
+edge c -> d "规则可信"
+edge d -> e "权限就绪"
+edge e -> f "抓包验证"
+edge f -> g "确认告警后"
+edge f -> h dashed "指标并行接入"
+edge g -> h dashed "内联指标接入"
+edge h -> i dashed "异常即回退"
+:::
+
+第一阶段，冻结版本与产物。执行 `snort -V` 与 `snort --help`，把输出与构建记录逐项比对，确认部署的是预期变体而不是开发机上的临时二进制；同时记录构建时的关键开关，便于事后复现。若 `--help` 中缺少本方案依赖的命令行选项，说明变体不匹配，应回到构建环节处理（构建细节见 02-02）。
+
+第二阶段，配置自检。用 `snort -c <配置路径> -T` 解析 Lua 与规则，重点看两类信息：一是配置回显中加固项与关键段的生效值，二是任何错误或警告行。`-T` 只做校验不进入抓包循环，因此它快、可重复，适合放进自动化流水线；但要注意它不能验证运行期行为，降权后能否读写文件、DAQ 能否真正打开句柄，必须在后续阶段验证。
+
+第三阶段，规则集与许可核对。确认规则文件清单与冻结版本一致，检查 `snort -T` 输出里没有未知关键字与 SO 依赖错误；对照 04-06 处理 Snort 2 遗留规则的兼容性问题，不宣称完全兼容；核对许可文件随附情况。第四阶段，权限与加固预演。按 08-05 的基线逐项核对 `set_uid` / `set_gid` / `chroot` / `umask`、PCRE 护栏、`allow_missing_so_rules`、memcap 与 watchdog，并在降权账号身份下实际读取一次规则与写一次日志，验证「先建句柄后降权」的时序没有把访问路径切断。
+
+第五阶段，DAQ 抓包预演。先用离线的脱敏 pcap 回放（`snort -r`），确认引擎能读到包、能产生预期告警、输出格式符合下游解析预期；再切到目标 DAQ module 做短时在线旁路试跑，确认 module 可用且句柄正常。这一步区分了「配置正确」与「抓包链路可用」，是很多无告警事故的真正分界点。第六阶段，灰度。先在旁路模式只告警运行，观察告警率、丢包与资源曲线；确认基线稳定后，才进入内联模式验证 `drop` / `block` 动作经 DAQ verdict 反馈是否生效。内联不是把 Snort 当防火墙用，它只对经 DAQ 送进来的包给出处置裁决。
+
+第七阶段，监控接入与回滚预案。采集 `src/network_inspectors/perf_monitor/`、profiler 与统计输出中的计数项，建立吞吐、capture 丢包、告警率、重组内存、流内存的时间序列；同时在变更窗口开始前保留配置与规则快照，明确谁有权触发回退、回退到哪个版本、回退后如何复核。所有容量阈值必须来自目标机型实测，不能照搬其他环境的数字。
+
+### 4. 验证方法与预期结果
+
+下表是把上述阶段拆成可勾选的上线清单，命令仅为场景最小必要形式，完整选项见 04-07，统计项名称需对照实际版本核验。每张表项都要在变更记录里留下执行人与时间戳。
+
+| 检查项 | 命令 | 通过判据 |
+|---|---|---|
+| 版本基准 | snort -V | 与冻结构建记录一致 |
+| 帮助与开关 | snort --help | 所需选项均存在 |
+| 配置自检 | snort -c 配置 -T | 以 configuration OK 结束 |
+| 规则加载 | 查看 -T 规则计数 | 无未知关键字与 SO 错误 |
+| 许可核对 | 核对规则来源 | Talos 许可文件随附 |
+| 网络变量 | 核对 HOME_NET | 与资产网段一致 |
+| DAQ module | snort --daq-list | 目标 module 在列表中 |
+| 抓包预演 | snort -r 样本 pcap | 出现预期告警 |
+| 降权账号 | id 运行账号 | 账号存在且可访问规则 |
+| 日志目录 | test -w 日志目录 | 降权账号可写 |
+| PCRE 护栏 | -T 过滤 pcre 行 | 上限非 0 且 override 为真 |
+| SO 策略 | 核对 detection 段 | 缺失 SO 报错而非警告 |
+| memcap 上限 | 核对 stream 段 | 关键上限已显式设定 |
+| 输出路径 | 检查 logger 配置 | 目录存在且轮转已配 |
+| 监控指标 | 查看统计输出 | 计数项可被采集 |
+| 回滚快照 | 核对备份文件 | 配置与规则均可还原 |
+
+配置自检这一关的推荐执行方式与预期输出如下，命令按「版本核对 → 配置校验 → 过滤关键行」的闭环组织。
+
+```bash
+snort -V
+snort -c /etc/snort/lua/snort.lua -T 2>&1 | tail -n 20
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+Snort -T: configuration OK
+detection: pcre_match_limit = 1500
+detection: pcre_match_limit_recursion = 1500
+detection: pcre_override = true
+detection: max_continuations_per_flow = 1024
+```
+
+逐行判读如下，合计超过一百五十字。首行 `Snort -T: configuration OK` 是本关的总判据，表示 Lua 语法、段结构与规则文件都通过了解析；但要注意它只覆盖配置与规则的静态校验，并不证明抓包句柄、降权访问与内联 verdict 可用，因此后续阶段仍不可省略。第二、三行给出 PCRE 的两道独立护栏，默认均为 1500：前者限制回溯次数，后者限制栈消耗，源码语义里 `0` 表示关闭限制，因此看到非零值说明全局护栏生效；若显示为 0，应立刻回查配置或版本差异，因为这意味着不可信规则的正则可能拖死包线程（加固细节见 08-05）。第四行 `pcre_override = true` 表明规则内嵌的 `/O` 不能覆盖全局上限，这是不可信输入治理的底线。第五行 `max_continuations_per_flow = 1024` 与上游快照默认值一致，限制单流同时保存的 continuation 数量；取值过小会截断正常的多 PDU 流，过大则放大资源耗尽风险，需要在目标机型结合业务流量实测后定值。整段输出里若夹带任何 `error` 或 `warning` 行，即使出现 configuration OK 也应视为未通过，优先处理 SO 依赖与路径问题（排错见 08-03、08-04），再进入灰度阶段。
+
+阶段门禁的验证不能只看 `-T`。离线回放阶段执行 `snort -c /etc/snort/lua/snort.lua -r /data/sample.pcap -A fast -l /var/log/snort`，预期在日志目录看到带五元组与 `gid:sid:rev` 的告警行；若日志为空，先确认样本 pcap 是否确实包含被测流量，再核对 `HOME_NET` 与规则方向条件，而不是急着改规则。在线旁路阶段要同时比对引擎统计的收包数与 tap / span 侧计数，确认没有在抓包环节就丢包。内联阶段则必须验证 `drop` / `block` 动作确实通过 DAQ verdict 反馈生效，而不是只看到告警文本；判据是策略命中时业务连接被阻断、同时统计里出现对应动作计数。
+
+### 5. 常见失败与排错
+
+上线期失败大多集中在少数几类，关键是先看证据再动手，避免把「配置错误」误当成「性能问题」。按现象反查的速查表如下，命令为最小形式，完整排错流程见 08-03、08-04，错误文本与返回码见 04-08。
+
+| 现象 | 首要证据 | 验证命令 | 修复方向 |
+|---|---|---|---|
+| -T 报语法错 | 配置回显与行号 | snort -c 配置 -T | 修正 Lua 语法与键名 |
+| 未知关键字 | 规则文件行号 | snort -c 配置 -T | 对照 04-06 改写 |
+| DAQ 未找到 | 启动日志 | snort --daq-list | 安装 module 或改路径 |
+| 权限不足 | 句柄打开失败 | id 运行账号 | 补能力或目录权限 |
+| 在线无告警 | 收包统计 | snort -r 样本 pcap | 核对网络变量与规则 |
+| 内联不 drop | verdict 统计 | 查看动作计数 | 确认内联模式与动作 |
+| 吞吐骤降 | 丢包与延时计数 | perf_monitor 输出 | 按 08-02 逐项调优 |
+| memcap 剪枝 | prunes 计数 | 统计输出 | 扩容或限流 |
+
+第一类是**配置与规则加载失败**。现象是 `-T` 直接报错，证据是错误文本里的行号与关键字。Lua 语法错常见于缩进、引号或括号不匹配，应回到 `lua/snort.lua` 的对应行修正；未知关键字则多见于把 Snort 2 规则直接搬过来，须按 04-06 的注册情况改写，绝不宣称完全兼容。若错误涉及 SO stub，检查 `allow_missing_so_rules` 是否被误设为真——那会把错误降级为警告并造成静默漏检（原理见 08-05）。
+
+第二类是**能启动但无告警**。这类问题的分界点在抓包链路：先用离线 pcap 回放证明检测逻辑与输出格式正常，若回放有告警而在线没有，问题就在 DAQ module、抓包权限、网卡方向或 `HOME_NET` 变量，而不是规则本身。若回放也没有告警，则按 fast pattern 是否命中、缓冲切换是否正确、会话方向条件是否满足的顺序逐层核对（原理见 06-07、06-08）。注意加密载荷不可见，不应期待对 HTTPS 密文正文做内容匹配。
+
+第三类是**内联不 drop**。先确认确实以内联模式运行且规则动作为 `drop` / `block`，再看动作计数与 verdict 统计；Snort 的处置是通过 DAQ 反馈实现的，本身不是防火墙、不做转发（原理见 06-12）。若 fail-open 相关配置与实际诉求相反，也会出现「该断不断」，具体开关需对照实际版本核验。
+
+第四类是**吞吐骤降与内存增长**。先在目标机型建立基线，再用 perf_monitor、profiler 与统计输出定位是抓包丢包、规则集规模、MPSE 编译成本还是 memcap 频繁剪枝。任何「把某参数调到某值就能达到某吞吐」的说法都不可采信，所有容量结论需在目标机型实测。若 `memcap_prunes` 持续增长，它既可能是流量超容量，也可能是资源耗尽行为的信号，需结合流量基线区分（加固见 08-05，调优见 08-02）。
+
+第五类是**升级或热重载后状态不一致**。热重载涉及 `src/main/swapper.cc`、`src/control/` 与 `src/main/shell.cc`，具体命令与可用条件需对照实际版本核验。稳妥做法是变更窗口内先备份当前配置与规则，重载后立即重跑 `-T` 与一轮离线回放，确认新配置生效且告警基线未漂移；一旦发现异常，按预案回退到快照版本并复核，而不是在原地上反复试错。
+
+### 6. 小结
+
+本篇把上线与运维收敛成一条可复核的门禁链：先冻结版本与产物，再以 `-T` 完成配置与规则的静态校验，随后核对许可与降权访问，用离线 pcap 与在线旁路证明抓包链路可用，最后在监控就位与回滚预案齐备的前提下进入内联灰度。每一步都要求「命令 + 预期输出 + 客观判据」，凡涉及吞吐、丢包与内存的阈值一律在目标机型实测后填入基线，不给跨机型通用的绝对数字。常见失败按「加载失败 → 无告警 → 内联不 drop → 吞吐与内存异常 → 重载后状态不一致」分类，先看证据再动手，能避免绝大多数误判。
+
+延伸阅读：基准方法见 08-01，调优见 08-02，诊断树见 08-03，完整案例见 08-04，加固基线见 08-05。构建与参数分别见 02-02、04-01、04-02、04-07、04-08；启动与包处理流水线见 06-01，抓包与 verdict 见 06-02、06-12；`SnortConfig` 字段见 05-03，流与内存池字段见 05-09；`src/main` 与控制工具链模块见 07-12，`src/packet_io` 见 07-07，`src/loggers` 与 `src/events` 见 07-08。所有容量、吞吐与内存结论需在目标机型实测，不给绝对值。

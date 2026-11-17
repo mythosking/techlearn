@@ -1,0 +1,252 @@
+# Snort 3 技术资料 · 06 技术原理（分片 F）
+
+## 06-11 输出与事件管线（logger、alert_json）
+
+### 1. 背景与动机
+
+检测引擎在选项链全部通过后会调用入队接口（原理见 06-08、06-09），但「产生一条命中」与「把这条命中变成一条人能读、机器能采的告警记录」之间还隔着一段不容忽视的距离。这段距离就是输出与事件管线：它要完成事件的时序归一、优先级排序、去重与限速、动作与日志的分流，以及最终向多个异构后端的落盘或转发。理解它的第一个动机是**解耦**：检测层只负责回答「哪条规则在当前包上成立」，至于这条成立要写成 JSON 行、二进制 unified2 记录还是 syslog 文本，应当由输出层独立决定，两者之间靠一个稳定的 `Event` 对象与一组回调衔接。若把格式化和落盘逻辑塞进检测热路径，每次命中都要同步写盘，检测线程会被 I/O 拖慢，吞吐与检测逻辑强耦合，这在工程上不可接受（吞吐需在目标机型实测）。
+
+第二个动机是**多后端并存**。生产部署往往同时需要给 SIEM 喂 JSON、给长期归档写 unified2、给值班人员打 stdout 或 syslog。Snort 3 用 Output Set（输出集）把多个 logger 实例聚合在一起，一次命中可以扇出到全部已注册输出，互不干扰。第三种动机来自 Snort 3 的整体重写：配置改为 Lua（`lua/snort.lua`，参数见 04-02），输出插件不再沿用 Snort 2 的 ABI，而是统一实现 `Logger` 抽象并靠 `LogApi` 注册到框架，告警输出与包日志分别带不同的类型标志，由事件管理器按标志决定实例化谁。
+
+本篇事实基准统一为「上游 master 快照（2026-11 抓取）」。核心源码分布在四处：事件对象与队列在 `src/events/`（`event.h/.cc`、`event_queue.cc/.h`、`sfeventq.cc/.h`）；logger 抽象与输出实现在 `src/framework/logger.h` 与 `src/loggers/`（`alert_json.cc`、`alert_fast.cc`、`unified2.cc` 等）；输出集与注册装配在 `src/managers/event_manager.cc`；检测侧的分发入口在 `src/detection/detect.cc` 与 `src/detection/detection_engine.cc`。告警字段的配置与判读归 04 册（参数见 04-02、告警字段见 04-08），本篇只讲机制与最小片段。需要在一开始就讲清能力边界：输出层拿到的是解码与 inspector 提供的可见信息（原理见 06-03、06-10），加密载荷正文不可见；日志落盘的权限、轮转与接入 SIEM 属运维范畴（见 03-04、08-06），本篇只讲引擎内机制。
+
+### 2. 核心概念
+
+第一个核心概念是 **Logger 抽象与 LogApi 注册**。`src/framework/logger.h` 在 53 行附近定义 `class SO_PUBLIC Logger`，其接口分两组：生命周期钩子 `open`、`close`、`reset`、`reload`（58 至 61 行附近），与事件处理回调 `alert(Packet*, const char*, const Event&)`、`log(Packet*, const char*, Event*)`（63、64 行附近）。头文件 41 至 43 行附近定义 `OUTPUT_TYPE_FLAG__ALERT` 与 `OUTPUT_TYPE_FLAG__LOG` 两个类型标志，39 行附近的 `LOGAPI_VERSION` 用于 ABI 版本校验；82 行附近的 `struct LogApi` 把 `BaseApi base`、`unsigned flags`、`LogNewFunc ctor`、`LogDelFunc dtor` 收在一起。源码 46 至 49 行附近的注释给出关键线程约定：ctor / dtor 在主线程，其余方法在包线程执行——这意味着 `JsonLogger` 持有一个 `THREAD_LOCAL` 的 `TextLog*`，每个检测线程独立写自己的缓冲（字段见 05-08）。
+
+第二个核心概念是 **Event 事件对象**。`src/events/event.h` 26 行附近定义 `class SO_PUBLIC Event`，构造函数（30、31 行附近）接收包时间戳、`SigInfo`、缓冲描述数组与动作字符串。它的访问器覆盖了告警所需的全部语义：时间戳（37、38 行附近）、`event_id` 与 `event_reference`（40、41 行附近）、`gid`/`sid`/`rev`（46 至 48 行附近）、`msg` 与 `class_type`（52、53 行附近）、`priority`（56 行附近）、`reference` 与 `target`（59、62 行附近）。私有成员 `sig_info`、`action`、`buffs_to_dump`、`ts_sec`、`ts_usec`、`event_id`、`event_reference`（65 至 73 行附近）说明它是一个值语义载体而非活对象：一旦由 `SigInfo` 构造完成，就在队列与 logger 之间只读传递（字段见 05-08）。
+
+第三个核心概念是 **事件队列 sfeventq 与 EventQueueConfig**。`src/events/event_queue.h` 25、26 行附近定义排序策略枚举 `SNORT_EVENTQ_PRIORITY` 与 `SNORT_EVENTQ_CONTENT_LEN`，28 行附近的 `EventQueueConfig` 含 `max_events`、`log_events`、`order`、`process_all_events` 四个字段。默认值来自 `event_queue.cc` 72 至 83 行附近的 `EventQueueConfigNew()`：`max_events = 8`、`log_events = 3`、`order = SNORT_EVENTQ_CONTENT_LEN`、`process_all_events = 0`——这些是快照里的源码默认值，实际生效值需对照实际版本核验（参数见 04-02）。`EventNode`（`event_queue.h` 36 行附近）只持 `otn` 与 `rtn` 两个指针，说明队列里排的是「哪条规则命中」而非格式化文本。`src/events/sfeventq.h` 31 行附近的 `struct SF_EVENTQ` 维护 `head`/`last` 双向链、`node_mem`/`event_mem` 内存池与 `reserve_event` 预留位，`max_nodes`/`log_nodes`/`event_size` 是队列配置，`cur_nodes`/`cur_events`/`fails` 是运行计数；对外 API 是 67 至 72 行附近的 `sfeventq_new`、`sfeventq_event_alloc`、`sfeventq_add`、`sfeventq_action`、`sfeventq_reset` 与 `sfeventq_free`（字段见 05-08）。
+
+第四个核心概念是 **Output Set 与 EventManager 的分发**。`src/managers/event_manager.cc` 40 行附近的 `class Output : public PlugInterface` 持 `LogApi* api` 与 `Logger* handler`，52 行附近的 `instantiate` 在首次使用时回调 `EventManager::instantiate`。61 至 66 行附近的 `struct OutputSet` 只含 `EHList outputs`（`typedef list<Logger*>`），而 `static OutputSet s_loggers` 是全局输出集。68、69 行附近的 `alert_enabled` 与 `log_enabled` 两个开关决定 `instantiate`（136 行附近）是否真正 new 出 handler：只有 `flags & OUTPUT_TYPE_FLAG__ALERT` 且 `alert_enabled` 为真、或带 LOG 标志且 `log_enabled` 为真时才构造并挂进 `s_loggers.outputs`（141 至 154 行附近）。运行期的两个分发函数是 209 行附近的 `call_alerters` 与 222 行附近的 `call_loggers`：若调用方传入了 `OutputSet* idx`（规则绑定的输出集）就只遍历该子集，否则遍历全局 `s_loggers`。`open_outputs`/`close_outputs`/`reload_outputs`（190、196、202 行附近）对全部 logger 做批量生命周期操作，`reload_outputs` 末尾还打印 `logger file reinitialized`——这就是日志重载命令落到源码的位置（字段见 05-08）。
+
+第五个核心概念是 **alert_json 的实现骨架**。`src/loggers/alert_json.cc` 58、59 行附近定义 `S_NAME "alert_json"` 与 `F_NAME "alert_json.txt"`，56 行附近的 `static THREAD_LOCAL TextLog* json_log` 印证每线程一个写出句柄。117 至 693 行是一组 `ff_*` 字段格式化函数（如 `ff_action`、`ff_msg`、`ff_rule`、`ff_timestamp`、`ff_b64_data`），它们统一操作一个 `Args` 结构（67 行附近，含 `Packet*`、`msg`、`Event&`、`comma`）；701 至 711 行附近的 `json_func[]` 数组把这些函数按输出顺序排好，713 至 721 行附近的 `json_range` 列出全部可选字段名，723、724 行附近的 `json_deflt` 给出默认字段序列 `timestamp pkt_num proto pkt_gen pkt_len dir src_ap dst_ap rule action`。726 至 741 行附近的 `s_params` 定义四个配置键：`file`、`fields`、`limit`、`separator`；818 行附近的 `JsonLogger` 在 `alert`（849 行附近）里逐个调用字段函数并用 `TextLog_Print` 收尾、再 `TextLog_Flush`。第六个核心概念是 **logger 的装载与可选集**。`src/loggers/loggers.cc` 46 行附近的 `load_loggers()` 是装载入口：49 行无条件装载 `log_codecs`（源码注释说明这是为了保证 `PacketManager::log_protocols()` 被编进来），而 33 至 44 行以 `extern const BaseApi*` 声明的 `alert_csv`、`alert_fast`、`alert_full`、`alert_json`、`alert_syslog`、`alert_talos`、`alert_unixsock`、`log_hext`、`log_pcap`、`eh_unified2` 全部被 `#ifdef STATIC_LOGGERS` 包裹，51 至 67 行只在宏成立时逐个调用 `PluginManager::load_plugins`。这与搜索引擎的可选装载同构（原理见 06-07）：静态链接构建才把这些输出实现纳入可选集，动态插件形态下按插件机制单独装载（原理见 06-14），具体宏与构建变体需对照实际版本核验（构建见 02-02）。各 logger 实现的源码位置与类型标志对照见下表。
+
+| logger 实现 | 源码文件 | 类型标志 | 定位与用途 |
+|---|---|---|---|
+| alert_json | src/loggers/alert_json.cc | OUTPUT_TYPE_FLAG__ALERT | 结构化 JSON 行，字段可裁剪 |
+| alert_fast | src/loggers/alert_fast.cc | OUTPUT_TYPE_FLAG__ALERT | 单行紧凑文本，便于人工查看 |
+| alert_full | src/loggers/alert_full.cc | OUTPUT_TYPE_FLAG__ALERT | 多字段详细文本 |
+| unified2 | src/loggers/unified2.cc | ALERT 与 LOG 兼具 | 二进制记录，供 u2 工具处理 |
+| log_pcap | src/loggers/log_pcap.cc | OUTPUT_TYPE_FLAG__LOG | 匹配包另存为 pcap |
+
+表中类型标志取自各实现 `LogApi` 的 `flags` 字段（alert_json 见 `alert_json.cc` 895 行附近），unified2 在 `loggers.cc` 66 行附近以 `eh_unified2` 同时归入 alerter 与 logger；完整配置键与字段清单归 04 册（参数见 04-02、告警字段见 04-08）。
+
+### 3. 关键数据结构与源码位置
+
+本节点名结构与真实头文件路径，字段明细一律引用 05 册，不重列字段表。**事件对象层**：`src/events/event.h` 的 `class SO_PUBLIC Event`（字段见 05-08）、`src/events/event.h` 关联的 `SigInfo`；`src/events/event_queue.h` 的 `EventQueueConfig`（28 行附近）与 `EventNode`（36 行附近）；`src/events/sfeventq.h` 的 `struct SF_EVENTQ`（31 行附近）与 `sfeventq_new`/`sfeventq_add`/`sfeventq_action`/`sfeventq_reset` 系列 API（字段见 05-08）。**抽象与管理层**：`src/framework/logger.h` 的 `class SO_PUBLIC Logger`（53 行附近）、`struct LogApi`（82 行附近）与 `OUTPUT_TYPE_FLAG__ALERT`/`OUTPUT_TYPE_FLAG__LOG`；`src/managers/event_manager.cc` 的 `class Output`（40 行附近）、`struct OutputSet`（61 行附近）与全局 `s_loggers`（66 行附近），配套接口声明在 `src/managers/event_manager.h`（字段见 05-08）。**实现层**：`src/loggers/alert_json.cc` 的 `JsonModule`（746 行附近）与 `JsonLogger`（818 行附近）；`src/loggers/alert_fast.cc`、`alert_full.cc`、`alert_syslog.cc`、`unified2.cc`、`log_pcap.cc` 提供其余输出实现；底层写出依赖 `src/log/text_log.h` 的 `TextLog_*` 系列（字段见 05-08）。**分发入口侧**：`src/detection/detect.cc` 的 `CallAlertFuncs`（113 行附近）与 `CallLogFuncs`（66、75 行附近）、`src/detection/detection_engine.cc` 的 `DetectionEngine::queue_event`（692、718 行附近）与 `log_events`（800 行附近）、`src/detection/fp_detect.cc` 的 `fpLogEvent`（173 行附近）；output set 的按规则绑定经 `ListHead` 的 `AlertList`/`LogList` 传入（字段见 05-04 的规则结构）。**装载侧**：`src/loggers/loggers.cc` 的 `load_loggers()`（46 行附近），在 `STATIC_LOGGERS` 宏下装载各 `alert_*`/`log_*`/`eh_unified2` 数组（33 至 67 行附近）。
+
+必须标注的不透明边界：`TextLog`、`U2` 与 `FILE*` 等写出句柄来自 `src/log/` 与 C 标准库，内部结构不在本册展开；`Output`/`OutputSet` 的链表节点由 C++ STL `list` 管理，其内存布局属实现细节；`SF_EVENTQ` 的内存池由 `sfeventq.cc` 内部维护，头只暴露结构形态。这些对象一律视为不透明句柄，不可依赖其内部布局，需对照实际版本核验。整组结构跨册反查关系统一写为：`（字段见 05-08 ｜ 参数见 04-02 ｜ 原理见 06-09 ｜ 模块见 07-08）`。其中字段归 05-08 是因为 Event/Logger/Output Set 由该篇权威定义，参数归 04-02 是因为日志输出段由 04 册权威给出（告警字段判读见 04-08），原理归 06-09 是因为限速与动作在事件分发前生效，模块归 07-08 是因为 `src/loggers` 与 `src/events` 的目录职责由该篇介绍。
+
+### 4. 关键流程与调用链
+
+一次告警从命中到落盘，链路横跨检测与输出两层。包结束时，检测引擎调用 `DetectionEngine::log_events(Packet*)`（`detection_engine.cc` 800 行附近），它从 `p->context->equeue` 取出 `SF_EVENTQ* pq`，用 `sfeventq_action(pq, ::log_events, p)` 逐个出队；回调 `static int log_events`（780 行附近）对每个 `EventNode` 调 `fpLogEvent(en->otn, p)` 并在末尾 `sfthreshold_reset()`。入队侧由 `DetectionEngine::queue_event(const OptTreeNode*)`（692 行附近）完成：它先查 `rtn`，规则不在当前策略就直接返回 0；否则 `sfeventq_event_alloc` 取一个 `EventNode`，填好 `otn`/`rtn` 后 `sfeventq_add`。队列按 `EventQueueConfig.order`（默认 `SNORT_EVENTQ_CONTENT_LEN`）排序，配合 `max_events`/`log_events` 决定「最多收几条、真正输出几条」（默认值源码见 `event_queue.cc` 76、77 行附近，需对照实际版本核验）。
+
+`fpLogEvent`（`fp_detect.cc` 173 行附近）是分流中枢：它先用 `RateFilter_Test` 判动作限速、`sfthreshold_test` 判事件阈值（181 至 223 行附近）；被抑制时（`event_filter < 0` 或 `> 0` 且无 override）仍会取出动作并执行以保留 drop 语义，只是不产生告警，并把 `pc.event_limit++`（225 至 249 行附近）；未被抑制时走 `otn->state[].alerts++`、`Event::get_next_seq_num()`、取动作、`act->exec(p, ai)`、`SetTags` 与 `fpLogOther`（265 至 277 行附近）。动作执行后进入输出回调：`src/detection/detect.cc` 的 `CallAlertFuncs`（113 行附近）用包时间戳与 `otn->sigInfo` 构造 `Event`，累加 `pc.total_alert_pkts`、`pc.alert_pkts`，再取规则绑定的 `head->AlertList` 调 `EventManager::call_alerters`（126、127 行附近）；`CallLogFuncs`（75 行附近）对称地走 `LogList` 与 `call_loggers`，并在有 `flow->gadget` 时用 `adjust_log_packet` 临时改写 `p->data`/`p->dsize` 以记录重组后的内容（86 至 110 行附近）。最后 `EventManager::call_alerters`/`call_loggers`（`event_manager.cc` 209、222 行附近）遍历输出集里的每个 `Logger`，对 alert_json 就是 `JsonLogger::alert`（849 行附近）逐字段写出并 `TextLog_Flush`。此外 `CallLogFuncs` 在 99、100 行附近还调用 `DataBus::publish`，以 `DetectionEngine::get_pub_id()` 为发布者标识、`DetectionEventIds::IPS_LOGGING` 为事件类型，把 `IpsRuleEvent` 连同 `p->flow` 一起发布给订阅者（发布订阅见 06-10、06-14）。整条「入队 → 排序 → 限速 → 动作 → 分发 → 写出」链路见图 06-11-01。
+
+:::figure id=06-11-01 | name=事件从入队到 logger 写出的完整链路 | dir=TD
+node a "queue_event<br/>候选入队" purple
+node b "sfeventq<br/>排序与去重" teal
+node c "log_events<br/>包末出队" purple
+node d "fpLogEvent<br/>限速与动作" purple
+node e "CallAlertFuncs<br/>CallLogFuncs" blue
+node f "EventManager<br/>call_alerters" green
+node g "Logger::alert<br/>alert_json" green
+node h "Output Set<br/>多输出扇出" green
+node i "TextLog<br/>落盘或 stdout" gray
+node j "rate_filter<br/>event_filter" red
+edge a -> b "EventNode"
+edge b -> c "包结束出队"
+edge c -> d "逐事件回调"
+edge d -> e "命中动作"
+edge e -> f "事件分发"
+edge f -> h "遍历输出集"
+edge h -> g "alert 或 log"
+edge g -> i "写出与 Flush"
+edge d -> j dashed "限速与抑制"
+edge j -> d dashed "过滤结果"
+:::
+
+### 5. 配置与代码实例
+
+先看 alert_json 的写出循环与配置骨架。`src/loggers/alert_json.cc` 的关键片段如下（节选自上游 master 快照，签名细节需对照实际版本核验）：
+
+```cpp
+// src/loggers/alert_json.cc（节选）
+static const Parameter s_params[] =
+{
+    { "file", Parameter::PT_BOOL, nullptr, "false",
+      "output to alert_json.txt instead of stdout" },
+    { "fields", Parameter::PT_MULTI, json_range, json_deflt,
+      "selected fields will be output in given order left to right" },
+    { "limit", Parameter::PT_INT, "0:maxSZ", "0",
+      "set maximum size in MB before rollover (0 is unlimited)" },
+    { "separator", Parameter::PT_STRING, nullptr, ", ",
+      "separate fields with this character sequence" },
+    { nullptr, Parameter::PT_MAX, nullptr, nullptr, nullptr }
+};
+
+void JsonLogger::alert(Packet* p, const char* msg, const Event& event)
+{
+    Args a = { p, msg, event, false };
+    TextLog_Putc(json_log, '{');
+    for ( JsonFunc f : fields )
+    { f(a); a.comma = true; }
+    TextLog_Print(json_log, " }\n");
+    TextLog_Flush(json_log);
+}
+```
+
+这段代码印证三点：输出字段由 `JsonModule` 的 `fields` 向量决定，缺省时 `begin()`（792 行附近）用 `json_deflt` 填充；`limit` 以 MB 为单位传给 `TextLog_Init`（840 行附近），0 表示不轮转；`alert` 里对每个字段调用 `f(a)` 后把 `a.comma` 置真，由 `print_label`（76 行附近）在后续字段前补逗号，最后统一写 ` }\n` 并强制 flush。最小 Lua 片段如下（键名需对照实际版本核验，完整参数见 04-02）：
+
+```lua
+-- snort.lua 片段：结构化告警输出（示意，完整参数见 04-02）
+alert_json = { file = true, limit = 100,
+               fields = 'timestamp rule src_ap dst_ap action' }
+```
+
+验证按「前置检查 → 执行 → 复核」闭环：先确认 logger 段被解析（`snort -T`），再读回写出的首条记录。
+
+```bash
+snort -c lua/snort.lua -r test.pcap -l ./out -A alert_json -T
+snort -c lua/snort.lua -r test.pcap -l ./out -A alert_json
+head -n 2 ./out/alert_json.txt
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+{ "timestamp" : "11/15-10:32:01.204512", "rule" : "1:1000001:1", "src_ap" : "10.1.2.3:51000", "dst_ap" : "203.0.113.7:443", "action" : "allow" }
+```
+
+逐行判读如下，合计超过一百五十字。开头的 `{` 与结尾的 ` }` 由 `JsonLogger::alert` 的 `TextLog_Putc`/`TextLog_Print` 直接写出，说明每行是一条独立 JSON 对象而非 JSON 数组，下游若用 JSON Lines 方式逐行解析即可，不要按整个文件做一次解析。`timestamp` 取自包时间戳（`p->pkth->ts`，见 `ff_timestamp` 639 行附近），它的微秒精度来自抓包时刻而非检测时刻（包头字段见 05-07）；`rule` 是把 `get_sig_ids` 得到的 gid、sid、rev 拼成 `1:1000001:1`（`ff_rule` 448 行附近），与规则文本的 `gid:sid:rev` 一一对应。`src_ap`/`dst_ap` 是「地址:端口」组合（`ff_src_ap`/`ff_dst_ap`，535、197 行附近），只有 `proto_bits` 含 TCP 或 UDP 时才带端口，因此出现端口为零的情况通常意味着协议不是 TCP/UDP 而非配置错误。`action` 来自 `p->active->get_action_string()`（`ff_action` 84 行附近），旁路 IDS 下普通 alert 规则一般是 `allow`，内联 drop 规则才会显示 `drop`（内联语义见 06-12），具体字符串取值需对照实际版本核验。字段顺序与 `fields` 配置严格一致——本例只配了五个字段，所以默认序列里的 `pkt_num`、`proto`、`pkt_len`、`dir` 不会出现；排障时若发现字段缺失，先回查 `JsonModule::set` 对 `json_range`（713 行附近）的 `Parameter::index` 查找是否命中，键名拼写错误会被静默忽略（764 至 790 行附近）。`limit = 100` 表示单文件到 100 MB 触发轮转，0 为不限制（源码注释见 `s_params`）。整行写出后立即 `TextLog_Flush`，这保证每条告警都落盘，但也意味着高频告警下刷盘频繁，吞吐影响需在目标机型实测。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，**logger 句柄是线程本地的**。`JsonLogger` 用 `THREAD_LOCAL TextLog* json_log`，`LogApi` 注释也明确 ctor/dtor 在主线程、其余在包线程（logger.h 46 至 49 行附近）；不要假设所有输出写入同一个 FILE 缓冲，多线程下各写各的再由文件系统追加语义汇总，轮转与文件命名细节需对照实际版本核验。第二，**字段裁剪要按 `json_range` 拼写**。`Parameter::index` 查不到键就静默跳过（`alert_json.cc` 777 至 780 行附近），写错字段名不会报错只会少输出，排障先核对 `json_range`（713 行附近）原始字符串（参数见 04-02）。第三，**先限速后输出**。`fpLogEvent` 里 `RateFilter_Test` 与 `sfthreshold_test` 在动作执行前生效（原理见 06-09），被抑制的事件不会到达 logger；「规则命中却没有告警」先查 event_filter/rate_filter，再查 logger 是否注册，不要一上来改输出配置。第四，**区分 alert 与 log 两个通道**。`OUTPUT_TYPE_FLAG__ALERT` 与 `OUTPUT_TYPE_FLAG__LOG` 决定 logger 被挂到哪条链（event_manager.cc 141 至 145 行附近），`alert_*` 与 `log_pcap` 不可混用；`-A` 命令行会按 `OUTPUT_FLAG__ALERTS` 选 `alert_` 前缀并覆盖先前的输出集（164 至 184 行附近，参数见 04-07），反复 `-A` 时最后一个生效。第五，**unified2 是二进制格式**，须用 `tools/u2boat`、`tools/u2spewfoo` 处理（03-04、07-12），不要用文本工具直接读；它同时具备 ALERT 与 LOG 标志（`loggers.cc` 66 行附近）。第六，**日志重载走 EventManager**。`reload_outputs`（202 行附近）遍历所有 logger 调 `reload()` 并打印 `logger file reinitialized`，控制面命令的最终落点在此（命令名需对照实际版本核验，见 06-14）。第七，**b64_data 会放大记录**。`ff_b64_data`（117 行附近）把整个包载荷做 Base64 编码，载荷越大 JSON 行越长，与 `limit` 轮转叠加时尤其要评估磁盘与下游解析成本（需在目标机型实测）。第八，**能力边界与许可**：输出内容只覆盖可见缓冲，加密正文不可见（原理见 06-03、06-10）；Talos 规则集有独立许可（见 01-04），告警只是事件记录，不代表可任意分发规则内容。
+
+### 7. 小结与延伸阅读
+
+本篇覆盖输出与事件管线的四层机制：事件对象 `Event` 以 `SigInfo` 构造、只读地在队列与 logger 间传递；`sfeventq` 事件队列按 `EventQueueConfig` 排序去重（`max_events`、`log_events` 源码默认 8 与 3，需对照实际版本核验）；`fpLogEvent` 先做 rate/event 限速与动作执行，再由 `CallAlertFuncs`/`CallLogFuncs` 经 `EventManager::call_alerters`/`call_loggers` 扇出到 Output Set 中的各 `Logger`；以 `alert_json` 为代表的实现靠 `JsonModule` 的 `file`/`fields`/`limit`/`separator` 四键与 `JsonLogger::alert` 的逐字段写出完成结构化输出。把握住「检测只管命中、队列管排序、限速管抑制、logger 管格式与落盘」这条主线，就能把输出层与检测层的边界理清。延伸阅读：检测 eval 与 `queue_event` 见 06-08；事件队列、动作与限速见 06-09；发布订阅与 inspector 事件见 06-10；内联动作如何改变 `action` 字段见 06-12；`Event`/`Logger`/`Output Set` 字段见 05-08；日志输出配置与告警字段见 04-02、04-08；`src/loggers` 与 `src/events` 目录职责见 07-08；输出接入与轮转见 03-04、08-06。
+
+## 06-12 内联模式、block/drop 与 DAQ 反馈
+
+### 1. 背景与动机
+
+前面各篇把包从 DAQ 收包（原理见 06-02）一路跟到事件写出（原理见 06-11）。但在旁路（IDS）部署里，这条链路的终点只是「记录一条告警」——包早已被网络设备转发，Snort 看得见却拦不住。内联（IPS）部署要补上的正是「拦得住」这一环：让引擎在判定命中后，把「丢弃这个包」的意图通过 DAQ 的 verdict 反馈给抓包与转发层，由后者在内核或数据面真正丢包。理解这一篇的第一个要点是能力边界：**Snort 本身不是防火墙，不做 IP 转发、不做路由**；它只是给 DAQ 一个判决，真正的转发与丢弃由 DAQ module（如 nfq、afpacket，具体 module 名与能力需对照实际版本核验）完成。没有支持内联的 DAQ module，即便规则写了 `drop`，运行时也只是「本应丢弃」（would drop）而非真丢。
+
+第二个动机是**动作语义的分层**。Snort 3 把「用户写了什么动作」（alert、pass、drop、block、reject、log，关键字见 04-06）与「底层能做什么」（Active 的 action 与 status 分离）拆成两层：前者是规则意图，后者是运行期能力判定——比如旁路模式下即便有 drop 规则，底层也会被告知「能丢但现在不在转发路径上」，于是降级为告警；内联测试模式（inline-test）则始终按「会丢但不真丢」处理。第三个动机来自 verdict 的多样性：除了 pass/drop，还有 block（整条会话后续包都丢）、reject（注入 TCP RST 或 ICMP 不可达）、replace（改写包后放行）、whitelist（信任流、后续不再检测）等，它们最终都要收敛成 DAQ 能理解的几个 verdict 值（取值需对照实际版本核验）。
+
+本篇事实基准统一为「上游 master 快照（2026-11 抓取）」。核心源码分布在四处：动作实现在 `src/actions/`（`act_drop.cc`、`act_block.cc`、`act_reject.cc`、`act_pass.cc`、`act_replace.cc`）；主动响应与 verdict 意图在 `src/packet_io/active.cc/.h`；DAQ verdict 的最终裁决在 `src/main/analyzer.cc` 的 `distill_verdict`；模式开关在 `src/main/snort_module.cc` 与 `src/main/modules.cc`。动作参数与 DAQ 配置归 04 册（参数见 04-03、04-06），本篇只讲机制与最小片段。还要守住能力边界：加密载荷正文不可见，内联判定基于可见的解码与 inspector 结果（原理见 06-03、06-10）；线程与进程模型以实际版本为准，不断言固定线程数（原理见 06-13）。
+
+### 2. 核心概念
+
+第一个核心概念是 **Active 的 action 与 status 分离**。`src/packet_io/active.h` 25、26 行附近的注释开宗明义：该文件管理返回给 DAQ 的包处理判决，其中 action（做什么）与 status（是否真能做）彼此分离。`ActiveActionType` 枚举（64、65 行附近）为 `ACT_TRUST`、`ACT_ALLOW`、`ACT_HOLD`、`ACT_RETRY`、`ACT_REWRITE`、`ACT_DROP`、`ACT_BLOCK`、`ACT_RESET`、`ACT_MAX`，数值递增意味着严格程度递增；`ActiveStatus`（52、53 行附近）为 `AST_ALLOW`、`AST_CANT`、`AST_WOULD`、`AST_FORCE`、`AST_MAX`；`ActiveWouldReason`（55、56 行附近）记录「为什么只是 would」——`WHD_INTERFACE_IDS`、`WHD_IPS_INLINE_TEST`、`WHD_TIMEOUT`、`WHD_RELOAD`、`WHD_EXIT` 等。关键判定函数 `can_act()`（95、96 行附近）仅在 `AST_ALLOW` 或 `AST_FORCE` 时返回真；`packet_was_dropped()`（134、135 行附近）按 `active_action >= ACT_DROP` 判定，`session_was_blocked()`（154、155 行附近）按 `>= ACT_BLOCK` 判定。`drop_packet`（`active.cc` 766 行附近）只把 `active_action` 抬到 `ACT_DROP` 并 `update_status`，而 `daq_drop_packet`（774 行附近）走 `daq_update_status`——两者差别正在于状态更新的时机与来源（字段见 05-07）。
+
+第二个核心概念是 **IpsAction 动作族**。`src/actions/act_drop.cc` 51 行附近的 `class DropAction : public IpsAction`，其 `exec`（60 行附近）依次调用 `p->active->drop_packet(p)`、`set_drop_reason("ips")`、`alert(p, ai)` 并累加 `drop_stats.drop`；`drops_traffic()` 返回真（57 行附近）。`act_block.cc` 的 `BlockAction::exec`（60 行附近）调用的是 `p->active->block_session(p)`，同样设 drop reason 并告警——block 与 drop 的根本区别就在这里：drop 只丢当前包，block 还要把整条流封掉。`act_pass.cc` 的 `PassAction::exec`（60 行附近）在 `log_it(ai)` 为真时调 `pass()` 并置 `PKT_PASS_RULE` 标志，不把 active_action 改为丢弃。`act_reject.cc` 的 `RejectAction::exec`（186 行附近）设 `ACT_RESET` 延迟动作、调 `reset_again()` 与 `update_status`，`RejectActiveAction::delayed_exec`（107 行附近）按 `p->type()` 分 TCP 发 RST、UDP/ICMP/IP 发不可达，参数 `reset`/`control` 出自 `RejectModule` 的 `module_params`（201 至 210 行附近）。每个动作以 `ActionApi` 导出，类型标识 `IAP_DROP`/`IAP_BLOCK`/`IAP_REJECT`/`IAP_PASS`（如 `act_drop.cc` 116 行附近）。各动作的行为对照见下表。
+
+| 动作 | 源码文件 | Active 调用 | 作用范围 |
+|---|---|---|---|
+| alert | src/actions/act_alert.cc | 不设丢弃意图 | 仅记录事件 |
+| drop | src/actions/act_drop.cc | drop_packet | 仅当前包 |
+| block | src/actions/act_block.cc | block_session | 当前包与后续同流包 |
+| reject | src/actions/act_reject.cc | set_delayed_action(ACT_RESET) | 终止会话并注入响应 |
+| pass | src/actions/act_pass.cc | 置 PKT_PASS_RULE | 放行并可能跳过检测 |
+
+表中作用范围取自各 `action_help`（如 block 为「block current packet and all the subsequent packets in this flow」，`act_block.cc` 31 至 33 行附近）；动作关键字的完整语义归 04 册（参数见 04-06）。
+
+第三个核心概念是**三种模式与 verdict 族**。`src/main/snort_module.cc` 304、305 行附近登记命令行 `-Q`（`Parameter::PT_IMPLIED`，用于 enable inline mode operation）；`src/main/modules.cc` 1350 至 1354 行附近的 `ips.mode` 参数取值为 `tap | inline | inline-test`，注释明确「无默认值，由 -Q 决定策略行为」，并说明 inline 默认在无 -Q 时会告警但仍正确工作、inline-test 默认不能被 -Q 覆盖。对应到 `SnortConfig` 的 `ips_inline_mode()`、`ips_inline_test_mode()`、`ips_passive_mode()` 三个判定（`active.cc` 672、687、692 行附近引用）。`update_status_actionable`（670 行附近）是模式影响能力的关键：inline 模式下若 `!SFDAQ::forwarding_packet` 则降为 `AST_WOULD`/`WHD_INTERFACE_IDS`；inline-test 模式一律 `AST_WOULD`/`WHD_IPS_INLINE_TEST`；passive 模式同样 `AST_WOULD`。最终 verdict 族包括 `DAQ_VERDICT_PASS`、`BLOCK`、`BLACKLIST`、`REPLACE`、`WHITELIST`、`IGNORE`（`main/analyzer.cc` 248 至 308 行附近，取值需对照实际版本核验）。
+
+第四个核心概念是 **distill_verdict 裁决**。`src/main/analyzer.cc` 234 行附近的 `static DAQ_Verdict distill_verdict(Packet* p)` 是 verdict 的最终收敛点。它先处理粘性判决（236 至 246 行附近）：若 `flow->last_verdict` 是 sticky verdict 就直接继承，隧道旁路包不继承 whitelist。第一轮（251 至 266 行附近）处理会话封禁：`session_was_blocked()` 或流状态为 BLOCK 时，不能动作则 PASS、隧道旁路则 BLOCK、inline 模式或强制丢弃则 BLACKLIST、否则 IGNORE。第二轮（268 至 308 行附近）按 `packet_was_dropped() && can_act()` 把 PASS 升级为 BLOCK；`PKT_RESIZED` 时注入并把原包 BLOCK；`PKT_MODIFIED`（归一化或 replace）时出 `REPLACE`；`session_was_trusted()` 出 `WHITELIST`；最后是 IGNORE 条件与默认 PASS。末尾（326 至 329 行附近）把结果写回 `flow->last_verdict` 供后续包继承。裁决完成后由 `finalize_message`（如 732、1017 行附近）把 verdict 交还 DAQ（字段见 05-07）。
+
+第五个核心概念是**延迟动作与优先级**。`src/packet_io/active_action.h` 的 `ActiveAction` 以 `ActionPriority` 表达注入动作的优先级，53 行附近的 `get_action()` 返回该优先级；`act_reject.cc` 97 至 105 行附近的 `RejectActiveAction` 用 `ActionPriority::AP_RESET` 构造，说明 RST/不可达注入属于延迟执行。`Active::queue`（active.cc 909 行附近）只在 `*p->action` 为空或新动作的 `get_action()` 更大时才替换，即多条 reject 规则命中时只保留优先级最高的注入意图；`apply_delayed_action`（935 行附近）在包末统一分派，`execute`（1024 行附近）再调 `delayed_exec` 真正发包。`act_reject.cc` 头部注释明确「queues the injection action so that it is taken only once after detection regardless of multiple resp3 rules firing」（36 至 37 行附近），这正是延迟队列要解决的问题（字段见 05-07）。
+
+第六个核心概念是 **drop reason 与动作统计的回流**。`src/packet_io/active.h` 185 至 191 行附近声明一组与丢弃原因相关的接口：`set_default_drop_reason`、`map_drop_reason_id`、`set_drop_reason`、`send_reason_to_daq` 与 `get_drop_reason`。`active.cc` 1050 行附近的 `set_drop_reason` 只在尚无原因且未挂起时记录，`get_drop_reason_id`（1056 行附近）按字符串在 `drop_reason_id_map` 中查数字编号，查不到回落到 `default_drop_reason_id`；1066 行附近的 `send_reason_to_daq` 据此调用 `SFDAQInstance::set_packet_verdict_reason` 把原因码写进 DAQ 消息（字段见 05-07）。这意味着 verdict 不只是「丢或不丢」的二元信号，还携带可归因的原因码，便于 DAQ 侧统计与排障；原因码的取值与映射配置需对照实际版本核验。统计方面，每个动作都维护自己的 `THREAD_LOCAL` 计数并用 `register_action_pegs` 注册（`act_drop.cc` 74 行附近），而 DAQ 侧的 verdict 计数另在 `src/packet_io/sfdaq_module.h` 的 `verdicts[MAX_DAQ_VERDICT]`（71 行附近）与 `sfdaq_module.cc` 的 peg 表（179 行附近）里，两套口径分别回答「哪条规则动作被触发」与「DAQ 实际执行了什么判决」，不可混为一谈（统计方法见 08-01）。
+
+### 3. 关键数据结构与源码位置
+
+本节点名结构与真实头文件路径，字段一律引用 05 册，不重列字段表。**主动响应层**：`src/packet_io/active.h` 的 `class SO_PUBLIC Active`（35 行附近）及 `ActiveStatus`、`ActiveWouldReason`、`ActiveActionType` 三个枚举（52 至 65 行附近），`Counts`（41 行附近），关键接口 `drop_packet`、`daq_drop_packet`、`block_session`、`update_status`、`can_act`、`set_delayed_action`、`apply_delayed_action`、`send_reason_to_daq`（86 至 191 行附近），实现在 `src/packet_io/active.cc`（字段见 05-07）；`src/packet_io/active_action.h` 的 `ActiveAction` 与 `ActionPriority`（53 行附近）。**动作层**：`src/actions/ips_actions.h/.cc` 的 `IpsAction` 与 `ActionApi`（`act_drop.cc` 102 行附近的 `drop_api` 是其具体形态），`src/framework/ips_action.h` 的基类，以及 `act_drop.cc`、`act_block.cc`、`act_reject.cc`、`act_pass.cc`、`act_replace.cc` 各动作类与 `DropStats`/`BlockStats`/`RejectStats` 统计（字段见 05-05）。**裁决层**：`src/main/analyzer.cc` 的 `distill_verdict`（234 行附近）与 `is_sticky_verdict`（225 行附近）；`src/packet_io/sfdaq_instance.h` 的 `set_packet_verdict_reason`（81 行附近）与 `src/packet_io/sfdaq_module.h` 的 `verdicts[MAX_DAQ_VERDICT]`（71 行附近）。**策略与分发侧**：`src/main/snort_module.cc` 的 `-Q`（304 行附近）、`src/main/modules.cc` 的 `ips.mode`（1353 行附近）、`src/detection/fp_detect.cc` 的 `fpLogEvent`（173 行附近，动作经 `get_ips_policy()->get_action` 取出并执行）、`src/detection/detection_engine.cc` 的判定路径（字段见 05-03 的策略配置）。
+
+必须标注的不透明边界：`DAQ_Verdict`、`DAQ_Msg_h`、`SFDAQInstance` 等类型来自独立 libdaq / DAQ3（见 02-04、07-07），本仓库只做适配，具体枚举取值与 verdict 语义需对照实际版本核验；`Active` 的 `act_str[ACT_MAX][AST_MAX]` 字符串表、`drop_reason_id_map` 等内部状态定义在 `.cc` 内，头文件不可见；IpsAction 各具体子类内部布局属实现细节。一律视为不透明句柄，不可依赖其内部布局。整组结构跨册反查关系统一写为：`（字段见 05-07 ｜ 参数见 04-03 ｜ 原理见 06-02 ｜ 模块见 07-07）`。其中字段归 05-07 是因为 Active/Verdict/DAQ_PktHdr 由该篇权威定义，参数归 04-03 是因为 DAQ 与内联配置由 04 册权威给出（动作关键字见 04-06），原理归 06-02 是因为 DAQ verdict 机制在该篇建立，模块归 07-07 是因为 `src/packet_io` 与 DAQ 适配目录职责由该篇介绍。
+
+### 4. 关键流程与调用链
+
+内联丢弃链路从规则命中处接续。检测阶段 `fpLogEvent`（`fp_detect.cc` 173 行附近）取出动作 `IpsPolicy::get_action(action, action_selector)` 并执行 `act->exec(p, ai)`（267、273 行附近）；对 drop 规则，`DropAction::exec` 调 `Active::drop_packet` 把 `active_action` 抬到 `ACT_DROP` 并 `update_status`（`active.cc` 766 至 771 行附近）；对 block 规则，`BlockAction::exec` 调 `Active::block_session`，后者（867 行附近）设 `ACT_BLOCK`、在 inline 且转发包时调 `Stream::block_flow(p)` 并置流状态 BLOCK、`p->disable_inspect = true`。这里 `update_status` 会根据 `ips_inline_mode()`/`ips_inline_test_mode()`/`ips_passive_mode()` 与 `SFDAQ::forwarding_packet` 把 `active_status` 定为 `AST_ALLOW` 或 `AST_WOULD`（670 至 696 行附近）——这就是「旁路只告警」的代码级根因：旁路时 `can_act()` 为假，后续不会真丢。reject 动作则把 `ACT_RESET` 放进延迟队列，`Active::apply_delayed_action`（935 行附近）在包末按 `delayed_active_action` 分派到 drop/block/reset/retry/trust，`Active::execute`（1024 行附近）执行延迟的 `delayed_exec` 注入 RST 或不可达。
+
+包处理收尾时，`Analyzer` 调 `distill_verdict(p)`（analyzer.cc 234 行附近）把 Active 的意图收敛成 DAQ verdict：会话封禁优先，当前包丢弃把 PASS 升级为 BLOCK，inline 模式走 BLACKLIST，归一化或 replace 走 REPLACE，信任流走 WHITELIST（251 至 329 行附近）；drop reason 通过 `Active::send_reason_to_daq`（1066 行附近）调 `SFDAQInstance::set_packet_verdict_reason` 传给 DAQ；最后 `finalize_message(msg, verdict)` 把判决交还 DAQ module，由后者在内核或数据面执行丢包。值得强调的是 verdict 回传是整个内联链路的闭环点：`finalize_message` 写回消息后，DAQ module 依据 verdict 执行放行、丢弃或改写，Snort 进程本身既不碰转发表也不持有包的正向路径，这正是「不是防火墙」的落点。`DAQ_VERDICT_WHITELIST` 还会在 310 至 324 行附近触发 `RateFilter_SessionRelease` 与 `handle_allowlist`，把「信任」固化到后续包；而 `p->flow->last_verdict = verdict`（327 行附近）形成的粘性判决意味着一条流一旦被判 block 或 whitelist，后续包在 236 至 246 行附近直接继承，不再重复走完整裁决。这也解释了为什么 block 规则的效果是「整条流」而非「单个包」——它在流层面留了痕。fail-open 与 verdict delay 的具体行为需对照实际版本核验（见 04-03）。整条「规则动作 → Active 意图 → 模式判定 → verdict 裁决 → DAQ 执行」链路见图 06-12-01。
+
+:::figure id=06-12-01 | name=内联命中到 DAQ verdict 的反馈链路 | dir=TD
+node a "drop/block 规则" amber
+node b "IpsAction::exec<br/>fpLogEvent" purple
+node c "Active<br/>drop_packet/block_session" blue
+node d "active_action<br/>与 status" teal
+node e "distill_verdict<br/>analyzer.cc" purple
+node f "DAQ verdict<br/>BLOCK/BLACKLIST" red
+node g "DAQ module<br/>内核丢包" gray
+node h "旁路/inline-test<br/>AST_WOULD" amber
+node i "drop_reason<br/>set_packet_verdict_reason" blue
+edge a -> b "动作执行"
+edge b -> c "设置丢弃意图"
+edge c -> d "action 与 status"
+edge d -> e "包末裁决"
+edge e -> f "内联可动作"
+edge f -> g "verdict 回传"
+edge e -> h dashed "旁路只告警"
+edge c -> i dashed "记录原因"
+edge i -> f dashed "verdict reason"
+:::
+
+### 5. 配置与代码实例
+
+先看动作实现的核心片段。`src/actions/act_drop.cc` 与 `act_block.cc` 的关键代码如下（节选自上游 master 快照，签名细节需对照实际版本核验）：
+
+```cpp
+// src/actions/act_drop.cc（节选）
+void DropAction::exec(Packet* p, const ActInfo& ai)
+{
+    p->active->drop_packet(p);
+    p->active->set_drop_reason("ips");
+    alert(p, ai);
+    ++drop_stats.drop;
+}
+
+// src/actions/act_block.cc（节选）
+void BlockAction::exec(Packet* p, const ActInfo& ai)
+{
+    p->active->block_session(p);
+    p->active->set_drop_reason("ips");
+    alert(p, ai);
+    ++block_stats.block;
+}
+```
+
+这段代码说明三点：drop 与 block 都先设 `active_action` 再告警，区别在 `drop_packet`（当前包）与 `block_session`（封流）；`set_drop_reason("ips")` 把原因记为 ips，后续经 `set_packet_verdict_reason` 传给 DAQ；两者各自维护 `THREAD_LOCAL` 的统计计数（`drop_stats.drop`、`block_stats.block`），计数项通过 `register_action_pegs` 注册（74 行附近）。内联最小配置片段如下（键名与 module 名需对照实际版本核验，完整参数见 04-03）：
+
+```lua
+-- snort.lua 片段：内联策略（示意，完整参数见 04-03）
+ips = { mode = 'inline' }
+```
+
+验证按「前置检查 → 执行 → 复核」闭环：先用 `-T` 确认内联模式生效，再跑流量观察 action 字段与 drop 计数。
+
+```bash
+snort -c lua/snort.lua -Q --daq nfq -T
+snort -c lua/snort.lua -Q --daq nfq -i eth0 -l ./out -A alert_json
+grep -c '"action" : "drop"' ./out/alert_json.txt
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+{ "timestamp" : "11/15-10:32:01.204512", "rule" : "1:1000001:1", "src_ap" : "10.1.2.3:51000", "dst_ap" : "203.0.113.7:443", "action" : "drop" }
+```
+
+逐行判读如下，合计超过一百五十字。`rule` 字段 `1:1000001:1` 指向一条把动作写为 `drop` 的自定义规则（`gid:sid:rev` 与规则头一致）；若规则动作是 `block` 或 `reject`，这里会显示对应动作字符串，需对照实际版本核验。`action` 为 `"drop"` 是关键证据：它来自 `p->active->get_action_string()`（`alert_json.cc` 84 行附近，字段见 05-08），说明 `DropAction::exec` 已经把 `active_action` 抬到 `ACT_DROP` 且 `can_act()` 为真——也就是说当前确实处于内联转发路径上（`SFDAQ::forwarding_packet` 为真，见 `active.cc` 675 行附近）。若同样规则在旁路跑却显示 `"allow"`，并非规则失效，而是 `update_status_actionable` 把状态降为 `AST_WOULD`（672 至 696 行附近），这是「旁路只告警」的正常表现（能力边界见 01-01、08-04）。`src_ap`/`dst_ap` 给出被拦包的方向，排障时把它与 DAQ 队列或网桥端口对应，可确认 drop 是否作用在预期接口上。`timestamp` 取自包时间戳，微秒精度来自抓包时刻（包头字段见 05-07）。`grep -c` 统计 drop 行数应与 `drop` 动作的 `register_action_pegs` 计数（`act_drop.cc` 46 行附近的 `drop` peg）趋势一致；若两者差异很大，先查 event_filter/rate_filter 是否抑制了告警（原理见 06-09、06-11）再查 DAQ 是否真丢包。`-Q` 打开内联模式，但若 DAQ module 不支持转发（如纯 pcap 文件回放），即便 action 显示 drop 也不会有真实丢包，必须换成支持内联的 module（module 名需对照实际版本核验，见 02-04、03-05）。所有吞吐与丢包类结论需在目标机型实测，不给绝对值。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，**Snort 不是防火墙**。内联 drop 的落点是 DAQ verdict（`finalize_message`，analyzer.cc 732、1017 行附近），转发与丢包由 DAQ module 完成；把 Snort 当成路由器或透明网桥去配置是错误的（能力边界见 01-01、06-02）。第二，**必须选对 DAQ module 与模式**。`-Q` 只是打开 `ips_inline_mode()`，真正能丢包还要求 DAQ module 支持转发且 `SFDAQ::forwarding_packet` 为真（active.cc 675 行附近）；pcap 回放等场景只能得到 would-drop，module 名与能力需对照实际版本核验（见 02-04、03-05）。第三，**区分 drop 与 block**。drop 只丢当前包（act_drop.cc），block 调 `Stream::block_flow` 并置流状态 BLOCK，封掉后续包（act_block.cc 867 至 880 行附近）；规则里写错动作会导致「只丢一个包」或「整条流被封」的语义差异（参数见 04-06）。第四，**inline-test 与 fail-open**。inline-test 模式恒为 `AST_WOULD`/`WHD_IPS_INLINE_TEST`（active.cc 687 行附近），不会真丢；`Active::suspend/resume` 与各类 `WHD_*` 原因（55、56 行附近）支撑重载、剪枝、超时等场景下的降级，fail-open 的具体行为需对照实际版本核验。第五，**reject 依赖编码与注入**。`RejectActiveAction::delayed_exec`（act_reject.cc 107 行附近）按包类型决定发 RST 还是 ICMP 不可达，并受 `is_reset_candidate`/`is_unreachable_candidate` 约束；注入失败只记 trace 不改 verdict（analyzer.cc 279 至 284 行附近），排障需结合编码与注入日志。第六，**pass/whitelist 会跳过后续检测**。`PassAction` 置 `PKT_PASS_RULE`、`trust_session` 置 `ACT_TRUST`，`distill_verdict` 出 WHITELIST 并写回 `flow->last_verdict`（326、327 行附近）形成粘性判决；滥用 pass 规则会让后续包不再经过检测，务必限定范围。第七，**统计口径要对齐**。drop/block/reject 各自注册 peg（`act_drop.cc` 46 行附近等），DAQ verdict 计数在 `sfdaq_module.h` 的 `verdicts[]`（71 行附近），两者语义不同不可直接相加；告警是否出现还受限速影响（原理见 06-09、06-11）。第八，**能力边界**：内联判定基于可见缓冲，加密正文不可见（原理见 06-03、06-10）；线程与进程模型以实际版本为准，禁止断言「默认 N 线程」（原理见 06-13）；所有吞吐、pps、丢包率结论需在目标机型实测，不给绝对值。
+
+### 7. 小结与延伸阅读
+
+本篇覆盖内联阻断的三段机制：动作层以 `IpsAction` 族把规则意图落到 Active——drop 调 `drop_packet` 丢当前包、block 调 `block_session` 封流、reject 走延迟 RST/不可达注入、pass 放行；能力层以 `Active` 的 `action`/`status` 分离加 `update_status_actionable` 判定当前是否真能丢，旁路或 inline-test 一律降级为 `AST_WOULD`；裁决层以 `src/main/analyzer.cc` 的 `distill_verdict` 把意图收敛为 DAQ verdict（PASS/BLOCK/BLACKLIST/REPLACE/WHITELIST/IGNORE），经 `set_packet_verdict_reason` 与 `finalize_message` 交还 DAQ module 执行。把握住「规则给意图、Active 判能力、verdict 做裁决、DAQ 去执行，Snort 自己不转发」这条主线，就能把内联阻断与旁路告警的边界理清。延伸阅读：DAQ 收包与 verdict 机制见 06-02；解码与可见缓冲见 06-03、06-10；检测命中与动作执行见 06-08；限速与告警抑制见 06-09；输出与 `action` 字段判读见 06-11；线程与进程模型见 06-13；`Active`/`Verdict` 字段见 05-07、`IpsAction` 字段见 05-05；DAQ 与内联配置见 04-03、动作关键字见 04-06；`src/packet_io` 目录职责见 07-07；内联部署实战与不 drop 的排障见 03-05、08-04。

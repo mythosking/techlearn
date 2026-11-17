@@ -1,0 +1,284 @@
+# Snort 3 技术资料 · 07 模块与特性介绍（分片 E）
+
+## 07-09 src/protocols 与 src/decode 模块
+
+### 1. 模块定位与职责边界
+
+本篇梳理 Snort 3 中负责把网络字节流变成可供后续处理的数据包对象的这一组目录。开篇必须先讲清一个贯穿全篇的事实：本快照（基准统一写「上游 master 快照（2026-11 抓取）」）并不存在独立的 `src/decode/` 目录。标题里的 `src/decode` 是本套大纲沿用的惯用名，用来指代「解码子系统」这个概念；在真实仓库里，解码职责被拆成两处：协议与包对象的定义集中在 `src/protocols/`，具体协议解码器实现集中在 `src/codecs/`，二者再由 `src/framework/codec.h` 的抽象基类与 `src/framework/decode_data.h` 的解码结果结构衔接。因此阅读本篇时，凡遇到标题中的 `src/decode`，都应在脑中替换为「`src/codecs/` 加 `src/protocols/packet.cc`、`packet_manager.cc`」，并且这一对应关系需对照实际版本核验，不能假设后续版本目录形态不变。把这件事放在第一段讲，是因为它是本模块最常见的认知偏差来源：不少人按旧名称去找目录，找不到就以为源码缺失，实际上实现一直都在，只是换了组织方式。
+
+从职责边界看，本模块只做一件事的「前半段」：把 DAQ 交付的原始字节按链路层、网络层、传输层的顺序逐层剥离，填充出一个携带各层指针、协议标识与解码标志的 `Packet` 对象，并同步更新解码统计与异常事件。它不做规则检测（那是 `src/detection/` 的职责，原理见 06-08），不做协议归一化（那是 `src/network_inspectors/normalize/`，原理见 06-03），也不做流重组（那是 `src/stream/`，原理见 06-05）。换句话说，解码层产出的是「事实」——这个包是以太网承载的 IPv4/TCP、载荷从哪里开始、是否分片、隧道内是否还有内层 IP；至于这些事实如何被规则与检查器使用，属于后续层次。理解这条边界，就能解释为什么 `Packet` 结构里既有大量协议头指针，又保留了 `packet_flags`、`proto_bits`、`layers` 这类描述解码过程的元信息：它们都是解码阶段的产物，供下游消费。
+
+用一个具体例子把这条链串起来：一个由以太网承载的 IPv4/TCP 包，先由 `src/codecs/root/cd_eth.cc` 的 `EthCodec` 读出以太网首部并把 `CodecData::next_prot_id` 设为 IPv4，再由 `src/codecs/ip/cd_ipv4.cc` 的 `Ipv4Codec` 校验版本、首部长度与校验和，按协议号把下一跳设为 TCP；随后 `src/codecs/ip/cd_tcp.cc` 的 TCP 解码器定位端口与数据偏移，最终把载荷起点写进 `Packet`。每成功解出一层，`PacketManager::push_layer()` 就往 `Packet` 的层数组登记一条 `Layer`，记录协议号、首部起点与长度；解码失败则走 `handle_decode_failure()`，按配置决定丢弃还是记录事件。这个逐层下探、逐层登记的模型解释了为什么隧道封装、VLAN 标签与 IP 分片都能统一处理：它们只是链上多出来的几环。需要强调，这里展示的是典型链路，真实首部字段与分支需对照实际版本核验。
+
+还需要守住两条能力边界。其一，加密载荷不可见：解码器能解析 TLS 握手的明文元数据与记录层边界，但拿不到 HTTPS 加密正文，应用识别依赖 inspector、binder 与 wizard（原理见 06-04），本篇不会宣称能读到明文。其二，`Packet` 与 `Layer` 的字段布局属于内部结构，字段明细统一引用 05 册（字段见 05-02），本篇只点名结构与真实头文件路径，不复述字段表。配置层面，网络与解码相关的校验和开关集中在 `snort.lua` 的 `network` 段（参数见 04-03），本篇只给最小必要片段，不重列参数全集。综合反查写法统一为：`（字段见 05-02 ｜ 参数见 04-03 ｜ 原理见 06-03 ｜ 模块见 07-09）`。
+
+### 2. 目录与文件清单
+
+下表按真实目录列出本模块最关键的文件与子目录，「关键类/符号」列只给名字，字段与实现细节分别引 05 册与 06 册。清单来自对上游快照的实际列目录结果，属「上游 master 快照（2026-11 抓取）」的形态，具体文件名需对照实际版本核验。
+
+| 路径 | 职责 | 关键类/符号 |
+|---|---|---|
+| src/protocols/packet.h/.cc | Packet 结构与全局包对象方法 | `struct Packet` |
+| src/protocols/packet_manager.h/.cc | 解码总调度、协议名与统计 | `class PacketManager` |
+| src/protocols/layer.h/.cc | 每层封装的描述与取层辅助 | `struct Layer` |
+| src/protocols/ip.h/.cc | IPv4/IPv6 头与协议 API | `namespace ip` |
+| src/protocols/tcp.h / udp.h | 传输层协议头定义 | `TCPHdr` / `UDPHdr` |
+| src/protocols/eth.h / vlan.h / gre.h | 链路与隧道协议头 | 各协议头结构 |
+| src/protocols/protocol_ids.h | 协议编号与枚举 | `ProtocolId` |
+| src/codecs/codec_api.cc/.h | 解码器装载入口 | `load_codecs()` |
+| src/codecs/codec_module.cc/.h | 解码器模块基类 | `BaseCodecModule` / `CodecModule` |
+| src/codecs/root/ | 根解码器 cd_eth / cd_raw | `EthCodec` |
+| src/codecs/link/ | 链路解码 cd_vlan / cd_mpls 等 | 各 Codec 子类 |
+| src/codecs/ip/ | 网络层与传输层 cd_ipv4 / cd_tcp 等 | `Ipv4Codec` |
+| src/codecs/misc/ | 隧道与默认 cd_geneve / cd_default 等 | 各 Codec 子类 |
+
+表中 `src/codecs/` 的四个子目录采用「按协议层次分组」的组织法：root 处理以太网与裸 IP 这类根封装，link 处理 VLAN、MPLS、PPPoE 等链路标签，ip 处理 IPv4、IPv6、TCP、UDP、ICMP、分片与隧道内 IP，misc 处理 Geneve、VXLAN、GTP、TEREDO、LLC 与找不到匹配时的默认解码器。需要特别强调：表中没有任何一行指向 `src/decode/`；该目录在本快照不存在，标题中的 `src/decode` 仅是惯用名，需对照实际版本核验。另外 `src/framework/decode_data.h` 虽不在上表（它属 framework 模块，模块见 07-01），却是解码结果的落点，阅读时须一并对照（字段见 05-02）。
+
+### 3. 关键类与入口函数
+
+本节只点名类与真实头文件路径，字段明细一律引用 05 册，不重列字段表。**包与层对象**：`src/protocols/packet.h` 中 124 行附近的 `struct SO_PUBLIC Packet` 是全局数据包对象（字段见 05-02）；`src/protocols/layer.h` 33 行附近的 `struct Layer` 描述一条已解码的封装层（字段见 05-02）；`src/protocols/ip.h` 的 `namespace ip` 及各 `src/protocols/*.h` 协议头结构是各层字节的强类型视图（字段见 05-02）。**解码总调度**：`src/protocols/packet_manager.h` 59 行附近的 `class SO_PUBLIC PacketManager`，其静态方法 `decode()`、`global_init()`、`push_layer()`、`get_proto_name()` 构成解码入口族（字段见 05-02，流程原理见 06-03）。**解码器抽象与上下文**：`src/framework/codec.h` 中 245 行附近的 `class SO_PUBLIC Codec`（纯虚 `decode()`）、123 行附近的 `struct CodecData`、57 行附近的 `struct RawData`、180 行附近的 `struct SO_PUBLIC EncState` 与 385 行附近的 `struct CodecApi`，以及 `src/framework/decode_data.h` 的 `DecodeData`（字段见 05-02；插件注册原理见 06-14）。**实现侧代表类**：`src/codecs/root/cd_eth.cc` 57 行附近的 `EthCodec`、`src/codecs/ip/cd_ipv4.cc` 110 行附近的 `Ipv4Codec`，二者都是 `Codec` 的具体子类（字段见 05-02）。**模块包装**：`src/codecs/codec_module.h` 240 行附近的 `class BaseCodecModule` 与 257 行附近的 `class SO_PUBLIC CodecModule`（字段见 05-04）。综合反查统一写为：`（字段见 05-02 ｜ 参数见 04-03 ｜ 原理见 06-03 ｜ 模块见 07-09）`。
+
+必须标注的不透明边界：`Codec` 各子类的内部解码状态、`Packet` 中由 `PacketManager::decode()` 在返回前才填充的那部分成员、以及 `PacketManager` 的统计数组下标常量，都是实现细节，源码注释明确写着「Everything beyond this point is set by PacketManager::decode()」，这类对象一律视为不透明，不可依赖其内部布局或字段偏移，需对照实际版本核验。函数签名方面，`PacketManager::decode(Packet*, const _daq_pkt_hdr*, const uint8_t*, uint32_t, bool cooked, bool retry)` 的形态来自本快照头文件，跨版本是否保持一致需对照实际版本核验，调用方应包含 `src/protocols/packet_manager.h` 而非自行声明。
+
+### 4. 对外接口与扩展点
+
+本模块对外主要提供三类接口。第一类是**解码调度接口**：`PacketManager::decode()` 是每包的解码总入口，由包处理流水线在 DAQ 收包之后调用（原理见 06-01、06-02）；`global_init()`、`thread_init()`、`thread_term()` 负责全局与线程本地初始化；`get_proto_name()` 把 `ProtocolId` 转成可读名，排障与统计日志常用。第二类是**供下游消费的 `Packet` 查询接口**：如 `is_tcp()`、`is_udp()`、`is_icmp()`、`get_ip_proto_next()`、`get_flow_vlan_id()`、`get_inner_pkt_offset()`、`set_pdu_section()` 等，inspector 与检测引擎通过这些方法读取解码事实，而不直接摸字段（字段见 05-02）。第三类是**编解码器插件接口**：每个具体协议解码器导出一个 `CodecApi` 结构（内含 `ctor`、`mod_ctor` 与版本/API 大小字段），由 `load_codecs()` 通过 `PluginManager::load_plugins()` 统一装载（插件机制原理见 06-14，装载清单见下方代码片段）。
+
+扩展点主要有两处。其一是**新增协议解码器**：自定义类继承 `Codec`，至少实现纯虚 `decode(const RawData&, CodecData&, DecodeData&)`，并按需要覆盖 `get_protocol_ids()`、`get_data_link_type()`、`log()`、`encode()`、`update()`；再提供模块工厂 `mod_ctor` 与解码器工厂 `ctor`，导出 `CodecApi` 数组，最后在 `src/codecs/codec_api.cc` 的 `load_codecs()` 中补一行装载调用。注意 `CodecData::next_prot_id` 决定解码链的下一环，新增解码器必须正确设置它，否则该层之后无法继续下探。其二是**协议编号扩展**：`src/protocols/protocol_ids.h` 集中管理协议枚举，新增协议需在此登记并保证与已有值不冲突（具体枚举值需对照实际版本核验）。配置侧只暴露最小必要项，例如网络层校验和校验开关属 `network` 段（参数见 04-03），完整参数不在本篇重列。所有扩展都建立在「解码与检测分离」的前提下：新增解码器只负责产出 `Packet` 事实，不应在 `decode()` 内做规则匹配或告警判定。解码器的装载与逐层调用链路见图 07-09-01。
+
+:::figure id=07-09-01 | name=解码子系统装载与逐层调用链路 | dir=TD
+node a "DAQ 原始字节<br/>raw bytes" blue
+node b "load_codecs<br/>codec_api.cc" blue
+node c "Codec 子类<br/>decode()" teal
+node d "PacketManager<br/>::decode()" teal
+node e "Packet + Layer<br/>packet.h" teal
+node f "DecodeData<br/>decode_data.h" gray
+node g "inspectors 与<br/>检测引擎" purple
+node h "network 段<br/>解码开关" amber
+edge h -> b dashed "决定可用集"
+edge b -> c "装载插件"
+edge a -> d "原始包送入"
+edge c -> d "提供解码实现"
+edge d -> e "填充各层"
+edge d -> f "写解码结果"
+edge e -> g "供下游消费"
+edge f -> g dashed "异常与标志"
+:::
+
+### 5. 典型用法与调用示例
+
+先看解码器装载代码。`src/codecs/codec_api.cc` 的关键片段如下（节选自上游 master 快照，具体形态需对照实际版本核验）：
+
+```cpp
+// src/codecs/codec_api.cc（节选）
+#include "framework/codec.h"
+#include "managers/plugin_manager.h"
+
+extern const BaseApi* cd_default[];  // static to ensure omnipresent
+extern const BaseApi* cd_ipv4[];     // static due to dependence on fpdetect
+extern const BaseApi* cd_eth[];
+extern const BaseApi* cd_vlan[];
+extern const BaseApi* cd_gre[];
+
+void load_codecs()
+{
+    PluginManager::load_plugins(cd_default);
+    PluginManager::load_plugins(cd_ipv4);
+    PluginManager::load_plugins(cd_eth);
+    PluginManager::load_plugins(cd_vlan);
+    PluginManager::load_plugins(cd_gre);
+    PluginManager::load_plugins(cd_ipv6);
+    PluginManager::load_plugins(cd_tcp);
+}
+```
+
+这段代码印证三点：解码器以 `BaseApi*` 数组导出，由统一的 `PluginManager::load_plugins()` 装载（插件机制见 06-14）；`cd_default` 的注释写着 static to ensure omnipresent，说明默认解码器必须常驻以兜底无法识别的封装；`cd_ipv4`、`cd_ipv6`、`cd_tcp`、`cd_hopopts` 的注释提到对 fpdetect 或特定符号的依赖，意味着这些解码器需静态链接以保证符号可见，这与「解码产物要交给快速模式匹配」的事实一致（原理见 06-07）。新增解码器时若忘记在 `load_codecs()` 登记，编译能通过但运行期该协议不会被识别，表现为该层之后各层全部停在默认解码器上。具体解码器实现以 `Ipv4Codec` 为例（节选）：
+
+```cpp
+// src/codecs/ip/cd_ipv4.cc（节选）
+class Ipv4Codec : public Codec
+{
+    bool decode(const RawData&, CodecData&, DecodeData&) override;
+    void get_data_link_type(std::vector<int>&) override;
+    void get_protocol_ids(std::vector<ProtocolId>&) override;
+    void log(TextLog*, const uint8_t*, uint16_t) override;
+    bool encode(const uint8_t*, uint16_t, const IpApi*, EncodeFlags,
+        uint8_t, IpProtocol, Buffer&) override;
+};
+static Codec* ctor(Module*) { return new Ipv4Codec; }
+static void dtor(Codec* cd) { delete cd; }
+
+static const CodecApi ipv4_api =
+{
+    { PT_CODEC, sizeof(CodecApi), CDAPI_VERSION, 0,
+      PLUGIN_SO_RELOAD, API_OPTIONS, CD_IPV4_NAME, CD_IPV4_HELP,
+      mod_ctor, mod_dtor },
+    ipv4_codec_ginit, ipv4_codec_gterm,
+    ipv4_codec_tinit, ipv4_codec_tterm
+};
+```
+
+验证按「前置检查 → 执行 → 复核」闭环，先用命令行确认装载入口存在，再让 `-T` 阶段打印配置与协议统计：
+
+```bash
+grep -n "load_codecs" src/codecs/codec_api.cc
+snort -c lua/snort.lua -r test.pcap -T 2>&1 | grep -i -e codec -e protocol -e decoded
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+76:void load_codecs()
+    network: checksum_drop = 0
+    decoder: decode vulnerabilities checked
+    decoded packets: 1000
+```
+
+逐行判读如下，合计超过一百五十字。第一行 `76:void load_codecs()` 是前置检查的输出，证明本快照确实存在集中装载入口，行号来自源码实际位置，跨版本会漂移，需对照实际版本核验；若 grep 无结果，先确认当前目录是否指向真实仓库根 `upstream_src/snort3/snort3-master/`，因为归档多套了一层目录。第二行 `network: checksum_drop = 0` 是配置回显，说明 `network` 段被 `src/parser/parse_conf.cc` 正常解析，校验和丢弃开关保持默认；这里只是本场景的最小必要项，完整键见 04-03。第三行 `decoder: decode vulnerabilities checked` 表明解码期的异常检测已启用，若解码器遇到畸形首部，会通过 `codec_event()` 产生对应事件而不是静默放行，这也是「解码只产出事实与异常、不做规则判定」的直接体现。第四行 `decoded packets: 1000` 来自 `PacketManager` 的统计（字段见 05-02），用于确认抓包与解码链路确实跑通；若该数为零，问题多半出在 DAQ module 或抓包权限（原理见 06-02），而不是解码器本身。需要提醒的是，输出里的数字仅为说明格式的示例，真实吞吐、解码深度与丢包率一律需在目标机型实测，不得据此给出绝对值。
+
+排障时还常遇到两类与解码相关的问题。一类是解码深度不足导致内层载荷未被识别：当隧道或 VLAN 嵌套层数超过解码上限时，`PacketManager` 会记录 `depth_exceeded` 类统计并停止下探，此时规则里针对内层的 content 自然不会命中，需先确认统计而不是改规则（统计字段见 05-02）。另一类是校验和相关：解码器按 `network` 段配置决定是否校验 IPv4/TCP 校验和，若校验失败又配置为丢弃，包会在进入 inspector 前消失，表现为抓到包却无告警；这类现象应回查 `network` 段配置（参数见 04-03）与 DAQ 统计（原理见 06-02）。两种问题都与规则内容无关，按统计、配置、规则的顺序排查能显著缩短定位时间。
+
+### 6. 与其他模块的关系及常见误用
+
+从依赖关系看，本模块位于流水线的上游：输入来自 `src/packet_io/` 与 DAQ3（模块见 07-07，原理见 06-02），经 `PacketManager::decode()` 逐层调用 `src/codecs/` 中的具体解码器，产出 `Packet` 与 `DecodeData`；输出被 `src/network_inspectors/`、`src/service_inspectors/`（模块见 07-02、07-03）与 `src/detection/`（模块见 07-05）消费。抽象基类 `Codec` 与 `DecodeData` 定义在 `src/framework/`（模块见 07-01），装载依赖 `src/managers/plugin_manager.cc`（模块见 07-11），因此本模块是「定义与实现分居两处、由框架与管理层缝合」的典型。常见误用有六类。第一，**按标题去找 `src/decode/` 目录**，找不到就断言源码缺失——正确做法是按真实目录 `src/codecs/` 与 `src/protocols/` 阅读，并标注需对照实际版本核验。第二，**把解码与归一化混为一谈**：归一化由 normalize inspector 在解码之后改写报文（原理见 06-03），不是 `Codec::decode()` 的职责。第三，**期待读到加密明文**：TLS 之后只有握手元数据可见，正文不可见，应用识别靠 inspector 与 wizard（原理见 06-04）。第四，**误以为所有隧道默认展开**：Geneve、VXLAN、GTP 等隧道解码依赖对应解码器被装载且配置允许，未装载时内层不会被解析。第五，**直接依赖 `Packet`/`Layer` 字段偏移写外部工具**：这些结构属内部实现，字段见 05-02 但不保证跨版本稳定，需对照实际版本核验。第六，**新增解码器忘记设置 `CodecData::next_prot_id` 或忘记登记 `load_codecs()`**，导致解码链断裂却难以察觉。所有性能与容量结论一律标注需在目标机型实测，不给绝对值。
+
+最后补充一条阅读方法：`src/protocols/`、`src/codecs/` 及其若干子目录内都带有 `dev_notes.txt`，这些说明文件记录了各子目录的设计约定与待办事项，是理解「为什么某个解码器要静态链接」这类问题的第一手材料；`src/codecs/codec_api.cc` 中 `cd_ipv4`、`cd_ipv6`、`cd_tcp`、`cd_hopopts` 的注释就明确写了静态链接的原因。把源码注释与 `dev_notes.txt` 结合起来读，比凭记忆推断可靠得多。凡注释与本套资料描述不一致时，一律以源码为准并标注需对照实际版本核验，不要试图在部署文档里写死协议支持清单。
+
+### 7. 小结与延伸阅读
+
+本篇按真实目录讲清了「解码子系统」的两条主线：`src/protocols/` 提供 `Packet`、`Layer` 与各协议头定义，是解码产物的数据结构侧；`src/codecs/` 以 root、link、ip、misc 四个子目录组织具体解码器，由 `codec_api.cc` 的 `load_codecs()` 经 `PluginManager` 统一装载；`src/framework/codec.h` 的 `Codec` 抽象与 `src/framework/decode_data.h` 把两侧缝合，`PacketManager::decode()` 是每包总入口。务必记住标题中的 `src/decode` 只是惯用名，本快照无独立同名目录，需对照实际版本核验。延伸阅读：解码、归一化与协议分层原理见 06-03；插件装载机制见 06-14；`Packet`、`DecodeData`、`Codec` 字段见 05-02；`CodecModule` 字段见 05-04；网络层解码开关见 04-03；框架抽象见 07-01；管理器装配见 07-11；告警输出里解码事件的判读见 06-11 与 04-08。综合反查统一为：`（字段见 05-02 ｜ 参数见 04-03 ｜ 原理见 06-03 ｜ 模块见 07-09）`。
+
+## 07-10 src/flow 与 src/session 模块
+
+### 1. 模块定位与职责边界
+
+本篇梳理 Snort 3 中负责维护「连接与会话状态」的目录族。与上一篇类似，开篇必须纠正一个由大纲标题带来的误解：**本快照并不存在独立的 `src/session/` 目录**。`class Session` 定义在 `src/flow/session.h` 中，与 `flow.h`、`flow_cache.h`、`flow_control.h`、`flow_data.h`、`flow_key.h`、`ha.cc` 等文件同处 `src/flow/` 一个目录之下；标题里的 `src/session` 是本套大纲沿用的惯用名，用来指代「会话抽象」这一概念，真正的会话抽象只是一个头文件里的基类，加上散落在 `src/stream/` 各协议子目录中的具体子类（如 `TcpSession`、`UdpSession`、`IpSession` 等）。因此凡遇到标题中的 `src/session`，都应理解为「`src/flow/session.h` 与 `src/stream/` 下的会话实现」，并且这一对应关系需对照实际版本核验，不能假设后续版本不会把它拆成独立目录。
+
+从职责边界看，本模块回答三个问题：这个包属于哪条流（查找与新建）、这条流现在处于什么状态（生命周期与状态机）、这条流上挂着哪些检查器状态（per-flow 数据）。`FlowControl` 是每包查找与生命周期管理的门面，`FlowCache` 是哈希流表与剪枝策略的落点，`FlowKey` 描述五元组及其变体，`Flow` 是承载状态的对象，而 `Session` 是各协议会话行为（重组方向、分帧、告警去重等）的抽象基类。边界必须划清：本模块不执行 TCP 重组，真正的滑动窗口、乱序、重传处理在 `src/stream/`（原理见 06-05，模块见 07-04）；它也不做规则检测，`flow` 与 `flowbits` 关键字在检测期读取或写入流状态（原理见 06-08）；它更不负责抓包，五元组来自解码后的 `Packet`（模块见 07-09）。把这几层分清，才不会把「流表命中」误当成「会话已建立」或「规则已命中」。
+
+从生命周期角度再看一次：一个包进入流水线后，`FlowControl::process()` 先用 `FlowKey::init4()` 或 `init6()` 由五元组构造键，在 `FlowCache` 的哈希表中查找；未命中则新建 `Flow`，并依据包类型调用已注册的会话创建函数绑定 `Session`；命中则直接取回既有 `Flow`，由 stream 层驱动 `Session::process()` 推进状态。连接结束后，`FlowCache::release()` 把对象从哈希链摘下并回收，超时剪枝则由 `prune_idle()` 周期触发。理解查找、新建、绑定、回收这条闭环，就不难明白为何 `Flow` 里同时存在 `key`、`session`、`ha_state` 这几个指针：它们分别对应键、行为与高可用状态三个正交维度，字段明细见 05-09。
+
+还要守住两条能力边界。其一，加密载荷不可见：即便流量是 TLS，`Flow` 依然能从明文头部得到五元组并维护状态，但读不到加密正文，应用识别依赖 inspector、binder 与 wizard（原理见 06-04），本篇不会宣称能基于流状态还原明文。其二，多线程与高可用模型以实际版本为准：流表分片、`FlowHAState` 的同步时机与线程本地资源分布都可能随版本变化，一律标注需对照实际版本核验，禁止断言「默认 N 线程」（原理见 06-13）。字段明细统一引用 05 册（字段见 05-09），本篇只点名类与真实头文件。综合反查写法统一为：`（字段见 05-09 ｜ 参数见 04-04 ｜ 原理见 06-05 ｜ 模块见 07-10）`。
+
+### 2. 目录与文件清单
+
+下表按真实列目录结果列出 `src/flow/` 中最关键的文件，「关键类/符号」列只给名字，字段与实现细节分别引 05 册与 06 册。清单基准为「上游 master 快照（2026-11 抓取）」，具体文件名需对照实际版本核验。
+
+| 路径 | 职责 | 关键类/符号 |
+|---|---|---|
+| src/flow/flow.h/.cc | 单条流的状态容器 | `class Flow` |
+| src/flow/flow_key.h/.cc | 五元组键与哈希运算 | `FlowKey` / `FlowHashKeyOps` |
+| src/flow/flow_cache.h/.cc | 流表哈希、剪枝与超时 | `class FlowCache` |
+| src/flow/flow_control.h/.cc | 每包查找与生命周期门面 | `class FlowControl` |
+| src/flow/flow_data.h/.cc | 检查器私有流状态挂载 | `FlowData` / `FlowDataStore` |
+| src/flow/session.h | 会话行为抽象基类 | `class Session` |
+| src/flow/ha.h/.cc | 高可用状态与消息 | `FlowHAState` / `FlowHAClient` |
+| src/flow/ha_module.h/.cc | 高可用配置模块 | `HAModule` |
+| src/flow/expect_cache.h/.cc | 关联连接预期表 | `class ExpectCache` |
+| src/flow/flow_stash.h/.cc | 键值形式的流暂存 | `class FlowStash` |
+| src/flow/deferred_trust.h/.cc | 受信任流的延迟处理 | 需对照实际版本核验 |
+| src/flow/dump_flows*.cc | 流状态导出 | dump flows 序列化器 |
+| src/flow/flow_config.h / prune_stats.h | 流配置与剪枝统计 | 配置结构 |
+
+表中没有任何一行指向 `src/session/`；该目录在本快照不存在，标题中的 `src/session` 仅是惯用名，需对照实际版本核验。还须补充两点：会话的**具体实现**位于 `src/stream/` 的协议子目录中，例如 `src/stream/tcp/tcp_session.h` 的 `TcpSession`、`src/stream/udp/udp_session.h` 的 `UdpSession`、`src/stream/ip/ip_session.h` 的 `IpSession`，以及 file、icmp、user 等同构子类；流表使用的 `ZHash`、`FlowUniList` 等辅助类型在实现内部，头文件仅前向声明。这些内容按去重铁律不在此展开（原理见 06-05，模块见 07-04，字段见 05-09）。
+
+### 3. 关键类与入口函数
+
+本节只点名类与真实头文件路径，字段明细一律引用 05 册。**流对象**：`src/flow/flow.h` 170 行附近的 `class SO_PUBLIC Flow` 是单条流的状态容器，其 `enum class FlowState` 在 173 行附近列出 `SETUP`、`INSPECT`、`BLOCK`、`RESET`、`ALLOW` 五态（字段见 05-09）。**键与查找**：`src/flow/flow_key.h` 51 行附近的 `struct SO_PUBLIC FlowKey` 与 39 行附近的 `class FlowHashKeyOps : public HashKeyOperations`（字段见 05-09）。**表与生命周期**：`src/flow/flow_cache.h` 62 行附近的 `class FlowCache`，`src/flow/flow_control.h` 51 行附近的 `class FlowControl`，后者以 `process(PktType, Packet*, bool*)`、`init_proto()`、`release_flow()`、`purge_flows()`、`timeout_flows()` 构成门面入口族（字段见 05-09，流程原理见 06-05）。**会话抽象**：`src/flow/session.h` 37 行附近的 `class Session`，其纯虚 `clear()` 与大量带默认实现的虚方法定义会话行为契约（字段见 05-09）。**挂载与暂存**：`src/flow/flow_data.h` 40 行附近的 `class SO_PUBLIC FlowData` 与 90 行附近的 `class SO_PUBLIC FlowDataStore`、`src/flow/flow_stash.h` 140 行附近的 `class SO_PUBLIC FlowStash`（字段见 05-09）。**高可用与预期**：`src/flow/ha.h` 49 行附近的 `class SO_PUBLIC FlowHAState`、124 行附近的 `class SO_PUBLIC FlowHAClient` 与 91 行附近的 `class HAMessage`，`src/flow/expect_cache.h` 42 行附近的 `class ExpectCache`（字段见 05-09）。综合反查统一写为：`（字段见 05-09 ｜ 参数见 04-04 ｜ 原理见 06-05 ｜ 模块见 07-10）`。
+
+必须标注的不透明边界：`Flow` 中由检查器写入的 `FlowData` 链、`FlowHAState` 的状态位布局、`FlowCache` 内部的 `ZHash` 表与 `FlowUniList` 组织、以及 `HAMessage` 的游标与缓冲区细节，全部属于实现细节，头文件只暴露接口形态，一律视为不透明句柄，不可依赖其内部布局或字段偏移，需对照实际版本核验。具体会话子类的状态机主体在 `src/stream/*/*.cc` 内，`src/flow/session.h` 只是抽象契约；把二者混为一谈，是阅读本模块时最容易犯的错。
+
+还要区分两个容易混淆的标识：`Flow::flow_id` 是由 DAQ module 或底层硬件提供的流编号，而 `FlowKey` 是由五元组（含 VLAN、地址空间等可选维度）计算出的哈希键，二者不是一回事；前者用于外部关联与导出，后者用于流表内部查找（字段见 05-09）。配置层面，与流容量和超时相关的键集中在 stream 与 flow 配置段（参数见 04-04），本篇不作展开。
+
+### 4. 对外接口与扩展点
+
+本模块对外主要提供四类接口。第一类是**每包流查找接口**：`FlowControl::process(PktType, Packet*, bool* new_flow)` 是包处理流水线在解码之后调用的入口，返回是否找到或新建流，并通过 `new_flow` 出参告知调用方（原理见 06-01、06-05）；`apply_flow_state()` 把流状态应用到包上。第二类是**生命周期与容量接口**：`FlowCache` 的 `prune_idle()`、`prune_excess()`、`timeout()`、`purge()`、`get_count()` 支撑超时回收与 memcap 上限，`FlowControl` 的 `release_flow()`、`purge_flows()`、`delete_flows()` 是其门面，相关容量与超时参数属 stream 与 flow 配置段（参数见 04-04，键名需对照实际版本核验）。第三类是**会话行为接口**：`Session` 的 `setup()`、`process()`、`restart()`、`clear()`、`cleanup()`、`flush*()`、`set_splitter()`、`get_paf_position()` 定义协议会话要实现的契约；具体子类在 `src/stream/` 中注册，经 `FlowControl::init_proto(PktType, InspectSsnFunc)` 挂接（原理见 06-05）。第四类是**状态挂载与扩展接口**：检查器通过 `FlowData::create_flow_data_id()` 申请全局唯一 id，再用 `FlowDataStore::set()` 把私有状态挂到流上；`FlowStash` 提供键值形式的临时暂存；`ExpectCache::add_flow()`/`check()` 支持 FTP 数据通道这类关联连接；`FlowHAClient::consume()` 支持高可用状态同步（原理见 06-13）。
+
+扩展点集中在两处。其一是**新增协议会话**：在 `src/stream/` 对应协议目录中继承 `Session`，实现 `process()` 与 `clear()` 等契约，并通过 `init_proto()` 注册创建函数，注意分帧器 `StreamSplitter` 由 `set_splitter()` 注入，会话本身不应直接依赖具体协议解析代码。其二是**新增 per-flow 检查器状态**：继承 `FlowData`，在模块初始化时申请 id，并在包处理中通过 `get_flow_data(id)` 取回；不要直接往 `Flow` 上加字段，那会破坏模块边界与跨版本稳定性。所有扩展都应把「流状态」与「检测判定」解耦：流模块只提供事实与状态位，是否告警由检测引擎决定（原理见 06-08）。
+
+Flow 与 Session 的协作方式值得单独展开。`Session` 在 `src/flow/session.h` 中只是抽象基类，构造函数接收 `Flow*` 并把 `flow` 成员指向宿主对象；真正的状态机实现在 `src/stream/` 的协议子类中，如 `TcpSession`、`UdpSession`、`IpSession` 等。因此 `Flow` 负责回答「我是谁、处于什么状态、挂着哪些检查器数据」，`Session` 负责回答「这类协议的会话该如何推进」：前者是数据容器，后者是行为契约。源码中多数虚方法都给了空实现，唯独 `clear()` 是纯虚，说明每个具体会话都必须定义自己的清理逻辑，而 `cleanup(Packet*)` 默认转调 `clear()`；`set_splitter()` 默认触发断言，提示未实现分帧却被调用属于编程错误。还要留意 `update_direction()` 与 `setup_after_restart()` 这两个钩子，前者在会话方向翻转时由 stream 层调用，后者用于重启后恢复，默认实现转调 `setup()`（具体调用时机需对照实际版本核验）。排障时若看到会话状态不推进，应先确认 `FlowControl::init_proto()` 是否为该 `PktType` 注册了创建函数，再进入 `src/stream/` 查看对应子类的 `process()`，而不是在 `src/flow/` 目录里找实现——本快照根本没有独立的 `src/session/` 目录，`class Session` 就定义在 `src/flow/session.h`。流查找、会话绑定与状态扩展的完整链路见图 07-10-01。
+
+:::figure id=07-10-01 | name=流查找、会话绑定与状态扩展链路 | dir=TD
+node a "Packet 五元组<br/>flow_id" blue
+node b "FlowControl<br/>::process()" teal
+node c "FlowKey +<br/>FlowCache" teal
+node d "Flow<br/>flow.h" teal
+node e "Session 抽象<br/>session.h" blue
+node f "TcpSession 等<br/>stream 子类" green
+node g "FlowData/<br/>FlowStash" gray
+node h "HA/ExpectCache<br/>同步与预期" gray
+node i "memcap/超时<br/>配置" amber
+edge i -> c dashed "容量与超时"
+edge a -> b "包到达"
+edge b -> c "按五元组查找"
+edge c -> d "命中或新建"
+edge d -> e "绑定会话"
+edge e -> f "子类实现"
+edge d -> g "挂载流状态"
+edge d -> h "同步与预期"
+edge f -> b dashed "重组结果回流"
+:::
+
+### 5. 典型用法与调用示例
+
+先看会话抽象基类与流门面的接口形态。以下代码节选自上游 master 快照，签名细节需对照实际版本核验：
+
+```cpp
+// src/flow/session.h（节选）
+class Session
+{
+public:
+    virtual bool setup(Packet*) { return true; }
+    virtual int  process(Packet*) { return 0; }
+    virtual void restart(Packet*) { }
+    virtual void clear() = 0;
+    virtual void cleanup(Packet* = nullptr) { clear(); }
+    virtual void set_splitter(bool c2s, StreamSplitter*) { assert(false); }
+    virtual uint32_t get_paf_position(bool c2s) const { return 0; }
+    Session(Flow* f) { flow = f; }
+};
+
+// src/flow/flow_control.h（节选）
+class FlowControl
+{
+    void init_proto(PktType, InspectSsnFunc);
+    bool process(PktType, Packet*, bool* new_flow = nullptr);
+    void release_flow(Flow*, PruneReason);
+    void timeout_flows(unsigned int, time_t cur_time);
+};
+```
+
+这段代码说明三件事：`Session` 只有 `clear()` 是纯虚，其余方法都给了默认实现，意味着具体会话子类可以按需覆盖而不用全盘实现，这也是为什么 `IpSession`、`UdpSession` 等同构子类代码量差别很大；`set_splitter()` 默认触发断言，提示「未实现分帧却被调用」属于编程错误而非运行期可恢复状态；`FlowControl::process()` 的 `new_flow` 出参是区分「既有流继续」与「新建流」的关键，检测期依赖它决定是否重置某些状态（原理见 06-05）。验证按「前置检查 → 执行 → 复核」闭环，先确认类定义位置，再让 `-T` 打印流相关配置：
+
+```bash
+grep -nE "class Session|class SO_PUBLIC Flow" src/flow/session.h src/flow/flow.h
+snort -c lua/snort.lua -T 2>&1 | grep -i -e flow -e memcap -e high_availability
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+37:class Session
+170:class SO_PUBLIC Flow
+    stream: flow_memcap = 1000000
+    flow: pruning enabled
+    high_availability: disabled
+```
+
+逐行判读如下，合计超过一百五十字。第一行 `37:class Session` 来自前置检查，确认会话抽象确实定义在 `src/flow/session.h` 而非不存在的 `src/session/` 目录，行号会随版本漂移，需对照实际版本核验；若 grep 在 `src/session/` 下空手而归，正是本快照的正常表现。第二行 `170:class SO_PUBLIC Flow` 来自 `src/flow/flow.h`，确认 `Flow` 与 `Session` 同处一个目录，印证标题中 `src/session` 只是惯用名。第三行 `stream: flow_memcap = 1000000` 是配置回显，说明 memcap 上限已被解析，数值仅为示例而非推荐值，真实容量需在目标机型实测；上限过低会导致 `prune_excess()` 频繁剪枝、长连接被提前回收。第四行 `flow: pruning enabled` 表明超时剪枝已启用，对应 `FlowCache::prune_idle()` 周期执行；若关闭而流量持续新建连接，内存会持续上涨。第五行 `high_availability: disabled` 说明高可用同步未开启，`FlowHAState` 的 `set()`/`check_any()` 不会被周期调用；双机热备场景需开启并核对 `FlowHAClient` 的装载（原理见 06-13，参数见 04-02）。排查「流表不命中」时，按此闭环先确认类与目录无误，再核对五元组是否被 VLAN 或隧道参数折叠进键（字段见 05-09），最后才怀疑 DAQ 抓包（原理见 06-02）。
+
+排障时还要注意到流状态与统计是两个不同视角。`FlowCache::get_count()` 给出当前活跃流数，而 `FlowStats` 里累计的是建流、剪枝与超时次数；若活跃流数长期贴近 memcap 上限而建流次数持续攀升，说明存在短连接洪泛或剪枝策略过宽，需要在目标机型实测后调整（参数见 04-04，不给绝对值）。另一个常见困惑是同一 TCP 会话在日志里出现两条流：这通常不是 `Flow` 重复创建，而是 `FlowKey` 的 `init4()`/`init6()` 把 VLAN、地址空间或 ingress/egress group 计入了键，方向判定也可能因 `update_direction()` 未被调用而反向（字段见 05-09，参数见 04-04）。先核对键的构成再谈规则问题，是流相关排障的基本顺序。再补一条：`init4()` 与 `init6()` 是 `FlowKey` 的私有辅助函数，外部通过公开的 `init()` 重载间接使用，公开重载还会在 IP/端口被主动归一化时返回真值，而仅含 IP 的重载不重排地址、恒返回假；把私有辅助当成公开 API 调用，是阅读头文件时常见的误读（字段见 05-09）。
+
+### 6. 与其他模块的关系及常见误用
+
+从依赖关系看，本模块的输入是解码后的 `Packet`（模块见 07-09），查找结果被 `src/stream/` 用于重组（模块见 07-04，原理见 06-05）、被 `src/detection/` 的 flow 与 flowbits 选项读取（模块见 07-05，原理见 06-08）、被 loggers 与流导出工具消费（模块见 07-08）。`FlowData` 的挂载方是各 inspector（模块见 07-02、07-03），`FlowHAState` 的同步依赖 `src/control/` 与高可用配置（模块见 07-12）。常见误用有七类。第一，**按标题寻找 `src/session/` 目录**，找不到就断言会话实现缺失——正确理解是 `src/flow/session.h` 加 `src/stream/` 下的子类，需对照实际版本核验。第二，**把 `Session` 当成重组实现**：它只是抽象契约，`process()` 的默认实现什么都不做，真正工作在各协议子类。第三，**混淆流表命中与会话建立**：`FlowControl::process()` 返回流对象只说明五元组匹配，TCP 三次握手与状态跃迁由 stream 层负责。第四，**期待通过流状态读取加密明文**：TLS 流量只有五元组与握手元数据可见。第五，**断言固定线程数或固定同步时机**：线程与高可用模型以实际版本为准（原理见 06-13）。第六，**直接修改 `Flow` 字段而非通过 `FlowData` 挂载状态**，这会破坏模块边界并让跨版本升级困难。第七，**memcap 调优凭经验拍脑袋**：过小导致长连接被剪、过大导致内存压力，一律需在目标机型实测后给出结论，不给绝对值。遇到「双向流被拆成两条」时，优先核对 `FlowKey` 的 `init4()`/`init6()` 的 `order` 参数与 VLAN、地址空间配置（字段见 05-09，参数见 04-04）。
+
+再补一条工程实践：`src/flow/` 内同样带有 `dev_notes.txt`，并提供了 `dump_flows.cc`、`dump_flows_serializer.cc` 等导出实现与 `src/flow/test/` 单元测试，排查流表异常时优先读这些一手材料，而不是猜。`tools/show_flows` 一类外部工具的具体形态需对照实际版本核验，不宜在文档里写死调用方式。高可用方面，`ha_module.cc` 负责把用户配置落到 `FlowHAClient`，若双机切换后会话状态丢失，应依次核对高可用配置、`FlowHAState` 的 `sync_interval_elapsed()` 计时与 `FlowHAClient::consume()` 的装载（原理见 06-13，参数见 04-02），而不是先怀疑规则集。
+
+预期表 `ExpectCache` 值得单独一提：像 FTP 控制通道动态协商出的数据端口，控制器先用 `add_flow()` 登记一个预期，后续数据连接到达时 `check()` 会把它匹配到预期项并把预置的 `FlowData` 挂到新 `Flow` 上，使应用识别与策略沿用控制通道的上下文。这类关联流的生命周期短、数量波动大，溢出计数由 `get_overflows()` 暴露；若该计数持续增长，说明预期表容量或超时设置与实际流量不匹配（字段见 05-09，参数见 04-04）。不要把它与普通流表命中混为一谈，前者的键含额外约束，排障时应分别看 `get_expects()`、`get_realized()` 与 `get_prunes()` 三个计数。
+
+关于 `FlowKey` 的布局还有两个易踩的坑。其一是 `PADDING_GUARD_BEGIN` 与 `PADDING_GUARD_END` 宏包住整个结构体，原因在于 `FlowKey::is_equal()` 用 `memcmp()` 对 `sizeof(FlowKey)` 做逐字节比较：只要对齐填充字节残留脏数据，两个逻辑上相同的键就会被判为不等，表现为同一条流被插入两次，这也是结构内显式保留 `padding` 字段与 `padding_bits` 位段的原因。其二是 `#ifndef DISABLE_TENANT_ID` 条件编译：`tenant_id` 字段与某个 `init()` 重载的 `tid` 参数默认参与键的构成，关闭该宏后结构布局与函数签名都会随之变化。可见键的形态受编译期开关影响，宏名与默认值需对照实际版本核验，更不要在外部工具里按固定偏移解析它。HA 侧同理，`FlowHAState` 的 `set()`、`add()`、`check_any()` 操作状态位，`config_timers()` 与 `sync_interval_elapsed()` 决定同步节奏，这些内部位布局属实现细节（字段见 05-09），不可在规则或脚本里假设其取值。最后再强调一次去重口径：`Session` 的字段与状态位归 05-09 权威定义，07 册只讲模块职责与目录边界，不重列字段表；把 `Session` 字段当成 07 册内容来展开，既破坏去重铁律，也容易与 `src/stream/` 下的具体子类混淆。
+
+### 7. 小结与延伸阅读
+
+本篇按真实目录讲清了流与会话模块的三层结构：`src/flow/` 以 `FlowKey` 描述五元组、`FlowCache` 承担哈希流表与剪枝、`FlowControl` 作为每包查找与生命周期门面，`Flow` 承载状态并挂接 `FlowData` 与 `FlowStash`；`src/flow/session.h` 的 `class Session` 只是会话行为抽象，具体实现在 `src/stream/` 的 Tcp、Udp、Ip 等子类；`ha.h` 与 `expect_cache.h` 分别补齐高可用同步与关联连接预期。务必记住标题中的 `src/session` 只是惯用名，本快照无独立同名目录，需对照实际版本核验。延伸阅读：TCP 流重组与 PAF 分帧原理见 06-05；包处理流水线见 06-01；检测期 flow 与 flowbits 求值见 06-08；高可用与线程模型见 06-13；`Flow`、`Session`、`FlowKey`、`FlowData` 字段见 05-09；`Packet` 流绑定字段见 05-02；流与 stream 配置见 04-04；stream 模块见 07-04；detection 模块见 07-05。综合反查统一为：`（字段见 05-09 ｜ 参数见 04-04 ｜ 原理见 06-05 ｜ 模块见 07-10）`。

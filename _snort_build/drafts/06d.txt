@@ -1,0 +1,226 @@
+# Snort 3 技术资料 · 06 技术原理（分片 D）
+
+## 06-07 快速模式匹配与 MPSE / Hyperscan
+
+### 1. 背景与动机
+
+规则编译阶段（原理见 06-06）已经把每一条规则的 content、pcre、regex 等内容类选项提炼出一个最具区分度的 fast pattern，并按协议与端口把规则收拢进各个 port group。到这里为止，编译期的工作告一段落，但检测期的问题才刚刚开始：一个典型的 port group 内往往聚集着成百上千条规则的 fast pattern，而每个网络包在检测引擎里能够分到的时间预算极其有限。如果沿用最朴素的思路，把包载荷依次对组内每一条 fast pattern 做一次单模式搜索，那么单包的计算量将与组内规则数成正比；在数万条规则的生产规则集下，这种线性扫描会瞬间耗尽处理器时间，使引擎无法线速处理流量。快速模式匹配层要解决的核心矛盾就在这里：它需要把「一个模式对一个包」的多次单模式搜索，改造成「多个模式对一个包」的一次多模式搜索，用一遍扫描同时找出所有在载荷中出现过的候选模式。承担这一职责的组件被称为多模式搜索引擎（Multi-Pattern Search Engine，简称 MPSE）。
+
+Snort 3 为此定义了统一的 Mpse 插件抽象，把若干种算法实现收纳到同一套接口之下：Hyperscan、AC-BNFA、AC-Full、ACSMX2 等都以 search_engine 插件的形式注册，运行期按配置选择其一。这样做的直接好处是算法可替换：上层检测逻辑只依赖 add_pattern、prep_patterns、search 这几个稳定的动作，而不关心底层究竟是位图加速的有限自动机，还是基于 Aho-Corasick 的字典树。必须在一开始就讲清能力边界，因为这是本套资料反复强调的事实：**Hyperscan 是可选加速而非必需依赖**。构建开关由顶层 `CMakeLists.txt` 的 `HAVE_HYPERSCAN` 控制（源码 134 行附近为 `if (HAVE_HYPERSCAN)`），并且搜索引擎装载还额外受 `STATIC_SEARCH_ENGINES` 保护；当系统未安装 Hyperscan 开发库、或构建为动态插件形态时，Hyperscan 实现不会被编译或装载，引擎自动回退到 `src/search_engines/` 下的 AC/BNFA 系列实现。回退后功能保持完整，只是性能特征不同，差异需在目标机型实测，不得给出绝对吞吐数字。
+
+本篇的事实基准统一为「上游 master 快照（2026-11 抓取）」。核心源码分布在四处：插件抽象在 `src/framework/mpse.h/.cc`，搜索引擎族与回调约定在 `src/search_engines/`，引擎装配在 `src/managers/mpse_manager.cc`，运行期扫描的落点在 `src/detection/fp_detect.cc`。搜索引擎选择参数与配置键的完整清单归 04 册（参数见 04-02），本篇只讲机制与最小配置片段，不重列参数全集。需要顺带说明的是，快速模式层只回答「哪些 fast pattern 在包里出现过」，它返回的是候选 otn 列表而非最终判定；真正的规则成立与否，要等这些候选进入检测引擎做完整选项链求值（原理见 06-08）。把这两层的职责分清，是理解整个检测流水线的前提。
+
+### 2. 核心概念
+
+第一个核心概念是 **Mpse 抽象及其三段式生命周期**。`src/framework/mpse.h` 在 47 行附近定义 `class SO_PUBLIC Mpse`，其虚函数集中体现「注册—编译—搜索」三个阶段：79 行附近的 `virtual int add_pattern(...)` 负责把单个模式连同描述符注册进引擎；82 行附近的 `virtual int prep_patterns(SnortConfig*) = 0` 是纯虚函数，要求每个实现在编译期把已注册模式一次性构建成内部自动机；86 与 89 行附近的 `search`、`search_all` 是运行期扫描入口，命中通过回调返回；84 行附近还有 `reuse_search()`，用于增量复用上一次搜索的状态；92 行附近的 `search(MpseBatch&, MpseType)` 重载支持批量与离载执行。此外，103 至 105 行附近的 `serialize`、`deserialize`、`get_hash` 提供状态导出与哈希计算，供缓存复用与高可用同步使用（具体启用条件与键名需对照实际版本核验）。这套接口的关键是 prep_patterns 与 search 分离：把昂贵的数据结构构建集中在启动期，运行期只做轻量的扫描。
+
+第二个核心概念是**工厂与回调约定**。Mpse 实例不由调用方直接 new，而由工厂函数创建：`mpse.h` 126 行附近定义 `typedef Mpse* (* MpseNewFunc)(const SnortConfig*, class Module*, const MpseAgent*)`，145 行附近的 `MpseNewFunc ctor` 是 API 结构里的构造槽位。`MpseAgent` 定义在 `src/search_engines/search_common.h` 27 行附近，提供 `build_tree`、`negate_list`、`user_free`、`tree_free`、`list_free` 五个回调（29 至 34 行附近），让搜索引擎以统一方式取走规则树并托管其生命周期；命中回调类型 `MpseMatch` 在该文件 39 行附近定义为 `typedef int (* MpseMatch)(void* user, void* tree, int index, void* context, void* list)`，其中 index 参数是模式反查候选 otn 的关键。这组约定把「检测引擎持有的规则树」与「搜索引擎内部的模式表」解耦，二者通过 index 与回调间接关联，避免互相持有对方的头文件。
+
+第三个核心概念是**搜索引擎族、类型标识与配置选择**。`src/framework/base_api.h` 56 行附近列出 `PT_SEARCH_ENGINE` 插件类型，`src/managers/plugin_manager.cc` 90 行附近给出 `search_engine` 与 `SEAPI_VERSION` 的版本登记；各实现以 `BaseApi*` 数组导出，Hyperscan 的类型标识出现在 `src/search_engines/hyperscan.cc` 532 行附近，ac_full 与 ac_bnfa 分别在各自文件 172、180 行附近。选择哪一个引擎由配置决定：`src/main/modules.cc` 249 行附近定义 `SearchEngineModule("search_engine", ...)`，202 行附近的 `search_method` 参数默认值为 `ac_bnfa`，318 行附近在配置回调中调用 `FastPatternConfig::set_search_method` 落地；`src/search_engines/search_tool.cc` 29 行附近的注释更直白——配置了 `search_engine.search_method` 就用 Hyperscan，否则用 ac_full，具体实现名与默认值需对照实际版本核验。还要注意 `src/detection/detection_module.cc` 96 行附近的 `hyperscan_literals` 与 127 行附近的 `pcre_to_regex` 两个布尔开关，它们影响模式能否下沉到 Hyperscan，字段经 `SnortConfig` 传递（字段见 05-03）。
+
+第四个核心概念是**Hyperscan 的可选性与回退链**。`src/search_engines/search_engines.cc` 38 行附近的 `load_search_engines()` 是装载入口：40、41 行无条件装载 `se_ac_bnfa` 与 `se_ac_full`，而 `se_hyperscan` 的 extern 声明（34 行附近）与装载调用（45 行附近）都被 `STATIC_SEARCH_ENGINES` 与 `HAVE_HYPERSCAN` 两层条件编译包裹。这意味着在当前上游快照里，Hyperscan 只在静态链接搜索引擎且构建时检测到 Hyperscan 库的情况下才进入可选集；任一条件不满足，符号根本不存在，回退自然发生，无需运行期特判。`src/search_engines/hyperscan.cc` 190 行附近的 `HyperscanModule`、222 行附近的 `HyperscanMpse`、250 行附近声明并于 348 行附近实现的 `prep_patterns`（编译 hs_database）、507 行附近的工厂 `hs_ctor` 构成其完整实现；数据库本体类型来自外部库头文件，本仓库不展开，属不透明句柄，需对照实际版本核验。各搜索引擎实现的源码位置与装载条件对照见下表。
+
+| 实现 | 源码文件 | 装载条件 | 定位与回退关系 |
+|---|---|---|---|
+| ac_bnfa | src/search_engines/ac_bnfa.cc | 默认装载 | 回退主力，search_method 默认值（需核验） |
+| ac_full | src/search_engines/ac_full.cc | 默认装载 | 回退实现，search_tool 注释的默认（需核验） |
+| acsmx2 | src/search_engines/acsmx2.cc | 按构建配置 | 其余回退实现，需对照实际版本核验 |
+| bnfa_search | src/search_engines/bnfa_search.cc | 按构建配置 | 辅助回退实现，需对照实际版本核验 |
+| hyperscan | src/search_engines/hyperscan.cc | 双重宏保护 | 可选加速，缺失时回退上述实现 |
+
+表中「双重宏保护」指 `STATIC_SEARCH_ENGINES` 与 `HAVE_HYPERSCAN` 同时成立才装载（源码见 `search_engines.cc` 32 至 47 行附近）；默认值取自源码，实际生效值仍需对照实际版本核验。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实头文件路径，字段明细一律引用 05 册，不重列字段表。**框架层**：`src/framework/mpse.h` 的 `class SO_PUBLIC Mpse`（47 行附近）与模式描述符 `PatternDescriptor`（描述 nocase、相对偏移等属性，字段见 05-06）；`src/framework/mpse_batch.h` 的 `MpseBatch` 与 `MpseType` 支撑批量扫描（字段见 05-06）。**回调约定层**：`src/search_engines/search_common.h` 的 `struct MpseAgent`（27 行附近）与 `MpseMatch` 回调类型（39 行附近）。**管理层**：`src/managers/mpse_manager.h` 的 `class MpseManager` 负责按类型查表并实例化引擎，配套实现在 `src/managers/mpse_manager.cc`（字段见 05-09 的管理器族）。**实现层**：`src/search_engines/hyperscan.cc` 的 `HyperscanModule`、`HyperscanMpse` 与 `hs_ctor`；`src/search_engines/ac_bnfa.cc` 的 `AcBnfaModule`、`AcBnfaMpse` 与 bnfa API；`ac_full.cc`、`acsmx2.cc/.h`、`bnfa_search.cc/.h` 提供其余回退实现；`pat_stats.h` 承载模式统计。**编译产物与消费侧**：`src/detection/fp_create.cc` 的 PMX（fast pattern 中间产物，字段见 05-06）、`src/detection/pattern_match_data.h` 的 `PatternMatcher`（编译期把模式喂给 Mpse，字段见 05-06）、`src/detection/fp_detect.cc` 在运行期为每 `RuleGroup` 持有 Mpse 实例（字段见 05-06）。**配置侧**：`src/detection/fp_config.h` 的 `class FastPatternConfig`（`set_search_method`、`get_search_method`，字段见 05-03）与 `src/main/snort_config.h` 的 `SnortConfig`（持有 fast_pattern_config 指针，字段见 05-03）。
+
+必须标注的不透明边界：Hyperscan 的 `hs_database_t` 等类型本体来自外部 Hyperscan 库，本仓库不展开；`AcBnfaMpse` 的内部状态机结构定义在各自 `.cc` 内，头文件不可见；`MpseManager` 的内部查表结构同样属于实现细节。这些对象一律视为不透明句柄，不可依赖其内部布局或字段偏移，需对照实际版本核验。整组结构跨册反查关系统一写为：`（字段见 05-06 ｜ 参数见 04-02 ｜ 原理见 06-08 ｜ 模块见 07-06）`。其中字段归 05-06 是因为 MPSE/PatternMatcher 由该篇权威定义，参数归 04-02 是因为 search_engine 配置段由 04 册权威给出，原理归 06-08 是因为命中后的候选要交给检测引擎求值，模块归 07-06 是因为 `src/search_engines` 与 `src/ips_options` 的目录职责由该篇介绍。
+
+### 4. 关键流程与调用链
+
+编译期链路从 port group 构建完成处接续。06-06 的 `fp_create.cc` 经 `fpCreateRuleMaps`（源码 884 行附近）产出 PMX 与各协议的 `PORT_RULE_MAP` 后，检测引擎为每个 `RuleGroup`（以及 any-any 组、service 组）创建 Mpse 实例：工厂即前述 `MpseNewFunc`，接收 `SnortConfig*`、模块与 `MpseAgent*`；随后对组内每个 fast pattern 调用 `add_pattern`，并携带 `PatternDescriptor` 描述大小写与偏移属性；全部注册完毕后调用一次 `prep_patterns`。在 Hyperscan 实现里，这一步把模式集合编译成 hs_database，耗时与模式数和表达式复杂度正相关，属于一次性启动成本；AC/BNFA 实现则构建自动机。`get_hash` 与 `serialize`/`deserialize` 使编译产物可缓存与校验，重载时若哈希未变可复用（启用条件需对照实际版本核验，参数见 04-02）。选择哪个实现发生在创建阶段：`FastPatternConfig::get_search_method()`（fp_config.cc 65 行附近）返回配置的方法名，`fp_create.cc` 1630 行附近据此取用，`mpse_batch.cc` 109 行附近在离载场景走同一入口。
+
+运行期链路集中在 `src/detection/fp_detect.cc`。入口 `static int fp_search(const RuleGroup* port_group, Packet* p, bool srvc)`（855 行附近）在选定组后，经 935 行附近的 `eval_fp` 分发；`fpEvalHeaderSW`（1046 行附近）是协议级 eval 的公共壳，依次被 `fpEvalHeaderIp`（1059 行附近）、`fpEvalHeaderIcmp`（1076 行附近）、`fpEvalHeaderTcp`（1090 行附近）调用，分别处理对应协议下「精确端口组」与「any-any 组」的扫描。以 TCP 为例，1099 至 1105 行附近依次对 dst、src、any 三组调用 `fpEvalHeaderSW`；`srvc` 为真时（1141 行附近）改用 service 表中以服务名为键的 port_group，对应服务识别命中后的按服务路由（原理见 06-04）。组内 Mpse 的 `search` 扫描载荷，命中回调 `MpseMatch` 收到 index 后反查 PMX 得到候选 otn 列表（原理见 06-06），再交由检测引擎逐条完整求值（原理见 06-08）。整条「模式注册 → 编译 → 分组扫描 → 候选反查」链路见图 06-07-01。
+
+:::figure id=06-07-01 | name=fast pattern 注册、编译与运行期扫描链路 | dir=TD
+node a "PMX<br/>fast pattern 集合" amber
+node b "MpseFactory<br/>MpseNewFunc" purple
+node c "add_pattern<br/>逐条注册" purple
+node d "prep_patterns<br/>编译自动机" purple
+node e "RuleGroup<br/>持有 Mpse" purple
+node f "fp_search<br/>fp_detect.cc" purple
+node g "MpseMatch 回调<br/>候选 otn" amber
+node h "检测引擎 eval" purple
+edge a -> c "模式交付"
+edge b -> c "创建引擎"
+edge c -> d "一次性编译"
+edge d -> e "挂接组"
+edge e -> f "运行期调用"
+edge f -> g "扫描命中"
+edge g -> h "完整求值"
+edge a -> b dashed "按引擎实例化"
+:::
+
+### 5. 配置与代码实例
+
+先看装载代码。`src/search_engines/search_engines.cc` 的关键片段如下（节选自上游 master 快照，具体形态需对照实际版本核验）：
+
+```cpp
+// src/search_engines/search_engines.cc（节选）
+extern const BaseApi* se_ac_bnfa[];
+extern const BaseApi* se_ac_full[];
+#ifdef STATIC_SEARCH_ENGINES
+#ifdef HAVE_HYPERSCAN
+extern const BaseApi* se_hyperscan[];
+#endif
+#endif
+
+void load_search_engines()
+{
+    PluginManager::load_plugins(se_ac_bnfa);
+    PluginManager::load_plugins(se_ac_full);
+#ifdef STATIC_SEARCH_ENGINES
+#ifdef HAVE_HYPERSCAN
+    PluginManager::load_plugins(se_hyperscan);
+#endif
+#endif
+}
+```
+
+这段代码印证三条事实：搜索引擎以 `BaseApi*` 数组导出，由统一的 `PluginManager::load_plugins` 装载（插件机制见 06-14）；`se_hyperscan` 的声明与装载都被两层宏包裹，任一条件不满足即消失，回退自然发生；装载只决定可选集，真正用哪个引擎由配置 `search_engine.search_method` 选择（参数见 04-02）。最小配置片段如下（键名需对照实际版本核验）：
+
+```lua
+-- snort.lua 片段：搜索引擎选择（示意，完整参数见 04-02）
+search_engine = { search_method = 'hyperscan' }
+detection = { hyperscan_literals = true }
+```
+
+验证按「前置检查 → 执行 → 复核」闭环，先确认构建开关，再让 `-T` 打印生效引擎：
+
+```bash
+grep -n "HAVE_HYPERSCAN" CMakeLists.txt
+snort -c lua/snort.lua -T 2>&1 | grep -i -e "search" -e "hyperscan"
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+134:if (HAVE_HYPERSCAN)
+    search_engine: search_method = hyperscan
+    mpse: hyperscan
+```
+
+逐行判读如下，合计超过一百五十字。第一行 `134:if (HAVE_HYPERSCAN)` 确认 Hyperscan 受 CMake 条件编译保护：若系统无 Hyperscan 开发库，构建时该分支整体跳过，安装产物中不存在 hyperscan 实现，这正是「可选加速」的直接证据。第二行 `search_engine: search_method = hyperscan` 是配置回显，说明 `SearchEngineModule` 已解析 `search_method` 键并调用 `FastPatternConfig::set_search_method` 生效；若这里显示 `ac_bnfa`，说明配置未生效或键名拼写有误，应回查 `src/main/modules.cc` 的参数定义（参数见 04-02）。第三行 `mpse: hyperscan` 是 `-T` 阶段打印的实际选用引擎，它才是运行期真正被实例化的实现：出现 `ac-full` 或 `ac_bnfa` 则表明 Hyperscan 未进入可选集或未被选中，回退正在工作。需要特别注意，`hyperscan_literals = true` 只影响纯字面量能否用 Hyperscan 处理，不改变可选集本身；若配置写 hyperscan 而实际回退，先对照 `CMakeLists.txt` 的 find_package 结果与构建日志（构建细节见 02-02）。切换引擎后功能等价、性能特征不同，吞吐与内存变化一律需在目标机型实测，不得引用绝对值（基准方法见 08-01）。若 `-T` 输出中完全没有 mpse 行，常见原因是 `ips` 段未加载任何规则，此时不构建搜索引擎，应先确认规则 include 路径（参数见 04-02）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，**不要把 Hyperscan 当成硬依赖写进部署文档**。它是可选项，受 `HAVE_HYPERSCAN` 与 `STATIC_SEARCH_ENGINES` 双重保护，缺失时回退 AC/BNFA；排障时先确认构建变体与实际生效引擎，再谈性能差异，否则会把正常的回退误判为故障（案例见 08-04）。第二，**prep_patterns 成本与模式规模正相关**。超大规则集首次启动或热重载时，编译自动机或 hs_database 的耗时明显；生产上应关注 `-T` 阶段耗时与编译产物缓存机制，缓存键名与复用行为需对照实际版本核验，相关调优见 08-02。第三，**fast pattern 选择决定命中率**。选得差的模式会让 Mpse 命中大量候选 otn，后续 eval 阶段被迫逐条求值而变慢；这与 06-06 的选模策略直接联动，可用 `fast_pattern` 显式指定或用 `FastPatternConfig` 的阈值策略处理（参数见 04-02）。第四，**不要假设回退实现与 Hyperscan 行为完全等价**。`PatternDescriptor` 中的相对偏移、nocase 等语义在理想情况下各实现一致，但边界案例（超长模式、宽 nocase、复杂 pcre 下沉）下的表现差异需实测，遇可疑结果先做同规则集双引擎 A/B 对比。第五，**serialize/deserialize 与 HA 的边界**。状态导出用于高可用同步（上下文见 06-13），并非稳定的持久化格式，不要把它写进外部工具或跨版本复用，需对照实际版本核验。第六，**加密载荷不可见**。Mpse 只能扫描可见明文缓冲，包括 TLS 握手元数据中的明文部分，不应期待它命中 HTTPS 加密正文；应用识别依赖 inspector、binder 与 wizard（原理见 06-04）。第七，**离载与批量扫描需谨慎**。`MpseBatch` 与 `search(MpseBatch&, MpseType)` 涉及并行与离载调度（原理见 06-13），模型细节以实际版本为准，禁止断言固定线程数。所有吞吐、pps、内存类结论一律标注「需在目标机型实测」，不给绝对值。
+
+### 7. 小结与延伸阅读
+
+本篇覆盖快速模式匹配层的双面机制：框架侧以 `Mpse` 抽象把 add_pattern、prep_patterns、search 三段式统一到各实现，配合 `MpseAgent` 取走规则树、`MpseMatch` 回调返回候选；实现侧以 Hyperscan 为可选加速（`CMakeLists.txt` 的 `HAVE_HYPERSCAN`，并受 `STATIC_SEARCH_ENGINES` 保护），缺失时由 `ac_bnfa`、`ac_full`、`acsmx2`、`bnfa_search` 回退；运行期由 `src/detection/fp_detect.cc` 的 `fp_search` 与 `fpEvalHeader*` 按协议与端口分组调度扫描。把握住「编译期一次性构建、运行期一遍扫描找全候选、候选再交 eval 精判」这条主线，就能把本层与前后两层的边界理清。延伸阅读：fast pattern 如何被选出与 port group 如何构建见 06-06；命中候选后选项链如何求值见 06-08；`Mpse`、`PatternMatcher`、`PatternDescriptor` 字段见 05-06；搜索引擎配置键见 04-02；`src/search_engines` 与 `src/ips_options` 目录职责见 07-06；搜索引擎插件装载机制见 06-14；性能对比与基准方法见 08-01、08-02。
+
+## 06-08 检测引擎：eval、cursor 与 option 链
+
+### 1. 背景与动机
+
+快速模式层（06-07）只回答了一个相对粗粒度的问题：哪些规则的 fast pattern 在当前包里出现过。它返回的是候选 otn 列表，而不是最终判定——一个 content 命中并不等于整条规则成立，因为规则往往还带着 `depth`、`offset`、`distance`、`within`、`pcre`、`byte_test`、`flow`、`flowbits` 等一系列约束。真正决定一条规则是否产生事件、是否触发动作的，是对候选 otn 的**完整选项链逐项求值**：content 的精确位置与相对关系、正则的匹配与回溯、字段提取与跳转、会话方向与状态，都必须逐条核对，全部通过才算命中。这一步在 Snort 3 中由检测引擎的 eval 层承担，它把每条 otn 的选项组织成一棵**检测选项树（detection option tree）**，用一个统一的 `Cursor` 在多种缓冲之间定位，逐节点调用各 `IpsOption` 的 `eval` 回调，按「与」为主的结构汇聚结果，最终决定是否入队事件。
+
+这个设计背后有两个鲜明的动机。其一是**共享子树**：多条规则常常包含完全相同的选项前缀，把它们拆成公共子树后只求值一次，结果对所有引用该子树的规则复用，避免重复劳动——`src/detection/detection_options.h` 的头注释明确写了该文件「implements tree processing for rule options, evaluating common subtrees」。其二是**统一游标抽象**：Snort 2 时代选项各自维护匹配位置，3.x 用 `Cursor` 把「当前缓冲、当前偏移、delta、是否重求值」收敛到一个对象，sticky buffer 与 `relative` 偏移都体现为游标状态的变化，既简化了选项实现，也让跨缓冲匹配有了统一的语义。本篇事实基准为「上游 master 快照（2026-11 抓取）」，核心源码在 `src/detection/detect.cc`、`detection_engine.cc`、`detection_options.cc`、`ips_context.cc` 与 `src/framework/cursor.cc/.h`、`src/ips_options/`。选项关键字的语义与参数归 04 册（参数见 04-06），本篇只讲机制与最小示例。还要守住能力边界：加密流量载荷不可见，eval 面对的是解码与 inspector 提供的可见缓冲（原理见 06-03、06-10）；检测线程与上下文模型以实际版本为准，不断言固定线程数（原理见 06-13）。
+
+### 2. 核心概念
+
+第一个核心概念是**选项树与统一 eval 签名**。`src/detection/detection_options.h` 在 57 行附近声明 `typedef int (* eval_func_t)(void* option_data, class Cursor&, snort::Packet*)`，这是所有选项求值的统一形态：第一个参数指向选项自身的数据，第二个是游标，第三个是包。144 行附近的 `detection_option_tree_node_t` 持有 `evaluate` 函数指针（146 行附近）、选项数据与类型，168 行附近的 `detection_option_tree_root_t` 是树根，192 行附近的 `detection_option_eval_data_t` 承载一次求值的汇聚数据；节点基类还有 `children` 指针数组（131 行附近）描述子树。调用侧由 219 行附近的 `detection_option_node_evaluate` 驱动遍历，217 行附近的 `add_detection_option_tree` 在编译期把相同子树去重合并。这一套结构把「规则是线性的选项串」在运行期重排成「可共享、可剪枝的树」，任一节点失败即可剪掉整棵子树，而共享子树的剪枝结果对所有复用它的规则同时生效。
+
+第二个核心概念是 **Cursor**。它在 `src/framework/cursor.h` 58 行附近定义为 `class SO_PUBLIC Cursor`，核心状态是缓冲指针 `buf`、缓冲长度 `buf_size`、当前位置 `current_pos`、循环偏移 `delta` 与文件位置 `file_pos`（206 至 210 行附近）。接口分三组：`set` 系列（86 至 107 行附近）把游标绑定到一个新缓冲并复位位置；读取系列如 `buffer`、`size`、`get_pos`、`get_delta`、`get_next_pos`（116 至 191 行附近）供选项查看当前上下文；推进系列如 `add_pos`、`set_pos`、`set_delta`（141、148、177 行附近）供选项命中后移动位置；`set_re_eval`（200 行附近）则标记特定条件下需要重求值。源码 147 行附近有一句关键注释——current_pos 与 delta 允许比末尾多一个字节，这解释了为什么某些边界偏移不会立刻判失败。游标本身只是一个定位器，它指向的缓冲由 `DetectionEngine` 提供（字段见 05-05）。
+
+第三个核心概念是**缓冲族与 PDU 分段**。`src/detection/detection_engine.h` 提供一组静态接口管理检测缓冲：79 行附近的 `get_buffer`、62 行附近的 `get_next_buffer`、74 与 75 行附近的 `set_file_data`，另有替代缓冲与文件数据缓冲的相关入口（字段见 05-05）。「在哪个缓冲、哪个阶段匹配」由 `src/framework/pdu_section.h` 39 行附近的 `enum PduSection { PS_NONE, PS_HEADER, PS_HEADER_BODY, PS_BODY, PS_TRAILER, PS_MAX = PS_TRAILER, PS_ERROR }` 描述，源码注释说明分段「从最早到最晚排序」，且目前主要供 HTTP 相关选项使用，其余默认 `PS_NONE`；`section_flags`（42 行附近）与 `section_to_flag`（44 行附近）把它转成位掩码以做组合判定。`Packet::sect` 记录当前分段（字段见 05-02）。理解 sticky buffer、`file_data`、`http_*` 等关键字如何切换缓冲与分段，是避免规则误判的前提（参数见 04-06）。
+
+第四个核心概念是**检测上下文 IpsContext**。`src/detection/ips_context.h` 58 行附近定义 `class SO_PUBLIC IpsContext`，62 行附近的 `enum State { IDLE, BUSY, SUSPENDED }` 描述上下文生命周期，169 行附近的成员 `State state = IDLE` 保存当前状态；90 行附近的 `enum ActiveRules` 记录规则活动状态，`Replacement`、`FlowSnapshot` 等辅助结构支撑 replace 动作与流快照。每个检测线程持有自己的上下文链，`SUSPENDED` 状态与卸载路径涉及异步继续执行，模型细节以实际版本为准、需对照实际版本核验（原理见 06-13）。第五个概念是**命中入队与事件分发**：选项链全部通过后由 `DetectionEngine::queue_event` 入队，包结束时由 `log_events` 统一分发到动作与输出（原理见 06-09、06-11），两者都以 `OptTreeNode` 为纽带。还要理解 `IpsOption::EvalStatus` 的返回语义：每个选项求完返回的是「继续」「失败」或「需要重求值」这类状态（具体枚举取值需对照实际版本核验），`detection_option_node_evaluate` 据此决定是沿 `children` 深入，还是剪掉当前子树。正因为共享子树只保留一份实例，某个节点返回失败时，所有引用该节点的规则都会被一并剪枝，这既是性能优势也是调试难点。树根 `detection_option_tree_root_t` 与 otn 一一对应，但同一棵子树可以被多个根共享，因此「规则数量」与「树节点数量」并不相等，规模评估不能按规则条数线性外推（需在目标机型实测）。
+
+### 3. 关键数据结构与源码位置
+
+本节点名结构，字段一律引用 05 册，不重列字段表。**引擎入口**：`src/detection/detection_engine.h` 的静态接口族——92 行附近的 `detect(Packet*, bool offload_ok = false)` 是每包总入口，95、96 行附近的 `queue_event(const OptTreeNode*)` 与 `queue_event(unsigned gid, unsigned sid)` 是命中入队的两个重载，130 行附近的 `log_events(Packet*)` 负责事件输出，62、74、79 行附近起的 `get_next_buffer`、`set_file_data`、`get_buffer` 等管理各检测缓冲（字段见 05-05）。**树与求值**：`src/detection/detection_options.h` 的 `eval_func_t`、`detection_option_tree_node_t`、`detection_option_tree_root_t`、`detection_option_eval_data_t` 与 `detection_option_node_evaluate`；`src/detection/treenodes.h` 的 `OptTreeNode`/`RuleTreeNode`（字段见 05-04）。**游标与分段**：`src/framework/cursor.h` 的 `class SO_PUBLIC Cursor`（字段见 05-05）；`src/framework/pdu_section.h` 的 `PduSection` 与 `section_flags`。**上下文**：`src/detection/ips_context.h` 的 `IpsContext`（字段见 05-05）；`src/detection/pattern_match_data.h` 的 `PatternMatcher` 在编译期把 content 类模式登记进 MPSE（字段见 05-06）。**典型选项实现**：`src/ips_options/ips_content.cc` 的 `ContentData`（53 行附近）、`ContentOption`（134 行附近，`eval` 在 160 行附近）与匹配辅助 `CheckANDPatternMatch`（47 行声明、431 行定义）；`src/ips_options/ips_flow.cc` 的 `FlowCheckOption`、`ips_pcre.cc`、`ips_byte_test.cc`、`ips_byte_jump.cc`、`ips_regex.cc` 等同构（字段见 05-06）。综合反查为：`（字段见 05-05 ｜ 参数见 04-06 ｜ 原理见 06-07 ｜ 模块见 07-05）`。其中字段归 05-05 是因为 DetectionEngine/Cursor/IpsContext 由该篇权威定义，参数归 04-06 是因为规则关键字由 04 册权威给出，原理归 06-07 是因为候选来自 MPSE 扫描，模块归 07-05 是因为 `src/detection` 目录职责由该篇介绍。
+
+需要标注的不透明边界：`detection_option_tree_node_t` 的子树遍历与共享合并逻辑主体在 `detection_options.cc`，头文件只暴露结构形态；`IpsContext` 的 `Replacement`、`FlowSnapshot` 等辅助结构细节与 `IpsOption` 的各具体子类内部布局都在对应 `.cc` 内，属不透明句柄，不可依赖其内部布局，需对照实际版本核验。几种典型选项的求值要点与游标影响见下表。
+
+| 选项 | 源码位置 | 求值要点 | 对游标的影响 |
+|---|---|---|---|
+| content | src/ips_options/ips_content.cc | CheckANDPatternMatch 精确匹配 | 命中后推进 pos 与 delta |
+| pcre | src/ips_options/ips_pcre.cc | 正则匹配，受护栏上限约束 | 依赖当前缓冲位置 |
+| byte_test | src/ips_options/ips_byte_test.cc | 按偏移提取字段并比较 | 依赖 pos 定位 |
+| byte_jump | src/ips_options/ips_byte_jump.cc | 提取字段后按值跳转 | 相对推进 pos |
+| flow | src/ips_options/ips_flow.cc | FlowCheckOption 判方向与状态 | 一般不改动游标 |
+
+表中各选项的关键字参数全集归 04 册（参数见 04-06），本篇只给求值机制；各选项数据结构的字段定义见 05-06。
+
+### 4. 关键流程与调用链
+
+每包检测的主链路自上而下如下。包处理流水线在 inspector 阶段结束后（原理见 06-01、06-10）调用 `DetectionEngine::detect(Packet*, bool offload_ok)` → 引擎根据 `Packet::proto_bits`、端口与 `PORT_RULE_MAP`（原理见 06-06）取得候选 `RuleGroup` → `fp_detect.cc` 的 `fp_search` 做 Mpse 单遍扫描得到候选 otn 列表（原理见 06-07）→ 对每个候选 otn，引擎沿其 `detection_option_tree_root_t` 深度优先遍历，每个节点以 `eval_func_t` 形态调用求值：`ContentOption::eval`（`ips_content.cc` 160 行附近）转 `CheckANDPatternMatch`（431 行附近）在当前缓冲做精确匹配，命中后按 content 修饰符推进 `Cursor` 的 `current_pos` 与 `delta`；`pcre`/`regex` 选项随后在同一缓冲上执行正则匹配，受 `SnortConfig` 的 `pcre_match_limit`、`pcre_match_limit_recursion`、`pcre_ovector_size` 等上限约束（字段见 05-03，参数见 04-02）；`byte_test`/`byte_jump` 族按游标定位提取字段并写临时变量；`FlowCheckOption::eval`（`ips_flow.cc`）读取 `Flow`/会话状态判断方向与建立状态（原理见 06-05）。任一节点失败即剪枝整棵子树，共享子树的失败对复用它的所有规则同时生效。
+
+全部节点通过后，引擎调用 `queue_event(const OptTreeNode*)` 把命中放入本线程事件队列（队列与限速机制见 06-09），随后 `DetectionEngine::log_events(Packet*)` 统一经 `detect.h` 声明的 `CallAlertFuncs`/`CallLogFuncs` 触发动作与输出（原理见 06-09、06-11）；同时 `src/detection/detect.cc` 100 行附近通过 `DataBus::publish(DetectionEngine::get_pub_id(), DetectionEventIds::IPS_LOGGING, ...)` 把检测结果发布给订阅者（发布订阅机制见 06-10、06-14）。进入检测前，`detect.cc` 56 行附近的 `snort_ignore` 与 58 行附近的 `snort_log` 两个钩子用于过滤需要跳过检测或只记录的包。整条「候选扫描 → 选项树求值 → 事件入队与分发」链路见图 06-08-01。
+
+:::figure id=06-08-01 | name=检测引擎 eval 求值与事件产生链路 | dir=TD
+node a "DetectionEngine::detect" purple
+node b "fp_search 候选 otn" purple
+node c "option tree<br/>逐节点 eval" purple
+node d "Cursor 缓冲定位" blue
+node e "content / pcre / byte" amber
+node f "flow / flowbits 状态" teal
+node g "queue_event 入队" green
+node h "CallAlertFuncs 动作" red
+edge a -> b "组内扫描"
+edge b -> c "候选转求值"
+edge c -> d "定位当前缓冲"
+edge c -> e "内容与正则"
+edge c -> f "会话条件"
+edge e -> g "链通过入队"
+edge g -> h "事件触发动作"
+edge d -> c dashed "delta/relative 回写"
+:::
+
+### 5. 配置与代码实例
+
+先看典型选项的 eval 形态与游标的推进方式。`src/ips_options/ips_content.cc` 的关键片段如下（节选自上游 master 快照，签名细节需对照实际版本核验）：
+
+```cpp
+// src/ips_options/ips_content.cc（节选）
+static IpsOption::EvalStatus CheckANDPatternMatch(class ContentData*, Cursor&);
+
+class ContentOption : public IpsOption
+{
+    EvalStatus eval(Cursor& c, Packet*) override
+    { return CheckANDPatternMatch(config, c); }
+    // 命中后依据 offset/depth/distance/within 推进 c 的位置与 delta
+};
+
+// src/framework/cursor.h（节选）：命中后重求值与偏移推进的典型接口
+unsigned get_pos() const;      // 当前位置
+bool add_pos(unsigned n);      // 相对推进
+bool set_pos(unsigned n);      // 绝对定位
+void set_delta(unsigned n);    // 设置循环偏移
+void set_re_eval(bool val);    // 标记需要重新求值
+```
+
+这段代码说明三件事：选项的求值统一成 `eval(Cursor&, Packet*)`，`ContentOption` 把工作委托给 `CheckANDPatternMatch`；content 修饰符不是独立选项，而是在一次匹配函数内部通过推进游标实现；`set_re_eval` 在 `ips_content.cc` 的 357、381、424 行附近被多次调用，表明特定条件下（如 relative 与循环组合）选项会被重新求值，跨版本行为差异需对照实际版本核验。运行期观测配合告警输出：
+
+```bash
+snort -c lua/snort.lua -r test.pcap -A fast -l ./out
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+11/15-10:32:01.204512 [**] [1:1000001:1] "custom tls fingerprint probe"
+[**] [Priority: 0] {TCP} 10.1.2.3:51000 -> 203.0.113.7:443
+```
+
+逐行判读如下，合计超过一百五十字。首行时间戳 `11/15-10:32:01.204512` 取自 `DAQ_PktHdr_t` 的包时间戳（字段见 05-07），微秒精度来自抓包时刻而非检测时刻；`[1:1000001:1]` 依次是生成器 ID、SID、规则版本号，与规则文本的 `gid:sid:rev` 一一对应——若出现 `[3:...]` 之类内置生成器号，说明事件来自预处理器或内置逻辑而非用户规则，对应 `queue_event(unsigned gid, unsigned sid)` 的另一个重载入口。双引号内是规则的 `msg` 文本；`Priority: 0` 来自规则头或 classtype 的优先级映射（参数见 04-06）。末行五元组给出方向：源 `10.1.2.3:51000` 到目的 `203.0.113.7:443`，`{TCP}` 与规则协议一致。排错时若规则 `-T` 加载成功却从未出现该行，按顺序核对：fast pattern 是否命中（06-07 的组统计）、`flow` 方向条件（`FlowCheckOption` 的会话判定）、`depth` 等位置修饰符与游标当前缓冲是否把匹配窗排除（本例 `depth:3` 只看载荷前三字节）、以及是否因共享子树被提前剪枝。此输出为 `alert_fast` 格式，完整字段与 JSON 格式的差异见 04-08 与 06-11。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一，**缓冲切换是最常见的误判来源**。`sticky buffer`、`file_data`、`http_*` 等关键字改变 `Cursor` 所指内容，若在规则里切换缓冲后仍按原始载荷写 `depth`、`offset`，匹配位置就完全错了；理解缓冲与 `PduSection` 的对应关系是规则调优的基本功，相关关键字见 04-06。第二，**relative 与 delta 的推进规则**。`ContentOption::eval` 命中后更新游标的 `delta`，后续相对选项以此为基准；源码中多处 `set_re_eval(true)` 表明特定条件会触发重求值，跨版本行为差异需对照实际版本核验，写复杂 relative 链时应逐段验证。第三，**PCRE 回溯与性能护栏**。`pcre_match_limit`、`pcre_match_limit_recursion`、`pcre_ovector_size` 是运行期护栏（字段见 05-03，参数见 04-02）；灾难性回溯的正则会让护栏频繁触发、规则恒不命中且耗时上升（需在目标机型实测），加固建议见 08-05。第四，**共享子树的隐式耦合**。相同选项子树共享求值结果虽带来性能优势，但调试时单条规则的求值路径可能已被其他规则「暖过」，跟踪输出与直觉不一致时，先确认子树复用关系再怀疑规则写错。第五，**flow/flowbits 的时机**。会话条件在 eval 期读取、命中后写入，重传与乱序包的状态语义见 06-05；误报排查先确认会话方向与建立状态，再回头怀疑规则内容。第六，**多线程上下文边界**。`IpsContext` 为线程本地资源，`SUSPENDED` 状态与 `detect(Packet*, bool offload_ok)` 的 offload 参数涉及异步继续执行，模型细节见 06-13 且需对照实际版本核验，禁止断言固定线程数。第七，**能力边界决定可见性**：加密载荷不可见，eval 面对的是 inspector 提供的可见缓冲，不应期待对 HTTPS 密文正文做 content 匹配。第八，**区分 fast pattern 命中与规则命中**：常见困惑是 fast pattern 明明命中却没有告警，这多半是选项链某一节点失败后剪枝的结果，而不是搜索引擎漏报；排障时先用 06-07 的组统计确认候选，再沿选项树逐节点核对修饰符与会话条件。所有吞吐、pps、内存类结论一律标注「需在目标机型实测」，不给绝对值。
+
+### 7. 小结与延伸阅读
+
+本篇覆盖检测引擎的三层机制：`DetectionEngine::detect` 作为每包总入口，把 fast pattern 候选转成 otn 求值；`detection_options.h` 的选项树以共享子树加 `eval_func_t` 统一签名驱动各 `IpsOption::eval`，任一节点失败即剪枝；`Cursor` 与缓冲族、`PduSection` 共同回答「在哪个缓冲、哪个偏移匹配」，事件经 `queue_event` 进入 `log_events` 分发到动作与输出。把握住「候选来自 MPSE、求值靠共享选项树、定位靠统一游标、命中经事件队列」这条主线，就能把检测层与前后各层的边界理清。延伸阅读：规则编译与分组见 06-06；MPSE 扫描见 06-07；事件队列、动作与限速见 06-09；`DetectionEngine`/`Cursor`/`IpsContext` 字段见 05-05；规则关键字全集见 04-06；`src/detection` 目录职责见 07-05；`src/ips_options` 与搜索引擎目录见 07-06；告警输出判读见 06-11 与 04-08。

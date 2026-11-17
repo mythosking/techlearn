@@ -1,0 +1,315 @@
+# SONiC 技术资料 · 06 技术原理（分片 B）
+## 06-03 CONFIG_DB 到 APPL_DB：mgr 进程与配置校验
+
+### 1. 背景与动机
+
+在《SONiC 技术资料》06 册的异步配置流水线中，`CONFIG_DB` 到 `APPL_DB` 这一段是最容易被忽略、却最容易被误判的一段。用户执行 `config` 命令或经 gNMI 下发意图后，配置首先落到 `CONFIG_DB`，命令随即返回；但此时ASIC 还没有任何变化，甚至 `APPL_DB` 里也未必出现对应的期望状态。真正把「用户写了什么」翻译成「系统期望做什么」的，是 `sonic-swss-master/cfgmgr/` 下一组按业务切分的配置管理进程，也就是本套资料统称的 `*mgrd`。它们是流水线的第二站：订阅 `CONFIG_DB` 的表项变更，做跨字段与跨表的语义校验，再把校验通过的期望状态写进 `APPL_DB`，交给 `orchagent` 继续翻译为 ASIC 对象（原理见 06-01 ｜ 原理见 06-04 ｜ 模块见 07-03）。理解这一段，是回答「为什么 `config` 返回成功却看不到下发效果」这一高频问题的前提。
+
+为什么需要一组独立进程，而不是由 CLI 直接写 `APPL_DB`？原因有三。其一，`CONFIG_DB` 保存的是用户意图的原始形态，表名、键结构与字段取值面向人和自动化脚本；`APPL_DB` 保存的是控制面可直接消费的期望状态，两者模型不同，必须有翻译层。其二，翻译过程并非无条件赋值，往往要先触碰内核 netdev、查询 `STATE_DB` 中的端口运行时状态、检查同组表项的一致性，这些动作需要独立的事件循环与重试语义，不能塞进 CLI。其三，按端口、接口、VLAN、缓冲区、CoPP 等业务拆成多个 `mgrd`，可以实现故障隔离与按特性启停；`dockers/docker-orchagent/supervisord.conf.common.j2` 中按依赖拉起 `portmgrd`、`intfmgrd`、`vlanmgrd`、`buffermgrd`、`coppmgrd` 等进程，正是这一设计的工程落地（参数见 04-07 ｜ 原理见 06-13）。
+
+还需要区分两种「校验」，它们在链路上处于不同位置、由不同组件负责。第一种是管理面基于模型的格式与约束校验，主体在 `sonic-mgmt-common-master/cvl/`：`cvl_api.go` 提供 `ValidationSessOpen()`、`ValidateIncrementalConfig()`、`ValidateEditConfig()`、`ValidateConfig()`、`ValidateStartupConfig()` 等入口，依据 YANG 模型检查类型、范围、leafref 与依赖关系（字段见 05-02 ｜ 模块见 07-07）。第二种是 `mgrd` 内部的运行时语义校验，它不依赖 YANG，而是看设备当前状态：例如 `portmgr.cpp` 的 `PortMgr::setPortMtu()` 先执行 `ip link set` 修改内核 netdev，成功后才写 `APPL_DB`；失败时还要读 `STATE_DB` 的端口状态决定是否告警。两种校验都不是「写库即成功」的同步语义，任何一层拒绝，期望状态都可能停在中间。本篇聚焦于 `cfgmgr/` 这一段的实现机制，模型校验只作边界说明，完整 schema 参数见 04-02、04-03。
+
+本篇的事实锚点是上游 master 快照（2026-11 抓取）中 `sonic-swss/sonic-swss-master/cfgmgr/` 的真实源码。凡本快照无法核实的字段名、函数签名与表常量取值，一律标注「需对照实际版本核验」并给出可定位目录；`sonic-swss-common`、`swsscommon` 本体不在本快照，`Select`、`Executor`、`ProducerStateTable` 与 `schema.h` 中的 `CFG_*_TABLE_NAME` 常量均属该仓，涉及处按「不在本快照，需对照实际版本核验」处理（字段见 05-02 ｜ 字段见 05-03 ｜ 模块见 07-05）。
+
+### 2. 核心概念
+
+第一个概念是「`mgrd` 与 `mgr` 的分工」。在 `cfgmgr/` 中，`xxxmgrd.cpp` 是守护进程入口，负责建连、构造管理对象、注册事件源并跑主循环；`xxxmgr.cpp` 与配套头文件实现业务对象，负责真正的校验与写库。以端口为例，`portmgrd.cpp` 的 `main()` 用 `Logger::linkToDbNative("portmgrd")` 绑定日志，构造 `DBConnector cfgDb("CONFIG_DB", 0)`、`DBConnector appDb("APPL_DB", 0)`、`DBConnector stateDb("STATE_DB", 0)` 三个连接，再构造 `PortMgr portmgr(&cfgDb, &appDb, &stateDb, cfg_port_tables)`；`portmgr.cpp` 的 `PortMgr` 构造函数继承 `Orch(cfgDb, tableNames)`，并持有 `m_cfgPortTable`、`m_statePortTable`、`m_appPortTable` 等成员（字段见 05-02 ｜ 字段见 05-05）。把入口与业务对象分开，使同一套 `Select` 骨架可以复用于不同业务，而校验逻辑各自独立。
+
+第二个概念是「表驱动订阅」。每个 `mgrd` 用一张表名清单声明自己关心的 `CONFIG_DB` 表。`portmgrd.cpp` 的 `cfg_port_tables` 含 `CFG_PORT_TABLE_NAME`、`CFG_SEND_TO_INGRESS_PORT_TABLE_NAME`；`intfmgrd.cpp` 的 `cfg_intf_tables` 含 `CFG_INTF_TABLE_NAME`、`CFG_LAG_INTF_TABLE_NAME`、`CFG_VLAN_INTF_TABLE_NAME`、`CFG_LOOPBACK_INTERFACE_TABLE_NAME`、`CFG_VLAN_SUB_INTF_TABLE_NAME`、`CFG_VOQ_INBAND_INTERFACE_TABLE_NAME`、`CFG_SAG_TABLE_NAME`；`vlanmgrd.cpp` 订阅 `CFG_VLAN_TABLE_NAME` 与 `CFG_VLAN_MEMBER_TABLE_NAME`；`coppmgrd.cpp` 订阅 `CFG_COPP_TRAP_TABLE_NAME`、`CFG_COPP_GROUP_TABLE_NAME` 与 `CFG_FEATURE_TABLE_NAME`。这些常量来自 `schema.h`，其定义在 `sonic-swss-common`，不在本快照，常量对应的实际表名需对照实际版本核验。表驱动的好处是：一个 `mgrd` 只感知自己关心的变更，互不干扰。
+
+第三个概念是「`Select` 事件循环」。`portmgrd.cpp` 把 `PortMgr` 放进 `vector<Orch *> cfgOrchList`，用 `swss::Select s` 遍历调用 `s.addSelectables(o->getSelectables())` 注册事件源，然后在 `while (true)` 里调用 `s.select(&sel, SELECT_TIMEOUT)`，其中 `SELECT_TIMEOUT` 在该文件定义为 1000 毫秒。返回值 `Select::ERROR` 时打印 `strerror(errno)` 并继续；`Select::TIMEOUT` 时调用 `portmgr.doTask()` 处理残留任务；否则把 `sel` 强转为 `Executor *` 并调用 `c->execute()`。`intfmgrd.cpp` 的主循环结构相同，只是超时时调用 `intfmgr.doTask()`。`Select` 与 `Executor` 的定义在 `sonic-swss-common`，不在本快照，成员函数语义需对照实际版本核验（字段见 05-08 ｜ 模块见 07-05）。
+
+第四个概念是「两层校验的边界」。管理面 CVL 校验的是「配置是否符合模型」，例如字段类型、枚举、范围与 leafref；`mgrd` 校验的是「配置在当前设备上是否可执行、是否与其它表一致」。`portmgr.cpp` 的 `PortMgr::isPortStateOk()` 从 `m_statePortTable`（`STATE_DB` 的端口状态表）取 `state` 字段，取不到或取值为空就返回 false，日志里才会打印「Port ... is ready」。这类校验依赖运行时状态，模型里写不出来，只能放在 `mgrd` 里。还要认识 `WarmStart::initialize("intfmgrd", "swss")` 与 `WarmStart::checkWarmStart("intfmgrd", "swss")` 这类调用：说明 `mgrd` 在 warm reboot 场景要区分冷启动与热启动，相关状态机见 06-10，能力受平台与版本限制，需对照实际版本核验。
+
+第五个概念是「写 `APPL_DB` 的语义」。`PortMgr` 构造时建立 `m_appPortTable(appDb, APP_PORT_TABLE_NAME)`，校验通过后经类似 `writeConfigToAppDb(alias, "mtu", mtu)` 的路径把字段写入 `APPL_DB`。写入动作经 `ProducerStateTable` 一类的生产者表完成，`ProducerStateTable` 属 `sonic-swss-common`，不在本快照，字段见 05-03。这里的关键纪律是：`mgrd` 写的是「期望状态」，不是芯片编程；`orchagent` 消费之后还有 `ASIC_DB` 与 `syncd` 两段，`config` 返回成功不等于硬件已下发（原理见 06-01 ｜ 排障见 08-03）。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与对象并给出可定位路径，不展开逐字段定义。结构体字段表统一放在 05 册，命令与参数全集放在 04 册，机制流程放在 06 册，模块能力放在 07 册，即（字段见 05-02 ｜ 参数见 04-02 ｜ 原理见 06-01 ｜ 模块见 07-03）。这样处理是为了让本篇保持机制聚焦，避免把 `CONFIG_DB` 表名与 `FieldValueTuple` 字段提前铺开。
+
+`cfgmgr/` 下的守护进程入口与业务对象成对出现，本快照可核实的清单如下，按业务归纳在表中给出；表中表名均为源码中的常量名，其实际取值需对照 `sonic-swss-common` 的 `schema.h` 与实际版本核验。
+
+| 入口文件 | 业务对象 | 订阅的配置表常量（节选） | 源码位置 |
+|---|---|---|---|
+| portmgrd.cpp | PortMgr | CFG_PORT_TABLE_NAME、CFG_SEND_TO_INGRESS_PORT_TABLE_NAME | cfgmgr/portmgrd.cpp、portmgr.cpp |
+| intfmgrd.cpp | IntfMgr | CFG_INTF_TABLE_NAME、CFG_VLAN_INTF_TABLE_NAME 等 7 张 | cfgmgr/intfmgrd.cpp、intfmgr.cpp |
+| vlanmgrd.cpp | VlanMgr | CFG_VLAN_TABLE_NAME、CFG_VLAN_MEMBER_TABLE_NAME | cfgmgr/vlanmgrd.cpp、vlanmgr.cpp |
+| buffermgrd.cpp | BufferMgr | CFG_BUFFER_POOL_TABLE_NAME、CFG_BUFFER_PROFILE_TABLE_NAME 等 | cfgmgr/buffermgrd.cpp、buffermgr.cpp |
+| coppmgrd.cpp | CoppMgr | CFG_COPP_TRAP_TABLE_NAME、CFG_COPP_GROUP_TABLE_NAME、CFG_FEATURE_TABLE_NAME | cfgmgr/coppmgrd.cpp、coppmgr.cpp |
+
+表中每个入口的 `main()` 都遵循「建连 → 构造对象 → 注册 `getSelectables()` → `select` 循环 → `execute()`／`doTask()`」的同一骨架；差异只在订阅表与业务校验。除表中所列，本快照还可核实 `nbrmgrd.cpp`、`tunnelmgrd.cpp`、`vrfmgrd.cpp`、`vxlanmgrd.cpp`、`teammgrd.cpp`、`fabricmgrd.cpp`、`natmgrd.cpp`、`macsecmgrd.cpp`、`sflowmgrd.cpp`、`stpmgrd.cpp` 等入口，以及 `buffermgrdyn.cpp` 这类辅助实现，完整清单以 `cfgmgr/` 目录为准。
+
+与「校验」相关的结构分两处。管理面在 `sonic-mgmt-common-master/cvl/`，本快照可核实 `cvl.go`、`cvl_api.go`、`cvl_cache.go`、`cvl_semantics.go`、`cvl_syntax.go` 与 `custom_validation/` 等文件；`cvl_api.go` 的 `ValidationSessOpen()`、`Finish()`、`ValidateStartupConfig()`、`ValidateIncrementalConfig()`、`ValidateConfig()`、`ValidateEditConfig()`、`ValidateFields()` 是主要入口，YANG 模型在 `models/yang/`，转换层在 `translib/`（字段见 05-09 ｜ 模块见 07-07）。配置管理侧在 `cfgmgr/`，`PortMgr` 的 `m_statePortTable`、`m_appPortTable` 等成员名可核实，字段含义见 05-02。
+
+与「事件与生产者表」相关的结构需要特别标注边界：`Select`、`Selectable`、`Executor`、`Consumer`、`ProducerStateTable` 与 `KeyOpFieldsValuesTuple` 的定义多在 `sonic-swss-common`，不在本快照，需对照实际版本核验，可定位目录为 `sonic-swss-common` 与 `sonic-py-swsssdk-master/src/swsssdk/`；后者的 `configdb.py` 中 `ConfigDBConnector` 提供 `set_entry()`、`get_entry()`、`get_table()` 等 Python 侧封装，是 CLI 落地配置的主要入口（字段见 05-03 ｜ 参数见 04-05）。`orchagent/orch.cpp` 中的 `Orch::getSelectables()`、`Consumer::execute()`、`Orch::doTask()` 与本篇 `mgrd` 复用同一框架，原理见 06-04。
+
+### 4. 关键流程与调用链
+
+把一次端口 MTU 修改从 `CONFIG_DB` 追到 `APPL_DB`，就得到本段最核心的处理链路，见图 06-03-01。
+
+:::figure id=06-03-01 | name=mgrd 订阅校验与写 APPL_DB 链路 | dir=TD
+node n1 "config / gNMI<br/>写 CONFIG_DB" teal
+node n2 "CONFIG_DB<br/>配置表" blue
+node n3 "CVL 增量校验<br/>cvl_api.go" gray
+node n4 "mgrd Select<br/>订阅变更" teal
+node n5 "Mgr 对象<br/>doTask 解析" teal
+node n6 "语义校验<br/>STATE_DB 状态" gray
+node n7 "APPL_DB<br/>期望状态" blue
+node n8 "orchagent<br/>后续消费" purple
+edge n1 -> n2 "写配置"
+edge n2 -> n3 dashed "管理面校验"
+edge n2 -> n4 "订阅"
+edge n4 -> n5 "execute"
+edge n5 -> n6 "查状态"
+edge n6 -> n7 "校验后写"
+edge n7 -> n8 "消费"
+:::
+
+图 06-03-01 用颜色区分语义：teal 为管理面与配置管理，blue 为数据库，gray 为辅助校验依赖，purple 为后续控制面。图中 CVL 用虚线连接，表示它属于管理面的并行校验入口，并非每个 `mgrd` 主循环内部的函数调用；若配置在模型校验阶段被拒绝，则根本不会以合法形态进入 `CONFIG_DB`。`mgrd` 的语义校验则是必经环节，且依赖 `STATE_DB` 的运行时状态。
+
+按图逐段展开。第一段：`sonic-utilities-master/config/main.py` 经 `ConfigDBConnector` 把字段写进 `CONFIG_DB` 的 `PORT` 表后立即返回；若入口是 gNMI 或 REST，则经 `sonic-mgmt-common-master/cvl/` 校验、`translib/` 转换后落到同一张表（原理见 06-14 ｜ 模块见 07-07）。第二段：`portmgrd.cpp` 启动时把 `CFG_PORT_TABLE_NAME` 等表注册到 `swss::Select`；`s.select(&sel, 1000)` 返回事件后，把 `sel` 转为 `Executor *` 并调用 `execute()`；若超时则调用 `portmgr.doTask()` 清理残留。第三段：`PortMgr` 的派生逻辑处理变更，以 MTU 为例，`PortMgr::setPortMtu()` 构造 `ip link set dev <alias> mtu <mtu>` 命令并经 `swss::exec()` 执行；成功后调用 `writeConfigToAppDb(alias, "mtu", mtu)` 写入 `APPL_DB`。第四段：若 netdev 操作失败，`isPortStateOk()` 读 `STATE_DB` 的端口表并取 `state` 字段；状态不就绪时打印 `SWSS_LOG_WARN` 并返回 false，不把未经验证的取值写进 `APPL_DB`，这是一种主动的失败保护。
+
+第五段：`APPL_DB` 中出现期望状态后，`orchagent` 的 `Consumer::execute()` 消费并进入 `Orch::doTask()`，后续翻译为 ASIC 对象写 `ASIC_DB`，再由 `syncd` 经 SAI 编程芯片（原理见 06-04 ｜ 原理见 06-05）。必须强调全流程异步：`config` 返回、`CONFIG_DB` 有表项、`APPL_DB` 有意图、`ASIC_DB` 有对象、`show` 有状态，是五个不同的里程碑，不能互相替代。排障时应自左向右逐段核对，而不是一上来怀疑硬件（排障见 08-03 ｜ 案例见 08-04）。
+
+还有两条容易忽略的支线。其一是开机与 warm reboot：`intfmgrd.cpp` 在构造对象前先读 `DEVICE_METADATA|localhost` 的 `mac` 字段，取不到就 `throw runtime_error`，说明某些 `mgrd` 依赖整机元数据就绪；`WarmStart::initialize()` 与 `checkWarmStart()` 表明它们还参与热启动状态恢复，相关能力受平台与版本限制（原理见 06-10）。其二是 DEL 与 SET 紧邻的竞态：`portmgr.cpp` 的注释明确提到「DEL notification 紧随新的 SET notification」会导致 netdev 操作失败，此时靠 `isPortStateOk()` 判定是否属于可容忍的启动期竞争，而不是无条件报错或写入错误值。这正是把语义校验放在 `mgrd` 而非 CLI 的价值所在。
+
+### 5. 配置/命令/代码实例
+
+本节只给理解本段机制所需的最小实例，完整配置表与 schema 见 04-02、04-03，完整命令全集见 04-05，本册不重列。先看一段可核验的源码骨架：`portmgrd.cpp` 的 `main()` 如何建立三个 DB 连接、注册事件源并驱动主循环。
+
+```cpp
+vector<string> cfg_port_tables = {
+    CFG_PORT_TABLE_NAME,
+    CFG_SEND_TO_INGRESS_PORT_TABLE_NAME,
+};
+
+DBConnector cfgDb("CONFIG_DB", 0);
+DBConnector appDb("APPL_DB", 0);
+DBConnector stateDb("STATE_DB", 0);
+
+PortMgr portmgr(&cfgDb, &appDb, &stateDb, cfg_port_tables);
+vector<Orch *> cfgOrchList = {&portmgr};
+
+swss::Select s;
+for (Orch *o : cfgOrchList)
+{
+    s.addSelectables(o->getSelectables());
+}
+
+while (true)
+{
+    Selectable *sel;
+    int ret;
+    ret = s.select(&sel, SELECT_TIMEOUT);
+    if (ret == Select::ERROR) { continue; }
+    if (ret == Select::TIMEOUT)
+    {
+        portmgr.doTask();
+        continue;
+    }
+    auto *c = (Executor *)sel;
+    c->execute();
+}
+```
+
+这段代码逐句对应第 2、4 节的概念。`cfg_port_tables` 是表驱动订阅的声明，两个 `CFG_*_TABLE_NAME` 常量来自 `schema.h`（属 `sonic-swss-common`，不在本快照，实际表名需对照实际版本核验）；三个 `DBConnector` 分别指向 `CONFIG_DB`、`APPL_DB`、`STATE_DB`，印证了 `mgrd` 同时读取配置、写期望状态、查运行时状态三种职责；`PortMgr` 构造时把三个连接和表名清单一起传入，业务对象因此不需要自己建连；`cfgOrchList` 虽只含一个对象，却保留了「一个进程承载多个 Orch」的扩展形态；`s.addSelectables(o->getSelectables())` 把 `Orch` 持有的事件源交给 `Select` 统一监听，`getSelectables()` 定义在 `orch.cpp`，不在本快照的 `Select` 本体需对照实际版本核验；`SELECT_TIMEOUT` 为 1000 毫秒，`ERROR` 分支只记录并继续，避免一次系统错误终止整个守护进程；`TIMEOUT` 分支调用 `doTask()` 是关键的兜底——它让没有新事件时残留的重试任务仍有机会被推进；有事件时强转为 `Executor *` 并调用 `execute()`，体现事件源与执行器的一一对应（字段见 05-08 ｜ 原理见 06-04）。
+
+再看一组运行时的前置检查与验证命令，用 `sonic-db-cli` 按库名读取表项，避免写死 Redis DB 编号（该工具在 `sonic-utilities-master/scripts/` 多处被引用，语法为 `sonic-db-cli <库名> <redis 命令>`，选项行为需对照实际版本核验）。
+
+```bash
+sonic-db-cli CONFIG_DB hget 'DEVICE_METADATA|localhost' type
+sonic-db-cli CONFIG_DB hget 'PORT|Ethernet0' mtu
+sonic-db-cli APPL_DB exists PORT_TABLE:Ethernet0
+sonic-db-cli APPL_DB hget 'PORT_TABLE:Ethernet0' mtu
+sonic-db-cli STATE_DB hget 'PORT_TABLE|Ethernet0' state
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（取值仅为格式示意）
+switch
+9100
+1
+9100
+ok
+```
+
+逐行判读如下。第一条命令读 `DEVICE_METADATA|localhost` 的 `type` 字段，输出 `switch` 表示普通交换机形态；若取到 `voq`、`fabric` 等值，说明处于多 ASIC 或 chassis 场景，相关能力受平台与版本限制、需对照实际版本核验，这也印证 `intfmgrd.cpp` 依赖整机元数据就绪的设计。第二条命令读 `PORT|Ethernet0` 的 `mtu`，输出 `9100` 说明用户意图已进入 `CONFIG_DB`；键名用竖线分隔表名与键、字段为哈希表字段，这是 `CONFIG_DB` 的常见表示，具体表名与字段需对照实际版本核验。第三条命令检查 `APPL_DB` 中 `PORT_TABLE:Ethernet0` 是否存在，输出 `1` 表示 `portmgrd` 已经写出期望状态；若此处为 `0` 而第二条有值，说明配置停在第一段，应查 `portmgrd` 进程状态与日志，而不是继续往 `ASIC_DB` 找原因。第四条命令读 `APPL_DB` 中该端口的 `mtu`，输出 `9100` 与第二条一致，说明翻译未丢字段；两者不一致或缺失通常意味着 `PortMgr::writeConfigToAppDb()` 未被调用，典型原因是 `ip link set` 失败且 `isPortStateOk()` 判定端口未就绪。第五条读 `STATE_DB` 中 `PORT_TABLE|Ethernet0` 的 `state`，输出 `ok` 是正常就绪标志，正是 `PortMgr::isPortStateOk()` 判断的依据；若为空或非就绪值，则解释了上一步为何拒绝写入。五条输出合起来构成「配置库有意图 → 期望库有状态 → 状态库可解释」的闭环判读；即使全部正常，也只说明走到 `APPL_DB`，不代表 ASIC 已编程（原理见 06-01 ｜ 原理见 06-04 ｜ 排障见 08-03）。
+
+第三条命令与第五条命令的输出块已注明「示例输出，具体格式需对照实际版本核验」，其中 `1`、`ok`、`9100` 仅为格式示意，不得当作任何具体版本的真实取值引用；`STATE_DB` 的状态字段取值、`APPL_DB` 的表名与键分隔符同样需对照实际版本核验，字段逐项含义见 05-02。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是「校验层次混淆」。把 CVL 的模型校验与 `mgrd` 的运行时语义校验当成同一件事，是最常见的误读。CVL 在 `sonic-mgmt-common/cvl/` 依据 YANG 模型检查结构与约束，`mgrd` 在 `cfgmgr/` 依据 `STATE_DB` 与内核 netdev 的当前状态决定是否写 `APPL_DB`；前者拒绝时配置根本不以合法形态落库，后者拒绝时 `CONFIG_DB` 有值而 `APPL_DB` 无值。排障时必须先确认停在哪一层，再决定查模型、查进程还是查状态（模块见 07-07 ｜ 排障见 08-03）。
+
+第二类是「同步生效幻觉」。`config` 命令返回成功只代表 `CONFIG_DB` 写入完成，后面还有 `mgrd`、`orchagent`、`syncd` 三段；不得写「配置即时生效」，也不得把 `APPL_DB` 有值当作硬件已下发。正确做法是按 `CONFIG_DB`、`APPL_DB`、`ASIC_DB`、`STATE_DB` 与 `show` 输出逐段核对。
+
+第三类是「表名与字段名补值」。本篇引用的 `CFG_PORT_TABLE_NAME`、`CFG_VLAN_MEMBER_TABLE_NAME`、`APP_PORT_TABLE_NAME` 等都是 `schema.h` 中的常量名，定义位于 `sonic-swss-common`，不在本快照；`Select`、`Executor`、`ProducerStateTable` 与 `KeyOpFieldsValuesTuple` 同样不在本快照。凡涉及常量取值、结构体字段和函数签名，一律写「不在本快照，需对照实际版本核验」并给出 `cfgmgr/`、`src/swsssdk/` 等可定位目录，不得凭印象补值。Redis DB 编号由运行时配置决定，须对照 `sonic-py-swsssdk/src/swsssdk/dbconnector.py` 的 `SonicDBConfig` 核验，本册一律用库名而非数字。
+
+第四类是「进程与依赖陷阱」。`mgrd` 由 `supervisord` 按依赖拉起，`intfmgrd.cpp` 在元数据缺失时直接抛异常，说明「库里有配置」不等于「进程能正常启动」；启动顺序与守护项参数见 04-07、原理见 06-13。warm reboot 场景下 `WarmStart::initialize()` 与 `checkWarmStart()` 改变处理分支，能力受平台与版本限制、需对照实际版本核验，不得宣称全平台无条件支持（原理见 06-10）。
+
+第五类是「事实边界与性能表述」。本快照只有主仓加七个子仓，`swsscommon` 本体、`sonic-swss-common`、FRR / FRRouting 源码、Linux 内核与厂商 SAI 实现都不在本快照；涉及处按「不在本快照，需对照实际版本核验」写。所有配置下发时延、收敛时间与表项容量类结论一律标注「需在目标机型实测」，不给绝对值、不给跨机型通用数字（基准方法见 08-01 ｜ 调优见 08-02）。
+
+最佳实践归纳为四条：其一，遇到「配置不生效」先按图 06-03-01 定位停在哪一段，再用 `sonic-db-cli` 按库名逐段取证；其二，读 `mgrd` 源码时把「入口主循环」与「业务对象校验」分开看，前者复用框架、后者承载业务语义；其三，跨册引用统一用（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx），本篇涉及的表项字段写「字段见 05-02」、命令与 schema 写「参数见 04-02」、后续调度写「原理见 06-04」、配置管理模块写「模块见 07-03」；其四，对快照内无法核实的内容宁可标注核验要求并给出目录，也不补值（模块见 07-05）。
+
+### 7. 小结与延伸阅读
+
+本篇把异步配置流水线的第二段讲清楚：`sonic-swss-master/cfgmgr/` 下各 `*mgrd` 以表驱动方式订阅 `CONFIG_DB`，用 `Select` 事件循环驱动 `Executor::execute()` 与 `Orch::doTask()`，经运行时语义校验后把期望状态写进 `APPL_DB`；管理面 CVL 校验提供另一层基于 YANG 模型的约束检查，二者位置不同、不可互相替代。`portmgrd.cpp`、`intfmgrd.cpp` 的主循环骨架与 `portmgr.cpp` 的 `PortMgr::setPortMtu()`、`isPortStateOk()`、`writeConfigToAppDb()` 是这一机制最可核验的样本。图 06-03-01 与入口清单表是回查索引；贯穿全篇的三条纪律是：配置返回不等于期望状态生成、期望状态生成不等于硬件下发、常量名不等于实际取值。
+
+延伸阅读按疑问分流。想理解 `APPL_DB` 之后发生了什么，接读 06-04（`orchagent` 架构与 `Orch` 调度）与 06-05（syncd 到 SAI）；想看端口、VLAN 这两类配置在 `mgrd` 与 `orchagent` 之间的完整对接，接读 06-06；想确认管理面校验如何落地，接读 06-14 与 07-07；想掌握 warm reboot 下 `mgrd` 的行为，接读 06-10，并记住相关能力受平台与版本限制。参数与 schema 走 04-02、04-03，字段逐项走 05-02、05-03、05-08，诊断树与案例走 08-03、08-04。
+
+最后重申资料纪律：本篇所有源码路径均相对各子仓 `xxx-master/` 根；示例输出均注明「示例输出，具体格式需对照实际版本核验」；`sonic-swss-common`、`swsscommon`、FRR、Linux 内核与厂商 SAI 实现一律写「不在本快照，需对照实际版本核验」；不确定的表名常量、字段名与函数签名均标注「需对照实际版本核验」并给出可定位目录；Redis DB 编号以 `SonicDBConfig` 为准、不写死；性能与容量数字一律标注「需在目标机型实测」。版本基准始终为「上游 master 快照（2026-11 抓取）」。下一篇 06-04 将进入 `orchagent`，讲清 `OrchDaemon` 的注册与 `Orch` 的任务调度、重试与批量处理机制。
+
+## 06-04 orchagent 架构与 Orch 调度
+
+### 1. 背景与动机
+
+`orchagent` 是异步配置流水线的第三站，也是整条链路里逻辑最密集的一站。它消费 `APPL_DB` 中的期望状态，按业务翻译成 SAI 对象写入 `ASIC_DB`，交由 `syncd` 经 SAI 编程芯片（原理见 06-01 ｜ 原理见 06-05）。与 `cfgmgr/` 下按业务拆成十几个 `*mgrd` 不同，`orchagent` 是**单个进程**承载几十个业务 Orch：`portsorch.cpp`、`intfsorch.cpp`、`neighorch.cpp`、`routeorch.cpp`、`mplsrouteorch.cpp`、`aclorch.cpp`、`copporch.cpp`、`qosorch.cpp`、`bufferorch.cpp`、`fdborch.cpp`、`flexcounterorch.cpp`、`crmorch.cpp`、`mirrororch.cpp`、`chassisorch.cpp` 等文件各自实现一个派生 Orch，却共享同一个事件循环、同一套任务队列与同一条到 `ASIC_DB` 的输出通道（模块见 07-03）。因此理解 `orchagent` 的关键不在某个业务 Orch 的算法，而在「调度」：谁在什么时机被唤醒、任务按什么顺序处理、失败的 how 被重试、批量如何合并。
+
+这种架构选择的动机有三。其一，业务对象之间存在依赖：端口要先于路由接口、路由接口要先于邻居、邻居要先于下一跳，若各 Orch 各自起线程、各自消费，就很难保证依赖顺序，也难以在 warm reboot 时按序恢复。单线程 `Select` 主循环加上显式注册顺序，把「顺序」变成可审计的代码事实。其二，很多任务会因依赖未就绪而暂时失败，例如某条路由要等的下一跳还没创建；如果直接丢弃，就永远无法收敛，因此需要 `RetryCache` 与 `task_need_retry` 语义，让失败任务在依赖就绪后重新进入待处理队列。其三，SAI 调用成本高，逐条同步调用会拖慢收敛，所以引入批量与管线：`bulker.h` 提供批量写入支持，`-k` 设置最大 bulk size，`-b` 设置 consumer table 的批量弹出大小，`OrchDaemon::flush()` 负责把管线中残留请求冲刷出去。所有收敛时间、下发时延与吞吐结论一律标注「需在目标机型实测」，不给绝对值（基准方法见 08-01 ｜ 调优见 08-02）。
+
+还需要先划清两条边界，否则整篇会被写反。第一，`orchagent` 不直接操作硬件：它在 `main.cpp` 里经 `sai_switch_api->create_switch()` 等调用与 sairedis 交互，生成的 SAI 对象以 `ASIC_DB` 表项形式交给 `syncd`；SAI 头文件在本快照的 `sonic-sairedis/SAI/` 目录为空、厂商实现闭源且不在本快照，涉及处写「不在本快照，需对照实际版本核验」（模块见 07-04）。第二，`orchagent` 的处理仍是异步的：`Consumer::execute()` 把任务放进 `m_toSync`、经 `Orch::doTask()` 处理、再经 `flush()` 写入 `ASIC_DB`，任一环节延后都表现为「`APPL_DB` 有值但芯片没变化」，不能把「已消费」当成「已下发」（排障见 08-03 ｜ 案例见 08-04）。本篇以上游 master 快照（2026-11 抓取）的 `sonic-swss/sonic-swss-master/orchagent/` 为唯一事实锚点，函数名可核实的写真实值，签名与成员不确定的写「需对照实际版本核验」。
+
+### 2. 核心概念
+
+第一个概念是「`OrchDaemon` 是注册与调度容器」。`orchagent/main.cpp` 在进入主循环前构造 `shared_ptr<OrchDaemon>`：普通交换机走 `make_shared<OrchDaemon>(&appl_db, &config_db, &state_db, chassis_db, zmq_server.get())`，DPU 形态走 `DpuOrchDaemon`，fabric 形态走 `FabricOrchDaemon`。随后调用 `orchDaemon->init()` 完成各业务 Orch 的注册，再调用 `orchDaemon->start(heartBeatInterval)` 进入主循环。`OrchDaemon::init()` 与 `OrchDaemon::start(long heartBeatInterval)` 的实现在 `orchdaemon.cpp`，`OrchDaemon::flush()` 同在该文件（原理见 06-13 ｜ 模块见 07-03）。换言之，`OrchDaemon` 负责「有哪些 Orch、它们的先后顺序、何时冲刷管线」，而单个 Orch 负责「这类任务怎么翻译」。
+
+第二个概念是「`Orch` 基类与派生 Orch」。`orch.cpp` 提供 `Orch::Orch()` 的多个重载（可接单表、多表、带优先级的表清单），`Orch::getSelectables()` 把持有的事件源交给调度器，`Orch::addConsumer()` 注册消费者，`Orch::doTask()` 做通用调度，`Orch::bake()` 在 warm restart 时对各 consumer 调 `refillToSync()` 回填任务，`Orch::dumpPendingTasks()` 用于排障导出未处理任务。派生 Orch 分布在 `portsorch.cpp`、`routeorch.cpp` 等文件；`Orch2::doTask(Consumer &consumer)` 提供了「解析 Request 后按 SET/DEL 分派到 `addOperation()` / `delOperation()`」的通用实现（字段见 05-05 ｜ 字段见 05-07）。`Orch`、`Request`、`Consumer`、`Executor` 的逐字段定义统一在 05 册，这里只点名。
+
+第三个概念是「事件源、执行器与 `Select`」。`Select`、`Selectable`、`Executor` 与 `ConsumerStateTable` 的定义多在 `sonic-swss-common`，不在本快照，需对照实际版本核验。`orch.cpp` 的 `Consumer::execute()` 先 `getConsumerTable()->pops(*entries)` 批量弹出条目，再把「`addToSync(entries)` 然后 `drain()`」打包成 lambda 交给 `Executor::processAnyTask()`；后者在 ring buffer 未启用时直接执行任务，在启用且当前执行器被 ring buffer 服务时把任务 `gRingBuffer->push(task)` 交给 ring 线程，否则等待 ring 空闲后在主线程执行。`Consumer::drain()` 最终调用 `((Orch *)m_orch)->doTask((Consumer&)*this)`。这段设计解释了 `-R` 选项与 `enableRingBuffer()` 的作用：把部分 Orch 的任务处理移出主循环，降低相互阻塞（字段见 05-08 ｜ 参数见 04-06）。
+
+第四个概念是「任务队列与重试」。`ConsumerBase` 维护 `m_toSync` 多映射（源码注释明确说明它是 multimap，允许一个键对应多个值），`addToSyncInternal()` 处理 SET 与 DEL 的合并：旧 SET 可能被退回 `m_toSync` 等待再合并，DEL 与 SET 紧邻时保留 DEL 并把旧 SET 移回，避免顺序错乱。`orch.h` 中的任务结果枚举可核实到 `task_success`、`task_invalid_entry`、`task_need_retry` 等值；返回需重试的条目由 RetryCache 机制接管，`orch.cpp` 的 `Orch::retryToSync()` 从 `getRetryCache(executorName)` 取已解析约束、`resolve()` 出任务、再 `addToSync(tasks, true)` 重新入队，`Orch::notifyRetry()` 则调用 `retryCache->mark_resolved(cst)` 标记约束已满足。`retrycache.h` 在本快照可核实，具体字段见 05-05。
+
+第五个概念是「请求解析」。派生 Orch 处理前通常先 `Request::parse()`；`request_parser.cpp` 可核实 `Request::parse()`、`parseOperation()`、`parseKey()`、`parseAttrs()`，以及 `parseBool()`、`parseMacAddress()`、`parseIpAddress()`、`parseIpPrefix()`、`parseUint()`、`parseVlan()`、`parsePacketAction()`、`parseUintList()` 等类型化解析函数。`Orch2::doTask()` 中 `request_.parse(it->second)` 后取 `getOperation()`，`SET_COMMAND` 走 `addOperation(request_)`、`DEL_COMMAND` 走 `delOperation(request_)`，处理成功才把条目从 `m_toSync` 擦除（字段名与签名需对照实际版本核验，字段见 05-05）。
+
+第六个概念是「SAI 边界与批量」。批量能力由 `bulker.h` 与相关派生 Orch 提供，`main.cpp` 里 `gBatchSize` 默认 `DEFAULT_BATCH_SIZE`（128），`-k` 设置 `gMaxBulkSize`，`-b` 覆盖 `gBatchSize`；这些是启动参数，完整清单见 04-06，本册不重列。`Orch` 只经 `ASIC_DB` 与 SAI 属性同 `syncd` 交互，不读写寄存器、不直接驱动芯片；`main.cpp` 的 `syncd_apply_view()` 经 `SAI_REDIS_SWITCH_ATTR_NOTIFY_SYNCD` 与 `SAI_REDIS_NOTIFY_SYNCD_APPLY_VIEW` 通知 syncd 应用视图，是两者协作的可核验例证（原理见 06-05 ｜ 模块见 07-04）。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与对象并给出可定位路径，不展开逐字段定义。结构体字段表统一放在 05 册，启动参数与命令全集放在 04 册，机制流程放在 06 册，模块能力放在 07 册，即（字段见 05-05 ｜ 参数见 04-06 ｜ 原理见 06-05 ｜ 模块见 07-03）。
+
+`orchagent/` 下的核心文件与职责对应关系见下表，表中路径相对 `sonic-swss/sonic-swss-master/` 仓库根，函数名可核实但签名与成员需对照实际版本核验。
+
+| 文件 | 承担角色 | 可核验的关键入口 |
+|---|---|---|
+| main.cpp | 进程入口与 SAI 初始化 | main、syncd_apply_view、getCfgSwitchType |
+| orchdaemon.cpp | Orch 注册与主循环 | OrchDaemon::init、start、flush |
+| orch.cpp | Orch 基类与任务调度 | Orch::doTask、bake、retryToSync、Consumer::execute |
+| request_parser.cpp | 请求解析 | Request::parse、parseOperation、parseKey、parseAttrs |
+| retrycache.h、bulker.h | 重试缓存与批量支持 | 类型与接口定义（字段见 05-05） |
+| notifications.cpp、response_publisher.cpp | 通知与响应发布 | 通知消费与状态回写（字段见 05-08） |
+
+除表中文件，本快照还可核实 `portsorch.cpp`、`intfsorch.cpp`、`neighorch.cpp`、`aclorch.cpp`、`copporch.cpp`、`bufferorch.cpp`、`qosorch.cpp`、`fdborch.cpp`、`flexcounterorch.cpp`、`crmorch.cpp`、`mirrororch.cpp`、`chassisorch.cpp`、`mplsrouteorch.cpp`、`routeorch.cpp`、`switchorch.cpp` 等派生实现，以及 `orchagent_restart_check.cpp`、`notifications.h`、`orch.h`、`orchdaemon.h`、`request_parser.h`、`return_code.h` 等头文件；完整清单以 `orchagent/` 目录为准。派生 Orch 的字段与继承关系见 05-07。
+
+必须清楚标注「不在本快照」的部分：`Select`、`Selectable`、`Executor`、`ConsumerStateTable`、`ProducerStateTable`、`FieldValueTuple` 等定义在 `sonic-swss-common`，该仓不在本快照；SAI 头文件应在 `sonic-sairedis/SAI/`，本快照该目录为空；厂商 SAI 实现闭源且不在本仓库。`orch.cpp` 中出现的 `swss::exec`、`SonicDBConfig` 等外部类型也分别属其它仓或封装层。涉及这些部分一律写「不在本快照，需对照实际版本核验」，不得据本快照编造文件、字段与版本（字段见 05-03 ｜ 字段见 05-04 ｜ 模块见 07-04 ｜ 模块见 07-05）。
+
+### 4. 关键流程与调用链
+
+把主循环、任务队列、重试与批量串起来，就得到 `orchagent` 的调度闭环，见图 06-04-01。
+
+:::figure id=06-04-01 | name=OrchDaemon 单线程调度与 Orch 重试闭环 | dir=TD
+node n1 "APPL_DB<br/>期望状态" blue
+node n2 "ConsumerStateTable<br/>事件源" blue
+node n3 "Select select<br/>OrchDaemon 主循环" purple
+node n4 "Consumer execute<br/>pops 入 m_toSync" purple
+node n5 "Orch doTask<br/>遍历 m_consumerMap" purple
+node n6 "Request parse<br/>SET / DEL 分派" purple
+node n7 "派生 Orch<br/>生成 ASIC 对象" purple
+node n8 "ASIC_DB<br/>待编程对象" amber
+node n9 "RetryCache<br/>未就绪任务" gray
+node n10 "flush / syncd<br/>经 SAI 编程" green
+edge n1 -> n2 "订阅"
+edge n2 -> n3 "就绪事件"
+edge n3 -> n4 "execute"
+edge n4 -> n5 "drain"
+edge n5 -> n6 "逐条解析"
+edge n6 -> n7 "addOperation"
+edge n7 -> n8 "写对象"
+edge n6 -> n9 dashed "task_need_retry"
+edge n9 -> n5 dashed "retryToSync"
+edge n8 -> n10 "消费"
+:::
+
+图 06-04-01 的重点不在「数据从哪到哪」，而在「调度如何闭环」：purple 节点全部属于控制面单线程循环，blue 是输入库与事件源，amber 是输出库，gray 是重试缓存，green 是下游同步路径。两条虚线是本图的关键——`task_need_retry` 的任务不丢弃而是进入 `RetryCache`，等约束满足后由 `retryToSync()` 重新送回 `Orch::doTask()`，这正是异步系统能最终收敛的原因。
+
+启动阶段先于主循环。`main.cpp` 调用 `WarmStart::initialize("orchagent", "swss")` 与 `checkWarmStart()`，注册各类信号处理器，用 `getopt` 解析启动参数，经 `initSaiApi()`、`initSaiRedis()`、`initFlexCounterTables()` 初始化 sairedis 环境，建立 `APPL_DB`、`CONFIG_DB`、`STATE_DB` 三个连接，再由 `getCfgSwitchType()` 判定交换机形态；随后 `sai_switch_api->create_switch(&gSwitchId, ...)` 创建 SAI switch 对象。这一切完成后才构造 `OrchDaemon` 并调用 `orchDaemon->init()`；非 warm start 时调用 `syncd_apply_view()` 通知 syncd 应用视图，最后 `orchDaemon->start(heartBeatInterval)`（原理见 06-13 ｜ 原理见 06-10 ｜ 参数见 04-06）。
+
+主循环按 `orchdaemon.cpp` 的 `OrchDaemon::start()` 运行：先把各 Orch 的 `getSelectables()` 加入 `m_select`，启动 ring 线程 `popRingBuffer`，然后每轮 `m_select->select(&s, SELECT_TIMEOUT)`。`Select::ERROR` 记录 `strerror(errno)` 后继续；`Select::TIMEOUT` 时先 `flush()` 冲刷 sairedis 管线，若 ring buffer 为空且空闲则对所有 Orch 调 `o->doTask()`；有事件时把 `s` 转成 `Executor *` 调 `c->execute()`，随后在 ring buffer 空闲条件下再对所有 Orch 调一次 `o->doTask()`，处理残留与重试任务。每轮还调用 `heartBeat()` 维持心跳，并在累计时间达到 `SELECT_TIMEOUT` 时执行 `flush()` 与 SAI 失败状态检查。这段逻辑说明：`doTask()` 既由事件触发，也由超时兜底驱动，所以「没有新配置」并不意味着队列一定为空（字段见 05-08 ｜ 排障见 08-04）。
+
+任务级调度有两层。外层是 `Orch::doTask()`：先算阈值 `gBatchSize == 0 ? 30000 : gBatchSize`，遍历 `m_consumerMap`，对每个执行器先 `retryToSync(it.first, threshold - count)` 把重试任务按配额放回，再 `it.second->drain()`；配额上限的设计是为了避免重试任务挤占新任务、造成饥饿。内层是 `Consumer::execute()` 到 `Consumer::drain()`：批量 `pops()` 后经 `processAnyTask()` 把任务送入 `m_toSync`，`drain()` 再调用 `((Orch *)m_orch)->doTask((Consumer&)*this)`；对使用 `Orch2` 通用实现的派生 Orch，`Orch2::doTask()` 逐条 `request_.parse()`、按 SET/DEL 分派到 `addOperation()` 或 `delOperation()`，成功才擦除条目。批量参数 `-b`、`-k` 影响单轮处理量，调大并非总是更快，调优结论需在目标机型实测（调优见 08-02）。
+
+输出与恢复是闭环的另外两端。`flush()` 把 sairedis 管线中的调用冲刷到 `ASIC_DB`；`syncd` 消费这些对象并经 SAI 编程芯片，`main.cpp` 的 `syncd_apply_view()` 用于视图切换通知（原理见 06-05）。warm reboot 时 `Orch::bake()` 对各 consumer 调 `refillToSync()` 回填状态，`orchagent_restart_check.cpp` 参与重启就绪判定；相关能力受平台与版本限制，需对照实际版本核验（原理见 06-10）。
+
+### 5. 配置/命令/代码实例
+
+本节只给理解调度机制所需的最小实例：一段可核验的调度源码、一组启动参数说明，以及一组「进程与库状态」判读命令。完整启动参数见 04-06，命令全集见 04-05，本册不重列。
+
+先看 `orch.cpp` 中 `Orch::doTask()` 的核心片段，它集中体现了重试配额与遍历调度的设计。
+
+```cpp
+void Orch::doTask()
+{
+    auto threshold = gBatchSize == 0 ? 30000 : gBatchSize;
+    size_t count = 0;
+
+    for (auto &it : m_consumerMap)
+    {
+        try
+        {
+            count += retryToSync(it.first, threshold - count);
+            it.second->drain();
+        }
+        catch (const std::invalid_argument& e)
+        {
+            SWSS_LOG_ERROR("Exception caught: type=invalid_argument, table=%s, orch=%s, error=%s",
+                           it.first.c_str(), typeid(*this).name(), e.what());
+        }
+    }
+}
+```
+
+这段代码有三处值得逐句判读。`threshold` 在 `gBatchSize` 为 0 时取 30000，否则取 `gBatchSize`，源码注释明确说明这是「限制单轮从 RetryMap 搬到 SyncMap 的任务数，避免新任务饥饿」；`gBatchSize` 由 `main.cpp` 的 `-b` 选项设置，默认 `DEFAULT_BATCH_SIZE` 为 128。循环遍历 `m_consumerMap`，即该 Orch 持有的全部执行器；对每个执行器先 `retryToSync()` 把满足约束的重试任务按剩余配额 `threshold - count` 放回，再 `drain()` 处理 `m_toSync` 中的待办任务。四类 `catch` 分别处理 `invalid_argument`、`logic_error`、`std::exception` 与未知异常，只记录错误、不终止循环，这是守护进程可用性的体现——某个表项格式错误不应让整个 `orchagent` 退出。需要强调，`m_consumerMap`、`m_toSync` 与 `RetryCache` 的字段定义属于 05 册范围，`RetryCache` 类型在 `retrycache.h` 可核实，字段见 05-05。
+
+启动参数方面，`main.cpp` 的 `usage()` 明确列出可核验的选项：`-b batch_size`（consumer table pop 批量，默认 128）、`-k bulk_size`（bulk 模式最大批量，默认 1000）、`-m MAC`（交换机 MAC）、`-i INST_ID`（多 ASIC 实例）、`-r record_type`（记录类型位图）、`-z mode`（redis_async / redis_sync / zmq_sync）、`-I heart_beat_interval`（心跳间隔）、`-R`（ring 线程）、`-M`（MACSec POST）、`-F`（BGP FIB 抑制）。这些是最小必要说明，参数全集与取值约束见 04-06，本册不展开。
+
+再看一组运行时的进程与库状态判读命令，覆盖「进程在不在、期望状态有没有、对象生成了没」三个问题。
+
+```bash
+show services
+sonic-db-cli APPL_DB exists PORT_TABLE:Ethernet0
+sonic-db-cli ASIC_DB keys 'ASIC_STATE:SAI_OBJECT_TYPE_PORT:*'
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（取值仅为格式示意）
+swss     docker
+---------------------------
+USER  PID  PPID  C STIME TTY  TIME CMD
+root    1     0  0 05:26 ?  00:00:14 /usr/bin/python /usr/bin/supervisord
+root   42     1  0 05:26 ?  00:01:35 /usr/bin/orchagent -b 128 -k 1000
+root   58     1  0 05:26 ?  00:00:03 /usr/bin/portsyncd
+1
+ASIC_STATE:SAI_OBJECT_TYPE_PORT:oid:0x1000000000616
+ASIC_STATE:SAI_OBJECT_TYPE_PORT:oid:0x1000000000617
+```
+
+逐行判读如下。第一段 `show services` 按容器分组列出进程，属于 `sonic-utilities-master/show/` 的状态读取能力，只读状态、不编程 ASIC；`swss docker` 段表明 `orchagent` 所在容器，具体容器名与分组格式需对照实际版本核验。随后 `PID 42` 的命令行含 `/usr/bin/orchagent -b 128 -k 1000`，说明进程在跑且批量参数为默认量级；若这里看不到 `orchagent`，应先查 `supervisord.conf.j2` 的依赖与容器日志，而不是继续查数据库。`PID 58` 的 `portsyncd` 是端口状态同步进程，与 `orchagent` 的启动依赖相关（原理见 06-13）。第二条命令输出 `1`，表示 `APPL_DB` 中 `PORT_TABLE:Ethernet0` 存在，即前一阶段 `portmgrd` 已写出期望状态；若为 `0`，问题在 06-03 那一段而非本段。第三条命令列出两个 `ASIC_STATE:SAI_OBJECT_TYPE_PORT:oid:...` 键，说明派生 Orch 已生成 PORT 类 SAI 对象并写入 `ASIC_DB`；键前缀 `ASIC_STATE:SAI_OBJECT_TYPE_` 与 `oid:` 形式可在 `sonic-py-swsssdk-master/src/swsssdk/port_util.py` 中核实，具体对象数量随端口数与版本变化，需对照实际版本核验。三段结果串起来表示「进程在、意图在、对象在」，但 `ASIC_DB` 有对象仍不等于芯片已编程，还需看 `STATE_DB` 与 `show interfaces status`，并依次接读 06-05（排障见 08-03）。输出块已注明示例输出与版本核验要求，所有取值仅为格式示意，不得当作真实设备数据引用。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是「把 `orchagent` 写成直接操作硬件」。这是个反复强调的红线：它消费 `APPL_DB`、生成 SAI 对象写 `ASIC_DB`，经 SAI 属性与 `syncd` 交互；`SAI/` 头文件在本快照为空目录、厂商实现不在本仓库，不得编造寄存器操作或芯片驱动细节（模块见 07-04）。第二类是「同步生效幻觉」：`Consumer::execute()` 消费、`Orch::doTask()` 处理、`flush()` 写 `ASIC_DB` 是三个不同时刻，不能把「日志里出现消费记录」等同于「硬件已下发」（原理见 06-01 ｜ 排障见 08-03）。
+
+第三类是「调度细节误用」。把 `Orch::doTask()` 的 `threshold` 当成固定值会误判重试行为：`gBatchSize` 为 0 时取 30000，否则随 `-b` 变化；把「没有新事件」当成「队列为空」也不对，因为 `select` 超时分支同样会驱动 `doTask()`。ring buffer 启用后（`gRingMode`、`enableRingBuffer()`、`popRingBuffer`），部分任务会在 ring 线程执行，按主线程日志推断处理顺序容易出错，需结合 `-R` 与 `Executor::processAnyTask()` 的分支判断（字段见 05-08 ｜ 参数见 04-06）。
+
+第四类是「重试与字段补值」。`task_need_retry`、`m_toSync`、`RetryCache` 与 SET/DEL 合并逻辑属于机制与字段范围：机制在本篇讲，字段见 05-05、05-07；类型定义所在的 `sonic-swss-common` 不在本快照，须写「不在本快照，需对照实际版本核验」。不得凭印象补字段名、函数签名或 `Request` 枚举值；`orch.h`、`request_parser.cpp`、`retrycache.h` 是可定位的核验入口。
+
+第五类是「平台、版本与性能」。多 ASIC、VOQ、fabric、DPU 等形态在 `main.cpp` 中走不同 `OrchDaemon` 派生类，能力受平台与版本限制、需对照实际版本核验，不得宣称全平台无条件支持（原理见 06-11）。所有收敛时间、配置下发时延、吞吐与表项容量一律标注「需在目标机型实测」，不给绝对值、不给跨机型通用数字；盲目调大 `-b`、`-k` 可能带来内存与延迟副作用，调优须实测（基准方法见 08-01 ｜ 调优见 08-02）。此外，本快照只有主仓加七个子仓，FRR / FRRouting 源码、Linux 内核、厂商 SAI 实现与 `sonic-swss-common` 均不在本快照，涉及处按「不在本快照，需对照实际版本核验」写。
+
+最佳实践归纳为四条：其一，排障先按图 06-04-01 判断停在「消费、解析、生成对象、冲刷」哪一段，再用 `show services`、`sonic-db-cli` 按库名逐段取证；其二，读源码时先 `main.cpp` 再 `orchdaemon.cpp` 再 `orch.cpp`，最后按业务跳到 `*orch.cpp`，避免一上来陷进派生逻辑；其三，跨册引用统一用（字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx），本篇涉及的 `Orch` 与 `Consumer` 字段写「字段见 05-05」、启动参数写「参数见 04-06」、下游同步写「原理见 06-05」、模块边界写「模块见 07-03」；其四，对快照无法核实的内容宁可标注核验要求并给出目录，也不补值（模块见 07-04）。
+
+### 7. 小结与延伸阅读
+
+本篇确立了 `orchagent` 的架构图景：`main.cpp` 完成 SAI 初始化、建连、switch 创建与 `OrchDaemon` 构造；`orchdaemon.cpp` 的 `init()` 注册各业务 Orch、`start()` 以单线程 `Select` 主循环统一驱动，超时与事件两条路径都会触发 `doTask()` 与 `flush()`；`orch.cpp` 的 `Consumer::execute()` 批量弹出任务、`addToSyncInternal()` 合并 SET 与 DEL、`Orch::doTask()` 按配额先重试再处理，`Orch2::doTask()` 经 `Request::parse()` 按 SET/DEL 分派到派生逻辑，生成对象写 `ASIC_DB`；`task_need_retry` 的任务由 `RetryCache` 接管并在约束满足后重回队列。图 06-04-01 与核心文件表是回查索引；贯穿全篇的三条纪律是：`orchagent` 不直接操作硬件、消费不等于下发、调度细节必须在目标机型实测。
+
+延伸阅读按疑问分流。想看 `ASIC_DB` 之后 `syncd` 如何调用 SAI 并回写状态，接读 06-05；想看端口、VLAN 从 `mgrd` 到派生 Orch 的完整对接，接读 06-03 与 06-06；想看路由、ACL、CoPP 等业务 Orch 的具体链路，接读 06-07、06-08；想理解 warm reboot 下 `bake()` 与状态恢复，接读 06-10，并记住相关能力受平台与版本限制；想看多 ASIC 与 chassis 形态下的不同 `OrchDaemon` 派生类，接读 06-11；容器启动顺序走 06-13。字段随查走 05-05、05-07、05-08，启动参数走 04-06，模块能力走 07-03、07-04，诊断树与案例走 08-03、08-04。
+
+最后重申资料纪律：本篇所有源码路径均相对各子仓 `xxx-master/` 根；示例输出均注明「示例输出，具体格式需对照实际版本核验」；`sonic-swss-common`、SAI 头文件、厂商 SAI 实现、FRR 与 Linux 内核一律写「不在本快照，需对照实际版本核验」；不确定的字段名、函数签名与枚举值均标注「需对照实际版本核验」并给出 `orchagent/`、`cfgmgr/`、`src/swsssdk/` 等可定位目录；Redis DB 编号以 `SonicDBConfig` 为准、不写死；性能与容量数字一律标注「需在目标机型实测」。版本基准始终为「上游 master 快照（2026-11 抓取）」。06 册后续各篇将按业务展开各条下发链路，本篇给出的调度框架是它们的共同底座。

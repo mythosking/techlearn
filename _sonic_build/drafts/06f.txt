@@ -1,0 +1,379 @@
+# SONiC 技术资料 · 06 技术原理（分片 F）
+## 06-11 多 ASIC / chassis 与数据库命名空间
+
+### 1. 背景与动机
+
+从 06-01 到 06-10，本册始终在一条单芯片的隐含前提下讲述配置流水线：一台交换机有一个 `orchagent`、一套 `ASIC_DB`、一个 `syncd` 和一颗转发 ASIC，从 `CONFIG_DB` 到芯片是一条直线。这个前提对接入与汇聚层的单芯片机型成立，却解释不了高端 box 与 chassis 类设备——它们的机箱里同时封装了两颗、四颗甚至更多转发 ASIC，或者由一块 supervisor 加多块 line card 组成，每块卡上又有多颗芯片。本篇的动机就是拆掉这条单芯片隐含前提，讲清 SONiC 如何在同一台设备上运行多套流水线、如何用「命名空间」把每套流水线隔离开、又如何把跨芯片的转发路径缝合起来。讲不清这段，读者面对一台多 ASIC 设备时会陷入两个极端：要么以为整台机器只有一个 `ASIC_DB`，要么以为跨芯片的端口和普通前面板端口没有区别，这两种理解都会在判读和排障时出错（原理见 06-01 ｜ 原理见 06-04）。
+
+从本快照的证据看，多 ASIC 的判定与命名空间解析集中在一个核心模块里：`sonic-buildimage/sonic-buildimage-master/src/sonic-py-common/sonic_py_common/multi_asic.py`（相对 `sonic-buildimage-master/` 仓根为 `src/sonic-py-common/sonic_py_common/multi_asic.py`）。这个文件并非凭空发明机制，而是读取设备上真实存在的 `asic.conf`：在 `device/arista/x86_64-arista_7280dr3a_36/asic.conf` 里可以核验到 `NUM_ASIC=2`、`DEV_ID_ASIC_0=09:00.0`、`DEV_ID_ASIC_1=03:00.0` 三行，在虚拟机型 `device/virtual/x86_64-kvm_x86_64_4_asic-r0/asic.conf` 里可以核验到 `NUM_ASIC=4`。`get_num_asics()` 解析 `num_asic` 项，`is_multi_asic()` 在其大于 1 时返回真。这说明多 ASIC 不是编译期常量，而是由设备目录里的配置文件在运行时决定的能力（模块见 07-10 ｜ 字段见 05-09）。
+
+第二个动机来自「数据库命名空间」这一容易与 Linux 网络命名空间混淆的概念。核心模块里 `get_current_namespace()` 通过 `/bin/ip netns identify <pid>` 判断进程所处的网络命名空间，`get_namespaces_from_linux()` 则 glob `/run/netns/*` 枚举所有命名空间；但 SONiC 的数据库命名空间同时体现在两套体系里：一是 Linux 网络命名空间（每颗 ASIC 一个，命名形如 `asic0`、`asic1`），二是 Redis 实例的 socket 与端口隔离。`dockers/docker-database/multi_database_config.json.j2` 模板把 `APPL_DB`、`ASIC_DB`、`COUNTERS_DB` 等分别映射到 `redis1`、`redis2`、`redis3` 等不同实例，socket 路径里带 `{{DEV}}` 变量，而单芯片模板 `database_config.json.j2` 把它们都放在同一个 `redis` 实例上。两套体系的耦合点就是命名空间名：给定一个 `asic0`，既能找到它的网络命名空间，也能找到它的那组 Redis 数据库（字段见 05-03 ｜ 参数见 04-04）。
+
+第三个动机来自 chassis 场景。VOQ（Virtual Output Queue）chassis 里，supervisor 卡持有全局视图，line card 只持有本卡相关的数据；数据库模板里 `CHASSIS_APP_DB` 与 `CHASSIS_STATE_DB` 被单独映射到 `redis_chassis` 实例，而 `connect_to_all_dbs_for_ns()` 对非 supervisor 主动移除这两张库。`get_asic_presence_list()` 区分 supervisor 与 line card 走两条不同的 ASIC 枚举路径，supervisor 从平台期望列表或 `CHASSIS_FABRIC_ASIC_INFO_TABLE` 读取，line card 则默认本卡所有 ASIC 都在位。这些机制决定了「chassis 与多 ASIC 受平台与版本限制，需对照实际版本核验」（原理见 06-10 ｜ 模块见 07-10）。本篇凡涉及具体设备能力一律按此纪律书写。
+
+### 2. 核心概念
+
+「ASIC 命名空间」指每颗转发 ASIC 对应的一套隔离环境，命名由 `ASIC_NAME_PREFIX = 'asic'` 加序号构成，即 `asic0`、`asic1`……`asicN`。`get_asic_id_from_name()` 把 `asic0` 还原成序号 `0`，`get_asic_index_from_namespace()` 在单 ASIC 机型上直接返回 0。与之相对的是 `DEFAULT_NAMESPACE = ''`，即全局（宿主）命名空间：单 ASIC 机型只有这一个命名空间，多 ASIC 机型上它运行的是宿主级配置与 chassis 数据库。要分清「网络命名空间」与「数据库命名空间」两个视角：前者由 Linux netns 实现、用于进程与端口隔离，后者由 `ConfigDBConnector(namespace=...)`、`SonicV2Connector(namespace=...)` 实现、用于库连接隔离，二者用同一个名字关联（字段见 05-03 ｜ 参数见 04-04）。
+
+「ASIC 子角色」是把命名空间按功能分组的维度。核心模块定义了 `FRONTEND_ASIC_SUB_ROLE = 'FrontEnd'`、`BACKEND_ASIC_SUB_ROLE = 'BackEnd'`、`FABRIC_ASIC_SUB_ROLE = 'Fabric'`，`get_all_namespaces()` 遍历每个 ASIC 命名空间，读取其 `DEVICE_METADATA` 表的 `localhost` 条目的 `sub_role` 字段，把它们归入 `front_ns`、`back_ns`、`fabric_ns` 三个列表返回。设备目录里 `get_asic_sub_role()` 对应 `SUB_ROLE_ASIC_{id}` 配置项，本快照的部分 `asic.conf` 中可核验 `NUM_ASIC` 与 `DEV_ID_ASIC_n`，但 `SUB_ROLE_ASIC_n` 的具体取值随设备与版本变化，需对照实际版本核验。前端 ASIC 接前面板端口，后端 ASIC 接内部端口，fabric ASIC 负责 chassis 内跨卡交换，三者的流水线拓扑并不相同（字段见 05-09 ｜ 模块见 07-10）。
+
+「端口角色」是跨 ASIC 缝合转发路径的关键。核心模块定义了 `EXTERNAL_PORT = 'Ext'`、`INTERNAL_PORT = 'Int'`、`INBAND_PORT = 'Inb'`、`RECIRC_PORT = 'Rec'`、`DPU_CONNECT_PORT = 'Dpc'` 与键名 `PORT_ROLE = 'role'`。`get_port_role()` 从端口表读取 `role` 字段，`is_role_internal()` 把 `Int`、`Inb`、`Rec`、`Dpc` 判为内部角色，`is_port_internal()`、`is_front_panel_port()` 与 `get_external_ports()` 据此区分内部端口与前面板端口。后端端口（内部端口）不直接对外，它把一颗 ASIC 的流量交给另一颗，`get_back_end_interface_set()` 还会把成员全为后端接口的聚合口识别为后端 LAG——源码注释明确说混用前后端成员属于错误配置、不被允许。这条规则说明多 ASIC 的端口不是物理上看见就能用，必须先判角色（字段见 05-02 ｜ 原理见 06-06）。
+
+「数据库命名空间的实例映射」由数据库模板表达。`multi_database_config.json.j2` 定义了 `redis`、`redis1`（6378）、`redis2`（6377）、`redis3`（6376）、`redis4`（6375）、`redis_chassis`（6380）、`remote_redis`、`redis_bmp` 等实例，把 `APPL_DB` 放进 `redis1`、`ASIC_DB` 放进 `redis2`、`COUNTERS_DB` 放进 `redis3`；而单芯片模板把这些库都指向 `redis`。`SonicDBConfig` 依据这份配置把库名解析成正确实例，`connect_config_db_for_ns()` 内部构造 `swsscommon.ConfigDBConnector(namespace=namespace)`，`connect_to_all_dbs_for_ns()` 构造 `SonicV2Connector(namespace=namespace)` 并逐库连接。Redis 各库的编号来自运行时配置，禁止写死，需对照 `sonic-py-swsssdk`（`src/swsssdk/dbconnector.py` 的 `SonicDBConfig`）与实际版本核验（字段见 05-03 ｜ 参数见 04-04 ｜ 模块见 07-05）。
+
+「容器与进程命名」把命名空间落到进程边界。`get_container_name_from_asic_id(service_name, asic_id)` 用 `'{}{}'.format(service_name, asic_id)` 拼出容器名，即 `syncd0`、`syncd1`、`swss0`、`swss1` 一类形态；这意味着每颗 ASIC 有自己独立的 `swss` 与 `syncd` 容器，各自跑一套 `orchagent` 与 `syncd`，彼此不共享 `ASIC_DB`。chassis 侧还有 supervisor 与 line card 之分：`is_supervisor()`、`is_chassis()`、`get_expected_asic_list()` 决定进程该连接哪些库、枚举哪些 ASIC。`sonic-swss/sonic-swss-master/orchagent/chassisorch.cpp` 里的 `ChassisOrch` 通过 `m_passThroughRouteTable(applDb, APP_PASS_THROUGH_ROUTE_TABLE_NAME)` 把跨卡路由写进 APPL_DB，`addRouteToPassThroughRouteTable()` 写入 `redistribute`、`next_vrf_name`、`next_hop_ip`、`ifname`、`source=CHASSIS_ORCH` 等字段——这是 chassis 场景下控制面协作的一个真实落点（模块见 07-03 ｜ 原理见 06-04）。
+
+下表把多 ASIC 与 chassis 涉及的核心概念、职责与可定位源码对应起来，便于回查；表中路径相对各子仓 `xxx-master/` 根，函数名可核验、签名需对照实际版本核验。
+
+| 概念 | 职责 | 可定位源码 | 回查去向 |
+|---|---|---|---|
+| 多 ASIC 判定 | 由 asic.conf 的 NUM_ASIC 判定 | `src/sonic-py-common/sonic_py_common/multi_asic.py` | 字段见 05-09 |
+| 命名空间解析 | Linux netns 与 DB 连接隔离 | `sonic_py_common/multi_asic.py`、`device_info.py` | 字段见 05-03 |
+| ASIC 子角色 | 划分前端、后端、fabric | `multi_asic.py` 的 `get_all_namespaces` | 字段见 05-09 |
+| 端口角色 | 区分前面板与内部端口 | `multi_asic.py` 的 `get_port_role` | 字段见 05-02 |
+| 实例映射 | 库到 Redis 实例的映射 | `dockers/docker-database/multi_database_config.json.j2` | 参数见 04-04 |
+| chassis 协作 | 跨卡路由与全局库 | `orchagent/chassisorch.cpp` | 原理见 06-04 |
+
+最后是边界收束：多 ASIC 命名空间与 chassis 支持受平台与版本限制，不同 HWSKU、不同版本的行为差异很大，本快照只能核实到核心模块、模板与部分 `asic.conf` 样本，具体设备的 ASIC 数、子角色分配、容器名与库实例映射一律写「需对照实际版本核验」，不据样本外推（模块见 07-10 ｜ 参数见 04-04）。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与对象并给出可定位路径，不展开逐字段定义。命名空间与 `SonicDBConfig` 相关结构字段见 05-03，`DEVICE_METADATA`、`SUB_ROLE_ASIC_n`、`CHASSIS_*` 等平台与设备配置字段见 05-09，端口 `role` 字段见 05-02，数据库实例与对象全集见 04-04，机制见 06-11，即（字段见 05-03 ｜ 字段见 05-09 ｜ 字段见 05-02 ｜ 参数见 04-04 ｜ 原理见 06-11 ｜ 模块见 07-05）。本篇聚焦「命名空间怎么解析、库怎么隔离」，字段与参数全集不在本册重列。
+
+核心解析模块的可核验落位是 `sonic-buildimage-master/src/sonic-py-common/sonic_py_common/multi_asic.py`，配套 `device_info.py` 提供 `get_asic_conf_file_path()`、`is_chassis()`、`is_supervisor()`、`is_dpu()`、`get_expected_asic_list()`。在 `device_info.py` 中可核验到 `USR_SHARE_SONIC_PATH = "/usr/share/sonic"` 及其派生的 `HOST_DEVICE_PATH = /usr/share/sonic/device`、`CONTAINER_PLATFORM_PATH = /usr/share/sonic/platform`，`get_asic_conf_file_path()` 依次在容器平台路径与宿主设备路径下寻找 `asic.conf`。`multi_asic.py` 里可核验的常量包括 `ASIC_NAME_PREFIX = 'asic'`、`NAMESPACE_PATH_GLOB = '/run/netns/*'`、`ASIC_CONF_FILENAME = 'asic.conf'`、`DEFAULT_NAMESPACE = ''`、`CHASSIS_STATE_DB = 'CHASSIS_STATE_DB'`、`CHASSIS_FABRIC_ASIC_INFO_TABLE = 'CHASSIS_FABRIC_ASIC_TABLE'`；成员类型与完整签名需对照实际版本核验（字段见 05-09 ｜ 模块见 07-10）。
+
+函数地图按职责分四组。判定与枚举组有 `get_num_asics()`、`is_multi_asic()`、`get_asic_id_from_name()`、`get_asic_device_id()`、`get_asic_sub_role()`、`get_namespace_list()`、`get_all_namespaces()`、`get_front_end_namespaces()`、`get_namespaces_from_linux()`、`get_current_namespace()`、`validate_namespace()`、`get_asic_presence_list()`；连接组有 `connect_config_db_for_ns()`、`connect_to_all_dbs_for_ns()`，分别构造 `ConfigDBConnector`、`SonicV2Connector`；表读取组有 `get_table()`、`get_table_for_asic()`、`get_table_entry_for_asic()`、`get_port_table()`、`get_port_entry()`、`mod_entry()`，其中 `get_table()` 把各命名空间的同表合并（`merged_table.update(ns_table)`）；端口与角色组有 `get_port_role()`、`is_role_internal()`、`is_port_internal()`、`is_front_panel_port()`、`get_external_ports()`、`get_back_end_interface_set()`、`is_port_channel_internal()`、`is_bgp_session_internal()`、`get_namespace_for_port()`、`get_asic_index_from_namespace()`、`get_container_name_from_asic_id()`。这些函数体在此可核验，字段细节留待 05 册（字段见 05-02 ｜ 模块见 07-05）。
+
+CLI 包装层落在另一个仓：`sonic-utilities/sonic-utilities-master/utilities_common/multi_asic.py`。该文件从 `sonic_py_common` 导入 `multi_asic`、`device_info`，定义了 `MultiAsic` 类及其 `get_ns_list_based_on_options()`、`is_multi_asic`、`current_namespace`，以及一组 click 选项构造 `multi_asic_click_options`、`multi_asic_click_option_namespace`、`multi_asic_ns_choices()`、`multi_asic_display_choices()`、`multi_asic_display_default_option()`、`multi_asic_namespace_validation_callback()`、`multi_asic_click_options` 装饰器和 `run_on_multi_asic()` 装饰器。`get_ns_list_based_on_options()` 里可核验到 `front_ns + back_ns + fabric_ns` 的拼接以及 `LazyChoice` 延迟选项，碰到未知命名空间会抛出 `'Unknown Namespace {}'`；这些命令选项的参数全集见 04-05（参数见 04-05 ｜ 模块见 07-06）。
+
+数据库模板与 chassis 源码是结构落位的最后一组的。`sonic-buildimage-master/dockers/docker-database/multi_database_config.json.j2` 与 `database_config.json.j2` 定义 `INSTANCES`、`DATABASES`、`VERSION` 顶层键，`DATABASES` 每项含 `id`、`separator`、`instance` 三键；`CHASSIS_APP_DB` 与 `CHASSIS_STATE_DB` 的 `instance` 为 `redis_chassis`。`sonic-swss-master/orchagent/chassisorch.cpp` 与 `chassisorch.h` 定义 `ChassisOrch`，可核验到 `addRouteToPassThroughRouteTable()`、`deleteRoutePassThroughRouteTable()`、`doTask(Consumer&)`、`update(SubjectType, void*)` 与成员 `m_passThroughRouteTable`、`m_vNetRouteOrch`。`sonic-buildimage-master/files/image_config/config-chassisdb/config-chassisdb` 是 chassis 数据库配置文件，具体字段需对照实际版本核验（字段见 05-09 ｜ 原理见 06-04 ｜ 模块见 07-10）。
+
+为便于把「对象—路径—回查去向」串起来，下表按子系统归纳可核验落位；表中均为目录或文件名，不含未核实的路径。
+
+| 子系统 | 关键文件（相对仓根） | 职责 | 回查去向 |
+|---|---|---|---|
+| 核心解析 | `src/sonic-py-common/sonic_py_common/multi_asic.py` | 判定多 ASIC、解析命名空间 | 字段见 05-09 |
+| 设备探测 | `sonic_py_common/device_info.py` | 定位 asic.conf、识别 chassis | 字段见 05-09 |
+| CLI 包装 | `utilities_common/multi_asic.py` | -n 与 --display 选项、跨 ns 执行 | 参数见 04-05 |
+| 库实例模板 | `dockers/docker-database/multi_database_config.json.j2` | 库到 Redis 实例映射 | 参数见 04-04 |
+| chassis 编排 | `orchagent/chassisorch.cpp`、`chassisorch.h` | 跨卡路由写 APPL_DB | 原理见 06-04 |
+| 设备样本 | `device/<vendor>/<hwsku>/asic.conf` | NUM_ASIC 与 DEV_ID_ASIC_n | 字段见 05-09 |
+
+### 4. 关键流程与调用链
+
+把全局配置、命名空间解析、每套数据库组、每套编排与转发芯片串起来，就得到多 ASIC 设备区别于单芯片设备的核心结构，见图 06-11-01。
+
+:::figure id=06-11-01 | name=多 ASIC 数据库命名空间与 chassis 数据库 | dir=TD
+node a "全局命名空间<br/>CONFIG_DB" blue
+node b "命名空间解析<br/>multi_asic" teal
+node c "asic0 数据库组<br/>APPL ASIC COUNTERS" amber
+node d "asic1 数据库组<br/>APPL ASIC COUNTERS" amber
+node e "各 ns orchagent<br/>swss0 swss1" purple
+node f "各 ns syncd<br/>与 SAI" green
+node g "asic0 转发芯片" red
+node h "asic1 转发芯片" red
+node i "内部端口互连<br/>Int Rec Inb" red
+node j "CHASSIS_APP<br/>CHASSIS_STATE_DB" blue
+edge a -> b "get_namespace_list"
+edge b -> c "ns=asic0"
+edge b -> d "ns=asic1"
+edge c -> e "消费 APPL_DB"
+edge d -> e "消费 APPL_DB"
+edge e -> f "写 ASIC_DB"
+edge f -> g "SAI0 编程"
+edge f -> h "SAI1 编程"
+edge g -> i "前端与后端端口"
+edge h -> i "内部端口"
+edge j -> b dashed "supervisor 全局视图"
+:::
+
+图 06-11-01 用颜色区分语义：blue 为全局配置库与 chassis 数据库，teal 为命名空间解析这一配置管理层，amber 为每颗 ASIC 独立的数据库组（含各自的 ASIC_DB），purple 为各命名空间的 `orchagent` 控制面，green 为各命名空间的 `syncd` 与 SAI，red 为转发芯片与内部端口这条硬件边界。虚线「supervisor 全局视图」表示 chassis 场景下 supervisor 持有的 `CHASSIS_APP_DB`、`CHASSIS_STATE_DB` 经全局视角参与解析，line card 是否连接这两张库由 `connect_to_all_dbs_for_ns()` 按 `is_supervisor()` 决定，受平台与版本限制，需对照实际版本核验（字段见 05-09 ｜ 模块见 07-10）。
+
+命名空间解析链是理解这张图的钥匙。用户或程序给出 `-n asic1` 后，CLI 包装层的 `MultiAsic.get_ns_list_based_on_options()` 先判断 `is_multi_asic`，再从 `get_all_namespaces()` 返回的 `front_ns`、`back_ns`、`fabric_ns` 中校验命名空间合法性，非法值触发 `'Unknown Namespace'`；随后 `get_namespace_list(namespace)` 返回 `[namespace]` 或全部命名空间列表。`connect_config_db_for_ns(namespace)` 用 `ConfigDBConnector(namespace=namespace)` 连到该 ns 的 `CONFIG_DB`，`connect_to_all_dbs_for_ns()` 则用 `SonicV2Connector` 连上该 ns 的全部库。图里 `b -> c`、`b -> d` 两条边表达的正是这一步：同一个解析层把请求导向不同的数据库组，而不是共享一个连接（参数见 04-04 ｜ 模块见 07-05）。
+
+每套数据库组之后是完整的单芯片流水线。`orchagent` 消费本 ns 的 `APPL_DB`，翻译成对象写入本 ns 的 `ASIC_DB`，本 ns 的 `syncd` 再经 SAI 编程本 ns 的转发芯片——这正是 06-04、06-05 讲解的流水线在每颗 ASIC 上各跑一遍。`swss0`、`swss1` 这类容器名由 `get_container_name_from_asic_id()` 拼出，容器间不共享 `ASIC_DB`，因此「整台机器只有一个 ASIC_DB」的直觉在这里彻底失效。排障时必须先确定目标端口属于哪个 ns（`get_namespace_for_port()` 可完成反向定位），再看那个 ns 的库与容器日志，否则会查错数据库（原理见 06-04 ｜ 原理见 06-05 ｜ 排障见 08-03）。
+
+跨芯片转发靠内部端口缝合。前端 ASIC 的某些端口通过 `role=Int`、`role=Rec`、`role=Inb` 等内部角色连到后端 ASIC 或 fabric，这些端口不对外呈现，源码里 `is_role_internal()` 把它们归为一类，`get_back_end_interface_set()` 进一步识别纯后端成员构成的 LAG。图 06-11-01 里 `g -> i`、`h -> i` 两条边表示两颗芯片经内部链路互通；`ChassisOrch` 则把跨卡路由以 `source=CHASSIS_ORCH` 写进 APPL_DB 的 pass-through 路由表，供路由层处理。跨 ASIC 的收敛时间、内部链路带宽与吞吐随机型、芯片与版本变化，一律标注「需在目标机型实测」，本册不给绝对值（原理见 06-04 ｜ 基准方法见 08-01 ｜ 调优见 08-02）。
+
+### 5. 配置/命令/代码实例
+
+本节给三组最小实例：一组用带 `-n/--namespace` 与 `--display` 的选项查看不同 ASIC 的端口状态并作逐行判读，一组给出核心模块中命名空间解析的代码片段，一组给出枚举命名空间与查看 `asic.conf` 的查询命令。完整的 `show` 命令参数见 04-05，数据库对象与实例映射见 04-04，命名空间字段见 05-03、05-09，本册不重列。命令名、选项、命名空间名与输出格式需对照实际版本核验。
+
+先看多 ASIC 下最常见的查看动作。以下命令按「前置检查 → 执行 → 验证输出 → 清理」组织，`-n/--namespace` 与 `--display` 选项来自 `utilities_common/multi_asic.py`，可核验但取值格式需对照实际版本核验。
+
+```bash
+# 前置检查：确认当前设备是多 ASIC，并列出可用命名空间
+show platform summary
+ip netns list
+# 执行：查看指定 ASIC 的端口状态
+show interfaces status -n asic0
+# 验证：聚合显示所有 ASIC（--display=all 的取值需对照实际版本核验）
+show interfaces status --display all
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（下列取值仅为格式示意，不代表任何具体版本或机型）
+$ ip netns list
+asic0
+asic1
+$ show interfaces status -n asic0
++-----------+-----------+-----+----------+-------+
+| Port      | Admin     | Oper| Speed    | Role  |
++-----------+-----------+-----+----------+-------+
+| Ethernet0 | up        | up  | 100000   | Ext   |
+| Ethernet-BP0 | up    | up  | 40000    | Int   |
++-----------+-----------+-----+----------+-------+
+$ show interfaces status --display all
+（输出合并 asic0 与 asic1 的端口，具体列与排序需对照实际版本核验）
+```
+
+逐行判读如下。`show platform summary` 用来确认设备形态与 ASIC 数，是多 ASIC 排障的第一步；若设备实际为单 ASIC，`-n/--namespace` 选项会按 `multi_asic_namespace_validation_callback()` 的逻辑提示不可用，因此不能先入为主地套用多 ASIC 命令。`ip netns list` 输出 `asic0`、`asic1` 两行，印证了 `NAMESPACE_PATH_GLOB = '/run/netns/*'` 的枚举逻辑与 `ASIC_NAME_PREFIX = 'asic'` 的命名规则；这两行是 Linux 网络命名空间，对应图 06-11-01 里的两个 ASIC 数据库组，具体数量应与 `asic.conf` 的 `NUM_ASIC` 一致。执行段 `show interfaces status -n asic0` 只查 `asic0` 这一个命名空间，输出的 `Ethernet0` 带 `Role=Ext`，是前面板端口；`Ethernet-BP0` 带 `Role=Int`，是内部后端端口，不对外呈现，两者同处 `asic0` 的端口表，说明 `-n` 收窄的是查询范围而不是把端口改名。`--display all` 则辐射全部命名空间，把 `asic0` 与 `asic1` 的端口合并展示，对应 `get_ns_list_based_on_options()` 里 `front_ns + back_ns + fabric_ns` 的拼接。最关键的一点：端口在 `show` 里可见只说明配置与状态层有记录，并不等于该端口所在 ASIC 的芯片已下发；按图 06-11-01 还需确认目标 ns 的 `ASIC_DB` 有对象、该 ns 的 `syncd` 无异常，不能跨 ns 混查（原理见 06-05 ｜ 参数见 04-05 ｜ 排障见 08-03）。整段命令为只读查询，不改变任何配置（参数见 04-05）。
+
+第二组给出核心模块的命名空间解析代码片段，用来印证「按 ns 连接不同库、按子角色分组」的实现形态；下列片段依据本快照中可核验的函数名与常量整理，为便于阅读做了简化，真实签名与控制流需对照实际版本核验。
+
+```python
+# 代码形态示意，依据 src/sonic-py-common/sonic_py_common/multi_asic.py 整理；签名需对照实际版本核验
+from sonic_py_common import multi_asic
+
+def ns_and_roles():
+    if multi_asic.is_multi_asic():
+        # get_all_namespaces 读取各 ns 的 DEVICE_METADATA sub_role 分组
+        roles = multi_asic.get_all_namespaces()
+        return roles['front_ns'] + roles['back_ns'] + roles['fabric_ns']
+    return [multi_asic.DEFAULT_NAMESPACE]
+
+def read_port_table_for_ns(ns):
+    # connect_config_db_for_ns 用 ConfigDBConnector(namespace=ns) 隔离库连接
+    cfgdb = multi_asic.connect_config_db_for_ns(ns)
+    return cfgdb.get_table('PORT')
+```
+
+这段代码把本篇的核心判断固化下来：`is_multi_asic()` 决定走单 ns 还是多 ns 分支，`get_all_namespaces()` 按 `sub_role` 把命名空间分成前端、后端与 fabric 三组，CLI 层再把三组拼成完整列表；`read_port_table_for_ns()` 用 `connect_config_db_for_ns(ns)` 为每个 ns 建立独立的配置库连接，因此同一个 `PORT` 表名在不同 ns 下读到的是不同内容。片段省略了错误处理与缓存逻辑（`config_db_handle` 字典用于缓存连接），读源码时应重点看 `get_table()` 如何用 `merged_table.update(ns_table)` 合并各 ns 的表，以及 `get_namespace_for_port()` 如何遍历 ns 反查端口归属，这两个函数正是「跨 ns 查询」与「按端口定位 ns」的直接实现（字段见 05-03 ｜ 模块见 07-05）。
+
+第三组给出枚举命名空间与查看设备配置文件的查询命令，用于确认 ASIC 数与设备 ID 是否符合预期；文件路径、字段名与输出需对照实际版本核验。
+
+```bash
+# 查看设备目录中的 ASIC 配置（路径需对照实际版本核验）
+cat /usr/share/sonic/device/x86_64-arista_7280dr3a_36/asic.conf
+# 通过 Python 接口读取命名空间列表（需在实际环境的 Python 中执行）
+python3 -c "from sonic_py_common import multi_asic; print(multi_asic.get_namespace_list())"
+```
+
+示例输出格式与具体文件名需对照实际版本核验。第一行的 `asic.conf` 在本快照对应文件里可核验为 `NUM_ASIC=2`、`DEV_ID_ASIC_0=09:00.0`、`DEV_ID_ASIC_1=03:00.0`，说明这台设备有两颗 ASIC 及各自的 PCI 设备号；`get_asic_device_id()` 正是解析 `DEV_ID_ASIC_{id}` 行。第二行的 `get_namespace_list()` 在多 ASIC 且未指定 ns 时走 `get_namespaces_from_linux()`，从 `/run/netns/*` 枚举并 `natsorted` 排序，单 ASIC 机型则返回 `[DEFAULT_NAMESPACE]` 即 `['']`。这两条命令分别对应图 06-11-01 中「设备配置」与「命名空间解析」两段的核验，属于只读探查（模块见 07-10 ｜ 参数见 04-04）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是命名空间混淆陷阱。最常见的是把 Linux 网络命名空间与数据库命名空间当成一回事，或在多 ASIC 设备上假定「只有一个 ASIC_DB」：`get_current_namespace()` 查的是 `/bin/ip netns identify`，而 `connect_config_db_for_ns()` 连的是 `ConfigDBConnector(namespace=...)`，二者靠同一个 `asic0` 之类的名字关联但并非同一对象。每颗 ASIC 有独立的数据库组、独立的 `swss`、`syncd` 容器与独立的 `ASIC_DB`，跨 ns 混查库会得到空结果或错误对象；排障第一步必须是确定目标端口属于哪个 ns（`get_namespace_for_port()`），再看那个 ns 的库与容器日志（字段见 05-03 ｜ 排障见 08-03）。
+
+第二类是角色误判陷阱。把内部端口（`role=Int`、`Inb`、`Rec`、`Dpc`）当成普通前面板端口配置，是跨 ASIC 场景的高频错误；`is_role_internal()` 与 `get_back_end_interface_set()` 的存在说明内部端口有独立的语义，后端 LAG 也不能混用前后端成员——源码注释明确说这种混用不被允许。`get_all_namespaces()` 按 `DEVICE_METADATA` 的 `sub_role` 分组，前端、后端、fabric ASIC 的端口与路由行为不同，不能套用同一套配置模板（字段见 05-02 ｜ 字段见 05-09）。
+
+第三类是事实纪律陷阱。核心模块与数据库模板在本快照可核验，但 `asic.conf` 只在部分设备目录有样本，`SUB_ROLE_ASIC_n` 的具体取值、`CHASSIS_FABRIC_ASIC_INFO_TABLE` 的实际内容、chassis 数据库的字段定义都需对照实际版本核验；`sonic-swss-common`、`sonic-py-swsssdk` 的完整实现与厂商相关文件不在本快照，涉及它们一律写「不在本快照，需对照实际版本核验」并给出 `src/sonic-py-common/`、`dockers/docker-database/`、`orchagent/` 等可定位目录（字段见 05-09 ｜ 模块见 07-05）。第四类是 DB 编号与实例陷阱：`multi_database_config.json.j2` 模板里 `APPL_DB` 在 `redis1`、`ASIC_DB` 在 `redis2` 是模板层面的映射，实际运行的库编号与实例须对照 `sonic-py-swsssdk/src/swsssdk/dbconnector.py` 的 `SonicDBConfig` 与运行时配置核验，禁止把模板里的编号当成全平台常量写死（参数见 04-04）。
+
+第五类是 chassis 能力陷阱。supervisor 与 line card 的数据库视图不同，`connect_to_all_dbs_for_ns()` 对非 supervisor 主动移除 `CHASSIS_APP_DB`、`CHASSIS_STATE_DB`，`get_asic_presence_list()` 对两类卡走不同枚举路径；`warmrestart/`、多 ASIC 与 chassis 支持受平台与版本限制，不同 HWSKU 与版本能力不同，一律写「受平台与版本限制，需对照实际版本核验」，不得宣称全平台无条件支持（原理见 06-10 ｜ 模块见 07-10）。第六类是性能陷阱：跨 ASIC 收敛时间、内部链路时延、批量下发吞吐随机型、芯片与版本变化，一律标注「需在目标机型实测」，不给绝对值、不给跨机型通用数字（基准方法见 08-01 ｜ 调优见 08-02）。第七类是「show 可见即已下发」陷阱：端口在 `show` 里可见只代表状态层有记录，不能反推某次 `config` 已使该 ASIC 的芯片下发，仍须按该 ns 的配置库、期望库、ASIC_DB 与 `show` 输出逐段核对（排障见 08-04）。
+
+最佳实践归纳为四条。其一，读代码时把路径写成 `upstream_src/` 下各子仓 `xxx-master/` 仓根的相对路径，并同时给出对应函数（`is_multi_asic()`、`get_all_namespaces()`、`connect_config_db_for_ns()`、`get_namespace_for_port()` 等），签名不确定就写「需对照实际版本核验」。其二，遇到「配置不生效」先按图 06-11-01 判定停在哪一段——是命名空间没解析对、该 ns 的库无对象、`orchagent` 未翻译，还是 `syncd` 未编程——再决定查哪个 ns 的容器日志，不做跳跃式判断。其三，命令、配置与输出按「前置检查、执行、验证输出、清理」闭环写，示例输出注明「示例输出，具体格式需对照实际版本核验」并附逐行判读。其四，跨册引用统一用四段式（字段见 05-03 ｜ 参数见 04-04 ｜ 原理见 06-05 ｜ 模块见 07-05），本篇涉及的命名空间与库连接字段写「字段见 05-03」、设备与平台配置写「字段见 05-09」、命令选项写「参数见 04-05」，不在本篇展开字段表与参数全集。
+
+### 7. 小结与延伸阅读
+
+本篇拆掉了 06 册此前隐含的单芯片前提：多 ASIC 由设备目录的 `asic.conf` 在运行时判定，`src/sonic-py-common/sonic_py_common/multi_asic.py` 用 `ASIC_NAME_PREFIX` 与 `/run/netns/*` 解析 `asic0`、`asic1` 等命名空间，`get_all_namespaces()` 按 `DEVICE_METADATA` 的 `sub_role` 把命名空间分成前端、后端、fabric 三组，`connect_config_db_for_ns()` 与 `connect_to_all_dbs_for_ns()` 为每颗 ASIC 建立独立的库连接。每套数据库组之后是完整的单芯片流水线——本 ns 的 `orchagent` 写本 ns 的 `ASIC_DB`、本 ns 的 `syncd` 经 SAI 编程本 ns 的芯片；跨芯片转发靠 `role=Int/Inb/Rec/Dpc` 的内部端口缝合，chassis 场景由 supervisor 持有 `CHASSIS_APP_DB`、`CHASSIS_STATE_DB` 并由 `ChassisOrch` 写跨卡路由。图 06-11-01 与两组归纳表是回查索引；三条纪律贯穿全篇——每颗 ASIC 有独立库与容器、端口须先判角色、多 ASIC 与 chassis 受平台与版本限制需核验。
+
+延伸阅读按疑问分流。想补流水线上游，接读 06-01（数据流总览）、06-02（producer/consumer）、06-04（orchagent 调度）、06-05（syncd 与 SAI 调用链）；想理解状态恢复与多芯片的关系，接读 06-10（warm reboot 与状态恢复）；想理解芯片适配的厂商边界，接读本篇后续的 06-12（平台驱动、SAI 适配与厂商实现边界）；想看容器如何按 ns 编排，接读 06-13（容器编排）。字段随查走 05-03（SonicDBConfig、Table）与 05-09（platform.json、PORT_STATE），参数随查走 04-04（数据库对象与实例）与 04-05（show/config 命令），模块能力走 07-05（py-swsssdk）与 07-10（platform/device/HWSKU 与 SAI 适配），部署实战走 03-06（多设备、多 ASIC 与容器化运维部署），排障走 08-03、08-04。跨册引用请始终使用「字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx」的写法，`xx` 替换为具体篇号。
+
+最后重申资料纪律：本篇所有示例输出均注明「示例输出，具体格式需对照实际版本核验」；所有源码路径均相对各子仓 `xxx-master/` 仓根；核心模块的字段、函数签名与 `asic.conf` 中未出现的 `SUB_ROLE_ASIC_n` 取值均标注核验要求并给出 `src/sonic-py-common/`、`dockers/docker-database/`、`orchagent/` 等可定位目录；`sonic-swss-common`、`sonic-py-swsssdk` 完整实现与厂商相关文件写「不在本快照，需对照实际版本核验」；性能、容量、收敛、时延与吞吐类结论一律标注「需在目标机型实测」。版本基准始终为「上游 master 快照（2026-11 抓取）」，不写绝对版本号与 Redis DB 编号。下一篇 06-12 将把视角从「多套流水线如何隔离」转向「一套流水线落到芯片的边界在哪里」，讲清平台驱动、`SAI` 适配层与厂商闭源实现的分工。
+
+## 06-12 平台驱动、SAI 适配与厂商实现边界
+
+### 1. 背景与动机
+
+06-05 把 syncd 经 SAI 编程 ASIC 的调用链讲到了 `VendorSai` 这一层，但刻意停在了一个边界上：`VendorSai.cpp` 里能核验到 `sai_global_apis_t` 函数指针表，表的成员指向 `sai_api_initialize`、`sai_api_query`、`sai_query_attribute_capability` 等统一 API，可这些符号真正的实现者是厂商提供的库，而厂商 SAI 实现闭源且不在本快照。本篇的动机就是接住 06-05 停下的地方，把「边界之内有什么、边界之外有什么、哪些能在快照里核实、哪些必须写需对照实际版本核验」讲清楚。缺了这一段，读者容易走两个极端：要么把 `SAI/` 空目录当成 SAI 不存在、进而怀疑整条调用链是虚构的，要么把厂商实现里想当然的细节写成确定事实，两种做法都违反本册的事实纪律（原理见 06-05 ｜ 模块见 07-04）。
+
+本篇要处理的是两条彼此独立、常被混为一谈的边界。第一条是「平台外设驱动」这条线：风扇、电源、温度传感器、LED、光模块等外设的状态采集与控制，属于 `pmon` 容器与 `sonic-platform-common` 基类体系，它读写的是STATE_DB、COUNTERS_DB 一类状态与计数库，不参与 ASIC 转发。第二条是「SAI 适配」这条线：转发 ASIC 的对象编程，属于 `sonic-sairedis` 的 `VendorSai`、`meta/`、虚拟 SAI 与厂商闭源库，它才是 06-05 调用链的终点。一个直观但必须纠正的误解是「平台驱动就是 SAI 驱动」——前者管外设、后者管转发芯片，二者代码仓不同、进程不同、目标库也不同。本快照里 `sonic-platform-common/sonic-platform-common-master/sonic_platform_base/` 下有 `platform_base.py`、`chassis_base.py`、`sfp_base.py`、`psu_base.py`、`fan_base.py`、`thermal_base.py`、`component_base.py` 等一整套基类，而 `device/<vendor>/<hwsku>/sonic_platform/` 下有厂商的 `platform.py`、`chassis.py`、`sfp.py` 等子类实现；这两组文件与 `sonic-sairedis` 的 `syncd/` 完全不在一条调用链上（模块见 07-10 ｜ 模块见 07-09）。
+
+第二个动机来自「开放与闭源的分界」这个 SONiC 生态的核心事实。基类、元数据层、虚拟 SAI、工具链都是开放的、可在本快照核验的；厂商对基类的子类实现虽然闭源，但本快照在部分设备目录下确实收录了 `sonic_platform` 包，例如 `device/accton/x86_64-accton_as7816_64x-r0/sonic_platform/` 下可核验到 `Platform(PlatformBase)` 与 `Chassis(ChassisBase)` 的继承关系；唯独厂商 SAI 实现（`libsai`）不在本快照，`sonic-sairedis-master/SAI/` 是空目录。这意味着本篇要用三种不同的措辞：可核实的写真实路径与函数名，设备目录下的子类写「样本可核验、具体版本需对照实际版本核验」，厂商 SAI 实现写「不在本快照，需对照实际版本核验」（模块见 07-04 ｜ 模块见 07-10）。
+
+第三个动机是把「能力查询」这条贯穿全册的纪律落到具体符号。06-05 讲 syncd 时提到 `queryStatsCapability()`、`queryAttributeCapability()` 一类能力查询，本篇要指出它们在 SAI 层有确切对应物：`VendorSai.cpp` 的 `sai_global_apis_t` 里可核验到 `query_attribute_capability = &sai_query_attribute_capability`、`query_stats_capability = &sai_query_stats_capability` 等成员。属性是否被目标机型支持，靠的正是这类查询，而不是枚举名看起来合理。把这条讲透，才能解释为什么「ASIC_DB 有对象」不等于「芯片已生效」，也才能给 06-11 的多 ASIC 场景一个共同的收束（原理见 06-05 ｜ 原理见 06-11 ｜ 排障见 08-03）。
+
+### 2. 核心概念
+
+「平台外设基类」指 `sonic-platform-common` 提供的一组抽象接口，它们是厂商实现必须继承的契约。`PlatformBase` 定义 `get_chassis()`，返回 `ChassisBase` 派生对象；`ChassisBase` 继承 `device_base.DeviceBase`，提供 `get_num_components()`、`get_num_modules()`、`get_num_fans()`、`get_num_fan_drawers()`、`get_num_psus()`、`get_num_pdbs()`、`get_num_thermals()`、`get_num_sfps()`、`get_num_cpos()`、`get_status_led()` 等一系列数量与状态接口，函数名可核验、完整签名需对照实际版本核验。`SfpBase`、`PsuBase`、`FanBase`、`ThermalBase`、`ComponentBase` 分别定义光模块、电源、风扇、温度传感器与组件的读写接口，例如 `SfpBase::get_temperature()`、`ThermalBase::get_temperature()`、`PsuBase::get_temperature_high_threshold()`、`ComponentBase::get_name()`。厂商在 `device/<vendor>/<hwsku>/sonic_platform/` 里以 `Platform(PlatformBase)`、`Chassis(ChassisBase)` 的形式实现这些契约，`as7816` 样本的 `chassis.py` 里可核验到 `NUM_FAN_TRAY`、`NUM_FAN`、`NUM_PSU`、`NUM_THERMAL`、`NUM_PORT`、`NUM_COMPONENT`、`SYSLED_FNODE`、`SYSLED_MODES` 等常量与继承关系（字段见 05-09 ｜ 模块见 07-10）。
+
+「platform.json」是平台外设的声明式清单。在 `device/accton/x86_64-accton_as7816_64x-r0/platform.json` 里可核验到顶层键 `chassis` 与 `interfaces`：`chassis` 下有 `name`、`components`、`fans`、`fan_drawers`、`psus`、`thermals`、`sfps`，`interfaces` 下每个以太网口带 `index`、`lanes` 与 `breakout_modes`，例如 `Ethernet0` 的 `lanes` 为 `73,74,75,76`，`breakout_modes` 给出 `1x100G[40G]`、`2x50G`、`4x25G`、`4x10G` 等分拆形态。这份文件把「机箱里有哪些可管理外设」「端口与物理通道如何对应」写清楚，是 `pmon` 侧与配置引擎共同依赖的硬件描述，字段全集见 05-09。它与 SAI 的对象模型没有直接对应关系——同一个端口在 `platform.json` 里是 `lanes` 描述，在 ASIC_DB 里是 SAI PORT 对象，二者分属不同层（字段见 05-09 ｜ 参数见 04-02）。
+
+「光模块适配」是平台驱动层最典型的开放实现样本。`sonic_platform_base/sonic_xcvr/xcvr_api_factory.py` 里的 `XcvrApiFactory` 依据光模块 EEPROM 低位内存读出的 SFF8024 ID 选择实现：`id_mapping` 把 `0x03` 映射到 `Sff8472Api`、`0x0D` 走 `_create_qsfp_api()` 再按 `revision_compliance` 分到 `Sff8436Api` 或 `Sff8636Api`、`0x11` 映射到 `Sff8636Api`、`0x18/0x19/0x1b/0x1e` 走 `_create_cmis_api()`。每个实现由「codes、mem_map、api」三件套构成，例如 `Sff8636Codes`、`Sff8636MemMap`、`Sff8636Api`，前者定义编码常量、中间者定义 EEPROM 字段偏移、后者定义读写方法。`_create_cmis_api()` 还按厂商名与 PN 列表分流到 `CredoAec800gApi`、`CmisFr800gApi`、`CmisAocSingleBankApi`、`CmisEnhancedLpoApi` 或通用 `CmisApi`，并能在相干模块时改选 `CCmisApi`。这段代码可完整核验，是理解「同一基类接口、多种厂商实现」的最佳入口（模块见 07-10 ｜ 字段见 05-09）。
+
+「SAI 适配层」指 `sonic-sairedis` 中把统一 SAI API 与 Redis 世界连接起来的部分。`syncd/VendorSai.cpp` 的构造函数里构造 `sai_global_apis_t ga`，成员包括 `api_initialize = &sai_api_initialize`、`api_query = &sai_api_query`、`api_uninitialize = &sai_api_uninitialize`、`log_set = &sai_log_set`、`object_type_query = &sai_object_type_query`、`query_attribute_capability = &sai_query_attribute_capability`、`query_attribute_enum_values_capability = &sai_query_attribute_enum_values_capability`、`query_stats_capability = &sai_query_stats_capability`、`switch_id_query = &sai_switch_id_query` 等，部分成员由 `HAVE_SAI_*` 宏控制是否为 `nullptr`。`apiInitialize()` 调用 `m_globalApis.api_initialize(flags, service_method_table)` 完成初始化，`create()`、`remove()`、`set()`、`get()`、`bulkCreate()` 等成员函数经这张表转到 SAI API。仓内 `meta/`（元数据与通知）、`lib/`（`RedisChannel.cpp`、`RedisRemoteSaiInterface.cpp`、`ClientSai.cpp`）、`vslib/`（虚拟 SAI）、`saidump/`、`saiplayer/`、`saisdkdump/`、`proxylib/` 等目录均可核验（字段见 05-04 ｜ 字段见 05-06 ｜ 模块见 07-04）。
+
+「厂商实现边界」是本篇要刻在读者脑子里的分界：`sonic-sairedis-master/SAI/` 在本快照是空目录，SAI 头文件、属性枚举全集与 `libsai` 二进制均不在快照；厂商对平台基类的子类实现属于设备相关代码，本快照只收录部分设备样本，且版本与机型强相关。因此凡是涉及具体 SAI 属性枚举取值、函数签名的完整形参、`libsai` 版本与 SAI 头文件版本匹配关系的内容，一律写「不在本快照，需对照实际版本核验」并给出可定位目录，不据空目录或样本设备编造。下表把两条边界线的核心概念、职责与可定位源码对应起来。
+
+| 概念 | 职责 | 可定位源码 | 回查去向 |
+|---|---|---|---|
+| 平台外设基类 | 定义 chassis/sfp/psu/fan 接口 | `sonic_platform_base/platform_base.py` 等 | 字段见 05-09 |
+| 厂商平台子类 | 继承基类实现具体外设 | `device/<vendor>/<hwsku>/sonic_platform/` | 模块见 07-10 |
+| 硬件清单 | 声明外设与端口通道 | `device/<vendor>/<hwsku>/platform.json` | 字段见 05-09 |
+| 光模块适配 | 按 SFF8024 ID 选实现 | `sonic_platform_base/sonic_xcvr/xcvr_api_factory.py` | 模块见 07-10 |
+| SAI 函数表 | 统一 API 入口与能力查询 | `syncd/VendorSai.cpp` | 字段见 05-04 |
+| 厂商 SAI 实现 | libsai 闭源不在快照 | `sonic-sairedis-master/SAI/` 为空 | 模块见 07-04 |
+
+最后是概念收束：平台外设驱动与 SAI 适配是两条独立的线，前者服务于 `pmon` 与状态采集、后者服务于转发芯片编程；开放的是基类、元数据层、虚拟 SAI 与工具链，闭源的是厂商子类实现（本快照有样本）与厂商 `libsai`（本快照没有）。把握这条分界，才不会把外设状态当成转发已生效的证明，也不会把空目录当成机制不存在（原理见 06-01 ｜ 模块见 07-09）。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与对象并给出可定位路径，不展开逐字段定义。平台与设备配置（`platform.json`、`PORT_STATE`）字段见 05-09，SAI 对象与 `attribute` 字段见 05-04，syncd 与 ASIC_DB 字段见 05-06，光模块 EEPROM 字段见 05-09，SAI 与 orchagent 参数见 04-06，容器服务参数见 04-07，即（字段见 05-09 ｜ 字段见 05-04 ｜ 字段见 05-06 ｜ 参数见 04-06 ｜ 参数见 04-07 ｜ 原理见 06-05）。本篇聚焦「哪一层归谁实现、边界落在哪里」，字段与参数全集不在本册重列。
+
+平台基类侧的结构落位集中在 `sonic-platform-common-master/sonic_platform_base/`。`platform_base.py` 定义 `PlatformBase`，`chassis_base.py` 定义 `ChassisBase(device_base.DeviceBase)`，`sfp_base.py` 定义 `SfpBase(device_base.DeviceBase, EepromReadWriteMixin)`，`psu_base.py`、`fan_base.py`、`thermal_base.py`、`component_base.py` 分别定义 `PsuBase`、`FanBase`、`ThermalBase`、`ComponentBase`。同目录还有 `device_base.py`、`fan_drawer_base.py`、`module_base.py`、`pdb_base.py`、`sensor_base.py`、`watchdog_base.py`、`bmc_base.py`、`sed_mgmt_base.py` 等。光模块实现在 `sonic_platform_base/sonic_xcvr/`（下分 `api/`、`codes/`、`mem_maps/`、`fields/`、`cdb/` 等）与 `sonic_platform_base/sonic_sfp/`（`sfputilbase.py`、`sfputilhelper.py`、`sff8472.py`、`sff8436.py`、`sff8636.py`、`qsfp_dd.py` 等）。`sonic_platform_api/` 下另有 `facade.py`、`meta.pyi`、`types.pyi`、`__init__.pyi`，是较新的平台 API 门面，其稳定接口范围需对照实际版本核验（字段见 05-09 ｜ 模块见 07-10）。
+
+厂商子类侧的结构落位在 `sonic-buildimage-master/device/<vendor>/<hwsku>/sonic_platform/`。以 `device/accton/x86_64-accton_as7816_64x-r0/sonic_platform/` 为样本，可核验到 `__init__.py`、`platform.py`、`chassis.py`、`component.py`、`eeprom.py`、`event.py`、`fan.py`、`fan_drawer.py`、`helper.py`、`psu.py`、`sfp.py`、`thermal.py`。`platform.py` 中 `class Platform(PlatformBase)` 的 `__init__()` 调用 `PlatformBase.__init__(self)` 并令 `self._chassis = Chassis()`；`chassis.py` 中 `class Chassis(ChassisBase)` 定义 `NUM_FAN_TRAY = 4`、`NUM_PSU = 2`、`NUM_THERMAL = 6`、`NUM_PORT = 64`、`NUM_COMPONENT = 5`、`SYSLED_FNODE`、`SYSLED_MODES` 等常量，并通过 `from .helper import APIHelper` 与 `from .event import SfpEvent` 引入辅助类。这些是设备样本，其他厂商与其他 HWSKU 的文件名、类名与常量需对照实际版本核验（字段见 05-09 ｜ 模块见 07-10）。
+
+SAI 适配侧的结构落位在 `sonic-sairedis-master/`。`syncd/VendorSai.cpp` 与配套头文件是函数表的载体，`apiInitialize()`、`apiUninitialize()`、`create()`、`remove()`、`set()`、`get()`、`getStats()`、`queryStatsCapability()`、`bulkCreate()`、`bulkRemove()`、`bulkSet()`、`bulkGet()` 等成员函数在此实现。`meta/` 下有 `Meta.cpp`、`Meta.h`、`Notification.cpp`、`NotificationFactory.cpp`、`AttrKeyMap.cpp` 等，`lib/` 下有 `Channel.cpp`、`RedisChannel.cpp`、`RedisRemoteSaiInterface.cpp`、`ClientSai.cpp`、`ContextConfig.cpp`，`vslib/` 下有 `Context.cpp`、`Event.cpp`、`Buffer.cpp` 等虚拟 SAI 实现，`proxylib/`、`pyext/`、`saidump/`、`saiplayer/`、`saisdkdump/`、`saiasiccmp/`、`saidiscovery/` 是工具与扩展目录。这些目录名可核验，文件内字段与完整签名需对照实际版本核验；`SAI/` 为空目录，不得据它编造头文件（字段见 05-04 ｜ 字段见 05-06 ｜ 模块见 07-04）。
+
+为便于把「层次—关键结构—源码位置」串起来，下表按四层归纳两条边界线上的可核验落位。
+
+| 层次 | 关键结构或对象 | 源码位置 | 回查去向 |
+|---|---|---|---|
+| 声明层 | platform.json 外设与通道 | `device/<vendor>/<hwsku>/platform.json` | 字段见 05-09 |
+| 基类层 | PlatformBase、ChassisBase、SfpBase | `sonic_platform_base/*.py` | 字段见 05-09 |
+| 厂商层 | Platform、Chassis 子类 | `device/<vendor>/<hwsku>/sonic_platform/` | 模块见 07-10 |
+| SAI 层 | sai_global_apis_t 函数表 | `sonic-sairedis/syncd/VendorSai.cpp` | 字段见 05-04 |
+| 适配层 | meta、lib、vslib | `sonic-sairedis/meta/`、`lib/`、`vslib/` | 模块见 07-04 |
+| 边界层 | 厂商 libsai 闭源 | `sonic-sairedis/SAI/` 为空 | 模块见 07-04 |
+
+### 4. 关键流程与调用链
+
+把平台外设线与 SAI 转发线并列画出，就得到本篇最重要的一张边界图，见图 06-12-01。
+
+:::figure id=06-12-01 | name=平台外设驱动与 SAI 适配的厂商边界 | dir=TD
+node a "platform.json<br/>设备清单与通道" blue
+node b "厂商 sonic_platform<br/>子类实现" gray
+node c "平台基类<br/>Chassis Sfp Psu" teal
+node d "pmon 守护进程<br/>sensor led psu" purple
+node e "STATE_DB<br/>状态与传感器" blue
+node f "ASIC_DB<br/>对象与属性" amber
+node g "各 ns syncd<br/>VendorSai" green
+node h "SAI 统一 API<br/>sai_api_query" green
+node i "厂商 libsai<br/>闭源不在快照" red
+node j "转发 ASIC" red
+edge a -> c "声明外设清单"
+edge b -> c "继承基类"
+edge c -> d "提供读取接口"
+edge d -> e "回写状态"
+edge f -> g "消费对象"
+edge g -> h "函数指针表调用"
+edge h -> i "动态装载"
+edge i -> j "编程芯片"
+:::
+
+图 06-12-01 的上半支是平台外设线：blue 的 `platform.json` 声明外设清单与端口通道，gray 的厂商 `sonic_platform` 子类继承 teal 的平台基类，purple 的 `pmon` 守护进程经基类接口读取传感器、LED、电源状态，回写 blue 的 STATE_DB；这条线止于状态与计数，不碰转发芯片。下半支是 SAI 转发线：amber 的 ASIC_DB 对象由本 ns 的 `orchagent` 写入（见 06-04、06-11），green 的 `syncd` 经 `VendorSai` 函数表调用 green 的 SAI 统一 API，再动态装载 red 的厂商 `libsai` 编程 red 的转发 ASIC。两支唯一的交点是「同一台设备、同一个端口」，但一条管可管理状态、一条管转发，绝不互相替代（模块见 07-09 ｜ 模块见 07-04 ｜ 原理见 06-05）。
+
+平台外设线的调用链起点是设备描述。`platform.json` 把机箱组件、风扇、风扇抽屉、电源、温度传感器、光模块与端口 `lanes`/`breakout_modes` 写成清单，厂商 `sonic_platform` 包里的 `Platform(PlatformBase)` 把自己构造的 `Chassis()` 赋给 `_chassis`，`Chassis(ChassisBase)` 以 `NUM_FAN_TRAY`、`NUM_PSU`、`NUM_THERMAL` 等常量落实数量，并为每个外设提供 `get_presence()`、`get_status()`、`get_temperature()` 一类接口。`pmon` 容器里的传感器、LED、风扇与电源守护进程通过这些接口周期读取，把结果写进 STATE_DB 与 COUNTERS_DB，运维才能在 `show platform` 与 `show interfaces` 里看到状态。要注意：这条线读的是 I2C、sysfs、CPLD 等外设总线，例如样本里的 `SYSLED_FNODE` 指向 `/sys/class/leds/` 下的文件；它与 SAI 的对象编程没有任何调用关系，不能把「传感器读到端口在位」当成「芯片端口已 up」（字段见 05-09 ｜ 模块见 07-09 ｜ 排障见 08-04）。
+
+SAI 转发线的调用链起点是 ASIC_DB。本 ns 的 `orchagent` 把配置翻译成 SAI 对象写入 `ASIC_DB`（06-04），`syncd` 从 `ASIC_STATE` 表消费命令码，经 `SaiObj.cpp`、`SaiAttr.cpp` 还原成 SAI 对象与属性，再由 `VendorSai::create()`、`set()`、`get()` 经 `m_globalApis` 函数表调到 `sai_api_query` 取到的 API 表项，最终进入厂商 `libsai` 编程芯片。初始化阶段 `VendorSai::apiInitialize()` 调用 `m_globalApis.api_initialize(flags, service_method_table)` 完成 SAI 上下文创建；能力查询阶段 `m_globalApis.query_attribute_capability`、`m_globalApis.query_stats_capability` 决定某属性或统计是否受支持。厂商 `libsai` 不在本快照，`sonic-sairedis-master/SAI/` 为空，SAI 头文件版本与 `libsai` 二进制版本的匹配关系需对照实际版本核验，不得据推测填写（原理见 06-05 ｜ 字段见 05-04 ｜ 模块见 07-04）。
+
+两条线的边界纪律在时序上同样成立。平台外设线的数据更新有自身周期，`pmon` 侧读到的是采样时刻的外设状态；SAI 转发线的数据更新受异步流水线约束，从 `config` 返回到芯片生效隔着若干进程（06-01 的铁律）。因此「`show platform` 显示电源正常」与「ASIC_DB 有端口对象」是两件独立的事，谁都不能替另一件作证。跨 ASIC 场景下还要先确定目标 ns（06-11），再看那个 ns 的 `swss`、`syncd` 容器与外设进程；外设状态随机型、传感器与版本变化，动态范围与精度需在目标机型实测，本册不给绝对值（基准方法见 08-01 ｜ 调优见 08-02 ｜ 排障见 08-03）。
+
+### 5. 配置/命令/代码实例
+
+本节给三组最小实例：一组用 `show platform` 与 `sfputil` 命令查看外设状态并作逐行判读，一组给出 `VendorSai.cpp` 函数表的代码片段以印证 SAI 边界，一组给出 `XcvrApiFactory` 的 ID 映射片段以印证光模块适配。完整命令参数见 04-05，SAI 与 orchagent 参数见 04-06，容器服务参数见 04-07，平台与设备字段见 05-09，本册不重列。命令名、选项、文件路径与输出格式需对照实际版本核验。
+
+先看平台外设线最常见的查看动作。以下命令按「前置检查 → 执行 → 验证输出 → 清理」组织，命令名与选项来自 `sonic-utilities` 的 `show/`、`sfputil/` 目录，取值格式需对照实际版本核验。
+
+```bash
+# 前置检查：确认平台与 HWSKU
+show platform summary
+# 执行：查看各外设状态
+show platform psustatus
+show platform fanstatus
+sfputil show presence
+# 验证：查看光模块信息与温度
+sfputil show eeprom -d Ethernet0
+show platform temperature
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（下列取值仅为格式示意，不代表任何具体版本或机型）
+$ show platform psustatus
+PSU    Status
+-----  ------
+PSU-1  OK
+PSU-2  OK
+$ sfputil show presence
+Port        Present
+----------  -------
+Ethernet0   Present
+Ethernet4   Present
+$ show platform temperature
+Sensor                    Temperature  Alarm
+------------------------  -----------  -----
+Temp sensor 1             32 C         N/A
+```
+
+逐行判读如下。`show platform summary` 是前置检查，用来确认平台名与 HWSKU，后续外设列表与 `platform.json` 的 `chassis` 清单应能对应；若平台识别异常，应先回到 `device/<vendor>/<hwsku>/` 与 `platform.json` 排查，而不是怀疑转发芯片。`show platform psustatus` 的输出两行 `PSU-1`、`PSU-2` 均为 `OK`，与 `as7816` 样本里 `NUM_PSU = 2` 的数量一致，说明厂商 `PsuBase` 子类的 `get_status()` 通过基类被 `pmon` 正常读取；列名与取值随版本变化，需对照实际版本核验。`sfputil show presence` 的 `Ethernet0`、`Ethernet4` 显示 `Present`，这是光模块在位状态，来自 `SfpBase` 子类读取 EEPROM 与 GPIO 的结果，与 `platform.json` 的 `sfps` 清单及 `interfaces` 的 `lanes` 对应；`Present` 只说明模块插着且可识别，不代表链路 up。`sfputil show eeprom -d Ethernet0` 读取光模块 EEPROM，`XcvrApiFactory.create_xcvr_api()` 会按 SFF8024 ID 选择 `Sff8472Api`、`Sff8636Api` 或 `CmisApi` 等实现来解析字段；`show platform temperature` 的 `Temp sensor 1` 为 `32 C`、`Alarm` 为 `N/A`，与 `platform.json` 里六个 `thermals` 条目之一对应，属 `ThermalBase::get_temperature()` 的回写结果。最关键的一点：这些命令读的是外设状态与采样值，全部来自 `pmon` 侧与 STATE_DB、COUNTERS_DB，不经 `syncd`、不编程 ASIC；不能用「光模块 Present、温度正常」推断「端口已在芯片里下发」，那要回到 06-05 的 ASIC_DB 与 SAI 调用链核对（原理见 06-05 ｜ 参数见 04-05 ｜ 排障见 08-03）。整段命令为只读查询，不改变配置（参数见 04-05）。
+
+第二组给出 `VendorSai.cpp` 函数表的代码片段，用来印证「统一 API 入口 + 能力查询」这一边界形态；下列片段依据本快照中可核验的成员名整理，为便于阅读做了简化，真实类型与控制流需对照实际版本核验。
+
+```cpp
+// 代码形态示意，依据 sonic-sairedis/syncd/VendorSai.cpp 整理；签名需对照实际版本核验
+VendorSai::VendorSai()
+{
+    m_apiInitialized = false;
+    memset(&m_apis, 0, sizeof(m_apis));
+
+    sai_global_apis_t ga = {
+        .api_initialize = &sai_api_initialize,
+        .api_query      = &sai_api_query,
+        .api_uninitialize = &sai_api_uninitialize,
+        .query_attribute_capability = &sai_query_attribute_capability,
+        .query_stats_capability     = &sai_query_stats_capability,
+        .object_type_query          = &sai_object_type_query,
+    };
+    m_globalApis = ga;
+}
+
+sai_status_t VendorSai::apiInitialize(uint64_t flags, ...)
+{
+    auto status = m_globalApis.api_initialize(flags, service_method_table);
+    return status;
+}
+```
+
+这段代码把 SAI 边界讲得很清楚：`sai_global_apis_t ga` 是一张函数指针表，成员指向 `sai_api_initialize`、`sai_api_query` 等统一 API 符号，`VendorSai` 把它们收进 `m_globalApis`，后续 `apiInitialize()`、`create()`、`set()`、`get()` 都通过这张表间接调用。源码里还有 `log_set = &sai_log_set`、`object_type_get_availability = &sai_object_type_get_availability`、`switch_id_query = &sai_switch_id_query` 等成员，以及用 `HAVE_SAI_BULK_OBJECT_GET_STATS`、`HAVE_SAI_QUERY_STATS_ST_CAPABILITY` 等宏控制的 `nullptr` 分支，说明能力随 SAI 版本变化。要点在于：这些符号名可核验，但它们的实现体来自厂商 `libsai`，不在本快照；函数签名的完整形参、`sai_status_t` 的返回约定与属性枚举取值都需对照实际版本核验，不得据片段补全（字段见 05-04 ｜ 原理见 06-05 ｜ 模块见 07-04）。
+
+第三组给出 `XcvrApiFactory` 的 ID 映射片段，用来印证「同一基类、多种实现」的适配方式；下列片段依据本快照中可核验的字典整理，为便于阅读做了简化，完整类层次需对照实际版本核验。
+
+```python
+# 代码形态示意，依据 sonic_platform_base/sonic_xcvr/xcvr_api_factory.py 整理
+def create_xcvr_api(self, bank=0):
+    id = self.lower_memory_info.get_id()
+    id_mapping = {
+        0x03: (self._create_api, (Sff8472Codes, Sff8472MemMap, Sff8472Api)),
+        0x0D: (self._create_qsfp_api, ()),
+        0x11: (self._create_api, (Sff8636Codes, Sff8636MemMap, Sff8636Api)),
+        0x18: (self._create_cmis_api, (bank,)),
+        0x19: (self._create_cmis_api, (bank,)),
+    }
+    if id in id_mapping:
+        func, args = id_mapping[id]
+        return func(*args)
+    return None
+```
+
+这段片段说明适配发生在「识别之后、使用之前」：`get_id()` 从 EEPROM 低位内存读出 SFF8024 ID，字典把它分派到不同的 codes、mem_map、api 三件套，`_create_qsfp_api()` 还按 `revision_compliance` 在 `Sff8436Api` 与 `Sff8636Api` 之间再分一次，`_create_cmis_api()` 则按厂商 PN 选具体实现。这正是「开放基类 + 可插拔实现」的样板，与本快照里厂商 `sonic_platform` 子类继承 `SfpBase` 的做法相互呼应；读源码时应重点看 `_create_api()` 如何把 `XcvrEeprom` 注入 api 对象，以及 EEPROM 字段偏移如何由 mem_map 决定。具体 ID 取值、类名与厂商 PN 列表需对照实际版本核验（字段见 05-09 ｜ 模块见 07-10）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是两条线的混淆陷阱。最常见的是把 `pmon` 侧的平台外设驱动当成 SAI 转发驱动：前者在 `sonic-platform-common/` 与 `device/<vendor>/<hwsku>/sonic_platform/`，读 I2C、sysfs、CPLD，回写 STATE_DB、COUNTERS_DB；后者在 `sonic-sairedis/syncd/`，经 `VendorSai` 调 `libsai` 编程 ASIC。把风扇、电源、光模块状态当成端口转发已生效的证明，是直接违反全册异步铁律的误判；判读要按 CONFIG_DB、APPL_DB、ASIC_DB、STATE_DB 与 `show` 输出逐段推进（原理见 06-01 ｜ 排障见 08-04）。
+
+第二类是空目录与闭源陷阱。`sonic-sairedis-master/SAI/` 在本快照为空目录，绝不能据它编造 SAI 头文件、属性枚举与版本号；厂商 `libsai` 闭源且不在本快照，所有关于 SAI 内部行为、属性取值与函数完整签名的细节一律写「不在本快照，需对照实际版本核验」并给出 `syncd/`、`meta/`、`lib/`、`vslib/` 等可定位目录。厂商对平台基类的子类实现虽在部分设备目录有样本，但版本与机型强相关，样本里的 `NUM_PSU`、`SYSLED_FNODE` 等常量不能外推到其它机型（模块见 07-04 ｜ 模块见 07-10）。
+
+第三类是能力边界陷阱。属性是否被支持要用 `sai_query_attribute_capability()` 一类能力查询确认，`ASIC_DB` 出现对象只代表对象进入芯片视图，不等于厂商 `libsai` 已把它写进芯片并生效；`HAVE_SAI_*` 宏控制的 `nullptr` 分支说明不同 SAI 版本能力不同，不能假定所有函数都存在。第四类是事实纪律陷阱：`sonic-swss-common`、`sonic-frr`/FRRouting、Linux 内核与厂商 SAI 实现均不在本快照，涉及它们写「不在本快照，需对照实际版本核验」；Redis 各库编号来自运行时配置，须对照 `sonic-py-swsssdk/src/swsssdk/dbconnector.py` 的 `SonicDBConfig` 核验，禁止写死（参数见 04-04 ｜ 原理见 06-05 ｜ 模块见 07-05）。
+
+第五类是版本匹配与升级陷阱。SAI 头文件版本、`libsai` 二进制版本与 `syncd` 期望的 API 版本必须匹配，否则可能出现符号缺失或能力查询失败；这种匹配关系随版本变化，需对照实际版本核验，不得宣称某组合全平台通用。`warmrestart/` 与平台外设状态的恢复受平台与版本限制，不同 HWSKU 行为不同，一律写「受平台与版本限制，需对照实际版本核验」（原理见 06-10 ｜ 模块见 07-10）。第六类是性能陷阱：外设采样周期、传感器精度、SAI 批量下发收敛时间、能力查询开销与吞吐随机型、芯片、版本变化，一律标注「需在目标机型实测」，不给绝对值、不给跨机型通用数字（基准方法见 08-01 ｜ 调优见 08-02）。第七类是跨 ASIC 叠加陷阱：多 ASIC 设备上要先确定目标 ns 再看对应容器与外设进程，不能把 `asic0` 的 SAI 能力结论套到 `asic1`（原理见 06-11 ｜ 排障见 08-03）。
+
+最佳实践归纳为四条。其一，读代码时把路径写成 `upstream_src/` 下各子仓 `xxx-master/` 仓根的相对路径，并同时给出对应符号（`PlatformBase::get_chassis()`、`XcvrApiFactory::create_xcvr_api()`、`VendorSai::apiInitialize()`、`sai_query_attribute_capability` 等），签名不确定就写「需对照实际版本核验」。其二，判读任何状态先问「这是哪条线」——外设状态走 `pmon` 与 STATE_DB，转发状态走 `orchagent`、`syncd` 与 ASIC_DB——再按图 06-12-01 定位到具体一段，不做跳跃式判断。其三，命令、配置与输出按「前置检查、执行、验证输出、清理」闭环写，示例输出注明「示例输出，具体格式需对照实际版本核验」并附逐行判读。其四，跨册引用统一用四段式（字段见 05-09 ｜ 参数见 04-06 ｜ 原理见 06-05 ｜ 模块见 07-04），本篇涉及的平台与光模块字段写「字段见 05-09」、SAI 对象写「字段见 05-04」、命令选项写「参数见 04-05」，不在本篇展开字段表与参数全集。
+
+### 7. 小结与延伸阅读
+
+本篇把 06-05 停在 `VendorSai` 的边界讲透：一侧是平台外设驱动线，`sonic-platform-common` 的 `PlatformBase`、`ChassisBase`、`SfpBase` 等基类定义契约，厂商在 `device/<vendor>/<hwsku>/sonic_platform/` 以 `Platform(PlatformBase)`、`Chassis(ChassisBase)` 的形式实现，`platform.json` 声明外设清单与端口通道，`XcvrApiFactory` 按 SFF8024 ID 选择 `Sff8472Api`、`Sff8636Api`、`CmisApi` 等实现，`pmon` 把外设状态回写 STATE_DB 与 COUNTERS_DB；另一侧是 SAI 转发线，`syncd` 的 `VendorSai` 用 `sai_global_apis_t` 函数表经 `sai_api_query` 调用统一 API，再动态装载厂商 `libsai` 编程 ASIC，能力靠 `sai_query_attribute_capability`、`sai_query_stats_capability` 确认。图 06-12-01 与两组归纳表是回查索引；三条纪律贯穿全篇——两条线互不替代、厂商 SAI 实现不在本快照、`ASIC_DB` 有对象不等于芯片已生效。
+
+延伸阅读按疑问分流。想补 SAI 调用链的上游与回写，接读 06-04（orchagent 调度）、06-05（syncd 与 SAI 调用链）、06-09（计数器与 telemetry）；想补多套流水线如何隔离，接读 06-11（多 ASIC 与数据库命名空间）；想看芯片适配如何随容器编排启动，接读 06-13（容器编排、服务依赖与启动顺序）。字段随查走 05-04（SAI 对象与 attribute）与 05-09（platform.json、PORT_STATE），参数随查走 04-06（SAI 与 orchagent 配置）与 04-07（容器服务参数），模块能力走 07-04（sonic-sairedis/syncd）与 07-10（platform/device/HWSKU 与 SAI 适配），部署实战走 02-04（平台适配与虚拟交换机 vs），排障走 08-03、08-04。跨册引用请始终使用「字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx」的写法，`xx` 替换为具体篇号。
+
+最后重申资料纪律：本篇所有示例输出均注明「示例输出，具体格式需对照实际版本核验」；所有源码路径均相对各子仓 `xxx-master/` 仓根；平台样本里的类名、常量与厂商 PN 列表均标注核验要求并给出 `sonic_platform_base/`、`device/<vendor>/<hwsku>/sonic_platform/`、`syncd/`、`meta/` 等可定位目录；厂商 SAI 实现与 SAI 头文件写「不在本快照，需对照实际版本核验」；版本匹配、能力范围、采样精度与性能类结论一律标注「需在目标机型实测」或「需对照实际版本核验」。版本基准始终为「上游 master 快照（2026-11 抓取）」，不写绝对版本号与 Redis DB 编号。至此 06 册技术原理的分片 F 两篇收束：06-11 讲清了多套流水线如何以命名空间隔离并用内部端口缝合，06-12 讲清了一套流水线落到芯片的边界在哪里，二者合起来构成「从多 ASIC 隔离到单芯片边界」的完整视角；06 册余下的 06-13、06-14 将分别展开容器编排与管理面，由后续分片接续。

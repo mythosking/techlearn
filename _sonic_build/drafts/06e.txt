@@ -1,0 +1,373 @@
+# SONiC 技术资料 · 06 技术原理（分片 E）
+## 06-09 计数器、FlexCounter 与 telemetry
+
+### 1. 背景与动机
+
+06-05 讲 syncd 的 SAI 调用链与 ASIC_DB 回写时，把「计数回写」作为三条上行数据流之一点到为止：syncd 经 `FlexCounter.cpp` 周期性读取 SAI 统计值，写入 COUNTERS_DB，再由 telemetry 与 `show` 读取。本篇的动机就是把这条被略过的支路展开成完整机制，回答三个此前悬而未决的问题：计数器由谁决定采集什么、以什么节奏采集；采集到的值如何以可查询的形态落到数据库；以及运维在 `show interfaces counters` 与 gNMI 订阅里看到的数字，究竟经过了多少层搬运。讲不清这三点，读者就容易把「能看到计数」误当成「数据在芯片里正常转发」，或者反过来，把「计数不涨」一概归咎于硬件——而两类判断都跳过了中间的控制面配置与采集进程（原理见 06-01 ｜ 原理见 06-05）。
+
+从本快照的证据看，计数器机制横跨了三个真实子仓，这一点与全册「多子仓协作」的主线完全一致。控制面配置侧在 `sonic-swss/sonic-swss-master/orchagent/flexcounterorch.cpp` 与 `flexcounterorch.h`，其中 `FlexCounterOrch` 继承 `Orch`，用 `doTask(Consumer&)` 订阅配置、用 `doTask(SelectableTimer&)` 处理延迟定时器，并把「某个计数组是否使能、轮询间隔是多少」翻译成给下行进程的配置。执行采集侧在 `sonic-sairedis/sonic-sairedis-master/syncd/FlexCounter.cpp`、`FlexCounter.h`、`FlexCounterManager.cpp`、`FlexCounterManager.h`，这里才有真正干活的 `FlexCounter`、`FlexCounterManager` 与 `BaseCounterContext` 三个类。命令与消费侧在 `sonic-utilities/sonic-utilities-master/counterpoll/main.py` 与 `utilities_common/portstat.py`，前者提供 `counterpoll` 命令改配置，后者把 COUNTERS_DB 的原始键翻译成人可读的接口名。容器与遥测侧则在 `sonic-buildimage/sonic-buildimage-master/dockers/docker-sonic-telemetry/`，可核验到 `telemetry.sh`、`docker-telemetry-entry.sh`、`telemetry_vars.j2` 等文件（模块见 07-03 ｜ 模块见 07-04 ｜ 模块见 07-06）。
+
+第二个动机来自一条容易被忽视的纪律：计数读取**不直接编程 ASIC**。全册反复强调 `orchagent` 只写 ASIC_DB、不直接操作硬件（原理见 06-05），而在计数这条路上，连「读」都是有边界的——`FlexCounter` 调用的是 SAI 的统计接口，厂商 SAI 实现多为闭源且不在本快照，`SAI/` 头文件目录在本快照亦不可据此编造具体枚举与签名。因此本篇凡涉及 `sai_stats_mode_t` 的具体取值、统计属性枚举与函数签名，一律写「需对照实际版本核验」并给出可定位目录，只把在快照里能核验到的类、方法与表名写成确定结论。这也解释了为什么 telemetry 能看到 counter 却改变不了转发行为：它处在整条链路的最末端，只读数据库，不碰 SAI，更不碰寄存器（模块见 07-04 ｜ 原理见 06-12）。
+
+第三个动机是把「异步流水线」的铁律延伸到可观测性。06-06 已把「`config` 返回成功不等于硬件已下发」讲透；计数侧的对应版本是「`counterpoll port enable` 返回成功不等于 `show interfaces counters` 立刻有数」。从配置写进 CONFIG_DB，到 `FlexCounterOrch` 展开为采集实例，到 syncd 线程按轮询间隔调用 SAI，再到写进 COUNTERS_DB、被 `show` 或 telemetry 读出，中间每段都是独立进程在推进，且轮询间隔本身决定了数据出现的延迟。本篇因此把「配置链」与「采集链」作为同等重要的两条主线，并说明为什么排障时要先问「计数有没有被使能」「轮询间隔是多少」，而不是先怀疑芯片（排障见 08-03 ｜ 调优见 08-02）。
+
+### 2. 核心概念
+
+「FlexCounter」在本册有两层含义，必须分清。第一层是 `orchagent` 侧的 `FlexCounterOrch`，它是一个配置编排器：可核验到它继承 `Orch`，实现了 `doTask(Consumer&)` 与 `doTask(SelectableTimer&)` 两个入口，另有 `bake()`、`handleDeviceMetadataTable(Consumer&)` 以及一组形如 `getPortCountersState()`、`getQueueCountersState()`、`getPgCountersState()`、`getWredQueueCountersState()` 的状态查询函数。它订阅的是 CONFIG_DB 里的计数配置表，把「PORT 组开不开、QUEUE 组间隔多少」这类意图整理成下行进程能消费的组与实例配置。第二层是 `syncd` 侧的 `FlexCounter` 类，它才是采集执行体：构造时接收 `instanceId`、`std::shared_ptr<sairedis::SaiInterface>`、`dbCounters` 与 `noDoubleCheckBulkCapability`，内部持有一个采集线程 `m_flexCounterThread`，由 `flexCounterThreadRunFunction()` 驱动，`waitPoll()` 与 `notifyPoll()` 负责按 `m_pollInterval` 睡眠与唤醒（原理见 06-04 ｜ 模块见 07-04）。
+
+「计数组（group）与实例（instance）」是理解配置翻译的关键抽象。`flexcounterorch.cpp` 里可核验到一张从配置键到组名的映射表，形如 `{"PORT", PORT_STAT_COUNTER_FLEX_COUNTER_GROUP}`、`{"QUEUE", QUEUE_STAT_COUNTER_FLEX_COUNTER_GROUP}`、`{"PG_DROP", PG_DROP_STAT_COUNTER_FLEX_COUNTER_GROUP}`、`{"RIF", RIF_STAT_COUNTER_FLEX_COUNTER_GROUP}`、`{"ACL", ACL_COUNTER_FLEX_COUNTER_GROUP}`、`{"TUNNEL", TUNNEL_STAT_COUNTER_FLEX_COUNTER_GROUP}` 等，映射键与 `counterpoll` 里的组名相互呼应。同名前缀下还可见 `PORT_RATE_COUNTER_FLEX_COUNTER_GROUP`、`QUEUE_WATERMARK_STAT_COUNTER_FLEX_COUNTER_GROUP`、`PORT_BUFFER_DROP_STAT_COUNTER_FLEX_COUNTER_GROUP` 等派生组，说明「速率」「水位」「缓存丢弃」是独立于原始统计的采集维度。这些组名的常量定义与展开后的组表全名需对照实际版本核验；本篇只确认映射关系在 `orchagent/flexcounterorch.cpp` 中真实存在（字段见 05-06 ｜ 参数见 04-04）。
+
+「轮询模式」决定读到的是累计值还是增量值。`FlexCounter.cpp` 中可核验到 `SAI_STATS_MODE_READ`、`SAI_STATS_MODE_READ_AND_CLEAR`、`SAI_STATS_MODE_BULK_READ`、`SAI_STATS_MODE_BULK_READ_AND_CLEAR` 四个模式名的引用，以及一组 `STATS_MODE_READ`、`STATS_MODE_READ_AND_CLEAR` 到 SAI 模式的映射；`FlexCounter.h` 里则有 `m_statsMode` 成员与 `always_check_supported_counters`、`use_sai_stats_capa_query`、`use_sai_stats_ext`、`double_confirm_supported_counters`、`no_double_check_bulk_capability` 等布尔开关。`READ_AND_CLEAR` 语义是「读后清零」，因此同一组计数若被两个消费者以不同模式读取，数值会互相影响；这也是 `counterpoll` 把 `PORT_BUFFER_DROP` 等组单独设长间隔的原因之一。具体枚举取值、能力查询函数签名与清零时机需对照实际版本核验（字段见 05-06 ｜ 原理见 06-05）。
+
+「读—写—消费三方分离」是计数机制的骨架。配置写在 CONFIG_DB 的 `FLEX_COUNTER_TABLE`——`counterpoll/main.py` 里可核验到 `ctx.obj.mod_entry("FLEX_COUNTER_TABLE", "PORT", ...)` 一类调用，字段名为 `POLL_INTERVAL` 与 `FLEX_COUNTER_STATUS`，取值 `enable` / `disable`；组与实例配置落在 FLEX_COUNTER_DB，供 syncd 侧读取；采集结果写进 COUNTERS_DB，`FlexCounter.cpp` 里可核验到 `countersTable.set(sai_serialize_object_id(vid), values, "")` 与 `countersTable.set("TIME_STAMP", values, "")`，即以对象 VID 为键写入计数字段并附时间戳。消费端 `portstat.py` 里可核验到 `COUNTERS_PORT_NAME_MAP = "COUNTERS_PORT_NAME_MAP"` 与 `RATES_TABLE_PREFIX = "RATES:"`，说明「端口名到对象 ID 的映射」与「速率表」共同完成了从原始键到可读输出的翻译（参数见 04-04 ｜ 字段见 05-06）。
+
+下表把计数与遥测链路上的核心概念、职责与本快照可定位的源码落位对应起来，便于回查；表中路径均相对各子仓 `xxx-master/` 根，类名与函数名可核验、常量定义需对照实际版本核验。
+
+| 概念 | 职责 | 可定位源码 | 边界说明 |
+|---|---|---|---|
+| FlexCounterOrch | 订阅计数配置并展开组 | `orchagent/flexcounterorch.cpp` | 组名常量定义需核验 |
+| FlexCounter | 采集线程与计数落库 | `syncd/FlexCounter.cpp` | SAI 模式枚举需核验 |
+| FlexCounterManager | 管理多个采集实例 | `syncd/FlexCounterManager.cpp` | 实例键格式需核验 |
+| counterpoll | 使能开关与轮询间隔 | `counterpoll/main.py` | 命令选项全集见 04-05 |
+| portstat | COUNTERS_DB 翻译为接口名 | `utilities_common/portstat.py` | 表名常量可核验 |
+| telemetry 容器 | gNMI 订阅对外供数 | `dockers/docker-sonic-telemetry/` | 服务二进制不在快照 |
+
+最后是边界收束：telemetry 服务本体（`/usr/sbin/telemetry`）与其 gNMI 实现不在本快照，可核验的只是容器启动脚本与模板；YANG 模型在 `dockers/../src/sonic-yang-models/` 与 `sonic-mgmt-common/cvl/testdata/schema/sonic-telemetry.yang` 一侧可见，但具体订阅路径与字段需对照实际版本核验。因此本篇谈到 telemetry 时只讲「它从 COUNTERS_DB 与 STATE_DB 取数、经 gNMI 对外提供订阅」这一层职责，不编造其内部结构（模块见 07-07 ｜ 原理见 06-14）。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与对象并给出可定位路径，不展开逐字段定义。FlexCounter 与 syncd 侧对象的字段统一放在 05-06，Orch 基类与 Consumer 字段放在 05-05、05-08，COUNTERS_DB 对象与 DB 编号放在 04-04，命令全集放在 04-05，模块能力放在 07 册，即（字段见 05-06 ｜ 字段见 05-05 ｜ 参数见 04-04 ｜ 参数见 04-05 ｜ 原理见 06-05 ｜ 模块见 07-04）。这样处理是为了让本篇聚焦「配置怎么变成采集、采集怎么变成可读数据」，而不是把结构体成员提前铺开。
+
+先给采集执行侧的对象地图。`syncd/FlexCounter.h` 里可核验到 `FlexCounter` 类，其公开方法包括 `addCounter(vid, rid, values)`、`bulkAddCounter(objectType, vids, rids, values)`、`removeCounter(vid)`、`addCounterPlugin(values)`、`removeCounterPlugins()`、`isEmpty()`、`isDiscarded()`；私有方法包括 `setPollInterval()`、`setSecondaryPollFactor()`、`setStatus()`、`setStatsMode()`、`collectCounters(swss::Table&)`、`runPlugins()`、`startFlexCounterThread()`、`endFlexCounterThread()`、`flexCounterThreadRunFunction()`、`waitPoll()`、`notifyPoll()`、`removeDataFromCountersDB()`、`getCounterContext()`、`createCounterContext()`、`removeCounterContext()`、`hasCounterContext()`。同一文件还定义了 `BaseCounterContext` 抽象基类（含 `addObject()`、`addObjectWithCounterGroups()`、`bulkAddObject()`、`removeObject()`、`collectData()`、`runPlugin()` 等纯虚方法）以及 `NoAttrData`、`PortPhyAttributeData`、`PortPhySerdesAttributeData` 等数据载体结构；这些名字都是真实的，成员类型与函数签名需对照实际版本核验（字段见 05-06）。
+
+管理器侧落在 `syncd/FlexCounterManager.h`，`FlexCounterManager` 类可核验到 `getInstance(instanceId)`、`removeInstance(instanceId)`、`removeAllCounters()`、`addCounterPlugin(instanceId, values)`、`removeCounterPlugins(instanceId)`、`addCounter(vid, rid, instanceId, values)`、`bulkAddCounter(vids, rids, instanceId, values)`、`removeCounter(vid, instanceId)` 等接口，内部以 `std::map<std::string, std::shared_ptr<FlexCounter>> m_flexCounters` 保存实例。这组接口说明 syncd 侧并非只有一个采集器，而是按 instanceId 维护一组采集器，各自可以有独立的组与轮询节奏；实例键的具体拼装规则需对照实际版本核验（字段见 05-06 ｜ 模块见 07-04）。
+
+配置编排侧落在 `orchagent/flexcounterorch.h` 与 `flexcounterorch.cpp`。头文件可核验到 `FlexCounterOrch : public Orch` 的声明、`doTask(Consumer&)` 与 `doTask(SelectableTimer&)` 两个入口、`bake() override`、一组 `get*State() const` 状态查询，以及 `FlexCounterQueueStates`、`FlexCounterPgStates` 两个辅助类（分别用 `std::vector<bool>` 记录队列与 PG 的使能位）。源文件里可核验到 `#define FLEX_COUNTER_DELAY_SEC 60` 与名为 `FLEX_COUNTER_DELAY` 的 `ExecutableTimer`，以及 `POLL_INTERVAL_FIELD`、`FLEX_COUNTER_STATUS_FIELD` 两个字段名常量的引用；字段常量定义与延迟定时器的触发条件需对照实际版本核验（字段见 05-05 ｜ 参数见 04-06）。
+
+命令与消费侧落在 `sonic-utilities`。`counterpoll/main.py` 可核验到 `counterpoll` 命令组及其 `port`、`queue`、`port_buffer_drop`、`phy`、`pg_drop` 等子组，每组各有 `interval` 与 `enable`、`disable` 子命令，统一通过 `ctx.obj.mod_entry("FLEX_COUNTER_TABLE", <组名>, ...)` 写入配置；`port_buffer_drop interval` 的注释明确写着「高 CPU 占用，间隔限制在 30s 到 300s」，并把常量 `PORT_BUFFER_DROP`、`PG_DROP`、`BUFFER_POOL_WATERMARK`、`ACL`、`ENI`、`HA_SET` 定义在文件头部。`utilities_common/portstat.py` 可核验到 `COUNTERS_PORT_NAME_MAP`、`RATES_TABLE_PREFIX`、`CounterTable` 类与对 `self.db.COUNTERS_DB` 的读取。两者之间的表名常量定义可能来自不在本快照的 `sonic-swss-common`，需对照实际版本核验（参数见 04-05 ｜ 模块见 07-06）。
+
+为便于把「结构—路径—回查去向」串起来，下表按四层归纳计数与遥测链路上可核验的落位。
+
+| 层次 | 代表结构或类 | 源码位置 | 回查去向 |
+|---|---|---|---|
+| 配置层 | counterpoll 命令组、FLEX_COUNTER_TABLE | `counterpoll/main.py` | 参数见 04-05 |
+| 编排层 | FlexCounterOrch、FlexCounterQueueStates | `orchagent/flexcounterorch.cpp` | 字段见 05-05 |
+| 采集层 | FlexCounter、FlexCounterManager、BaseCounterContext | `syncd/FlexCounter.cpp` | 字段见 05-06 |
+| 消费层 | CounterTable、COUNTERS_PORT_NAME_MAP | `utilities_common/portstat.py` | 参数见 04-04 |
+
+### 4. 关键流程与调用链
+
+把配置写入、编排展开、周期采集、计数落库与对外消费串起来，就得到计数与遥测的完整链路，见图 06-09-01。
+
+:::figure id=06-09-01 | name=计数器配置、采集与遥测消费链路 | dir=TD
+node a "CONFIG_DB<br/>FLEX_COUNTER_TABLE" blue
+node b "counterpoll CLI<br/>port enable" teal
+node c "FlexCounterOrch<br/>doTask bake" purple
+node d "FLEX_COUNTER_DB<br/>组与实例配置" blue
+node e "syncd FlexCounter<br/>FlexCounterManager" green
+node f "VendorSai<br/>getStats 批量读" green
+node g "ASIC 转发芯片<br/>统计寄存器" red
+node h "COUNTERS_DB<br/>COUNTERS RATES" blue
+node i "show interfaces<br/>counterpoll 判读" gray
+node j "docker-sonic-telemetry<br/>gNMI 订阅" gray
+edge b -> a "写使能与间隔"
+edge a -> c "订阅配置变更"
+edge c -> d "展开组与实例"
+edge d -> e "读取采集配置"
+edge e -> f "collectCounters"
+edge f -> g "SAI 统计调用"
+edge e -> h "写计数与时间戳"
+edge h -> i "读取并翻译"
+edge h -> j "订阅供数"
+:::
+
+图 06-09-01 中 blue 为数据库与配置输入，teal 为 `counterpoll` 配置管理，purple 为 `orchagent` 控制面，green 为 syncd 与 SAI 采集执行体，red 为硬件与统计寄存器边界，gray 为辅助的 `show` 与 telemetry 消费端。需要强调的是，图中 `VendorSai` 到 ASIC 是一步「只读」调用：`FlexCounter` 经 SAI 统计接口读取芯片计数器，既不写对象属性也不改转发表，这与 06-05 的下行编程链方向相反（原理见 06-05 ｜ 模块见 07-04）。图中 `FLEX_COUNTER_DB` 的具体表名、以及组配置展开后的键格式需对照实际版本核验。
+
+配置链从 `counterpoll` 开始。`counterpoll port enable` 经 `ctx.obj.mod_entry("FLEX_COUNTER_TABLE", "PORT", {"FLEX_COUNTER_STATUS": "enable"})` 把使能位写进 CONFIG_DB；`counterpoll port interval 1000` 则写入 `{"POLL_INTERVAL": 1000}`，该子命令在源码里用 `click.IntRange(100, 30000)` 约束范围，即 100 到 30000 毫秒——这是本快照可直接核验的取值边界，但不同组的范围不同（`port_buffer_drop` 是 30000 到 300000，`pg_drop` 是 1000 到 30000），完整约束见 04-05。`FlexCounterOrch::doTask(Consumer&)` 订阅这张表，识别字段名 `POLL_INTERVAL_FIELD` 与 `FLEX_COUNTER_STATUS_FIELD`，通过 `flexcounterorch.cpp` 里的映射表把配置键翻译成对应的 `*_FLEX_COUNTER_GROUP`，再展开成 syncd 可消费的组与实例配置写入 FLEX_COUNTER_DB（函数名与映射键可核验，组表全名需对照实际版本核验，原理见 06-04 ｜ 参数见 04-06）。
+
+采集链在 syncd 侧闭环。`FlexCounterManager::addCounter()` 或 `bulkAddCounter()` 按 instanceId 找到或创建 `FlexCounter` 实例，再由实例的 `addCounter()` 把对象 VID、RID 与感兴趣的统计 ID 交给对应的 `BaseCounterContext` 派生上下文。当采集线程由 `startFlexCounterThread()` 拉起后，`flexCounterThreadRunFunction()` 在 `waitPoll()` 上按 `m_pollInterval` 等待，被唤醒后调用 `collectCounters()`；后者遍历上下文调用 `collectData()`，经 `VendorSai` 的统计接口（源码里可见 `SAI_STATS_MODE_BULK_READ` 一类模式引用，说明支持批量读取）取值，最后用 `countersTable.set(sai_serialize_object_id(vid), values, "")` 把结果写进 COUNTERS_DB，并额外写一条 `TIME_STAMP`。`removeCounter()` 与 `removeDataFromCountersDB()` 负责对象删除时清理残留，避免「端口已删但计数仍在」的脏数据（字段见 05-06 ｜ 原理见 06-05）。
+
+消费链分两条。其一是 CLI：`show interfaces counters` 一类命令由 `sonic-utilities` 实现（原理见 06-14），`portstat.py` 先经 `COUNTERS_PORT_NAME_MAP` 把 `Ethernet1` 这类端口名映射到对象 ID，再读对应计数表；需要速率时改用 `RATES_TABLE_PREFIX` 拼出速率键。其二是 telemetry：`dockers/docker-sonic-telemetry/telemetry.sh` 用 `sonic-cfggen -d -t telemetry_vars.j2` 从 CONFIG_DB 渲染出 `x509`、`gnmi`、`certs` 三组变量，再拼出 `/usr/sbin/telemetry` 的启动参数（可核验到 `--port`、`--client_auth`、`--paths_blacklist`、`-logtostderr` 等选项），对外提供 gNMI 订阅；默认端口在该脚本里可取 8080，无证书时回退到 `--noTLS --bind_address 127.0.0.1`。两条消费链都只读数据库，不经 SAI，更不会改写 ASIC（模块见 07-06 ｜ 模块见 07-02 ｜ 原理见 06-14）。
+
+必须把异步时序再强调一次：以图 06-09-01 的任意一条边为界，上游完成不代表下游已完成。`counterpoll port enable` 返回成功只代表 CONFIG_DB 有了使能位；计数真正出现在 COUNTERS_DB，还要等编排展开、采集线程唤醒与一次 `collectCounters()` 走完，延迟量级与轮询间隔直接相关。排障时应逐段核对：CONFIG_DB 有没有使能、组配置有没有展开、COUNTERS_DB 有没有对象键、`show` 能不能翻译出端口名，而不是一上来怀疑硬件。轮询间隔、批量读取的收敛时间与采集开销随机型、芯片与版本变化，一律标注「需在目标机型实测」，本册不给绝对值（排障见 08-03 ｜ 基准方法见 08-01 ｜ 调优见 08-02）。
+
+### 5. 配置/命令/代码实例
+
+本节给三组最小实例：一组用 `counterpoll` 完成使能、设定间隔并用 `show` 验证闭环，附逐行判读；一组给 `FlexCounterOrch` 与 `FlexCounter` 的代码形态片段印证翻译与采集；一组给 COUNTERS_DB 的只读查询命令。完整命令全集见 04-05，FLEX_COUNTER_TABLE 字段见 04-04，配置文件与参数见 04-02，本册不重列。所有命令需在具备相应权限的环境执行，命令名、选项、表名与键格式需对照实际版本核验。
+
+先看一次典型的端口计数使能与验证闭环。以下命令按「前置检查 → 执行 → 验证输出 → 清理」组织，命令名与选项需对照实际版本核验。
+
+```bash
+# 前置检查：确认端口存在且链路为 up，否则计数没有意义
+show interfaces status
+# 执行：使能端口计数，并把轮询间隔设为 1000 毫秒
+counterpoll port enable
+counterpoll port interval 1000
+# 验证：查看计数使能状态与端口计数首屏
+counterpoll show
+show interfaces counters
+# 清理（可选）：验证结束后关闭该组采集
+counterpoll port disable
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（下列取值仅为格式示意，不代表任何具体版本或机型）
+$ counterpoll show
+Type                Interval    Status
+----------------    --------    ------
+PORT                1000        enable
+QUEUE               1000        disable
+$ show interfaces counters
+Port       RX_OK    RX_DRP   TX_OK    TX_DRP
+-------    ------   ------   ------   ------
+Ethernet1  12045    0        9981     0
+Ethernet2  0        0        0        0
+```
+
+逐行判读如下。前置的 `show interfaces status` 用来确认端口存在且链路为 up，这是计数有业务意义的前提；若端口本就 down，计数停在 0 属正常，应先回到链路排查而不是怀疑采集。执行段的两条命令中，`counterpoll port enable` 只把 CONFIG_DB 里 `FLEX_COUNTER_TABLE` 的 PORT 项写为 `FLEX_COUNTER_STATUS=enable`，`counterpoll port interval 1000` 写入 `POLL_INTERVAL=1000`，源码里该子命令用 `click.IntRange(100, 30000)` 限制范围，超范围会被 CLI 直接拒绝——这两条返回成功都只代表配置层完成，后面还有 `FlexCounterOrch` 展开、syncd 线程唤醒与 `collectCounters()` 落库三段。验证段的 `counterpoll show` 输出中，`Type` 列列出 PORT、QUEUE 两组，`Interval` 列显示 PORT 为 `1000`、`Status` 列为 `enable`，与刚写入的配置一致，说明配置层已生效；QUEUE 仍为 `disable` 是默认状态，属正常。`show interfaces counters` 的输出里 `Ethernet1` 的 `RX_OK` 为 `12045`、`TX_OK` 为 `9981`，这些值来自 COUNTERS_DB 经 `portstat.py` 翻译的结果；`RX_DRP`、`TX_DRP` 为 0 说明无丢弃，而 `Ethernet2` 全为 0 要与它的链路状态对照判断，不能据 0 就断定采集失效。最关键的一点：这些数字是某一轮轮询快照，不是实时值，刚使能后要等至少一个轮询间隔才有数；把间隔调得过小会增加采集开销，需按机型实测（原理见 06-09 ｜ 参数见 04-05 ｜ 调优见 08-02）。
+
+第二组给出 `FlexCounterOrch::doTask()` 与采集线程的代码形态片段，用来印证「按字段翻译」与「按间隔采集」的实现形态；下列片段依据本快照中可核验的函数名、字段名与映射键整理，为便于阅读做了简化，真实函数签名与控制流需对照实际版本核验。
+
+```cpp
+// 代码形态示意，依据 orchagent/flexcounterorch.cpp 与 syncd/FlexCounter.cpp 整理；签名需对照实际版本核验
+void FlexCounterOrch::doTask(Consumer &consumer)
+{
+    for (const auto &item : consumer.consume()) {
+        const auto &field = item.getField();
+        if (field == POLL_INTERVAL_FIELD) {
+            // 依据值更新对应组的轮询间隔
+        } else if (field == FLEX_COUNTER_STATUS_FIELD) {
+            // 依据 enable/disable 展开或撤销组与实例配置
+        }
+    }
+}
+
+void FlexCounter::flexCounterThreadRunFunction()
+{
+    while (m_runFlexCounterThread) {
+        waitPoll();                 // 按 m_pollInterval 睡眠
+        collectCounters(m_countersTable); // 读取 SAI 统计并写 COUNTERS_DB
+    }
+}
+```
+
+这段代码强化了本篇的核心判断：`FlexCounterOrch::doTask()` 以字段名作为路由键，`POLL_INTERVAL_FIELD` 与 `FLEX_COUNTER_STATUS_FIELD` 分别驱动间隔更新与使展开；`FlexCounter::flexCounterThreadRunFunction()` 则是一个「睡—采—写」循环，`waitPoll()` 与 `notifyPoll()` 控制节奏，`collectCounters()` 完成实际的读取与落库。片段中省略的参数以注释占位但不是正文占位，读者读源码时应重点看 `collectData()` 如何按 `SAI_STATS_MODE_READ` 或 `SAI_STATS_MODE_READ_AND_CLEAR` 取值，以及 `countersTable.set(sai_serialize_object_id(vid), values, "")` 如何以 VID 为键写入，这正是「计数不直接编程 ASIC、只写数据库」的证据（字段见 05-06 ｜ 原理见 06-05）。
+
+第三组给出 COUNTERS_DB 的只读查询命令，用于在计数不涨时逐段定位；库名、表名与键格式需对照实际版本核验。
+
+```bash
+# 观察端口名到对象 ID 的映射（表名见 utilities_common/portstat.py）
+sonic-db-cli COUNTERS_DB HGETALL 'COUNTERS_PORT_NAME_MAP'
+# 观察某对象的原始计数字段（键名形态需对照实际版本核验）
+sonic-db-cli COUNTERS_DB HGETALL 'COUNTERS:oid:0x1000000000001'
+```
+
+示例输出格式与具体键名需对照实际版本核验。`sonic-db-cli` 的用法与参数见 04-05，COUNTERS_DB 对象见 04-04；这两条命令属于只读探查，分别验证图 06-09-01 中「翻译映射」与「原始计数」两段。若映射表为空，问题多在端口未创建或同步未到位；若映射有而对象键无计数，问题多在计数未使能或采集线程未运行；若对象键有值而 `show` 看不到，则问题在 CLI 翻译层（排障见 08-03 ｜ 原理见 06-09）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是层次混淆陷阱。最常见的是把 CONFIG_DB 的 `FLEX_COUNTER_TABLE`（用户配置）、FLEX_COUNTER_DB 的组与实例配置（进程间配置）、COUNTERS_DB 的 `COUNTERS` 与 `RATES` 表（运行结果）当成同一个东西，或者把 `show interfaces counters` 能看到数字当成「采集正在实时进行」。三者分属配置层、编排层与结果层，必须按图 06-09-01 逐段区分，验证时按 CONFIG_DB、FLEX_COUNTER_DB、COUNTERS_DB 与 `show` 输出推进，不能跳段下结论（参数见 04-04 ｜ 排障见 08-03）。第二类是「配置即时生效」陷阱：`counterpoll port enable` 返回成功只代表写进 CONFIG_DB，计数需要等编排展开与至少一个轮询间隔才会出现；刚使能就断言「计数不涨是硬件故障」是典型的跳段判断（原理见 06-01 ｜ 排障见 08-04）。
+
+第三类是事实纪律陷阱。`FlexCounter`、`FlexCounterManager`、`BaseCounterContext`、`FlexCounterOrch` 这些类名与 `addCounter()`、`collectCounters()`、`doTask()`、`bake()` 等方法名在本快照可核验，但 `sai_stats_mode_t` 的枚举取值、统计属性枚举、能力查询函数签名、`*_FLEX_COUNTER_GROUP` 常量定义与组表全名多来自不在本快照的 `sonic-swss-common` 或厂商 SAI，需对照实际版本核验；不确定的一律标注并给出 `syncd/`、`orchagent/`、`counterpoll/`、`utilities_common/` 等可定位目录（字段见 05-06 ｜ 模块见 07-05）。第四类是 DB 编号陷阱：Redis 各库编号来自运行时 `database_config.json`，须对照 `sonic-py-swsssdk/src/swsssdk/dbconnector.py` 的 `SonicDBConfig` 与实际版本核验，禁止写死「COUNTERS_DB 是某号库」（参数见 04-04）。
+
+第五类是模式与清零陷阱。`READ_AND_CLEAR` 语义为读后清零，若两个消费者以不同模式读取同一组计数，数值会互相干扰；`FlexCounter.h` 里 `always_check_supported_counters`、`use_sai_stats_capa_query`、`double_confirm_supported_counters` 等开关正是为了应对不同芯片对统计能力的差异，其默认取值与行为需对照实际版本核验（字段见 05-06 ｜ 原理见 06-12）。第六类是性能陷阱：`counterpoll/main.py` 里 `port_buffer_drop interval` 的注释明确说明这组计数轮询会造成高 CPU 占用，因此把间隔限制在较长区间；把间隔盲目调小、把不该开的组全开，是常见「越调越慢」误操作。轮询开销、收敛时间与吞吐随机型、芯片、版本变化，一律标注「需在目标机型实测」，不给绝对值（调优见 08-02 ｜ 基准方法见 08-01）。第七类是 telemetry 边界陷阱：telemetry 服务二进制与 gNMI 实现不在本快照，容器脚本可核验的是启动参数与默认值，不得据脚本反推其内部结构；订阅路径与字段需对照实际版本核验（模块见 07-07 ｜ 原理见 06-14）。
+
+最佳实践归纳为四条。其一，读代码时把路径写成 `upstream_src/` 下各子仓 `xxx-master/` 的相对路径，并同时给出对应类与方法（`FlexCounterOrch::doTask()`、`FlexCounter::collectCounters()`、`FlexCounterManager::addCounter()` 等），签名不确定就写「需对照实际版本核验」。其二，把任何一次「计数不涨」都拆成图 06-09-01 的若干段，先判定停在哪一段，再决定查哪张库表与哪个进程的日志，避免一上来怀疑硬件。其三，命令、配置与输出按「前置检查、执行、验证输出、清理」闭环写，示例输出注明「示例输出，具体格式需对照实际版本核验」并附逐行判读。其四，跨册引用统一用四段式（字段见 05-06 ｜ 参数见 04-05 ｜ 原理见 06-05 ｜ 模块见 07-04），本篇涉及的 SAI 模式字段写「字段见 05-06」、命令选项写「参数见 04-05」、syncd 编程写「原理见 06-05」、telemetry 模块写「模块见 07-02」，不在本篇展开字段表与参数全集。
+
+### 7. 小结与延伸阅读
+
+本篇把 06-05 略过的计数回写支路讲透：`counterpoll` 把使能与轮询间隔写进 CONFIG_DB 的 `FLEX_COUNTER_TABLE`，`orchagent/flexcounterorch.cpp` 的 `FlexCounterOrch` 用 `doTask(Consumer&)` 与 `bake()` 把配置键经映射表翻译成组与实例配置写入 FLEX_COUNTER_DB，`sonic-sairedis/syncd/` 的 `FlexCounterManager` 与 `FlexCounter` 按 instanceId 管理采集实例、由采集线程经 `VendorSai` 的 SAI 统计接口周期读取（支持批量读模式）并以对象 VID 为键写入 COUNTERS_DB 及 TIME_STAMP，`portstat.py` 用 `COUNTERS_PORT_NAME_MAP` 与 `RATES_TABLE_PREFIX` 翻译为可读输出，`docker-sonic-telemetry` 用 `telemetry.sh` 拼装 `/usr/sbin/telemetry` 启动参数对外提供 gNMI 订阅。图 06-09-01 与四层落位表是回查索引；三条纪律贯穿全篇——计数读取不直接编程 ASIC、配置成功不等于立刻有数、SAI 模式与组常量多不在本快照需核验。
+
+延伸阅读按疑问分流。想补流水线上游，接读 06-01（数据流总览）、06-04（orchagent 调度）、06-05（syncd 与 SAI 调用链）；想理解状态恢复里计数组如何重建，接读 06-10（warm reboot 与状态恢复）；想理解管理面如何对外供数，接读 06-14（gNMI / REST / CLI 管理面）。字段随查走 05-06（syncd、ASIC_DB 与 FlexCounter）与 05-05（Orch、Request、Consumer），参数随查走 04-04（DB 对象）与 04-05（命令全集），模块能力走 07-03（sonic-swss / orchagent）、07-04（sonic-sairedis / syncd）与 07-06（sonic-utilities CLI），排障走 08-03、08-04，调优走 08-02。跨册引用请始终使用「字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx」的写法，`xx` 替换为具体篇号。
+
+最后重申资料纪律：本篇所有示例输出均注明「示例输出，具体格式需对照实际版本核验」；所有源码路径均相对各子仓 `xxx-master/` 根；类名、函数名与字段名可核验处直书其名，签名、SAI 枚举、组常量定义与组表全名不确定处均标注核验要求并给出 `syncd/`、`orchagent/`、`counterpoll/`、`utilities_common/` 等可定位目录；`sonic-swss-common`、厂商 SAI 实现与 telemetry 服务二进制写「不在本快照，需对照实际版本核验」；性能、容量、时延与吞吐类结论一律标注「需在目标机型实测」。版本基准始终为「上游 master 快照（2026-11 抓取）」，不写绝对版本号与 Redis DB 编号。下一篇 06-10 将把视角从「运行中如何采集状态」转向「重启后如何恢复状态」，讲清 warm reboot 如何借助 WARM_RESTART 表与状态机把上述所有运行时状态无损带回。
+
+## 06-10 warm reboot 与状态恢复
+
+### 1. 背景与动机
+
+06-09 讲清了运行中计数与状态如何被采集、落库、对外供数，但那一切建立在一个前提上：进程一直在跑。一旦软件升级或故障需要重启控制面进程，问题就来了——重启期间数据面能不能不中断、重启后那些写进 APPL_DB、ASIC_DB 与各 STATE_DB 表的运行时状态能不能无损带回？这正是 warm reboot（热重启）要回答的问题，也是本篇的动机。如果说 06-01 到 06-09 讲的是「配置如何从上到下走成转发状态」，本篇讲的就是「如何在不破坏转发状态的前提下，把控制面换一遍」。讲不清这段，读者就会把 warm reboot 误当成简单的「进程重启」，或反过来，把它当成任何场景下都能无损的万能开关——而实际上它受平台与版本严格限制（原理见 06-01 ｜ 原理见 06-05 ｜ 03-05）。
+
+从本快照的证据看，warm reboot 机制横跨三个子仓，且每一段的职责边界都很清楚。状态机与公共辅助在 `sonic-swss/sonic-swss-master/warmrestart/`，可核验到 `warmRestartHelper.cpp`、`warmRestartHelper.h`、`warmRestartAssist.cpp`、`warmRestartAssist.h` 四个文件，其中定义了 `WarmStartHelper` 与 `AppRestartAssist` 两个核心类；编排侧的自检工具在 `orchagent/orchagent_restart_check.cpp`，负责在重启 orchagent 前做状态检查并把它「冻结」在确定态；syncd 侧的状态保留与视图比对在 `sonic-sairedis/sonic-sairedis-master/syncd/`，可核验到 `WarmRestartTable.cpp`、`AsicView.cpp`、`ComparisonLogic.cpp`、`BestCandidateFinder.cpp`、`HardReiniter.cpp`、`SingleReiniter.cpp` 这一整套文件；CLI 与配置侧在 `sonic-utilities/sonic-utilities-master/show/warm_restart.py` 与 `sonic-buildimage/.../src/sonic-yang-models/yang-models/sonic-warm-restart.yang`。这种「公共辅助—应用编排— syncd 视图—外部配置」的四段结构，正是理解状态恢复的钥匙（模块见 07-03 ｜ 模块见 07-04 ｜ 模块见 07-06）。
+
+第二个动机来自全册反复强调的能力边界。SPEC 与总纲都明确：warm reboot、`warmrestart/`、多 ASIC 命名空间与 chassis 支持**受平台与版本限制，不同 HWSKU / 版本能力不同，一律写「受平台与版本限制，需对照实际版本核验」，不得宣称全平台无条件支持**。这一条在本篇尤其要落实：内核与 ASIC 能否在进程重启期间保留转发表、厂商 SAI 能否维持对象句柄、具体定时器取值，都随机型、芯片与版本变化。本篇凡涉及这些的地方一律标注核验要求，只把在快照里能核验到的类名、方法名、状态枚举与表名写成确定结论（模块见 07-10 ｜ 原理见 06-12）。
+
+第三个动机是把「异步流水线」的铁律延伸到重启场景。06-06 讲过「`config` 返回成功不等于硬件已下发」；warm reboot 的对应版本是「进程重启完成不等于状态已恢复」。从应用发出冻结请求、收到 READY 确认、进程有序停止、内核与 ASIC 保留转发表，到重启后各应用按 FSM 状态重新加载旧表项、重放重启期间的新状态、比对差异并 reconcile 到 RECONCILED，中间是一串独立进程与定时器在推进。任一段失败，warm reboot 就会退化为冷启动甚至转发中断。本篇因此把「重启前的冻结」与「重启后的恢复」作为同等重要的两条主线，并用一张图把状态恢复的完整流程表达出来（排障见 08-03 ｜ 案例见 08-04）。
+
+### 2. 核心概念
+
+「warm reboot」在本册指控制面进程重启而数据面（ASIC 转发表）保持不中断的过程，它区别于冷启动（cold boot，转发表清空重建）。从 syncd 侧可核验到这个区分是真实存在的：`syncd/SaiSwitch.cpp` 里 `SaiSwitch` 构造函数带 `bool warmBoot` 参数，并以成员 `m_warmBoot` 记录本次是否热启动；`SaiSwitch.cpp` 与 `ComparisonLogic.cpp` 中可核验到 `getColdBootDiscoveredVids()`、`getWarmBootDiscoveredVids()`、`getWarmBootNewDiscoveredVids()` 三个接口，分别返回冷启动、热启动已发现与热启动新发现的 VID 集合。这组接口说明 syncd 在热启动时会把「芯片里本来就有的对象」与「本次新发现的对象」分开处理——前者应被复用而非重建，后者可能意味着固件变化或异常（函数名可核验，集合处理逻辑需对照实际版本核验，原理见 06-05 ｜ 模块见 07-04）。
+
+「WarmStart 状态机」是应用侧恢复流程的主线。`warmrestart/warmRestartHelper.cpp` 可核验到 `WarmStartHelper` 类（命名空间 `swss`）及其对 `WarmStart` 命名空间的调用：`WarmStart::initialize(appName, dockerName)` 初始化、`WarmStart::checkWarmStart(m_appName, m_dockName)` 判断本次是否热启动、`WarmStart::setWarmStartState(m_appName, state)` 与 `WarmStart::getWarmStartTimer(m_appName, m_dockName)`。状态取值在本快照可核验到两个：`WarmStart::INITIALIZED`（`checkAndStart()` 在确认启用后把状态置为它）与 `WarmStart::RECONCILED`（`isReconciled()` 判断当前状态是否等于它，`inProgress()` 则以「已启用且状态不等于 RECONCILED」判定恢复仍在进行）。完整状态枚举与迁移条件需对照实际版本核验；本篇只用这两个可核验状态串讲主线（字段见 05-09 ｜ 原理见 06-10）。
+
+「恢复辅助双助手」指 `WarmStartHelper` 与 `AppRestartAssist` 两个类，它们面向不同粒度的应用。`WarmStartHelper` 的方法可核验到 `setState()`、`getState()`、`checkAndStart()`、`isReconciled()`、`inProgress()`、`getRestartTimer()`、`registerTable()`、`runRestoration()`、`insertRefreshMap()`、`reconcile()`，内部以 `TableContext`（含 `syncTable`、`restorationTable`、`restorationVector`、`refreshMap`）管理每张表的恢复上下文；`kfvVector` 与 `kfvMap` 两个类型别名分别承载「旧状态向量」与「新状态映射」。`AppRestartAssist` 则提供 `readTablesToMap()`、`insertToMap()`、`reconcile()`、`startReconcileTimer()`、`stopReconcileTimer()`、`checkReconcileTimer()`、`isWarmStartInProgress()`、`appDataReplayed()`、`warmStartDisabled()`、`registerAppTable()` 等方法，并用 `cache_state_t` 枚举（`STALE`、`SAME`、`NEW`、`DELETE`）标记每条缓存的状态。两个助手都遵循「先缓存旧状态、再接收新状态、最后比对差异」的套路，只是适配的应用模型不同（字段见 05-09 ｜ 原理见 06-02）。
+
+「冻结与自检」是重启前的关键闸门。`orchagent_restart_check.cpp` 是一个独立二进制，源码里可核验到它的选项：`-n / --noFreeze`（检查成功也不冻结）、`-s / --skipPendingTaskCheck`（跳过待处理任务依赖检查）、`-w / --waitTime`（等待应答毫秒数，默认 1000）、`-r / --retryCount`（重试次数，默认 0）、`-h / --help`。它在 APPL_DB 上用 `NotificationProducer` 向 `RESTARTCHECK` 通道发请求（op 为 `orchagent`，附带 `NoFreeze`、`SkipPendingTaskCheck` 两个字段），并在 `RESTARTCHECKREPLY` 通道上监听应答；当返回数据为 `READY` 时打印成功并退出。这套「请求—自检—冻结—应答」机制保证 orchagent 在确定的状态下被重启，否则残留的 pending task 会让恢复后的状态不可预测（原理见 06-04 ｜ 参数见 04-05）。
+
+下表把 warm reboot 涉及的核心概念、职责与本快照可定位的源码落位对应起来，便于回查；表中路径均相对各子仓 `xxx-master/` 根，类名与方法名可核验、状态枚举全集与定时器取值需对照实际版本核验。
+
+| 概念 | 职责 | 可定位源码 | 边界说明 |
+|---|---|---|---|
+| WarmStartHelper | 应用 FSM 与表恢复 | `warmrestart/warmRestartHelper.cpp` | 状态枚举全集需核验 |
+| AppRestartAssist | 表级缓存与差异调和 | `warmrestart/warmRestartAssist.cpp` | 定时器取值需核验 |
+| orchagent_restart_check | 重启前自检与冻结 | `orchagent/orchagent_restart_check.cpp` | 选项全集见 04-05 |
+| WarmRestartTable | syncd 侧重启标志落库 | `syncd/WarmRestartTable.cpp` | 表字段需核验 |
+| 视图比对 | 复用旧对象、发现新对象 | `syncd/ComparisonLogic.cpp` | 处理逻辑需核验 |
+| WARM_RESTART 表 | 外部使能与定时器配置 | `show/warm_restart.py`、YANG 模型 | 字段见 05-09 |
+
+最后是边界收束：warm reboot 的最终效果依赖内核、驱动与厂商 SAI 在重启期间保留 ASIC 转发表与对象句柄，这些大多不在本快照或受平台与版本限制，需对照实际版本核验。本篇只讲「控制面如何协调重启、如何用状态机与表缓存恢复数据库状态」这一层机制，不宣称任何机型都无条件支持，也不编造厂商 SAI 的内部行为（原理见 06-12 ｜ 模块见 07-10）。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与对象并给出可定位路径，不展开逐字段定义。WARM_RESTART 表与 PORT_STATE 等结构字段统一放在 05-09，Orch 与 Consumer 字段放在 05-05、05-08，syncd 与 ASIC_DB 字段放在 05-06，命令与参数全集放在 04-05，模块能力放在 07 册，即（字段见 05-09 ｜ 字段见 05-05 ｜ 参数见 04-05 ｜ 原理见 06-05 ｜ 模块见 07-03）。这样处理是为了让本篇聚焦「状态机怎么走、表怎么恢复」，而不是把结构成员提前铺开。
+
+应用侧的状态机与恢复助手落在 `sonic-swss/sonic-swss-master/warmrestart/`。`warmRestartHelper.h` 可核验到 `WarmStartHelper` 类，其方法包括构造 `WarmStartHelper(RedisPipeline*, ProducerStateTable*, syncTableName, dockerName, appName)`、`setState(WarmStart::WarmStartState)`、`getState()`、`checkAndStart()`、`isReconciled()`、`inProgress()`、`getRestartTimer()`、`registerTable()`、`runRestoration()`、`insertRefreshMap(const KeyOpFieldsValuesTuple&)`、`reconcile()`、`compareAllFV()`、`compareOneFV()`、`printKFV()`，以及内部类型 `kfvVector`、`kfvMap` 与结构 `TableContext`。`warmRestartAssist.h` 可核验到 `AppRestartAssist` 类、`cache_state_t` 枚举（`STALE=0`、`SAME=1`、`NEW=2`、`DELETE=3`）、常量 `CACHE_STATE_FIELD = "cache-state"` 与 `DEFAULT_INTERNAL_TIMER_VALUE = 5`，以及 `readTablesToMap()`、`insertToMap()`、`reconcile()`、`appDataReplayed()`、`warmStartDisabled()`、`registerAppTable()` 等方法与 `appTableCacheMap`、`m_appTables`、`m_psTables`、`m_warmStartTimer` 等成员。这些名字都真实，完整签名与状态迁移需对照实际版本核验（字段见 05-09）。
+
+syncd 侧的状态保留与视图比对落在 `sonic-sairedis/sonic-sairedis-master/syncd/`。`WarmRestartTable.h` 可核验到 `syncd::WarmRestartTable` 类，方法包括 `setFlagFailed()`、`setPreShutdown(bool succeeded)`、`setWarmShutdown(bool succeeded)`，内部持 `m_dbState` 与 `m_table` 两个 `std::shared_ptr`，说明它把「预关机是否成功、热关机是否成功、是否失败」写入数据库供恢复时读取。`SaiSwitch.h` 与 `SaiSwitch.cpp` 可核验到 `getColdBootDiscoveredVids()`、`getWarmBootDiscoveredVids()`、`getWarmBootNewDiscoveredVids()` 与成员 `m_warmBoot`、`m_warmBootDiscoveredVids`、`m_warmBootNewDiscoveredVids`。`ComparisonLogic.cpp` 里可核验到对这三个 VID 集合的读取与判断。此外 `AsicView.cpp`、`BestCandidateFinder.cpp`、`HardReiniter.cpp`、`SingleReiniter.cpp` 均在本快照可核验，分别承担视图表示、候选查找与对象重建职责；具体类名与方法签名需对照实际版本核验（字段见 05-06 ｜ 原理见 06-05）。
+
+自检工具落在 `orchagent/orchagent_restart_check.cpp`。它用 `swss::DBConnector db("APPL_DB", 0)` 连接 APPL_DB，`swss::NotificationProducer restartQuery(&db, "RESTARTCHECK")` 发请求、`swss::NotificationConsumer restartQueryReply(&db, "RESTARTCHECKREPLY")` 收应答，用 `swss::Select` 等待（`waitTime` 默认 1000 毫秒），发送时 op 为 `orchagent` 并附 `NoFreeze`、`SkipPendingTaskCheck` 两个字段，收到 `data == "READY"` 即判定检查成功。这些通道名、op 与判定条件均可核验；orchagent 侧如何响应 `RESTARTCHECK`、如何冻结自身，需回到 `orchagent/` 源码核验（原理见 06-04 ｜ 参数见 04-05）。
+
+配置与外部接口落在 `sonic-utilities` 与 YANG 模型。`show/warm_restart.py` 可核验到 `warm_restart` 命令组及其 `state`、`config` 两个子命令：`state` 从 STATE_DB 读 `WARM_RESTART_TABLE` 前缀下的键，取 `restore_count` 与 `state` 两个字段；`config` 从 CONFIG_DB 读 `WARM_RESTART` 表，并结合 STATE_DB 的 `WARM_RESTART_ENABLE_TABLE` 前缀判断 `enable`，还能解析 `bgp_timer`、`bgp_eoiu`、`teamsyncd_timer`、`neighsyncd_timer` 等字段。`sonic-warm-restart.yang` 可核验到模块 `sonic-warm-restart`、容器 `WARM_RESTART`、列表 `WARM_RESTART_LIST`（键为 `module`）、枚举 `module-name`（含 `bgp`、`teamd`、`swss`、`system`）以及 `bgp_eoiu`、`bgp_timer`、`teamsyncd_timer` 等叶子，其中 `bgp_timer` 取值范围为 1 到 3600。字段名与表前缀可核验，完整 schema 见 04 册（字段见 05-09 ｜ 参数见 04-05 ｜ 模块见 07-07）。
+
+为便于把「结构—路径—回查去向」串起来，下表按四层归纳 warm reboot 链路上可核验的落位。
+
+| 层次 | 代表结构或类 | 源码位置 | 回查去向 |
+|---|---|---|---|
+| 配置层 | WARM_RESTART 表、module-name 枚举 | `sonic-warm-restart.yang` | 参数见 04-05 |
+| 应用辅助层 | WarmStartHelper、AppRestartAssist | `warmrestart/` | 字段见 05-09 |
+| 自检层 | orchagent_restart_check、RESTARTCHECK | `orchagent/orchagent_restart_check.cpp` | 原理见 06-04 |
+| syncd 层 | WarmRestartTable、ComparisonLogic | `syncd/` | 字段见 05-06 |
+
+### 4. 关键流程与调用链
+
+warm reboot 的精髓在于「重启前冻结、重启后恢复」两阶段状态机，把这条流程完整画出来，见图 06-10-01。
+
+:::figure id=06-10-01 | name=Warm reboot 冻结与状态恢复流程 | dir=TD
+node a "WARM_RESTART 表<br/>使能与定时器" blue
+node b "orchagent_restart_check<br/>RESTARTCHECK 请求" teal
+node c "orchagent 自检<br/>pending task 检查" purple
+node d "READY 与冻结<br/>确定态" green
+node e "进程有序停止<br/>内核保留转发表" red
+node f "重启后 INITIALIZED<br/>checkAndStart" purple
+node g "runRestoration<br/>读取旧表项" teal
+node h "重放期间 insertRefreshMap<br/>接收新状态" purple
+node i "reconcile<br/>比对差异" purple
+node j "RECONCILED<br/>恢复完成" green
+edge a -> b "读取使能"
+edge b -> c "请求自检"
+edge c -> d "返回 READY"
+edge d -> e "冻结后停止"
+edge e -> f "进程重启"
+edge f -> g "加载旧状态"
+edge g -> h "接收重放"
+edge h -> i "新旧比对"
+edge i -> j "差异收敛"
+:::
+
+图 06-10-01 中 blue 为外部配置输入，teal 为公共恢复助手与自检工具，purple 为 orchagent 控制面状态机，green 为确定态与恢复完成态，red 为硬件与内核边界。这张图把本篇的核心判断固定下来：warm reboot 不是一次「停止—启动」，而是一个带确认、带缓存、带比对的闭环——只有走到右下角的 `RECONCILED`，才算真正恢复完成；中间任一环失败，状态就会停在某个非 RECONCILED 态，`inProgress()` 持续为真（原理见 06-10 ｜ 排障见 08-04）。图中 `READY`、`INITIALIZED`、`RECONCILED` 三个状态名与 `RESTARTCHECK` 通道均可核验，定时器与完整状态枚举需对照实际版本核验。
+
+重启前的冻结阶段从配置读取开始。`WARM_RESTART` 配置（含各模块使能与定时器，如 `bgp_timer`）决定哪些应用启用热重启；`orchagent_restart_check` 依此发出 `RESTARTCHECK` 请求，默认 `waitTime` 为 1000 毫秒、`retryCount` 为 0，可用 `-w`、`-r` 调整。orchagent 收到请求后做自检，重点检查是否还有 pending task——若 `-s / --skipPendingTaskCheck` 被设置则跳过该检查，若 `-n / --noFreeze` 被设置则检查成功也不冻结。只有在状态确定、没有残留任务时，orchagent 才回 `RESTARTCHECKREPLY` 数据 `READY`，工具据此判定成功。这一步的意义是：让进程停在一个「所有已接收任务都已处理完」的确定点，避免重启后面对半截断的状态（函数名与通道名可核验，orchagent 内部冻结实现需对照实际版本核验，原理见 06-04）。
+
+冻结确认后进入停止与保留阶段。orchagent 及各相关应用被有序停止，syncd 侧通过 `WarmRestartTable` 的 `setPreShutdown(succeeded)`、`setWarmShutdown(succeeded)` 把关机阶段是否成功写入数据库；理想情况下，内核与 ASIC 保持转发表不被清空，SAI 对象句柄得以保留。这一阶段能否成立完全依赖平台、驱动与厂商 SAI，受平台与版本限制、需对照实际版本核验——这也正是 warm reboot 不能在任意机型上无条件保证的根本原因（模块见 07-10 ｜ 原理见 06-12）。
+
+重启后进入恢复阶段，这是图 06-10-01 下半段的主线。各应用构造 `WarmStartHelper`，先由 `checkAndStart()` 调 `WarmStart::checkWarmStart()` 判断本次是否热启动；若启用，则把状态置为 `WarmStart::INITIALIZED`，并清理上一轮失败残留的 `restorationVector` 与 `refreshMap`。随后 `runRestoration()` 让各应用把数据库中的旧状态上传到临时缓冲（即 `kfvVector`），作为比对基准。在恢复窗口内，重启期间到达的新状态通过 `insertRefreshMap()` 写入 `refreshMap`。待重放完毕，`reconcile()` 用 `compareAllFV()`、`compareOneFV()` 逐字段比对旧状态与新状态：一致的保留、新的采纳、删除的清理，最终把状态置为 `RECONCILED`。`AppRestartAssist` 走的是同一逻辑的另一实现，用 `readTablesToMap()` 缓存旧表、`insertToMap()` 接收新表、以 `cache_state_t` 的 `STALE/SAME/NEW/DELETE` 标记差异，再由 `reconcile()` 收敛（字段见 05-09 ｜ 原理见 06-02）。
+
+syncd 侧的恢复与 orchagent 侧并行但职责不同。`SaiSwitch` 依据 `m_warmBoot` 区分本次启动形态，`ComparisonLogic` 分别取 `getColdBootDiscoveredVids()`、`getWarmBootDiscoveredVids()`、`getWarmBootNewDiscoveredVids()`：冷启动走全量重建；热启动时，已发现的旧 VID 应被复用，新发现的 VID 则被记录并可能触发告警（源码里可核验到「discovered new RIDs on WARM BOOT」一类日志），再由 `BestCandidateFinder`、`HardReiniter`、`SingleReiniter` 决定是否重建或复用对象。这里要落实异步铁律：数据库状态恢复到 RECONCILED，并不等于 ASIC 与所有应用都已收敛到可用态，仍须按各库表与 `show` 输出逐段核对（原理见 06-05 ｜ 排障见 08-03）。
+
+必须把时序边界讲透：以图 06-10-01 的任意一条边为界，上游完成不代表下游已完成。`READY` 只代表自检通过并允许冻结，不代表转发表已安全保留；`INITIALIZED` 只代表 FSM 起步，不代表旧状态已加载；`reconcile()` 返回也不代表 ASIC 已收敛。判定 warm reboot 是否成功，应确认应用状态为 `RECONCILED`、`restore_count` 符合预期、各库表与 `show` 输出反映运行时结果，而不是只看进程是否重启完成。恢复耗时、定时器窗口与收敛时间随机型、芯片与版本变化，一律标注「需在目标机型实测」，本册不给绝对值（基准方法见 08-01 ｜ 排障见 08-04）。
+
+### 5. 配置/命令/代码实例
+
+本节给三组最小实例：一组用 `show warm_restart` 观察使能与状态并作逐行判读，一组给 `orchagent_restart_check.cpp` 与 `warmRestartHelper.cpp` 的代码形态片段印证自检与状态机，一组给 WARM_RESTART 配置片段。完整命令全集见 04-05，WARM_RESTART 表与 schema 见 04-05，结构字段见 05-09，本册不重列。所有命令需在具备相应权限的环境执行，命令名、选项、表名与字段名需对照实际版本核验。
+
+先看一次典型的 warm reboot 状态观察闭环。以下命令按「前置检查 → 执行 → 验证输出 → 清理/恢复」组织，命令名与选项需对照实际版本核验。
+
+```bash
+# 前置检查：确认容器与数据库可达，查看版本以确认平台支持（版本需对照实际版本核验）
+show version
+# 执行：查看 warm restart 配置与运行状态
+show warm_restart config
+show warm_restart state
+# 验证（若环境支持，需对照实际版本核验）：执行重启前自检工具
+orchagent_restart_check -w 2000 -r 1
+# 清理/恢复：验证结束后按需关闭某模块 warm restart（命令需对照实际版本核验）
+config warm_restart disable swss
+```
+
+```text
+示例输出，具体格式需对照实际版本核验（下列取值仅为格式示意，不代表任何具体版本或机型）
+$ show warm_restart config
+name        enable    timer_name           timer_duration    eoiu_enable
+--------    ------    ------------------   -------------     -----------
+bgp         true      bgp_timer            300               false
+swss        true      NULL                 NULL              NULL
+teamd       false     NULL                 NULL              NULL
+$ show warm_restart state
+name        restore_count    state
+--------    --------------   -----------
+bgp         2                Reconciled
+swss        2                Reconciled
+```
+
+逐行判读如下。前置的 `show version` 用来确认平台与版本，因为 warm reboot 受平台与版本限制，不同机型能力不同，这一步是判断「该机型是否支持」的起点，具体版本需对照实际版本核验。执行段的两条命令中，`show warm_restart config` 输出里 `bgp` 行 `enable` 为 `true`、`timer_name` 为 `bgp_timer`、`timer_duration` 为 `300`，与 `sonic-warm-restart.yang` 里 `bgp_timer` 字段及 `show/warm_restart.py` 的解析逻辑一致（该字段取值范围 1 到 3600）；`swss` 行 `enable` 为 `true` 但计时器字段为 `NULL`，说明该模块只开使能未配定时器，属正常形态；`teamd` 行 `enable` 为 `false`，表示未启用，与 `module-name` 枚举里可出现 `teamd` 相符。验证段的 `show warm_restart state` 中，`bgp`、`swss` 两行 `restore_count` 为 `2`，表示已成功恢复两次，`state` 为 `Reconciled`（大小写与取值随版本变化，需对照实际版本核验），对应图 06-10-01 右下角的 `RECONCILED` 终态，说明这两次恢复都收敛完成；若某模块 `state` 停在非 RECONCILED 值，则说明恢复仍在进行或失败，需按状态机逐段排查。`orchagent_restart_check -w 2000 -r 1` 把等待时间设为 2000 毫秒、重试 1 次，返回 `RESTARTCHECK succeeded` 才表示自检通过，`NOT_READY` 或超时都要先查 pending task 而不是强行重启。最关键的一点：`state` 为 `Reconciled` 只说明控制面状态机收敛，不等于 ASIC 转发表在整个重启期间毫无抖动，仍需结合业务流量与设备侧观测判断；所有阈值与命令选项需对照实际版本核验（原理见 06-10 ｜ 参数见 04-05 ｜ 排障见 08-04）。
+
+第二组给出 `orchagent_restart_check.cpp` 与 `warmRestartHelper.cpp` 的代码形态片段，用来印证「请求—自检—冻结」与「初始化—恢复—收敛」的实现形态；下列片段依据本快照中可核验的函数名、通道名与状态名整理，为便于阅读做了简化，真实函数签名与控制流需对照实际版本核验。
+
+```cpp
+// 代码形态示意，依据 orchagent_restart_check.cpp 与 warmrestart/warmRestartHelper.cpp 整理；签名需对照实际版本核验
+int main(int argc, char **argv)
+{
+    swss::DBConnector db("APPL_DB", 0);
+    swss::NotificationProducer restartQuery(&db, "RESTARTCHECK");
+    swss::NotificationConsumer restartQueryReply(&db, "RESTARTCHECKREPLY");
+    restartQuery.send("orchagent", "orchagent", values); // 附 NoFreeze / SkipPendingTaskCheck
+    int result = s.select(&sel, waitTime);                // 默认 1000 毫秒
+    if (result == swss::Select::OBJECT) {
+        restartQueryReply.pop(op_ret, data, values_ret);
+        if (data == "READY") { /* 自检成功，允许冻结 */ }
+    }
+}
+
+bool WarmStartHelper::checkAndStart()
+{
+    bool enabled = WarmStart::checkWarmStart(m_appName, m_dockName);
+    if (enabled) {
+        setState(WarmStart::INITIALIZED); // 进入恢复状态机
+    }
+    return enabled;
+}
+```
+
+这段代码强化了本篇的核心判断：`orchagent_restart_check` 本质是一个基于通知通道的「请求—应答」工具，靠 `RESTARTCHECK` 发问、`RESTARTCHECKREPLY` 收答、`data == "READY"` 判定自检通过；`WarmStartHelper::checkAndStart()` 则用 `WarmStart::checkWarmStart()` 判断是否热启动，若是就把 FSM 推到 `WarmStart::INITIALIZED`。片段中省略的参数以注释占位但不是正文占位，读者读源码时应重点看 `runRestoration()` 如何加载旧状态、`insertRefreshMap()` 如何接收新状态，以及 `reconcile()` 如何用 `compareAllFV()` 逐字段比对并推进到 `RECONCILED`（字段见 05-09 ｜ 原理见 06-04）。
+
+第三组给出 WARM_RESTART 的配置片段，用于说明使能与定时器的形态；字段与取值需对照实际版本核验。
+
+```json
+{
+  "WARM_RESTART": {
+    "bgp": { "bgp_timer": "300", "bgp_eoiu": "false" },
+    "swss": {},
+    "teamd": {}
+  }
+}
+```
+
+该片段对应 `sonic-warm-restart.yang` 里 `WARM_RESTART_LIST` 以 `module` 为键、`module-name` 枚举含 `bgp`/`teamd`/`swss`/`system` 的结构，`bgp_timer` 取值范围 1 到 3600、`bgp_eoiu` 为布尔值；完整 schema 与写入方式见 04-05，字段解释见 05-09。配置只是外部意图，能否真正热重启仍取决于平台与版本（模块见 07-07 ｜ 参数见 04-05）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一类是能力边界陷阱，也是本篇最重要的一条。warm reboot、`warmrestart/`、多 ASIC 与 chassis 支持**受平台与版本限制**，不同 HWSKU、芯片与版本能力不同，不得宣称全平台无条件支持；内核与 ASIC 能否在进程重启期间保留转发表、厂商 SAI 能否维持对象句柄，都随机型变化，一律写「受平台与版本限制，需对照实际版本核验」（模块见 07-10 ｜ 原理见 06-12）。第二类是「重启完成即恢复完成」陷阱：`RESTARTCHECK` 返回 `READY` 只代表自检通过，进程重启完成只代表新进程起来，只有状态机走到 `RECONCILED`、`restore_count` 符合预期、各库表与 `show` 输出反映运行时结果，才算真正恢复；把任一步当成终点都会误判（排障见 08-03 ｜ 案例见 08-04）。
+
+第三类是事实纪律陷阱。`WarmStartHelper`、`AppRestartAssist`、`WarmRestartTable`、`SaiSwitch`、`ComparisonLogic` 这些类名与 `checkAndStart()`、`runRestoration()`、`reconcile()`、`setPreShutdown()`、`getWarmBootDiscoveredVids()` 等方法名在本快照可核验，但 `WarmStart` 完整状态枚举、`cache_state_t` 之外的状态语义、定时器取值、通道应答的完整字段与厂商 SAI 内部行为多来自不在本快照的 `sonic-swss-common` 或厂商实现，需对照实际版本核验；不确定的一律标注并给出 `warmrestart/`、`orchagent/`、`syncd/` 等可定位目录（字段见 05-09 ｜ 模块见 07-05）。第四类是 DB 编号与表名陷阱：Redis 库编号来自运行时 `database_config.json`，须对照 `sonic-py-swsssdk/src/swsssdk/dbconnector.py` 的 `SonicDBConfig` 核验，禁止写死；`WARM_RESTART_TABLE`、`WARM_RESTART_ENABLE_TABLE` 前缀可在 `show/warm_restart.py` 核验，但完整字段与状态取值需对照实际版本核验（参数见 04-04 ｜ 字段见 05-09）。
+
+第五类是自检参数陷阱。`orchagent_restart_check` 的 `-n / --noFreeze` 与 `-s / --skipPendingTaskCheck` 会改变冻结与检查行为：跳过 pending task 检查或强制不冻结，会让「自检成功」失去原本的确定性保障，非必要不使用；`-w`、`-r` 过小会因响应慢而误报超时，过大则拖长重启窗口，取值需结合机型实测（参数见 04-05 ｜ 基准方法见 08-01）。第六类是状态机陷阱：`RECONCILED` 之前的任何状态都表示恢复未收敛，若 `inProgress()` 长期为真、`state` 停在非 RECONCILED 值，往往意味着 `reconcile()` 卡在某张表的差异比对上，应按图 06-10-01 定位到具体阶段再查对应应用日志，而不是一律归咎硬件（原理见 06-10 ｜ 排障见 08-04）。第七类是配置陷阱：`WARM_RESTART` 表里某模块 `enable` 为 `false`、或计时器字段为 `NULL`，未必是错误，可能是该模块只用默认行为或未启用；判读要结合 `module-name` 枚举与 YANG schema，不能据单个字段下结论（参数见 04-05 ｜ 模块见 07-07）。
+
+最佳实践归纳为四条。其一，读代码时把路径写成 `upstream_src/` 下各子仓 `xxx-master/` 的相对路径，并同时给出对应类与方法（`WarmStartHelper::checkAndStart()`、`AppRestartAssist::reconcile()`、`orchagent_restart_check` 的 `RESTARTCHECK` 流程、`WarmRestartTable::setWarmShutdown()` 等），签名不确定就写「需对照实际版本核验」。其二，把任何一次「warm reboot 失败」都拆成图 06-10-01 的若干段，先判定停在哪一段（自检未 READY、停止未保留、恢复未加载、比对未收敛），再决定查哪个应用的日志与哪张库表，避免跳段判断。其三，命令、配置与输出按「前置检查、执行、验证输出、清理」闭环写，示例输出注明「示例输出，具体格式需对照实际版本核验」并附逐行判读。其四，跨册引用统一用四段式（字段见 05-09 ｜ 参数见 04-05 ｜ 原理见 06-05 ｜ 模块见 07-04），本篇涉及的 WARM_RESTART 字段写「字段见 05-09」、命令选项写「参数见 04-05」、syncd 视图恢复写「原理见 06-05」、warmrestart 模块写「模块见 07-03」，不在本篇展开字段表与参数全集。
+
+### 7. 小结与延伸阅读
+
+本篇把 warm reboot 的两阶段状态机讲透：重启前由 `orchagent_restart_check` 经 `RESTARTCHECK`/`RESTARTCHECKREPLY` 通知通道请求自检，orchagent 在清除 pending task 后回 `READY` 并冻结，syncd 侧 `WarmRestartTable` 记录预关机与热关机是否成功、内核与 ASIC 保留转发表；重启后 `WarmStartHelper` 经 `checkAndStart()` 把 FSM 推到 `WarmStart::INITIALIZED`，`runRestoration()` 加载旧状态、`insertRefreshMap()` 接收重放的新状态、`reconcile()` 用 `compareAllFV()` 比对差异并推进到 `RECONCILED`，`AppRestartAssist` 以 `cache_state_t` 完成同类的表级调和；syncd 侧 `SaiSwitch` 与 `ComparisonLogic` 用冷/热启动 VID 集合区分复用与重建。图 06-10-01 与四层落位表是回查索引；三条纪律贯穿全篇——warm reboot 受平台与版本限制、进程重启完成不等于状态恢复完成、状态枚举与定时器多不在本快照需核验。
+
+延伸阅读按疑问分流。想补流水线上游，接读 06-01（数据流总览）、06-04（orchagent 调度）、06-05（syncd 与 SAI 调用链）；想理解运行中状态如何被采集，接读 06-09（计数器、FlexCounter 与 telemetry）；想理解多芯片场景下的命名空间，接读 06-11（多 ASIC / chassis 与数据库命名空间）；想理解厂商适配边界，接读 06-12（平台驱动、SAI 适配与厂商实现边界）。字段随查走 05-09（platform.json、PORT_STATE 与 WARM_RESTART）与 05-06（syncd、ASIC_DB 与 FlexCounter），参数随查走 04-05（命令全集）与 04-04（DB 对象），模块能力走 07-03（sonic-swss / orchagent）、07-04（sonic-sairedis / syncd）与 07-07（sonic-mgmt-common、YANG 与 CVL），部署实战走 03-05（升级、warm reboot 与配置持久化），排障走 08-03、08-04。跨册引用请始终使用「字段见 05-xx ｜ 参数见 04-xx ｜ 原理见 06-xx ｜ 模块见 07-xx」的写法，`xx` 替换为具体篇号。
+
+最后重申资料纪律：本篇所有示例输出均注明「示例输出，具体格式需对照实际版本核验」；所有源码路径均相对各子仓 `xxx-master/` 根；类名、方法名、状态名与通道名可核验处直书其名，签名、完整状态枚举、定时器取值与厂商 SAI 行为不确定处均标注核验要求并给出 `warmrestart/`、`orchagent/`、`syncd/`、`show/` 等可定位目录；`sonic-swss-common` 与厂商 SAI 实现写「不在本快照，需对照实际版本核验」；warm reboot 能力写「受平台与版本限制，需对照实际版本核验」；性能、容量、时延与吞吐类结论一律标注「需在目标机型实测」。版本基准始终为「上游 master 快照（2026-11 抓取）」，不写绝对版本号与 Redis DB 编号。至此 06 册技术原理的分片 E 两篇收束：06-09 讲清了运行中计数与状态如何经 FlexCounter 采集、落库并对外供数，06-10 讲清了重启后如何借助状态机与表缓存把运行时状态无损带回，二者合起来构成「运行时状态如何产生、又如何在重启中存活」的完整闭环。
