@@ -182,3 +182,68 @@ sudo dnf install -y wireguard-tools
 无论哪种方法，装完都建议按同样的顺序验证：先 modprobe wireguard 加载模块，再 lsmod 确认在列，最后 wg --version 确认工具就绪。若内核太老又不便装模块，例如容器环境或没有 root 权限，可以退回到前面介绍的 wireguard-go 用户态实现，它只需要 /dev/net/tun，不依赖内核模块，代价是性能较低。
 
 需要说明，WireGuard 官方安装页只覆盖到 CentOS 7 与 8，未单独列出 CentOS Stream 与 Rocky、AlmaLinux；这些较新版本的结论来自其 5.14 内核已内置 WireGuard 这一事实，具体到某个发行版的包名与仓库地址，建议以该版本官方文档为准核验。
+
+## SUP-03 用户态与内核态的性能差异与取舍
+
+### 1. 三层实现的性能关系
+
+把三种主流实现放在一起比较需要先说明前提：性能差异只针对数据面加解密与封装转发，协议本身一致。在这个前提下，运行位置决定了性能层级。
+
+| 实现 | 运行位置 | 数据面性能 | 典型平台 |
+|---|---|---|---|
+| wireguard-linux | Linux 内核模块，5.6 起内置 | 最高 | Linux 桌面与服务器 |
+| wireguard-nt | Windows 原生内核驱动 | 最高（Windows 平台） | Windows 10/11、Server |
+| wireguard-go | 用户态进程 | 明显较低 | 跨平台，macOS/BSD/容器等 |
+
+也就是说，在 Linux 上 wireguard-linux 快于 wireguard-go，在 Windows 上 wireguard-nt 快于 wireguard-go。用户态实现并非协议更轻或更重，只是数据面被放在了用户进程里。
+
+### 2. 用户态更慢的根本原因
+
+差别来自每个数据包额外穿越用户态与内核态的边界。内核态路径中，应用流量进入内核网络栈后直接由内核模块完成加密与 UDP 封装再交给网卡，全程不离开内核，没有边界穿越。用户态路径中，内核先把包经 TUN 虚拟网卡交给 wireguard-go 进程，这是一次内核到用户态的拷贝；进程在用户态完成加解密后再通过 UDP socket 发回内核，这是第二次用户态到内核的拷贝。收发两个方向叠加，每个包要经历多次上下文切换与数据拷贝。
+
+下图把两条路径并列，标出用户态方案多出来的边界穿越点，这是性能差距的来源。
+
+:::figure id=SUP-03-01 | name=用户态与内核态路径的边界穿越差异 | dir=LR
+node k1 "应用" blue
+node k2 "内核网络栈" blue
+node k3 "内核模块加解密" green
+node k4 "网卡" gray
+edge k1 -> k2
+edge k2 -> k3
+edge k3 -> k4
+node u1 "应用" blue
+node u2 "内核 + TUN" blue
+node u3 "用户态加解密" amber
+node u4 "UDP socket 回内核" amber
+node u5 "网卡" gray
+edge u1 -> u2
+edge u2 -> u3 "穿越边界"
+edge u3 -> u4 "穿越边界"
+edge u4 -> u5
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：**内核态一行**为「应用 → 内核网络栈 → 内核模块加解密 → 网卡」，全程在内核；**用户态一行**为「应用 → 内核 + TUN → 用户态加解密 → UDP socket 回内核 → 网卡」，其中「内核 + TUN 到用户态加解密」和「用户态加解密到 UDP socket 回内核」两处标注了穿越边界，正是多出来的开销。
+
+小包、高并发场景下这种开销最明显，表现为 CPU 占用更高、吞吐更低。wireguard-go 官方文档对此的表述是内核模块 faster and better integrated into the OS，官方并未给出统一的性能倍数，具体差距取决于机型、包大小与负载，不宜套用某个固定数字。
+
+### 3. 不是优劣，而是取舍
+
+用户态更慢，换来的是内核态给不了的东西，两方面各有明确适用场景。
+
+| 维度 | 内核态实现 | 用户态 wireguard-go |
+|---|---|---|
+| 数据面性能 | 高，无边界穿越 | 较低，有边界穿越 |
+| 内核权限 | 需要加载内核模块 | 不需要，仅需 /dev/net/tun |
+| 部署环境 | 需可 insmod 的宿主机 | 容器、无 root、老内核均可 |
+| 系统集成 | NetworkManager、systemd-networkd 原生支持 | 需自行管理进程与接口 |
+| 跨平台一致性 | 各平台实现不同 | 一套代码跨多平台 |
+
+用户态的优势场景包括：容器或无内核模块权限的环境、老内核且不便装 DKMS、跨平台需要复用同一套实现、以及协议调试与研究。代价是性能损耗。内核态的优势是性能与操作系统集成度，适合有原生内核实现的 Linux 与 Windows 生产环境。
+
+### 4. 一个容易混淆的细节
+
+Windows 上有个常见误解需要澄清：官方 wireguard-windows 客户端内部确实使用了 wireguard-go 作为组件，但其数据面优先走 wireguard-nt 内核驱动。因此笼统地说 Windows 的 WireGuard 都是用户态并不准确。在 Linux 上若两种实现同时存在，内核模块也是默认路径，用户态需要显式用 wireguard-go wg0 启动。
+
+### 5. 小结
+
+在有原生内核实现的平台上，内核态是性能优先的默认选择，用户态是兼容性与权限受限时的退路；两者协议完全一致，差别只在数据面放在哪执行。这也是 SUP-01 中"官方不推荐 Linux 生产环境优先用 wireguard-go"这一结论的依据。
