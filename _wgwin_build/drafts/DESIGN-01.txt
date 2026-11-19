@@ -118,3 +118,53 @@ VPP 从 22.02 起就有 src/plugins/wireguard，基于 wireguard-openbsd 实现�
 5. 团队与周期：几个人、多久要出可用版本？
 
 这几点确定后，方案可收敛到一条具体技术路线，包括模块划分、加密流水线设计、性能验证方法，并可先做一份基准测试方案来量化"到底差多少才叫线速"。
+
+## DESIGN-02 两点澄清：多线程难度与 wireguard-openbsd 出处
+
+### 1. "单线程改多线程"难在哪
+
+先纠正一个可能的误解：它不是不能开多线程，而是协议状态的多线程安全尚未做完。难度属于中等偏上的工程问题，不是理论难题——IPsec 在同一套 VPP 框架里就做到了 production 加 MULTITHREAD，证明框架本身支持多线程。难点在 WireGuard 协议有一批共享可变状态，多线程下会相互冲突。
+
+下图给出从共享状态到改造点的完整逻辑。
+
+:::figure id=DESIGN-02-01 | name=WireGuard 协议状态与多线程扩展的冲突 | dir=LR
+node s1 "共享状态 会话密钥 握手 计数器" purple
+node s2 "多个 worker 同时读写" red
+node s3 "竞争与顺序 重放窗口须递增" red
+node s4 "加锁或无锁化改造" amber
+node f1 "会话表按 worker 分片" teal
+node f2 "重放窗口原子位图" teal
+node f3 "握手单线程集中处理" teal
+node f4 "加密上下文跨 worker 生命周期" teal
+edge s1 -> s2
+edge s2 -> s3
+edge s3 -> s4
+edge s4 -> f1
+edge s4 -> f2
+edge s4 -> f3
+edge s4 -> f4
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：起点「共享状态 会话密钥 握手 计数器」被「多个 worker 同时读写」，引发「竞争与顺序 重放窗口须递增」，解决办法是「加锁或无锁化改造」，具体落到四个改造点——「会话表按 worker 分片」「重放窗口原子位图」「握手单线程集中处理」「加密上下文跨 worker 生命周期」。
+
+逐点展开。其一，会话表按 worker 分片并配合 RSS 保序：WireGuard 是 peer 粒度的会话，同一 peer 的包必须落到同一 worker 才能正确维护序号，否则要额外的会话分片与哈希规则。其二，抗重放窗口无锁化：WireGuard 用滑动位图记录收到过的包序号并要求严格递增，并发更新必须用原子操作或无锁结构，OpenBSD 实现里用了 SMR 安全内存回收，直接加锁会把性能优势吃掉。其三，握手状态机集中在主线程做，数据线程只读会话密钥快照，需要读写分离与引用计数。其四，加密上下文生命周期，这正是 26.06 Gerrit 补丁在修的问题——异步加密时一个包把 crypto context 指针排进队列跨过 worker barrier，销毁线程可能在加密完成前就释放上下文，导致 use-after-free；补丁给每个在途包加引用计数，等最后一个完成再回收。
+
+所以准确说法是：多线程在工程上完全可做，但需要把协议状态逐处改造成并发安全，是若干个月的工作量且要处理大量边界条件。VPP 官方把插件标为 development、特性表里不列 MULTITHREAD，正是承认这项工作尚未收尾。
+
+### 2. wireguard-openbsd 是什么，为什么官方组织里找不到
+
+它确实存在，是 Jason Donenfeld（WireGuard 作者）维护的 OpenBSD 内核态实现，托管在 `git.zx2c4.com/wireguard-openbsd`，主仓库最后一次提交是 2021-10-26，已停更——因为 2020 年它就被合并进 OpenBSD 内核主线，独立仓库使命完成。
+
+在 GitHub 的 WireGuard 组织里找不到它是因为托管位置不同：GitHub 组织是镜像（每个仓库都标注 Mirror only），官方源在 `git.zx2c4.com`；而 wireguard-openbsd 只在 zx2c4 的 Git 服务上，没有对应的 GitHub 镜像。
+
+三个官方实现是同协议、不同平台的关系。
+
+| 实现 | 平台与运行态 | 现状 |
+|---|---|---|
+| wireguard-linux | Linux 内核态 | 5.6 起进内核主线 |
+| wireguard-openbsd | OpenBSD 内核态 | 6.6 起进内核主线，独立仓库停更于 2021 |
+| wireguard-go | 跨平台用户态 | 官方持续维护，macOS/BSD/容器等平台主力 |
+
+VPP 为什么选它做基座而不是 wireguard-linux：wireguard-openbsd 是内核态实现里结构最清晰、模块化最好、许可证最宽松的一份，没有 Linux 内核那套复杂依赖（tasklet、netlink、RCU、workqueue），更容易移植到 VPP 这种用户态数据面框架。Linux 版依赖内核设施太重，go 版是用户态进程模型，都不适合直接嵌进 VPP。这是取 kernel 实现之魂、弃 kernel 框架之壳的选择。
+
+需要注意时效性：VPP 当作基座的代码停留在 2021 年，所以其插件加密仍用 OpenSSL（curve25519、chachapoly1305），而非更高效的实现；官方改进清单第一条就是 Use all benefits of VPP-engine，这也解释了它离线速还有距离。
