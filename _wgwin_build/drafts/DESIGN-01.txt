@@ -1,0 +1,120 @@
+# 高性能用户态 VPN 数据面方案讨论（第一轮）
+
+> **文档性质**：方案讨论记录，持续迭代。本轮完成需求澄清与候选方案列举，待用户回答关键问题后收敛到具体技术路线。
+> **需求**：用户态加解密、高性能、目标达到网口线速，考虑 DPDK 或其他开源框架（如 VPP）。
+> **事实来源**：FD.io VPP 26.02 特性列表与 26.06 发布说明、VPP Gerrit 变更、WireGuard 官方资料。所有成熟度标注均引自官方文档，未做主观拔高。
+
+## DESIGN-01 需求澄清与候选方案
+
+### 1. 核心判断：线速是可达的，但瓶颈不在收包
+
+先给结论。线速目标可达，但成败不取决于"选 DPDK 还是 VPP"，而取决于三个更底层的决策：加密怎么加速、协议兼容性要求、报文如何进出用户态。
+
+一个容易被忽视的事实是：**加密才是瓶颈，报文 I/O 反而不是**。DPDK / VPP 的轮询模式收包做到百万 pps 是常规能力，但每个包都要过一遍 ChaCha20-Poly1305 或 AES-GCM（上下文初始化、批量提交、轮询完成、认证标签封装），CPU 很快被打满。因此方案设计的重心应放在加密流水线，而非收包框架。
+
+### 2. 先校准"线速"这个目标
+
+线速不是一个数字，而是速率与包长的组合，两者共同决定难度量级。
+
+| 端口速率 | 64B 小包 | 1500B 大包 |
+|---|---|---|
+| 10GbE | 14.88 Mpps | 0.81 Mpps |
+| 100GbE | 148.8 Mpps | 8.1 Mpps |
+
+加密开销按包计，所以小包线速比大包线速难一到两个数量级。必须先明确目标属于哪一档：1500B 大包 10G 线速，用 AES-NI 软件加密就有机会；64B 小包 100G 线速，纯软件基本无解，必须上硬件卸载。
+
+### 3. 三个必答决策点
+
+下图从线速目标倒推，依次经过三个决策，落到候选方案。
+
+:::figure id=DESIGN-01-01 | name=高性能用户态 VPN 方案决策树 | dir=TD
+node g "目标：N 乘 100G 线速" blue
+node d1 "决策1 加密加速方式" amber
+node d2 "决策2 协议兼容性" amber
+node d3 "决策3 报文进出模型" amber
+node pa "A VPP + IPsec 生产级" green
+node pb "B VPP + WireGuard" purple
+node pc "C DPDK 自研数据面" gray
+edge g -> d1
+edge d1 -> d2
+edge d2 -> d3
+edge d3 -> pa
+edge d3 -> pb
+edge d3 -> pc
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：起点是「目标：N 乘 100G 线速」，依次经过「决策1 加密加速方式」「决策2 协议兼容性」「决策3 报文进出模型」三个决策，最后分出三个方案分支——「A VPP + IPsec 生产级」「B VPP + WireGuard」「C DPDK 自研数据面」。
+
+**决策 1：加密靠什么加速**
+
+软件指令集路线（AES-NI / VAES）零额外成本，AES-GCM 在大包场景吞吐很高。Intel 的 IPSec-MB、ISA-L_crypto 是多缓冲实现，能把多个包的加密打包并行，吞吐显著高于逐个调用 OpenSSL；VPP 的 ipsecmb 引擎正是基于它。硬件卸载路线（Intel QAT / DPU / 智能网卡）在小包线速或 100G 以上场景几乎必需，DPDK 的 rte_cryptodev 抽象层直接支持 QAT 轮询模式驱动，代价是硬件成本与驱动适配。还有个隐藏变量：WireGuard 用的 ChaCha20-Poly1305 在无 AES 加速的 ARM 上比 AES-GCM 快，但在有 VAES 的 x86 上反而吃亏。
+
+**决策 2：要不要兼容标准协议**
+
+这是最大的分叉点。若要与现成 WireGuard / IPsec 客户端互通，就必须照协议实现；若两端都是自有设备，私有协议能省掉大量兼容性包袱（抗重放窗口、握手状态机、MTU 探测等），性能设计空间大得多。
+
+**决策 3：报文怎么进出用户态**
+
+DPDK 独占网卡是轮询模式、零拷贝、无中断，性能天花板最高，但网卡被独占，机器上其他网络栈用不了。AF_XDP 与内核共存，性能略低但运维友好。混合模式——控制面走内核 socket、数据面走 DPDK——是最常见的工程折中。
+
+### 4. 候选方案 A：VPP + IPsec（生产级路径）
+
+这是成熟度最高的路径。VPP 的 IPsec 标注为 production 且支持多线程，源码在 src/vnet/ipsec；三种加密引擎（Intel IPSecMB / OpenSSL / 原生实现）全部是 production，均支持 GCM 与 CBC；BFD、ACL、FIB 等配套能力齐全，FD.io 每季度 CSIT 报告提供公开性能基准，便于对照验证。
+
+- 优点：成熟度最高、开发量最小、多线程可扩展、有公开基准数据
+- 缺点：协议是 IPsec ESP 而非 WireGuard；IKEv2 插件仍为 experimental，密钥协商这一层需要额外投入或外接 strongSwan
+- 适用：能接受 IPsec、要尽快上线、追求稳妥线速——这是当前的首选生产路径
+
+### 5. 候选方案 B：VPP + WireGuard（协议正确但未成熟）
+
+VPP 从 22.02 起就有 src/plugins/wireguard，基于 wireguard-openbsd 实现。但成熟度标注为 development，特性列表中仅列 API 与 CLI 支持，未标注 MULTITHREAD——单线程是线速的硬伤。26.06 的 Gerrit 上仍在修异步加密的上下文生命周期问题，说明正处于活跃开发但未到生产状态。此外 26.06 发布说明里 wireguard_peer_add 已被标记为 deprecated，改为 v2，意味着跟随上游要承担 API 变更成本。
+
+- 优点：标准 WireGuard 互操作，ChaCha20-Poly1305 软件性能好，可直接复用 VPP 转发框架
+- 缺点：单线程限制线速；成熟度不足；异步加密仍在完善；上游 API 仍在演进
+- 适用：WireGuard 互通是硬需求且愿意投入力量推动上游成熟，或目标速率不高（如 10G 大包）时先做 POC 验证
+
+### 6. 候选方案 C：DPDK 自研数据面（性能天花板）
+
+用 DPDK 加 rte_cryptodev（软件 AES-NI 引擎或 QAT 硬件）与 ISA-L_crypto / IPSec-MB，从零搭建加密隧道数据面，控制面用 Go 或 Python 单独实现。
+
+- 优点：完全掌控流水线，可针对包长与会话模型极致优化；QAT 卸载下小包线速才有可能
+- 缺点：需自行实现会话表、抗重放、PMTUD、分片重组、keepalive、多核会话亲和、热升级等，工作量是 A / B 的数倍
+- 适用：协议私有或有特殊性能要求、团队有足够 C 与 DPDK 积累、且有硬件预算
+
+### 7. 补充方案 D：AF_XDP + 用户态加密
+
+如果网卡不能被独占是硬约束，AF_XDP 是折中方案——保留内核协议栈，数据面在用户态，运维简单，适合云原生与多租户环境。VPP 有 AF_XDP 驱动（experimental，Linux 5.4 以上）。性能低于纯 DPDK，但部署代价小得多。
+
+### 8. 核实的关键事实（官方口径）
+
+下表摘录 VPP 26.02 特性列表的成熟度标注，是方案选型的硬依据。
+
+| 特性 | 成熟度 | 支持 | 源码路径 |
+|---|---|---|---|
+| Wireguard protocol | development | API CLI | src/plugins/wireguard |
+| IP Security | production | API CLI MULTITHREAD | src/vnet/ipsec |
+| IPSec crypto engine · Intel IPSecMB | production | API CLI MULTITHREAD | src/crypto_engines/ipsecmb |
+| IPSec crypto engine · OpenSSL | production | API CLI MULTITHREAD | src/crypto_engines/openssl |
+| IPSec crypto engine · native | production | API CLI MULTITHREAD | src/crypto_engines/native |
+| ikev2 plugin | experimental | API CLI MULTITHREAD | src/plugins/ikev2 |
+| AF_XDP device driver | experimental | API CLI STATS MULTITHREAD | src/plugins/af_xdp |
+
+需要特别指出：WireGuard 插件标注为 development 且未列 MULTITHREAD，这与 IPsec 的 production 加 MULTITHREAD 形成鲜明对比。所谓"用 VPP 做到线速"和"用 VPP 跑 WireGuard 做到线速"是两件难度完全不同的事。
+
+### 9. 当前建议（待关键问题回答后收敛）
+
+建议先确认 WireGuard 互通是否为硬需求，再按下面三条路径分流。
+
+- 不是硬需求：选方案 A（VPP + IPsec），用 IPSecMB 引擎，先拿大包 10G / 25G 线速跑通，再评估是否上 QAT。风险最低、见效最快。
+- 是硬需求且目标不超过 10G：选方案 B 做 POC，验证单线程是否够用，同时跟踪上游多线程进展。
+- 是硬需求且目标 25G 以上小包：选方案 C，且必须配 QAT 或 DPU，纯软件加密做不到。
+
+### 10. 待用户确认的问题
+
+1. 协议：WireGuard 互通是硬需求，还是只要"用户态加密隧道"即可？对端是自有设备还是标准客户端？
+2. 速率与包长：目标多少 G？典型包长是 1500B 大包还是 IMIX / 小包为主？
+3. 硬件：能否接受 QAT 卡或 DPU？CPU 是什么代次（有无 VAES / AVX-512）？
+4. 部署：物理机独占网卡可以吗，还是要与现有业务共用？
+5. 团队与周期：几个人、多久要出可用版本？
+
+这几点确定后，方案可收敛到一条具体技术路线，包括模块划分、加密流水线设计、性能验证方法，并可先做一份基准测试方案来量化"到底差多少才叫线速"。
