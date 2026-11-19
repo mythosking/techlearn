@@ -103,6 +103,16 @@
 | 内联元数据 | `u32 opaque[N];` `opaque2[N];` | 供上层模块复用的通用存储槽 | 通过 `vnet_buffer(b)` 等宏强转为具体结构 | 05-04 05-08 |
 | 引用计数 | `u16 ref_count;` `u32 locks;` | 共享对象的生命周期计数 | 归零才真正释放，克隆只加计数 | 05-04 05-07 |
 
+#### 3.4 跨篇字段联动的阅读范式
+
+前面三小节给出的是「读单个字段」的工具，本小节补上「读字段之间关系」的方法，这是把本篇索引表真正用起来的关键。先看一条最常见的联动链：`clib_error_t` 的 `what` / `message` 是 vec 字符串，`code` 是标量错误码，分别对应控制面 API 回复里的文本与数值；而 `vlib_error_t` 的 `node_index` 段与 `code` 段走的是完全不同的路径——后者被编码进 `vlib_buffer_t.error`（见 05-04），再由 `show errors` 反解成节点名与错误字符串（命令见 04-06）。同为「错误」，一个走 vec 生命周期、一个走位编码，读者若把两者混为一谈，就会误以为 `clib_error_free` 能释放 buffer 里那一个字节。本篇索引表正是用来防止这类串台：遇到错误字段先在「结构体 → 06 / 07 篇目」表定位它属于哪一层，再决定用哪套释放或判读纪律。
+
+第二条范式是「通用字段模式」的跨篇复现。引用计数模式在 05-04 的 `ref_count`、05-06 的 `vnet_config_t.reference_count`、05-07 的 `fib_node_t.fn_locks`、05-11 的 SA 锁计数里反复出现，语义始终是归零才释放、克隆只加计数；池索引模式则贯穿 `sw_if_index`（05-05）、`dpoi_index`（05-07）、`dev_instance`（05-11）。阅读时不必逐篇重学，只要确认该字段在本篇表里属于哪种模式，就能直接套用本篇 3.3 的阅读要点，再回对应篇核对具体类型与版本差异。反过来，若在某一篇遇到没见过的字段模式，也应先回到本篇 3.3 的字典看它能否归入既有类别，而不是凭直觉猜它是下标还是指针。
+
+生命周期维度上，本篇元结构可分三类。`clib_error_t` 是短命对象，随一次失败路径构造、经 API 回复后立即释放；注册项 `xxx_registration_t` 与 `vlib_node_t` 是长命对象，编译期生成或初始化期写定、运行期只读、进程退出才消失；承载热字段的 `vlib_buffer_t`、`vlib_node_runtime_t`（见 05-03 / 05-04）则是第三种节奏——分配后常驻池，每个报文读写、用毕归还而非销毁。判定某字段属于哪一类，看字段表「读写时机」列即可：出现构造时或失败路径多为第一类，出现编译期赋值或初始化写多为第二类，出现每次 dispatch 或每包读写则一定是第三类。三类字段的调试手段也不同：第一类看 API 回复与释放是否漏调，第二类看 `pahole` 布局与注册宏展开，第三类看 `show runtime` / `show buffers` 与 gdb 热字段采样（命令见 04-06）。
+
+最后是边界条件。本篇反复标注「需对照实际版本核验」的字段，风险不在字段本身而在跨版本照抄：flags bit、结构是否内嵌、类型取 u32 还是 uword，任一处漂移都会让按字节解析的代码错位。因此凡涉及具体 bit 值或默认值的结论，一律以本地 `rg` 与 `pahole -C <类型>` 的结果为准（核验方法见本篇第 5 节）；本篇只回答「该往哪个方向想、该去哪一册查」，不替代源码真值，也不展开这些字段参与的机制流程（原理见 06-xx）。
+
 ### 4. 内存布局与缓存行对齐
 
 VPP 对结构体布局的讲究，几乎全部源于一个事实：数据面每包只有几十纳秒预算，**一次 cache miss 的代价远大于几十条指令**。因此阅读任何 VPP 结构体字段，都不能只看「这个字段是什么」，还要看「它落在第几个 cache line、和谁挨着、是不是被多线程写」。
@@ -297,6 +307,18 @@ edge plug -> refs dashed "命令见 04"
 | `elog_track` / 统计 | `elog_track_t` / 计数 | 该 worker 的事件跟踪与统计 | src/vlib/threads.h | 事件发生时写 | `show threads`（命令见 04-06）判读 | 需对照实际版本核验 |
 
 字段解读：这一层是「每 worker 的档案」，主要是名字、绑核、状态与统计，通常不参与报文转发本身。阅读 `show threads` 输出时，各列基本能一一对应到这里的字段；命令全参数见 04-06，本篇不重列。
+
+#### 3.5 主结构字段的联动关系与生命周期
+
+本节把前面四张字段表串起来，回答一个表内看不出的问题：这些字段在进程的一生中谁写、谁读、何时生效。先讲时间组的联动。`clib_time` 在初始化阶段由 `clib_time_init` 校准一次，之后 `cpu_time_reference` 与 `time_last_dispatch` 每轮主循环更新，`main_loop_count` 每轮自增；三者配合 `quantum` 为协作式调度提供「现在是什么时刻、本轮跑了多久」的依据（原理见 06-05）。注意 `clib_time` 是换算基准而非墙上时钟，任何把它直接当时间戳的解释都是错的，必须经 `vlib_time_now` / `clib_time_now` 换算。这组字段全部位于 `cacheline0`，因为 input 节点与调度器每包都要读时间。
+
+再讲身份组与子系统挂载组的分工。`thread_index` 与 `n_vlib_mains` 在线程初始化后基本只读，`vlib_get_main()` 靠前者定位当前线程的那一份 `vlib_main_t` 副本；而 `node_main`、`elog_main`、`pending_frames` 与 buffer 关联字段只是「入口」——字段本身是一个内嵌结构、指针或下标，真正的数据在 05-03（节点与帧）、05-04（缓冲池）、05-10（事件日志）里。因此改动这些字段不会改变子系统行为，只会改变「从哪里找到子系统」；想改节点行为应走 feature arc（05-06），想改缓冲池容量应改 startup.conf（命令见 04-01）。`vlib_thread_main_t.nthreads` / `workers` 与 `vlib_main_t.n_vlib_mains` 之间存在口径冗余，是否把 main 线程算进去在版本间有差异，拿它们做数组上界前必须本地核验。
+
+生命周期上，这三大件可分为三个时段。进程启动段：`vlib_main_t` 数组按「main + worker 数」一次性分配，通常落在共享堆或每线程堆（见 05-10），`clib_time` 校准、`thread_index` 写入、`node_main` 内嵌初始化、`vlib_worker_thread_t` 的 `name` / `cpu_id` 由 `vlib_launch_worker_thread` 填充。运行段：热字段被反复读写，`main_loop_count` 与统计计数只增不减，`elog_main` 在事件发生时追加，`pending_frames` 在 dispatch 前后入队出队（原理见 06-07）；这一段里除计数与队列外，其余字段基本冻结。销毁段：进程常驻，这些结构不单独释放，worker 退出时由线程管理入口回收其私有数据；因此「往 `vlib_main_t` 里加字段」要极为审慎——它是每线程副本，加八个字节就乘以 worker 数，落在热区还会被所有报文路径命中。
+
+失败模式与边界条件有四类值得单列。其一，在 worker 上下文里直接写 `vlib_global_main`，以为改的是本线程副本，结果造成跨线程共享状态污染；正确做法是一律 `vlib_get_main()->...`，全局配置变更必须走 barrier 与远程过程调用（原理见 06-06 / 06-07）。其二，把 `n_vlib_mains` 当 worker 数、把 `workers` 长度当线程上界，口径不同会越界。其三，手工 `memcpy` 一段 `sizeof(vlib_main_t)`，忽略其中的 cacheline mark 填充与内嵌大结构，必然错位。其四，`clib_spinlock_t` / `volatile` 计数（见 05-10）在 barrier 期间读写，只靠 `volatile` 而不配内存屏障，在弱内存序平台上可见性无法保证。`show runtime` / `show threads` / `show vlib memory` 分别对应本篇与 05-03 / 05-10 的字段落地（命令见 04-06），是验证上述联动是否与预期一致的最快手段；字段类型与成员名仍以 `src/vlib/main.h`、`src/vlib/threads.h` 为准（需对照实际版本核验）。
+
+读这些字段时还要建立一个并发视角。`vlib_main_t` 是每线程副本，热区里的计时与计数由本线程独占写，理论上不需要锁；但全局单例、事件日志与缓冲池主结构是进程级共享，worker 若绕过本线程副本去写它们，就会与主线程或其他 worker 形成数据竞争。判断一个字段是否安全，先看它在字段表里被标成每线程一份还是全局单例，再看读写时机列是否出现每轮自增、事件发生时写这类并发写入描述。凡是跨线程共享且会被写的字段，要么通过每线程副本隔离，要么经过屏障与远程过程调用序列化（原理见 06-06 / 06-07），不能依赖编译器的默认行为保证正确性。把这个视角带进调试器：同一时刻打印两个 worker 的循环计数，若读数差异过大，说明线程配置或绑核与预期不符，应先回到线程拓扑字段核对，而不是直接怀疑计数器损坏。
 
 ### 4. 内存布局与缓存行对齐
 
@@ -535,6 +557,20 @@ edge tm -> mains dashed "线程数口径"
 
 字段解读：`vlib_node_main_t` 内嵌于 `vlib_main_t.node_main`（见 05-02），是「节点 + 帧 + 边 + 注册项 + pending 队列」五大池的总目录。它自身是冷结构，字段多为池指针/哈希表；真正的高频访问都落在它指向的 `vlib_node_runtime_t` 与 `vlib_frame_t` 上。
 
+#### 3.7 节点与帧字段的联动关系和生命周期
+
+本节把静态描述与运行态两条线合起来看。字段的源头是 `vlib_node_registration_t`：它的 `function` / `name` / `type` 在编译期写定，`scalar_size` 与 `vector_size` 决定帧里标量区与向量区怎么切分，`n_errors` / `error_strings` 供 `show errors` 反查（命令见 04-06），`next_node_names` 在建图时转成 `vlib_node_t.next_nodes` 里的 `u32` 索引。初始化时这些值被拷进 `vlib_node_t`，后者成为运行期只读的「说明书」；真正的「工作台」是 `vlib_node_runtime_t`，它的 `function` 指针才是 dispatch 实际调用的入口，`node_index` 回指 `vlib_node_t.index`，`scalar_size` / `vector_size` 是从静态描述冗余缓存来的，免得每次都回查大结构。想换处理函数而只改 `vlib_node_t.function` 不会生效，必须改注册项或走多架构选择 `node_fn_registrations`（原理见 06-02 / 06-05）。
+
+帧与运行态的联动靠三组索引。`vlib_frame_t` 的 `scalar_offset` 与 `vector_offset` 把 `arguments` 柔性区切成两段，向量区每个元素是 `u32 buffer_index`（见 05-04）；`vlib_node_runtime_t.next_frames` / `next_frame_index` 决定这批索引下一跳送到哪个 `vlib_frame_t`，`cached_next_index` 缓存上次选择以加速同去向批量转发。`vlib_pending_frame_t` 则把「哪个帧、交给哪个 runtime、从哪条边来」压成 `frame_index` / `node_runtime_index` / `next_frame_index` 三个 `u32`；这三个字段与帧池、runtime 数组、next_frames 池一一对应，机制上如何按优先级入队属 06-07，本篇只给字段对应关系。`vlib_node_main_t` 是上述五个池的总目录：`nodes`、`node_runtimes`、`frames`、`next_frames`、`pending_frames` 分别给出入口，`node_by_name` / `nodes_by_type` 是注册期建立的索引视图。
+
+生命周期分三段。初始化段：构造函数遍历 linker section 里的 `vlib_node_registration_t`，`vlib_register_all_nodes` 建 `vlib_node_t` 池与 `node_by_name` 哈希，按 `type` 分组进 `nodes_by_type`；线程初始化时按「线程数 × 节点数」铺开 `vlib_node_runtime_t` 数组，`runtime_data_bytes` 决定尾部柔性区 `runtime_data` 的长度，`next_frames` 在建图时填好。运行段：每个 dispatch 读写 `function` / `cached_next_index` / `flags`，累加 `calls` / `vectors` / `clocks` / `max_clock`；`state` 由控制面经 `vlib_node_set_state` 切换，`suspends` 只在 process 节点挂起时变化。销毁段：这些池与数组全程常驻，不逐帧释放；帧从 `frames` 池借出、用毕归还，`clear runtime`（命令见 04-06）只把统计字段清零而不动结构。
+
+失败模式与边界条件：`frame_index` / `buffer_index` / `node_runtime_index` 全是池下标而非地址，用 `vlib_get_frame` / `vlib_get_buffer` / `vlib_get_node_runtime` 换算，拿 `~0` 去取值会越界；`arguments` 是零长数组，`sizeof(vlib_frame_t)` 不含它，写循环上界要用 `frame_size` 或 `vlib_frame_n_vectors` 而非结构体大小；跨版本照抄 `calls` / `vectors` 的类型（u32 还是 u64）、`pending_frames` 挂在 `vlib_main_t` 还是 `vlib_node_main_t`、`vlib_frame_t` 是否有显式 `n_vectors`，都会让解析错位，须以 `pahole -C <类型>` 与 `src/vlib/node.h` 核验（需对照实际版本核验）。`show runtime` 的 Calls / Vectors / Clocks 列即本节统计字段的直接格式化，用它和 gdb 打印的 `runtime->vectors` 对照，是验证字段映射的最快方法（命令见 04-06）。
+
+把字段表读成一张生产者与消费者的关系图，能解释许多看似矛盾的读写时机。注册项由编译期产生、初始化期消费；静态描述由注册流程产生、建图流程消费；运行时数据与帧由上游节点填写、下游节点消费；统计字段由调度累加、由展示命令消费。每一对生产与消费之间都靠一个索引衔接：节点名经名字哈希换成节点索引，节点索引换成运行时索引，运行时索引与下一跳索引换成帧索引，帧索引再换成帧向量里的缓冲区索引。沿着这条链自问这个值是谁写的、谁在读、中间经过几次换算，就能判断某个字段为空或异常时该往上游查还是往下游查。例如统计计数有值但报文不转发，说明节点被调用过而下一跳字段配置有误，应核对帧边数组与缓存的下一跳索引，而不是继续盯着计数器。
+
+另一条值得强调的边界是热字段与冷字段的判读顺序。展示命令输出的是累加结果，适合看长期趋势；调试器直接打印运行时结构看到的是瞬时值，适合看某一次调度后的状态。两者不一致不等于字段损坏：展示命令读的是本线程副本，而调试器若打印的是另一个线程的运行时数组，取值自然不同。多 worker 环境下，运行时结构按线程各有一份，打印前必须先确认线程下标，再把该下标对应的结构作为判读对象。统计字段在版本间有宽度差异，类型从短整数扩到长整数时旧脚本的解析会错位，写自动化判读工具前应用布局核对命令确认成员偏移与大小（需对照实际版本核验）。
+
 ### 4. 内存布局与缓存行对齐
 
 本篇三个热结构的缓存行设计构成一条完整链路：`vlib_node_runtime_t` 用两个 cacheline mark 把「dispatch 热字段」与「统计冷字段」分开；`vlib_frame_t` 用 `scalar_offset` / `vector_offset` 保证向量区按 `VLIB_FRAME_VECTOR_ALIGN`（通常按 `u32`/字长）对齐，使 `u32 buffer_index[]` 能被 SIMD/批量循环按顺序装载；`vlib_pending_frame_t` 则刻意压到十几个字节、无对齐填充，以便在队列里紧密排布、一次 cache line 能装下好几个待调度项。
@@ -759,6 +795,20 @@ vlib_buffer_template_t tmpl = {
 | 全局统计 | `u64` 计数 | 分配/释放/丢包计数 | src/vlib/buffer.h | 分配回收时 | `show buffers` `show memory`（命令见 04-06） | 需核验 |
 
 字段解读：`vlib_buffer_main` 是全局单例（05-02 里通过 `vlib_global_main` 关联），是「所有池 + 每线程缓存 + 模板 + 统计」的总目录。它自身是冷结构；高频路径走的是它指向的 per-thread 空闲缓存与 `vlib_buffer_t` 本身。
+
+#### 3.6 buffer 字段的联动关系、生命周期与边界条件
+
+本节回答字段表难以直观看出的三件事：一个 buffer 从生到死哪些字段被谁改，opaque 的多视图如何在各层之间传递，以及哪些字段组合是高频误用点。先看生命周期。`vlib_buffer_template_t` 在池初始化时预置 `flags` / `current_config_index` / `ref_count` / `buffer_pool_index` 等初值，分配时由 `vlib_buffer_alloc_from_pool` 整段复制到新 buffer 的元数据头，所以一个刚分配出来的 buffer，`ref_count` 已经是 1、`buffer_pool_index` 已指向正确的池。运行期 `current_data` 和 `current_length` 随每层 prepend / 剥离协议头、链式拼接而变；`flags` 在全生命周期反复读写；`trace_index` 仅在开启 packet trace 时写入。释放走 `vlib_buffer_free`，它先按 `ref_count` 判断是否为克隆：大于 1 时只减计数，归零才按 `buffer_pool_index` 找回 `vlib_buffer_pool_t` 归还，free list 由 `lock` 保护（机制见 06-09）。buffer 不逐包销毁，而是借出—归还循环，这正是「索引即身份」的前提。
+
+再看 opaque 多视图的联动。同一段 `u32 opaque[N]`，在 vlib 层被具名解释为 `current_config_index` / `ref_count` / `buffer_pool_index` / `error`，在 vnet 层又被 `vnet_buffer(b)` 强转成 `vnet_buffer_opaque_t`（含 `sw_if_index[VLIB_RX/TX]` 与 L2/L3 上下文，见 05-08）。`current_config_index` 是这条联动链的关键：它由 05-06 的 feature 配置在 input 节点写入，决定该报文沿哪条 config string 跑特性；`error` 则承载 05-01 的 `vlib_error_t` 低位编码，丢包时由 `vlib_error_set` 写入、由 `show errors` 反解。三者共用同一段内存却属于不同层，随意覆盖 `opaque` 前几个 `u32` 会同时破坏特性链、释放归属与错误统计，插件扩展应使用约定的 `opaque2` 或 `vnet_buffer` 槽位。
+
+池与主结构的联动体现为两级索引。`vlib_buffer_main_t.buffer_pools` 是全局数组，按 NUMA 分出多个 `vlib_buffer_pool_t`；每个池的 `index` 与 buffer 内的 `buffer_pool_index` 互为校验，`start` + `size` + `buffer_index` 换算出 `vlib_buffer_t *`，而 `n_buffers` / `n_alloc` / free list 描述占用情况；`available_buffers` 是每线程本地缓存，用来减少多核对全局 `lock` 的争用（机制见 06-09）。`physmem_map_index` 把池关联到 05-10 的物理内存映射，`numa_node` 决定它落在哪个 NUMA 节点。`show buffers` 的 Size / n_buffers / available 列就是这些字段的格式化（命令见 04-06）。
+
+失败模式与边界条件集中在四处。一，把 `buffer_index` 或 `next_buffer` 当指针，必须用 `vlib_get_buffer` 换算，`~0` 表示链尾。二，自己用 `b->data + b->current_data` 算报文指针，忽略 `current_data` 为负时 headroom 的存在，应统一走 `vlib_buffer_get_current`。三，克隆后重复 `vlib_buffer_free`，绕过 `ref_count` 破坏 free list。四，跨版本照抄 flags bit 与 `opaque[10]` 长度——`opaque2` 在部分版本不存在，`pre_data` 可能在结构体尾部，布局以 `pahole -C vlib_buffer_t` 和 `src/vlib/buffer.h` / `src/vnet/buffer.h` 为准（需对照实际版本核验）。若 `current_data` 为负说明已消耗 headroom，若 `flags` 中 traced 位未置则 `trace_index` 无意义，这类组合判读是 trace 排错的基本功（命令见 04-06）。
+
+从字段联动的角度看，一个报文在 VPP 里的身份始终是两个数：帧向量里的下标记与缓冲区自己的池下标记，而不是数据指针。当前数据偏移只是这段内存内部的游标，各层协议头通过改变它实现零拷贝的封装与解封装；当前长度记录本段有效字节数；链式字段在分片时把多段串起来，链尾用无效值标识。理解这一点，就明白为什么整条转发链上没有任何地方去拷贝报文数据，变的只是游标、长度与元数据字段。反过来，任何试图按数据指针跨节点追踪报文的做法都会失败，因为指针从未在节点之间传递，节点之间传递的只是那个整数下标记。
+
+缓冲池字段还牵出一个容量边界。池内总数是固定容量，可用数与每线程缓存决定还能分配多少；当可用数长期接近零时，新报文会因分配失败被丢弃，这类丢包在池状态输出里表现为可用数触底，而不是错误计数增长。所属池编号在此时尤为关键：多 NUMA 池场景下，一个 worker 若反复从远端池分配，会增加跨节点内存访问，性能下降却不一定报错，须结合节点归属与绑核配置一起判读（原理见 06-04）。物理内存映射关联的映射决定了大页与设备直接内存访问的可用性，网卡设备的内存池与之相连，池创建失败往往源于大页不足而不是参数写错。核验时把池状态输出的容量列、内存占用的总量与调试器里的池字段三者对照，才能区分池太小、缓存没回收与映射未建立这三类问题（命令见 04-06）。
 
 ### 4. 内存布局与缓存行对齐
 
@@ -1007,6 +1057,22 @@ VPP 的接口模型有一对核心概念必须靠字段讲清：**hw interface �
 
 字段解读：与 device class 管「收发」不同，hw interface class 管「链路层头怎么填」。`build_rewrite` 是三层转发（05-07 的 `ip_adjacency_t`）构造二层头时回调的入口——理解它，就能把本篇与 05-07 连起来：邻接表里的 rewrite 数据，本质是这张类的 `build_rewrite` 按具体 MAC/VLAN 生成后存下来的字节串。
 
+#### 3.7 接口索引体系的联动关系、生命周期与边界
+
+本节把 hw/sw 两套索引与两张回调表串成一张可检索的网。先看索引联动。`vnet_interface_main_t.hw_interfaces` 与 `sw_interfaces` 是两个 pool，`hw_if_index` / `sw_if_index` 是各自的下标，遵循 05-09 的池语义（`pool_elt_at_index`、`~0` 无效）。一个 hw interface 通过 `sw_if_index` 指向它的主逻辑接口；子接口只在 `sw_interfaces` 里新增一项，用 `sup_sw_if_index` 指回主接口，`sub` 联合保存 VLAN id 与内外层 tag，不新增 hw interface。`sw_if_index_by_sup_sw_if_index` 建立父到子的映射，`hw_interface_class_by_name` / `device_class_by_name` 把类名换算成 `hw_class_index` / `dev_class_index`，`interface_tags_by_sw_if_index` 供 CLI 按名字解析（命令见 04-03）。记住一条铁律：能配 IP、挂 feature、进 FIB 的是 sw interface（见 05-06 / 05-07），只有设备级操作与 `show hardware` 才用 hw_if_index。
+
+第二组联动是两张回调表与设备实例。`vnet_hw_interface_t.dev_class_index` 指向 `vnet_device_class_t`，其 `tx_function` 是发包入口；`hw_class_index` 指向 `vnet_hw_interface_class_t`，其 `build_rewrite` 构造二层头字节串，落到 05-07 的 `ip_adjacency_t.rewrite_header`。插件把自定义设备接进 vnet 时，正是靠 `dev_class_index + dev_instance` 这对二元组从自己的全局数组里取回私有数据（05-11 的 `dpdk_device_t` 即如此），`hw_class_index + hw_instance` 则定位链路类型实例。`flags` 与较新版本的 `caps` 记录接口状态与硬件能力，由 `set interface state` / `set interface offload` 触发写入（命令见 04-03）；`link_speed` 由驱动在链路变化时更新。`admin_up_down_function` / `clear_counters_function` / `format_device_name` / `format_tx_trace` 是驱动实现或可选实现的回调。
+
+生命周期分三段。初始化段：`vnet_device_class_t` 与 `vnet_hw_interface_class_t` 由 `VNET_DEVICE_CLASS` / `VNET_HW_INTERFACE_CLASS` 宏在插件加载时注册，字段以函数指针为主、注册后只读（原理见 06-11）；接口创建时由 `vnet_register_hw_interface` / `vnet_create_sw_interface` 填 `name` / `dev_instance` / `tx_node_index` / `type` 等，子接口另经 `vnet_create_sub_interface` 写 `sup_sw_if_index` 与 `sub`。运行段：`flags` / `caps` / `link_speed` / `description` 随 CLI 与链路事件更新，`name` / `tag` 随配置改动；`tx_node_index` 与 `dev_instance` 在发包热路径被读取，用于找发送节点与设备实例（原理见 06-02）。销毁段：接口删除时从两个 pool 释放对应项、清理名称 hash 与 tag 映射；两张回调表随进程常驻不释放。
+
+失败模式与边界条件：其一，把池索引当指针——取地址必须走 `vnet_get_hw_interface` / `vnet_get_sw_interface`，接口名是 vec 字符串不是 `char *` 常量，释放走 vec 接口。其二，以为子接口有独立 hw interface，结果把子接口的 `sw_if_index` 当 `hw_if_index` 用，作用到错误对象。其三，跨版本照抄 flags bit——`VNET_HW_INTERFACE_FLAG_*` / `VNET_SW_INTERFACE_FLAG_*` 的位定义与 `caps` 收敛关系变化大，须 `rg` 本地宏。其四，`sub` 联合成员名随版本漂移最剧，写子接口代码前用 `pahole -C vnet_sw_interface_t` 核对（需对照实际版本核验）。`show interface` 的 Idx 列是 sw_if_index、State 列来自 `flags`，`show hardware` 看 hw_if_index，把两处输出与 gdb 里的 `sup_sw_if_index` 一起看，才能确认父子链是否正确（命令见 04-03 / 04-06）。
+
+接口字段的判读有一条实用顺序：先定软件接口索引，再回溯硬件接口索引，最后核对两张回调表。原因是绝大多数配置与转发状态都以软件接口索引为键——IP 地址表、VRF 绑定、特性配置（05-06）、转发出接口（05-07）、访问控制绑定（05-12）都落在这一个整数上；硬件接口索引只在设备级操作与硬件展示里出现。把这两个索引在心里分属两张表，是避免配置没生效类误判的第一步。接口展示输出的序号列是前者，硬件展示的序号列是后者，同一块物理口在两处的编号常常不同，打印字段时务必注明取自硬件接口池还是软件接口池。
+
+子接口的字段联动尤其容易出错。创建子接口只在软件接口池新增一项，父接口索引指回主接口，子接口联合记录 VLAN 标识与匹配方式；它共享主接口的硬件接口索引、设备实例与发送节点，没有独立的硬件接口。因此在子接口上配置二层或三层参数时，真正被改写的是这一项软件接口的标志位与关联配置，而不是新建设备。若把子接口的软件索引误当硬件索引传给设备级入口，操作会作用到编号恰好相同的另一块设备或返回无效索引，症状是命令成功但现象不对。核对父子链最稳妥的方法是在调试器里同时打印主接口的软件索引与子接口的父接口索引，再与接口展示输出对照（命令见 04-03 / 04-06）。
+
+能力位与状态位的区别也值得写清。标志位表达当前状态，如接口是否启用、是否混杂模式，由起停与配置命令直接改写；能力位表达硬件能力，如各类卸载是否可用，由能力协商阶段写定，运行期一般只读。把能力位当状态位去手工置位，不会真的启用对应的硬件功能，反而可能让后续协商逻辑读到矛盾值。较新版本把散落的标志收敛为统一的能力类型，字段名与位定义变化较大，判断某一位含义只能查本地头文件里的宏定义，不能照抄旧版本笔记。设备类与链路类两张表是只读注册表，字段以函数指针为主，进程启动后冻结；插件若漏实现某个回调，接口在正常展示里看不出异常，却在发包或起停时失效，这类问题应回查回调表字段而不是接口实例字段（原理见 06-11）。
+
 ### 4. 内存布局与缓存行对齐
 
 接口结构体整体属于「控制面/低频」数据，不像 `vlib_buffer_t`（05-04）那样有严苛的 cacheline 热区设计。但仍有两个布局要点值得读准。
@@ -1223,6 +1289,20 @@ Feature Arc 的结构分三层：弧定义、特性注册、运行期配置。�
 | `current_config_index`（每报文） | `u32`（在 buffer opaque，见 05-04） | 报文携带的当前配置索引，随转发推进可能前移 | src/vlib/buffer.h | input 写、feature 节点读/推进 | `vnet_get_config_data`（入口） | 字段名见 05-04 |
 
 字段解读：三者是「同一套配置在三个粒度上的投影」——接口级位图（谁开了什么）→ 接口级 `config_index`（组合后的配置）→ 报文级 `current_config_index`（这个包正跑到链的哪一步）。理解这个投影关系，比死记任何单个字段都重要。
+
+#### 3.6 feature 字段的联动关系、生命周期与边界
+
+本节沿索引链把静态注册、接口配置与报文携带三层字段串起来。先看注册层如何汇入弧。`vnet_feature_registration_t` 的 `arc_name` / `node_name` 定位「挂在哪条弧的哪个节点」，`runs_before` / `runs_after` 给出偏序约束（排序机制见 06-03），`feature_index` 是初始化后分配、在该弧内的位序号，`n_next_nodes` / `next_node_names` 描述该 feature 节点的出边。初始化时这些注册项挂进 `vnet_feature_arc_t.feature_registrations`，经排序写入 `features` 数组——下标即 `feature_index`，`feature_index_by_name` 是名字到位号的哈希，`n_features` 记录总数，`start_nodes` / `end_node` 界定弧的首尾。注意弧名与图节点名是两个命名空间：`ip4-unicast` 是弧，`ip4-lookup` 是节点（见 05-03）。
+
+第二层是「位图 → 配置串 → 索引」的翻译。`vnet_feature_config_main_t.feature_bitmap_by_sw_if_index` 记录每个 sw_if_index（05-05）启用了哪些 feature，按 `feature_index` 置位；`feature_count_by_sw_if_index` 用于快速判定空链。启停时由 `vnet_feature_enable_disable` 重建配置：把置位的 feature 依 `features` 次序拼成 `config_string`，存进 `vnet_config_main_t.config_string_heap`，并用 `config_string_hash` 按内容去重——相同组合只生成一份 `vnet_config_t`，靠 `reference_count` 记录多少接口共享。`config_index_by_sw_if_index` 保存每接口最终生效的 `config_index`，它只是 `config_pool` 的下标；`config_string` 指向堆里的字节串，`features` / 位图是配置包含哪些 feature 的视图，`next` 用于池管理。
+
+第三层是报文级投影。`current_config_index` 位于 `vlib_buffer_t.opaque`（见 05-04），input 节点把 `config_index_by_sw_if_index[sw_if_index]` 搬进来，后续 feature 节点据此查 `config_pool[config_index].config_string` 决定下一跳；随转发推进，这个值可能前移到配置串的后段。三层是「同一套配置在三个粒度上的投影」，理解它比死记单个字段更重要。
+
+生命周期与边界条件：注册项编译期生成、初始化期读、运行期只读；`vnet_config_t` 由启停操作增删，`reference_count` 归零才回收（与 05-04 的 `ref_count`、05-07 的 `fn_locks` 同属引用计数模式，见 05-01）。配置变更只影响之后到达的报文，已在途的报文仍持旧 `current_config_index`，存在正常的旧配置窗口。失败模式有四类：把 `config_index`（池下标）当 `feature_index`（弧内位号），二者都是小整数却分属两套命名空间；用 hw_if_index 而非 sw_if_index 去索引 `config_index_by_sw_if_index`；手工改写报文的 `current_config_index` 让 feature 节点跳到不存在的 next 槽位；跨版本照抄 `vnet_feature_arc_t` / `vnet_config_main_t` 成员名与容器形态。启停 feature 唯一正规入口是 `vnet_feature_enable_disable`（原理见 06-03，命令见 04-05），gdb 验证时应只读不写；字段名以 `src/vnet/feature/feature.h`、`src/vnet/config.h` 为准（需对照实际版本核验）。
+
+特性字段的判读要区分声明了什么与实际生效了什么。注册项里的弧名、节点名与先后约束只是静态声明，说明某个特性存在、挂在哪条弧、相对次序如何；弧里的特性数组是排序后的结果；而真正决定某个报文跑哪些特性的，是接口的配置索引与报文携带的当前配置索引。三者层层收窄：声明给出全集，排序给出次序，接口位图给出子集，配置索引把子集编译成字节串，报文索引再定位到字节串的当前位置。排错时从最靠近报文的一层往外查通常更快，先看报文的索引是否有效，再看接口的配置索引是否指向有效池元素，然后才看位图与注册项。
+
+引用计数提供了另一个判据。相同特性组合被哈希去重后共享一条配置串，引用计数字段表示有多少接口在用；这个数只增不减、或配置索引指向引用计数为零的池元素，都说明重建流程出了问题，常见诱因是调试期手工改写或版本升级后旧配置未迁移。配置串堆区是连续存放的，字符串按内容追加，切换接口配置时旧串不会立刻消失而是等待引用归零，因此堆占用会阶段性偏高，这属于正常现象，不必据此判断内存泄漏。跨版本核对时重点看配置主结构内部究竟用池还是堆、每弧配置主结构是否把配置主结构内嵌，以及位图的存储形态；这些差异不改变位图选特性、索引选配置链的核心逻辑，却会让按旧布局写的解析脚本失效（需对照实际版本核验）。
 
 ### 4. 内存布局与缓存行对齐
 
@@ -1490,6 +1570,16 @@ edge fcm -> arc dashed "sw_if_index 维度映射"
 
 字段解读：`ip_lookup_main_t` 是查找子系统的「全局配置 + 接口到 VRF 的映射」容器。`fib_index_by_sw_if_index` 把 05-05 的 `sw_if_index` 连到 `fib_table_t`，是收包时判断「这个包该查哪张 FIB」的字段。完整查找流程在 06-02，命令在 04-04。
 
+#### 3.9 FIB 字段的联动关系、生命周期与边界
+
+本节把前缀、条目、负载均衡、邻接与 DPO 串成一条「前缀 → entry → LB → DPO → adjacency」的索引链。先看嵌入式继承提供的统一身份：`fib_entry_t.fe_node`、`load_balance_t.lb_node`、`ip_adjacency_t` 的基类都是 `fib_node_t`，且必须是首成员，`fn_type` + `fn_index` 构成带类型的弱引用，`fn_children` / `fn_parent` 表达依赖树，`fn_locks` 决定生命周期（归零才回收，见 05-01 通用模式）。正因基类落在偏移零，指向派生对象的指针与指向其 `fib_node_t` 的指针同址，可按 `fn_type` 安全转换；重排首成员会破坏这一契约。
+
+查找与转发的联动分两级。查找键是 `fib_prefix_t.fp_addr` / `fp_len` / `fp_proto`，它作为 `clib_bihash` 的 key（05-09）在 `fib_table_t` 的 mtrie / bihash 里命中 `fib_entry_t`；表本身由 `ft_table_id` / `ft_proto` / `ft_index` 描述，`ip4_fib_t` / `ip6_fib_t` 是真正的查找引擎。收包时 `ip_lookup_main_t.fib_index_by_sw_if_index` 把 05-05 的 `sw_if_index` 映射到具体表，决定「这个包查哪张 FIB」（原理见 06-02）。命中后 `fib_entry_t.fe_lb` 给出一个 `dpo_id_t`；若有多条等价路径，`load_balance_t.lb_buckets` 每桶又是一个 `dpo_id_t`，按 `lb_n_buckets` 展开、由 `lb_hash_config` 指定的字段做流哈希选桶，`lb_paths` 保存下一跳与权重。最终 `dpo_id_t.dpoi_type` / `dpoi_index` 指向邻接：`ip_adjacency_t.rewrite_header` 存着 05-05 的 `build_rewrite` 生成的二层头字节串，`next_hop` 是下一跳，`lookup_next_index` 区分 rewrite / glean / midchain。八字节的 `dpo_id_t` 是整条链的通用货币。
+
+生命周期方面，这些对象都是 pool 元素：`fib_table_t` 随 VRF 创建，`fib_entry_t` 随路由增删、由 `fe_sources`（较新版本的多来源重构）与 `fn_locks` 共同决定回收，`load_balance_t` 随路径重算重建 `lb_buckets`，邻接由 ARP/ND 事件驱动改写 `rewrite_header`。失败模式：把 `dpoi_index` / `fn_index` 当指针，必须用 `dpo_get` / `fib_node_get` / `pool_elt_at_index` 换算，丢掉 `dpoi_type` 会定位到错误类型的池；假设 `sizeof(dpo_id_t) == 8` 而不核对，多架构或新版本加入 next_node 字段会改变布局；以为 `fib_entry_t` 直接存出接口，实际是多级 DPO 间接；跨版本照抄 `fe_sources` / `fe_lb` / `lb_buckets` 成员名。字段以 `src/vnet/fib/`、`src/vnet/dpo/`、`src/vnet/adj/` 的本地定义为准（需对照实际版本核验），`show ip fib` / `show adjacency` 的 via 数与 rewrite 长度可用来交叉验证（命令见 04-04）。
+
+读这组字段时还要记得表与引擎分离。转发表结构只保存表标识与协议类型，真正的最长前缀匹配发生在具体协议的查找结构里，而这些查找结构的字段定义在 05-09。因此当路由展示查不到某条已下发的路径时，先确认表索引是否选对——接口到表的映射把接口绑定到表，绑定错误会表现为路由在别的虚拟路由转发实例里；只有在表索引正确的前提下，才需要怀疑查找结构本身。递归路由的场景里，父条目与兄弟条目关系共同维护依赖关系，上游下一跳变化会触发后向通知重算（原理见 06-02），重算期间可能短暂读到旧的转发对象引用，这是正常的过渡状态，不应据此判断转发错误。邻接改写字段则把二层头缓存下来，发包时直接复制到报文头部预留区，若改写字节串与当前接口的硬件地址不一致，表现为对端收得到帧却不回应，核对时应把邻接字段与接口的硬件地址字段一起看（命令见 04-04）。
+
 ### 4. 内存布局与缓存行对齐
 
 FIB 结构体族的布局有两个核心考量。
@@ -1721,6 +1811,18 @@ edge look -> tbl "sw_if_index 选表"
 | `l2.feature...` | 位/计数 | L2 特性链推进状态 | src/vnet/buffer.h | L2 转发时 | `l2_input` | 需核验 |
 
 字段解读：这是 05-04 `vlib_buffer_t.opaque` 的 vnet 解释（同一段内存的多视图，见 05-04 第 4 节）。L2 节点不另分配内存，直接把入接口、BD、L2 头长度写进这段 `opaque`。理解它，就补齐了「配置字段（BD/L2 input config）→ 报文字段（opaque）」的最后一环。
+
+#### 3.8 二层字段的联动关系、生命周期与边界
+
+本节把协议头、桥域、MAC 表与接口配置四层字段连起来。先看「配置侧」的三处同源。`l2_input_config_t` 按 sw_if_index（05-05）存成 vec，是 `l2_input` 节点收包第一眼查的表：`feature_bitmap` 决定走 bridge 还是 xconnect，`bd_index` 决定查哪张 MAC 表，`shg` 做水平分割，`xconnect_sw_if_index` 指向交叉连接对端。这份 `bd_index` 必须与 `l2_bridge_domain_t.bd_index`、`l2fib_key_t.bd_index` 同源——前者是桥域侧的整体开关（`feature_bitmap` 里的 flood / learn / forwarding / arp_term 等位），后者是 MAC 查表键的一半。三者任一处写错，报文就会进错误的桥域查 MAC，表现为「成员都在、就是不通」。用户侧的 `bridge-domain 10` 是 `bd_id`，经 `l2_bridge_domain_main_t.bd_index_by_bd_id` 换算成内部 `bd_index`；把 id 当池下标是二层配置最隐蔽的坑，因为下标常常恰好有值、不崩溃但语义错。
+
+第二组联动是 BVI 与报文载体。`l2_bridge_domain_t.bvi_sw_if_index` 给桥域配一个桥虚拟接口，使二层域能与三层互通；改动它会影响 BD 的三层出口、对应接口 `l2_input_config_t` 的 BVI 位，以及出方向写回 `vnet_buffer(b)->l2`（3.7）的内容，排「BVI 不通」要三处一起看。报文级字段 `sw_if_index[VLIB_RX]` / `l2.l2_len` / `l2.bd_index` 落在 05-04 的 `vlib_buffer_t.opaque`，L2 节点不另分配内存，直接把入接口、BD、头长度写进这段联合。这补齐了「配置字段 → 报文字段」的最后一环，也意味着乱写 opaque 会同时破坏 feature 与 L3 上下文。
+
+协议头一极是独立的字节视图。`ethernet_header_t.dst_address` / `src_address` / `type` 与 `ethernet_vlan_header_t.tci` / `type` 用 `clib_packed` 强制 `sizeof` 为 14 和 4，逐字节贴合线上报文；`type` 是网络字节序，须 `clib_net_to_host_u16` 转换后才能与类型宏比较。它们不能有 cacheline mark、不能加字段，偏移用 `offsetof` 核对；邻接里的 `rewrite_header`（05-07）本质上就是这段头按具体 MAC 填好的字节串。
+
+生命周期与边界：BD 由 `bd_add_del` 创建，`feature_bitmap` / `members` / `mac_age` 随 CLI 更新；L2FIB 条目由 MAC 学习写入、由 `l2fib_mac_age_scanner`（原理见 06-15）按 `timestamp` 老化，`flags` 里的 static / filter / drop 决定表项行为；协议头与 `l2_input_config_t` 随接口配置增删，常驻进程期。失败模式：按主机序判断 `type`；给 packed 头加对齐；混用 `bd_id` 与 `bd_index`；把 L2 `feature_bitmap` 当 05-06 的 feature arc（二者独立，启停走 `set interface l2`）；以为 L2FIB 有独立 `l2fib_entry_t` 而实际是 bihash 键值（05-09）。字段以 `src/vnet/ethernet/`、`src/vnet/l2/`、`src/vnet/buffer.h` 为准（需对照实际版本核验），`show bridge-domain` / `show l2fib` 是核对入口（命令见 04-04）。
+
+二层字段还有一个容易忽略的层级：同一张媒体访问控制表在报文转发与控制面展示中是两种形态。转发表里它是定长键值，键由硬件地址与桥域索引拼成，值里装出接口与标志位；展示命令输出的是这些键值被格式化后的文本，并不存在一个逐条独立的条目结构。理解这一点，排错时就不会去找那个不存在的结构，而是直接核对键值：地址学习是否写入、桥域索引是否与接口配置一致、时间戳是否因老化被扫描器回收。静态配置的条目由标志位区分，不参与老化；若静态条目意外消失，通常不是老化的问题，而是配置下到了错误的桥域。桥域编号到内部索引的映射是用户标识与内部下标之间的唯一换算入口，任何涉及桥域编号的核对都应先经过它，再去看池元素（命令见 04-04）。同样地，以太网协议头与虚拟局域网头是逐字节贴合线上报文的紧凑结构，字段偏移不能靠直觉推算；换一个带更多可选字段的协议头，六个字节加六个字节加两个字节的算术就不再成立，必须用取偏移的宏核对（需对照实际版本核验）。
 
 ### 4. 内存布局与缓存行对齐
 
@@ -1971,6 +2073,18 @@ bitmap、fifo、heap 三个小容器合用一节：先按本表 `bitmap_t` 部�
 
 字段解读：`bitmap_t` 就是 vec 的一层语义包装（`uword *`），`clib_bitmap_*` 宏按「位号 / (8*sizeof(uword))」定位字、按位掩码置位——05-06 的 feature 位图、05-08 的 L2 位图、pool 的 `free_bitmap` 全是它。fifo 与 heap 在 vppinfra 里形态随版本变化较大（较新版本 session 层用 `svm_fifo`，见 05-10；定时器用 `tw_timer_wheel`，见 05-10），故仅给出通用字段并标注核验。注意 `vppinfra/heap.h` 的「二叉堆」与 05-10 的 `mheap_t`（内存堆）是**完全不同的两样东西**，名字相似别混淆。
 
+#### 3.6 容器字段的跨篇联动、生命周期与边界
+
+本节说明这些底座字段如何被前八篇复用，以及隐藏头部带来的纪律。先看 vec 与 pool。`vec_header_t.len` 是元素个数而非字节数，`vec_len` 通过「回退一个头」读出它，因此 `vec_free` 必须从原指针出发，直接 `free()` 会漏掉头部造成堆损坏（呼应 05-01 误用三）。`pool_header_t.free_bitmap` 标记哪些槽位空闲、`free_indices` 是空闲索引栈、`max_len` / `n_elts` 给容量与占用、`elt_size` 供 `pool_elt_at_index` 按索引乘元素大小算地址。这套「索引即偏移」的语义正是全册 `sw_if_index`（05-05）、`buffer_index`（05-04）、`dpoi_index`（05-07）、`bd_index`（05-08）都用 `u32` 而不存指针的底层原因。更细的 `first_free_elt_index` 是分配扫描起点，扩容与增删策略属 06-08。
+
+第二组是哈希家族的分工。`hash_t` 用 `pairs` 数组 + `hash_func` / 比较回调支持变长键，`log2_pair_size` 描述键值对大小，`n_elts` 计数；它适合 05-06 的 `feature_index_by_name` 这类字符串键。`clib_bihash` 由 `bihash_template.h` 按键/值宽生成 `clib_bihash_8_8_t` 等具体类型，主结构的 `buckets` / `nbuckets` 描述桶数组，`working_copies` 用于桶分裂时的增量更新，`lock` 保护写操作；桶 `clib_bihash_bucket_t.offset` 把值页偏移与锁位压进一个 `u64`，可用 `as_u64` 联合视图原子读，因此读路径无锁。键值 `clib_bihash_kv_*_t.key` / `value` 是定长打包：05-07 的前缀、05-08 的 `mac + bd_index`、05-11 的 NAT 五元组都塞进这里。本篇的 `bitmap_t` 则是 `uword *` 的 vec，`clib_bitmap_set` 按「位号 / 字长」定位，05-06 feature 位图、05-08 L2 位图、pool 的 `free_bitmap` 全用它。`fifo` 的头尾游标与 `heap` 的「句柄索引 + 元素偏移」两级寻址分别服务于队列与优先队列，形态随版本变化。
+
+生命周期上，容器字段由各自的 `*_init` / `*_alloc` 建立，随元素增删扩容，进程期常驻、不逐元素释放；vec/pool/bitmap 用专用 `vec_free` / `pool_free` / `clib_bitmap_free`，bihash 有自己的 init/free 入口。失败模式与边界条件：把 `vec_len` 当字节数去算内存（要乘 `sizeof(T)`）、把池索引当指针或忘记 `pool_is_free` 判空（索引 `~0` 越界）、给变长键 hash 配错回调、假设存在名为 `clib_bihash_t` 的具体类型（实际是模板生成的 `clib_bihash_8_8_t` 等）。跨版本还要核对 `vec_header_t` 是否含扩展 flags、bihash 桶位布局、`pool_header_t` 成员名与 `offset` 低位是否复用为锁位；布局真值用 `pahole -C <具体类型>` 与 `src/vppinfra/vec.h` / `pool.h` / `bihash_template.h` 核验（需对照实际版本核验）。`show vlib memory` / `show ip fib` / `show l2fib` 的表项数对应这些容器计数（命令见 04-06），gdb 里 `vec_header(v)` / `pool_header(p)` 把隐藏头部打出来，是验证字段映射最直接的方法。
+
+把这些容器放回调用链里看，能解释它们为何长成这样。收包路径需要按索引取元素的常数时间操作，于是有了对象池与索引即偏移的约定；转发路径需要按下标密集访问一组定长值，于是有了动态数组与紧凑头部；查表路径需要定长键与无锁读，于是有了有界哈希的桶与值页；控制面需要按名字找对象，于是有了通用哈希。四种需求对应四种字段布局，混淆它们的典型后果是：用通用哈希去承载高频数据面查表，扩容时的回调开销与锁竞争都会显现；用有界哈希去存变长字符串键，则要为定长打包付出额外拼接成本。选择判据是键是否定长、读是否高频、是否需要无锁，而不是哪一种哈希表更出名。
+
+隐藏头部还带来一个排错上的推论。长度与占用数这类宏读数极快，但得到的是元素数量而不是占用字节，估算内存时必须乘上元素大小并加上外挂的位图与哈希桶；内存统计给出的总量与逐项相加对不上时，差额往往就在这些外挂结构上。另一个推论是：按字节解析容器内容几乎必然出错，因为头部在数据之前、元素可能有填充、值页还有分裂状态位。正确的做法是始终通过宏与入口函数访问字段，只在验证布局时用布局核对工具与空指针取偏移（需对照实际版本核验）。把这两条纪律写进插件开发规范，能避免绝大多数读到了看似合理但语义错误的值的问题（命令见 04-06）。
+
 ### 4. 内存布局与缓存行对齐
 
 vppinfra 容器的布局精髓是「**头部紧贴数据、索引即偏移**」。vec 的内存是 `[vec_header_t][T0][T1]...`，指针给到 `T0`；pool 是 `[pool_header_t][free_bitmap vec 外挂][T0][T1]...`，`pool_elt_at_index` 直接按索引乘 `elt_size` 算地址。这种布局让「取第 i 个元素」是一条乘法 + 加法，没有任何指针追逐，缓存局部性极好——这正是 05-04 里 `u32 buffer_index`、05-05 里 `sw_if_index`、05-07 里 `dpoi_index` 全都用「索引而非指针」的底层原因：它们最终都落到某个 vec/pool 的连续数组上。
@@ -2189,6 +2303,20 @@ edge vec -> bmp "位图本质是 vec"
 
 字段解读：`clib_atomic` 不是结构体，而是一组宏/类型封装，它是 `svm_queue_t.head/tail`、`clib_spinlock_t.lock`、bihash 桶原子读（05-09）能正确工作的前提——`volatile` 只保证「不被编译器优化掉」，真正跨核可见性靠 `clib_memory_barrier`。`timer_wheel` 由 `tw_timer_template.h` 按「句柄宽度/用户数据宽度」模板生成，槽位 + 池 + 刻度构成；05-08 的 MAC 老化、05-11 的 NAT 会话超时、06-15 的 process 节点定时都挂在它上面，实现机制在 06-15。
 
+#### 3.6 内存与同步字段的联动关系、生命周期与边界
+
+本节把堆、共享区、队列与同步原语串成一条「谁分配、谁保护、谁消费」的链。先看 mheap 的隐藏头部联动。`mheap_elt_t` 的 `size` 高位存字节数、低位塞空闲标志，`prev_size` 指向物理前邻块，释放时 O(1) 找到它做合并；用户拿到的指针在头之后，`mheap_free` 会自行回退一个元素头，手写地址会破坏堆（与 05-09 的 vec/pool 同理）。`mheap_t.flags` 决定这个堆是进程私有还是共享区内的分配器，`start` / `max_size` 给出地址与容量，`free_lists` 按尺寸分桶，`lock` 保护多核并发分配，`n_elts` 是统计（对应 `show vlib memory`，命令见 04-06）。
+
+共享区的联动以 `svm_region_t` 为根。`base` 是每个进程各自的映射基址，主进程与客户端未必相同，因此区内所有跨进程引用只能用相对 `base` 的偏移，不能存绝对指针——这是 `svm_queue_t.data` 元素与 API 消息（05-12）都用偏移/值的根本原因。`heap` 指向区内 `mheap_t`，所有共享对象从它分配；`name` 对应 `/dev/shm` 里的映射文件，`magic` / `version` 供客户端映射时校验，`client` 引用计数记录映射者，`mutex` 保护区操作。区内布局自顶向下是 `[svm_region_t 头][mheap_t][svm_queue_t 主队列][API 消息][statseg 目录]`，`size` 界定整区。
+
+队列与同步原语的联动是本节重点。`svm_queue_t.size` 取 2 的幂便于按位取模，`eltsize` 定单元素字节数，`data[0]` 是环形存储区；`head` 由消费者写、`tail` 由生产者写，二者都是 `volatile u32`，靠 `clib_memory_barrier` 保证「先写 data 再更新 tail」的顺序对另一核可见——`volatile` 只防编译器优化，不保证跨核可见性，弱内存序架构上尤其危险。`clib_spinlock_t.lock` 用原子比较交换获取，须按 `CLIB_CACHE_LINE_BYTES` 对齐独占一个 cache line，否则多个热点锁相邻会伪共享；`owner` / `recursion` 是调试版才有的字段。`clib_atomic_add` / `clib_atomic_cas` 是这组字段正确工作的前提，也是 bihash 桶原子读（05-09）的基础。`tw_timer_wheel_t` 的 `wheels` / `current_tick` / `timers` / `expired` 为消息与会话提供超时，05-08 的 MAC 老化、05-11 的 NAT 会话超时、06-15 的 process 定时都挂在它上面。
+
+生命周期与边界：主进程 `svm_region_init` 创建共享区并初始化区内堆与主队列，客户端 `svm_region_map` 映射、断开时 `svm_region_unmap` 减引用，最后随映射释放；`mheap_t` 与 `tw_timer_wheel_t` 进程期常驻。失败模式：在共享区存绝对指针（客户端地址无效）、用 `volatile` 代替内存屏障、把 `mheap_free` 传成未回退的用户指针、把锁当普通结构体内嵌而不对齐、混淆 `vppinfra/heap.h` 二叉堆与 `mheap_t`、以为主进程与客户端共享同一虚拟地址。跨版本核对 `mheap_elt_t` 位布局、`clib_spinlock_t` 是否用 C11 原子、`tw_timer_template.h` 生成类型名，真值以 `pahole -C <具体类型>` 与 `src/vppinfra/mheap.h`、`src/svm/`、`src/vppinfra/lock.h` 为准（需对照实际版本核验）；`/dev/shm` 与 `/proc/<pid>/maps` 可印证 `base` / `size`（命令见 04-06）。
+
+共享内存的字段判读有一条总原则：凡是从共享区读出来的指针，先问它是不是偏移。共享区基址在客户端与主进程里取值不同，所以区内对象只能靠相对基址的偏移互相引用；消息队列的数据元素值与消息里的索引都遵循这一约定。调试器挂在主进程上打印队列内容，看到的是主进程视角的布局；客户端侧的同一份数据虽然字节相同，解释方式却必须换成客户端的基址。把这个差异记在心里，跨进程数据不一致的问题就有一半有了着落。
+
+同步字段的判读同样需要方向感。生产者只关心队尾游标，消费者只关心队头游标，两个游标各写各的；看到队头长时间不动，应查消费者是否在等待事件通知，而不是怀疑生产者没写数据。写侧先后顺序由内存屏障保证，屏障缺失在宽松内存序架构上才暴露，在常见架构上可能长期正常，因此不能因为本地跑得通就省略。自旋锁则要区分锁住的是哪份元数据：保护堆元数据时，多核分配会排队；保护共享区映射时，客户端连接会短暂停顿。把锁的归属与读写时机列对照，可以判断某次停顿是正常争用还是锁范围过大。定时器轮字段的核对重点是刻度与到期回调：当前刻度不推进，所有依赖它的老化与超时都会停摆，这类问题查的是主循环驱动（原理见 06-15），而不是轮内槽位本身（需对照实际版本核验）。
+
 ### 4. 内存布局与缓存行对齐
 
 共享内存布局是本篇最需要「按图索骥」的部分。典型布局（自顶向下）：
@@ -2405,6 +2533,22 @@ NAT 插件在 19.x→23.x 经历了显著重构：旧版 `snat_main_t` 单体，
 | `..._by_...` / 查找 | bihash / 结构 | 策略快速匹配表（05-09） | src/plugins/ipsec/ipsec_spd.h | 收包匹配时 | `ipsec_policy_match`（入口） | 需核验 |
 
 字段解读：IPSec 三件套是「SA（怎么加密）+ SPD（哪些流量要加密）+ 绑定（哪个接口用哪个 SPD）」。`ipsec_sa_t.spi` 是收包查 SA 的键；`seq` + 抗重放窗口用位图（05-09）；`dpo` 把 SA 接进 05-07 的 DPO 链，使「加密后转发」成为一个数据面对象。SA 的引用/锁计数决定生命周期（呼应 05-01 通用模式），受 SPD 策略与隧道引用，归零才释放。
+
+#### 3.5 插件结构的联动关系、生命周期与边界
+
+本节把三组插件结构如何「组合基础字段」讲清，这是把本篇当成工具书用的关键。先讲 DPDK 设备与接口层的缝合。`dpdk_main_t.devices` 是 `dpdk_device_t *` 数组，按 `dev_instance` 索引，`n_devices` 是探测到的 port 数，`conf` 保存 startup.conf `dpdk{}` 的解析结果（命令见 04-01）。单个设备里 `device_index` / `port_id` 是 DPDK 侧的标识，`hw_if_index` / `sw_if_index` 回指 vnet 接口（05-05），`dev_instance` 是 `dpdk_main.devices` 的下标——三者靠 `vnet_register_hw_interface` 注册时建立映射，取值未必相等。05-05 的 `vnet_device_class_t.tx_function` 拿到 `dev_instance` 后，正是从 `dpdk_device_t.rx_queues` / `tx_queues` 取队列发送；`mbuf` / `rte_mempool` 把 DPDK 的 rte_mbuf 与 05-04 的 `u32 buffer_index` 关联，`cpu_socket` 决定 NUMA 归属（原理见 06-04 / 06-12）。`flags` 记录 up / promisc / offload 状态，`per_thread` 计数按 worker 分开以避免多核写同一 cache line（呼应 05-02 每线程副本）。
+
+再讲 NAT 与 IPSec 的「会话表 + 引用 + DPO」范式。`nat44_main_t`（旧版为 `snat_main_t`）的核心是 `sessions` 会话表，用 05-09 的 `clib_bihash` 实现，键值是五元组（src/dst IP、port、proto、VRF）定长打包，值是翻译后的地址与端口；`static_mappings` 与 `addresses` 分别是静态映射与外部地址池，`interfaces` 标记每个 sw_if_index 的 inside / outside 角色，`outside_fib_index` 指向 05-07 的 FIB 表，`config` / `nat44_config_t` 存会话上限、超时与端口范围，`per_thread_data` 呼应 05-02 的 worker 模型，`feature` 节点索引把 NAT 挂进 05-06 的 `ip4-unicast` / `ip4-output` 弧。IPSec 侧 `ipsec_main_t.sad` / `spds` 是 SA 与 SPD 池，`spd_index_by_sw_if_index` 绑定接口，`by_spi` 是 SPI 查找表；`ipsec_sa_t.spi` 是收包查 SA 的键，`protocol` 区分 AH / ESP，`crypto_alg` / `integ_alg` 与 `crypto_key` / `integ_key` 给出算法与密钥，`seq` 与抗重放窗口用 05-09 的位图，`dpo` 把 SA 接进 05-07 的 DPO 链，使「加密后转发」成为数据面对象；`ipsec_spd_t.policies` / `n_policies` 是策略数组。`sad` 与 `spds` 的关系是「哪些流量要加密 + 用哪条 SA 加密 + 哪个接口用哪个 SPD」。
+
+生命周期分三段。初始化段：插件加载时 `dpdk_init` / `nat44_init` / `ipsec_init` 建立各自主结构，`dpdk_device_setup` 探测 port 并注册 hw 接口，NAT 读配置建地址池，IPSec 由 `ipsec_sa_add` / `ipsec_spd_add` 建 SA/SPD 并填查找表。运行段：`sessions` 随首包建、随 `timer_wheel`（05-10）超时老化；`ipsec_sa_t.seq` 与抗重放窗口每包读写，是 SA 里唯一的热字段；DPDK 的 `per_thread` 统计随收发累加。销毁段：SA 受 SPD 策略、隧道与 DPO 引用，由 `ipsec_sa_lock` / `ipsec_sa_unlock` 的引用计数决定回收，手工释放会悬空；NAT 会话与 DPDK 设备随插件卸载清理。
+
+失败模式与边界条件：其一，把 `dev_instance` / `spi` / `spd_index` 当指针——全是池下标或查找键，用 `xxx_get` 入口或 `pool_elt_at_index` 换算，`spi` 不是 SA 下标。其二，`dev_instance` 与 `hw_if_index` 数值相等也不等价，前者在 `dpdk_main.devices` 寻址、后者在 `vnet_interface_main_t.hw_interfaces`（05-05）寻址，打印值必须连同字段所在结构一起记录。其三，跨版本照抄 NAT 主结构名——`snat_main_t` 迁到 `nat44_main_t` / `nat66` 后字段集合完全不同；IPSec SA 后端也重构过。其四，插件 feature 节点索引与 05-03 的 `vlib_node_t.index` 是两套命名空间，不能混用。其五，以为 SA 密钥是能跨进程用的绝对指针，实际是 vec 外挂、只在主进程有效。字段以 `src/plugins/dpdk/dpdk.h`、`src/plugins/nat/`、`src/plugins/ipsec/` 本地定义为准（需对照实际版本核验），`show hardware` / `show nat44 sessions` / `show ipsec sa` 是核对入口（命令见 04-05 / 04-06）。
+
+把三组插件放在同一张对照表里看，会发现它们的结构几乎同构：一个全局主结构持有池与查找表，池里是业务对象，业务对象用整数索引定位并通过数据面对象引用接进转发层，再通过接口索引或设备实例接回接口层。网卡设备靠设备实例从设备数组取回自己，地址转换会话靠五元组哈希键在会话表里进出，安全关联靠安全参数索引在关联库里被找到。差异只在键的形状：设备是数组下标，会话是五元组打包，安全关联是协议索引。理解这套同构关系，读第四个插件结构时就能直接预测它会有主结构、池、键、数据面对象引用与引用计数这几类字段，再去表里逐项核对即可，不必从头学起。
+
+地址转换与安全关联的会话生命周期还共享同一套时间驱动。会话表项按配置里的超时参数老化，安全关联的序列号与抗重放窗口随每包推进，两者都依赖定时器轮提供的刻度（05-10）。当会话表占用持续上涨而不回落，先查超时配置是否被改大、再查定时器是否推进，最后才怀疑删除路径有泄漏；仅仅因为会话展示条目多就判定泄漏，是常见的误判。安全关联的引用计数同样容易被低估：一条关联可能同时被策略、隧道与数据面对象引用，加锁与解锁不配对会让计数只增不减，表现为关联无法删除。把谁可能引用这个对象列成清单逐项排查，比盯着计数值本身更有效（命令见 04-05）。
+
+网卡设备侧的性能字段要按节点与队列两个维度读。收发队列通常按 worker 分配，队列与绑核的对应关系来自线程拓扑（05-02）；设备所在节点属性决定缓冲区池应当落在同一位置（05-04）。若某块网卡吞吐明显偏低而错误计数为零，先看该设备的队列数是否与 worker 数匹配、跨节点访问是否存在，再考虑卸载能力协商；字段层面的核对入口是硬件展示里的队列与节点信息以及调试器里的节点属性（命令见 04-03）。版本差异方面，网卡结构随驱动版本调整、地址转换由单体拆成分族、安全关联换过后端，三者都不影响上述同构关系，却会让具体成员名失效，必须以本地插件目录为准（需对照实际版本核验）。
 
 ### 4. 内存布局与缓存行对齐
 
@@ -2651,6 +2795,24 @@ edge nm -> hw "接口 inside/outside"
 | 消费者 / 锁 | 结构 / `clib_spinlock_t` | 消费者连接与同步（05-10） | src/vlib/stat/stat_segment.h | 连接/刷新时 | `stat_segment_...`（入口） | 需核验 |
 
 字段解读：statseg 是「共享内存（05-10）+ 目录 vec（05-09）+ 计数器数组」的组合。`directory` 把名字映射到数据偏移，`data` 里存的是 05-03 `vlib_node_runtime_t` 统计字段（`calls`/`vectors`/`clocks`）等运行时计数的快照；消费者（vppctl `show statseg`、外部监控）通过 `svm_region_t` 映射读取，用 `update_interval` / 版本号判断一致性。它是「字段落地为可观测数据」的最后一环。
+
+#### 3.6 服务结构的联动关系、生命周期与边界
+
+本节把五组服务结构如何复用前十一篇的基础字段串起来。先看 ACL 的「规则 → 绑定 → 引用」链。`acl_list_t.rules` 是 05-09 的 vec，每条规则含五元组掩码与动作，`count` / `n_rules` 是规则数，`tag` 是用户标签；`lock` 是引用计数，决定 ACL 何时回收（与 05-06 的 `vnet_config_t.reference_count`、05-07 的 `fib_node_t.fn_locks` 同属引用计数模式，见 05-01），`hash` / 预编译匹配表用 hash 或 bihash 加速查找。`acl_main_t.acls` 是 ACL 池，`interface_...` 按 sw_if_index（05-05）把 ACL 索引绑到接口方向，`feature` 节点索引把 ACL 挂进 05-06 的 feature 弧，`..._counters` 记匹配与丢弃计数。
+
+第二组是 LB 的 Maglev 表。`lb_vip_t.key` 把 IP + port + proto 打包成 VIP 查找键，`vip_index` 是池下标，`maglev` 是一段 `u32` 数组、每槽存一个 backend 索引，`n_buckets` 是表长，`backends` 是后端集合，`encap` 决定 GRE / L3DSR / NAT4 / NAT6 等封装，`dpo` 把 VIP 接进 05-07 的 DPO 链。转发时对流哈希取模选 `maglev` 槽位得到后端，思想与 05-07 `load_balance_t.lb_buckets` 相同，但 Maglev 用一致性哈希使后端增删时扰动最小（算法见 07-09）；后端变化必须走 `lb_maglev_rebuild` 整表重算，手工写槽位会破坏分布。`lb_main_t.vips` 是 VIP 池，`..._by_...` 用 bihash（05-09）做键查找，`per_cpu` 是每 worker 的粘性与统计（呼应 05-02）。
+
+第三组是 VXLAN 隧道。`vxlan_tunnel_t.src` / `dst` 是 05-07 的 `ip46_address_t`，`vni` 是 24 位网络标识，`encap_fib_index` / `decap_fib_index` 指定封装/解封装用的 FIB 表，`sw_if_index` / `hw_if_index` 是隧道对应的逻辑与硬件接口（05-05），`rewrite` 是预构造的外层 UDP/IP/VXLAN 头、`dpo` 是转发结果，`flags` 记 UDP 端口、GPE、L2/L3 模式等属性。`vxlan_main_t.tunnels` 是隧道池，`..._by_...` 用 `(src, dst, vni, vrf)` 打包键查 bihash，`tunnel_index_by_sw_if_index` 完成隧道与 sw 接口的换算——二者数值通常不等，混用会查错隧道。封装时把 `rewrite` 写到 05-04 buffer 的 headroom（原理见 07-06）。
+
+第四、五组落在共享内存。`vlib_api_main_t.msg_table` 是消息名到 msg_id 与处理函数的表，消息头 `msg_id` / `client_index` / `context` 由 `*.api` 生成（04-07），传输走 05-10 的 `svm_queue_t`（`..._queue`）与 `svm_region_t`（`region`）。`stat_segment_main_t.directory` 把统计项名映射到数据偏移，`shared_header` / `heap` 指向 05-10 的共享区与区内堆，`counters` 里存的是 05-03 `vlib_node_runtime_t.calls` / `vectors` / `clocks` 等统计的快照，`update_interval` / 版本号供消费者判断快照一致性（命令见 04-06）。
+
+生命周期与边界：各 `*_main_t` 随插件加载初始化、常驻进程期；ACL 列表按 CLI 增删、由 `lock` 归零回收，VIP 与隧道随配置增删、由 `dpo` 与引用计数决定释放，消息与统计条目随客户端/注册项增删。失败模式：把 `vip_index` / `tunnel_index` 当指针、把 `msg_id` 当连续编号；直接改 `maglev[]` 槽位；在共享区存绝对指针（statseg / API 消息，见 05-10）；混淆 `sw_if_index` 与 `tunnel_index`；把 statseg 版本号当普通字段并发读而不判断一致性；照抄 `*.api` 生成的消息字段名。字段以 `src/plugins/`、`src/vlib/api.h`、`src/vlib/stat/` 为准（需对照实际版本核验），`show acl` / `show lb vip` / `show vxlan tunnel` / `show api` / `show statseg` 是核对入口（命令见 04-05 / 04-06 / 04-07）。
+
+这五组结构可以按数据放在哪里分成两半，判读思路随之不同。访问控制、负载均衡与隧道的规则、表项与隧道对象都在进程私有内存里，用动态数组、对象池与有界哈希组织（05-09），靠整数索引与数据面对象引用相互衔接；二进制接口与统计段则把主要数据放在共享内存区（05-10），靠偏移与版本号跨进程传递。前者的典型错误是索引维度用错——把池下标当数组下标、把软件接口索引当隧道索引；后者的典型错误是把共享区里的值当成本进程可直接解引用的指针，或忽略版本号而读到半更新快照。分清一个字段落在哪一半，就决定了该用调试器直接打印还是该换算偏移再读。
+
+一致性哈希表是负载均衡字段里最值得单独理解的一处。查找数组的每个槽只存后端下标，不存地址也不存数据面对象引用；转发时对流做哈希取模选槽，再用该下标去后端集合里找目标。因此第一个槽读到的一只说明该槽指向一号后端，与转发对象的池索引毫无关系。后端增删会触发整表重算，重算期间旧表与新表短暂并存，这正是槽位数与表内容在某些时刻看起来不匹配的原因；手工改槽位会破坏一致性哈希的分布性质，使后端变更时大量会话突然换后端（算法见 07-09，字段见本篇）。虚拟互联网协议地址的数据面对象引用则是该地址作为整体转发对象的引用，与槽内后端下标属于不同层级，不可混谈。
+
+统计段字段把整册收了尾。目录是名字到偏移的映射，计数器区里存的是各节点运行时统计字段的快照，刷新周期与版本号让消费者判断读到的是否为一个完整周期的数据。这意味着统计展示输出与运行时展示的瞬时值允许有差异——前者是采样快照，后者是实时累加；两者差距过大时，先查刷新周期与消费者读取节奏，再怀疑计数器本身。接口消息头字段由接口描述文件生成，随定义变化，写控制面程序时应以本地生成的头文件为准，而不是照抄旧笔记里的字段名（命令见 04-07，编程见 04-07）。
 
 ### 4. 内存布局与缓存行对齐
 
