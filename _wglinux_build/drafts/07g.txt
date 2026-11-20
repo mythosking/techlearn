@@ -1,0 +1,162 @@
+## 07-13 wireguard-tools：wg、config、encoding、curve25519 与 wg-quick
+
+### 1. 背景与动机
+
+WireGuard Linux 的数据面在内核，但把人写的配置变成内核状态的，是 wireguard-tools 这一组用户态程序。本篇是 07 册「模块与特性介绍」中唯一处理用户态工具族的一篇：07-01 至 07-12 讲的是 `drivers/net/wireguard/` 下的内核驱动与 `lib/crypto/` 下的加密原语，本篇讲的是 `wireguard-tools/src/` 下的 C 源码与 bash 脚本。两层通过 netlink 通用族连接：工具负责解析、编码与序列化，内核负责保存状态与加解密。把这两层混为一谈，是阅读上游资料时最常见的错误之一。本篇讨论的是一款「工具集」的特性，而非内核驱动本身。
+
+先看工具族自己声明的身份。`src/wg.c` 顶部注释与所有源文件一样，是 `SPDX-License-Identifier: GPL-2.0 OR MIT`，Copyright (C) 2015-2026 Jason A. Donenfeld。`src/version.h` 里 `WIREGUARD_TOOLS_VERSION` 定义为 `"1.0.20260223"`，这是工具版本；它既不是内核驱动 `version.h` 里的 `"1.0.0"`，也不是目标系统的内核版本。`src/Makefile` 第 51 行还会用 `git describe --dirty` 覆盖这个版本号（若工作树带 git 元数据），因此从源码直接编译出的 `wg --version` 可能与发行版打包版本不同，版本核验时要留意这一点（版本基准见 01-04）。
+
+为什么需要独立的用户态工具族？因为内核驱动只暴露 netlink 属性接口——`WG_CMD_GET_DEVICE`、`WG_CMD_SET_DEVICE` 两条命令，加上 device、peer、allowedip 三层属性（全集见 04-05、04-06）。它不理解 ini 配置文件，不认识 base64 编码的私钥字符串，也不会解析 `Endpoint = demo.wireguard.com:51820` 这样的域名加端口。这些「把人类可读输入翻译成二进制 netlink 属性」的工作，全部由 wg 工具承担。换句话说，内核驱动定义「能配置什么」，wg 工具定义「怎么配置」。本篇要讲清后者，以及各源文件之间如何分工协作。
+
+工具族的进程形态也值得强调。wg 是短生命周期的命令行程序：每次执行都打开 netlink 套接字、发请求、收应答、退出，没有常驻守护进程。这与 IPsec 需要 IKE 守护进程持续维护 SA 形成鲜明对比（对比见 01-02）。wg-quick 则是一个 bash 脚本，它包装 wg 与 ip 命令，完成接口创建、地址、MTU、路由与 DNS 设置。理解「工具是一次性的、数据面在内核」，才能明白为什么在 ps 输出里找不到 WireGuard 进程是正常的，而不是据此判断它没有运行。
+
+从模块组成看，整个工具族可分成三层。最上层是面向用户的入口与子命令实现，包括 wg.c、genkey.c、pubkey.c、set.c、setconf.c、show.c、showconf.c；中间层是解析与编解码，包括 config.c、encoding.c、curve25519.c 及其两个后端头文件；最下层是通信与辅助设施，包括 ipc.c、ipc-linux.h、netlink.h、containers.h、terminal.c、ctype.h。wg-quick 脚本与 man 手册、bash 补全、systemd 单元则作为外围分发物存在。三层之间靠 containers.h 定义的 wgdevice 链表传递数据：解析层产出链表，通信层消费链表，展示层从通信层读回链表再渲染。这个「一条链表贯穿始终」的结构，是读懂整个工具族的钥匙。
+
+### 2. 核心概念
+
+工具族可以压缩为五个核心概念：单入口、三种输入、三层镜像、两类编解码、一个脚本封装。
+
+单入口，指 `wg.c` 的 `main()` 是唯一可执行入口。它维护一张 `subcommands[]` 静态表，把子命令字符串映射到函数指针：`show` 映射 `show_main`，`showconf` 映射 `showconf_main`，`set` 映射 `set_main`，`setconf`、`addconf`、`syncconf` 三个名字都映射 `setconf_main`，`genkey` 与 `genpsk` 都映射 `genkey_main`，`pubkey` 映射 `pubkey_main`。共享实现的判别靠 `argv[0]`：`setconf_main` 内部用 `strcmp(argv[0], "addconf")` 与 `strcmp(argv[0], "syncconf")` 区分行为，`genkey_main` 用 `strcmp(argv[0], "genkey")` 决定是否对随机字节做钳制。无参数执行 `wg` 时，`main()` 构造 `new_argv={"show", NULL}` 默认走 `show_main`，所以 `wg` 与 `wg show` 等价。
+
+三种输入，指配置来源有三条路径：命令行参数由 `config_read_cmd` 解析，ini 配置文件由 `config_read_init`、`config_read_line`、`config_read_finish` 这组状态机解析，内核运行态由 `ipc_get_device` 通过 netlink 读回。前两条用于写配置，第三条用于查询。
+
+三层镜像，指 `containers.h` 里定义的 `struct wgdevice`、`struct wgpeer`、`struct wgallowedip`，它们是内核同名状态在用户态的镜像链表：一个 device 挂多个 peer，一个 peer 挂多个 allowedip，用 `first_peer` / `next_peer` 与 `first_allowedip` / `next_allowedip` 串联。这些结构的逐字段定义交给 05 册（字段见 05-09、05-01），本篇只点名职责。
+
+两类编解码，指 `encoding.c` 的 base64 与 hex 转换、`curve25519.c` 的公钥派生。`genkey` 与 `pubkey` 子命令、配置解析里的密钥字段、show 与 showconf 的输出，全都依赖这两者，而且刻意实现为常量时间以抵抗侧信道。一个脚本封装，指 `wg-quick/linux.bash`：它不属于 wg 这个二进制，而是 Makefile 在 install 时按 `PLATFORM` 把 `wg-quick/$(PLATFORM).bash` 安装为 `/usr/bin/wg-quick` 的独立脚本。
+
+### 3. 关键数据结构与源码位置
+
+本篇是 07 册「目录级模块职责」的权威源，因此这一节按文件逐一交代职责，不再停留在点名式浏览。用户态镜像结构的字段不在这里展开（字段见 05-09、05-01）；命令行参数全集交给 04 册（参数见 04-01、04-03）。
+
+| 源码文件 | 所属层 | 核心职责 |
+|---|---|---|
+| wg.c / subcommands.h | 入口 | PROG_NAME 全局量、subcommands[] 分派表、版本与帮助处理 |
+| config.c / config.h | 解析 | 命令行与 ini 两套解析器、config_ctx 状态、各字段 parse_* 函数 |
+| encoding.c / encoding.h | 编解码 | 常量时间 base64/hex、密钥长度宏、key_is_zero |
+| curve25519.c / curve25519.h | 密钥运算 | 公钥派生、位钳制、按 int128 选择 HACL64 或 Fiat32 后端 |
+| genkey.c / pubkey.c | 子命令 | 随机数生成、私钥生成与公钥导出 |
+| set.c / setconf.c | 子命令 | 把解析结果写入内核，syncconf 的 peer 同步算法 |
+| show.c / showconf.c | 子命令 | 从内核读状态并渲染为可读输出或 ini |
+| ipc.c / ipc.h / ipc-linux.h | 通信 | IPC 抽象与 Linux netlink 实现，SET/GET/列表 |
+| netlink.h | 依赖 | 内嵌精简 libmnl，通用族握手与属性操作 |
+| containers.h / terminal.c / ctype.h | 辅助 | 镜像结构、终端着色、字符分类 |
+| wg-quick/linux.bash | 脚本 | 接口 up/down/save/strip，地址路由 DNS 与防火墙 |
+| Makefile / man / completion / systemd | 构建与分发 | 编译安装、手册、补全、单元文件 |
+
+几个关键定义要单独记。`encoding.h` 用宏算长度：`WG_KEY_LEN_BASE64` 为 `(((WG_KEY_LEN)+2)/3)*4+1`，对 32 字节密钥即 45；`WG_KEY_LEN_HEX` 为 `WG_KEY_LEN*2+1`，即 65。`curve25519.h` 的 `CURVE25519_KEY_SIZE` 为 32，并提供内联的 `curve25519_clamp_secret`。`config.h` 的 `struct config_ctx` 保存当前 device、last_peer、last_allowedip 与两个 section 标志位，是 ini 解析状态机的核心。`containers.h` 在缺 `linux/wireguard.h` 时把 `WG_KEY_LEN` 回退定义为 32，体现了工具族跨平台（Linux、BSD、Windows、Haiku）的设计意图。
+
+构建关系由 Makefile 描述：`wg` 目标由通配符 `*.c` 编译出的所有 `.o` 链接而成，`PLATFORM` 取自 `uname -s`；install 目标安装 wg 二进制、`man/wg.8`、补全脚本，并在 `WITH_WGQUICK` 时把平台脚本装成 wg-quick、在 `WITH_SYSTEMDUNITS` 时安装 systemd 单元（构建细节见 02-04）。
+
+通信层的两个文件值得再展开。`netlink.h` 是 LGPL-2.1+ 授权的「精简版 libmnl」，以头文件形式内嵌了属性构造、校验、嵌套与回调解析函数，并额外封装了 `struct mnlg_socket`：`mnlg_socket_open` 通过 `NETLINK_GENERIC` 上的 `CTRL_CMD_GETFAMILY` 把族名 `wireguard` 解析成动态族 id，使工具无需硬编码 id。`ipc.c` 则在编译期根据平台包含 `ipc-linux.h`、`ipc-openbsd.h`、`ipc-freebsd.h` 或 `ipc-windows.h`，把「内核驱动通道」与「用户态 UAPI 通道」的选择封装在 `ipc_set_device`、`ipc_get_device`、`ipc_list_devices` 三个函数里：在 Linux 上优先内核 netlink，若发现目标是用户态实现（如 wireguard-go）则转走 UAPI socket。这种抽象让上层子命令完全不感知底层平台差异。辅助文件中，`terminal.c` 提供终端着色输出（show 的 `TERMINAL_FG_*` 系列宏即来自 `terminal.h`），`ctype.h` 提供跨平台的空白与数字判定，fuzz/ 目录则为配置与命令解析提供模糊测试入口。
+
+### 4. 关键流程与调用链
+
+第一条是命令分派链。`main()` 收到 argv 后，先处理 `--version`、`--help`、`version`、`help` 四种全局形式，再把 `argc==1` 归一化为 show，最后遍历 `subcommands[]` 用 `strcmp` 匹配 `argv[1]`，命中即调用对应函数指针并传入 `argc-1`、`argv+1`。这个设计让新增子命令只需在表里加一行，也解释了为什么 setconf 的三个别名能共享实现。
+
+第二条是配置写入链。以 `wg set` 为例：`set_main` 调用 `config_read_cmd` 把命令行参数解析成一个 `wgdevice`，`strncpy` 接口名后调用 `ipc_set_device`。`ipc.c` 的 `ipc_set_device` 在编译了 `IPC_SUPPORTS_KERNEL_INTERFACE` 的 Linux 上，先用 `userspace_has_wireguard_interface` 判断目标是不是用户态实现，是则走 `userspace_set_device`，否则走 `kernel_set_device`。后者在 `ipc-linux.h` 中：`mnlg_socket_open(WG_GENL_NAME, WG_GENL_VERSION)` 打开通用族套接字，其内部先发 `CTRL_CMD_GETFAMILY` 解析出族 id；随后 `mnlg_msg_prepare` 准备 `WG_CMD_SET_DEVICE` 消息，`mnl_attr_put_strz` 写入 `WGDEVICE_A_IFNAME`，再以嵌套属性依次写 `WGDEVICE_A_PRIVATE_KEY`、`WGDEVICE_A_LISTEN_PORT`、`WGDEVICE_A_FWMARK`，以及 `WGDEVICE_A_PEERS` 下的 `WGPEER_A_PUBLIC_KEY`、`WGPEER_A_ENDPOINT`、`WGPEER_A_PRESHARED_KEY`、`WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL` 和 `WGALLOWEDIP_A_*`。所有写入都用 `mnl_attr_put_check` 系列做边界检查，一旦缓冲区不足就跳到 `toobig_allowedips` 或 `toobig_peers` 标签收尾并 `goto again` 分批发送（netlink 交互原理见 06-14）。
+
+第三条是配置读取链。`show_main` 通过 `ipc_list_devices` 或 `ipc_get_device` 取数据；`kernel_get_device` 同样用 `mnlg_socket_open`，发出带 `NLM_F_DUMP` 的 `WG_CMD_GET_DEVICE`，回调 `read_device_cb` 逐层调用 `parse_device`、`parse_peers`、`parse_peer`、`parse_allowedip` 把属性填回镜像结构，`coalesce_peers` 再把同公钥的 peer 合并成一条。渲染由 `pretty_print` 完成，它按 `last_handshake_time` 排序（`sort_peers`），并用 `masked_key` 隐藏私钥与预共享密钥；`ugly_print` 与 `dump_print` 则提供单字段与制表符分隔的机器可读格式。`showconf_main` 走同一读取链，但把结果渲染回 ini 供 setconf 使用。
+
+第四条是密钥链。`genkey_main` 调用 `get_random_bytes` 取 32 字节熵：Linux 上优先 `getentropy`，其次 `getrandom` 系统调用，最后回退 `/dev/urandom`（Windows 用 `RtlGenRandom`）。若以 genkey 名字调用，先 `curve25519_clamp_secret` 做位钳制，再 `key_to_base64` 输出；genpsk 跳过钳制。`pubkey_main` 从 stdin 读满 44 字符 base64，校验长度与尾随字符，`key_from_base64` 解成 32 字节后调 `curve25519_generate_public`（以 basepoint={9} 做标量乘），再编码输出。`curve25519.c` 依据 `__SIZEOF_INT128__` 选择 `curve25519-hacl64.h` 或 `curve25519-fiat32.h` 后端。
+
+这四条链与 wg-quick 的包装关系见图 07-13-01。
+
+:::figure id=07-13-01 | name=wireguard-tools 工具族分层与 netlink 交互 | dir=TD
+node n1 "wg 命令入口<br/>wg.c 分派表" blue
+node n2 "配置解析<br/>config.c 两套解析器" teal
+node n3 "编解码与密钥<br/>encoding/curve25519" purple
+node n4 "IPC 抽象<br/>ipc.c" gray
+node n5 "netlink 实现<br/>ipc-linux.h" gray
+node n6 "netlink 通用族<br/>wireguard" amber
+node n7 "内核接口状态<br/>device/peer/allowedip" red
+node n8 "wg-quick 脚本<br/>bash 包装" green
+node n9 "ini 配置文件<br/>wg0.conf" green
+edge n8 -> n2 "addconf/setconf"
+edge n9 -> n2 "逐行解析"
+edge n1 -> n2 "命令行参数"
+edge n1 -> n3 "genkey/pubkey"
+edge n3 -> n2 "密钥字节"
+edge n2 -> n4 "wgdevice 链表"
+edge n4 -> n5 "ipc_set/get_device"
+edge n5 -> n6 "SET/GET 属性"
+edge n6 -> n7 "读写内核状态"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：入口「wg 命令入口」把「命令行参数」与「ini 配置文件」交给「配置解析」，密钥类子命令走「编解码与密钥」；「wg-quick 脚本」也把配置喂给「配置解析」。解析得到的 wgdevice 链表经「IPC 抽象」下沉到「netlink 实现」，再以 SET/GET 属性与「netlink 通用族 wireguard」通信，最终读写「内核接口状态」。
+
+### 5. 配置/命令/代码实例
+
+下面给出三组实例，分别对应密钥与命令行操作、wg-quick 配置文件、读状态判读；参数全集见 04 册（参数见 04-01、04-02）。
+
+```bash
+# 生成私钥并导出公钥（私钥留在本机）
+wg genkey | tee privatekey | wg pubkey > publickey
+# 直接用命令行设置接口与 peer
+wg set wg0 listen-port 51820 private-key ./privatekey \
+    peer <对端公钥> endpoint 203.0.113.9:51820 allowed-ips 10.0.0.2/32
+# 不中断会话地重载 wg-quick 配置
+wg syncconf wg0 <(wg-quick strip wg0)
+```
+
+第一行是管道式密钥生成，genkey 的输出既是落盘的 `privatekey` 又是 pubkey 的输入，对应 `genkey_main` 与 `pubkey_main` 的协作；第二行展示 `config_read_cmd` 支持的 `listen-port`、`private-key`、`peer`、`endpoint`、`allowed-ips` 关键字，注意 `private-key` 后跟的是文件路径（走 `parse_keyfile`）而非密钥本身；第三行是 wg-quick 手册推荐的重载技巧，`strip` 先滤掉 wg-quick 扩展字段，再把纯 ini 交给 syncconf。
+
+```ini
+[Interface]
+Address = 10.0.0.1/24
+PrivateKey = <本端私钥>
+ListenPort = 51820
+DNS = 1.1.1.1
+MTU = 1420
+
+[Peer]
+PublicKey = <对端公钥>
+AllowedIPs = 10.0.0.2/32
+Endpoint = demo.wireguard.com:51820
+PersistentKeepalive = 25
+```
+
+`Address`、`DNS`、`MTU` 是 wg-quick 在 `[Interface]` 段扩展的字段，由 `parse_options` 处理，其余行累积进 `WG_CONFIG` 后经 `set_config` 以 `wg addconf` 送入 `config_read_line`；`AllowedIPs` 逗号分隔、缺省掩码按地址族取 /32 或 /128，由 `parse_allowedips` 实现；`Endpoint` 的域名解析由 `parse_endpoint` 完成，受环境变量 `WG_ENDPOINT_RESOLUTION_RETRIES` 控制重试次数，默认 15 次。
+
+```bash
+wg show wg0
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+示例输出，具体格式需对照实际版本核验
+interface: wg0
+  public key: <本端公钥>
+  private key: (hidden)
+  listening port: 51820
+peer: <对端公钥>
+  endpoint: 203.0.113.9:51820
+  allowed ips: 10.0.0.2/32
+  latest handshake: 2 minutes ago
+  transfer: 1.25 KiB received, 980 B sent
+  persistent keepalive: every 25 seconds
+```
+
+逐行判读如下。第一行 `interface: wg0` 对应 `show.c` 的 `pretty_print` 里对 `WGDEVICE_A_IFNAME` 的渲染，确认查询命中了正确设备。第二行 `public key` 是 `kernel_get_device` 解出的 `WGDEVICE_A_PUBLIC_KEY` 经 `key_to_base64` 的结果，应与分发给对端的值一致。第三行 `private key: (hidden)` 来自 `masked_key`：只要环境变量 `WG_HIDE_KEYS` 不为 never，工具就刻意不回显私钥；这里显示为 hidden 恰恰说明保护生效。第四行 `listening port` 对应 `WGDEVICE_A_LISTEN_PORT`，为空通常意味着没设私钥或接口未 up。第五行 `peer` 段来自 `WGPEER_A_PUBLIC_KEY`，一个接口可有多个 peer。第六行 `endpoint` 对应 `WGPEER_A_ENDPOINT`，由 `endpoint()` 经 `getnameinfo` 格式化。第七行 `allowed ips` 对应 `WGALLOWEDIP_A_IPADDR` 与 `WGALLOWEDIP_A_CIDR_MASK`。第八行 `latest handshake` 由 `ago()` 对 `WGPEER_A_LAST_HANDSHAKE_TIME` 做相对时间格式化，是判断隧道可用的最关键一行。第九行 `transfer` 来自 `WGPEER_A_RX_BYTES` 与 `WGPEER_A_TX_BYTES`，`bytes()` 负责 KiB 与 MiB 换算。第十行 `persistent keepalive` 由 `every()` 渲染 `WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL`，对应配置里的 25 秒。
+
+### 6. 注意事项、陷阱与最佳实践
+
+还有一个解析层面的陷阱：配置解析刻意宽松但有严格边界。`config.c` 的 `get_value` 用 `strncasecmp` 做大小写不敏感匹配，`config_read_line` 先按 `#` 截断注释、再用 `char_is_space` 剥离全部空白后交给 `process_line`，因此键名大小写与多余空格都不影响解析；但 `parse_keyfile` 会检查密钥文件尾随字符，`pubkey_main` 也会拒绝 base64 之后的非空白字符，且 `config_read_finish` 强制每个 peer 必须有 PublicKey。写配置生成工具时若输出多余字符或遗漏公钥，会在这些校验点被拒绝，报错分别对应「Found trailing character in key file」与「A peer is missing a public key」。
+
+第一个陷阱是把编码函数换成通用库。`encoding.c` 的 base64 与 hex 刻意写成常量时间：`encode_base64` 用一组掩码加减避免分支，`key_from_base64` 用 `volatile ret` 累积错误位，`key_is_zero` 用 `asm volatile` 屏障防止编译器优化掉遍历。若图省事改用带查表和早退的普通 base64 库，会引入侧信道，违背文件头注释「resists side-channel attacks」的承诺。
+
+第二个陷阱是误用 genkey 与 genpsk。`genkey_main` 里只有 `argv[0]` 等于 genkey 时才 `curve25519_clamp_secret`；genpsk 生成的是任意 32 字节预共享密钥，不应被钳制。把两者混用（例如对 psk 做钳制）会缩小密钥空间。
+
+第三个陷阱是忽视 wg-quick 的用户态回退。`add_if` 在 `ip link add ... type wireguard` 失败且 `/sys/module/wireguard` 不存在时，会打印警告并回退到 wireguard-go（由 `WG_QUICK_USERSPACE_IMPLEMENTATION` 指定，默认 wireguard-go）。这意味着 `wg-quick up` 成功不代表跑的是内核模块；在性能敏感场景要确认加载的是内核驱动（基准见 08-01、调优见 08-02）。
+
+第四个陷阱是混淆 setconf、addconf、syncconf 三者的语义。三者共用 `setconf_main`，但 addconf 以 append=true 调用 `config_read_init`，不清空 `WGDEVICE_REPLACE_PEERS` 标志，追加配置；setconf 清空；syncconf 额外调用 `sync_conf`，它 `ipc_get_device` 拉回运行时 peer，`qsort` 排序后构造 `WGPEER_REMOVE_ME` 项删除配置文件里已不存在的 peer，同时保留仍存在的会话——这正是「重载不中断会话」的实现机理。误用 setconf 做重载会重置所有 peer，导致握手重来。
+
+第五个陷阱是忽略配置文件权限与路径约束。`parse_options` 要求文件名匹配 `[a-zA-Z0-9_=+.-]{1,15}.conf`，并对全局可写的文件打印警告；`genkey_main` 也检查 stdout 是否为 world-accessible 文件并提示设置 umask 077。第六个陷阱是误算 MTU：`set_mtu_up` 在自动模式下按 endpoint 路由 MTU 减 80 作为封装开销，这是经验值而非定值，跨 IPv6 或特殊封装时要实测。
+
+最佳实践可归纳为四步：用 `wg genkey` 与 `wg pubkey` 规范生成与分发密钥，私钥永不出本机（密钥流程见 03-03）；先用 `wg set` 建立最小两点配置，再用 `wg show` 的 `latest handshake` 与 `transfer` 两行确认隧道真正可用（排障见 08-03）；稳定后改用 wg-quick 管理并收敛 AllowedIPs、按需配置 keepalive（部署见 03-02、03-04）；需要重载时用 syncconf 配合 `wg-quick strip`，而不是 setconf。凡本段涉及的命令选项，全集见 04 册（参数见 04-01、04-03）。
+
+### 7. 小结与延伸阅读
+
+本篇把 wireguard-tools 定位为「连接人类可读配置与内核 netlink 属性接口的用户态工具族」：`wg.c` 单入口分派九个名字到六个实现函数；`config.c` 提供命令行与 ini 两套解析器；`encoding.c` 以常量时间完成 base64 与 hex 编解码；`curve25519.c` 按平台选择后端完成公钥派生与位钳制；`ipc.c` 与 `ipc-linux.h` 把 wgdevice 镜像序列化为 `WG_CMD_SET_DEVICE` 与 `WG_CMD_GET_DEVICE` 属性；`wg-quick/linux.bash` 则以脚本形式包装 wg 与 ip，补齐地址、MTU、路由、DNS 与防火墙。记住「工具一次性、数据面在内核、三层结构镜像内核状态」，就抓住了这一族模块的主线。
+
+延伸阅读按三条线走：想看每个命令有哪些参数，去 04 册的参数全集（参数见 04-01、04-02、04-03、04-05）；想看 wgdevice、wgpeer、wgallowedip 逐字段含义，去 05 册（字段见 05-09、05-01）；想看 netlink 通道与用户态交互的完整机理，去 06 册（原理见 06-14）。本篇作为 07 册的模块职责权威源，只交代 wireguard-tools 这一族做什么、各文件负责什么；内核侧各驱动模块的职责见本册其他篇（模块见 07-01）。跨册随查按（字段见 05-01 ｜ 参数见 04-01 ｜ 原理见 06-14 ｜ 模块见 07-01）执行。凡本篇标注「需对照实际版本核验」的输出格式、默认值与版本号，均以 `_wglinux_build/upstream_src/` 下对应文件为准，本套资料不编造未核验的路径与取值。

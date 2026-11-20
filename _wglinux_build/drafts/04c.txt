@@ -1,0 +1,358 @@
+## 04-05 netlink 通用族命令与属性全集（WG_CMD_* / WG_attr_*）
+
+### 1. 背景与动机
+
+WireGuard Linux 的配置面既不在配置文件里，也不在某种进程间私有协议里，而是完整架在 Linux 内核的通用 netlink（generic netlink）之上。理解这一点，才能明白为什么 `wg set`、`wg show`、`wg syncconf` 这些看起来平平无奇的用户态命令，最终都能精准落到内核接口与 peer 的状态上，而全程不需要任何常驻守护进程。本篇是 04 册中关于「命令与属性」的唯一权威源：我们把 `enum wg_cmd` 的两条命令，以及 device、peer、allowedip 三层属性枚举的全部成员，按源码逐项列出，说明它们的数值、载荷类型、读写方向和在线嵌套层次。凡本篇出现的命令号与属性号，均以本快照 `include/uapi/linux/wireguard.h` 为准；该文件顶部用注释明确写着「Do not edit directly, auto-generated from: Documentation/netlink/specs/wireguard.yaml」，并标注 YNL-GEN 与 `tools/net/ynl/ynl-regen.sh` 重新生成方式。也就是说，本快照里的编号是生成结果，而不是某位维护者手写的魔法数字，这在跨内核版本比对时尤其关键：不同内核快照里同一属性若发生增删，编号可能整体位移，因此「按名字引用、不按数字硬编码」是读懂并使用这套 uapi 的基本纪律。
+
+本篇与紧随其后的 04-06 是同源两篇，分工要分清。本篇聚焦「怎么通信、有哪些命令与属性、属性在线上如何组织」；04-06 聚焦「每个常量与标志的精确数值、MAX 宏如何推导、用户态结构定义长什么样」。换句话说，本篇是语义与在线格式视角，04-06 是数值与结构视角，二者互为索引而不相互替代。本套资料的版本基准统一为「wireguard-linux stable 分支内核驱动快照 + wireguard-tools 1.0.20260223」，下文凡出现源码路径均相对 `_wglinux_build/upstream_src/`，规范中为节约篇幅省略前缀；用户态 netlink 实现读 `wireguard-tools/src/ipc-linux.h` 与 `wireguard-tools/src/netlink.h`。由于内核与工具链持续演进，个别字段的类型与方向标注需对照目标系统实际版本核验，这一点会在第 6 节集中说明。
+
+### 2. 核心概念
+
+通用 netlink 的第一层抽象是「族」（family）。族有名字也有动态编号：名字是字符串 `WG_GENL_NAME`，值为 `"wireguard"`；编号是内核在模块注册时分配的一个 16 位整数，用户态必须先通过 `NETLINK_GENERIC` 通道发送 `CTRL_CMD_GETFAMILY`、携带 `CTRL_ATTR_FAMILY_NAME`，才能取回 `CTRL_ATTR_FAMILY_ID`。这就是 `netlink.h` 中 `mnlg_socket_open()` 的核心动作：它把族名换成族 id，存进 `struct mnlg_socket` 的 `id` 字段，同时把版本（由 `WG_GENL_VERSION` 传入，值为 1）存进 `version` 字段。此后所有消息头里的 `nlmsg_type` 填的都不是族名而是这个动态 id，这正是「通用」二字的含义——族编号随加载顺序变化，硬编码必然出错。
+
+第二层抽象是「命令」。每条通用 netlink 消息在 `nlmsghdr` 之后跟着一个 `struct genlmsghdr`，其中 `cmd` 字段填的就是 `enum wg_cmd` 的取值，`version` 字段填族版本。本快照的 `enum wg_cmd` 只有两条：`WG_CMD_GET_DEVICE`（读）与 `WG_CMD_SET_DEVICE`（写），二者数值分别为 0 与 1，末尾哨兵 `__WG_CMD_MAX` 为 2，对外宏 `WG_CMD_MAX` 定义为 `__WG_CMD_MAX - 1`，即 1。全部配置与查询动作都被压缩进这两条命令：写操作把 device 及嵌套其内的 peer、allowedip 一次性发给内核，读操作把内核当前状态回吐给用户态。
+
+第三层抽象是「属性」。属性是 netlink 的 TLV（类型—长度—值）单元，`struct nlattr` 的 `nla_type` 低 14 位就是属性值，`nla_len` 是含头总长，净荷紧跟其后。WireGuard 把属性分成三层：device 层 `wgdevice_attribute`、peer 层 `wgpeer_attribute`、allowedip 层 `wgallowedip_attribute`。三层之间用「嵌套属性」串接：device 的 `WGDEVICE_A_PEERS` 内嵌若干 peer，每个 peer 的 `WGPEER_A_ALLOWEDIPS` 又内嵌若干 allowedip，嵌套属性在 `nla_type` 上置 `NLA_F_NESTED` 标志位。用户态 `netlink.h` 的 `mnl_attr_nest_start()` 正是干这件事——它把 `NLA_F_NESTED | type` 写进 `nla_type`，再用 `mnl_attr_nest_end()` 回填长度。
+
+第四层是「标志位」。标志属性本身只是承载一个 u32 位图，真正的语义在 `wgdevice_flag`、`wgpeer_flag`、`wgallowedip_flag` 三组枚举里。这里有个极容易混淆的点：用户态 `containers.h` 里还有一套 `WGDEVICE_HAS_PRIVATE_KEY`、`WGPEER_REMOVE_ME` 之类的位，它们与 uapi 里的 `WGDEVICE_F_REPLACE_PEERS`、`WGPEER_F_REMOVE_ME` 不是同一套。前者是用户态描述「本结构体哪些字段有效、要做何种操作」的内部标记，后者才是真正编码进 netlink 属性 `WGDEVICE_A_FLAGS` / `WGPEER_A_FLAGS` / `WGALLOWEDIP_A_FLAGS` 的线上值。两套值在语义上有映射关系（如用户态 `WGPEER_REMOVE_ME = 1<<0` 映射为 uapi `WGPEER_F_REMOVE_ME = 1`），但绝不能把它们当成同一个宏来用。第 5 节会用代码展示这套映射的实际写法。
+
+### 3. 关键数据结构与源码位置
+
+要读懂这套命令与属性，需要把 uapi 声明与用户态实现两头对照。权威声明文件是 `wireguard-linux-src/include/uapi/linux/wireguard.h`，它虽然只有八十行，却定义了族名、族版本、密钥长度、三组标志、三层属性枚举与命令枚举；由于是 YNL 生成物，它同时也是内核侧与用户态共同遵守的契约。用户态实现的主文件是 `wireguard-tools/src/ipc-linux.h`，其中 `kernel_set_device()` 负责装配 SET 请求，`kernel_get_device()` 负责发起 GET 请求，`kernel_get_wireguard_interfaces()` 负责枚举接口；底层 TLV 拼装与通用 netlink 封装则在 `wireguard-tools/src/netlink.h`，关键结构是 `struct mnlg_socket`，它把 socket 句柄、缓冲区、族 id、版本、序列号与端口 id 打包在一起。承载用户态语义的结构定义在 `wireguard-tools/src/containers.h`：`struct wgdevice`、`struct wgpeer`、`struct wgallowedip`，以及跨平台的 `struct timespec64`。下表把本篇反复引用的源码位置收拢成速查。
+
+| 关注点 | 真实源码路径 | 本篇用途 |
+|---|---|---|
+| 命令与属性枚举声明 | `wireguard-linux-src/include/uapi/linux/wireguard.h` | 逐项列出命令号与属性号的唯一依据 |
+| 用户态 netlink 主实现 | `wireguard-tools/src/ipc-linux.h` | 展示 SET/GET 消息如何装配与解析 |
+| 通用 netlink 封装与族解析 | `wireguard-tools/src/netlink.h` | 解释 mnlg_socket_open 与嵌套属性拼装 |
+| 用户态配置结构与内部标志 | `wireguard-tools/src/containers.h` | 对照 HAS_* 位与 uapi F_* 位的区别 |
+
+为便于逐项查阅，下面三张表把三层属性枚举的全部成员按数值顺序列出，并标注载荷类型与方向。「方向」指该属性在 `WG_CMD_SET_DEVICE`（写）与 `WG_CMD_GET_DEVICE`（读）中的出现情况；标注「GET」的属于内核回吐的统计或派生字段，用户态 SET 请求不会携带。
+
+| WGDEVICE_A_* 成员（device 层） | 数值 | 载荷类型 | 方向 |
+|---|---|---|---|
+| WGDEVICE_A_UNSPEC | 0 | 无（占位） | 无 |
+| WGDEVICE_A_IFINDEX | 1 | U32 | GET |
+| WGDEVICE_A_IFNAME | 2 | STRING | SET/GET |
+| WGDEVICE_A_PRIVATE_KEY | 3 | 二进制 32 字节 | SET/GET |
+| WGDEVICE_A_PUBLIC_KEY | 4 | 二进制 32 字节 | GET |
+| WGDEVICE_A_FLAGS | 5 | U32 位图 | SET |
+| WGDEVICE_A_LISTEN_PORT | 6 | U16 | SET/GET |
+| WGDEVICE_A_FWMARK | 7 | U32 | SET/GET |
+| WGDEVICE_A_PEERS | 8 | NESTED | SET/GET |
+| __WGDEVICE_A_LAST | 9 | 哨兵，非有效属性 | 无 |
+
+device 层属性之后是 peer 层属性全集，见下表。
+
+| WGPEER_A_* 成员（peer 层） | 数值 | 载荷类型 | 方向 |
+|---|---|---|---|
+| WGPEER_A_UNSPEC | 0 | 无（占位） | 无 |
+| WGPEER_A_PUBLIC_KEY | 1 | 二进制 32 字节 | SET/GET |
+| WGPEER_A_PRESHARED_KEY | 2 | 二进制 32 字节 | SET/GET |
+| WGPEER_A_FLAGS | 3 | U32 位图 | SET |
+| WGPEER_A_ENDPOINT | 4 | sockaddr（IPv4/IPv6） | SET/GET |
+| WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL | 5 | U16 | SET/GET |
+| WGPEER_A_LAST_HANDSHAKE_TIME | 6 | timespec64 二进制 | GET |
+| WGPEER_A_RX_BYTES | 7 | U64 | GET |
+| WGPEER_A_TX_BYTES | 8 | U64 | GET |
+| WGPEER_A_ALLOWEDIPS | 9 | NESTED | SET/GET |
+| WGPEER_A_PROTOCOL_VERSION | 10 | U32 | GET |
+| __WGPEER_A_LAST | 11 | 哨兵，非有效属性 | 无 |
+
+peer 层再往下是 allowedip 层属性全集，见下表。
+
+| WGALLOWEDIP_A_* 成员（allowedip 层） | 数值 | 载荷类型 | 方向 |
+|---|---|---|---|
+| WGALLOWEDIP_A_UNSPEC | 0 | 无（占位） | 无 |
+| WGALLOWEDIP_A_FAMILY | 1 | U16（AF_INET/AF_INET6） | SET/GET |
+| WGALLOWEDIP_A_IPADDR | 2 | 二进制 4 或 16 字节 | SET/GET |
+| WGALLOWEDIP_A_CIDR_MASK | 3 | U8 | SET/GET |
+| WGALLOWEDIP_A_FLAGS | 4 | U32 位图 | SET |
+| __WGALLOWEDIP_A_LAST | 5 | 哨兵，非有效属性 | 无 |
+
+在消息格式层面，一条 SET 请求从外到内是：`struct nlmsghdr`（`nlmsg_type` 为动态族 id，`nlmsg_flags` 含 `NLM_F_REQUEST | NLM_F_ACK`）→ `struct genlmsghdr`（`cmd = WG_CMD_SET_DEVICE`，`version = 1`）→ 若干 device 层属性。device 层里 `WGDEVICE_A_IFNAME` 总是第一个放进去的，作为定位接口的主键；随后是私钥、监听端口、fwmark 等标量属性，最后才是 `WGDEVICE_A_PEERS` 嵌套块。GET 请求则只带 `WGDEVICE_A_IFNAME`，并置 `NLM_F_DUMP`，表示期望内核把该接口的完整状态以多段消息回吐。理解「外层是 genlmsghdr，内层是三层 TLV」这件事，是读懂后面所有属性表的钥匙。
+
+### 4. 关键流程与调用链
+
+先说族解析。`mnlg_socket_open(WG_GENL_NAME, WG_GENL_VERSION)` 在 `netlink.h` 第 731 行定义：它打开一个 `NETLINK_GENERIC` 的 raw socket，用 `MNL_SOCKET_AUTOPID` 自动绑定并拿到端口 id，然后构造 `CTRL_CMD_GETFAMILY` 请求，属性填 `CTRL_ATTR_FAMILY_NAME = "wireguard"`，发送后由 `get_family_id_cb()` 回调从响应的 `CTRL_ATTR_FAMILY_ID` 取出族 id 存入 `nlg->id`。有一个细节值得记住：若查不到族（模块未加载），内核返回 `ENOENT`，该函数把它翻译成 `EPROTONOSUPPORT` 返回——这就是为什么模块没插时 `wg show` 报的错看起来像「协议不支持」而不是「找不到族」。拿到 id 后，`mnlg_msg_prepare()`（`__mnlg_msg_prepare` 的薄封装）为每条命令重填 nlmsghdr 与 genlmsghdr，序列号用 `time(NULL)` 生成。
+
+再说 SET 路径。`kernel_set_device()` 先打开族，再 `mnlg_msg_prepare(nlg, WG_CMD_SET_DEVICE, NLM_F_REQUEST | NLM_F_ACK)`，随后 `mnl_attr_put_strz(nlh, WGDEVICE_A_IFNAME, dev->name)` 把接口名写进去。接着是一串按用户态标志条件触发的标量属性：有 `WGDEVICE_HAS_PRIVATE_KEY` 就放 32 字节 `WGDEVICE_A_PRIVATE_KEY`；有 `WGDEVICE_HAS_LISTEN_PORT` 就放 u16 的 `WGDEVICE_A_LISTEN_PORT`；有 `WGDEVICE_HAS_FWMARK` 就放 u32 的 `WGDEVICE_A_FWMARK`；有 `WGDEVICE_REPLACE_PEERS` 就把 uapi 的 `WGDEVICE_F_REPLACE_PEERS` 置进一个局部 flags，非空时才放 `WGDEVICE_A_FLAGS`。peer 部分从 `WGDEVICE_A_PEERS` 嵌套开始，对每个 peer 再开一层匿名嵌套，依次放 `WGPEER_A_PUBLIC_KEY`、可选的预共享密钥、endpoint（IPv4 用 `sockaddr_in`、IPv6 用 `sockaddr_in6`）、keepalive 间隔，以及 peer 的 `WGPEER_A_FLAGS`；每个 peer 的 allowedip 又嵌在 `WGPEER_A_ALLOWEDIPS` 里。所有写入都用 `*_check` 变体并传入 `SOCKET_BUFFER_SIZE`，一旦消息超过一页缓冲区就跳到 `toobig_peers` / `toobig_allowedips` 标签收尾发送，外层用 `goto again` 把剩余 peer 分到下一条消息，避免溢出。
+
+最后说 GET 路径。`kernel_get_device()` 同样打开族，但用 `WG_CMD_GET_DEVICE` 加 `NLM_F_DUMP`，只带接口名；`mnlg_socket_recv_run()` 循环收包，交给 `read_device_cb()` → `parse_device()` 逐属性解析，`WGDEVICE_A_PEERS` 触发 `parse_peers()`，`WGPEER_A_ALLOWEDIPS` 触发 `parse_allowedips()`，层层回填到用户态结构。解析完成后 `coalesce_peers()` 把公钥相同的 peer 合并、拼接其 allowedip 链表，因为 dump 可能把同一 peer 拆成多段返回。接口枚举则走另一条路：`kernel_get_wireguard_interfaces()` 用 `NETLINK_ROUTE` 的 `RTM_GETLINK`，在 `IFLA_LINKINFO` 里放 `IFLA_INFO_KIND = WG_GENL_NAME`，按「接口类型」而非 genetlink 族来筛出所有 wireguard 接口。族解析、SET、GET 三者的关系见图 04-05-01。
+
+:::figure id=04-05-01 | name=通用 netlink 配置面的族解析与 SET/GET 双路径 | dir=TD
+node c1 "wg 命令<br/>set / show" blue
+node c2 "mnlg_socket_open<br/>CTRL_CMD_GETFAMILY" teal
+node c3 "CTRL_ATTR_FAMILY_ID<br/>动态族 id" purple
+node c4 "WG_CMD_SET_DEVICE<br/>NLM_F_REQUEST|ACK" green
+node c5 "WG_CMD_GET_DEVICE<br/>NLM_F_REQUEST|ACK|DUMP" green
+node c6 "device 层属性<br/>IFNAME/KEY/PORT/FLAGS" gray
+node c7 "PEERS 嵌套<br/>peer 层属性" gray
+node c8 "ALLOWEDIPS 嵌套<br/>allowedip 层属性" gray
+node c9 "内核驱动状态<br/>device/peer/trie" red
+node c10 "逐层 parse_* 回调<br/>coalesce_peers" amber
+edge c1 -> c2 "族名解析"
+edge c2 -> c3 "取 id"
+edge c3 -> c4 "写路径"
+edge c3 -> c5 "读路径"
+edge c4 -> c6 "组属性"
+edge c6 -> c7 "嵌套"
+edge c7 -> c8 "嵌套"
+edge c8 -> c9 "写入内核"
+edge c5 -> c10 "收包解析"
+edge c10 -> c9 "还原状态"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「wg 命令 set/show」先经「mnlg_socket_open 发 CTRL_CMD_GETFAMILY」拿到「CTRL_ATTR_FAMILY_ID 动态族 id」；写路径是「WG_CMD_SET_DEVICE」依次组「device 层属性」「PEERS 嵌套 peer 层属性」「ALLOWEDIPS 嵌套 allowedip 层属性」再写入「内核驱动状态」；读路径是「WG_CMD_GET_DEVICE」由「逐层 parse_* 回调 coalesce_peers」把多段响应还原为「内核驱动状态」的对等视图。
+
+### 5. 配置/命令/代码实例
+
+下面这段命令展示了从用户态视角触发上述两条命令的典型写法；它们是理解属性流向的入口，具体参数语义属 04-01、04-02 范畴，本篇只关心它们最终落到哪个命令与属性。
+
+```bash
+# 写路径：触发 WG_CMD_SET_DEVICE，携带 device 与 peer 属性
+wg set wg0 private-key ./privatekey listen-port 51820 fwmark 42
+wg set wg0 peer <对端公钥> endpoint 203.0.113.9:51820 allowed-ips 10.0.0.2/32
+
+# 读路径：触发 WG_CMD_GET_DEVICE（带 NLM_F_DUMP）
+wg show wg0
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+interface: wg0
+  public key: <本端公钥>
+  private key: (hidden)
+  listening port: 51820
+  fwmark: 0x2a
+peer: <对端公钥>
+  endpoint: 203.0.113.9:51820
+  allowed ips: 10.0.0.2/32
+  persistent keepalive: every 25 seconds
+  latest handshake: 8 seconds ago
+  transfer: 2.10 KiB received, 1.44 KiB sent
+```
+
+逐行判读如下。首行 `interface: wg0` 来自 `WG_CMD_GET_DEVICE` 响应中的 `WGDEVICE_A_IFNAME` 属性，它既是 SET 请求里的定位主键，也是 dump 结果的分组标识，确认查询命中了正确接口。第二行 `public key` 由私钥经 Curve25519 派生，对应 `WGDEVICE_A_PUBLIC_KEY`，是内核回吐的属性而非用户态计算后显示的值；对端必须用同一个值配置，否则握手静默失败。第三行 `private key: (hidden)` 说明工具刻意不回显 32 字节私钥，但底层 `WGDEVICE_A_PRIVATE_KEY` 属性确实在内核里存在且可经 netlink 读写，`hidden` 只是展示层保护。第四行 `listening port: 51820` 对应 u16 类型的 `WGDEVICE_A_LISTEN_PORT`，来自前面 `wg set ... listen-port` 写入的属性。第五行 `fwmark: 0x2a` 对应 u32 的 `WGDEVICE_A_FWMARK`，十进制 42 即十六进制 0x2a，用于策略路由打标。第六行 `peer:` 起一个 peer 段，对应 `WGPEER_A_PUBLIC_KEY`；一个接口下可有多个这样的段，彼此由 `WGDEVICE_A_PEERS` 嵌套层分隔。第七行 `endpoint` 对应 `WGPEER_A_ENDPOINT`，其载荷是 `sockaddr_in` 或 `sockaddr_in6` 结构而非纯字符串，解析时靠 `sa_family` 区分 IPv4 与 IPv6。第八行 `allowed ips` 同时对应 `WGALLOWEDIP_A_IPADDR` 与 `WGALLOWEDIP_A_CIDR_MASK`，二者嵌在 `WGPEER_A_ALLOWEDIPS` 里，决定「源地址校验」与「出向选路」两件事。第九行 `persistent keepalive` 对应 u16 的 `WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL`，单位为秒。第十行 `latest handshake` 对应二进制时间戳属性 `WGPEER_A_LAST_HANDSHAKE_TIME`（编译期按 `struct timespec64` 的 16 字节布局传递），是判断隧道是否真正可用的核心。第十一行 `transfer` 分别对应 u64 的 `WGPEER_A_RX_BYTES` 与 `WGPEER_A_TX_BYTES`，只有握手成功且 allowedips 正确时才会增长。整个输出没有任何一行来自本地配置文件——全部是内核经 `WG_CMD_GET_DEVICE` 回吐的属性渲染结果，这正是「配置面在 netlink」的最直接证据。
+
+为了把 uapi 声明与用户态装配对照起来，下面给出 uapi 头中的命令枚举与用户态 `kernel_set_device()` 里装配标志的精简片段（保留真实枚举名与位值，节选以便阅读）。
+
+```c
+/* wireguard-linux-src/include/uapi/linux/wireguard.h（节选） */
+enum wg_cmd {
+	WG_CMD_GET_DEVICE,
+	WG_CMD_SET_DEVICE,
+	__WG_CMD_MAX
+};
+#define WG_CMD_MAX (__WG_CMD_MAX - 1)
+
+enum wgdevice_flag {
+	WGDEVICE_F_REPLACE_PEERS = 1,
+};
+enum wgpeer_flag {
+	WGPEER_F_REMOVE_ME = 1,
+	WGPEER_F_REPLACE_ALLOWEDIPS = 2,
+	WGPEER_F_UPDATE_ONLY = 4,
+};
+```
+
+```c
+/* wireguard-tools/src/ipc-linux.h 的 kernel_set_device()（节选） */
+if (dev->flags & WGDEVICE_REPLACE_PEERS)
+	flags |= WGDEVICE_F_REPLACE_PEERS;   /* 用户态位 → uapi 标志 */
+if (flags)
+	mnl_attr_put_u32(nlh, WGDEVICE_A_FLAGS, flags);
+if (peer->flags & WGPEER_REMOVE_ME)
+	flags |= WGPEER_F_REMOVE_ME;
+if (peer->flags & WGPEER_REPLACE_ALLOWEDIPS)
+	flags |= WGPEER_F_REPLACE_ALLOWEDIPS;
+```
+
+第一段 C 代码是 uapi 的权威声明：注意 `WG_CMD_MAX` 用哨兵减一推导，而三组标志全都是显式的 1、2、4，即标准位图布局。第二段 C 代码揭示了「用户态内部位」到「线上标志属性」的映射：左边 `dev->flags & WGDEVICE_REPLACE_PEERS` 是 `containers.h` 里的用户态位，右边 `WGDEVICE_F_REPLACE_PEERS` 才是填进 `WGDEVICE_A_FLAGS` 的 uapi 值。像 `WGDEVICE_HAS_PRIVATE_KEY` 这类 `HAS_*` 位不会出现在这段映射里，因为它们只决定「要不要放某个属性」，而不被编码成标志值本身。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把动态族 id 当成固定值。族编号由内核注册顺序决定，绝不能把某次 `CTRL_CMD_GETFAMILY` 得到的 id 写死；正确做法始终是先 `mnlg_socket_open()` 解析族名再发命令。第二个陷阱是混淆两套标志。用户态 `HAS_*` 是「字段有效位」，只在本地结构体里用；`F_*` 才是线上位图。把 `WGPEER_HAS_PRESHARED_KEY`（值 8）误当成 uapi 的 `WGPEER_F_*` 发出去，属性语义会完全错乱。第三个陷阱是忽略缓冲区分片。`kernel_set_device()` 用一页大小的 `SOCKET_BUFFER_SIZE`（`mnl_ideal_socket_buffer_size()` 在页大小大于 8192 时截断为 8192）拼装消息，peer 或 allowedip 很多时必须依赖 `goto again` 分多条消息发送；自己实现工具时若照搬「一条消息塞全部」的写法，会在 peer 规模大时静默失败。
+
+第四个陷阱是属性顺序与嵌套标志。`WGDEVICE_A_IFNAME` 必须作为 SET 请求的主键首先出现；嵌套属性必须用 `NLA_F_NESTED` 置位（由 `mnl_attr_nest_start()` 完成），且嵌套结束要正确回填长度，否则内核解析会错位。第五个陷阱是把 dump 的中断当致命错误：`kernel_get_wireguard_interfaces()` 对 `NLM_F_DUMP_INTR` 返回 `EINTR` 时选择接受部分结果而非无限重试，因为繁忙系统上隧道增删很常见；`kernel_get_device()` 则对 `EINTR` 用 `goto try_again` 重试。第六个陷阱是接口名长度：`kernel_get_device()` 在 `strlen(iface) >= IFNAMSIZ` 时直接返回 `ENAMETOOLONG`，因为 libmnl 不校验缓冲区，必须先挡住超长名。第七个陷阱是误用 `WGPEER_F_UPDATE_ONLY`。该位值为 4，语义是「只更新已存在的 peer，不要新建」；若在一个尚不存在的公钥上设置它，内核不会自动建出 peer，配置会看似成功却毫无效果。它与 `WGPEER_F_REMOVE_ME`（删除 peer）互斥，同一条 SET 里同时置位属于自相矛盾的请求。第八个陷阱是属性类型与字节序。netlink 属性按主机字节序传递，`mnl_attr_put_u16` / `u32` / `u64` 写入的是本地字节序，跨机器或跨架构抓包解读时必须按本机序解析；`mnl_attr_validate()` 用 `MNL_TYPE_U8` / `U16` / `U32` / `U64` 做长度校验，类型不符会被拒绝，因此自定义实现必须严格按第 3 节表格里的类型放值，例如 CIDR 掩码是 u8、端点家族是 u16、流量计数是 u64，任何一位写错都会让内核的策略校验失败并返回错误。
+
+最佳实践：把 uapi 头当契约、把 YAML spec 当源头——要确认某属性的类型与方向，先看生成它的 `Documentation/netlink/specs/wireguard.yaml`，再看生成结果 `wireguard.h`；写工具时用 `*_check` 系列函数并制定分片策略；解析一律做类型与长度校验（如 `MNL_TYPE_U16` / `MNL_TYPE_U64`），不要信任对端属性；遇到未识别的新属性（例如本快照枚举里存在但用户态 `parse_peer()` 未处理 `WGPEER_A_PROTOCOL_VERSION`）应跳过而非报错，以兼容后续内核新增字段。这些做法的底层机制属 06-14，模块职责属 07-11，均需对照实际版本核验。
+
+### 7. 小结与延伸阅读
+
+本篇把 WireGuard Linux 配置面的命令与属性全集收束成一张可查的地图：族名 `WG_GENL_NAME = "wireguard"` 经 `CTRL_CMD_GETFAMILY` 换成动态族 id；命令只有 `WG_CMD_GET_DEVICE`（读，带 dump）与 `WG_CMD_SET_DEVICE`（写，带 ACK）两条；属性分 device、peer、allowedip 三层，通过 `NLA_F_NESTED` 的 `PEERS` 与 `ALLOWEDIPS` 嵌套串接；标志以 u32 位图承载，用户态 `HAS_*` 与 uapi `F_*` 是两套必须分清的位域。读写两条路径分别由 `kernel_set_device()` 与 `kernel_get_device()` 实现，解析靠 `parse_device` → `parse_peers` → `parse_peer` → `parse_allowedips` → `parse_allowedip` 逐层回调，最后 `coalesce_peers()` 合并分段结果。本篇给出的 attribute 枚举逐项数值与类型是命令与属性的权威口径，具体常量的精确数值与结构定义见紧邻的 04-06。
+
+延伸阅读建议：命令的用户态语法读 04-01、04-02，本篇只解释它们落到哪条 netlink 命令；netlink 通道与用户态交互的底层原理读 06-14；用户态结构逐字段读 05-09。跨册随查按（字段见 05-09 ｜ 配置见 03-02 ｜ 原理见 06-14 ｜ 模块见 07-11）执行：结构体逐字段去 05、部署与配置体系去 03、机制与调用链去 06、目录级模块能力去 07。凡本篇标注「需对照实际版本核验」的属性类型、方向与错误码，均以 `_wglinux_build/upstream_src/` 下 `include/uapi/linux/wireguard.h`、`wireguard-tools/src/ipc-linux.h` 与 `netlink.h` 为准，本套资料不编造未核验的路径与取值。
+
+## 04-06 uapi wireguard.h 常量、标志与结构定义全集
+
+### 1. 背景与动机
+
+如果说 04-05 回答的是「配置面怎么通信、有哪些命令与属性」，那么本篇回答的是更底层也更容易被忽略的问题：「这些命令与属性在头文件里到底长什么样、精确数值是多少」。在内核与用户态的边界上，uapi 头文件是双方共同编译进各自二进制的那份契约，任何一个宏的拼写或数值被误读，都会造成用户态发出的请求被内核拒绝，或者两边对同一位标志的理解分道扬镳。本篇把 `wireguard-linux-src/include/uapi/linux/wireguard.h` 里的每一个 `#define`、每一个 `enum` 的每一个成员及其数值、三个 `*_MAX` 宏的推导方式，以及用户态承载同一批数据的结构定义，逐项列成可查的清单。这是全册关于常量的唯一权威源：其他册若需引用 `WG_KEY_LEN`、`WGPEER_F_REMOVE_ME` 之类，只给最小片段并回指本篇，绝不在这里重复展开。
+
+先立一条规矩：这份头文件是不能手改的。文件第 2 至第 5 行明确写着「Do not edit directly, auto-generated from: Documentation/netlink/specs/wireguard.yaml」「YNL-GEN uapi header」「To regenerate run: tools/net/ynl/ynl-regen.sh」。它位于内核树的 `include/uapi/linux/` 之下，意味着一旦进入发行版内核头文件包，就对全部用户态程序可见；修改它却不同步 YAML 规范，下次 `ynl-regen.sh` 会覆盖你的改动。因此读这份文件的正确姿势是：把它当生成产物，追根溯源去读 `Documentation/netlink/specs/wireguard.yaml`（本快照未包含该 YAML，故本篇所有数值均以生成后的头文件为准，涉及规范原文处需对照目标内核源码树核验）。文件头的 SPDX 行是 `((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause)`，这种双许可声明让它在 GPL 内核与 BSD 风格用户态代码里都能合法使用，是与「WireGuard 代码刻意采用宽松许可」这一设计取向一致的细节。
+
+本篇与 04-05 同源但视角不同：04-05 讲语义与在线格式，本篇讲数值与结构；本篇列出的 #define 值与位图值，是阅读 `ipc-linux.h`、分析 netlink 抓包、核对 `wg show` 输出的前提。版本基准仍为「wireguard-linux stable 分支内核驱动快照 + wireguard-tools 1.0.20260223」，源码路径相对 `_wglinux_build/upstream_src/` 省略前缀；用户态结构定义取自 `wireguard-tools/src/containers.h` 与 `contrib/embeddable-wg-library/wireguard.h`。
+
+### 2. 核心概念
+
+理解这份头文件，要分清三类不同的「数值来源」。第一类是 `#define` 指定的宏：`WG_GENL_NAME`、`WG_GENL_VERSION`、`WG_KEY_LEN`，它们的值由文件直接给出，分别是 `"wireguard"`、1、32，没有任何推导。第二类是 C 枚举成员的自动编号：`enum wg_cmd` 与三层属性枚举里，从 `WG_CMD_GET_DEVICE`、`WGDEVICE_A_UNSPEC` 等第一个成员开始，编译器自动从 0 递增赋值，所以 UNSPEC 恒为 0、后续成员依次加一。这也是为什么在任何一份该头文件里，`WGDEVICE_A_IFNAME` 永远是 2、`WGPEER_A_PROTOCOL_VERSION` 永远是 10——不是谁规定了这个数字，而是它在枚举里排在第三个和第十一个位置。第三类是显式赋值的标志位：`WGDEVICE_F_REPLACE_PEERS = 1`、`WGPEER_F_REMOVE_ME = 1`、`WGPEER_F_REPLACE_ALLOWEDIPS = 2`、`WGPEER_F_UPDATE_ONLY = 4`、`WGALLOWEDIP_F_REMOVE_ME = 1`，它们被写成 1、2、4 而非自动编号，一看就是位图（bitmask），每个值占一个独立的二进制位，可以按位或组合。
+
+每类枚举末尾都有一个双下划线哨兵，例如 `__WGDEVICE_A_LAST`、`__WGPEER_A_LAST`、`__WGALLOWEDIP_A_LAST`、`__WG_CMD_MAX`。哨兵本身不是有效属性或命令，它只是「最后一个成员再加一」的占位符，用来自动算出对外公开的 `*MAX` 宏：`#define WGDEVICE_A_MAX (__WGDEVICE_A_LAST - 1)`、`#define WGPEER_A_MAX (__WGPEER_A_LAST - 1)`、`#define WGALLOWEDIP_A_MAX (__WGALLOWEDIP_A_LAST - 1)`、`#define WG_CMD_MAX (__WG_CMD_MAX - 1)`。以 device 层为例，`__WGDEVICE_A_LAST` 因为排在 `WGDEVICE_A_PEERS` 之后自动取值为 9，于是 `WGDEVICE_A_MAX` 等于 8，正好是最后一个有效属性 `WGDEVICE_A_PEERS` 的值。这套「哨兵减一」写法在内核里非常常见，好处是新增属性时只需在哨兵前插一行，MAX 自动跟着长，不会忘记更新。
+
+密钥长度 `WG_KEY_LEN = 32` 是本篇最该记住的常量之一。它规定 Curve25519 私钥、公钥与预共享密钥在 netlink 上传输时都是 32 字节原始二进制。注意这里有一个高频误解：配置文件里看到的 `wg genkey` 输出是 44 字符的 base64 文本（外加一个结尾 NUL，共 45 字节），那是编码后的形式，不是 `WG_KEY_LEN` 本身。`contrib/embeddable-wg-library/wireguard.h` 里的 `typedef char wg_key_b64_string[((sizeof(wg_key) + 2) / 3) * 4 + 1];` 精确解释了换算：32 字节按每 3 字节一组编码成 4 个 base64 字符，`(32+2)/3*4 = 44`，再加一字节 NUL 得 45。把 44 当成密钥长度去写 netlink 属性，会让属性载荷长度对不上而被内核拒绝。
+
+第三个要点是「uapi 头文件里有没有结构体」。答案是没有——这份 `wireguard.h` 只含 `#define` 与 `enum`，不定义任何 `struct`。真正随 netlink 载荷出现的数据结构定义在用户态：内部实现用 `wireguard-tools/src/containers.h` 的 `struct wgdevice` / `struct wgpeer` / `struct wgallowedip`， embeddable 库用同名但 typedef 风格的 `wg_device` / `wg_peer` / `wg_allowedip`；内核侧对应的结构（`wg_device`、`wg_peer` 等）则在驱动源码里，逐字段解读属 05 册。本篇把用户态这几个结构列全，是为了说明「一份 32 字节密钥、一个 u16 端口、一组 u64 计数器」在跨越 netlink 前后分别落在哪个成员的哪个位置，这正是常量与结构定义全集的意义。
+
+### 3. 关键数据结构与源码位置
+
+围绕这份头文件的源码位置形成一条清晰链路。源头是 `wireguard-linux-src/Documentation/netlink/specs/wireguard.yaml`（本快照未收录，需对照目标内核源码树），生成物是 `wireguard-linux-src/include/uapi/linux/wireguard.h`，重生成脚本是内核树的 `tools/net/ynl/ynl-regen.sh`；三者构成「规范—生成结果—重生成工具」的闭环。消费者一端在内核：`drivers/net/wireguard/` 下各源文件（本快照中该目录未见独立的 `netlink.c`，说明内核侧 netlink 代码已随 YNL 框架生成或移入公共路径，具体位置需对照目标内核版本核验）；另一端在用户态：`wireguard-tools/src/ipc-linux.h` 用这些枚举装配与解析消息，`wireguard-tools/src/containers.h` 定义承载数据的人员结构，`contrib/embeddable-wg-library/wireguard.h` 提供可嵌入第三方程序的公共 API。版本字符串另有出处：`drivers/net/wireguard/version.h` 的 `WIREGUARD_VERSION` 为 `"1.0.0"`，`wireguard-tools/src/version.h` 的 `WIREGUARD_TOOLS_VERSION` 为 `"1.0.20260223"`，二者与 `WG_GENL_VERSION`（1）是三个互不相同的「版本」，不能混用。下表把本篇涉及的常量与结构位置收拢成速查。
+
+| 关注点 | 真实源码路径 | 本篇用途 |
+|---|---|---|
+| uapi 常量与枚举权威声明 | `wireguard-linux-src/include/uapi/linux/wireguard.h` | 逐项数值的唯一依据 |
+| 生成来源与重生成脚本 | `Documentation/netlink/specs/wireguard.yaml`、`tools/net/ynl/ynl-regen.sh` | 解释「不可手改」与版本差异 |
+| 用户态内部结构与内部标志 | `wireguard-tools/src/containers.h` | 给出 HAS_* 位与结构字段 |
+| 可嵌入公共 API 与结构 | `wireguard-tools/contrib/embeddable-wg-library/wireguard.h` | 给出密钥 base64 长度换算与 typedef 结构 |
+
+先把 uapi 头中全部 `#define` 与哨兵/MAX 宏的数值列成一张常量全集表。这些值要么由 `#define` 直接给出，要么由枚举位置自动推导，都是编译期常量。
+
+| 常量或宏 | 精确值 | 来源方式 |
+|---|---|---|
+| WG_GENL_NAME | "wireguard" | `#define` 直接给出 |
+| WG_GENL_VERSION | 1 | `#define` 直接给出 |
+| WG_KEY_LEN | 32 | `#define` 直接给出 |
+| WG_CMD_MAX | 1 | `__WG_CMD_MAX`(2) 减 1 |
+| WGDEVICE_A_MAX | 8 | `__WGDEVICE_A_LAST`(9) 减 1 |
+| WGPEER_A_MAX | 10 | `__WGPEER_A_LAST`(11) 减 1 |
+| WGALLOWEDIP_A_MAX | 4 | `__WGALLOWEDIP_A_LAST`(5) 减 1 |
+
+先给出 uapi 头中最核心的三组标志位全集表。它们不是自动编号，而是显式位值，因此每一位的含义都必须逐项记牢。
+
+| 枚举 | 成员 | 精确值 | 含义 |
+|---|---|---|---|
+| wgdevice_flag | WGDEVICE_F_REPLACE_PEERS | 1 | 用本次提供的 peer 集合整体替换原有 peer |
+| wgpeer_flag | WGPEER_F_REMOVE_ME | 1 | 删除该公钥对应的 peer |
+| wgpeer_flag | WGPEER_F_REPLACE_ALLOWEDIPS | 2 | 用本次 allowedip 集合替换该 peer 原有集合 |
+| wgpeer_flag | WGPEER_F_UPDATE_ONLY | 4 | 只更新已存在的 peer，不新建 |
+| wgallowedip_flag | WGALLOWEDIP_F_REMOVE_ME | 1 | 删除该 allowedip 条目 |
+
+再看用户态 `containers.h` / embeddable 库里那套内部标志表。它们与 uapi 的 `F_*` 位同名前缀相似但数值体系独立，是本篇最需要提醒读者分清的地方。
+
+| 结构层级 | 用户态内部标志 | 精确值 | 与 uapi 标志的关系 |
+|---|---|---|---|
+| device | WGDEVICE_REPLACE_PEERS | 1<<0 | 映射为 WGDEVICE_F_REPLACE_PEERS |
+| device | WGDEVICE_HAS_PRIVATE_KEY | 1<<1 | 仅标记字段有效，不编码成标志位 |
+| device | WGDEVICE_HAS_PUBLIC_KEY | 1<<2 | 仅标记字段有效，不编码成标志位 |
+| device | WGDEVICE_HAS_LISTEN_PORT | 1<<3 | 仅标记字段有效，不编码成标志位 |
+| device | WGDEVICE_HAS_FWMARK | 1<<4 | 仅标记字段有效，不编码成标志位 |
+| peer | WGPEER_REMOVE_ME | 1<<0 | 映射为 WGPEER_F_REMOVE_ME |
+| peer | WGPEER_REPLACE_ALLOWEDIPS | 1<<1 | 映射为 WGPEER_F_REPLACE_ALLOWEDIPS |
+| peer | WGPEER_HAS_PUBLIC_KEY | 1<<2 | 仅标记字段有效，不编码成标志位 |
+| peer | WGPEER_HAS_PRESHARED_KEY | 1<<3 | 仅标记字段有效，不编码成标志位 |
+| peer | WGPEER_HAS_PERSISTENT_KEEPALIVE_INTERVAL | 1<<4 | 仅标记字段有效，不编码成标志位 |
+| allowedip | WGALLOWEDIP_REMOVE_ME | 1<<0 | 映射为 WGALLOWEDIP_F_REMOVE_ME |
+
+### 4. 关键流程与调用链
+
+常量的「生命周期」是从 YAML 规范到两端二进制的一条单向链。`wireguard.yaml` 描述族名、命令与各属性的类型和约束；`ynl-regen.sh` 读取它，按 YNL 模板生成 `include/uapi/linux/wireguard.h`；这份头文件随内核头文件包发布，被内核驱动代码与用户态 `ipc-linux.h` 同时 `#include <linux/wireguard.h>`。于是 `WG_CMD_SET_DEVICE`、`WGDEVICE_A_IFNAME`、`WGPEER_F_REMOVE_ME` 这些符号在两边拥有完全相同的数值，这正是契约的意义。任何绕过头文件、在某一侧手写数字的写法，都会在这条链上埋下不一致的隐患。理解这条链，也就理解了为什么本快照缺少独立的 `netlink.c` 并不奇怪——随着 netlink 规范化的推进，越来越多的解析代码由 YNL 从 YAML 生成，手写文件自然会减少甚至消失，具体布局需对照目标内核版本核验。
+
+第二条链是「用户态标志到位图属性」的转换。`kernel_set_device()` 在发送前检查 `dev->flags` 与 `peer->flags` 里的 `HAS_*` 与操作位：每个 `HAS_*` 决定要不要放对应属性（例如 `HAS_LISTEN_PORT` 决定放 `WGDEVICE_A_LISTEN_PORT`），而 `REPLACE_PEERS`、`REMOVE_ME`、`REPLACE_ALLOWEDIPS` 这几个操作位则被翻译成 uapi 的 `F_*` 值，按位或成 u32，写进 `WGDEVICE_A_FLAGS` 或 `WGPEER_A_FLAGS`。注意 `WGPEER_F_UPDATE_ONLY` 在 uapi 里有定义（值 4），但本快照的 `kernel_set_device()` 装配代码里并未出现对应的用户态标志，说明它是协议层保留给其他实现或未来工具的能力，wg 工具当前未必用到——这类「uapi 有、用户态暂不用」的字段，阅读时要如实标注，不可臆造调用点。
+
+第三条链是「密钥长度从常量到 base64」。`wg genkey` 生成 32 字节随机私钥（内部 `wg_key[32]`），`wg pubkey` 由私钥经 Curve25519 派生同样 32 字节的公钥；它们对外以 base64 文本呈现，长度由 `wg_key_b64_string[((sizeof(wg_key)+2)/3)*4+1]` 算得 45 字节（44 字符加 NUL）。当 `wg set` 解析配置时，`encoding.c` 把 44 字符 base64 解码回 32 字节，`kernel_set_device()` 再以 `sizeof(dev->private_key)`（即 `WG_KEY_LEN`）为长度放进 `WGDEVICE_A_PRIVATE_KEY` 属性。三条链的关系，以及常量在其中的落点，见图 04-06-01。
+
+:::figure id=04-06-01 | name=从 YAML 规范到 uapi 常量再到用户态结构的单向链 | dir=LR
+node d1 "wireguard.yaml<br/>netlink 规范源头" blue
+node d2 "ynl-regen.sh<br/>YNL 生成器" teal
+node d3 "wireguard.h<br/>#define 与 enum" purple
+node d4 "内核驱动<br/>编译期常量" green
+node d5 "ipc-linux.h<br/>装配与解析属性" green
+node d6 "containers.h<br/>wgdevice/wgpeer 结构" gray
+node d7 "WG_KEY_LEN=32<br/>原始密钥字节" amber
+node d8 "base64 44 字符<br/>+1 NUL = 45" red
+edge d1 -> d2 "读取规范"
+edge d2 -> d3 "生成头文件"
+edge d3 -> d4 "内核引入"
+edge d3 -> d5 "用户态引入"
+edge d5 -> d6 "填充结构"
+edge d6 -> d7 "密钥入属性"
+edge d7 -> d8 "编码呈现"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：源头「wireguard.yaml netlink 规范」经「ynl-regen.sh YNL 生成器」产出「wireguard.h #define 与 enum」，这份头文件同时被「内核驱动编译期常量」与「ipc-linux.h 装配与解析属性」引入；用户态由「containers.h wgdevice/wgpeer 结构」承载数据，其中「WG_KEY_LEN=32 原始密钥字节」在对外展示时被编码成「base64 44 字符 +1 NUL = 45」。
+
+### 5. 配置/命令/代码实例
+
+下面第一块代码把 uapi 头里的命令枚举、三组标志与三层属性枚举的关键部分按真实数值标注出来（在源码里大多数成员不显式写数值，这里为便于查阅补全了推导结果，不改变其含义）；第二块代码用 shell 验证密钥长度与 base64 换算。随后给出示例输出与逐行判读。
+
+```c
+/* wireguard-linux-src/include/uapi/linux/wireguard.h 数值全解（推导值以注释标出） */
+#define WG_GENL_NAME    "wireguard"
+#define WG_GENL_VERSION 1
+#define WG_KEY_LEN      32
+
+enum wg_cmd {
+	WG_CMD_GET_DEVICE,   /* 0 */
+	WG_CMD_SET_DEVICE,   /* 1 */
+	__WG_CMD_MAX         /* 2 */
+};
+#define WG_CMD_MAX (__WG_CMD_MAX - 1)   /* 1 */
+
+enum wgdevice_attribute {
+	WGDEVICE_A_UNSPEC,      /* 0 */
+	WGDEVICE_A_IFINDEX,     /* 1 */
+	WGDEVICE_A_IFNAME,      /* 2 */
+	WGDEVICE_A_PRIVATE_KEY, /* 3 */
+	WGDEVICE_A_PUBLIC_KEY,  /* 4 */
+	WGDEVICE_A_FLAGS,       /* 5 */
+	WGDEVICE_A_LISTEN_PORT, /* 6 */
+	WGDEVICE_A_FWMARK,      /* 7 */
+	WGDEVICE_A_PEERS,       /* 8 */
+	__WGDEVICE_A_LAST       /* 9 */
+};
+#define WGDEVICE_A_MAX (__WGDEVICE_A_LAST - 1)   /* 8 */
+
+enum wgpeer_flag {
+	WGPEER_F_REMOVE_ME = 1,          /* bit0 */
+	WGPEER_F_REPLACE_ALLOWEDIPS = 2, /* bit1 */
+	WGPEER_F_UPDATE_ONLY = 4,        /* bit2 */
+};
+```
+
+```bash
+# 生成私钥并导出公钥，随后核对长度换算
+wg genkey | tee privatekey | wg pubkey > publickey
+wc -c privatekey            # 期望 45：44 个 base64 字符 + 1 个 NUL
+awk '{print length($0)}' privatekey   # 期望 44
+grep -E 'WG_GENL_NAME|WG_GENL_VERSION|WG_KEY_LEN' /usr/include/linux/wireguard.h
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+$ wc -c privatekey
+45 privatekey
+$ awk '{print length($0)}' privatekey
+44
+$ grep -E 'WG_GENL_NAME|WG_GENL_VERSION|WG_KEY_LEN' /usr/include/linux/wireguard.h
+#define WG_GENL_NAME    "wireguard"
+#define WG_GENL_VERSION 1
+#define WG_KEY_LEN      32
+```
+
+逐行判读如下。第一组 `wc -c privatekey` 输出 45，表示私钥文件在磁盘上占 45 字节，这正好对应 embeddable 库里 `wg_key_b64_string` 的数组大小 45——44 个有效 base64 字符加上 C 字符串结尾的 NUL，说明 `wg genkey` 输出的是文本形式而非 32 字节裸密钥；若你误以为文件里存的是 32 字节原始数据，就会在长度换算上出错。第二组 `awk '{print length($0)}'` 输出 44，排除 NUL 后得到纯 base64 字符数，与公式 `(32+2)/3*4 = 44` 完全吻合，反过来验证了 `WG_KEY_LEN = 32` 这一常量：`wg_key[32]` 每 3 字节编码成 4 字符，32 字节需要 11 组编码容量，即 44 字符。第三组是从系统头文件里 grep 出的三个宏：`WG_GENL_NAME "wireguard"` 是通用 netlink 族名，`mnlg_socket_open()` 正是拿它去解析族 id，字符串内容必须与内核 `MODULE_ALIAS_GENL_FAMILY` 注册的族名逐字一致，否则查族会失败；`WG_GENL_VERSION 1` 是族版本，`genlmsghdr.version` 填的就是它，版本不匹配的内核会拒绝请求；`WG_KEY_LEN 32` 是密钥原始字节长度，`WGDEVICE_A_PRIVATE_KEY`、`WGPEER_A_PUBLIC_KEY`、`WGPEER_A_PRESHARED_KEY` 三个二进制属性的载荷长度都必须是它。这三行合起来说明：配置文件里看到的字符串、netlink 上传输的二进制、头文件里的宏，是同一份密钥的三种表达，常量是贯穿三者的换算基准。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是手改生成的 uapi 头文件。它是 YNL 从 `wireguard.yaml` 生成的产物，改了会被 `ynl-regen.sh` 覆盖，而且会让自己与内核其他消费者的契约不一致；正确做法是改规范再重新生成，或向上游报告需求。第二个陷阱是混淆三个版本：族版本 `WG_GENL_VERSION = 1`、驱动版本 `WIREGUARD_VERSION = "1.0.0"`、工具版本 `WIREGUARD_TOOLS_VERSION = "1.0.20260223"`，三者数值与用途完全不同，任何「把 1.0.0 当成 netlink 版本」的想法都是错的。第三个陷阱是把 base64 长度当密钥长度：`WG_KEY_LEN` 恒为 32 字节，44 是编码后长度，45 是含 NUL 的字符串数组大小，三者别混。
+
+第四个陷阱是把用户态 `HAS_*` 位当成 uapi 标志发出去。回想第 3 节第二张表：`WGDEVICE_HAS_PRIVATE_KEY = 1<<1` 只是「本结构里私钥有效」的本地标记，若直接拿去填 `WGDEVICE_A_FLAGS`，内核会把它解释成 `WGDEVICE_F_REPLACE_PEERS` 之外的未知位，行为不可预期；正确做法是像 `kernel_set_device()` 那样先判断 `HAS_*` 决定放哪些属性，再把操作位单独翻译成 `F_*` 值。第五个陷阱是忽略哨兵与 MAX 宏：`__WGDEVICE_A_LAST` 等双下划线成员是内部占位符，绝不能当有效属性值发送；对外校验属性上界要用 `WGDEVICE_A_MAX` 这类减一后的宏，而不是哨兵本身。第六个陷阱是把 `WGPEER_A_PROTOCOL_VERSION`（属性号 10）当成用户态可写字段：它在 uapi 枚举里存在，但本快照 `ipc-linux.h` 的 `parse_peer()` 没有对应 case，属于内核回吐、用户态参考实现暂不解析的字段，具体语义需对照生成它的 YAML 规范与实际内核版本核验。第七个陷阱是假设头文件里能找到 `struct wgdevice`：它不在 uapi 头里，而在 `containers.h` 与 embeddable 库，内核结构则在驱动源码（字段见 05 册）。
+
+最佳实践：遇到任何常量先回头文件确认数值，再回 YAML 确认语义；写解析代码时用 `*_MAX` 做上界校验、遇到大于 MAX 的未知属性选择跳过以兼容新内核；密钥处理全程以 `WG_KEY_LEN` 为长度基准，只在输入输出边界做 base64 编解码；跨版本比对时以「枚举成员名」而非数字为锚点，因为新增成员会让后续数字位移。遵循这些做法，才能让这份常量全集真正成为可靠的权威源，而不是一堆易错的数字。
+
+### 7. 小结与延伸阅读
+
+本篇把 `include/uapi/linux/wireguard.h` 的常量、标志与结构定义逐项落定：三个 `#define`（`WG_GENL_NAME = "wireguard"`、`WG_GENL_VERSION = 1`、`WG_KEY_LEN = 32`）；`enum wg_cmd` 的 GET/SET 两条命令与 `WG_CMD_MAX = 1`；device、peer、allowedip 三层属性枚举及其 `__*_LAST` 哨兵与 `*MAX` 宏（8、10、4）；三组标志的精确位值（REPLACE_PEERS=1，REMOVE_ME=1，REPLACE_ALLOWEDIPS=2，UPDATE_ONLY=4）；以及用户态 `struct wgdevice` / `wgpeer` / `wgallowedip` 与 `struct timespec64` 的字段布局，并厘清了用户态 `HAS_*` 位与 uapi `F_*` 位的两套体系。核心结论是：uapi 头只含宏与枚举、不含结构体，它是从 YAML 生成、不可手改的双许可契约；32 字节原始密钥经 base64 变成 44 字符、加 NUL 成 45 字节，这是贯穿配置、netlink 与头文件的换算基准。
+
+延伸阅读：命令与属性的语义、类型与在线格式见 04-05；密钥生成与分发的部署视角见 03-03；用户态配置结构逐字段详解见 05-09；netlink 通道的底层机制见 06-14。跨册随查按（字段见 05-09 ｜ 部署见 03-03 ｜ 原理见 06-14 ｜ 模块见 07-11）执行：结构体逐字段去 05、部署场景去 03、机制与调用链去 06、目录级模块能力去 07。凡本篇标注「需对照实际版本核验」的规范原文与内核侧 netlink 代码位置，均以 `_wglinux_build/upstream_src/` 下对应文件为准，本套资料不编造未核验的路径与取值。

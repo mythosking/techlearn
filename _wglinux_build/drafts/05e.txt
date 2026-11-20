@@ -1,0 +1,151 @@
+## 05-09 加密原语上下文与 uapi 配置结构字段详解
+
+### 1. 背景与动机
+
+本篇是 05 册「关键数据结构字段」唯一权威源的收官篇，承担此前各篇没有覆盖的两类结构：其一，加密原语的状态上下文。WireGuard 内核驱动并不自己实现密码学算法，而是通过这些年已经进入内核 crypto 库的通用实现来完成 ChaCha20、Poly1305、Curve25519、BLAKE2s 与 SipHash 五种运算；这些实现位于 `_wglinux_build/upstream_src/wireguard-linux-src/lib/crypto/` 下，分别对应 `chacha.c`、`poly1305.c`、`curve25519.c`、`blake2s.c` 与 `siphash.c`。它们虽然是通用库代码而非驱动私有代码，但每一次握手、每一次加解密都会触碰其中的状态字段，因此属于本册必须讲清的「关键数据结构」。其二，用户态与内核之间的 ABI 契约结构，集中在 `include/uapi/linux/wireguard.h`：三层属性枚举 `wgdevice_attribute`、`wgpeer_attribute`、`wgallowedip_attribute`，命令枚举 `wg_cmd`，以及 device、peer、allowedip 三组标志位枚举。
+
+这两类结构的性质截然不同，阅读时必须分清。加密原语的上下文是「运行期状态」：它们随一次哈希、一次流加密、一次认证而创建、推进、销毁，生命周期以微秒甚至更短计，字段记录的是算法内部累加器、缓冲长度、一次性密钥材料。uapi 枚举则是「编译期契约」：它们本质是 netlink 属性 ID 与命令 ID 的整数编号，只要头文件定稿就不再变化，用户态的 `wg` 工具与内核必须对这些编号达成一致。前者改了只需重编译内核，后者改了会破坏用户态兼容性。把两类结构放在同一篇，是因为它们恰好是数据面的两个端点：uapi 把用户配置送进内核，加密上下文把明文变成密文；一端是配置的入口，另一端是数据的出口。
+
+必须先交代本快照的取材边界。`lib/crypto/` 下只收录了上述五个 `.c` 实现文件，而这些文件里反复引用的状态结构定义头文件——例如 `<crypto/chacha.h>`、`<crypto/internal/poly1305.h>`、`<crypto/blake2s.h>`、`<linux/siphash.h>`——并不在本快照收录范围内。因此本篇采取的策略是：凡字段名能从 `.c` 文件对成员的访问表达式中直接读出（如 `ctx->t[0]`、`desc->buflen`、`key->key[1]`），就逐字写出并注明访问点；凡涉及结构完整定义、精确类型、字段顺序、字节宽度，一律标注「需对照实际版本核验」，绝不凭记忆补全。这种克制是 05 册作为字段唯一权威源必须坚守的底线——宁可少写一个字段，不可编造一个字段。常量取值也不是本篇重点：命令号、属性号、标志位的具体数值属于 04 册权威范围，本篇只在表格里给出字段语义与交叉引用（常量详见 04-05、04-06）。
+
+### 2. 核心概念
+
+理解本篇的两类结构，可以抓住「三种状态模型、三层嵌套属性」这条主线。
+
+先说三种状态模型。第一种是「显式流式上下文」：调用方在栈上或结构中分配一个状态对象，算法函数反复更新它，最后一次性取结果并清零。BLAKE2s 与 Poly1305 属于这一类。它们的典型用法在 `noise.c` 的 `mix_hash` 中一目了然：先 `struct blake2s_ctx blake;` 声明栈上上下文，再 `blake2s_init` 初始化，连续两次 `blake2s_update` 把旧哈希与新数据喂进去，最后 `blake2s_final` 把结果写回。这段可见于 `drivers/net/wireguard/noise.c:432` 附近。上下文、`update`、`final` 三件套构成了内核 crypto 库流式 API 的统一心智模型。
+
+第二种是「一次性密钥上下文」：ChaCha20 的 `struct chacha_state` 在 `chacha.c` 中作为参数出现（`chacha_crypt(struct chacha_state *state, ...)`），它承载密钥、 nonce 与计数器，但每个块都会由 `chacha_block_generic` 推进内部计数；`chacha.c:19` 的局部数组 `u8 stream[CHACHA_BLOCK_SIZE] __aligned(sizeof(long))` 则是块级密钥流暂存，注释明确写着对齐是为了加速 `crypto_xor_cpy`。值得注意的是 `hchacha_block`，它从同一个状态派生出子密钥，这正是 WireGuard 使用 XChaCha20-Poly1305 时扩展 nonce 的关键一步。由于 `struct chacha_state` 的定义在缺失的 `<crypto/chacha.h>` 中，本篇只描述其在 `.c` 文件中可见的使用方式，布局需对照实际版本核验。
+
+第三种是「无持久状态的函数式原语」：Curve25519 与 SipHash 不提供跨调用的上下文。Curve25519 的签名 `curve25519(u8 mypublic[...], const u8 secret[...], const u8 basepoint[...])` 是一次 ECDH，计算结果直接写入调用方缓冲区，函数内部只有两个静态只读常量 `curve25519_null_point`（全零，`__aligned(32)`）与 `curve25519_base_point`（首字节为 9，`__aligned(32)`），见 `lib/crypto/curve25519.c:19-20`。SipHash 以 `const siphash_key_t *key` 作为调用方提供的密钥上下文，从 `siphash.c` 的 `PREAMBLE(len)` 宏能看到 `key->key[1]`、`key->key[0]` 两个成员被读入 v0 到 v3；它提供 `siphash_1u64` 到 `siphash_4u64`、`siphash_1u32`、`siphash_3u32` 等定长入口，以及对齐与非对齐两种缓冲区版本。区分「持久状态」与「函数式」很重要：前者要关心清零与复位，后者只需关心密钥材料本身的保密与随机性。
+
+再说三层嵌套属性。uapi 头是自动生成的，开头明确标注「auto-generated from Documentation/netlink/specs/wireguard.yaml」并由 YNL 工具生成，这意味着枚举顺序直接来自 netlink spec，不应手工调整。三层对应配置数据的嵌套：`wgdevice_attribute` 描述一个接口（如 `WGDEVICE_A_PRIVATE_KEY`、`WGDEVICE_A_LISTEN_PORT`、`WGDEVICE_A_PEERS`），其中 `WGDEVICE_A_PEERS` 是一个嵌套属性，其每个元素由 `wgpeer_attribute` 描述（如 `WGPEER_A_PUBLIC_KEY`、`WGPEER_A_ENDPOINT`、`WGPEER_A_ALLOWEDIPS`），而 `WGPEER_A_ALLOWEDIPS` 再次嵌套，元素由 `wgallowedip_attribute` 描述（`WGALLOWEDIP_A_FAMILY`、`WGALLOWEDIP_A_IPADDR`、`WGALLOWEDIP_A_CIDR_MASK`）。这种「device 包含 peer、peer 包含 allowedip」的层级，正好映射到内核里 `wg_device` → `wg_peer` → allowedips 树的嵌套关系。命令只有两个：`WG_CMD_GET_DEVICE` 读、`WG_CMD_SET_DEVICE` 写。三组标志位枚举则承载「替换、删除、仅更新」等批量操作语义。
+
+### 3. 关键数据结构与源码位置
+
+下表逐字段列出五个加密原语在 `.c` 文件中可见的状态上下文成员与关键参数。凡定义头文件不在本快照者，已明确标注需对照实际版本核验。
+
+| 上下文/API | 关键成员或参数 | 源码可见的类型 | 职责与注意 |
+|---|---|---|---|
+| `struct chacha_state` | `state`（入参） | `struct chacha_state *` | 流密码状态，承载密钥/计数器；定义于 `<crypto/chacha.h>`，本快照未收录，需对照实际版本核验 |
+| `chacha.c` 局部 | `stream[]` | `u8[CHACHA_BLOCK_SIZE] __aligned(sizeof(long))` | 块级密钥流暂存，对齐以加速 `crypto_xor_cpy` |
+| `struct poly1305_desc_ctx` | `s[4]` | `u32[4]`（由 `get_unaligned_le32` 写入） | 一次性认证密钥的一半，取自 key+16 至 key+28 |
+| `struct poly1305_desc_ctx` | `buflen` | 整型长度（精确类型需核验） | 未消费字节数，`poly1305_init` 置零，`update` 累加 |
+| `struct poly1305_desc_ctx` | `buf[]` | `u8[]`（容量需核验） | 不足 `POLY1305_BLOCK_SIZE` 的尾部暂存 |
+| `struct poly1305_desc_ctx` | `state.h` | 内部累加器数组 | 压缩状态，`poly1305_emit` 据其与 `s` 生成标签 |
+| `struct blake2s_ctx` | `h[8]` | `u32[8]` | 八个链接值，`final` 时经 `cpu_to_le32_array` 输出 |
+| `struct blake2s_ctx` | `t[0]`、`t[1]` | `u32[2]` | 64 位字节计数，`blake2s_increment_counter` 用进位更新 `t[1]` |
+| `struct blake2s_ctx` | `f[0]`、`f[1]` | `u32[2]` | 末块标志，`blake2s_set_lastblock` 置 `f[0] = -1` |
+| `struct blake2s_ctx` | `buf[]`、`buflen`、`outlen` | `u8[]` 与长度字段（精确类型需核验） | 尾部暂存、暂存长度、期望输出长度 |
+| `curve25519` 系列 | `mypublic`/`secret`/`basepoint` | `u8[CURVE25519_KEY_SIZE]` | 无持久状态；`__must_check` 的 bool 返回值检测全零点 |
+| `siphash_key_t` | `key[0]`、`key[1]` | `u64[2]`（由 `PREAMBLE` 访问推断） | 调用方提供的 PRF 密钥；定义于 `<linux/siphash.h>`，需对照实际版本核验 |
+| `hsiphash_key_t` | `key[0]`、`key[1]` | 宽度随架构 32/64 位（需核验） | 非安全 PRF，仅供哈希表；见 `ratelimiter.c:13` 的 static 实例 |
+
+表中几个字段值得展开。`blake2s_ctx.t[0]` 与 `t[1]` 是理解 BLAKE2s 流式特性的钥匙：`blake2s_increment_counter` 的实现是 `ctx->t[0] += inc; ctx->t[1] += (ctx->t[0] < inc);`，用一次无符号比较完成 64 位加法的高位进位，既避免分支又耗时恒定。压缩函数里 `v[12] = BLAKE2S_IV4 ^ ctx->t[0]`、`v[13] = BLAKE2S_IV5 ^ ctx->t[1]`，把已处理字节数混入置换，这正是哈希长度扩展防御的关键。`blake2s_sigma[10][16]` 是十轮消息字选择表，`unrolled_full` 宏展开十轮 G 函数以允许常量折叠。`blake2s_final` 结尾调用 `blake2s_zeroize_ctx(ctx)`，确保密钥化哈希的中间状态不会残留在栈上——WireGuard 用 `blake2s_init_key` 做带密钥 PRF 时这一点尤为要紧。
+
+`poly1305_desc_ctx` 的生命周期同样体现「用完即焚」：`poly1305_init` 把一次性密钥的后 16 字节读入 `s[0..3]`，并调用 `poly1305_block_init` 用前 16 字节初始化累加器；`poly1305_update` 按 `POLY1305_BLOCK_SIZE` 分块，不足一块的留在 `buf` 里由 `buflen` 记录；`poly1305_final` 对尾部补 1 和零后调用 `poly1305_emit(&desc->state.h, dst, desc->s)`，最后 `memzero_explicit(desc, sizeof(*desc))` 把整个描述上下文清零。Poly1305 的安全性建立在「同一密钥只用一次」之上，因此 WireGuard 在每次 `chacha20poly1305_encrypt` 前都重新派生密钥，绝不复用同一个 `desc`。
+
+uapi 侧的逐字段语义见下表。各枚举成员的具体编号属于常量权威范围（详见 04-05、04-06），此处只讲它们作为配置数据结构字段的含义。
+
+| 枚举/结构 | 字段语义（分组） | 在配置链中的角色 | 常量细节 |
+|---|---|---|---|
+| `enum wg_cmd` | `GET_DEVICE` / `SET_DEVICE` | 读配置与写配置两类命令入口 | 详见 04-05 |
+| `enum wgdevice_flag` | `REPLACE_PEERS` | 写设备时是否整体替换 peer 列表 | 详见 04-06 |
+| `enum wgdevice_attribute` | 身份：IFINDEX、IFNAME、PRIVATE_KEY、PUBLIC_KEY | 定位接口并设置静态身份 | 详见 04-06 |
+| `enum wgdevice_attribute` | 参数：LISTEN_PORT、FWMARK | 监听端口与 firewall mark | 详见 04-06 |
+| `enum wgdevice_attribute` | 嵌套：FLAGS、PEERS | 标志位与 peer 数组入口 | 详见 04-06 |
+| `enum wgpeer_flag` | `REMOVE_ME` / `REPLACE_ALLOWEDIPS` / `UPDATE_ONLY` | 删除、替换地址列表、仅更新已有 peer | 详见 04-06 |
+| `enum wgpeer_attribute` | 身份与密钥：PUBLIC_KEY、PRESHARED_KEY、FLAGS | 标识 peer 并提供预共享密钥 | 详见 04-06 |
+| `enum wgpeer_attribute` | 网络：ENDPOINT、PERSISTENT_KEEPALIVE_INTERVAL | 对端地址与保活间隔 | 详见 04-06 |
+| `enum wgpeer_attribute` | 统计与嵌套：LAST_HANDSHAKE_TIME、RX_BYTES、TX_BYTES、ALLOWEDIPS、PROTOCOL_VERSION | 握手时间、收发字节、地址列表、协议版本 | 详见 04-06 |
+| `enum wgallowedip_flag` | `REMOVE_ME` | 从地址列表中移除条目 | 详见 04-06 |
+| `enum wgallowedip_attribute` | FAMILY、IPADDR、CIDR_MASK、FLAGS | 地址族、IP 字节序列、前缀长度与标志 | 详见 04-06 |
+
+注意 `WGDEVICE_A_MAX`、`WGPEER_A_MAX`、`WGALLOWEDIP_A_MAX` 与 `WG_CMD_MAX` 都由 `__XXX_A_LAST - 1` 这类哨兵推导而来，它们不是可发送的属性，而是 netlink 校验层用来界定合法范围的上界。用户态构造请求时若把属性号写到 MAX 之外，内核的 netlink policy 会直接拒绝。理解「哨兵—上界」这对字段，是读懂自动生成 uapi 头的关键。
+
+### 4. 关键流程与调用链
+
+加密上下文的调用链可以从驱动侧的实际引用点还原。握手初始化时，`wg_noise_init`（`noise.c:34`）用 `blake2s` 一次性函数从握手名称派生初始 chaining key，随后用 `blake2s_init` / `blake2s_update` / `blake2s_final` 三件套从标识符名称派生初始 hash。密钥派生核心 `kdf`（`noise.c` 内、`blake2s_init_key` 路径）反复实例化 `struct blake2s_ctx`，把 chaining key 与输入材料压缩出新密钥。`mix_dh`（`noise.c:404`）先调 `curve25519(dh_calculation, private, public)` 做 ECDH，检查 `__must_check` 返回的 bool（全零点视为无效共享密钥），再把结果交给 `kdf`；`mix_precomputed_dh` 则用 `crypto_memneq` 对预计算共享密钥做同样的零点检查。`mix_hash`（`noise.c:432`）是 BLAKE2s 流式 API 的标准用例。
+
+数据加密走 `chacha20poly1305_encrypt` 这个包装层（`noise.c:467`、`send.c:216`），其底层正是 `chacha.c` 与 `poly1305.c`：ChaCha20 生成密钥流并异或明文，Poly1305 对密文与关联数据计算标签；`hchacha_block` 提供 XChaCha 的 nonce 扩展。解密侧 `chacha20poly1305_decrypt`（`noise.c:477`、`receive.c:278`）先验标签再解密。cookie 机制在 `cookie.c:36` 与 `cookie.c:94` 两处实例化 `struct blake2s_ctx`，分别派生 cookie 密钥与计算 cookie 值，并在 `cookie.c:193`、`cookie.c:216` 用 XChaCha20-Poly1305 加解密质询载荷。
+
+SipHash 的调用点分散在两个数据结构中。`peerlookup.h:17-22` 的 `struct pubkey_hashtable` 内嵌一个 `siphash_key_t key`，配合 `DECLARE_HASHTABLE(hashtable, 11)` 与 mutex，用于按公钥哈希定位 peer——这是安全 PRF 的典型用途，防止攻击者构造大量公钥造成哈希碰撞退化。`ratelimiter.c:13` 的 `static hsiphash_key_t key` 则服务握手限速：`hsiphash_2u32` 与 `hsiphash_3u32`（`ratelimiter.c:97`、`ratelimiter.c:104`）把网络序词与 IP 映射到桶索引，这里用非安全变体是因为目标是均匀分桶而非抗敌手。
+
+uapi 的调用链从用户态开始：`wg` 工具把 `wg0.conf` 解析成 netlink 消息，命令字段填 `WG_CMD_SET_DEVICE`，顶层属性按 `wgdevice_attribute` 编码，其中 `WGDEVICE_A_PEERS` 嵌套若干 peer 属性，每个 peer 的 `WGPEER_A_ALLOWEDIPS` 再嵌套 allowedip 属性。内核 netlink 校验层依据自动生成的 policy 检查属性号与类型，通过后交给 `device.c` 的配置更新函数，最终写入 `wg_device` / `wg_peer` / allowedips 树的字段。读方向 `WG_CMD_GET_DEVICE` 在 RCU 保护下组装同样三层结构返回给 `wg show`。网协议原理见 06-14，配置命令语义见 04-02，模块职责见 07-11。
+
+两类结构的调用链在密钥材料处交汇：uapi 的 `WGDEVICE_A_PRIVATE_KEY` 与 `WGPEER_A_PRESHARED_KEY` 把密钥写入内核，随后被 `curve25519_generate_public`（`noise.c:301`）与 `blake2s_init_key` 消费，参与 `mix_dh`、`mix_psk`。也就是说，配置面的字段是密码学状态的输入源。核心关系见图 05-09-01。
+
+:::figure id=05-09-01 | name=加密原语上下文与 uapi 配置面的分工 | dir=TD
+node a1 "enum wg_cmd<br/>GET/SET_DEVICE" teal
+node a2 "三层属性枚举<br/>device/peer/allowedip" blue
+node a3 "blake2s_ctx<br/>哈希与 KDF 上下文" purple
+node a4 "curve25519<br/>ECDH 无状态" gray
+node a5 "chacha_state<br/>ChaCha20 流状态" green
+node a6 "poly1305_desc_ctx<br/>Poly1305 认证状态" amber
+node a7 "siphash_key_t<br/>哈希表 PRF 密钥" red
+edge a1 -> a2 "承载属性"
+edge a2 -> a3 "下发密钥材料"
+edge a3 -> a4 "派生握手密钥"
+edge a4 -> a5 "生成会话密钥"
+edge a5 -> a6 "AEAD 组合"
+edge a2 -> a7 "公钥哈希索引"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「enum wg_cmd GET/SET_DEVICE」命令承载「三层属性枚举 device/peer/allowedip」，后者把密钥材料下发给「blake2s_ctx 哈希与 KDF 上下文」，由此派生握手密钥交给「curve25519 ECDH 无状态」运算，生成会话密钥进入「chacha_state ChaCha20 流状态」，再与「poly1305_desc_ctx Poly1305 认证状态」组合成 AEAD；同时属性枚举还提供「siphash_key_t 哈希表 PRF 密钥」用于公钥哈希索引。
+
+### 5. 配置/命令/代码实例
+
+下面给出两套实操代码。第一套定位加密上下文的成员访问点与 uapi 枚举定义，第二套展示驱动中 BLAKE2s 流式上下文与 Poly1305 描述上下文的典型用法（片段基于 `noise.c` 与 `poly1305.c`，用于说明字段用法，非逐字源码引用）。
+
+```bash
+# 在源码快照中定位加密原语上下文成员与 uapi 枚举
+cd _wglinux_build/upstream_src/wireguard-linux-src
+grep -rn "ctx->t\[0\]\|desc->buflen\|key->key\[1\]" lib/crypto/
+grep -rn "struct blake2s_ctx blake" drivers/net/wireguard/
+grep -n "enum wg_cmd\|enum wgdevice_attribute\|WGDEVICE_F_REPLACE_PEERS" include/uapi/linux/wireguard.h
+```
+
+```c
+/* BLAKE2s 流式上下文：栈上分配、推进、取结果并清零 */
+struct blake2s_ctx blake;
+blake2s_init(&blake, NOISE_HASH_LEN);
+blake2s_update(&blake, chaining_key, NOISE_HASH_LEN);
+blake2s_update(&blake, label, label_len);
+blake2s_final(&blake, digest);   /* 内部 zeroize */
+
+/* Poly1305 描述上下文：init/update/final 三件套 */
+poly1305_init(&desc, one_time_key);
+poly1305_update(&desc, ciphertext, len);
+poly1305_final(&desc, tag);      /* 内部 memzero_explicit */
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+示例输出，具体格式需对照实际版本核验
+lib/crypto/blake2s.c:35:	ctx->t[0] += inc;
+lib/crypto/poly1305.c:32:	desc->buflen = 0;
+lib/crypto/siphash.c:28:	v3 ^= key->key[1];
+drivers/net/wireguard/noise.c:434:	struct blake2s_ctx blake;
+drivers/net/wireguard/ratelimiter.c:13:static hsiphash_key_t key;
+include/uapi/linux/wireguard.h:72:enum wg_cmd {
+```
+
+逐行判读如下。第一行是 BLAKE2s 的 64 位字节计数低位 `t[0]` 的进位更新表达式，说明该字段是随 `update` 持续推进的流式状态，而非一次性参数。第二行来自 `poly1305_init`，把描述上下文的 `buflen` 归零，印证 Poly1305 的「一次性密钥、每次重新初始化」语义。第三行来自 `siphash.c` 的 `PREAMBLE` 宏，把调用方密钥的高 64 位 `key[1]` 异入状态字 v3，说明 SipHash 的上下文是外部提供的 `siphash_key_t` 而非内部累加器。第四行显示 `noise.c` 在栈上声明 `struct blake2s_ctx`，对应 `mix_hash` 之类的小作用域用途，函数返回即销毁。第五行是 `ratelimiter.c` 的 `static hsiphash_key_t key`，说明非安全哈希密钥是全局长期存在的，与一次性认证密钥的生命周期截然不同。第六行定位到 uapi 头的 `enum wg_cmd`，表明命令 ID 是自动生成的 ABI 常量，其取值细节需到 04-05 查证而非从本篇推断。这组输出把「流式状态、一次性状态、外部密钥、全局密钥、ABI 枚举」五种形态并列呈现，正是本篇的核心：字段的形态决定了它的生命周期与清零方式，读代码时先看形态再看名字。清理环节：grep 为只读操作，无需清理；示例代码不分配持久资源。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把加密上下文当作可长期持有的对象。BLAKE2s 与 Poly1305 的上下文都是短生命周期：`blake2s_final` 会 `blake2s_zeroize_ctx`，`poly1305_final` 会 `memzero_explicit`。若在 final 之后继续读取这些上下文，得到的不是可用状态而是被清零的残留，且这种错误在调试构建里未必立刻暴露。特别是 Poly1305 的安全性完全依赖「一次性密钥」，复用同一个 `desc` 做两次认证会直接破坏消息认证强度。
+
+第二个陷阱是忽略 `__must_check`。`curve25519` 与 `curve25519_generate_public` 的声明都带此标记，返回 bool 表示结果是否为非全零点。调用方必须检查：`noise.c:411` 的 `if (unlikely(!curve25519(...))) return false;` 就是正确示范。若把返回值丢弃，攻击者可提交一个导致全零共享密钥的公钥，使握手在没有真正 ECDH 的情况下继续。
+
+第三个陷阱是把对齐与非对齐变体混用。`siphash.c` 同时提供 `__siphash_aligned` 与 `__siphash_unaligned`（以及对应的 hsiphash 版本），选择哪种取决于平台是否定义 `CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS`。这些是内核内部派发细节，驱动通常调用 `siphash_*` 包装函数；直接调用底层变体在错误平台上可能触发对齐异常。同理，ChaCha20 与 Poly1305 都有 `CONFIG_CRYPTO_LIB_*_ARCH` 架构优化开关，通用实现与架构实现的切换由宏在头文件完成，本快照未提供该头文件，需对照实际版本核验。
+
+第四个陷阱是把 uapi 枚举当普通 C 枚举随意重排。它由 `Documentation/netlink/specs/wireguard.yaml` 经 YNL 自动生成，成员顺序即 netlink 属性号，重排等于破坏 ABI。新增字段必须通过修改 spec 并重新生成，而不是手工编辑头文件。第五个陷阱是混淆标志位与属性：`WGDEVICE_F_REPLACE_PEERS` 等是位掩码（1、2、4 这类 2 的幂），装在 `*_A_FLAGS` 属性里传输；属性本身是编号，两者不在同一命名空间。
+
+最佳实践：读加密上下文时，先判断它属于「流式 / 一次性 / 无状态 / 外部密钥」中的哪一类，再看生命周期与清零要求；读 uapi 字段时，先确认三层嵌套的层级位置，再到 04-05、04-06 查具体编号；凡本快照缺失的头文件定义，一律标注需对照实际版本核验。密码学机制的原理（KDF、Noise_IK、抗重放）见 06-02、06-03、06-08，加密模块族职责见 07-12。
+
+### 7. 小结与延伸阅读
+
+本篇作为 05 册的收官，补齐了两类关键结构。加密原语侧：BLAKE2s 的 `blake2s_ctx` 以 `h[8]`、`t[0]/t[1]`、`f[0]/f[1]`、`buf/buflen/outlen` 承载流式哈希与 KDF；Poly1305 的 `poly1305_desc_ctx` 以 `s[4]`、`buf/buflen`、`state.h` 承载一次性认证；ChaCha20 的 `chacha_state` 承载流密钥与计数，配合 `hchacha_block` 实现 XChaCha；Curve25519 无持久状态，以 `__must_check` 返回值检测全零点；SipHash 以 `siphash_key_t.key[0]/key[1]` 作为调用方 PRF 密钥，hsiphash 变体仅供哈希表。uapi 侧：`wg_cmd` 定义读写命令，`wgdevice_attribute`、`wgpeer_attribute`、`wgallowedip_attribute` 构成三层嵌套配置契约，三组标志位承载批量操作语义，MAX 常量作为校验上界。凡本快照未收录头文件定义的精确字段类型与布局，均需对照实际版本核验。
+
+延伸阅读：握手状态与 message 结构见 05-05，noise 密钥派生原理见 06-03，Noise_IK 状态机见 06-02，netlink 配置通道见 06-14，netlink 命令与属性全集见 04-05，uapi 常量与标志全集见 04-06，加密模块族见 07-12，uapi 配置接口模块见 07-11。跨册随查按（字段见 05-01 ｜ 参数见 04-05 ｜ 原理见 06-02 ｜ 模块见 07-12）执行。本篇字段以 `lib/crypto/*.c` 与 `include/uapi/linux/wireguard.h` 为准，需对照实际版本核验。

@@ -1,0 +1,312 @@
+## 06-05 发送路径：封装、加密与分片
+
+### 1. 背景与动机
+
+理解了握手如何建立会话密钥（时序见 06-03，消息布局见 06-04），接下来要回答一个更贴近数据面的问题：当内核协议栈把一包普通的内网 IP 流量交给 wg0 这块虚拟网卡之后，WireGuard 究竟用什么步骤把它变成一包可以从物理网卡发出的、经过认证加密的 UDP 报文。这条路径就是发送路径，它是整个驱动里最热、最讲究吞吐的一段代码，集中分布在 `drivers/net/wireguard/send.c`、`device.c` 的 `wg_xmit`、`socket.c` 的发送分支，以及 `queueing.h` 的队列辅助函数中。本册是机制的唯一权威源，本篇就把这条链路逐函数拆开讲透；结构体逐字段定义不在本册展开（字段见 05-06），用户态命令的完整参数交给参数册（参数见 04-01），目录级模块职责交给模块册（模块见 07-07）。
+
+发送路径之所以值得单独讲，是因为它同时要解决三个彼此拉扯的工程矛盾。第一，加密是计算密集操作，如果放在 `ndo_start_xmit` 的上下文里同步做，发送进程就会被 ChaCha20-Poly1305 的计算拖住，吞吐和延迟都不可接受；因此驱动必须把加密卸载到工作队列，让发送入口快速返回。第二，多核并行加密能提升吞吐，但 WireGuard 是带序列号的可靠数据报协议，同一对等体的包必须保持递增的 nonce 顺序，否则接收端的抗重放窗口（机制见 06-08）会把乱序包当成重放丢弃；因此"并行加密"与"按 peer 保序发送"必须兼得。第三，以太网的 MTU 通常只有 1500 字节，隧道封装本身要吃掉外层 IP 头、UDP 头和 WireGuard 数据头，若不做分片，内层大包封装后会超过路径 MTU 而被 IP 层分片，一旦丢一片整包就要重传；因此驱动需要在封装前把大包切开，也就是 GSO 分段。
+
+这三个矛盾催生了发送路径最有特色的设计：一条"两级队列 + 批量加密 + 串行投递"的流水线。报文先进入每个 peer 的暂存队列，分配好 nonce 后挂到设备的加密队列，由多个 per-CPU 工作线程批量取出、原地加密，再按 peer 交回一个串行工作队列，最后统一经 UDP socket 发出。理解这条流水线，是理解 WireGuard Linux 为什么能在内核态做到高吞吐的关键，也是排查"握手成功但数据不通""吞吐上不去"这类问题的前提。
+
+需要提前说明的是版本口径。本篇所有函数名、常量与代码路径均来自本快照 `_wglinux_build/upstream_src/wireguard-linux-src/drivers/net/wireguard/`，包括 `send.c`、`receive.c`、`device.c`、`socket.c`、`queueing.h`、`messages.h`、`noise.h`。这些符号在内核版本演进中可能调整，凡涉及具体数值与函数签名，均以目标系统实际源码为准；本篇不做绝对性能数字的断言，一切吞吐结论都需需在目标机型实测。
+
+### 2. 核心概念
+
+发送路径可以归纳为四个核心概念： netdev 入口、nonce 与密钥的绑定、批量加密、保序投递。
+
+**netdev 入口**是说发送路径的起点不是某个 WireGuard 专有接口，而是一个标准 `net_device` 的 `ndo_start_xmit` 回调。`device.c` 里的 `netdev_ops` 结构把 `.ndo_start_xmit` 指向 `wg_xmit`。当内核按路由表决定一包流量要从 wg0 出去时，就会调用这个函数。这意味着对上层而言，wg0 与普通网卡没有区别——路由、策略路由、qdisc 都可以照常施加。理解这一点很重要：很多"WireGuard 不通"的问题实际上是路由没有把目标网段指向 wg0，`wg_xmit` 根本没被调用。
+
+**nonce 与密钥的绑定**是说每个待发数据包在入队前就要确定两样东西：用哪把会话密钥加密，以及用哪个 nonce（计数器）加密。`wg_packet_send_staged_packets` 从 `peer->keypairs.current_keypair` 取出当前密钥对，验证它有效且未过期，然后对每个包用 `atomic64_inc_return(&keypair->sending_counter) - 1` 分配一个递增的 nonce。nonce 既写进数据消息的 `counter` 字段供对端抗重放，又作为 ChaCha20-Poly1305 的随机数输入。密钥与 nonce 一旦绑定就随包携带在 `PACKET_CB(skb)->keypair` 与 `PACKET_CB(skb)->nonce` 里，后续加密 worker 不再查表。
+
+**批量加密**是说加密不是"一包一个工作项"，而是"一批一个工作项"。同一 peer 的暂存队列里往往有多包（尤其是 GSO 分段产生的多个段），驱动把这些包串成链表，整条链表只带一个 keypair，交给 per-CPU 的 `wg_packet_encrypt_worker` 一次性遍历加密。这样既减少了工作队列调度次数，又让同批包共享密钥引用，摊薄了加解密的的固定开销。
+
+**保序投递**是说加密完成后，包不能各自直接调用 socket 发出，而要按 peer 收拢到一个串行工作队列 `transmit_packet_work`。`wg_packet_tx_worker` 按 rx/tx 前队列（`prev_queue`）的顺序逐个取包，只有状态变成 `PACKET_STATE_CRYPTED` 或 `PACKET_STATE_DEAD` 才处理，从而既保证顺序，又避开"状态还没就绪就发送"的竞态。这套机制把"加密并行"与"发送有序"解耦，是本篇最核心的设计思想（多核并发的整体讨论见 06-13）。
+
+下表把发送路径的四个概念与承载它们的关键函数对应起来，作为后续调用的速查。
+
+| 核心概念 | 承载函数 | 所在源码 | 关键作用 |
+|---|---|---|---|
+| netdev 入口 | `wg_xmit` | `device.c` | 选 peer、GSO 分段、入暂存队列 |
+| nonce 与密钥绑定 | `wg_packet_send_staged_packets` | `send.c` | 取当前密钥、分配递增 nonce |
+| 批量加密 | `wg_packet_encrypt_worker` / `encrypt_packet` | `send.c` | per-CPU 批量 AEAD 封装 |
+| 保序投递 | `wg_packet_tx_worker` | `send.c` | 按 peer 串行发送并维护定时器 |
+
+### 3. 关键数据结构与源码位置
+
+本节只点名发送路径反复用到的数据结构与真实路径，不展开字段表（逐字段定义见 05-06）。
+
+首先是承载每包元数据的 `struct packet_cb`。它定义在 `queueing.h`，通过宏 `PACKET_CB(skb)` 映射到 `skb->cb` 控制缓冲区，里面装着 `nonce`、`keypair`、`state`、`mtu`、`ds` 五个字段。发送路径把这五个字段当作贯穿流水线的"行李"：`nonce` 与 `keypair` 由暂存阶段写入、加密阶段消费，`state` 是跨工作项的交接状态，`mtu` 决定填充长度，`ds` 是外层 DSCP/ECN 值。因为 `skb->cb` 是每包独立的控制缓冲，不需要额外分配内存。
+
+其次是表达交接状态的 `enum packet_state`，同样在 `queueing.h`，只有三个值：`PACKET_STATE_UNCRYPTED`（未加密，刚入队）、`PACKET_STATE_CRYPTED`（加密成功）、`PACKET_STATE_DEAD`（加密失败或队列满）。这三个状态是加密 worker 与发送 worker 之间唯一的握手信号，用 `atomic_set_release` 写入、`atomic_read_acquire` 读取，保证跨 CPU 的内存可见性。
+
+第三是两级队列所依赖的结构。设备级加密队列 `struct crypt_queue` 定义在 `device.h`，内含一个无锁多生产者环形缓冲 `ptr_ring`、一个 per-CPU 的 `multicore_worker` 数组和 `last_cpu` 轮转游标；`wg_device` 里有两个这样的队列——`encrypt_queue` 与 `decrypt_queue`（后者用于接收路径）。peer 级的 `struct prev_queue` 也在 `device.h`，是一个单消费者队列，带 `head/tail/peeked` 与计数，专门解决"先 peek 再决定消费"的场景。`wg_peer` 里对应 `tx_queue` 与 `rx_queue`。
+
+第四是数据消息的结构 `struct message_data`，定义在 `messages.h`。它由一个 `message_header`（`type` 为 `cpu_to_le32(MESSAGE_DATA)`）、`key_idx`（对端索引）、`counter`（nonce）和变长的 `encrypted_data` 组成。几个关键常量也在这里：`MESSAGE_PADDING_MULTIPLE = 16` 规定填充必须是 16 字节倍数，`MESSAGE_MINIMUM_LENGTH` 是最小数据消息长度，`noise_encrypted_len(plain_len)` 在原长上加认证标签长度，`DATA_PACKET_HEAD_ROOM` 是 `encrypt_packet` 用 `skb_cow_head` 预留的头部空间。下面是 `messages.h` 中数据消息结构与相关常量的真实片段，便于把发送字段与常量对应起来：
+
+```c
+struct message_data {
+	struct message_header header;   /* type = cpu_to_le32(MESSAGE_DATA) */
+	__le32 key_idx;                 /* keypair->remote_index */
+	__le64 counter;                 /* PACKET_CB(skb)->nonce */
+	u8 encrypted_data[];            /* 明文+填充，尾部附 16 字节认证标签 */
+};
+#define message_data_len(plain_len) \
+	(noise_encrypted_len(plain_len) + sizeof(struct message_data))
+enum message_alignments {
+	MESSAGE_PADDING_MULTIPLE = 16,
+	MESSAGE_MINIMUM_LENGTH = message_data_len(0)
+};
+```
+
+注意 `message_data_len` 与 `noise_encrypted_len` 这两个宏：前者算整条数据消息长度（头 + 密文 + 标签），后者在原长上加认证标签长度。发送侧的 `is_keepalive` 判断用 `message_data_len(0)`，正好是只有头与标签的空负载消息长度；接收侧的 `update_rx_stats` 也用它还原原始密文长度统计。
+
+下图把发送路径涉及的主要源码文件与函数在调用层次上串起来，便于建立整体印象。
+
+:::figure id=06-05-01 | name=发送路径源码层次与两级队列 | dir=TD
+node n1 "ndo_start_xmit<br/>wg_xmit" blue
+node n2 "暂存队列<br/>staged_packet_queue" teal
+node n3 "nonce 分配<br/>send_staged_packets" purple
+node n4 "设备加密队列<br/>encrypt_queue / ptr_ring" gray
+node n5 "per-CPU worker<br/>encrypt_worker" red
+node n6 "AEAD 封装<br/>encrypt_packet" red
+node n7 "peer 串行队列<br/>tx_queue / tx_worker" teal
+node n8 "UDP 发送<br/>send4 / send6" green
+edge n1 -> n2 "入队"
+edge n2 -> n3 "取密钥"
+edge n3 -> n4 "create_data"
+edge n4 -> n5 "queue_work_on"
+edge n5 -> n6 "批量遍历"
+edge n6 -> n7 "state=CRYPTED"
+edge n7 -> n8 "create_data_done"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：发送从 netdev 回调「wg_xmit」开始，报文先进入「暂存队列 staged_packet_queue」，经「nonce 分配 send_staged_packets」绑定密钥与计数器，再由「入队 create_data」挂到「设备加密队列 encrypt_queue / ptr_ring」；「per-CPU worker encrypt_worker」批量取出，调用「AEAD 封装 encrypt_packet」原地加密，把状态置为 CRYPTED 后交回「peer 串行队列 tx_queue / tx_worker」，最终由「UDP 发送 send4 / send6」从物理网卡发出。
+
+### 4. 关键流程与调用链
+
+现在按执行顺序把全链路拆成六段。
+
+**第一段：`wg_xmit` 入口与 GSO 分段。** 函数位于 `device.c`。它先用 `wg_check_packet_protocol` 确认 skb 里确实是 IPv4 或 IPv6 包，否则返回 `-EPROTONOSUPPORT`。接着调用 `wg_allowedips_lookup_dst(&wg->peer_allowedips, skb)` 按目的地址查 trie 找到目标 peer（trie 查找原理见 06-07）；找不到就返回 `-ENOKEY`，并针对 v4/v6 发送 ICMP 不可达。然后检查 peer 的 endpoint 地址族是否已被配置或学习到（`AF_INET` 或 `AF_INET6`），否则返回 `-EDESTADDRREQ`。之后计算 `mtu`：若 skb 带有有效 dst 就取 `dst_mtu(skb_dst(skb))`，否则退回 `dev->mtu`。真正的分片判断在这里——若 `skb_is_gso(skb)` 为真，说明这是一个 GSO 大包，调用 `skb_gso_segment(skb, 0)` 把它切成适合 MTU 的段链表，释放原 skb，改遍历段链表；若不是 GSO 包，就只做 `skb_mark_not_on_list`。这个顺序很关键：**分段发生在加密之前**，每个段随后独立成为一个 WireGuard 数据消息、拥有独立 nonce，避免了对端解密后还要重组。逐段处理时还会 `skb_share_check` 复制共享 skb、`skb_dst_drop` 丢掉原始 dst，并把算好的 `mtu` 写进 `PACKET_CB(skb)->mtu`。最后把所有段挂进 `peer->staged_packet_queue`，若队列长度超过 `MAX_STAGED_PACKETS`（值为 128）就从头部丢弃最老的包，再调用 `wg_packet_send_staged_packets`。
+
+**第二段：暂存队列出队、取密钥与分配 nonce。** `wg_packet_send_staged_packets` 在 `send.c`。它先用 `skb_queue_splice_init` 把暂存队列"偷"成本地链表，避免长时间持锁。然后从 `peer->keypairs.current_keypair` 取当前密钥对并加引用，连续做三项检查：密钥是否存在、`sending.is_valid` 是否为真、`sending.birthdate` 是否超过 `REJECT_AFTER_TIME`（180 秒）；任一项不满足就走错误分支。检查通过后，遍历每个包：用 `ip_tunnel_ecn_encap(0, ip_hdr(skb), skb)` 计算外层 DSCP/ECN 写入 `PACKET_CB(skb)->ds`（这里第一个参数为 0，即故意不复制内层 TOS，避免信息泄漏），再用 `atomic64_inc_return(&keypair->sending_counter) - 1` 分配 nonce；若 nonce 达到 `REJECT_AFTER_MESSAGES` 就判定密钥失效。注意这里要求"要么给全队列都分配到 nonce，要么整体失败"——任何一个包分配失败都放弃整批，等待下次握手，绝不半途发出导致序号空洞。成功后把 keypair 引用挂到链表首包的 `PACKET_CB`，调用 `wg_packet_create_data`。
+
+**第三段：入设备加密队列。** `wg_packet_create_data` 调用 `queueing.h` 里的 `wg_queue_enqueue_per_device_and_peer`。这个内联函数做了两件事：先用 `atomic_set_release` 把首包状态设为 `PACKET_STATE_UNCRYPTED`，并把整条链表挂进 peer 的 `prev_queue`（`tx_queue`）；再用 `ptr_ring_produce_bh` 把同一个 skb 指针投进设备的 `encrypt_queue`，并用 `wg_cpumask_next_online` 选一个在线 CPU，调用 `queue_work_on` 唤醒该 CPU 上的加密 worker。这里一个 skb 同时出现在两个队列：设备队列负责"驱动加密"，peer 队列负责"保序等待"，两者通过 `state` 字段协调。若 peer 队列满返回 `-ENOSPC`，或设备环形缓冲满返回 `-EPIPE`，会走各自的清理分支释放引用与 skb。
+
+**第四段：批量加密与 AEAD 封装。** `wg_packet_encrypt_worker` 是每个 CPU 一个的工作项，函数开头用 `container_of(work, struct multicore_worker, work)->ptr` 取回所属的 `crypt_queue`。它在一个 `while` 循环里用 `ptr_ring_consume_bh` 不断取包；每取到一条链表，就遍历其中每个 skb 调用 `encrypt_packet(skb, PACKET_CB(first)->keypair)`。注意 keypair 取自链表首包 `first`，因为同批包共享一把密钥。全部成功后把状态初值设为 `PACKET_STATE_CRYPTED`，任何一个失败就设为 `PACKET_STATE_DEAD` 并中断遍历，最后调用 `wg_queue_enqueue_per_peer_tx` 把状态写回并唤醒 peer 的发送 worker。循环末尾的 `cond_resched()` 让出 CPU，避免长时间占用软中断上下文。
+
+`encrypt_packet` 是封装的核心，值得逐行讲。它先 `skb_get_hash` 强制在加密前算好哈希，保证流分析在所有封装层上一致。然后 `calculate_skb_padding` 算填充长度：若未设 MTU，就把长度向上对齐到 16 字节倍数；否则取 `min(mtu, ALIGN(last_unit, 16)) - last_unit`，保证填充后整包不超过 MTU。接着 `trailer_len = padding_len + noise_encrypted_len(0)`（后者就是 16 字节认证标签），`plaintext_len = skb->len + padding_len`。随后用 `skb_cow_head` 预留 `DATA_PACKET_HEAD_ROOM` 头部空间，若内层是 `CHECKSUM_PARTIAL` 就调 `skb_checksum_help` 先把校验和算实——顺序很重要，必须在追加填充和头部之前完成，否则校验范围会错。再用 `skb_cow_data(skb, trailer_len, &trailer)` 扩展尾部以容纳填充与标签，把填充区 `memset` 为零，用 `skb_push` 在前面压入 `struct message_data` 头并填好 `type`、`key_idx = keypair->remote_index`、`counter = nonce`，用 `pskb_put` 把尾部接回。最后把 skb 的分散块转成 scatterlist，调用 `chacha20poly1305_encrypt_sg_inplace` 原地加密整个明文区，认证标签追加在末尾。这一系列操作没有任何整包拷贝，是零拷贝封装的典范。
+
+**第五段：保序投递。** `wg_queue_enqueue_per_peer_tx` 先取 peer 引用，用 `atomic_set_release` 写入状态，再用 `wg_cpumask_choose_online(&peer->serial_work_cpu, peer->internal_id)` 为该 peer 选一个固定 CPU，把 `transmit_packet_work` 排到该 CPU。由于同一 peer 总被映射到同一 CPU，串行性得到保证。`wg_packet_tx_worker` 在一个 `while` 循环里用 `wg_prev_queue_peek` 看队首，只有当状态不再是 `PACKET_STATE_UNCRYPTED` 才用 `wg_prev_queue_drop_peeked` 取出：状态为 CRYPTED 就调 `wg_packet_create_data_done` 发送，为 DEAD 就 `kfree_skb_list` 丢弃；随后释放 keypair 与 peer 引用，并在 `need_resched` 时让出 CPU。
+
+**第六段：send 收尾与 UDP 发出。** `wg_packet_create_data_done` 先更新"已认证包经过/已发送"两类定时器，再遍历链表逐包判断：`skb->len == message_data_len(0)` 说明是空负载的 keepalive；对每个非 keepalive 且 `wg_socket_send_skb_to_peer` 成功的包置 `data_sent` 为真，最后调用 `wg_timers_data_sent` 并 `keep_key_fresh`。`keep_key_fresh` 检查当前密钥是否已发送超过 `REKEY_AFTER_MESSAGES` 或（作为发起方时）签发时间超过 `REKEY_AFTER_TIME`，若是则调用 `wg_packet_send_queued_handshake_initiation` 排队发起新握手——这就是"数据流量自然触发密钥轮换"的机制。`wg_socket_send_skb_to_peer` 按 endpoint 地址族分派到 `send4` 或 `send6`：二者构造 `flowi4`/`flowi6`，经 `dst_cache` 复用路由或直接 `ip_route_output_flow` / `ip6_dst_lookup_flow` 查路由，设置 `skb->ignore_df = 1` 允许底层分片，最后调用 `udp_tunnel_xmit_skb` / `udp_tunnel6_xmit_skb` 完成 UDP 与外层 IP 头封装并交给物理网卡；发送成功后累加 `peer->tx_bytes`。
+
+### 5. 配置/命令/代码实例
+
+发送路径本身没有独立的用户态命令，但可以用观测手段验证它是否正常工作。下面给出一段组合命令：查看接口是否宣告了 GSO 能力、查看 peer 的 nonce 与计数相关状态、抓取发出的 UDP 数据消息。
+
+```bash
+# 查看 wg0 是否宣告 GSO/TSO 能力（决定 wg_xmit 是否走 skb_gso_segment）
+ethtool -k wg0 | grep -E 'generic-segmentation-offload|tcp-segmentation-offload|scatter-gather'
+
+# 查看 peer 状态，transfer 行的 sent 字节数对应 peer->tx_bytes 累加
+wg show wg0
+
+# 抓取发往对端 51820 端口的数据消息，观察外层 UDP 长度是否受 MTU 约束
+tcpdump -ni eth0 'udp and dst port 51820' -c 5
+```
+
+下面的输出展示了这条流水线的可观测侧面（示例输出，具体格式需对照实际版本核验）。
+
+```text
+generic-segmentation-offload: on
+tcp-segmentation-offload: on
+scatter-gather: on
+interface: wg0
+  listening port: 51820
+peer: <对端公钥>
+ endpoint: 203.0.113.9:51820
+  allowed ips: 10.0.0.2/32
+  transfer: 1.25 KiB received, 42.6 KiB sent
+IP 10.0.0.9.51820 > 203.0.113.9.51820: UDP, length 1376
+```
+
+逐行判读如下。第 1 至 3 行来自 `ethtool -k`，`generic-segmentation-offload: on` 与 `tcp-segmentation-offload: on` 对应 `device.c` 中 `wg_setup` 给 `dev->features` 设置的 `NETIF_F_GSO` 与 `NETIF_F_GSO_SOFTWARE`，`scatter-gather: on` 对应 `NETIF_F_SG`——正是这些能力让 `wg_xmit` 有 GSO 大包可切、让 `encrypt_packet` 能用 scatterlist 做零拷贝加密；若这里显示 off，说明上层不会把大包交给 wg0，`skb_gso_segment` 分支不会被触发。`interface: wg0` 与 `listening port: 51820` 来自 netlink GET 渲染的接口属性（参数见 04-05）。`peer:` 段来自 peer 属性，`allowed ips` 决定 `wg_xmit` 里 `wg_allowedips_lookup_dst` 能否找到这个 peer，写错会使发送直接返回 `-ENOKEY`。关键第 8 行 `transfer` 的 `sent` 值对应 `wg_socket_send_skb_to_peer` 成功时累加的 `peer->tx_bytes`：它只在批量加密成功且 socket 发送无误后增长，因此"握手成功但 sent 恒为 0"往往意味着路由没把流量送到 wg0，或 nonce/密钥检查在 `wg_packet_send_staged_packets` 阶段就失败了。最后一行 tcpdump 的外层 `UDP, length 1376` 正好印证了 `calculate_skb_padding` 的 MTU 约束：外层长度被压在路径 MTU 以内，16 字节对齐的填充与 16 字节认证标签都计入其中，说明 GSO 分段与填充逻辑都在按预期工作。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是混淆"握手包"与"数据包"的发送路径。本篇讲的 `wg_xmit` 到 UDP 发出，处理的是 `MESSAGE_DATA` 数据消息；握手发起走的是完全不同的分支——`wg_packet_send_queued_handshake_initiation` 把工作项排到 `handshake_send_wq`，由 `wg_packet_handshake_send_worker` 调用 `wg_packet_send_handshake_initiation` 直接构造并发出。两者共享 socket，但不共享加密队列。排查"连不上"时要先分清是握手没发还是数据没发。
+
+第二个陷阱是以为"并行加密"就可以随意多线程发同一 peer 的包。实际上 nonce 必须用 `atomic64_inc_return` 严格递增，且发送由 `transmit_packet_work` 串行化。若人为破坏这个顺序，对端 `counter_validate` 会把乱序包判为重放并丢弃，表现为"吞吐莫名下降但无报错"（抗重放原理见 06-08）。
+
+第三个陷阱是忽略暂存队列的 `MAX_STAGED_PACKETS = 128` 上限。队列满时 `wg_xmit` 会从头部丢最老的包并 `DEV_STATS_INC(dev, tx_dropped)`；在密钥尚未建立、包被 orphan 暂存等待握手时，大量突发流量可能触发这个上限，造成丢包。看到 `tx_dropped` 增长，应优先检查握手是否健康、endpoint 是否可达。
+
+第四个陷阱是把 keepalive 当成普通数据。keepalive 是 `skb->len == message_data_len(0)` 的空负载数据消息，`wg_packet_create_data_done` 会刻意不把 keepalive 计入 `data_sent`，因此它不会触发 `wg_timers_data_sent`，但会更新"已发送"定时器。理解这一点才能解释为什么纯 keepalive 流量下 transfer 几乎不增长。
+
+最佳实践方面：其一，确认网卡与内核支持 GSO/GRO  scatter-gather，让零拷贝路径生效（调优见 08-02）；其二，通过 `wg show` 的 `sent` 字节数与 tcpdump 外层长度联合验证封装是否按 MTU 进行；其三，把 MTU 设置在 `ETH_DATA_LEN` 减去封装开销的合理值，避免依赖底层 IP 分片；其四，当观察到 nonce 触发 `REKEY_AFTER_MESSAGES` 频繁轮换时，应检查是否存在异常流量而非盲目调参。所有这些观测都只是手段，真正的机制解释以本篇源码链路为准。
+
+### 7. 小结与延伸阅读
+
+本篇把发送路径拆成六段：`wg_xmit` 选 peer 并做 GSO 分段、`wg_packet_send_staged_packets` 取密钥分配 nonce、`wg_queue_enqueue_per_device_and_peer` 把包同时挂进设备加密队列与 peer 保序队列、`wg_packet_encrypt_worker` 批量调用 `encrypt_packet` 做零拷贝 AEAD 封装、`wg_packet_tx_worker` 按 peer 串行投递、`wg_socket_send_skb_to_peer` 经 `send4`/`send6` 完成 UDP 封装发出。贯穿其中的设计思想是"加密并行、发送保序"，靠 `packet_state` 三态与两级队列解耦实现；`keep_key_fresh` 把密钥轮换自然嵌入数据流，避免维护额外定时器。
+
+延伸阅读建议：抗重放窗口与 nonce 校验见 06-08，多核并发与 per-CPU worker 的整体讨论见 06-13，socket 与 GSO/GRO 的底层细节见 06-12，allowedips 查找见 06-07。跨册随查按（字段见 05-06 ｜ 参数见 04-01 ｜ 原理见 06-08 ｜ 模块见 07-07）执行：结构体逐字段去 05 册，命令参数全集去 04 册，相关机制去 06 册内对应篇，目录级模块职责去 07 册。凡本篇标注"需对照实际版本核验"的函数签名与常量，均以 `_wglinux_build/upstream_src/` 下对应源码文件为准，本套资料不编造未核验的路径与取值。
+
+## 06-06 接收路径：解封装、解密与校验
+
+### 1. 背景与动机
+
+发送路径把一个内网 IP 包变成认证加密的 UDP 报文发出去，接收路径则要完成完全相反的使命：从 UDP socket 收到一包来自不可信网络的密文，把它还原成内层明文 IP 包并安全注入内核协议栈，同时挡住伪造、重放和源地址欺骗。这条链路集中在 `drivers/net/wireguard/receive.c`，配合 `queueing.h` 的队列调度、`socket.c` 的接收回调与 endpoint 处理、`device.c` 里 NAPI 的注册。本册是机制的唯一权威源，本篇逐函数讲清从 UDP 收包到明文注入协议栈的全链路；逐字段定义不在本册展开（字段见 05-06），相关命令参数交给参数册（参数见 04-01），目录级模块职责交给模块册（模块见 07-08）。
+
+接收路径面临的安全压力比发送路径大得多。发送端的输入来自本机协议栈，是可信的；接收端的输入来自公网，任何人都可以往监听端口发 UDP 包。因此接收路径必须在做昂贵的解密运算之前，先用一系列廉价的检查把明显非法的包挡掉，否则攻击者可以用海量垃圾包把 CPU 拖死——这正是 cookie 与限速机制要解决的第一道防线的问题（详见 06-09、06-10）。即使通过了廉价检查，解密之后仍不能立即注入协议栈，还要回答三个问题：这个包的 nonce 是否见过（抗重放）、它声称的源地址是否真的属于 sending peer（源地址校验）、它是不是一个握手包需要走另一条状态机（消息分派）。这三个问题决定了接收路径必然是一条"先廉价过滤、再昂贵解密、后严格校验"的漏斗。
+
+和发送路径对称，接收路径同样要解决"解密并行"与"处理有序"的矛盾。驱动用与发送侧镜像的两级队列做到这一点：设备级 `decrypt_queue` 把包分给多个 per-CPU 的 `wg_packet_decrypt_worker` 并行解密，peer 级 `rx_queue` 则把解密结果收拢到 NAPI poll 中按序处理。NAPI 的引入还有一个额外好处——它把注入协议栈的动作放在软中断上下文，并可批量收包，提升吞吐。理解这条"漏斗 + 两级队列 + NAPI"的流水线，是理解 WireGuard 如何在开放网络上既安全又高效的关键。
+
+版本口径同样需要声明：本篇所有函数名、常量与路径均来自本快照 `_wglinux_build/upstream_src/wireguard-linux-src/drivers/net/wireguard/`，重点是 `receive.c`、`socket.c`、`queueing.h`、`messages.h`、`noise.h`。凡涉及具体数值与函数签名均以目标系统实际源码为准；本篇不做绝对性能数字断言，一切吞吐结论都需在目标机型实测。
+
+### 2. 核心概念
+
+接收路径可以归纳为四个核心概念：廉价前置校验、消息分派、批量解密、三层后置校验。
+
+**廉价前置校验**是说包在进入任何昂贵运算前，先过两道便宜的关：一是 UDP socket 层的封装回调，二是 `prepare_skb_header` 与 `validate_header_len` 对报文长度和结构的检查。只有长度精确匹配某类已知消息的包才会被接受，长度对不上一律丢弃。这一层不涉及任何密钥，纯粹是结构校验，成本极低。
+
+**消息分派**是说通过前置校验后，包按 `type` 字段分流：`MESSAGE_DATA` 走数据路径，三类握手消息走握手队列。分派发生在 `wg_packet_receive` 的 switch 中，数据消息取外层 DSCP/ECN 后交给 `wg_packet_consume_data`，握手消息则被投进 `handshake_queue` 并唤醒一个工作线程（握手消费状态机见 06-02）。本篇聚焦数据路径。
+
+**批量解密**是说数据消息查出 keypair 后，和发送侧一样经历"设备队列 + peer 队列"两级入队，由 per-CPU 的 `wg_packet_decrypt_worker` 批量取出、原地解密，再通过 `napi_schedule` 唤醒 NAPI。解密同样是 AEAD 的 scatterlist 原地操作，无整包拷贝。
+
+**三层后置校验**是说解密成功后还要依次过抗重放（`counter_validate`）、endpoint 提取、以及 `wg_packet_consume_data_done` 里的源地址校验与注入前检查。`counter_validate` 决定 nonce 是否可接受，源地址校验用 allowedips 反查确认"这个源 IP 确实属于这个 peer"，两者任一失败都丢包。只有全部通过，包才经 `napi_gro_receive` 注入协议栈。这三层是接收安全的最后闸门。
+
+下表把四个概念与承载函数对应起来，作为调用链速查。
+
+| 核心概念 | 承载函数 | 所在源码 | 关键作用 |
+|---|---|---|---|
+| 廉价前置校验 | `prepare_skb_header` / `validate_header_len` | `receive.c` | 长度与结构白名单过滤 |
+| 消息分派 | `wg_packet_receive` | `receive.c` | 数据/握手分流 |
+| 批量解密 | `wg_packet_decrypt_worker` / `decrypt_packet` | `receive.c` | per-CPU 批量 AEAD 解密 |
+| 三层后置校验 | `wg_packet_rx_poll` / `wg_packet_consume_data_done` | `receive.c` | 抗重放、源校验、注入 |
+
+### 3. 关键数据结构与源码位置
+
+本节只点名接收路径反复用到的数据结构与真实路径，不展开字段表（逐字段定义见 05-06）。
+
+首先是贯穿全链路的 `struct packet_cb`，仍在 `queueing.h`，经 `PACKET_CB(skb)` 映射到 `skb->cb`。接收路径用到其中三个字段：`keypair` 由 `wg_packet_consume_data` 查表写入，携带解密所需的接收密钥；`nonce` 由 `decrypt_packet` 从数据消息头读出；`state` 同样是 UNCRYPTED/CRYPTED/DEAD 三态，协调解密 worker 与 NAPI poll 的交接。
+
+其次是抗重放的 `struct noise_replay_counter`，定义在 `noise.h`，内含当前计数器 `counter`、自旋锁 `lock` 和位图 `backtrack`。它被内嵌在 `struct noise_keypair` 里作为 `receiving_counter`，每把密钥对有独立的接收窗口。相关常量在 `messages.h`：`COUNTER_BITS_TOTAL = 8192`、`COUNTER_WINDOW_SIZE = COUNTER_BITS_TOTAL - COUNTER_REDUNDANT_BITS`，`REJECT_AFTER_MESSAGES` 则限定计数器上限。这些常量共同决定了接收窗口的大小与拒绝阈值（抗重放的完整算法见 06-08）。下面是这两个结构的真实定义，便于把接收字段与 antireplay 状态对应起来：
+
+```c
+/* noise.h */
+struct noise_replay_counter {
+	u64 counter;                                   /* 已见最大序号 */
+	spinlock_t lock;                               /* 保护位图与计数器 */
+	unsigned long backtrack[COUNTER_BITS_TOTAL / BITS_PER_LONG];
+};
+struct noise_keypair {
+	struct noise_symmetric_key sending;
+	atomic64_t sending_counter;
+	struct noise_symmetric_key receiving;
+	struct noise_replay_counter receiving_counter;  /* 接收窗口 */
+	__le32 remote_index;
+	/* ... */
+};
+```
+
+注意 `backtrack` 数组是 `unsigned long` 类型、长度 `COUNTER_BITS_TOTAL / BITS_PER_LONG`，即把 8192 位窗口按机器字长切成若干块；`counter_validate` 用 `test_and_set_bit` 直接对字操作，避免逐位移位，这也是 RFC6479 算法"避免位移"的由来。发送侧的 `sending_counter` 是 `atomic64_t`，而接收侧的 `receiving_counter.counter` 靠自旋锁保护，二者并发模型不同，不可混用。
+
+第三是 NAPI 相关结构。`peer.h` 里每个 `wg_peer` 内嵌一个 `struct napi_struct napi`；`wg_packet_decrypt_worker` 解密完成后调用 `napi_schedule(&peer->napi)` 把该 peer 挂进软中断的 poll 列表，随后 `wg_packet_rx_poll` 在一个循环里处理最多 `budget` 个包，处理完调用 `napi_complete_done`。`budget` 是 NAPI 的反压机制，防止单个 peer 长期独占 CPU。
+
+第四是外层 SKB 与 endpoint 处理。`socket.c` 的 `wg_socket_endpoint_from_skb` 从 UDP/IP 头中提取对端地址与端口写入 `struct endpoint`，这是 endpoint 漫游学习的基础。`wg_packet_consume_data_done` 先 `wg_socket_set_peer_endpoint` 更新 peer 的 endpoint，再拿它做后续校验。相关结构逐字段见 05-07。
+
+下图把接收路径主要函数按调用层次串起来。
+
+:::figure id=06-06-01 | name=接收路径源码层次与漏斗式校验 | dir=TD
+node r1 "UDP encap_rcv<br/>wg_receive" blue
+node r2 "前置校验<br/>prepare_skb_header" teal
+node r3 "消息分派<br/>wg_packet_receive" purple
+node r4 "查 keypair<br/>wg_packet_consume_data" gray
+node r5 "设备解密队列<br/>decrypt_queue" gray
+node r6 "per-CPU worker<br/>decrypt_packet" red
+node r7 "NAPI poll<br/>wg_packet_rx_poll" amber
+node r8 "抗重放<br/>counter_validate" red
+node r9 "源校验与注入<br/>consume_data_done" teal
+node r10 "内核协议栈<br/>napi_gro_receive" green
+edge r1 -> r2 "收包"
+edge r2 -> r3 "validate_header_len"
+edge r3 -> r4 "MESSAGE_DATA"
+edge r4 -> r5 "查表入队"
+edge r5 -> r6 "queue_work_on"
+edge r6 -> r7 "napi_schedule"
+edge r7 -> r8 "逐包校验"
+edge r8 -> r9 "endpoint/源校验"
+edge r9 -> r10 "注入"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：接收从 UDP 封装回调「wg_receive」开始，经「前置校验 prepare_skb_header」过滤长度，由「消息分派 wg_packet_receive」选出数据消息，「查 keypair wg_packet_consume_data」后挂进「设备解密队列 decrypt_queue」；「per-CPU worker decrypt_packet」批量原地解密，用 `napi_schedule` 唤醒「NAPI poll wg_packet_rx_poll」，逐包过「抗重放 counter_validate」与「源校验与注入 consume_data_done」，最后「napi_gro_receive」把明文注入「内核协议栈」。
+
+### 4. 关键流程与调用链
+
+现在按执行顺序把全链路拆成七段。
+
+**第一段：UDP 接收回调。** `socket.c` 的 `wg_socket_init` 在建立 UDP socket 时用 `struct udp_tunnel_sock_cfg cfg` 设置 `.encap_type = 1`、`.encap_rcv = wg_receive`、`.sk_user_data = wg`，再调 `setup_udp_tunnel_sock` 注册。这样内核在 UDP 层识别到该封装类型时，把 skb 交给 `wg_receive`。后者几乎不做处理：从 `sk->sk_user_data` 取回 `wg_device`，`skb_mark_not_on_list` 后直接调 `wg_packet_receive(wg, skb)`。握手与数据两条路径都从这里开始。
+
+**第二段：前置校验。** `wg_packet_receive` 第一步调用 `prepare_skb_header(skb, wg)`。这个函数先 `wg_check_packet_protocol` 确认协议一致，并检查传输头指针落在 skb 有效范围内；然后取 `udp_hdr(skb)`，算 `data_offset`（UDP 头相对 skb->data 的偏移），检查它不超过 `U16_MAX` 且留得下 UDP 头；再用 `udp_get_len_short(udp)` 读 UDP 长度，检查它不小于 UDP 头长、且不超过 `skb->len - data_offset`——这一步专门对付谎报长度的报文。随后用 `pskb_may_pull` 保证数据头可读、`pskb_trim` 把 skb 裁到声明长度，`skb_pull` 跳过 UDP 头后再次核对长度一致。接着调用 `validate_header_len` 做白名单：数据消息要求 `skb->len >= MESSAGE_MINIMUM_LENGTH` 才返回 `sizeof(struct message_data)`；三类握手消息则要求长度精确等于各自结构大小；否则返回 0 表示非法。`prepare_skb_header` 最后通过一推一拉（先 `__skb_push` 用 `pskb_may_pull` 确保整个头可读，再 `__skb_pull` 复位）完成校验并让 skb 回到可解析状态。任何一步失败都返回 `-EINVAL`，由 `wg_packet_receive` 的 `err` 标签 `dev_kfree_skb` 丢包。
+
+**第三段：消息分派。** 通过前置校验后，`wg_packet_receive` 用 `SKB_TYPE_LE32(skb)` 读类型做 switch。三类握手消息被投进 `handshake_queue`：若队列长度超过 `MAX_QUEUED_INCOMING_HANDSHAKES / 2`，用 `spin_trylock_bh` 尝试入队（入不进就丢弃，避免在负载下被握手洪泛压垮），否则正常 `ptr_ring_produce_bh`；入队后用 `wg_cpumask_next_online` 选 CPU，`queue_work_on` 唤醒 `handshake_receive_wq` 上的 worker。数据消息 `MESSAGE_DATA` 则先 `PACKET_CB(skb)->ds = ip_tunnel_get_dsfield(ip_hdr(skb), skb)` 记录外层 DSCP/ECN（供注入时做 ECN 解封装），再调 `wg_packet_consume_data`。未知类型会 `WARN` 并丢弃。
+
+**第四段：查 keypair 并入设备解密队列。** `wg_packet_consume_data` 从数据消息头读 `__le32 idx = ((struct message_data *)skb->data)->key_idx`，在 RCU 读锁内用 `wg_index_hashtable_lookup(wg->index_hashtable, INDEX_HASHTABLE_KEYPAIR, idx, &peer)` 按索引查到对应 keypair，同时带回所属 peer。查不到（说明密钥索引无效或会话已过期）直接释放。接着 `wg_noise_keypair_get` 增加密钥引用，检查 peer 未死亡，然后调用 `wg_queue_enqueue_per_device_and_peer(&wg->decrypt_queue, &peer->rx_queue, skb, wg->packet_crypt_wq)`——与发送侧完全对称：把包同时挂进设备解密队列和 peer 接收队列，状态置 UNCRYPTED，唤醒一个在线 CPU 上的解密 worker。
+
+**第五段：批量解密。** `wg_packet_decrypt_worker` 与加密 worker 是镜像：用 `container_of(work, struct multicore_worker, work)->ptr` 取回 `decrypt_queue`，在循环里 `ptr_ring_consume_bh` 取包，调用 `decrypt_packet(skb, PACKET_CB(skb)->keypair)`，成功置 `PACKET_STATE_CRYPTED`、失败置 `PACKET_STATE_DEAD`，再调 `wg_queue_enqueue_per_peer_rx(skb, state)`。这个内联函数写入状态后用 `napi_schedule(&peer->napi)` 把 peer 挂进 NAPI poll 列表——注意接收侧收尾用的是 NAPI 而不是工作队列，这与发送侧的 `transmit_packet_work` 不同，目的是在软中断里批量注入协议栈。`decrypt_packet` 本身先做三项密钥有效性检查（keypair 非空、`receiving.is_valid`、birthdate 未超 `REJECT_AFTER_TIME`、接收计数未达 `REJECT_AFTER_MESSAGES`），再从数据头读 `counter` 存进 `PACKET_CB(skb)->nonce`；随后用一推一拉的 `skb_push`/`skb_pull` 技巧保护网络头信息不被 `skb_cow_data` 裁掉，把 skb 转成 scatterlist，调用 `chacha20poly1305_decrypt_sg_inplace` 原地解密并验证认证标签；最后 `pskb_trim` 去掉末尾 16 字节认证标签，恢复指针后返回成功。任何一步失败都返回 false，包被标记 DEAD。
+
+**第六段：NAPI poll 与抗重放。** `wg_packet_rx_poll` 是 NAPI 的 poll 回调，参数 `budget` 限制本轮最多处理包数，若为 0 直接返回。它在 `while` 循环里用 `wg_prev_queue_peek` 看 peer 接收队列首包，只有当状态不再是 UNCRYPTED 才用 `wg_prev_queue_drop_peeked` 取出。状态非 CRYPTED（即 DEAD）直接跳出处理跳到 `next` 释放。对 CRYPTED 的包，先调 `counter_validate(&keypair->receiving_counter, PACKET_CB(skb)->nonce)` 验重放：这是 RFC6479 的位图算法，用一个 8192 位的滑动窗口记录已见序号，序号太旧或位图里已置位就判为重放丢弃，日志打印 "Packet has invalid nonce"；否则窗口前移并置位（完整算法见 06-08）。抗重放通过后用 `wg_socket_endpoint_from_skb` 提取外层源 endpoint，失败也丢弃。全部通过则 `wg_reset_packet(skb, false)` 清理 skb 元数据（第二参数 false 表示不保留哈希，因为要重新注入协议栈重新分类），再调 `wg_packet_consume_data_done` 做最后的源校验与注入，并置 `free = false` 表示 skb 已被接管。`next` 标签统一释放 keypair 与 peer 引用，若 `free` 仍为真则 `dev_kfree_skb`。循环末尾用 `work_done` 计数，达到 `budget` 就停止；若处理量小于 budget 就 `napi_complete_done` 结束本轮 NAPI。
+
+**第七段：源校验与注入。** `wg_packet_consume_data_done` 是接收路径的最后闸门。它先用 `wg_socket_set_peer_endpoint` 更新对端 endpoint（漫游学习），若收到的是用新密钥对的包（`wg_noise_received_with_keypair` 返回真）就调 `wg_timers_handshake_complete` 并 `wg_packet_send_staged_packets` 冲刷暂存包，再触发 `keep_key_fresh`（接收侧的这个静态函数与发送侧不同：它检查发起方密钥是否接近 `REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT`，用 `sent_lastminute_handshake` 避免重复触发）。若 `skb->len == 0` 说明是 keepalive，只更新统计后释放。对普通数据包，先检查网络头有效、IP 版本是 4 或 6，然后设置 `skb->dev = dev`、`skb->ip_summed = CHECKSUM_UNNECESSARY`、`skb->csum_level = ~0`——因为 Poly1305 已认证整包未被篡改，明确告诉协议栈所有封装层的校验和都不必重算；再用 `ip_tunnel_parse_protocol` 解析内层协议，按 v4/v6 从 IP 头算出内层长度并做 `INET_ECN_decapsulate`。若声明长度大于实际长度就判为 "dishonest_packet_size" 丢弃；否则 `pskb_trim` 裁到内层长度。最关键的一步是源地址校验：用 `wg_allowedips_lookup_src(&peer->device->peer_allowedips, skb)` 按内层源地址反查 peer，若查到的 peer 与解密用的 peer 不一致（`routed_peer != peer`），说明这包虽然通过了认证，但源 IP 不属于该 peer，判为 "dishonest_packet_peer" 丢弃——这挡住了"合法 peer 伪造他人源地址"的攻击（trie 查找原理见 06-07）。全部通过后调用 `napi_gro_receive(&peer->napi, skb)` 把明文注入协议栈，并按原长度更新接收统计。各类 dishonest 分支都会累加 `rx_errors` 等统计后释放包。
+
+### 5. 配置/命令/代码实例
+
+接收路径没有独立命令，但可以观察它的公平性与合法性过滤效果。下面给出一组命令：查看接口的接收错误统计（对应各类 dishonest 丢弃与抗重放丢弃）、查看 peer 的接收字节数、查看内核日志里的抗重放告警。
+
+```bash
+# 查看接口统计，rx_errors/rx_length_errors/rx_frame_errors 对应 dishonest_* 分支
+ip -s link show wg0
+
+# 查看 peer 接收字节数（对应 peer->rx_bytes，由 update_rx_stats 累加）
+wg show wg0
+
+# 查看抗重放与前置校验相关的速率限制日志
+dmesg | grep -E 'invalid nonce|Invalid MAC|unallowed src IP'
+```
+
+下面展示这些命令的典型输出（示例输出，具体格式需对照实际版本核验）。
+
+```text
+RX: bytes  packets  errors  dropped overrun mcast
+   1310720   10240    3       0       0       0
+interface: wg0
+  public key: <本端公钥>
+  listening port: 51820
+peer: <对端公钥>
+  endpoint: 203.0.113.9:51820
+  allowed ips: 10.0.0.2/32
+  latest handshake: 8 seconds ago
+  transfer: 1.25 KiB received, 42.6 KiB sent
+[12345.678] wg0: Packet has invalid nonce 4294967296 (max 4294967295)
+```
+
+逐行判读如下。第 1 行 `RX:` 统计块来自内核 netdev 的 per-CPU 统计，`bytes` 与 `packets` 对应 `update_rx_stats` 里 `dev_sw_netstats_rx_add` 累加的值——注意它在校验通过后按原始密文长度（`message_data_len`）累加，因此反映的是收到的 WireGuard 数据消息而非纯内层载荷。`errors` 为 3，对应 `wg_packet_consume_data_done` 里三类 `dishonest_packet_*` 分支对各 `DEV_STATS_INC`（`rx_errors`、`rx_frame_errors`、`rx_length_errors`）的累加：其中 size 不符走 `rx_length_errors`，类型非法与源地址非法走 `rx_frame_errors`，三者都同时计入 `rx_errors`。第 3 至 8 行是 `wg show` 渲染的 netlink 属性（参数见 04-05）：`allowed ips` 决定源校验时 `wg_allowedips_lookup_src` 的反查结果，写错会让合法包被判为 "unallowed src IP"；`latest handshake` 反映握手状态，若为空说明数据包可能根本没通过前置校验或密钥查表。`transfer` 的 `received` 对应 `peer->rx_bytes`，只在包成功走完 `napi_gro_receive` 后增长——因此"errors 增长而 received 不增长"通常意味着包在抗重放或源校验阶段被大量丢弃。最后一行的内核日志 `Packet has invalid nonce ... (max ...)` 出自 `wg_packet_rx_poll` 中 `counter_validate` 返回 false 的分支，nonce 远大于当前 max 说明收到的是明显过期或伪造序号的包，被抗重放窗口正确拦下；这类日志用 `net_dbg_ratelimited` 限速打印，不会因攻击而刷屏（抗重放细节见 06-08）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把接收路径与发送路径的收尾机制混为一谈。发送侧解密完成后用 `transmit_packet_work` 工作队列串行发送，接收侧解密完成后用 `napi_schedule` 走 NAPI poll。两者都用两级队列和 packet_state 三态，但收尾上下文不同：NAPI 在软中断里批量处理，带 `budget` 反压。误认为接收也走工作队列，会错误估算延迟与 CPU 占用。
+
+第二个陷阱是忽略前置校验的"精确长度"要求。`validate_header_len` 对四类消息的长度要求不同：数据消息只需不小于最小长度（因为负载变长），三类握手消息则必须精确等于结构大小。任何长度不匹配的包都会被 `prepare_skb_header` 丢弃。手工构造测试报文时若长度算错，会表现为"包根本没进入解密路径"，而不是解密失败。
+
+第三个陷阱是以为解密成功就等于可以信任。`decrypt_packet` 成功只证明包由持有会话密钥的对端发出且未被篡改，但不证明源 IP 合法。`wg_packet_consume_data_done` 的 `wg_allowedips_lookup_src` 反查才是源地址校验的关键，缺了它就能被合法 peer 用来伪造任意源地址。理解这一点才能明白为什么 allowedips 既是路由表又是访问控制表（原理见 06-07）。
+
+第四个陷阱是误解 `CHECKSUM_UNNECESSARY` 与 `csum_level = ~0`。这不是"跳过校验偷懒"，而是基于 Poly1305 已认证整包未被修改的事实，主动通知协议栈无需重复计算各层校验和。若内层包在隧道外被篡改，认证标签校验就会失败，包根本到不了这一步。
+
+第五个陷阱是把抗重放丢弃误判为链路故障。`counter_validate` 对乱序到达（如多路径传输）或重发的包会丢弃并打印 "invalid nonce"。适度乱序在正常网络中可能出现，但 WireGuard 选择严格抗重放而非容忍乱序，这是安全性优先的取舍；看到该日志应先确认是否已真实丢包，而非直接调大窗口（窗口机制见 06-08）。
+
+最佳实践方面：其一，通过 `ip -s link` 的 `errors` 分类与 `wg show` 的 `received` 联合定位丢包发生在哪一层；其二，用 `dmesg` 的速率限制日志区分前置校验失败（Invalid MAC）、抗重放（invalid nonce）与源地址非法（unallowed src IP）；其三，确认 NAPI 与 GRO 在目标内核启用以获得批量注入的吞吐收益（调优见 08-02）；其四，endpoint 漫游依赖 `wg_socket_set_peer_endpoint`，NAT 场景下注意其对连接保持的影响（定时器见 06-11）。所有观测都只是手段，机制解释以本篇源码链路为准。
+
+### 7. 小结与延伸阅读
+
+本篇把接收路径拆成七段：UDP 回调 `wg_receive`、`prepare_skb_header` 前置校验、`wg_packet_receive` 消息分派、`wg_packet_consume_data` 查 keypair 入队、`wg_packet_decrypt_worker` 批量解密、`wg_packet_rx_poll` 在 NAPI 中做抗重放与 endpoint 提取、`wg_packet_consume_data_done` 做源校验与协议栈注入。贯穿其中的设计思想是"先廉价过滤、再昂贵解密、后严格校验"的漏斗，以及"解密并行、处理有序"的两级队列；`counter_validate` 的 RFC6479 位图窗口与 `wg_allowedips_lookup_src` 的源反查，构成接收安全的两道核心闸门。
+
+延伸阅读建议：抗重放窗口算法见 06-08，cookie 与 DoS 防护见 06-09，握手消息的消费状态机见 06-02，allowedips 查找与源校验原理见 06-07，socket 与 GRO 细节见 06-12，多核并发见 06-13。跨册随查按（字段见 05-06 ｜ 参数见 04-01 ｜ 原理见 06-08 ｜ 模块见 07-08）执行：结构体逐字段去 05 册，命令参数全集去 04 册，相关机制去 06 册内对应篇，目录级模块职责去 07 册。凡本篇标注"需对照实际版本核验"的函数签名与常量，均以 `_wglinux_build/upstream_src/` 下对应源码文件为准，本套资料不编造未核验的路径与取值。

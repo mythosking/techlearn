@@ -1,0 +1,313 @@
+## 02-03 从零构建实战：内核模块编译、insmod 与 dkms 兼容路径
+
+### 1. 背景与动机
+
+构建是把一份静态源码变成运行中内核模块的必经环节，也是许多"明明照着文档做了却加载不上"的问题的真正根源。WireGuard 的内核实现虽然已经进入 Linux 主线，但不同发行版、不同内核版本携带的驱动新旧不一：有的发行版内核较老、尚未合入 WireGuard，有的则出于稳定考虑冻结在某个旧版本，还有的场景需要对驱动打补丁、打开调试开关，或把它回溯移植到自定义内核上。这些情形都无法靠"发行版仓库里装一个包"解决，必须从源码自行构建。本篇要回答的就是这条链路上的三个实务问题：怎样把一个 `wireguard.ko` 从源码编译出来，怎样用 `insmod` / `modprobe` 把它正确加载进内核，以及在不把驱动编进内核树的场景下，怎样借 dkms 让模块随内核升级自动重建。
+
+先明确本篇在整个构建册里的位置，避免与相邻篇重复。02-01 负责源码获取、内核树目录结构与依赖矩阵，告诉读者从哪里拿到 `wireguard-linux-src` 快照、需要哪些编译依赖；02-02 负责 Kconfig 与 Makefile 的构建配置，解释 `CONFIG_WIREGUARD` 这个配置符号如何在 Kconfig 中声明、在 `.config` 中取值；本篇 02-03 则承接这两篇，专讲"动手做"——从实际的 `drivers/net/wireguard/Makefile` 与 `main.c` 出发，把编译、加载、兼容路径这条操作链走通；02-05 再讲调试构建、动态调试与 selftest。换言之，本篇关心的是"命令怎么敲、产物是什么、加载时内核实际做了什么"，而配置符号的完整语义与调试开关的细节，分别让给 02-02 与 02-05（构建配置见 02-02，调试构建见 02-05）。
+
+版本基准必须先厘清，否则读任何构建日志都会迷失。本套资料的内核驱动快照是 `wireguard-linux` stable 分支的 `drivers/net/wireguard/` 目录，其驱动的自身版本来自 `drivers/net/wireguard/version.h` 中的 `WIREGUARD_VERSION "1.0.0"`；这是驱动字符串，不是 Linux 内核版本，也不是用户态 `wireguard-tools` 的版本。用户态工具的 `src/version.h` 另定义为 `WIREGUARD_TOOLS_VERSION "1.0.20260223"`，而目标机器的内核版本又是一个独立取值，由 `uname -r` 决定。三者相互独立：构建内核模块时匹配的是内核版本与内核头文件版本，构建用户态工具时用的是工具版本（工具构建见 02-04），而 `wireguard.ko` 通过 `MODULE_VERSION` 暴露的则是那个 `"1.0.0"`。把这三个版本号混用，是阅读 `modinfo` 输出时最常见的误判来源。
+
+需要特别说明 dkms 的定位。dkms（Dynamic Kernel Module Support，动态内核模块支持）并不属于上游 `wireguard-linux` 源码树，它是发行版与打包者用来管理树外内核模块的一套框架：当系统安装新内核时，dkms 会用新内核的头文件自动重新编译并注册已登记的树外模块，从而避免"内核升级后模块失效"的经典问题。因此本篇涉及 dkms 的部分讲的是工程实践与兼容思路，其具体目录布局、配置文件字段与命令行为需对照目标发行版的 dkms 版本核验，本套资料不把它伪装成上游源码里的文件；凡 dkms 相关断言，均按"需对照实际版本核验"处理。
+
+最后交代本篇的证据边界。构建命令的具体输出格式、模块加载后的 `dmesg` 文本、乃至 dkms 状态行，都因内核版本、编译器与发行版而异，本篇给出的示例仅用于建立"输入—产物—内核反应"的对应关系，并统一标注"示例输出，具体格式需对照实际版本核验"。凡是函数、宏、常量与文件路径，则严格取自本快照的 `drivers/net/wireguard/Makefile`、`main.c` 与 `version.h`，绝不编造。读法是：把本篇当作一张围绕真实源码展开的"构建操作地图"，细节参数去 04 册、结构字段去 05 册、机制原理去 06 册、模块职责去 07 册。
+
+### 2. 核心概念
+
+理解从零构建，先要理解 kbuild 是怎样把一个目录里的 C 文件变成一个 `.ko` 文件的。核心线索在 `drivers/net/wireguard/Makefile` 里，只有十八行，却包含了三个关键概念。其一是复合目标：`wireguard-y := main.o` 开始，逐行 `+=` 追加 `noise.o`、`device.o`、`peer.o`、`timers.o`、`queueing.o`、`send.o`、`receive.o`、`socket.o`、`peerlookup.o`、`allowedips.o`、`ratelimiter.o`、`cookie.o`、`netlink.o` 与 `generated/netlink.o`，最后用 `obj-$(CONFIG_WIREGUARD) := wireguard.o` 收口。这里的 `wireguard.o` 不是一个普通的单文件目标，而是由 kbuild 自动把 `wireguard-y` 列出的所有 `.o` 链接而成的复合模块；`obj-$(CONFIG_WIREGUARD)` 的写法则是 kbuild 的标准习语——当 `CONFIG_WIREGUARD=y` 时目标进入 `obj-y` 被编进内核，为 `m` 时进入 `obj-m` 生成可加载模块，为 `n` 时整行消失。这解释了为什么同一个 Makefile 能同时支持"编进内核"与"编成模块"两种形态。
+
+其二是编译标志。`ccflags-y := -D'pr_fmt(fmt)=KBUILD_MODNAME ": " fmt'` 定义了模块统一的打印前缀：`KBUILD_MODNAME` 在构建时被替换为模块名 `wireguard`，于是模块内所有 `pr_info`、`pr_err` 输出都会自动带上 `wireguard: ` 前缀——这正是加载成功后 `dmesg` 里那行 `wireguard: WireGuard 1.0.0 loaded.` 的来源，前缀并非手写在每个打印点，而是由这条 `pr_fmt` 宏统一注入。紧接着的 `ccflags-$(CONFIG_WIREGUARD_DEBUG) += -DDEBUG` 是条件编译：只有当 `CONFIG_WIREGUARD_DEBUG` 打开时才追加 `-DDEBUG`，从而激活 `main.c` 中用 `#ifdef DEBUG` 包裹的自检代码（调试开关的完整语义见 02-05）。
+
+其三是模块身份声明，全部集中在 `main.c` 末尾。`module_init(wg_mod_init)` 与 `module_exit(wg_mod_exit)` 分别把 `wg_mod_init`、`wg_mod_exit` 注册为加载与卸载入口；这两个宏会把函数放入内核特殊的 `.init.text` 与 `.exit.text` 段，前者在初始化完成后其内存可被内核回收，后者在模块被静态编入内核时根本不会保留。`MODULE_LICENSE("GPL v2")` 声明许可为 GPLv2，这不仅是一行说明——内核会据此判断模块是否可以使用那些标记为 GPL-only 的导出符号，许可不符会导致加载时的符号解析失败。`MODULE_DESCRIPTION`、`MODULE_AUTHOR`、`MODULE_VERSION(WIREGUARD_VERSION)` 分别提供描述、作者与版本，其中版本正是 `version.h` 的 `"1.0.0"`。
+
+模块别名是加载机制的另一个核心概念，也是"为什么 `ip link add wg0 type wireguard` 能自动加载模块"的答案。`MODULE_ALIAS_RTNL_LINK(KBUILD_MODNAME)` 声明这是一个 rtnetlink 链路类型模块，别名形如 `rtnl-link-wireguard`；`MODULE_ALIAS_GENL_FAMILY(WG_GENL_NAME)` 声明它承载名为 `WG_GENL_NAME`（即 `"wireguard"`）的通用 netlink 族，别名形如 `netlink-genl-wireguard`。构建时 modpost 工具会把这些别名写入 `modules.alias`，`modprobe` 在收到内核的模块请求时按别名查找并加载对应 `.ko`。这带来一个实务区分：`insmod` 只按文件路径加载指定模块，不解析依赖、不查别名；`modprobe` 则读取 `modules.alias` 与 `modules.dep`，支持按别名加载并自动处理依赖。构建完成后用 `depmod` 刷新这些索引，是让 `modprobe` 与自动加载正常工作的前提。
+
+最后一个概念是 dkms 的"树外模块"身份。上游驱动是随内核树构建的，其 Makefile 依赖内核的 kbuild 体系；而内核树之外的模块要想用同样的 kbuild 规则编译，必须提供匹配当前运行内核的内核头文件（headers），并保证编译时的 ` vermagic`（内核版本魔数）与运行内核一致。dkms 的本质就是把"用哪个内核头文件编译、编译产物放到哪里、内核升级后如何重做"这三件事自动化。理解这一点后，dkms 不再是神秘的黑盒：它调用的仍是同一套 `make -C <内核构建目录> M=<模块目录> modules` 机制，区别只是把这个过程挂到了内核安装的钩子上。
+
+### 3. 关键数据结构与源码位置
+
+本篇不展开结构体字段——那统一交给 05 册（字段见 05-02），本节只把构建与加载直接涉及的源码位置和声明收拢成一张可核对的清单，便于后文逐行判读时回查。
+
+首先是构建入口文件。`drivers/net/wireguard/Makefile` 定义了对象列表与编译标志，是 kbuild 读取本目录的第一个文件；其第 17 行 `obj-$(CONFIG_WIREGUARD) := wireguard.o` 决定模块的生成，第 1 行的 `pr_fmt` 与第 2 行的 `-DDEBUG` 决定日志前缀与调试开关。其次是模块入口文件 `drivers/net/wireguard/main.c`：`wg_mod_init` 在第 20 行以 `__init` 修饰开始，依次调用各子系统初始化函数；`wg_mod_exit` 在第 63 行以 `__exit` 修饰开始，按逆序回收；第 71 至 78 行集中了 `module_init`、`module_exit` 与五个 `MODULE_*` 声明。第三是版本文件 `drivers/net/wireguard/version.h`，仅一行 `#define WIREGUARD_VERSION "1.0.0"`，被 `main.c` 通过第 6 行 `#include "version.h"` 引入，并用于 `pr_info` 打印与 `MODULE_VERSION`。
+
+除了这三个主文件，构建链还会触及若干由源码生成或间接引用的位置。`generated/netlink.o` 出现在对象列表末尾，说明 netlink 相关代码的一部分来自生成文件（生成流程属于构建配置的细节，见 02-02）；`netlink.c` 与 `netlink.h` 实现通用 netlink 族的注册（`wg_genetlink_init` 的实现），其命令与属性常量定义在上层头文件 `include/uapi/linux/wireguard.h`（常量全集见 04-05、04-06）。`allowedips.c` 提供 `wg_allowedips_slab_init`，是初始化链的第一环。这些位置在本篇只作为"初始化函数调用到了哪里"的坐标出现，不展开实现（原理见 06-01）。
+
+下表把本篇反复引用的源码位置与用途收拢成速查表。
+
+| 关注点 | 真实源码路径 | 本篇用途 |
+|---|---|---|
+| 对象列表与模块目标 | `drivers/net/wireguard/Makefile` 第 3–17 行 `wireguard-y`、`obj-$(CONFIG_WIREGUARD)` | 解释复合目标与 kbuild 语法 |
+| 日志前缀与调试开关 | `drivers/net/wireguard/Makefile` 第 1–2 行 `pr_fmt`、`-DDEBUG` | 解释 `dmesg` 前缀与 DEBUG 条件编译 |
+| 加载/卸载入口 | `drivers/net/wireguard/main.c` 第 20、63 行 `wg_mod_init`、`wg_mod_exit` | 解释初始化顺序与逆序回收 |
+| 模块身份与别名 | `drivers/net/wireguard/main.c` 第 71–78 行 `module_init`、`MODULE_LICENSE`、`MODULE_ALIAS_*` | 解释许可、自动加载与 modinfo |
+| 驱动版本字符串 | `drivers/net/wireguard/version.h` 的 `WIREGUARD_VERSION` | 区分驱动版本与内核/工具版本 |
+| netlink 族与 uapi | `drivers/net/wireguard/netlink.c`、`include/uapi/linux/wireguard.h` | 作为初始化调用坐标，常量见 04-05、04-06 |
+| 结构字段与模块职责 | `device.c` 的 `wg_device` 等 | 本篇不展开，字段见 05-02、模块见 07-01 |
+
+读这张表时要注意"本册处理方式"这一列的去重意图：作为构建册，本篇只负责把源码位置与构建、加载行为对上号，凡是涉及字段布局、参数全集、机制细节的内容，一律通过四段式引用让给权威册，避免与其他篇重复叙述（字段见 05-02 ｜ 参数见 04-07 ｜ 原理见 06-01 ｜ 模块见 07-01）。
+
+### 4. 关键流程与调用链
+
+构建链从一条 `make` 命令开始。在完整内核树内构建时，典型过程是先配置好 `.config`（确保 `CONFIG_WIREGUARD=m` 或 `=y`，配置语义见 02-02），再执行内核的模块构建目标；kbuild 进入 `drivers/net/wireguard/` 目录，读取该目录的 Makefile，把 `wireguard-y` 列出的每一个 `.o` 编译出来，再由 kbuild 把这一组对象链接成复合模块 `wireguard.o`，最终生成 `wireguard.ko`。链接阶段之后，modpost 工具扫描模块，生成 `Module.symvers`（导出符号校验）、`modules.alias`（由 `MODULE_ALIAS_*` 而来）与 `modules.dep`（依赖关系）。这一步解释了为什么构建产物不只是一个 `.ko` 文件——配套的别名与依赖索引，是后续 `modprobe` 与自动加载能工作的前提。
+
+加载链从 `insmod wireguard.ko` 或 `modprobe wireguard` 开始。内核先做一系列一致性检查：模块格式是否正确、`vermagic` 是否与当前内核匹配、所依赖的符号是否都能在当前内核的符号表中找到、模块声明的许可是否满足 GPL-only 符号的要求。任何一项不满足，加载都会在入口函数执行之前失败，这正是"insmod 报 Invalid module format 或 Unknown symbol"的原因。检查通过后，内核调用 `module_init` 注册的 `wg_mod_init`，其内部顺序严格遵循依赖关系：先 `wg_allowedips_slab_init()` 为 trie 节点准备 slab 缓存，这是最基础的资源；在 `DEBUG` 编译下接着运行 `wg_allowedips_selftest()`、`wg_packet_counter_selftest()`、`wg_ratelimiter_selftest()` 三项自检，任一失败就把返回值设为 `-ENOTRECOVERABLE` 并 `goto err_peer`；随后 `wg_noise_init()` 初始化握手基础设施，`wg_peer_init()` 初始化对等体子系统，`wg_device_init()` 注册网络设备相关结构，最后 `wg_genetlink_init()` 注册通用 netlink 族，使配置通道可用。全部成功后，第 48、49 行两条 `pr_info` 打印加载信息与版权行——注意第一条正是 `pr_fmt` 前缀与 `WIREGUARD_VERSION` 拼接的结果。
+
+回滚链与卸载链是同一段代码的镜像。`wg_mod_init` 中每一层初始化失败都通过 `goto` 跳到对应标签，逆序释放已经成功的层：`err_netlink` 先 `wg_device_uninit()` 再落到 `err_device` 回收 peer、`err_peer` 回收 slab；这种"逐层 goto 回滚"是内核模块的标准写法，保证任何中途失败都不留残余资源。`wg_mod_exit` 则在模块卸载时按 `wg_genetlink_uninit()`、`wg_device_uninit()`、`wg_peer_uninit()`、`wg_allowedips_slab_uninit()` 的逆序完整回收。理解这条链有个实际收益：当加载失败时，`dmesg` 里最后一条成功的打印与第一条失败的返回码，可以反过来定位是哪一层初始化出了问题（错误码速查见 04-08）。
+
+dkms 兼容链则是把上述构建链"挂到内核升级钩子上"。其工作流可概括为：把驱动源码放入 dkms 约定的源码目录并提供一份描述文件（内容需对照实际版本核验），用 dkms 命令 add、build、install 把模块登记并安装到当前内核；此后每当系统安装新内核，dkms 的钩子会用新内核头文件重新执行同一套 kbuild 构建，并在新内核的模块目录中注册产物。关键点是 dkms 并未改变构建本身，它调用的仍是 `M=<模块目录>` 的树外构建流程，因此前文关于 `vermagic`、内核头文件匹配、符号解析的所有注意事项，在 dkms 场景下同样成立——dkms 只是把"再构建一次"自动化了，并不能绕开内核 ABI 兼容性这道硬约束。
+
+整条从源码到加载的链路，以及 dkms 在其中所处的位置，见图 02-03-01。
+
+:::figure id=02-03-01 | name=从源码到加载的构建链路与 dkms 位置 | dir=TD
+node s1 "wireguard-y 对象列表<br/>Makefile 第3-17行" blue
+node s2 "kbuild 编译<br/>生成各 .o" teal
+node s3 "链接为 wireguard.ko<br/>复合模块" teal
+node s4 "modpost<br/>生成 alias 与 dep" purple
+node s5 "insmod / modprobe<br/>内核一致性检查" gray
+node s6 "wg_mod_init<br/>分层初始化" green
+node s7 "pr_info 打印<br/>1.0.0 loaded" amber
+node d1 "dkms 钩子<br/>内核升级重构建" red
+edge s1 -> s2 "读取 Makefile"
+edge s2 -> s3 "ld 链接"
+edge s3 -> s4 "扫描符号"
+edge s4 -> s5 "depmod 索引"
+edge s5 -> s6 "module_init"
+edge s6 -> s7 "成功后打印"
+edge d1 -> s2 "触发重构建"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：主线从「wireguard-y 对象列表」经「kbuild 编译生成各 .o」到「链接为 wireguard.ko 复合模块」，再由「modpost 生成 alias 与 dep」产出索引，随后「insmod / modprobe 内核一致性检查」通过后调用「wg_mod_init 分层初始化」，最终「pr_info 打印 1.0.0 loaded」；旁路是「dkms 钩子 内核升级重构建」在内核升级时重新触发 kbuild 编译这一步。
+
+### 5. 配置/命令/代码实例
+
+先看构建入口本身。下面这段取自 `drivers/net/wireguard/Makefile` 的关键行，它决定了模块由哪些对象组成、以什么形态产出：
+
+```makefile
+ccflags-y := -D'pr_fmt(fmt)=KBUILD_MODNAME ": " fmt'
+ccflags-$(CONFIG_WIREGUARD_DEBUG) += -DDEBUG
+wireguard-y := main.o
+wireguard-y += noise.o
+wireguard-y += device.o
+wireguard-y += peer.o
+wireguard-y += timers.o
+wireguard-y += queueing.o
+wireguard-y += send.o
+wireguard-y += receive.o
+wireguard-y += socket.o
+wireguard-y += peerlookup.o
+wireguard-y += allowedips.o
+wireguard-y += ratelimiter.o
+wireguard-y += cookie.o
+wireguard-y += netlink.o generated/netlink.o
+obj-$(CONFIG_WIREGUARD) := wireguard.o
+```
+
+这段 Makefile 有三处值得逐字读：`obj-$(CONFIG_WIREGUARD) := wireguard.o` 用变量展开决定模块形态；`wireguard-y +=` 的连续追加构成复合目标对象清单；`ccflags-y` 的 `pr_fmt` 定义让所有打印自动带 `wireguard:` 前缀。注意最后一行用 `:=` 而非 `+=`，是赋值而非追加，这是该文件收口模块目标的写法。
+
+下面给出在内核树内构建并加载模块的一组命令（示例输出，具体格式需对照实际版本核验）：
+
+```bash
+# 确认已配置 CONFIG_WIREGUARD=m（配置语义见 02-02）
+grep CONFIG_WIREGUARD .config
+
+# 在内核树根构建该目录的模块
+make -C /lib/modules/$(uname -r)/build M=$PWD/drivers/net/wireguard modules
+
+# 安装模块并刷新依赖/别名索引
+sudo make -C /lib/modules/$(uname -r)/build M=$PWD/drivers/net/wireguard modules_install
+sudo depmod -a
+
+# 按别名加载（推荐，能解析依赖）并查看模块身份
+sudo modprobe wireguard
+modinfo wireguard
+
+# 卸载模块
+sudo modprobe -r wireguard
+```
+
+执行上述命令后，验证链路的典型输出如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+CONFIG_WIREGUARD=m
+  LD      M     drivers/net/wireguard/wireguard.o
+  CC [M]  drivers/net/wireguard/main.o
+  MODPOST drivers/net/wireguard/Module.symvers
+filename:       /lib/modules/6.x.x/kernel/drivers/net/wireguard/wireguard.ko
+version:        1.0.0
+license:        GPL v2
+description:    WireGuard secure network tunnel
+author:         Jason A. Donenfeld <Jason@zx2c4.com>
+vermagic:       6.x.x SMP preempt mod_unload
+alias:          rtnl-link-wireguard
+alias:          netlink-genl-wireguard
+depends:
+```
+
+逐行判读如下。首行 `CONFIG_WIREGUARD=m` 来自 `.config`，`m` 表示构造成可加载模块而不是内建（`y`）或禁用（`n`），直接决定 Makefile 第 17 行 `obj-$(CONFIG_WIREGUARD)` 展开为 `obj-m`。第二行 `LD M ... wireguard.o` 是 kbuild 把 `wireguard-y` 清单里的所有对象链接为复合目标的动作，印证了 `wireguard.o` 并非单个 C 文件编译产物。第三行 `CC [M] ... main.o` 是编译 `main.c` 的过程，`[M]` 标记表明这是模块构建而非内建；`main.o` 里就包含 `wg_mod_init` 与那些 `MODULE_*` 声明。第四行 `MODPOST ... Module.symvers` 表明 modpost 正在扫描导出符号并生成校验文件，这一步同时产出 `modules.alias`。第五行 `filename` 显示模块的最终安装路径，位于内核版本对应的模块目录下，路径里含 `6.x.x` 正是 `vermagic` 必须匹配的内核版本。第六行 `version: 1.0.0` 直接来自 `MODULE_VERSION(WIREGUARD_VERSION)`，也就是 `version.h` 里的那个字符串，与内核版本、工具版本都无关。第七行 `license: GPL v2` 来自 `MODULE_LICENSE("GPL v2")`，它决定模块能否引用 GPL-only 导出符号。第八行 `description` 与第九行 `author` 分别来自 `MODULE_DESCRIPTION` 与 `MODULE_AUTHOR`。第十行 `vermagic` 是加载时一致性检查的核心字段，必须与运行内核完全匹配，否则 `insmod` 会以 `Invalid module format` 拒绝加载——这也是 dkms 必须在每次内核升级后重构建的根本原因。第十一行、第十二行两条 `alias` 分别来自 `MODULE_ALIAS_RTNL_LINK(KBUILD_MODNAME)` 与 `MODULE_ALIAS_GENL_FAMILY(WG_GENL_NAME)`，正是它们让 `modprobe` 能在 `ip link add wg0 type wireguard` 触发内核请求时找到本模块（netlink 原理见 06-14）。第十三行 `depends:` 为空，说明本模块没有依赖其他模块，这是因为加密原语等依赖已随主线内核编入。加载成功后若执行 `dmesg | tail`，会看到带 `wireguard:` 前缀的 `WireGuard 1.0.0 loaded. See www.wireguard.com for information.`，这个前缀正是 Makefile 第 1 行 `pr_fmt` 注入的效果，而非打印语句里手写。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是用 `insmod` 强行加载与内核不匹配的模块。由于 `insmod` 不做依赖解析、也不按别名查找，它只对指定文件做最基本的加载尝试；一旦 `vermagic` 与当前内核不一致，就会失败并可能留下难以理解的错误码。正确做法是用 `modprobe`：它读取 `modules.dep` 与 `modules.alias`，既能按别名加载又能处理依赖，配合加载前先 `depmod -a` 刷新索引，可避开绝大多数"模块就在磁盘上却加载不了"的问题。第二个陷阱是忽视内核头文件版本。树外构建必须用与目标运行内核完全一致的头文件和构建目录（`/lib/modules/$(uname -r)/build`），用错版本即便编译通过，`vermagic` 也会在加载时被拒；这一点在 dkms 场景下表现为"新内核装好后 dkms 重建失败"，需检查新内核的 headers 是否已安装。
+
+第三个陷阱是许可不匹配。`MODULE_LICENSE("GPL v2")` 不是可有可无的说明文字：内核对标记为 GPL-only 的导出符号会拒绝非 GPL 兼容模块引用，若把声明改成不兼容许可，加载会在符号解析阶段失败。因此擅自修改 `main.c` 的许可声明是高危操作。第四个陷阱是误改 `__init` / `__exit` 语义。`wg_mod_init` 的 `__init` 段在初始化完成后其内存会被内核回收，若把它注册的函数在初始化之后再次调用，将访问已释放内存；这是内核模块与普通程序的关键差异，调试时不要试图在运行期"重入"初始化函数。
+
+第五个陷阱是把调试构建的产物当生产件。`CONFIG_WIREGUARD_DEBUG` 打开时会追加 `-DDEBUG`，激活 `main.c` 中 `#ifdef DEBUG` 包裹的三项 selftest；自检失败会让初始化返回 `-ENOTRECOVERABLE`，调试构建因此在某些环境下更难加载成功。生产构建应关闭该开关，调试用途的单测与自检留给 02-05 处理。第六个陷阱是低估 dkms 的边界。dkms 解决的是"内核升级后自动重编译"，但无法解决"驱动源码与新版内核 API 不兼容"——若上游驱动在新内核上编译报错，dkms 只是忠实地把编译错误记录下来，仍需人工适配源码或换用更新版本；此外启用 Secure Boot 的系统还会要求模块签名，dkms 重构建的模块若未签名会被内核拒绝加载，这部分属于发行版安全策略，需对照实际环境核验。
+
+最佳实践可以归纳为五步。其一，构建前先确认 `CONFIG_WIREGUARD=m` 与目标内核的头文件齐备（配置见 02-02）。其二，优先用内核树内的标准 `make ... M=... modules` 流程构建，保留完整的 `Module.symvers` 与 `modules.alias`，不要手工拼命令绕过 kbuild。其三，构建后先 `modinfo` 核对 `version`、`license`、`vermagic` 与两条 `alias` 是否与预期一致，再决定是否加载。其四，加载统一走 `modprobe` 并在安装后 `depmod -a`，让别名与依赖索引保持最新。其五，在需要跨内核升级长期维护的场景才引入 dkms，并为其配置好签名与头文件依赖；在一次性或受控环境里，手动构建反而更透明、更可审计。凡遇到加载失败，按"先看 `dmesg` 最后一条内核报错，再回查 `vermagic` 与符号依赖，最后确认许可"的顺序排查，通常能快速定位（排障思路见 08-03）。
+
+### 7. 小结与延伸阅读
+
+本篇围绕 `drivers/net/wireguard/Makefile` 与 `main.c`，把"从源码到运行中模块"的链路走了一遍：Makefile 用 `obj-$(CONFIG_WIREGUARD) := wireguard.o` 把 `wireguard-y` 对象清单链接成复合模块，用 `pr_fmt` 统一日志前缀，用条件标志控制调试编译；`main.c` 用 `module_init` / `module_exit` 注册入口，`wg_mod_init` 按 allowedips、noise、peer、device、genetlink 的依赖顺序分层初始化，失败时逐层 `goto` 回滚，`wg_mod_exit` 逆序回收；五个 `MODULE_*` 声明分别提供许可、描述、作者、版本与两条别名，其中版本取自 `version.h` 的 `"1.0.0"`，别名使 `modprobe` 能按 rtnetlink 链路类型与 netlink 族名自动加载模块。dkms 的本质是把同一套树外 kbuild 流程挂到内核升级钩子上，它自动化了"重构建"却没有绕开 `vermagic` 与 ABI 兼容的硬约束。
+
+延伸阅读按三条线展开：构建配置的符号语义（如 `CONFIG_WIREGUARD` 如何在 Kconfig 声明）读 02-02，调试构建与 selftest 读 02-05，源码获取与依赖矩阵读 02-01；想理解初始化各层究竟做了什么，按机制读 06-01 的启动注册总览、按模块职责读 07-01 的 `main.c` 入口与 07-02 的设备生命周期；需要字段细节查 05-02 的 `wg_device`，需要 `modinfo` 之外更多参数与错误码查 04-07 与 04-08；加载后的运维排障读 08-03。跨册随查按（字段见 05-02 ｜ 参数见 04-07 ｜ 原理见 06-01 ｜ 模块见 07-01）执行。凡本篇标注"需对照实际版本核验"的 dkms 配置字段、命令输出格式与发行版行为，均以目标系统实际环境为准，本套资料不编造未核验的路径与取值。
+
+## 02-04 wireguard-tools 构建：wg、wg-quick 与 bash 补全
+
+### 1. 背景与动机
+
+内核模块只提供数据面，真正把配置写进内核、把接口拉起来的，是用户态的 `wireguard-tools`。这套工具包含两个面向使用者的程序：`wg(8)` 是配置与查询 WireGuard 接口的主命令，`wg-quick(8)` 则是一个读取 `wg` 风格配置文件并自动完成地址、路由、DNS 等附加设置的便捷脚本。前者是 C 程序，后者是 bash 脚本，二者共享同一个源码仓库。本篇要讲的是怎样从源码把这三者——`wg` 主程序、`wg-quick` 脚本、bash 补全文件——构建并安装到目标系统，以及构建过程中那些决定"装到哪里、装不装"的变量与探测逻辑。
+
+为什么要从源码构建工具，而不是直接用发行版包？理由与内核模块类似但有工具自己的特点。其一是版本滞后：发行版仓库里的 `wireguard-tools` 可能落后于上游，缺少某些子命令或补全能力；其二是安装路径定制：打包者往往需要把程序装进特定 `PREFIX` 与 `DESTDIR`，并决定是否附带 man 手册、systemd unit 与 bash 补全；其三是可审计与可定制：工具源码量小、依赖极简，README 明确写着"There are no dependencies other than a good C compiler and a sane libc"，意味着在受限环境里从零构建非常轻量；其四是为了解工具本身——读懂 `wg.c` 的子命令分发表与两个补全脚本，才能真正理解 `wg` 为什么"没有守护进程"，以及按下 Tab 时 shell 到底在做什么。
+
+版本基准仍要三分开。用户态工具的版本由 `src/version.h` 的 `WIREGUARD_TOOLS_VERSION "1.0.20260223"` 定义，这是本快照的基准；`wg --version` 打印的就是它。注意 Makefile 里还有一条更动态的取值路径：`WIREGUARD_TOOLS_VERSION = $(patsubst v%,%,$(shell GIT_DIR="$(PWD)/../.git" git describe --dirty 2>/dev/null))`，即优先用 `git describe` 从仓库标签推导版本并去掉 `v` 前缀，只有取不到时才回退到 `version.h` 里的默认值。这与内核驱动 `version.h` 的 `"1.0.0"`（见 01-01、02-03）和内核版本 `uname -r` 是三个独立取值（版本基准见 01-04）。把工具版本误当成驱动版本，是阅读 `wg --version` 与 `modinfo wireguard` 输出时最常见的混淆。
+
+本篇的范围与分工需要交代清楚。`wg` 的全部命令行参数、子命令选项与配置语义属于参数权威册 04-01、04-02、04-03，本篇只在 `wg.c` 的子命令分发表层面点名，不展开每个子命令的选项（参数见 04-01）；`wg0.conf` 的配置体系与 `wg-quick` 的字段用法属于 03-02，本篇只讲脚本是怎样被构建和安装的；`wg` 通过 netlink 与内核通信的机制属于 06-14，本篇只点到 IPC 链路的存在（原理见 06-14）；工具内部各源文件（config、encoding、curve25519、ipc 等）的职责属于 07-13，本篇不逐一展开（模块见 07-13）。本篇专注的是"构建、安装、运行分发与补全"这条操作链。
+
+最后给出证据口径。凡涉及函数名、变量名、默认值与文件路径，均取自本快照的 `wireguard-tools/README.md`、`src/Makefile`、`src/wg.c`、`src/version.h`、`src/completion/` 下两个补全脚本以及 `contrib/` 目录，尽量给出真实路径；凡涉及具体命令输出格式、发行版安装差异与第三方工具行为，统一标注"需对照实际版本核验"。本篇不写绝对版本号以外的性能或兼容性断言，也不把 `contrib/` 下的示例脚本说成生产组件——README 明确说它们"not immediately useful for production use"，只应作为灵感来源。
+
+### 2. 核心概念
+
+理解工具构建，第一个核心概念是"一个二进制，多个子命令"。`src/wg.c` 的 `main` 函数并不为每条命令生成一个独立可执行文件，而是维护一张 `subcommands[]` 分发表：表项是 `const char *subcommand`、函数指针 `int (*function)(int, const char**)` 与描述 `const char *description` 三者组成的结构，静态列出 `show`、`showconf`、`set`、`setconf`、`addconf`、`syncconf`、`genkey`、`genpsk`、`pubkey` 九个子命令。`main` 先处理 `-v/--version/version`（打印 `wireguard-tools v%s`）与 `-h/--help/help`（调用 `show_usage`），无参数时默认调用 `show_main`，有参数时遍历分发表按字符串比对，命中就把 `argc-1` 与 `argv+1` 交给对应函数。这里有两个容易忽略的细节：`setconf`、`addconf`、`syncconf` 三个子命令共用同一个 `setconf_main` 函数指针，`genkey` 与 `genpsk` 共用 `genkey_main`——区别由函数内部对子命令名的判断决定，而不是分发表里写了不同函数。这种"单二进制 + 表驱动分发"的设计，正是工具部署极简的原因：装一个 `wg` 文件就获得全部子命令。
+
+第二个概念是 `wg-quick` 与补全文件的"非编译"属性。`wg-quick` 不是 C 程序，而是安装时从 `wg-quick/$(PLATFORM).bash` 拷贝并改名为 `wg-quick` 的脚本，所以它的"构建"本质是选择平台对应脚本并安装；bash 补全文件同理，是 `completion/wg.bash-completion` 与 `completion/wg-quick.bash-completion` 两个纯文本 shell 脚本，被安装到 `BASHCOMPDIR` 下。因此 `make` 阶段真正编译的只有 C 源文件，而 `make install` 阶段才把脚本、手册页、systemd unit 与补充分发到各自目录。理解这个区别，就不会奇怪为什么 `make` 之后目录里只有一个 `wg` 可执行文件。
+
+第三个概念是构建变量的"可覆盖 + 自动探测"双层设计。`src/Makefile` 用 `?=` 定义了一组变量：`PREFIX ?= /usr`、`DESTDIR ?=`、`SYSCONFDIR ?= /etc`、`BINDIR ?= $(PREFIX)/bin`、`BASHCOMPDIR ?= $(PREFIX)/share/bash-completion/completions`、`RUNSTATEDIR ?= /var/run`、`PKG_CONFIG ?= pkg-config` 等；更特别的是 `SYSTEMDUNITDIR`，它用 `$(shell $(PKG_CONFIG) --variable=systemdsystemunitdir systemd ... || echo "$(PREFIX)/lib/systemd/system")` 查询 systemd 的 unit 目录，查不到就回退到默认路径。三个 `WITH_*` 开关 `WITH_BASHCOMPLETION`、`WITH_WGQUICK`、`WITH_SYSTEMDUNITS` 初始为空，走自动探测：当 `BASHCOMPDIR` 目录存在时打开 bash 补全，当 `$(BINDIR)/bash` 或 `$(DESTDIR)/bin/bash` 存在时打开 `wg-quick`，当 `SYSTEMDUNITDIR` 存在时打开 systemd unit。这套逻辑的实务含义是：打包时若想强制包含或排除某项，应显式把变量设为 `yes` 或 `no`，而不要依赖探测结果（安装与目标变量详见后文表格）。
+
+第四个概念是平台推导与版本注入。`PLATFORM ?= $(shell uname -s | tr '[:upper:]' '[:lower:]')` 把内核名转成小写作为平台标识，`wg-quick/$(PLATFORM).bash` 据此选择脚本；若存在 `uapi/$(PLATFORM)/.` 目录，则 `CFLAGS` 追加 `-isystem uapi/$(PLATFORM)` 引入平台专用头文件。编译标志还包括 `-O3`、`-std=gnu99 -D_GNU_SOURCE -Wall -Wextra -MMD -MP` 与 `-DRUNSTATEDIR=...`，`DEBUG=yes` 时再追加 `-g`。版本则通过 `git describe` 注入为 `-D'WIREGUARD_TOOLS_VERSION="..."'`。最后是关于许可的一个易错点：整个项目按 README 是 GPLv2，但 `src/wg.c` 文件头的 SPDX 标注是 `GPL-2.0 OR MIT`；单文件许可与项目整体许可是两个层面，引用时应以 COPYING 与 README 的项目声明为准，并注意两者的区分（许可见 01-04）。
+
+### 3. 关键数据结构与源码位置
+
+本篇不展开配置结构体的字段——那属于 05 册（字段见 05-09），本节只把构建、安装与运行分发直接涉及的源码位置收拢成清单，便于第五节逐行判读时回查。
+
+构建与安装的核心文件是 `src/Makefile`。它定义变量与探测逻辑（第 5–37 行）、平台与编译标志（第 38–54 行）、平台特化链接库（第 55–74 行，如 FreeBSD 加 `-lnv`、Haiku 加 `-lnetwork -lbsd`、Windows 改用 mingw clang 与 windres）、静默输出规则（第 76–86 行，`V=1` 可关闭）、单二进制链接规则 `wg: $(sort $(patsubst %.c,%.o,$(wildcard *.c)))`（第 88 行）以及 `install`、`clean`、`check` 目标（第 90–112 行）。`README.md` 提供构建与安装的变量说明以及 `WITH_*` 开关的语义。版本文件 `src/version.h` 以 `#ifndef WIREGUARD_TOOLS_VERSION` guard 定义默认值 `1.0.20260223`，正好承接 Makefile 在取不到 `git describe` 时不注入宏的情形。
+
+运行与分发的核心文件是 `src/wg.c`：第 15–29 行的 `subcommands[]` 分发表、第 31–38 行的 `show_usage`、第 40–66 行的 `main` 分发逻辑，以及第 13 行的全局 `PROG_NAME`。补全与脚本类是 `src/completion/wg.bash-completion`（`_wg_completion` 函数，用 `COMP_CWORD`、`COMP_WORDS`、`compgen` 分派）与 `src/completion/wg-quick.bash-completion`（`_wg_quick_completion` 函数，扫描 `/etc/wireguard` 下的 `*.conf`），以及被安装为 `wg-quick` 的 `src/wg-quick/linux.bash` 等平台脚本。`contrib/` 目录则收纳示例与扩展，包括 `embeddable-wg-library`（单文件 C89 库，注意其 `wireguard.c` / `wireguard.h` 因使用 libmnl 代码而是 LGPL-2.1+）、`reresolve-dns`（配合 cron 周期重解析动态 DNS 并调用 `wg set ... endpoint ...`）、`extract-keys`、`extract-handshakes`、`highlighter`、`json/wg-json`、`dns-hatchet`、`nat-hole-punching`、`sticky-sockets`、`external-tests`（Go/Haskell/Python/Rust）等；README 明确这些"most of these are not immediately useful for production use"。
+
+下表把本篇反复引用的源码位置与用途收拢成速查。
+
+| 关注点 | 真实源码路径 | 本篇用途 |
+|---|---|---|
+| 构建变量与探测 | `wireguard-tools/src/Makefile` 第 5–37 行 | 解释 `WITH_*` 自动探测与路径变量 |
+| 编译标志与版本注入 | `wireguard-tools/src/Makefile` 第 38–54 行 | 解释 `CFLAGS`、`PLATFORM`、`git describe` |
+| 单二进制链接规则 | `wireguard-tools/src/Makefile` 第 88 行 `wg:` | 解释所有 `*.c` 链接为单个 `wg` |
+| 安装分发规则 | `wireguard-tools/src/Makefile` 第 93–105 行 `install:` | 解释各文件的安装路径与权限 |
+| 子命令分发表 | `wireguard-tools/src/wg.c` 第 15–29 行 `subcommands[]` | 解释单二进制多子命令 |
+| 主函数分发 | `wireguard-tools/src/wg.c` 第 40–66 行 `main` | 解释版本/帮助/默认 show/分发 |
+| 版本默认值 | `wireguard-tools/src/version.h` | 解释 `WIREGUARD_TOOLS_VERSION` 回退值 |
+| wg 补全 | `wireguard-tools/src/completion/wg.bash-completion` | 解释 `_wg_completion` |
+| wg-quick 补全 | `wireguard-tools/src/completion/wg-quick.bash-completion` | 解释 `_wg_quick_completion` |
+| 扩展示例 | `wireguard-tools/contrib/` 各子目录 | 只点名，不作生产组件 |
+| 参数与机制 | `wg` 参数全集、netlink 交互 | 本篇不展开，参数见 04-01、原理见 06-14 |
+
+这张表同样体现去重意图：作为构建册，本篇只把源码位置与"构建/安装/运行分发"行为对上号，参数语义去 04 册、配置体系去 03 册、机制去 06 册、模块职责去 07 册（字段见 05-09 ｜ 参数见 04-01 ｜ 原理见 06-14 ｜ 模块见 07-13）。
+
+### 4. 关键流程与调用链
+
+构建链从 README 给出的两条命令开始：`cd src` 后执行 `make`。Makefile 的 `.DEFAULT_GOAL` 是 `all`，而 `all: wg`，所以默认目标就是那个单二进制 `wg`。第 88 行 `wg: $(sort $(patsubst %.c,%.o,$(wildcard *.c)))` 用 `wildcard` 收集当前目录所有 C 源文件、把扩展名替换为 `.o` 并排序，作为 `wg` 的依赖；于是 `wg.c`、`config.c`、`encoding.c`、`curve25519.c`、`ipc.c` 等全部被编译为对象文件，再由隐式链接规则合成一个 `wg`。当 `V` 不等于 1 时，第 76–86 行把 `COMPILE.c`、`LINK.o`、`RM` 包装成只回显 `CC`、`LD`、`CLEAN` 的静默形式，这解释了构建日志里那些短前缀。若要看完整编译命令，设 `V=1` 即可关闭包装。
+
+安装链由 `make install` 触发，其动作全部写在第 93–105 行，且多项受 `WITH_*` 开关约束：先用 `install -v -d` 建目录再拷贝，`wg` 以 `0755` 安装到 `$(DESTDIR)$(BINDIR)`，`man/wg.8` 以 `0644` 安装到 `$(MANDIR)/man8`；仅当 `WITH_BASHCOMPLETION=yes` 时安装 `completion/wg.bash-completion` 为 `$(BASHCOMPDIR)/wg`（`0644`）；仅当 `WITH_WGQUICK=yes` 时把 `wg-quick/$(PLATFORM).bash` 安装为 `$(BINDIR)/wg-quick`（`0755`），并以 `0700` 建立 `$(DESTDIR)$(SYSCONFDIR)/wireguard` 目录；`wg-quick.8` 手册页、wg-quick 补全文件与 systemd unit 同样各自受对应开关约束。理解这条链有个实际收益：打包时若发现某项没被安装，多半是自动探测把它判成了 `no`，应显式设 `WITH_*=yes`。
+
+运行链从 `wg.c` 的 `main` 开始。它先把 `argv[0]` 存入全局 `PROG_NAME`，再依次判断版本请求、帮助请求与无参数情形，最后遍历 `subcommands[]` 按字符串匹配把控制权交给对应函数指针。以 `wg show` 为例，`show_main` 会通过 IPC 层（Linux 上是 netlink 通用族）向内核发 `WG_CMD_GET_DEVICE` 请求并渲染返回属性；`wg set`、`wg syncconf` 等则走 `WG_CMD_SET_DEVICE`。这条 IPC 链路的实现属于 06-14，本篇只点到为止（原理见 06-14）。
+
+补全链是 shell 侧的独立流程。两个补全文件各自定义一个函数并用 `complete -F` 注册到对应命令：`wg.bash-completion` 末尾是 `complete -o nosort -F _wg_completion wg`，`wg-quick.bash-completion` 末尾是 `complete -o filenames -o nosort -F _wg_quick_completion wg-quick`。当用户按下 Tab，bash 设置 `COMP_WORDS` 与 `COMP_CWORD`，函数据此分派：`_wg_completion` 在第一个词位置用 `compgen -W` 补全九个顶层子命令，在第二个词位置调用 `wg show interfaces` 枚举已有接口，在 `show` 的第三个词位置补全 `public-key`、`private-key`、`listen-port`、`peers`、`allowed-ips` 等字段，在 `set` 子命令里用一组 `has_*` 标志位避免同一参数重复出现；`_wg_quick_completion` 则在第一个词位置补全 `up`/`down`，在 `up` 的第二个词位置扫描 `/etc/wireguard/*.conf`（FreeBSD/Darwin 追加 `/usr/local/etc/wireguard`）给出配置名，在 `down` 位置从 `wg show interfaces` 取活跃接口。
+
+构建、安装与运行分发三者的关系，以及 bash 补全作为旁路的位置，见图 02-04-01。
+
+:::figure id=02-04-01 | name=wireguard-tools 构建安装与运行分发链 | dir=TD
+node t1 "src/Makefile<br/>变量与探测规则" blue
+node t2 "wg.c 等所有 *.c<br/>编译为 .o" teal
+node t3 "链接为单二进制 wg" teal
+node t4 "make install<br/>按 WITH_* 分发" purple
+node t5 "wg 主程序<br/>subcommands 表分发" green
+node t6 "wg-quick<br/>平台 bash 脚本" gray
+node t7 "两个 bash 补全<br/>complete 注册" amber
+node t8 "netlink SET/GET<br/>配置内核" red
+edge t1 -> t2 "wildcard *.c"
+edge t2 -> t3 "ld 链接"
+edge t3 -> t4 "安装目标"
+edge t4 -> t5 "BINDIR/wg"
+edge t4 -> t6 "BINDIR/wg-quick"
+edge t4 -> t7 "BASHCOMPDIR"
+edge t5 -> t8 "IPC 配置"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：主线从「src/Makefile 变量与探测规则」驱动「wg.c 等所有 *.c 编译为 .o」，再「链接为单二进制 wg」，随后「make install 按 WITH_* 分发」；分发结果一条到「BINDIR/wg 即 wg 主程序 subcommands 表分发」，一条到「BINDIR/wg-quick 平台 bash 脚本」，一条到「BASHCOMPDIR 下的两个 bash 补全 complete 注册」；主程序再经「IPC 配置 netlink SET/GET」与内核交互。
+
+### 5. 配置/命令/代码实例
+
+先看 `wg.c` 里决定"单二进制多子命令"的分发表，这是理解工具结构的钥匙：
+
+```c
+static const struct {
+    const char *subcommand;
+    int (*function)(int, const char**);
+    const char *description;
+} subcommands[] = {
+    { "show", show_main, "Shows the current configuration and device information" },
+    { "set", set_main, "Change the current configuration, add peers, remove peers, or change peers" },
+    { "setconf", setconf_main, "Applies a configuration file to a WireGuard interface" },
+    { "addconf", setconf_main, "Appends a configuration file to a WireGuard interface" },
+    { "syncconf", setconf_main, "Synchronizes a configuration file to a WireGuard interface" },
+    { "genkey", genkey_main, "Generates a new private key and writes it to stdout" },
+    { "genpsk", genkey_main, "Generates a new preshared key and writes it to stdout" },
+    { "pubkey", pubkey_main, "Reads a private key from stdin and writes a public key to stdout" }
+};
+```
+
+注意 `setconf`、`addconf`、`syncconf` 三项都指向 `setconf_main`，`genkey`、`genpsk` 两项都指向 `genkey_main`；描述文字不同但函数指针相同，差别在函数内部判定。这说明分发表是"入口路由表"而非"实现清单"。
+
+下面是从源码构建、安装并验证的一组命令（示例输出，具体格式需对照实际版本核验）：
+
+```bash
+cd wireguard-tools/src
+make                          # 默认目标 all -> wg
+V=1 make clean && V=1 make    # 想看完整编译命令时打开 V=1
+./wg --version                # 验证版本字符串
+
+# 打包到 staging 目录，显式打开全部可选项
+make install DESTDIR=/tmp/stage PREFIX=/usr \
+     WITH_BASHCOMPLETION=yes WITH_WGQUICK=yes WITH_SYSTEMDUNITS=yes
+ls -l /tmp/stage/usr/bin/wg /tmp/stage/usr/bin/wg-quick \
+      /tmp/stage/usr/share/bash-completion/completions/wg
+```
+
+执行后的典型输出如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+  CC      wg.o
+  CC      config.o
+  LD      wg
+wireguard-tools v1.0.20260223 - https://git.zx2c4.com/wireguard-tools/
+-rwxr-xr-x 1 root root  ... /tmp/stage/usr/bin/wg
+-rwxr-xr-x 1 root root  ... /tmp/stage/usr/bin/wg-quick
+-rw-r--r-- 1 root root  ... /tmp/stage/usr/share/bash-completion/completions/wg
+-rw-r--r-- 1 root root  ... /tmp/stage/usr/share/bash-completion/completions/wg-quick
+```
+
+逐行判读如下。前三行 `CC wg.o`、`CC config.o`、`LD wg` 来自 Makefile 第 76–86 行的静默包装：当 `V` 不等于 1 时，`COMPILE.c` 被改成先回显 `CC $@` 再执行真实编译，`LINK.o` 同理回显 `LD $@`，所以看到的是短前缀而非完整命令行；`LD wg` 正对应第 88 行 `wg:` 目标把所有对象链接成单二进制。第四行 `wireguard-tools v1.0.20260223 - ...` 是 `wg.c` 的 `main` 在处理 `--version` 时用 `printf("wireguard-tools v%s - ...\n", WIREGUARD_TOOLS_VERSION)` 打印的结果，其中的版本号来自 `git describe` 注入或 `version.h` 的 `1.0.20260223`，与内核驱动的 `1.0.0` 无关。第五、六行是 `wg` 与 `wg-quick` 被安装到 `$(DESTDIR)$(BINDIR)` 的结果，权限 `0755` 对应 install 目标里的 `-m 0755`，`wg-quick` 来自 `wg-quick/$(PLATFORM).bash` 而非编译产物。第七、八行是两份补全文件被安装到 `$(BASHCOMPDIR)` 下并改名为 `wg`、`wg-quick`，权限 `0644` 对应 `-m 0644`，只有当 `WITH_BASHCOMPLETION=yes` 时这两行才会出现。整个 `DESTDIR=/tmp/stage` 的用法说明工具支持分阶段安装：先落到 staging 目录检查文件清单，再打包或同步到目标机，这正是打包者显式设置 `WITH_*` 变量的典型场景（安装变量全集见本册前文表格，参数见 04-01）。若此时运行 `wg show interfaces`，其可用接口列表也正是补全函数调用的同一个数据源，配置通道的细节见 06-14。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是依赖自动探测却不了解探测依据。`WITH_WGQUICK` 的探测检查的是 `$(BINDIR)/bash` 或 `$(DESTDIR)/bin/bash` 是否存在，而非系统里有没有 bash；在交叉构建或 staging 场景下，即便目标机有 bash，只要 staging 目录里没有对应路径，探测就可能判成 `no`，导致 `wg-quick` 没被安装。结论是打包时必须显式设置 `WITH_*` 变量，不要靠探测碰运气。第二个陷阱是 `DESTDIR` 与 `PREFIX` 混淆：`PREFIX` 决定安装前缀（默认 `/usr`），`DESTDIR` 只是打包时的暂存根目录（默认空），二者叠加成 `$(DESTDIR)$(BINDIR)`；把两者混为一谈会导致文件装到错误路径。
+
+第三个陷阱是版本号来源。`wg --version` 的字符串优先来自 `git describe --dirty`，若源码不是 git 仓库或没有标签，注入就会落空，回退到 `version.h` 的默认值；因此从归档包构建与从 git 仓库构建，版本字符串可能不同，这不是错误。分发时应明确版本口径，避免把 `1.0.20260223` 误报成内核驱动版本。第四个陷阱是补全"不生效"。补全文件安装后还需要目标环境已启用 bash-completion 框架、`BASHCOMPDIR` 指向框架实际扫描的目录，且当前 shell 已重新加载补全——仅仅把文件拷到目录，并不会让已经打开的 shell 自动生效。若 `BASHCOMPDIR` 探测失败或被设为 `no`，两个补全函数根本不会被安装。
+
+第五个陷阱是把 `contrib/` 当生产组件。README 明确这些脚本与示例"most of these are not immediately useful for production use"，它们用于启发自定义工具。特别要注意许可差异：`contrib/embeddable-wg-library` 的 `wireguard.c` / `wireguard.h` 因使用 libmnl 代码而是 LGPL-2.1+，与主程序的许可不同，嵌入专有项目前必须分别评估（许可见 01-04）。第六个陷阱是忽略跨平台分支。Makefile 对 FreeBSD、Haiku、Windows 各有不同的链接库与编译器设置，Windows 分支甚至改用 `x86_64-w64-mingw32-clang` 与 windres 生成资源；在 Linux 上验证过的构建命令不能原样套到其他平台，`PLATFORM` 的推导值与 `wg-quick/$(PLATFORM).bash` 的可用性需逐平台核验。
+
+最佳实践可归纳为五步。其一，先用 `cd src && make` 加 `./wg --version` 快速确认工具能构建、版本符合预期。其二，打包时用 `make install DESTDIR=... PREFIX=...` 并显式设置三个 `WITH_*` 开关，避免探测不确定性。其三，核对安装清单中 `wg`、`wg-quick`、两份补全、man 手册页与 systemd unit 是否齐全、权限是否正确（可执行 `0755`、数据 `0644`、配置目录 `0700`）。其四，调试构建问题时用 `V=1 make` 展开完整编译命令，必要时 `DEBUG=yes` 追加 `-g`。其五，把 `contrib/` 当参考资料而非直接部署，引用其代码前先确认许可。凡遇到安装缺项，按"先看 `WITH_*` 是否被探测成 `no`，再核对 `DESTDIR`/`PREFIX` 拼接路径，最后检查平台脚本是否存在"的顺序排查（排障见 08-03）。
+
+### 7. 小结与延伸阅读
+
+本篇把 `wireguard-tools` 的构建与安装拆成三条链：构建链由 `src/Makefile` 的 `wg: $(sort $(patsubst %.c,%.o,$(wildcard *.c)))` 把所有 C 源文件编译并链接为单个 `wg`，`V=1` 可展开静默命令；安装链由 `install:` 目标按 `WITH_BASHCOMPLETION`、`WITH_WGQUICK`、`WITH_SYSTEMDUNITS` 三个开关把 `wg`（0755）、`wg-quick`（0755）、两份 bash 补全（0644）、man 手册页与 `/etc/wireguard`（0700）分发到 `$(DESTDIR)` 与 `PREFIX` 拼接出的路径；运行链由 `wg.c` 的 `subcommands[]` 表把九个子命令分发给对应函数，其中 `setconf`/`addconf`/`syncconf` 共用 `setconf_main`、`genkey`/`genpsk` 共用 `genkey_main`，并通过 IPC 走 netlink 与内核交互。`_wg_completion` 与 `_wg_quick_completion` 两个函数分别注册到 `wg` 与 `wg-quick`，把顶层子命令、接口名、配置字段与 `*.conf` 文件名做成 Tab 补全。版本字符串优先取 `git describe`、回退 `version.h` 的 `1.0.20260223`，与驱动版本 `1.0.0`、内核版本三者独立。
+
+延伸阅读按三条线展开：想逐个掌握 `wg` 的子命令选项与 `wg-quick` 配置字段，读 04-01、04-02、04-03 与 03-02；想理解 `wg` 如何通过 netlink 把配置写进内核，读 06-14 与 06-01；想了解 config、encoding、curve25519、ipc 等源文件各自职责，读 07-13；结构字段查 05-09，许可与版本基准查 01-04，安装后的运维与排障查 08-03。跨册随查按（字段见 05-09 ｜ 参数见 04-01 ｜ 原理见 06-14 ｜ 模块见 07-13）执行。凡本篇标注"需对照实际版本核验"的安装输出格式、发行版探测行为与第三方工具细节，均以 `wireguard-tools/README.md` 与目标系统实际环境为准，本套资料不编造未核验的路径与取值。

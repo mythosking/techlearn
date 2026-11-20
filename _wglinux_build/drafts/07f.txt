@@ -1,0 +1,316 @@
+## 07-11 sysfs.c 与 uapi 配置接口模块
+
+### 1. 背景与动机
+
+Linux 内核网络驱动的配置面从来不是单一形态。常见的入口有 ioctl、sysfs 属性文件、ethtool 私有操作集、procfs 节点，以及 netlink 套接字族。不同子系统根据历史包袱与需求选择不同组合：网卡驱动常带 ethtool，设备模型天然提供 sysfs，而需要表达嵌套结构与批量事务的网络配置则越来越倾向 netlink。WireGuard Linux 的选择很彻底——把全部配置收敛到 netlink 通用族（generic netlink），并把内核与用户态之间的协议契约写进一个 uapi 头文件，由用户态的 wg 工具与第三方控制面共同遵守。理解这个选择，是理解本篇全部内容的前提：配置面不是一个散落在文件系统各处的属性集合，而是一棵有明确枚举编号、有版本、有命令语义的属性树。
+
+本快照有一个必须先讲清楚的事实：`drivers/net/wireguard/` 目录下**没有 sysfs.c**。逐目录 grep `module_param`、`DEVICE_ATTR`、`ethtool_ops`、`sysfs` 等符号均无匹配；`drivers/net/wireguard/Makefile` 的 `wireguard-y` 列表为 main.o、noise.o、device.o、peer.o、timers.o、queueing.o、send.o、receive.o、socket.o、peerlookup.o、allowedips.o、ratelimiter.o、cookie.o、netlink.o、generated/netlink.o，其中也没有 sysfs.o。因此就这份快照而言，既不存在 WireGuard 自己的 sysfs 属性文件，也不存在私有 ethtool 操作；任何「通过 /sys/class/net/wg0 下的 WireGuard 专属属性读写配置」的说法都不适用于本快照（需对照实际版本核验）。阅读旧资料或发行版补丁文档时偶尔会看到 sysfs 相关描述，那对应的是其他版本或下游改动，本册不据以立论，也不编造任何 sysfs 属性名与路径。
+
+既然配置职责不落在 sysfs 上，它由哪几部分承担？内核侧是 netlink 通用族的实现，用户态侧是 wg 工具，而两者之间的契约就是 `include/uapi/linux/wireguard.h`。本快照提供了这份契约文件，但 Makefile 引用的 `netlink.c` 与 `generated/netlink.c` 源文件并未随快照提供，`generated/` 目录也不存在。这与当前上游的版本特征完全吻合：头文件顶部明确标注 `auto-generated from: Documentation/netlink/specs/wireguard.yaml`，并注明由 `tools/net/ynl/ynl-regen.sh` 重新生成，即 netlink 定义已被纳入 YAML 规范统一管理，内核侧的解析代码与 uapi 头都由规范生成。因此本篇的准确对象是「配置接口的契约模块」：讲清楚 uapi 头暴露了哪些命令、属性与标志，以及它们如何经由 netlink 通道落到内核状态；消息如何解析、策略如何校验、属性如何映射到 device/peer 的机制细节交给 06-14，命令与常量的完整清单交给 04-05、04-06。
+
+为什么 uapi 头值得单独成篇？因为它是整个配置生态的稳定锚点。wg 工具、wg-quick 脚本、各类第三方控制面（例如基于 YNL 生成的 Python 或 Go 绑定）都不直接读内核结构，而是按这份头文件里约定的族名、版本号、命令号与属性编号编码消息。一旦枚举值在不同版本间漂移，配置就会静默失效甚至写到错误的字段上。把契约集中到一个头、再由 YAML 规范生成，正是为了避免「各写各的枚举值」。可以说，数据面的正确性是靠 `messages.h` 的消息布局保证的，而配置面的正确性就是靠这个 uapi 头保证的；前者决定报文能否互通，后者决定配置能否抵达正确的内核对象（消息布局原理见 06-04，配置机制见 06-14）。
+
+### 2. 核心概念
+
+把 uapi 头的内容压缩，可以记为「一个通用族、两条命令、三层属性、五组标志、一个定长」。
+
+**一个通用族**：`#define WG_GENL_NAME "wireguard"` 与 `#define WG_GENL_VERSION 1` 定义了配置通道的身份。通用族是 netlink 的一种多路复用机制：在单个 netlink 套接字上用族名区分不同子系统，用版本号区分协议演进。wg 工具正是用族名与版本打开到该族的 netlink 套接字，再在消息里带上命令号。内核侧则由 `main.c` 中的 `wg_genetlink_init()` 完成族注册，这一步发生在模块初始化的最后阶段，体现「先有 device/peer 状态、再开放配置入口」的依赖顺序（模块入口见 07-01，注册链路见 06-01）。通用族与 rtnetlink 的分工也要分清：`ip link add wg0 type wireguard` 走 rtnetlink 创建的是 net_device 外壳，而 `wg set` 走通用族写入的是隧道自身的密钥、peer 与 AllowedIPs；两者缺一不可，却不是同一条通道。
+
+**两条命令**：`enum wg_cmd` 只有 `WG_CMD_GET_DEVICE` 与 `WG_CMD_SET_DEVICE` 两个成员，`WG_CMD_MAX` 由 `__WG_CMD_MAX - 1` 得到，值为 1。GET 负责查询，把内核里 device、peer、allowedip 的状态按属性填回用户态，`wg show` 的每一行都来自这条命令的返回；SET 负责写入，把用户态编码好的属性树推给内核。值得注意的是 SET 的语义是「以设备为单位提交」，具体是整体替换、追加还是仅更新，由标志位决定，而不是靠更多命令。这种「两条命令加标志位」的设计极大压缩了接口面积：没有 create/delete 设备的独立命令——设备的创建删除交给 rtnetlink；也没有 add/del peer 的独立命令——对 peer 的增删同样通过 SET 加标志表达。
+
+**三层属性**：`wgdevice_attribute`、`wgpeer_attribute`、`wgallowedip_attribute` 三个枚举恰好对应配置模型的三个层级。device 层有 `WGDEVICE_A_IFINDEX`、`WGDEVICE_A_IFNAME`、`WGDEVICE_A_PRIVATE_KEY`、`WGDEVICE_A_PUBLIC_KEY`、`WGDEVICE_A_FLAGS`、`WGDEVICE_A_LISTEN_PORT`、`WGDEVICE_A_FWMARK`、`WGDEVICE_A_PEERS`；peer 层有 `WGPEER_A_PUBLIC_KEY`、`WGPEER_A_PRESHARED_KEY`、`WGPEER_A_FLAGS`、`WGPEER_A_ENDPOINT`、`WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL`、`WGPEER_A_LAST_HANDSHAKE_TIME`、`WGPEER_A_RX_BYTES`、`WGPEER_A_TX_BYTES`、`WGPEER_A_ALLOWEDIPS`、`WGPEER_A_PROTOCOL_VERSION`；allowedip 层有 `WGALLOWEDIP_A_FAMILY`、`WGALLOWEDIP_A_IPADDR`、`WGALLOWEDIP_A_CIDR_MASK`、`WGALLOWEDIP_A_FLAGS`。三层通过 `PEERS` 与 `ALLOWEDIPS` 两个嵌套属性串成一棵树：一个 device 带多个 peer，一个 peer 带多个 allowedip。每个枚举的第一个成员都是 `*_A_UNSPEC`，值为 0，这是 netlink 属性枚举的惯例，保留 0 表示「未指定」，避免把合法属性误用 0 编号；每层末尾的 `*_A_MAX` 都由 `__*_A_LAST - 1` 计算，供内核属性策略校验上界（完整枚举与取值见 04-05、04-06）。
+
+**五组标志**：`WGDEVICE_F_REPLACE_PEERS`（值 1）控制 SET 时是否替换该设备的全部 peer；`WGPEER_F_REMOVE_ME`（1）、`WGPEER_F_REPLACE_ALLOWEDIPS`（2）、`WGPEER_F_UPDATE_ONLY`（4）分别表达删除该 peer、替换其 AllowedIPs、仅更新已存在的 peer；`WGALLOWEDIP_F_REMOVE_ME`（1）表达删除该 allowedip。这些值是位掩码而非序号，可以同时置位组合语义。其中 `WGPEER_F_UPDATE_ONLY` 尤其值得记住：它保证「若这个公钥对应的 peer 不存在，就什么都不做」，防止把拼错一位的公钥悄悄建成一个新 peer——在缺少中心校验的 WireGuard 里，这类误配极难从日志里发现（配置语义见 04-02）。
+
+**一个定长**：`#define WG_KEY_LEN 32` 规定所有密钥材料都是 32 字节，涵盖接口私钥、接口公钥与 peer 的预共享密钥。这个数字正是 Curve25519 公钥长度与 ChaCha20-Poly1305 对称密钥长度，uapi 层用同一个常量把它们统一起来，用户态编码与内核解码不必各自记忆尺寸（原语尺寸来源见 07-12，字段布局见 05-09）。此外，uapi 头里没有任何 `struct` 定义，只有宏与枚举——这是 YNL 生成头的重要特征：配置数据在运行时以 netlink 属性树表达，不需要一个固定的 C 结构在内核与用户态之间按字节传递。这与 05 册描述的内核内部结构（如 `wg_device`、`wg_peer`）形成对照：后者是内核态的内存表示，前者是跨边界的线上表示，二者不可混用。
+
+### 3. 关键数据结构与源码位置
+
+本篇作为模块介绍，只点名结构与真实路径并给最小片段，逐字段定义交给 05 册，常量与命令全集交给 04 册。先给源码位置速查表。
+
+| 关注点 | 真实源码路径 | 本册处理方式 |
+|---|---|---|
+| 配置契约（命令/属性/标志） | `include/uapi/linux/wireguard.h` | 给最小片段，全集见 04-05、04-06 |
+| 模块构成证据（无 sysfs.o） | `drivers/net/wireguard/Makefile` | 列 `wireguard-y` 清单作证 |
+| 内核 netlink 实现 | `drivers/net/wireguard/netlink.c`、`generated/netlink.c`（本快照未提供） | 只点名，原理见 06-14 |
+| 通用族注册入口 | `drivers/net/wireguard/main.c` 的 `wg_genetlink_init()` | 只点名，模块见 07-01 |
+| 属性落地的内核对象 | `device.c`、`peer.c`、`allowedips.c` | 只点名，字段见 05-02、05-03、05-04 |
+| 用户态配置实现 | `wireguard-tools/src/ipc-linux.h`、`ipc.c`、`config.c` | 只点名，模块见 07-13 |
+
+下面是从 `include/uapi/linux/wireguard.h` 摘出的最小片段，仅用于展示契约的形态；完整常量、标志与枚举取值见 04-06，命令全集见 04-05：
+
+```c
+/* 节选：include/uapi/linux/wireguard.h */
+#define WG_GENL_NAME    "wireguard"
+#define WG_GENL_VERSION 1
+#define WG_KEY_LEN      32
+
+enum wgdevice_attribute {
+    WGDEVICE_A_UNSPEC,
+    WGDEVICE_A_IFINDEX,
+    WGDEVICE_A_IFNAME,
+    WGDEVICE_A_PRIVATE_KEY,
+    WGDEVICE_A_PUBLIC_KEY,
+    WGDEVICE_A_FLAGS,
+    WGDEVICE_A_LISTEN_PORT,
+    WGDEVICE_A_FWMARK,
+    WGDEVICE_A_PEERS,
+    __WGDEVICE_A_LAST
+};
+#define WGDEVICE_A_MAX (__WGDEVICE_A_LAST - 1)
+
+enum wg_cmd {
+    WG_CMD_GET_DEVICE,
+    WG_CMD_SET_DEVICE,
+    __WG_CMD_MAX
+};
+#define WG_CMD_MAX (__WG_CMD_MAX - 1)
+```
+
+读这段片段要抓住三点。第一，`WGDEVICE_A_UNSPEC` 隐式取值 0，`WGDEVICE_A_IFINDEX` 取 1，依次递增；用户态编码时必须 `#include <linux/wireguard.h>` 用符号名，而不是把「监听端口是第 6 号属性」这种数字硬写进代码。第二，`WGDEVICE_A_PEERS` 是嵌套属性的入口，它本身不带标量值，其值是一组 peer 属性；再往里 `WGPEER_A_ALLOWEDIPS` 又是 allowedip 数组的入口，三层就是这样套起来的。第三，`WG_CMD_MAX` 的计算方式是「哨兵减一」，这是 netlink 枚举的通用写法，内核据此分配属性策略数组并校验用户态传入的属性编号是否越界；若用户态发来一个编号大于等于 `WGDEVICE_A_MAX` 的属性，内核会在策略校验阶段拒绝，这正是 uapi 头作为契约的强制力所在。需要再次强调：快照里没有 `sysfs.c`，也没有随附 netlink 实现的 `.c` 源文件，因此本篇不展开任何属性读写回调的函数级细节，那部分以 06-14 为准。
+
+### 4. 关键流程与调用链
+
+配置写入链路从用户敲下命令开始。`wg set wg0 ...` 在 `wireguard-tools/src/config.c` 中把 ini 风格或命令行参数解析成内存中的配置对象，随后 `ipc.c` 提供的 IPC 抽象把它序列化为 netlink 属性；在 Linux 上这个抽象由 `ipc-linux.h` 以 netlink 实现，用 `WG_GENL_NAME` 与 `WG_GENL_VERSION` 打开到 `wireguard` 通用族的套接字，把命令设为 `WG_CMD_SET_DEVICE`，再发送。内核侧收到消息后，由 netlink 层按属性策略校验编号与长度，遍历 device 层的 `WGDEVICE_A_*` 属性：私钥写入接口的静态身份（随后触发 `curve25519_clamp_secret` 与 `curve25519_generate_public`，见 07-12），监听端口写入 socket 绑定，peer 数组逐个更新 peer 状态与 allowedips trie。整个 SET 是同步的，返回即生效，没有守护进程缓存配置，也没有「应用配置」的二次动作（工具模块见 07-13，机制见 06-14）。
+
+配置读取链路方向相反：`wg show wg0` 同样打开通用族套接字，但命令设为 `WG_CMD_GET_DEVICE`。内核遍历指定 device 及其 peer，把 `WGDEVICE_A_PUBLIC_KEY`、`WGDEVICE_A_LISTEN_PORT`、`WGPEER_A_LAST_HANDSHAKE_TIME`、`WGPEER_A_RX_BYTES`、`WGPEER_A_TX_BYTES` 等属性逐一填充回传，wg 工具再渲染成人类可读的段落。这里有个重要区分要落实：`wg show` 输出里的 `transfer` 两行是统计值，来自 peer 的收发计数器，属于 GET 的返回属性；它们不是配置项，不能通过 SET 写入。把统计字段误当配置项，是初读 uapi 头时常见的混淆（字段来源见 05-03）。
+
+一个容易忽略的链路细节是设备的创建与删除根本不经过本通用族。`ip link add wg0 type wireguard` 通过 rtnetlink 触发内核按 `MODULE_ALIAS_RTNL_LINK` 加载模块并走 `wg_newlink` 创建 `net_device`，此时接口还没有私钥、没有 peer，处于「有壳无内容」状态；只有随后的 `wg set` 才通过通用族把密钥与 peer 灌进去。反过来，`ip link del wg0` 由 rtnetlink 触发设备销毁，内核自动回收该设备下的 peer 与 netlink 状态，不需要也不存在「WG_CMD_DEL_DEVICE」。理解这条分工，就能解释为什么 `wg` 工具从不创建接口——它只负责通用族这一半，rtnetlink 那一半由 `ip` 负责（设备生命周期见 07-02）。
+
+下图把配置面的三条通道与 uapi 契约的关系画在一起，并标出本快照缺失的部分。
+
+:::figure id=07-11-01 | name=配置面：uapi 契约、netlink 通道与三层属性树 | dir=TD
+node n1 "wg 工具<br/>set / show" amber
+node n2 "uapi 头<br/>族名 命令 属性 标志" blue
+node n3 "netlink 通用族<br/>wireguard v1" teal
+node n4 "WG_CMD_SET_DEVICE<br/>写入配置" purple
+node n5 "WG_CMD_GET_DEVICE<br/>查询状态" green
+node n6 "device / peer / allowedip<br/>三层嵌套属性" gray
+node n7 "内核状态<br/>wg_device 与 wg_peer" red
+node n8 "rtnetlink<br/>ip link add/del" amber
+edge n1 -> n2 "按契约编码"
+edge n2 -> n3 "族名与版本"
+edge n3 -> n4 "SET"
+edge n3 -> n5 "GET"
+edge n4 -> n6 "嵌套属性"
+edge n5 -> n6 "属性回传"
+edge n6 -> n7 "内核落地"
+edge n7 -> n5 "状态来源"
+edge n8 -> n7 "创建与删除 net_device"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「wg 工具 set/show」按「uapi 头 族名 命令 属性 标志」约定的契约编码，打开「netlink 通用族 wireguard v1」；写入走「WG_CMD_SET_DEVICE 写入配置」，查询走「WG_CMD_GET_DEVICE 查询状态」，两者都操作「device/peer/allowedip 三层嵌套属性」，最终落到「内核状态 wg_device 与 wg_peer」，查询时状态再沿反方向回传；旁路「rtnetlink ip link add/del」只负责创建与删除 net_device，不经过通用族。图中没有 sysfs 节点，因为本快照未提供 sysfs.c。
+
+### 5. 配置/命令/代码实例
+
+下面这组命令同时做三件事：查看 uapi 契约的真实内容、用 wg 工具触发 SET 与 GET 两条命令、验证快照确实没有 sysfs.c。所有路径相对快照根目录。
+
+```bash
+# 查看 uapi 契约中的族标识、device 属性与命令枚举
+grep -n 'WG_GENL_\|WGDEVICE_A_\|WG_CMD_' include/uapi/linux/wireguard.h
+
+# 用 wg 工具触发 SET：设备级与 peer 级各一条
+wg set wg0 private-key ./privatekey listen-port 51820
+wg set wg0 peer <对端公钥> allowed-ips 10.0.0.2/32
+
+# 用 GET 取回状态
+wg show wg0
+
+# 核实本快照是否提供 sysfs.c
+find drivers/net/wireguard -name 'sysfs.c'
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+$ grep -n 'WG_GENL_\|WGDEVICE_A_\|WG_CMD_' include/uapi/linux/wireguard.h
+10:#define WG_GENL_NAME    "wireguard"
+11:#define WG_GENL_VERSION 1
+29:enum wgdevice_attribute {
+33:    WGDEVICE_A_PRIVATE_KEY,
+36:    WGDEVICE_A_LISTEN_PORT,
+38:    WGDEVICE_A_PEERS,
+42:#define WGDEVICE_A_MAX (__WGDEVICE_A_LAST - 1)
+72:enum wg_cmd {
+73:    WG_CMD_GET_DEVICE,
+74:    WG_CMD_SET_DEVICE,
+78:#define WG_CMD_MAX (__WG_CMD_MAX - 1)
+$ find drivers/net/wireguard -name 'sysfs.c'
+（无输出）
+```
+
+逐行判读如下。第 10 行 `WG_GENL_NAME "wireguard"` 是通用族的族名，wg 工具打开 netlink 套接字时用它做族查找，名字写错会得到「族不存在」而非配置错误，排查时先确认这一行。第 11 行 `WG_GENL_VERSION 1` 是族版本，目前恒为 1，它和 uapi 头的生成规范绑定，用户态工具与内核必须一致，否则族协商失败。第 29 行标志 `enum wgdevice_attribute` 的开始，其首个成员 `WGDEVICE_A_UNSPEC` 隐式取 0，这是 netlink 属性枚举的标准起点，后续成员从 1 递增，因此第 33 行私钥属性是 4 号、第 36 行监听端口是 6 号——注意这是枚举顺序推出的编号，实务中应引用符号而非硬写数字。第 38 行 `WGDEVICE_A_PEERS` 是三个属性层级的连接点，它的值不是标量而是一组 peer 属性，SET 时嵌套的 peer 就挂在这里。第 42 行用 `__WGDEVICE_A_LAST - 1` 计算 `WGDEVICE_A_MAX`，内核属性策略据此校验上界，超过该编号的属性在到达业务逻辑前就被拒绝，这正是 uapi 契约的强制边界。第 72 至 78 行是命令枚举：`WG_CMD_GET_DEVICE` 为 0、`WG_CMD_SET_DEVICE` 为 1，`WG_CMD_MAX` 由哨兵减一得到 1，说明整个配置面只有这两条命令，peer 的增删改都通过 SET 加标志表达。最末 `find` 无输出，直接证明本快照 `drivers/net/wireguard/` 下不存在 `sysfs.c`，与 Makefile 的 `wireguard-y` 清单一致，因此任何基于 sysfs 属性的配置写法在本快照都不成立。把这两组命令的结论合起来看：契约在头文件、通道在通用族、落地在 device/peer，而 sysfs 这一路是空的（属性字段见 05-09，常量全集见 04-06）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱就是本篇开头反复强调的：以为 WireGuard Linux 一定有 sysfs 接口。就本快照而言，grep 无匹配、Makefile 无 sysfs.o、`find` 无结果，三重证据一致；遇到要求「从 /sys 下某属性读密钥」的说法，先让用户给出确切路径，多半来自别的版本或臆测（接口全集见 04-07，但该册同样应以实际版本为准）。第二个陷阱是把 uapi 枚举值当稳定数字硬编码。枚举号由头文件与 YAML 规范共同决定，salvage 旧代码时若看到把属性编号写成字面量的做法，应改为包含 `<linux/wireguard.h>` 后用符号名，否则一次规范演进就可能写错字段。
+
+第三个陷阱是把 GET 与 SET 想象成需要握手或会话的两次独立事务。配置面没有守护进程、没有协商、没有证书；SET 消息返回即生效，GET 只是把当前内核状态渲染出来。第四个陷阱是把 `wg show` 里的统计字段当成可配置项：`WGPEER_A_RX_BYTES`、`WGPEER_A_TX_BYTES`、`WGPEER_A_LAST_HANDSHAKE_TIME` 都是只读的运行状态，由数据面在收发包与握手时更新，SET 写入它们没有意义（字段见 05-03）。第五个陷阱是把 uapi 头当成跨进程的结构体定义：头里没有任何 `struct`，配置以属性树传递；拿它去做 `sizeof` 或结构体对齐计算是方向性错误。第六个陷阱是直接手改生成的 uapi 头。顶部的 `auto-generated` 注释意味着正确做法是修改 YAML 规范再运行 YNL 重新生成，直接改头文件会在下次生成时被覆盖（具体生成流程需对照实际内核版本核验）。
+
+最佳实践可以归纳为四条。其一，用符号而非数字：用户态代码一律包含 uapi 头，用 `WG_CMD_*`、`WGDEVICE_A_*` 等符号编码，避免编号漂移。其二，用标志位表达精确语义：批量替换 peer 时置 `WGDEVICE_F_REPLACE_PEERS`，只想更新既有 peer 时置 `WGPEER_F_UPDATE_ONLY`，删除时置对应的 `REMOVE_ME`，这比「先删后建」更安全，也避免中间态。其三，改完即查：每次 `wg set` 后用 `wg show` 的 `latest handshake` 与 `transfer` 两行确认配置落到了正确的 peer 上；若握手长期不建立，优先核对公钥与 endpoint，而不是怀疑 netlink 通道（排障见 08-03）。其四，控制面集成优先使用 YNL 生成的绑定，而不是手写 netlink 属性编码——属性树的嵌套与长度校验容易出错，生成代码把这些细节封装好了（模块见 07-13）。最后提醒一次口径：本快照缺少 netlink 实现源文件，本篇对配置语义的推断均基于 uapi 契约与 Makefile 证据；若要验证内核侧的具体回调与策略，请以包含 `netlink.c` 与 `generated/` 目录的完整内核源码为准。
+
+### 7. 小结与延伸阅读
+
+本篇把 07-11 定位为「配置接口的契约模块」而不是某个具体文件：本快照没有 sysfs.c，也没有 ethtool 私有操作，配置完全经 netlink 通用族 `wireguard`（版本 1）完成，契约写在 `include/uapi/linux/wireguard.h`。这个契约由 `WG_GENL_NAME`/`WG_GENL_VERSION` 定义身份，由 `wg_cmd` 的两条命令 GET/SET 定义操作，由 `wgdevice_attribute`/`wgpeer_attribute`/`wgallowedip_attribute` 三层枚举定义一棵可嵌套的属性树，由 `wgdevice_flag`/`wgpeer_flag`/`wgallowedip_flag` 三组位掩码定义替换、删除与仅更新语义，并由 `WG_KEY_LEN 32` 统一密钥尺寸。头文件由 YAML 规范经 YNL 生成，这一版本特征既解释了为什么头里没有 `struct`，也解释了为什么不应手改生成结果。配置写入走 SET、读取走 GET，设备的创建删除则归 rtnetlink，三者在 `wg set`、`wg show`、`ip link add/del` 三条命令上各司其职。
+
+延伸阅读建议按三条线走：想核对契约原文，直接读 `include/uapi/linux/wireguard.h`，并用 `drivers/net/wireguard/Makefile` 验证模块构成；想看命令、常量与标志的完整清单，去 04-05 与 04-06，想看 sysfs/ethtool 接口全集则去 04-07（注意以实际版本为准）；想理解 netlink 消息如何解析、属性如何映射到内核状态，去 06-14，并参照 06-01 的初始化链路了解 `wg_genetlink_init()` 的注册时机。结构字段去 05-09 与 05-02、05-03，用户态工具如何消费这份契约去 07-13。跨册随查按（字段见 05-09 ｜ 参数见 04-06 ｜ 原理见 06-14 ｜ 模块见 07-13）执行：结构体逐字段去 05、参数与命令全集去 04、机制与调用链去 06、目录级模块能力去 07。凡本篇标注「需对照实际版本核验」之处，均以 `_wglinux_build/upstream_src/` 下对应文件为准，本套资料不编造未核验的路径、属性名与取值。
+
+## 07-12 src/crypto 加密原语模块族
+
+### 1. 背景与动机
+
+WireGuard 协议最鲜明的设计决定之一，是把密码套件固定下来 rather than 让两端协商：对称加密与认证固定为 ChaCha20-Poly1305，密钥交换固定为 Curve25519，哈希与密钥派生固定为 BLAKE2s。协议名 `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` 本身就把这三样写进了身份标识——在 `drivers/net/wireguard/noise.c` 第 28 行，这个 37 字节的字符串被定义为 `handshake_name`，参与初始 chaining key 与 handshake hash 的计算。固定套件的直接后果是代码面极小、可审计性强，代价是失去协商弹性：任何合规实现都必须逐字节兼容，不能换成 AES-GCM 或别的曲线。这解释了为什么本册要把加密原语作为「模块族」单独介绍——它们不是可替换的配置项，而是协议的组成部分（套件在消息格式中的落点见 06-04）。
+
+在 Linux 内核里，这些原语的实现位于 `lib/crypto/`，但要先厘清一个极易混淆的概念：它们属于内核的 **crypto library（加密库）**，而不是通常说的 **Crypto API 算法实现**。两者的差别不在算法本身，而在调用形态。Crypto API 的典型用法是分配一个 `struct crypto_aead` 或 `struct crypto_shash` 变换对象，设置密钥，再通过异步或同步接口提交请求，过程中涉及变换分配、算法查找、可能还有硬件加速驱动；crypto library 则把算法实现为可直接调用的普通函数，如 `curve25519()`、`blake2s()`、`chacha_crypt()`，没有对象分配、没有算法查找、没有回调，调用点就是一次普通的函数调用。WireGuard 选择后者，是为了在每包路径上避免额外开销并保持行为确定。这一选择在 Kconfig 里有直接证据：`drivers/net/Kconfig` 的 `config WIREGUARD` 段用 `select CRYPTO_LIB_CURVE25519`、`select CRYPTO_LIB_CHACHA20POLY1305`、`select CRYPTO_LIB_UTILS` 拉入库实现；同一文件里出现的 `CRYPTO`、`CRYPTO_AES`、`CRYPTO_GCM` 等开关属于其他配置项的依赖，不能据此推断 WireGuard 走 Crypto API 算法框架（需对照实际版本核验）。
+
+关于快照边界也必须如实说明。本快照的 `lib/crypto/` 只提供五个实现文件：`chacha.c`、`poly1305.c`、`curve25519.c`、`blake2s.c`、`siphash.c`。驱动大量调用的 AEAD 胶水层实现 `chacha20poly1305.c` 并未随快照提供，crypto 头文件 `include/crypto/*.h` 与 `include/linux/siphash.h` 也未收录——它们在源码中以 `#include <crypto/...>`、`#include <linux/siphash.h>` 的形式被引用。因此本篇的写法是：以这五个 `.c` 文件为「逐函数核实」的事实基础，结合驱动侧真实调用点（noise.c、send.c、receive.c、cookie.c、ratelimiter.c、peerlookup.h、messages.h）说明用途与关系；对未随快照提供、只能从调用点推断的部分明确标注，不臆造其源码细节。这种「实现在库、调用在驱动」的分层，正是 07 册作为模块权威源要交代清楚的东西。
+
+### 2. 核心概念
+
+五个原语模块可以按「在协议里的角色」逐一理解。
+
+**ChaCha20 流加密（`lib/crypto/chacha.c`）**：实现 RFC7539 的 ChaCha 流密码。核心通用实现是 `chacha_crypt_generic()`，它把明文按 `CHACHA_BLOCK_SIZE` 分块，逐块调用 `chacha_block_generic()` 生成密钥流，再用 `crypto_xor_cpy()` 与输入异或；密钥流缓冲区用 `__aligned(sizeof(long))` 对齐，便于异或路径按机器字处理。另一个导出函数 `hchacha_block()` 提供 HChaCha20 原语，供 XChaCha20 构造子密钥使用。文件通过 `CONFIG_CRYPTO_LIB_CHACHA_ARCH` 在编译期选择架构优化实现与通用实现，未定义架构优化时把 `chacha_crypt_arch` 直接映射为通用函数。两个函数都以 `EXPORT_SYMBOL_GPL` 导出，供 GPL 兼容模块调用。在 WireGuard 中，ChaCha20 承担数据面与握手消息的对称加密，是 ChaCha20-Poly1305 AEAD 的加密半边（调用见 07-05、07-07、07-08）。
+
+**Poly1305 认证（`lib/crypto/poly1305.c`）**：实现 RFC7539 的 Poly1305 消息认证码。三个导出函数构成典型流式接口：`poly1305_init()` 把 32 字节密钥的后 16 字节解成 `s[0..3]` 作为一次性填充，并调用 `poly1305_block_init()` 初始化状态；`poly1305_update()` 处理整块与尾块，整块走 `poly1305_blocks()`，不足一块的字节暂存于 `desc->buf`；`poly1305_final()` 对尾部按规则补 1 与 0 后做最后一轮，再用 `poly1305_emit()` 输出 16 字节标签，并以 `memzero_explicit()` 清空描述符。文件同样用 `CONFIG_CRYPTO_LIB_POLY1305_ARCH` 切换架构优化与通用实现。在 WireGuard 中，Poly1305 是 AEAD 的认证半边：接收路径验证标签后才认为明文可信，`receive.c` 中那句「已经验证过 Poly1305 认证标签」的注释正是这个意思（原理见 06-06）。
+
+**Curve25519（`lib/crypto/curve25519.c`）**：实现 X25519 风格的 ECDH 密钥交换。文件顶部定义两个常量点：`curve25519_null_point` 全零、`curve25519_base_point` 首字节为 9 的基点。导出函数 `curve25519()` 以 secret 与 basepoint 计算 `mypublic`，并用 `crypto_memneq()` 做恒定时间的全零检查后返回布尔值——注意这个函数带 `__must_check` 属性，调用者若忽略返回值编译器会告警，因为「结果为全零」意味着低阶点攻击，必须当作错误处理。另一个导出函数 `curve25519_generate_public()` 先用 `crypto_memneq()` 检查私钥不是全零，再经 `curve25519_base_arch()` 用基点派生公钥并再次检查输出。私钥钳位（`curve25519_clamp_secret()`）与随机数生成（`curve25519_generate_secret()`）由头文件提供，实现不在本 `.c` 文件中。本文件同样有 `CONFIG_CRYPTO_LIB_CURVE25519_ARCH` 架构开关，模块许可声明为 `GPL v2`、作者为 Jason A. Donenfeld。WireGuard 用它做静态-静态、临时-静态等所有 ECDH 计算（原理见 06-02、06-03）。
+
+**BLAKE2s（`lib/crypto/blake2s.c`）**：实现 BLAKE2s 哈希与 PRF。文件内 `blake2s_sigma[10][16]` 是十轮置换表，`blake2s_compress_generic()` 把消息块装入 `m[16]`、把链状态装入 `v[16]`，随后用宏 `G()` 展开十轮混合，并通过 `unrolled_full` 展开循环以利于常量折叠；计数器用 `blake2s_increment_counter()` 处理 64 位进位。导出接口是 `blake2s_update()`（增量喂数据）与 `blake2s_final()`（设置末块标志、补零、压缩、按小端输出并调用 `blake2s_zeroize_ctx()` 清零上下文）；一次性接口 `blake2s()`、初始化接口 `blake2s_init()` 与带密钥的 `blake2s_init_key()` 由头文件提供。WireGuard 对 BLAKE2s 的使用远不止「算哈希」：`noise.c` 的 `hmac()` 用 BLAKE2s 按 0x36/0x5c 异或构造 HMAC，`kdf()` 在这个 HMAC 上实现 HKDF 的 extract 与 expand（0x1/0x2/0x3 三个标签），`mix_hash()` 用它滚动握手哈希，`cookie.c` 用带密钥的 BLAKE2s 计算 mac1/mac2。可以说 BLAKE2s 是握手的「胶水原语」，握手的每一个状态推进都要经过它（密钥派生见 06-03）。
+
+**SipHash（`lib/crypto/siphash.c`）**：实现 SipHash 短输入 PRF，文件注释明确区分两种用途：SipHash2-4 作为安全 PRF，HalfSipHash1-3 / SipHash1-3 只作为「不安全 PRF，仅适合哈希表」。实现用 `PREAMBLE`/`POSTAMBLE` 宏封装四字状态 `v0..v3` 的初始化与收尾，`SIPROUND` 映射到架构提供的 `SIPHASH_PERMUTATION`；导出函数分两组，64 位的 `siphash_1u64()` 到 `siphash_4u64()`、`siphash_1u32()`、`siphash_3u32()`，以及 32 位的 `hsiphash_1u32()` 到 `hsiphash_4u32()`；`__siphash_aligned()` 与 `__siphash_unaligned()` 分别处理对齐与非对齐内存，`CONFIG_DCACHE_WORD_ACCESS` 与 `CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS` 决定走哪条快速路径。SipHash 不在协议名里、不上报文，是纯实现细节：WireGuard 用它给哈希表分桶，防止攻击者通过构造大量公钥或源地址制造哈希碰撞式拒绝服务（限速原理见 06-10）。
+
+把五个原语与协议名对起来看会得到一个清晰结论：`25519` 对应 Curve25519，`ChaChaPoly` 对应 ChaCha20 加 Poly1305，`BLAKE2s` 对应 BLAKE2s；SipHash 不在其中，因为它只服务于内核内部数据结构，不参与线上字节。原语的固定尺寸还会穿透到报文布局：`messages.h` 把 `NOISE_PUBLIC_KEY_LEN` 定义为 `CURVE25519_KEY_SIZE`、`NOISE_SYMMETRIC_KEY_LEN` 定义为 `CHACHA20POLY1305_KEY_SIZE`、`NOISE_AUTHTAG_LEN` 定义为 `CHACHA20POLY1305_AUTHTAG_SIZE`、`NOISE_HASH_LEN` 定义为 `BLAKE2S_HASH_SIZE`，这意味着改原语实现不能改变这些尺寸，否则报文格式随之改变、与所有其他实现失去互通（字段见 05-09，消息格式见 06-04）。
+
+### 3. 关键数据结构与源码位置
+
+作为模块族介绍，本节按「实现文件—核心函数—驱动调用点—本册处理」四列给出地图，逐字段上下文交给 05-09，参数与常量交给 04-06。
+
+| 原语模块 | 真实源码路径 | 核心导出函数 | 在 WireGuard 中的调用点 |
+|---|---|---|---|
+| ChaCha20 流加密 | `lib/crypto/chacha.c` | `chacha_crypt()`、`hchacha_block()` | `noise.c`、`send.c`、`cookie.c` 经 AEAD 胶水间接调用 |
+| Poly1305 认证 | `lib/crypto/poly1305.c` | `poly1305_init/update/final()` | 经 `chacha20poly1305_*` 胶水在 `send.c`、`receive.c` 调用 |
+| Curve25519 ECDH | `lib/crypto/curve25519.c` | `curve25519()`、`curve25519_generate_public()` | `noise.c` 的 `wg_noise_precompute_static_static()`、`mix_dh()` |
+| BLAKE2s 哈希/PRF | `lib/crypto/blake2s.c` | `blake2s_update()`、`blake2s_final()` | `noise.c` 的 `hmac()`、`kdf()`、`mix_hash()`，`cookie.c` |
+| SipHash 哈希表 PRF | `lib/crypto/siphash.c` | `siphash_*`、`hsiphash_*` | `peerlookup.h`、`ratelimiter.c` |
+| 尺寸桥接常量 | `drivers/net/wireguard/messages.h` | `NOISE_*_LEN`、`COOKIE_NONCE_LEN` |  defining 握手与数据报文布局 |
+
+下面是从两个原语文件摘出的最小片段，用来展示库函数的调用形态与导出方式；完整实现请直接读源码。
+
+```c
+/* 节选一：lib/crypto/chacha.c —— 直接调用的流加密库函数 */
+void chacha_crypt(struct chacha_state *state, u8 *dst, const u8 *src,
+                  size_t bytes, int nrounds)
+{
+    chacha_crypt_arch(state, dst, src, bytes, nrounds);
+}
+EXPORT_SYMBOL_GPL(chacha_crypt);
+
+void hchacha_block(const struct chacha_state *state,
+                   u32 out[HCHACHA_OUT_WORDS], int nrounds)
+{
+    hchacha_block_arch(state, out, nrounds);
+}
+EXPORT_SYMBOL_GPL(hchacha_block);
+
+/* 节选二：lib/crypto/curve25519.c —— ECDH 与恒定时间零值检查 */
+bool __must_check
+curve25519(u8 mypublic[CURVE25519_KEY_SIZE],
+           const u8 secret[CURVE25519_KEY_SIZE],
+           const u8 basepoint[CURVE25519_KEY_SIZE])
+{
+    curve25519_arch(mypublic, secret, basepoint);
+    return crypto_memneq(mypublic, curve25519_null_point,
+                         CURVE25519_KEY_SIZE);
+}
+EXPORT_SYMBOL(curve25519);
+```
+
+这段片段说明了库 API 的三个共同特征。其一，函数签名直接暴露算法参数：`chacha_crypt()` 收状态指针、目标、源、字节数与轮数，`curve25519()` 收输出、私钥与基点，调用者看得见自己在做什么，这与 Crypto API 里「分配变换—设置密钥—提交请求」的间接风格截然不同。其二，`EXPORT_SYMBOL` 与 `EXPORT_SYMBOL_GPL` 决定可见范围：Curve25519、BLAKE2s、Poly1305、SipHash 用前者，ChaCha 用后者，WireGuard 模块本身是 GPLv2，两种都能链接。其三，每个文件都有形如 `CONFIG_CRYPTO_LIB_*_ARCH` 的编译期开关：开启时包含 `$(SRCARCH)` 目录下的架构头，把 `*_arch` 函数替换为优化实现；未开启时 `*_arch` 宏映射回 `*_generic`。因此「源码里读到的通用实现」与「目标机器上实际执行的指令」未必相同，性能结论一律需在目标机型实测（基准见 08-01、调优见 08-02）。
+
+### 4. 关键流程与调用链
+
+**握手链路**是原语调用最密集的地方。`wg_noise_init()` 用 `blake2s()` 把 `handshake_name` 哈希成初始 chaining key，再用 `blake2s_init/update/final()` 把 chaining key 与 `identifier_name` 混成初始 handshake hash，两都标记为 `__ro_after_init`；设置接口私钥时，`wg_noise_set_static_identity_private_key()` 先 `curve25519_clamp_secret()` 再 `curve25519_generate_public()` 派生公钥。发起握手时，`curve25519_generate_secret()` 生成临时私钥、`curve25519_generate_public()` 派生临时公钥；`mix_dh()` 调 `curve25519()` 做 ECDH 并把结果送进 `kdf()`，`mix_hash()` 用 BLAKE2s 滚动哈希，`mix_psk()` 把预共享密钥经 KDF 混入。KDF 本身是「BLAKE2s 上的 HMAC 上的 HKDF」：先 `hmac(secret, data, chaining_key, ...)` 提取熵，再用标签 0x1、0x2、0x3 逐步展开出 chaining key 与对称密钥，`derive_keys()` 由此得到收发两路密钥并打上时间戳。握手消息的加解密由 `message_encrypt()` / `message_decrypt()` 完成，它们调 `chacha20poly1305_encrypt/decrypt()`，把 handshake hash 作为附加认证数据、nonce 固定为 0（源码注释明确写着 Always zero for Noise_IK），随后用 `mix_hash()` 把密文滚入哈希（状态机见 06-02，派生时序见 06-03）。
+
+**数据链路**追求每包效率。`send.c` 调用 `chacha20poly1305_encrypt_sg_inplace()`，直接在 `sk_buff` 的 scatter-gather 缓冲区原地加密，避免复制；`receive.c` 调 `chacha20poly1305_decrypt_sg_inplace()` 原地解密，并在注释里指出 Poly1305 标签已经验证过，所以后续可以信任明文长度与内容。这里的 `sg_inplace` 变体是库 API 面向网络栈的关键适配：数据面不构造 AEAD 对象，只对现有缓冲区做变换（发送见 07-07、接收见 07-08）。
+
+**cookie 链路**混合使用 BLAKE2s 与 XChaCha20-Poly1305。`cookie.c` 用带密钥的 `blake2s_init_key()` 对源 IP 与 UDP 源端口计算 mac1，用 `blake2s()` 直接计算 mac2，用于 DoS 防护下的来源验证；真正的 cookie 载荷则用 `xchacha20poly1305_encrypt/decrypt()` 加解密，nonce 长度取 `COOKIE_NONCE_LEN`，其值为 `XCHACHA20POLY1305_NONCE_SIZE`。XChaCha20 的 24 字节 nonce 让随机 nonce 可以直接放在报文里而不必担心重用，这正是 HChaCha20（`hchacha_block()`）在库里的用武之地（cookie 机制见 06-09）。
+
+**哈希表链路**体现 SipHash 的用途。`peerlookup.h` 的 `struct pubkey_hashtable` 里有一把 `siphash_key_t key` 与一个 11 位哈希表，公钥查 peer 时以随机密钥做 SipHash 再取模分桶；`ratelimiter.c` 有静态 `hsiphash_key_t key`，把网络命名空间字与 IP 地址用 `hsiphash_2u32()`（IPv4）或 `hsiphash_3u32()`（IPv6）散列到限速桶索引。密钥随机化使攻击者无法预知分桶，避免构造碰撞把某个桶打满（限速原理见 06-10）。
+
+下图把五个原语、AEAD 组合、派生环节与 WireGuard 数据面的关系收拢到一张图里。
+
+:::figure id=07-12-01 | name=五种加密原语与 WireGuard 用途映射 | dir=TD
+node p1 "ChaCha20<br/>chacha.c" red
+node p2 "Poly1305<br/>poly1305.c" red
+node p3 "AEAD<br/>ChaCha20-Poly1305" purple
+node p4 "Curve25519<br/>curve25519.c" teal
+node p5 "BLAKE2s<br/>blake2s.c" blue
+node p6 "HMAC 与 HKDF<br/>密钥派生" green
+node p7 "SipHash<br/>siphash.c" amber
+node p8 "哈希表分桶<br/>peer 与限速" gray
+node p9 "WireGuard 数据面<br/>noise send receive" blue
+edge p1 -> p3 "加密半边"
+edge p2 -> p3 "认证半边"
+edge p3 -> p9 "握手与数据加密"
+edge p4 -> p9 "ECDH 密钥交换"
+edge p5 -> p6 "哈希原语"
+edge p6 -> p9 "派生会话密钥"
+edge p7 -> p8 "随机密钥散列"
+edge p8 -> p9 "查表与限速"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「ChaCha20 chacha.c」提供加密半边、「Poly1305 poly1305.c」提供认证半边，二者组成「AEAD ChaCha20-Poly1305」用于「WireGuard 数据面 noise send receive」的握手与数据加密；「Curve25519 curve25519.c」直接为数据面提供 ECDH 密钥交换；「BLAKE2s blake2s.c」支撑「HMAC 与 HKDF 密钥派生」，派生结果进入数据面；「SipHash siphash.c」以随机密钥做散列，服务「哈希表分桶 peer 与限速」，最终也汇入数据面的查表与限速环节。
+
+### 5. 配置/命令/代码实例
+
+原语模块没有自己的配置命令——它们是库函数，由 Kconfig 选择、被驱动直接调用。下面这组命令用于在本快照里核实「有哪些原语实现、驱动在哪些位置调用它们」。
+
+```bash
+# 列出快照提供的原语实现文件
+ls lib/crypto/
+
+# 查看消息头如何把原语尺寸桥接到报文常量
+grep -n 'include <crypto/\|NOISE_.*_LEN\|COOKIE_NONCE_LEN' drivers/net/wireguard/messages.h
+
+# 查看 SipHash 在限速模块中的调用点
+grep -n 'hsiphash\|siphash' drivers/net/wireguard/ratelimiter.c drivers/net/wireguard/peerlookup.h
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+$ ls lib/crypto/
+blake2s.c  chacha.c  curve25519.c  poly1305.c  siphash.c
+$ grep -n 'include <crypto/\|NOISE_.*_LEN\|COOKIE_NONCE_LEN' drivers/net/wireguard/messages.h
+9:#include <crypto/curve25519.h>
+10:#include <crypto/chacha20poly1305.h>
+11:#include <crypto/blake2s.h>
+18:    NOISE_PUBLIC_KEY_LEN = CURVE25519_KEY_SIZE,
+19:    NOISE_SYMMETRIC_KEY_LEN = CHACHA20POLY1305_KEY_SIZE,
+21:    NOISE_AUTHTAG_LEN = CHACHA20POLY1305_AUTHTAG_SIZE,
+22:    NOISE_HASH_LEN = BLAKE2S_HASH_SIZE,
+30:    COOKIE_NONCE_LEN = XCHACHA20POLY1305_NONCE_SIZE,
+$ grep -n 'hsiphash\|siphash' drivers/net/wireguard/ratelimiter.c drivers/net/wireguard/peerlookup.h
+ratelimiter.c:7:#include <linux/siphash.h>
+ratelimiter.c:13:static hsiphash_key_t key;
+ratelimiter.c:97:    bucket = &table_v4[hsiphash_2u32(net_word, ip, &key) &
+ratelimiter.c:104:    bucket = &table_v6[hsiphash_3u32(net_word, ip >> 32, ip, &key) &
+peerlookup.h:13:#include <linux/siphash.h>
+peerlookup.h:20:    siphash_key_t key;
+```
+
+逐行判读如下。`ls` 一行列出五个文件，正是本快照 `lib/crypto/` 的全部内容：没有 `chacha20poly1305.c`，说明 AEAD 胶水层未随快照提供，但驱动确实通过 `chacha20poly1305_*` 调用它，这是快照边界而非「WireGuard 不用 AEAD」的证据。`messages.h` 第 9 至 11 行分别包含 `crypto/curve25519.h`、`crypto/chacha20poly1305.h`、`crypto/blake2s.h`，这三个头文件也不在本快照内，属于内核标准 include 路径，它们声明了原语的尺寸常量与一次性接口（如 `blake2s()`、`curve25519_generate_secret()`），这也解释了为什么五个 `.c` 文件里的导出函数并不是原语 API 的全部。第 18 行 `NOISE_PUBLIC_KEY_LEN = CURVE25519_KEY_SIZE` 把公钥长度锚定到曲线实现，对应 uapi 的 `WG_KEY_LEN 32`；第 19 行对称密钥长度锚定到 `CHACHA20POLY1305_KEY_SIZE`，决定 AEAD 密钥为 32 字节；第 21 行认证标签长度取 `CHACHA20POLY1305_AUTHTAG_SIZE`，即 Poly1305 的 16 字节输出，直接决定每条报文的开销；第 22 行握手哈希长度取 `BLAKE2S_HASH_SIZE`，即 BLAKE2s 的 32 字节摘要，HKDF 的所有中间值都是这个尺寸；第 30 行 cookie nonce 取 XChaCha20 的 nonce 尺寸，与 HChaCha20 子密钥构造配套。`ratelimiter.c` 第 13 行的静态 `hsiphash_key_t key` 是全局随机密钥，第 97、104 行分别用 `hsiphash_2u32()` 与 `hsiphash_3u32()` 把 IPv4 与 IPv6 的五元组信息散列成桶索引；`peerlookup.h` 第 20 行的 `siphash_key_t key` 则服务于公钥哈希表。两组调用都用 32 位 `hsiphash_*` 而非 64 位 `siphash_*`，与其「哈希表用途、非安全 PRF」的定位一致，印证了文件注释里的定义（原语尺寸字段见 05-09，常量全集见 04-06）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把 `lib/crypto/` 当成 Crypto API 的算法实现集合。这里没有 `crypto_aead_alloc()`、没有 `struct shash_desc`、没有算法名字符串查找；它是可直接链接的函数库。据此推断 WireGuard 会在运行时动态切换算法是错误的——套件固定，库函数在编译期由 Kconfig 与架构开关决定。第二个陷阱是把 AEAD 胶水层的缺席误读为「快照里没有 AEAD」。快照确实没有 `chacha20poly1305.c`，但 `messages.h` 的包含、`noise.c` 的 `chacha20poly1305_encrypt/decrypt()`、`send.c`/`receive.c` 的 `sg_inplace` 变体、`cookie.c` 的 `xchacha20poly1305_encrypt/decrypt()` 都证明 AEAD 在调用层面真实存在；描述未提供的实现时标注即可，不要臆造其函数体。第三个陷阱是以为原语可配置替换。协议名固定了 ChaChaPoly 与 BLAKE2s，换成 AES-GCM 或其他哈希会破坏与所有标准实现的互通（互通边界见 01-02）。
+
+第四个陷阱是忽略架构优化开关。`CONFIG_CRYPTO_LIB_CHACHA_ARCH`、`CONFIG_CRYPTO_LIB_POLY1305_ARCH`、`CONFIG_CRYPTO_LIB_BLAKE2S_ARCH`、`CONFIG_CRYPTO_LIB_CURVE25519_ARCH` 会把通用实现替换为架构专用版本，阅读源码得到的「通用路径」未必是实际执行路径；调性能或复现问题时先确认目标内核打开了哪些开关。第五个陷阱是把敏感数据清零当成可有可无。`poly1305_final()` 用 `memzero_explicit()`、`blake2s_final()` 用 `blake2s_zeroize_ctx()`、`curve25519()` 用 `crypto_memneq()` 做恒定时间比较，这些写法都是为了对抗编译器优化与侧信道；改成普通 `memset` 或 `memcmp` 会引入真实安全风险。第六个陷阱是误用 SipHash 的安全等级：`hsiphash_*` 系列按文件注释只是「不安全 PRF，仅适合哈希表」，不能拿来当报文认证码；WireGuard 的报文认证用 BLAKE2s（mac1/mac2）与 Poly1305（AEAD），分工不能颠倒。
+
+最佳实践可归纳为四条。其一，审计从 `messages.h` 的尺寸常量入手：`NOISE_*_LEN` 是原语与报文布局的接口，确认它们与 uapi 的 `WG_KEY_LEN 32` 一致，就能快速发现尺寸层面的错配。其二，关注 Kconfig 依赖：`select CRYPTO_LIB_*` 是这些模块被编进内核的原因，构建问题先查这里（构建配置见 02-02）。其三，把「原语实现」与「原语调用」分开读：想知道算法怎么算就读 `lib/crypto/*.c`，想知道在 WireGuard 里怎么用就读 `noise.c`、`send.c`、`receive.c`、`cookie.c`、`ratelimiter.c`，两者通过导出符号连接。其四，性能与侧信道结论都要在目标机型实测与审计，本册不给绝对数字（基准见 08-01，安全加固见 08-05）。Selftest 目录可用于验证握手与包处理链路，但依赖完整源码树（调试构建见 02-05）。
+
+### 7. 小结与延伸阅读
+
+本篇把 07-12 定位为「加密原语模块族」：本快照 `lib/crypto/` 提供五个实现文件——`chacha.c` 的 ChaCha20 流加密、`poly1305.c` 的 Poly1305 认证、`curve25519.c` 的 ECDH、`blake2s.c` 的哈希与 PRF、`siphash.c` 的哈希表 PRF；它们属于内核 crypto library，以 `EXPORT_SYMBOL`/`EXPORT_SYMBOL_GPL` 导出普通函数供驱动直接调用，与需要分配变换对象的 Crypto API 算法实现不是一回事。五个原语在 WireGuard 中分别承担 ChaCha20-Poly1305 AEAD 的加密与认证半边、Noise_IK 的 ECDH、HMAC/HKDF 与握手哈希、以及 peer 与限速哈希表的抗碰撞分桶；协议名 `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` 点明了前三者的角色，而 SipHash 是纯实现细节、不上报文。`messages.h` 用 `NOISE_PUBLIC_KEY_LEN`、`NOISE_SYMMETRIC_KEY_LEN`、`NOISE_AUTHTAG_LEN`、`NOISE_HASH_LEN` 把原语尺寸桥接到报文布局，任何改变都会影响互通。快照缺少 `chacha20poly1305.c` 与相关头文件，本篇已如实标注，未编造其实现细节。
+
+延伸阅读建议按三条线走：想核对实现，逐函数读 `lib/crypto/` 下五个 `.c` 文件，并注意 `CONFIG_CRYPTO_LIB_*_ARCH` 开关；想看驱动如何调用，读 `noise.c` 的 `wg_noise_init()`、`hmac()`、`kdf()`、`mix_dh()`、`message_encrypt()`，以及 `send.c`、`receive.c`、`cookie.c`、`ratelimiter.c`、`peerlookup.h`；想看原语尺寸如何进入报文，读 `messages.h` 与 06-04。机制层面，握手状态机见 06-02、密钥派生见 06-03、cookie 见 06-09、限速见 06-10。跨册随查按（字段见 05-09 ｜ 参数见 04-06 ｜ 原理见 06-03 ｜ 模块见 07-05）执行：结构体逐字段去 05、参数与常量全集去 04、机制与调用链去 06、目录级模块能力去 07。凡本篇标注「需对照实际版本核验」或者指明快照缺失之处，均以 `_wglinux_build/upstream_src/` 下对应文件为准，本套资料不编造未核验的路径、函数体与取值。

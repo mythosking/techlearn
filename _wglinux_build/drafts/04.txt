@@ -1,0 +1,1351 @@
+# WireGuard Linux 技术资料 · 04 参数与 API 手册
+
+## 04-01 wg 命令行参数全集
+
+### 1. 背景与动机
+
+本册是整套 WireGuard Linux 资料中「参数、命令、常量」的唯一权威源，而本篇 04-01 又是 wg 这个用户态命令的权威清单。之所以把参数单独立成一册，是因为其他各册在讲到配置时都会用到 `wg show`、`wg set`、`AllowedIPs`、`listen-port` 这样的名字，如果每一册都各自罗列一遍，既容易遗漏，也容易在版本演进后出现互相矛盾的说明。因此本册采取「一处写全、多处引用」的策略：凡涉及 wg 的子命令、开关、参数名与取值约束，都以本篇和紧接着的 04-02 为准，其他册只给最小片段并注明「完整参数见 04-01」。本篇的任务是把 wg 命令本身拆解到每一个子命令、每一个选项、每一个参数，逐项对照源码核实，不臆造任何一个开关。
+
+wg 是 `wireguard-tools` 包提供的配置实用程序，其版本基准为 `WIREGUARD_TOOLS_VERSION` 所定义的 `1.0.20260223`（见 `wireguard-tools/src/version.h`）。需要特别强调的是，wg 只负责 WireGuard 专属的那部分配置——接口私钥、监听端口、fwmark、peer 公钥、endpoint、AllowedIPs、持久 keepalive 与预共享密钥。它不创建接口、不配置 IP 地址、不写路由：创建与删除接口由 `ip link add/del ... type wireguard` 完成，地址由 `ip address` 完成，路由由 `ip route` 完成。man 手册 `src/man/wg.8` 的 DESCRIPTION 第一段就把这条边界写得很清楚。理解这条边界非常重要，因为大量「wg 配了却不通」的问题，根源其实在地址或路由，而不在 wg 参数本身（部署流程见 03-01、排障思路见 08-03）。
+
+wg 的入口逻辑集中在 `wireguard-tools/src/wg.c`，代码量不大却信息密集。它的 `main()` 先处理三个全局开关：当参数为 `-v`、`--version` 或 `version` 时，打印 `wireguard-tools v%s` 后返回；当参数为 `-h`、`--help` 或 `help` 时，调用 `show_usage()` 打印帮助后返回；当完全不带参数（`argc == 1`）时，把参数替换成 `{"show"}` 直接落到 show 子命令——这就是「wg 默认等于 wg show」的实现。其余情况用一个静态数组 `subcommands[]` 做字符串匹配：结构里每一项含 `subcommand` 名称、`function` 函数指针与 `description` 描述，遍历匹配成功后调用 `subcommands[i].function(argc - 1, argv + 1)`，也就是把子命令名从参数列表中剥掉再交给具体处理函数；匹配失败则打印 `Invalid subcommand` 并返回 1。整张分派表一共九个条目，加上两个全局开关，构成了 wg 命令的完整表面。
+
+为什么把命令入口写得如此「薄」？因为真正的解析工作被下放到了各个子命令文件里，而配置语义又统一收敛到 `config.c`。这种「薄入口、厚解析」的结构带来两个直接好处：其一，所有需要写配置的命令（set、setconf、addconf、syncconf）都复用同一个 `config.c` 解析器，因此命令行参数与配置文件字段在语义上高度一致，不会出现「命令行支持但文件不支持」的偏差；其二，查询命令（show、showconf）只读不写，走 `ipc_get_device()`，配置命令才走 `ipc_set_device()`，读写路径在源码层面就是分开的。后续小节会沿着这两条路径，把每个子命令支持的开关逐一展开，并把它们与 uapi 属性对应起来，但属性的完整枚举交给 04-05、常量与标志交给 04-06，本篇只在必要处点名。
+
+### 2. 核心概念
+
+从使用目的看，wg 的九个可被子命令可以归为四组。第一组是查询类，包含 `show` 与 `showconf`：前者把运行态与配置态渲染成人可读的表格或脚本友好的字段，后者把当前配置导出成可回灌的 INI 格式文本。第二组是配置类，包含 `set`、`setconf`、`addconf`、`syncconf`：它们都改写内核接口状态，但改写方式差异很大，`set` 接受命令行键值对，`setconf` 用文件整体替换，`addconf` 在现有基础上追加，`syncconf` 则先读回现有配置再只改有差异的部分。第三组是密钥类，包含 `genkey`、`genpsk`、`pubkey`：它们不接触内核接口，只在标准输入输出上做随机数生成与 Curve25519 运算。第四组是元信息类，即 `help` 与版本开关，它们由 `main()` 直接处理，不在 `subcommands[]` 表里。把这四组分开理解，是掌握全部参数的前提。
+
+第二个核心概念是「配置面与数据面分离」在命令层的体现。wg 的所有配置命令最终都通过 `ipc_set_device()` 把序列化的 `wgdevice` 交给 netlink 通用族 `WG_CMD_SET_DEVICE`，由内核更新 device/peer/allowedip 三层状态；查询命令通过 `ipc_get_device()` 发 `WG_CMD_GET_DEVICE` 读回。netlink 通道的细节见 06-14。这意味着 wg 本身没有任何常驻进程，也没有任何数据面职责——它是一次性执行的配置客户端。也正因为如此，wg 的参数集合与 netlink 属性集合几乎是一一对应的：每一个命令行开关背后都对应一个 `WGDEVICE_A_*`、`WGPEER_A_*` 或 `WGALLOWEDIP_A_*` 属性，以及一个 `*_HAS_*` 标志位。读源码时可以反向印证：`config.c` 里每成功解析一个参数，几乎都会给相应的 `flags` 置位，例如解析 listen-port 成功会置 `WGDEVICE_HAS_LISTEN_PORT`，解析 peer 公钥成功会置 `WGPEER_HAS_PUBLIC_KEY`。这种「值 + 标志位」的成对出现，是理解配置语义的关键，字段层面的展开见 05-09。
+
+第三个核心概念是「同一个语义，两种输入形态」。`set` 走 `config_read_cmd()`，直接解析命令行参数数组；`setconf` 等走 `config_read_line()`，逐行解析 INI 文件。两条路径最终产出同一个 `struct wgdevice`，再交给同一个 `ipc_set_device()`。因此参数名在两处写法不同但含义一致：命令行用连字符小写形式 `listen-port`、`private-key`、`persistent-keepalive`、`allowed-ips`、`preshared-key`，而配置文件里用驼峰形式 `ListenPort`、`PrivateKey`、`PersistentKeepalive`、`AllowedIPs`、`PresharedKey`，`fwmark` 对应 `FwMark`，`endpoint` 对应 `Endpoint`，`peer` 后跟的公钥对应 `PublicKey`。解析时对配置文件键名使用 `strncasecmp`，也就是大小写不敏感，但对命令行的 `strcmp` 是大小写敏感的。这一差异在没有认真读 `config.c` 时很容易踩坑。
+
+第四个核心概念是三个环境变量，它们改变输出与解析行为而不改变命令语法。`WG_COLOR_MODE` 取 `always`、`never` 或 `auto`（含未设置），决定 show 是否输出 ANSI 颜色；`WG_HIDE_KEYS` 取 `never` 时让 show 显示私钥与预共享密钥，其他情况显示 `(hidden)`——这一点在 `show.c` 的 `masked_key()` 里直接体现；`WG_ENDPOINT_RESOLUTION_RETRIES` 控制 endpoint DNS 解析的重试次数，默认 15，设为 `infinity` 表示无限重试，其解析在 `parse_dns_retries()` 中完成。这三个变量在排障脚本里很实用：设置 `WG_COLOR_MODE=never` 可以得到纯净文本，设置 `WG_HIDE_KEYS=never` 可以在受控环境里核对密钥是否写对（但仍应避免把密钥落到日志里）。
+
+### 3. 关键数据结构与源码位置
+
+wg 命令的参数全集可以从三组源码结构里完整还原。第一组是入口分派结构。在 `wireguard-tools/src/wg.c` 中，`subcommands[]` 是一个匿名结构体数组，字段为 `subcommand`（字符串）、`function`（`int (*)(int, const char**)` 函数指针）与 `description`（帮助文本）。这张表就是权威的子命令清单：show、showconf、set、setconf、addconf、syncconf、genkey、genpsk、pubkey。注意 `genpsk` 与 `genkey` 共用同一个 `genkey_main()`，区别仅在于 `argv[0]` 的名称——`genkey_main()` 里只有 `argv[0]` 等于 `"genkey"` 时才调用 `curve25519_clamp_secret()`，因此 `genpsk` 生成的是未经钳制的随机 32 字节。同理 `setconf`、`addconf`、`syncconf` 三者共用 `setconf_main()`，差异靠 `argv[0]` 判断（是否 addconf、是否 syncconf）。
+
+第二组是配置解析上下文。`wireguard-tools/src/config.h` 定义了 `struct config_ctx`，含四个字段：`device` 指向正在构建的 `wgdevice`，`last_peer` 指向最近创建的 peer，`last_allowedip` 指向最近创建的 allowedip，以及两个布尔量 `is_peer_section` 与 `is_device_section` 标记当前处于哪个 INI 段。config.h 还声明了四个解析函数：`config_read_cmd()`（解析命令行数组）、`config_read_init()`（初始化上下文，参数 `append` 决定是否追加）、`config_read_line()`（解析单行）、`config_read_finish()`（收尾校验并返回设备）。这四个函数构成文件解析的完整生命周期。`struct wgdevice`、`struct wgpeer`、`struct wgallowedip` 本身定义在 uapi 相关头文件中，逐字段说明交给 05-09，本篇只把它们当作解析产物来引用。
+
+第三组是各子命令的实现文件，它们决定了每个命令到底接受哪些开关。`show.c` 实现 `show_main()`，其中的 `ugly_print()` 用一个长长的 `if (!strcmp(param, ...))` 链穷举了全部 show 字段选项；`showconf.c` 实现 `showconf_main()`，把 `wgdevice` 反向渲染成 INI 文本；`set.c` 实现 `set_main()`，把参数数组交给 `config_read_cmd()`；`setconf.c` 实现 `setconf_main()` 与关键的 `sync_conf()`；`genkey.c` 同时承载 genkey 与 genpsk；`pubkey.c` 实现 `pubkey_main()`。表 04-01-A 把这些源码位置收拢成速查表。
+
+表 04-01-A　wg 子命令源码位置速查
+| 子命令 | 实现函数 | 源文件 | 关键内部结构或函数 |
+|---|---|---|---|
+| show | show_main | src/show.c | pretty_print、ugly_print、dump_print |
+| showconf | showconf_main | src/showconf.c | wgdevice 反向渲染为 INI |
+| set | set_main | src/set.c | config_read_cmd、ipc_set_device |
+| setconf | setconf_main | src/setconf.c | config_read_init、config_read_line |
+| addconf | setconf_main | src/setconf.c | config_read_init(append=true) |
+| syncconf | setconf_main | src/setconf.c | sync_conf、peer_origin |
+| genkey | genkey_main | src/genkey.c | get_random_bytes、curve25519_clamp_secret |
+| genpsk | genkey_main | src/genkey.c | get_random_bytes（不钳制） |
+| pubkey | pubkey_main | src/pubkey.c | curve25519_generate_public |
+
+读懂这三层结构有一个实际收益：当你想确认「某个参数到底存不存在、拼写如何」时，不必去猜或去搜网上的二手资料，只要按「子命令 → 实现文件 → 解析函数」的顺序定位即可。例如要确认 set 是否支持 `preshared-key`，直接看 `config.c` 的 `config_read_cmd()` 里有没有对应分支；要确认 show 是否支持 `latest-handshakes`，直接看 `show.c` 的 `ugly_print()` 与 bash 补全脚本 `src/completion/wg.bash-completion` 第 25 行的字段列表。本篇后续所有结论都按这个方式从源码得出。
+
+### 4. 关键流程与调用链
+
+主分派链路在 `wg.c` 的 `main()` 中：设置全局 `PROG_NAME` 为 `argv[0]`，先匹配版本与帮助开关，再处理无参数默认 show，最后遍历 `subcommands[]` 做字符串精确匹配并调用对应函数。这里所有比较都用 `strcmp`，因此子命令名是大小写敏感的，`wg SHOW` 会落到 `Invalid subcommand`。匹配成功后传给子函数的参数是 `argc - 1, argv + 1`，也就是把子命令本身去掉——这解释了为什么各子命令的 usage 里 `argv[0]` 就是子命令名（如 setconf.c 用它判断是否 addconf/syncconf）。
+
+查询链路以 `wg show` 为例：`show_main()` 根据第一个参数分三种情况。若为 `all` 或省略，调用 `ipc_list_devices()` 拿到接口名列表，再对每个接口 `ipc_get_device()` 读回 `wgdevice`，逐个渲染；若为 `interfaces`，只打印接口名列表后返回；否则把该参数当作接口名直接 `ipc_get_device()`。读回后，若命令行给了第三个参数（字段名），走 `ugly_print()` 输出脚本友好格式；否则走 `pretty_print()` 输出人可读格式。`pretty_print()` 内部还会调用 `sort_peers()` 按最近握手时间排序，把从未握手的 peer 排到最后——这就是为什么 `wg show` 的输出顺序看起来「不稳定」，它其实是按握手新鲜度动态排序的。dump 模式是 `ugly_print()` 的一个特殊分支，转给 `dump_print()` 输出两段落的制表符分隔数据。
+
+配置链路以 `wg set` 为例：`set_main()` 检查 `argc < 3` 则打印 usage，否则把 `argv + 2` 起的参数交给 `config_read_cmd()`，解析出 `wgdevice` 后写入接口名，再调用 `ipc_set_device()`。`setconf` 一族则走文件解析：`fopen()` 配置文件，`config_read_init(&ctx, append)` 初始化（只有 addconf 传 true），用 `getline()` 逐行喂给 `config_read_line()`，再 `config_read_finish()` 校验每个 peer 都有公钥，最后写入接口名；若子命令是 syncconf，额外调用 `sync_conf()` 后再 `ipc_set_device()`。密钥链路最短：`genkey_main()` 用 `get_random_bytes()` 取 32 字节随机数，genkey 时钳制私钥标量，再 `key_to_base64()` 输出；`pubkey_main()` 从 stdin 读定长 base64，`key_from_base64()` 解码后用 `curve25519_generate_public()` 派生公钥再编码输出。
+
+图 04-01-01 把主分派与上述三条链路串在一起，展示了每个子命令最终落到哪个IPC 调用与哪个渲染或解析函数。
+
+:::figure id=04-01-01 | name=wg 命令分派与三条核心链路 | dir=TD
+node n1 "wg main 分派<br/>wg.c subcommands" amber
+node n2 "查询类<br/>show / showconf" teal
+node n3 "配置类<br/>set / setconf 等" blue
+node n4 "密钥类<br/>genkey / pubkey" purple
+node n5 "ipc_get_device<br/>netlink GET" gray
+node n6 "config 解析<br/>config.c" green
+node n7 "ipc_set_device<br/>netlink SET" red
+node n8 "pretty / ugly / dump<br/>渲染输出" teal
+node n9 "base64 与<br/>Curve25519" purple
+edge n1 -> n2 "查询"
+edge n1 -> n3 "配置"
+edge n1 -> n4 "密钥"
+edge n2 -> n5 "读状态"
+edge n5 -> n8 "渲染"
+edge n3 -> n6 "解析参数"
+edge n6 -> n7 "写状态"
+edge n4 -> n9 "本地运算"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：顶层是「wg main 分派 wg.c subcommands」，它分出三路——「查询类 show / showconf」经「ipc_get_device netlink GET」读回状态后由「pretty / ugly / dump 渲染输出」呈现；「配置类 set / setconf 等」经「config 解析 config.c」生成设备对象，再由「ipc_set_device netlink SET」写入内核；「密钥类 genkey / pubkey」不接触接口，只在本地做「base64 与 Curve25519」运算。
+
+### 5. 配置/命令/代码实例
+
+表 04-01-B 是本篇的核心，列出 wg 全部子命令及其开关参数。这是「参数全集」的权威清单，凡本套其他册提到 wg 参数，均以本表为准。
+
+表 04-01-B　wg 子命令与开关参数全集
+| 子命令 | 位置参数 | 可选开关/字段 | 取值与约束 | 实现文件 |
+|---|---|---|---|---|
+| show | `<interface>` / all / interfaces | 字段选项共十二个，分两行列出于下 | 至多一个字段选项；无字段则人可读格式 | show.c |
+| └ show 字段（一） | — | public-key、private-key、listen-port、fwmark、peers、preshared-keys | 脚本友好格式 | show.c |
+| └ show 字段（二） | — | endpoints、allowed-ips、latest-handshakes、transfer、persistent-keepalive、dump | dump 为制表符分隔 | show.c |
+| showconf | `<interface>` | 无 | 导出为 INI 文本 | showconf.c |
+| set | `<interface>` | listen-port `<port>`、fwmark `<mark>`、private-key `<file>`、peer `<base64>` 及其子项 | 可多次 peer；子项见下 | set.c / config.c |
+| setconf | `<interface> <file>` | 无 | 整体替换配置 | setconf.c |
+| addconf | `<interface> <file>` | 无 | 追加配置 | setconf.c |
+| syncconf | `<interface> <file>` | 无 | 读回后差异同步，不断会话 | setconf.c |
+| genkey | 无 | 无 | 输出 base64 私钥 | genkey.c |
+| genpsk | 无 | 无 | 输出 base64 预共享密钥 | genkey.c |
+| pubkey | 无 | 无 | 从 stdin 读私钥，输出公钥 | pubkey.c |
+| help / -h / --help | 无 | 无 | 打印帮助 | wg.c |
+| version / -v / --version | 无 | 无 | 打印工具版本 | wg.c |
+
+表 04-01-C 进一步展开 `set ... peer` 之后的子项，这些子项都必须在某个 `peer` 之后出现，否则 `config_read_cmd()` 会报 `Invalid argument`。
+
+表 04-01-C　set 子命令 peer 子项全集
+| 子项 | 参数 | 语义 | 约束与特殊值 | 对应标志位 |
+|---|---|---|---|---|
+| peer | `<base64 公钥>` | 新增或定位一个对等体 | 32 字节 base64 | WGPEER_HAS_PUBLIC_KEY |
+| remove | 无 | 删除该 peer | 仅跟在 peer 后有效 | WGPEER_REMOVE_ME |
+| preshared-key | `<file>` | 设置预共享密钥 | 必须是文件；空文件删除 | WGPEER_HAS_PRESHARED_KEY |
+| endpoint | `<ip>:<port>` | 对端地址 | IPv6 用 `[...]:port`；支持主机名 | 无 HAS 标志 |
+| persistent-keepalive | `<秒>` | 保活间隔 | off/0 关闭，1–65535 | WGPEER_HAS_PERSISTENT_KEEPALIVE_INTERVAL |
+| allowed-ips | `[+\|-]<ip>/<cidr>[,...]` | 允许地址段 | 默认替换；+ 增加、- 删除 | WGPEER_REPLACE_ALLOWEDIPS |
+
+下面给出一组覆盖查询、配置与密钥三类命令的实操序列：
+
+```bash
+# 版本与帮助：由 wg.c 的 main 直接处理
+wg --version
+wg help
+
+# 查询：全部接口、接口名列表、单接口人可读、单字段脚本友好、dump
+wg show
+wg show interfaces
+wg show wg0
+wg show wg0 public-key
+wg show wg0 dump
+
+# 配置：设置接口参数与一个 peer 的完整子项
+wg set wg0 listen-port 51820 fwmark 0xca6c private-key ./private.key
+wg set wg0 peer <对端公钥> endpoint 203.0.113.9:51820 \
+  persistent-keepalive 25 allowed-ips 10.0.0.2/32 \
+  preshared-key ./psk.key
+
+# 密钥：管道式生成密钥对与预共享密钥
+umask 077
+wg genkey | tee private.key | wg pubkey > public.key
+wg genpsk > psk.key
+```
+
+这组命令里，`wg show wg0 dump` 的输出最能体现「字段与源码一一对应」。下面给出其示例输出（示例输出，具体格式需对照实际版本核验），字段之间用制表符分隔，为便于阅读此处用空格示意其列：
+
+```text
+示例输出，具体格式需对照实际版本核验
+<私钥base64>  <公钥base64>  51820  off
+<对端公钥base64>  (none)  203.0.113.9:51820  10.0.0.2/32  1700000000  12800  9600  off
+```
+
+逐行判读如下。第一行首列是私钥 base64，由 `dump_print()` 里的 `maybe_key(device->private_key, ...)` 产生——注意 dump 模式会输出私钥（除非该字段缺失显示 `(none)`），这与 pretty 模式的 `(hidden)` 不同，因此 dump 输出必须当敏感数据保护。第二列是公钥，由 `maybe_key(device->public_key, ...)` 产生，由本端私钥经 Curve25519 派生。第三列 `51820` 是 `device->listen_port`，对应 uapi 的 `WGDEVICE_A_LISTEN_PORT`，若未设置则为 0，表示接口 up 时随机选端口。第四列 `off` 来自 `fwmark` 分支：当 `device->fwmark` 为 0 时打印 `off`，否则打印 `0x%x`。第二行进入 peer 部分：首列 `key(peer->public_key)` 是对端公钥，对应 `WGPEER_A_PUBLIC_KEY`；第二列 `(none)` 来自 `maybe_key(peer->preshared_key, ...)`，表示未配置预共享密钥，若配置则显示其 base64。第三列是 `endpoint()` 函数用 `getnameinfo()` 加 `NI_NUMERICHOST` 渲染的地址与端口，对应 `WGPEER_A_ENDPOINT`。第四列 `10.0.0.2/32` 由 `ip(allowedip)` 与 `allowedip->cidr` 拼接，对应 allowedip 的 IP 与掩码属性。第五列 `1700000000` 是 `peer->last_handshake_time.tv_sec` 的裸 Unix 时间戳（脚本友好，不做格式化），对应 `WGPEER_A_LAST_HANDSHAKE_TIME`，这是判断隧道是否真正握手的硬指标。第六、七列 `12800` 与 `9600` 分别是 `peer->rx_bytes` 与 `peer->tx_bytes`，对应 `WGPEER_A_RX_BYTES` 与 `WGPEER_A_TX_BYTES`；只有握手成功且路由正确时它们才增长。第八列 `off` 来自 `peer->persistent_keepalive_interval` 为零时的分支，非零则打印秒数。整行的列顺序与 man 手册 wg.8 的 dump 说明完全一致，也和 bash 补全脚本给出的字段集合吻合。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把 `private-key` 与 `preshared-key` 当成可以直接跟在命令行上的值。无论是命令行还是配置文件，这两个参数都要求文件：在 `config.c` 中它们分别走 `parse_keyfile()`，而不是 `parse_key()`。man 手册明确说明，命令行参数在多数系统上不算私密，所以密钥必须来自文件；若使用 bash，可以用进程替换 `<(echo PRIVATEKEYSTRING)` 安全地传字符串。若指定 `/dev/null` 或其他空文件，工具会把密钥清零并视为删除——`parse_keyfile()` 在读不到内容且文件为空时返回全零密钥，这是「清空密钥」的正规做法，不要试图用空字符串。
+
+第二个陷阱是误解 `allowed-ips` 的替换与增量语义。`parse_allowedips()` 一开始就把 `WGPEER_REPLACE_ALLOWEDIPS` 置位，意味着一次赋值默认替换该 peer 的全部 AllowedIPs；但如果某个条目带 `+` 前缀，会清掉 REPLACE 标志并走增量增加；带 `-` 前缀则额外置 `WGALLOWEDIP_REMOVE_ME` 表示删除。若传空字符串，会清空该 peer 的所有 AllowedIPs（函数里对空串直接返回 true，但 REPLACE 标志已置位）。配置文件里 `AllowedIPs` 写成 `10.0.0.2/32, 10.0.0.3/32` 是多值逗号分隔，而命令行里习惯多次写或在一次 `allowed-ips` 里用逗号；两条路径都收敛到同一个 `parse_allowedips()`，语义一致。掩码写错（例如把 `/32` 写成 `/24`）会让流量路由到错误的 peer，是静默故障的高发点（路由原理见 06-07）。
+
+第三个陷阱是混淆 `show` 的人可读模式与脚本模式。不带字段参数时走 `pretty_print()`，会隐藏密钥、把时间戳格式化成「xx seconds ago」、把字节数格式化成 KiB/MiB，并按握手时间排序；一旦带上任一字段参数就走 `ugly_print()`，输出制表符分隔的原始值，不隐藏私钥（如 dump 所示）、时间戳是裸秒数、字节数是整数。写自动化脚本时务必显式指定字段，避免依赖人可读格式——后者会随终端宽度、颜色设置和语言而变化。
+
+第四个陷阱是忽视环境变量的影响。`WG_HIDE_KEYS=never` 会让 pretty 模式也显示私钥与预共享密钥，运维脚本若要抓取公钥应改用 `wg show ... public-key`，避免误开密钥显示后把输出写入日志。`WG_COLOR_MODE=never` 可保证输出无 ANSI 转义序列，便于 diff 与正则 matching（此处指文本匹配）。第五个陷阱是照抄参数而不核验版本：本篇基于 wireguard-tools 1.0.20260223 快照，不同发行版打包的工具版本可能有细微差异，遇到行为不符时以 `wg --version` 与实际源码为准。
+
+最佳实践：先用 `wg --version` 确认工具可用，再用 `wg show interfaces` 确认内核接口存在；配置时优先用 `setconf`/`syncconf` 管理文件、用 `set` 做临时改动；核对状态用 `wg show <iface>` 看人可读摘要、用 `wg show <iface> latest-handshakes` 与 `transfer` 做量化判断；生成密钥时先 `umask 077` 再管道操作，私钥文件权限设为仅本人可读；涉及热更新 peer 时优先考虑 syncconf 以保留会话（其完整语义见 04-02）。
+
+### 7. 小结与延伸阅读
+
+本篇把 wg 命令拆解到子命令与参数两级：`main()` 通过 `subcommands[]` 分派九个可调用子命令，外加版本与帮助两个全局开关；无参数时默认执行 show。四组子命令各司其职——查询类 show/showconf 走 `ipc_get_device()`，配置类 set/setconf/addconf/syncconf 走 `config.c` 解析后由 `ipc_set_device()` 写入，密钥类 genkey/genpsk/pubkey 只在本地做随机与 Curve25519 运算。表 04-01-B 与 04-01-C 给出了参数全集：show 支持十二个字段选项，set 支持三个接口级开关与六个 peer 子项，私钥与预共享密钥必须是文件，AllowedIPs 默认替换而 + / - 表示增量，persistent-keepalive 与 fwmark 支持 off/0 关闭。dump 输出的每一列都能逐一映射到 uapi 属性与 `show.c` 中的声明。
+
+需要延续阅读的有三处：其一，syncconf 与 setconf、set 在配置语义上的深层差异，以及 config_ctx 的解析生命周期，见 04-02；其二，netlink 属性的完整枚举与标志位全集，见 04-05、04-06；其三，这些配置字段在内核结构里的落点，见 05-09。跨册随查按（字段见 05-09 ｜ 原理见 06-14 ｜ 模块见 07-13 ｜ 排障见 08-03）执行：结构体逐字段去 05、机制与调用链去 06、目录级模块能力去 07、运维场景与基准去 08；本篇所在的 04 册本身就是参数与命令的权威源，其他册凡涉及 wg 参数均回指本篇。凡标注「需对照实际版本核验」的开关、字段与语法，均以 `_wglinux_build/upstream_src/wireguard-tools/src/` 下对应文件为准，本套资料不编造未核验的路径与取值。
+
+## 04-02 wg syncconf / set / setconf 与配置语义
+
+### 1. 背景与动机
+
+wg 提供四种改写配置的途径——`set`、`setconf`、`addconf`、`syncconf`——它们在 `wg.c` 的 `subcommands[]` 里被登记为四个名字，但其中后三个共用 `setconf_main()` 一个实现，第一个由 `set_main()` 单独实现。对使用者而言，这四种途径最令人困惑的地方不是参数拼写，而是「语义」：同样一份配置，用 setconf 应用和用 syncconf 应用，对现有隧道会话的影响完全不同。本篇专门处理这一层面的问题，把「配置如何被解析、如何被合并、最终如何落到内核」讲清楚。参数清单本身已在 04-01 给出，本篇不重复罗列每一个开关，而是聚焦它们之间的组合规则与差异。
+
+先看一个真实场景。假设一条已经建立握手、正在传输数据的隧道，运维想给某个 peer 增加一条 AllowedIPs。若用 `wg set` 直接执行 `allowed-ips`，默认语义是替换该 peer 的全部 AllowedIPs，除非在条目上加 `+` 前缀；若用 `wg setconf` 整体灌入一份配置文件，由于配置初始化时会置 `WGDEVICE_REPLACE_PEERS`，内核会重建 peer 集合，正在进行的会话随之被打断；若改用 `wg syncconf`，工具会先通过 `ipc_get_device()` 读回当前运行态，把配置文件与运行态逐一比对，只对真正有差异的部分发出更改，从而不打断现有会话。man 手册 wg.8 在 syncconf 条目下明确写着它「much less efficient than setconf, but has the benefit of not disrupting current peer sessions」——这句是理解 syncconf 存在意义的钥匙。
+
+为什么替换 peer 会打断会话？因为在内核里，peer 对象承载着握手状态、会话密钥、计数器与发送队列（字段见 05-03）。一旦配置通道把 peer 标记为删除再重建，这些运行态就被丢弃，对端必须重新握手。syncconf 的设计目标正是避免这种「无谓的重建」：它试图让「配置文件所描述的期望状态」与「内核中的当前状态」之间的差异最小化，只把差异写下去。代价是它要多做一次读回、一次按公钥排序的集合比较，因此效率低于直接覆盖式的 setconf。理解这层取舍，才能在实际运维中正确选择工具（热更新与部署流程见 03-05、08-06）。
+
+从源码组织看，本篇的主战场是 `wireguard-tools/src/config.c` 与 `wireguard-tools/src/setconf.c`。前者提供统一的解析引擎，后者在解析之上实现「追加」与「差异同步」的额外逻辑。把这两份代码读透，就能回答几乎所有关于配置语义的问题：为什么配置文件键名大小写不敏感、为什么注释以 `#` 开头、为什么每个 peer 必须有公钥、为什么空的 AllowedIPs 会清空地址段、为什么 syncconf 对未列出的 peer 会执行删除。下面各节按「概念—结构—流程—实例—陷阱」的顺序展开。
+
+### 2. 核心概念
+
+第一个核心概念是四种配置语义的精确区分。`set` 是命令行增量更新：它只把你显式写出的开关下发，未提及的字段保持内核原样。`setconf` 是文件整体替换：`config_read_init()` 在 append 为 false 时置 `WGDEVICE_REPLACE_PEERS`，意味着配置里没写的 peer 会被删除。`addconf` 是文件追加：传入 append 为 true，不置 REPLACE_PEERS，因此配置里的 peer 叠加到现有集合之上。`syncconf` 是文件差异同步：它先把 REPLACE_PEERS 清掉，再通过 `sync_conf()` 计算出需要删除的 peer 并显式加入删除指令，最终达到「结果等于文件内容」但「尽量不扰动现有会话」的效果。一句话概括：setconf 是「覆盖」，addconf 是「叠加」，syncconf 是「对齐」，set 是「点改」。
+
+第二个核心概念是标志位驱动的语义。`config.c` 在解析每个字段成功后都会置一个 `*_HAS_*` 标志，例如解析 PrivateKey 置 `WGDEVICE_HAS_PRIVATE_KEY`、解析 Endpoint 不置 HAS 标志但直接写 endpoint、解析 PublicKey 置 `WGPEER_HAS_PUBLIC_KEY`、解析 PresharedKey 置 `WGPEER_HAS_PRESHARED_KEY`、解析 PersistentKeepalive 置 `WGPEER_HAS_PERSISTENT_KEEPALIVE_INTERVAL`。这些标志告诉内核「这个字段这次被显式提供了」。除此之外还有几个「行为」标志：`WGDEVICE_REPLACE_PEERS` 表示替换全部 peer，`WGPEER_REMOVE_ME` 表示删除该 peer，`WGPEER_REPLACE_ALLOWEDIPS` 表示替换该 peer 的地址段，`WGALLOWEDIP_REMOVE_ME` 表示从地址段里删除某条。syncconf 的聪明之处就在于它精确操纵这几个行为标志，而不是简单覆盖。常量与标志的完整枚举见 04-06。
+
+第三个核心概念是解析上下文 `config_ctx`。它把「正在构建的设备」「最近的 peer」「最近的 allowedip」「当前处于哪个 INI 段」四个状态穿在一条解析线上。因为 INI 是行式格式，`AllowedIPs = ...` 必须挂到最近一个 `[Peer]` 上，所以工具用 `last_peer` 记住归属；多条 AllowedIPs 行要串成链表，所以用 `last_allowedip` 记住链尾。理解这个上下文，就能理解为什么配置文件里字段的顺序有隐含约束：出现在任何 `[Peer]` 之前的字段会被当成 `[Interface]` 段或报错，而 `[Peer]` 里的字段必然归属于最近那个 peer。
+
+第四个核心概念是两条解析路径的收敛。`config_read_cmd()` 处理命令行数组，只认小写连字符形式的参数名，且私钥来自文件；`config_read_line()` 处理 INI 行，用 `get_value()` 做大小写不敏感的前缀匹配，键名是驼峰形式。两条路径都调用同一批 `parse_port()`、`parse_fwmark()`、`parse_key()`、`parse_endpoint()`、`parse_allowedips()`、`parse_persistent_keepalive()` 辅助函数，因此取值约束完全一致：端口走 `getaddrinfo()` 解析，fwmark 支持十进制与 0x 十六进制及 off，Keepalive 为 1–65535 或 off，endpoint 支持 IPv4、方括号包裹的 IPv6 与主机名。这种「入口不同、约束相同」的设计，是配置语义一致性的根本保证。
+
+### 3. 关键数据结构与源码位置
+
+配置语义的全部秘密集中在三个结构里。`config_ctx` 定义于 `wireguard-tools/src/config.h`，含 `struct wgdevice *device`、`struct wgpeer *last_peer`、`struct wgallowedip *last_allowedip` 三个指针与 `is_peer_section`、`is_device_section` 两个布尔标志。`config_read_init()` 把它清零后分配一个空 device，并在非追加模式下置 `WGDEVICE_REPLACE_PEERS | WGDEVICE_HAS_PRIVATE_KEY | WGDEVICE_HAS_FWMARK | WGDEVICE_HAS_LISTEN_PORT` 四个标志——注意这里把三个 HAS 标志也置上了，意味着 setconf 即使文件里没写私钥、fwmark、listen-port，也会把它们当作「显式设置为零值」下发，从而清空原值，这正是「整体替换」的底层机制。
+
+`peer_origin` 是 `setconf.c` 里为 syncconf 定义的小结构，含 `struct wgpeer *peer` 与 `bool from_file`。sync_conf 把配置文件里的 peer 标记为 `from_file = true`，把从内核读回的运行态 peer 标记为 `false`，然后把两者放进同一个数组按公钥排序。`peer_cmp()` 先按 `public_key` 做 `memcmp`，公钥相同时再按 `from_file` 区分（文件来的排前面），从而让「同一公钥的文件条目与运行态条目」相邻，便于配对比较。
+
+`wgdevice`、`wgpeer`、`wgallowedip` 是解析的产物，其定义来自 uapi 头文件（字段见 05-09），本篇只把它们当作「携带值与标志位的容器」。表 04-02-A 把配置语义相关的源码位置收拢。
+
+表 04-02-A　配置语义关键源码位置速查
+| 关注点 | 源码位置 | 关键符号 | 语义作用 |
+|---|---|---|---|
+| 解析上下文 | src/config.h | struct config_ctx | 串起 device / peer / allowedip 解析状态 |
+| 命令行解析 | src/config.c | config_read_cmd | 解析小写连字符参数数组 |
+| 文件行解析 | src/config.c | config_read_line / process_line | 解析 INI 行与段 |
+| 字段求值 | src/config.c | parse_port / parse_fwmark / parse_endpoint 等 | 统一取值约束 |
+| 地址段语义 | src/config.c | parse_allowedips / parse_ip_prefix | 替换与 + / - 增量 |
+| 收尾校验 | src/config.c | config_read_finish | 校验每个 peer 有公钥 |
+| 文件命令入口 | src/setconf.c | setconf_main | 区分 setconf / addconf / syncconf |
+| 差异同步 | src/setconf.c | sync_conf / peer_origin / peer_cmp | 读回比对、删除多余 peer |
+| 命令行入口 | src/set.c | set_main | 点改式下发 |
+
+读懂这三组结构的关键，是建立「解析产物 = 值 + 标志位」的心智模型：解析器不直接改内核，而是先构建一棵带有丰富标志的设备树，再由 `ipc_set_device()` 一次性序列化下发。所有语义差异——替换、追加、对齐——都体现为「构建这棵树时置了哪些标志」，而不是下发阶段的不同逻辑。syncconf 之所以特殊，仅仅因为它在构建树之后、下发之前，多插入了一个 `sync_conf()` 步骤来修正标志与 peer 列表。
+
+### 4. 关键流程与调用链
+
+文件解析的完整生命周期有四步。`setconf_main()` 先 `fopen()` 配置文件，然后调用 `config_read_init(&ctx, append)`，其中 append 仅当 `argv[0]` 为 `addconf` 时为 true；接着用 `getline()` 逐行读入，每行交给 `config_read_line()`，该函数先截掉 `#` 之后的内容作为注释，再剔除所有空白字符，若清洗后为空行则跳过，否则交给 `process_line()`；所有行读完后调用 `config_read_finish()` 校验每个 peer 都有 `WGPEER_HAS_PUBLIC_KEY`，否则报 `A peer is missing a public key` 并返回失败；最后写入接口名，若为 syncconf 则先 `sync_conf()`，再 `ipc_set_device()`。
+
+`process_line()` 的分派逻辑很清晰：行等于 `[Interface]` 时置 `is_device_section = true`、`is_peer_section = false`；行等于 `[Peer]` 时分配一个新 peer 挂到链表尾，并置 `is_peer_section = true`、`is_device_section = false`，同时给新 peer 置 `WGPEER_REPLACE_ALLOWEDIPS`；在 device 段里用 `key_match()` 匹配 `ListenPort`、`FwMark`、`PrivateKey`；在 peer 段里匹配 `Endpoint`、`PublicKey`、`AllowedIPs`、`PersistentKeepalive`、`PresharedKey`。这里 `key_match` 宏展开为 `get_value(line, key "=")`，而 `get_value()` 用 `strncasecmp`，所以键名大小写不敏感，且等号后紧跟值。
+
+`parse_allowedips()` 是地址段语义的核心。它一开始置 peer 的 `WGPEER_REPLACE_ALLOWEDIPS`，然后对逗号分隔的每个条目调用 `parse_ip_prefix()`：若条目以 `-` 开头，置 `WGALLOWEDIP_REMOVE_ME` 并贯穿到 `+` 分支；`+` 分支清掉 peer 的 `WGPEER_REPLACE_ALLOWEDIPS` 并把指针前移跳过前缀。因此不带前缀的赋值是替换，带 `+` 是增加，带 `-` 是删除。随后 `parse_ip()` 区分 IPv4/IPv6，`strsep()` 拆出 CIDR，缺省掩码 IPv4 为 32、IPv6 为 128，`validate_netmask()` 校验主机位非零时仅打警告 `Warning: AllowedIP has nonzero host part` 而不拒绝。
+
+syncconf 的 `sync_conf()` 算法值得逐段拆解。它先做两个早退：文件无 peer 时直接返回 true（意味着空的 syncconf 配置不会删除任何 peer），读回运行态失败则报错。随后清掉 `file->flags` 的 `WGDEVICE_REPLACE_PEERS`。接着把文件 peer 与运行态 peer 都放进 `peer_origin` 数组，按 `peer_cmp()` 排序。然后遍历数组，专注处理「来自运行态」（`from_file == false`）的条目：若在排序后的数组里找不到同公钥的文件条目，就构造一个 `WGPEER_REMOVE_ME` 的 peer 挂到文件 peer 链表头，表示删除这个多余 peer；若找到了同公钥的文件条目（相邻位置），则处理两种「清零」情形——运行态有预共享密钥而文件条目没有时，把文件条目的 preshared_key 清零并置 HAS 标志以确保下发删除；运行态有 keepalive 而文件条目没有时，把文件条目的 keepalive 置 0 并置 HAS 标志。这样 syncconf 最终下发的树，既表达了文件里显式写出的值，也补齐了「需要被清除」的字段，同时不触碰那些未变化的 peer 会话。
+
+图 04-02-01 对比了三种文件配置入口在解析树构建阶段的差异。
+
+:::figure id=04-02-01 | name=三种文件配置入口的语义分流 | dir=TD
+node c1 "配置文件 INI" amber
+node c2 "setconf 整体替换" blue
+node c3 "addconf 追加" teal
+node c4 "syncconf 差异同步" green
+node c5 "config_read_line<br/>逐行解析" gray
+node c6 "置 REPLACE_PEERS" red
+node c7 "不清 REPLACE_PEERS" purple
+node c8 "sync_conf 读回比对" red
+node c9 "构造 wgdevice 树" blue
+node c10 "ipc_set_device 下发" teal
+edge c1 -> c2 "选 setconf"
+edge c1 -> c3 "选 addconf"
+edge c1 -> c4 "选 syncconf"
+edge c2 -> c5 "解析"
+edge c3 -> c5 "解析"
+edge c4 -> c5 "解析"
+edge c2 -> c6 "置位"
+edge c3 -> c7 "保留"
+edge c4 -> c8 "差异计算"
+edge c6 -> c9 "构建"
+edge c7 -> c9 "构建"
+edge c8 -> c9 "修正后构建"
+edge c9 -> c10 "序列化"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：起点「配置文件 INI」分三条路——「setconf 整体替换」在「config_read_line 逐行解析」后「置 REPLACE_PEERS」；「addconf 追加」解析后「不清 REPLACE_PEERS」；「syncconf 差异同步」解析后走「sync_conf 读回比对」。三者最终都「构造 wgdevice 树」并交给「ipc_set_device 下发」，差别只在构建树时置了哪些标志。
+
+### 5. 配置/命令/代码实例
+
+先给出一份典型的 INI 配置文件，它是 setconf 与 syncconf 的共同输入，也是 showconf 的输出格式：
+
+```bash
+cat > /etc/wireguard/wg0.conf <<'EOF'
+[Interface]
+PrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=
+ListenPort = 51820
+FwMark = 0xca6c
+
+[Peer]
+PublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=
+PresharedKey = I+Hm1nP3KjZ8rQ7vT2wL9xY4uB6cD0eF3gA5sN1mHk=
+AllowedIPs = 10.0.0.2/32, 10.0.0.3/32
+Endpoint = 203.0.113.9:51820
+PersistentKeepalive = 25
+EOF
+
+# 三种应用方式：语义分别是对齐、覆盖、叠加
+wg syncconf wg0 /etc/wireguard/wg0.conf
+wg setconf wg0 /etc/wireguard/wg0.conf
+wg addconf wg0 /etc/wireguard/wg0.conf
+```
+
+配置文件中注释以 `#` 开头，空白会被剔除，段名与键名大小写不敏感；`AllowedIPs` 一行给出多个逗号分隔的 CIDR。表 04-02-B 从语义维度对比四种配置途径，这是本节的核心表格。
+
+表 04-02-B　四种配置途径语义对比
+| 维度 | set | setconf | addconf | syncconf |
+|---|---|---|---|---|
+| 输入形态 | 命令行键值对 | INI 文件 | INI 文件 | INI 文件 |
+| 解析函数 | config_read_cmd | config_read_line | config_read_line | config_read_line |
+| REPLACE_PEERS | 不置 | 置位 | 不置 | 先清后置删除项 |
+| 未列出的 peer | 保留 | 删除 | 保留 | 删除（显式 REMOVE_ME） |
+| 未列出的接口字段 | 保留 | 清零 | 保留 | 保留 |
+| 是否读回运行态 | 否 | 否 | 否 | 是（ipc_get_device） |
+| 对现有会话影响 | 点改，局部 | 重建，打断 | 局部保留 | 尽量不打断 |
+| 相对效率 | 高 | 高 | 高 | 较低 |
+| 典型用途 | 临时改动、脚本 | 首次下发、全量替换 | 批量追加 peer | 热更新、保留会话 |
+
+用 `wg showconf wg0` 可以把当前运行态导出为同样的 INI 格式，便于核对 syncconf 的结果。下面给出示例输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+示例输出，具体格式需对照实际版本核验
+[Interface]
+ListenPort = 51820
+FwMark = 0xca6c
+PrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=
+
+[Peer]
+PublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=
+PresharedKey = I+Hm1nP3KjZ8rQ7vT2wL9xY4uB6cD0eF3gA5sN1mHk=
+AllowedIPs = 10.0.0.2/32, 10.0.0.3/32
+Endpoint = 203.0.113.9:51820
+PersistentKeepalive = 25
+```
+
+逐行判读如下。`[Interface]` 是 showconf.c 固定打印的段头，对应 config.c 的 `process_line()` 里 `[Interface]` 分支所识别的段名。[Interface] 段内三行的输出顺序由 showconf.c 的 printf 次序决定：先 `ListenPort`（`device->listen_port` 非零才打印），对应配置解析里的 `ListenPort` 键与 `parse_port()`；再 `FwMark`（非零才打印，格式为 `0x%x`），对应 `FwMark` 键与 `parse_fwmark()`；最后 `PrivateKey`（仅当 `WGDEVICE_HAS_PRIVATE_KEY` 置位才打印），对应 `PrivateKey` 键与 `parse_key()`。空行是 showconf.c 在 Interface 段末尾主动打印的分隔。
+`[Peer]` 段头由 `for_each_wgpeer()` 循环内打印，每个 peer 一个段；`PublicKey` 由 `key_to_base64(peer->public_key)` 产生，是 config_read_finish() 强制要求存在的字段。`PresharedKey` 仅当 `WGPEER_HAS_PRESHARED_KEY` 置位才打印，对应解析里的 `PresharedKey` 键——syncconf 在文件条目缺该字段但运行态有时，会主动清零并置 HAS 标志，确保这里不再输出旧密钥。`AllowedIPs` 由遍历 `first_allowedip` 链表并用 `inet_ntop()` 加 `cidr` 拼接，多个条目以逗号分隔，正好能被 `parse_allowedips()` 读回。`Endpoint` 由 `getnameinfo()` 加 `NI_NUMERICHOST` 渲染，IPv6 会包方括号，对应 `parse_endpoint()` 支持的格式。`PersistentKeepalive` 仅在间隔非零时打印，对应 `parse_persistent_keepalive()`，值为 1–65535 秒。整段输出构成了一个可被 setconf/syncconf 原样回灌的闭合格式，这正是 showconf 的设计目的。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是以为 syncconf 只是「更温和的 setconf」。它确实不打断会话，但语义上仍以配置文件为准：`sync_conf()` 会把运行态里存在、文件里未列出的 peer 构造为 `WGPEER_REMOVE_ME` 并下发删除。因此用一份「只包含部分 peer」的配置文件做 syncconf，会删掉其余 peer，这和 setconf 的删除结果一致，只是过程更精细。唯一例外是空配置（无 peer）时 sync_conf 早退，不会删除任何 peer——这是一个容易误解的边界。
+
+第二个陷阱是混淆「peer 级替换」与「地址段级替换」。`WGPEER_REPLACE_PEERS` 作用于整个接口的 peer 集合，由 setconf 置位；`WGPEER_REPLACE_ALLOWEDIPS` 作用于单个 peer 的地址段，在每个 `[Peer]` 段出现时由 config.c 置位。前者删除 peer，后者只清空该 peer 的 AllowedIPs。当你在配置里写了 `AllowedIPs =` 空值，`parse_allowedips()` 会把该 peer 的地址段清空，但 peer 本身仍在——这与删掉整个 `[Peer]` 段（配合 REPLACE_PEERS 才会删 peer）是两件事。
+
+第三个陷阱是忽略接口字段在 syncconf 中的处理差异。对比表 04-02-B 可见：setconf 因 config_read_init 把 `WGDEVICE_HAS_PRIVATE_KEY | WGDEVICE_HAS_FWMARK | WGDEVICE_HAS_LISTEN_PORT` 都置上，未写出的接口字段会被清零；而 syncconf 清掉 REPLACE_PEERS 后走差异逻辑，只在文件里显式给出的字段才会改动，未列出的接口字段保持原值。这意味着若想用 syncconf 清空 fwmark，必须在文件里显式写 `FwMark = 0` 或 `off`，而不是省略该行。这一差异常被误用。
+
+第四个陷阱是配置文件的格式细节。# 注释、行内空白剔除、大小写不敏感都是 config.c 实现的；但键名必须与 `key_match()` 里的字面量一致（如 `PersistentKeepalive` 而非 `PersistentKeepaliveInterval`），且每个 peer 必须有 `PublicKey`，否则 config_read_finish() 直接拒绝整份配置。另外私钥与 PresharedKey 在配置文件里直接写 base64 字符串（这与命令行要求文件路径不同），因此配置文件本身是敏感文件，必须限制权限（建议 0600）。
+
+最佳实践：把「期望状态」完整地写进一份配置文件，日常热更新一律用 `syncconf`，既保证结果收敛又保留会话；首次部署或需要彻底重置时用 `setconf`；临时给正在运行的接口追加一个 peer 用 `addconf`；单点参数微调用 `set`，并记得 `allowed-ips` 默认替换、需要增量时加 `+`。每次改动后用 `wg show <iface> latest-handshakes` 确认会话未被打断、用 `wg showconf <iface>` 核对落盘结果（状态字段含义见 04-01、排障见 08-03）。涉及密钥的配置变更要同步更新分发与权限管理（密钥流程见 03-03）。
+
+### 7. 小结与延伸阅读
+
+本篇聚焦 syncconf、set、setconf 三种配置途径的语义差异：四者共用 `config.c` 的解析引擎，却在构建 `wgdevice` 树时置不同标志——set 点改、setconf 置 REPLACE_PEERS 覆盖、addconf 不清标志叠加、syncconf 通过 `sync_conf()` 读回运行态、按公钥排序比对、删除多余 peer 并补齐需清零字段，从而在不打断会话的前提下让状态对齐配置文件。解析生命周期为 `config_read_init` → `config_read_line`/`process_line` → `config_read_finish` → `sync_conf`（仅 syncconf）→ `ipc_set_device`；地址段的替换与 + / - 增量由 `parse_ip_prefix()` 操纵 `WGPEER_REPLACE_ALLOWEDIPS` 与 `WGALLOWEDIP_REMOVE_ME` 实现。showconf 的输出与解析器输入构成闭合格式，可原样回灌。
+
+延伸阅读：参数全集与 show 字段清单见 04-01；标志位与 netlink 属性的完整枚举见 04-06、04-05；配置文件格式的逐项说明见 04-04；peer 与 allowedip 在内核里的结构字段见 05-03、05-04；netlink 下发通道的原理见 06-14。跨册随查按（字段见 05-03 ｜ 原理见 06-14 ｜ 模块见 07-13 ｜ 排障见 08-03）执行：结构体逐字段去 05、机制与调用链去 06、目录级模块能力去 07、运维场景与基准去 08；本篇与 04-01 同属参数与命令权威源，其他册凡涉及配置语义均回指本册。凡标注「需对照实际版本核验」的字段、标志与行为，均以 `_wglinux_build/upstream_src/wireguard-tools/src/` 下的 config.c 与 setconf.c 为准，本套资料不编造未核验的路径与取值。
+
+## 04-03 wg-quick 配置参数全集
+
+### 1. 背景与动机
+
+wg-quick 不是 C 程序，而是一段 bash 脚本，这是理解它全部参数的起点。在 wireguard-tools 源码树里，它的主体是 `src/wg-quick/linux.bash`（Linux 版本；同目录还有 darwin.bash、freebsd.bash、openbsd.bash 与 android.c 等平台变体），由 `src/wg-quick/wg` 这个包装脚本负责按当前平台分派到对应实现。它的权威手册是 `src/man/wg-quick.8`。本套资料的事实锚点是 wireguard-tools 1.0.20260223（`src/version.h` 中 `WIREGUARD_TOOLS_VERSION "1.0.20260223"`），下文所有键名、默认值、函数名与调用顺序均以该快照的 `linux.bash` 和 `wg-quick.8` 为准；平台变体之间的差异需对照实际系统核验。
+
+为什么要单独为 wg-quick 的参数立一篇权威源？因为 wg-quick 在 `wg(8)` 的配置文件格式之上「额外」定义了一批键，而手册 wg.8 与 wg-quick.8 各讲一半，社区资料又常把两者混写，导致实践里频繁出现「把 Address 当成 wg 原生键」「以为 Table=off 只是不写路由」这类错误。source of truth 只有一个：`linux.bash` 的 `parse_options()` 函数里那个 `case "$key" in` 分支，它逐字列出了 wg-quick 自己吃掉、不再转发给 wg 的键；其余所有键都由 `set_config()` 原样交给 `wg addconf`。换句话说，wg-quick 的参数面 = wg 原生配置键（见 04-04 的统一格式描述）+ 九个 Interface 段扩展键 + 四个子命令。本篇把后两者完整、逐项、按源码列出，作为全册引用这些参数时的唯一权威出处。
+
+从设计意图看，手册 wg-quick.8 开宗明义说它是「an extremely simple script for easily bringing up a WireGuard interface, suitable for a few common use cases」，是「just a simple script that wraps invocations to wg(8) and ip(8)」。这句话决定了它的参数风格：不是有一套独立的配置语言，而是用 wg 的 INI 文件做载体，在 `[Interface]` 段里塞进几个「脚本自己解释」的键，再自动完成地址分配、MTU 计算、路由推断、DNS 下发与防火墙规则。理解了「包装器」这一定位，就能明白为什么它的参数大多对应一条 or 多条 `ip` 命令：Address 对应 `ip address add`，MTU 对应 `ip link set mtu`，Table 对应 `ip route add ... table`，而 PreUp/PostUp 之类干脆就是让你自己塞任意 bash 命令的逃生口。对进阶需求，手册明确建议改用更完整的网络管理器或直接用 wg 与 ip——这条边界也应写进参数手册的适用说明里。
+
+### 2. 核心概念
+
+要准确掌握 wg-quick 的参数，先建立三组概念：**四个子命令、九个扩展键、一个转发规则**。
+
+四个子命令来自 `wg-quick.8` 的 SYNOPSIS 与 `linux.bash` 末尾的参数分派：`up`（建接口并配置）、`down`（拆接口，可选先保存配置）、`save`（不拆接口，直接把当前状态写回配置文件）、`strip`（输出剔除 wg-quick 扩展键后的纯 wg 配置，常与 `wg syncconf` 配合热重载）。入口参数形式统一为 `wg-quick <up|down|save|strip> <CONFIG_FILE|INTERFACE>`；给接口名时按手册与 `parse_options()` 第 43 行展开为 `/etc/wireguard/<接口名>.conf`，并会继续搜索发行版特定路径。接口名必须符合正则 `[a-zA-Z0-9_=+.-]{1,15}`——这既是 `parse_options()` 第 43、45 行的校验，也是内核 netdev 名字长度限制的体现；`wg0`、`wgvpn0`、`nyc`、`paris` 都合法。
+
+九个扩展键全部位于 `[Interface]` 段，由 `parse_options()` 在读到该段时截获：`Address`、`DNS`、`MTU`、`Table`、`PreUp`、`PostUp`、`PreDown`、`PostDown`、`SaveConfig`。关键判别细节是：`parse_options()` 用 `stripped="${line%%\#*}"` 先去掉 `#` 后的注释，再分别计算 `key` 与 `value`；但 Pre/Post 四个钩子键刻意使用 `unstripped_value`（第 54 行）——保留注释符号后的原文，因为防火墙命令里合法出现 `#` 的场景需要原样传给 bash。钩子里的特殊串 `%i` 在 `execute_hooks()` 第 294 行被替换为接口名；可重复出现，按出现顺序执行。这些是别的资料极少写清、却直接影响参数行为的细节。
+
+一个转发规则指：除了上述九个键，`parse_options()` 会把【所有】其余行原样累积进 `WG_CONFIG`（第 72 行 `WG_CONFIG+="$line"$'\n'`），最终由 `set_config()` 通过 `cmd wg addconf "$INTERFACE" <(echo "$WG_CONFIG")` 交给 wg。因此 `[Peer]` 段的 PublicKey、AllowedIPs、Endpoint 等键，以及 `[Interface]` 段里的 PrivateKey、ListenPort、FwMark，都不是 wg-quick 的「自有参数」，而是 wg 原生配置键（其格式与解析规则见 04-04）。下表给出 wg-quick 自有参数的全集，逐项标注取值、默认、重复性与源码依据，作为权威速查。
+
+| 参数 | 所属段 | 取值与默认 | 可否重复 | 源码依据（linux.bash） |
+|---|---|---|---|---|
+| `Address` | Interface | 逗号分隔的 IPv4/IPv6 地址，可带 CIDR；无默认，通常必填 | 是 | `parse_options()` 第 59 行 `ADDRESSES+=( ${value//,/ } )` |
+| `DNS` | Interface | IP 作 DNS 服务器，非 IP 主机名作搜索域；无默认 | 是 | 第 61–63 行，按 `^[0-9.]+$` 或含冒号判为 IP |
+| `MTU` | Interface | 正整数；缺省时按 endpoint/默认路由自动计算再减 80 | 否 | 第 60 行赋值 `MTU`，`set_mtu_up()` 第 126–143 行 |
+| `Table` | Interface | `off`/`auto`/自定义表名或数字；默认 `auto` | 否 | 第 64 行赋值 `TABLE`，`add_route()` 第 171–179 行 |
+| `PreUp` | Interface | 任意 bash 片段，`%i` 展开为接口名 | 是 | 第 65 行用 `unstripped_value` 收集 |
+| `PostUp` | Interface | 同上，在 up 流程末尾执行 | 是 | 第 67 行收集，`cmd_up()` 第 342 行执行 |
+| `PreDown` | Interface | 同上，在 down 流程开头执行 | 是 | 第 66 行收集，`cmd_down()` 第 348 行执行 |
+| `PostDown` | Interface | 同上，在 down 流程末尾执行 | 是 | 第 68 行收集，`cmd_down()` 第 353 行执行 |
+| `SaveConfig` | Interface | `true`/`false`（大小写敏感见陷阱节）；默认 `false` | 否 | 第 69 行 `read_bool SAVE_CONFIG`，`read_bool()` 第 77–83 行 |
+| `up` 子命令 | 命令行 | `wg-quick up <配置文件或接口名>` | — | 第 369–372 行 `auto_su`→`parse_options`→`cmd_up` |
+| `down` 子命令 | 命令行 | `wg-quick down <配置文件或接口名>` | — | 第 373–376 行分派到 `cmd_down` |
+| `save` 子命令 | 命令行 | `wg-quick save <接口名>`，不拆接口写回配置 | — | 第 377–380 行分派到 `cmd_save` |
+| `strip` 子命令 | 命令行 | `wg-quick strip <接口名>`，输出纯 wg 配置 | — | 第 381–384 行分派到 `cmd_strip` |
+
+### 3. 关键数据结构与源码位置
+
+wg-quick 没有结构体，它的「状态」是 `linux.bash` 顶部的全局 shell 变量。理解这些变量与操作它们的函数，就等价于理解了它的内部数据结构。变量集中在第 14–28 行：`INTERFACE`（从配置文件名正则捕获的接口名）、`CONFIG_FILE`（规范化后的绝对路径）、`WG_CONFIG`（要转发给 wg 的配置文本）、`ADDRESSES`（地址数组）、`MTU`（标量字符串）、`DNS` 与 `DNS_SEARCH`（两个数组，分别存服务器与搜索域）、`TABLE`（路由表标量）、`PRE_UP`/`POST_UP`/`PRE_DOWN`/`POST_DOWN`（四个钩子数组）、`SAVE_CONFIG`（0/1 整数），以及两个流程标志 `HAVE_SET_DNS` 与 `HAVE_SET_FIREWALL`，用于 down 时判断是否要撤销 DNS 与防火墙改动。
+
+函数分层很清晰。`parse_options()`（第 40–75 行）是唯一的解析入口，负责文件定位、权限警告、逐行切分与上面九个键的截获；`read_bool()`（第 77–83 行）只接受字面量 `true`/`false`，否则 `die`。配置生效由 `cmd_up()`（第 327–344 行）编排，依次调用 `add_if()`（第 89–97 行，`ip link add`，失败时回退 wireguard-go）、`execute_hooks()`（钩子执行）、`set_config()`（第 251–253 行，`wg addconf`）、`add_addr()`（第 120–124 行，按地址含冒号选 `-4`/`-6`）、`set_mtu_up()`、`set_dns()`、`add_route()`。拆卸侧由 `cmd_down()` 编排 `del_if()`（第 99–118 行）、`save_config()`（第 255–289 行）、`unset_dns()`、`remove_firewall()`。默认路由的特殊处理集中在 `add_default()`（第 213–249 行）与 `get_fwmark()`（第 182–188 行）。`save_config()` 会重建 `[Interface]` 头、再拼接 `wg showconf` 的输出；`cmd_strip()` 只回显 `WG_CONFIG`。这些函数的行号是后续交叉引用与排障的直接索引。
+
+从文档与集成角度看，参数还有两个「外部接口」：手册 `src/man/wg-quick.8` 的 CONFIGURATION 段给出九个键的自然语言定义，`cmd_usage()`（第 300–325 行）则内嵌了一份等价的 `--help` 文本；`src/systemd/wg-quick@.service` 与 `wg-quick.target` 把 `wg-quick up %i` 接入 systemd，说明这些参数在开机启动时同样被 `parse_options()` 重新解析一遍，并不存在「systemd 专有参数」。bash 补全在 `src/completion/wg-quick.bash-completion`，负责键名补全。模块职责属于 07-13，这里只点名不展开。
+
+### 4. 关键流程与调用链
+
+`up` 流程最能体现参数如何变成命令。`cmd_up()` 先检查接口是否已存在（`ip link show dev`），再设置 `trap 'del_if; exit'` 保证中途失败能回滚，然后 `add_if` 建接口、`execute_hooks` 跑 PreUp、`set_config` 把 `WG_CONFIG` 喂给 `wg addconf`——注意这一步才真正写入 PrivateKey、ListenPort、Peer 等原生键。接着按 `ADDRESSES` 逐个 `add_addr`，`set_mtu_up` 设 MTU 并 up 接口，`set_dns` 经 resolvconf 下发 DNS。路由部分是一个循环：从 `wg show ... allowed-ips` 取所有前缀，按前缀长度降序（`sort -nr -k 2 -t /`）逐个 `add_route`；`add_route()` 遇到 `Table=off` 直接返回，遇到自定义表用 `ip route add ... table`，遇到 `*/0` 转 `add_default()`，其余用普通 `ip route add`。最后跑 PostUp 并解除 trap。
+
+`add_default()` 是 wg-quick 最复杂的参数副作用。当 AllowedIPs 含默认路由且 `Table` 为 `auto` 或空时，`get_fwmark` 先读 `wg show fwmark`；若未设置则从 51820 起找一个未占用的表号，`wg set ... fwmark` 写入，再用 `ip rule add not fwmark <表号> table <表号>` 与 `ip rule add table main suppress_prefixlength 0` 做策略路由，默认路由写进该表，最后用 nftables 或 iptables 打上 `wg-quick(8) rule for <接口>` 注释的防泄漏规则，并按需打开 `net.ipv4.conf.all.src_valid_mark`。这就是「Table=auto 自动处理默认网关」的完整含义——它远不止一条路由。整个参数到命令的映射关系见图 04-03-01。
+
+:::figure id=04-03-01 | name=wg-quick up 参数到命令的调用链 | dir=TD
+node a1 "parse_options<br/>截获九个扩展键" blue
+node a2 "WG_CONFIG<br/>转发其余键给 wg" teal
+node a3 "cmd_up<br/>编排全流程" purple
+node a4 "add_if + add_addr<br/>ip link/address" gray
+node a5 "set_mtu_up<br/>自动算 MTU 减 80" amber
+node a6 "add_route<br/>路由推断" green
+node a7 "add_default<br/>fwmark + ip rule" red
+node a8 "execute_hooks<br/>PreUp/PostUp" blue
+edge a1 -> a2 "未截获行"
+edge a1 -> a3 "参数就绪"
+edge a3 -> a4 "建接口"
+edge a4 -> a5 "设 MTU"
+edge a5 -> a6 "加路由"
+edge a6 -> a7 "默认路由"
+edge a3 -> a8 "钩子"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：`parse_options` 截获九个扩展键，其余行进入 `WG_CONFIG` 转发给 wg；`cmd_up` 编排全流程，先 `add_if + add_addr` 建接口配地址，再 `set_mtu_up` 自动算 MTU 减 80，然后 `add_route` 做路由推断，遇到默认路由转 `add_default` 用 fwmark 与 ip rule 处理，钩子 `PreUp/PostUp` 由 `execute_hooks` 在首尾执行。
+
+`down` 流程与 `up` 近似镜像：`cmd_down()` 先确认接口确为 WireGuard 接口，跑 PreDown，若 `SaveConfig=true` 则 `save_config()` 写回，再 `del_if()`——它会在 `Table` 为空或 `auto` 且存在 `/0` 时，按 fwmark 清掉策略路由规则，再 `ip link delete`；最后依次撤销 DNS、防火墙、跑 PostDown。`save` 只调用 `save_config()`，`strip` 只回显 `WG_CONFIG`，两者都不改接口状态。值得注意的是，`parse_options()` 对四个子命令一视同仁地先跑一遍，所以 `strip` 与 `save` 也会校验配置文件路径、打印权限警告——这是理解其报错来源的关键。
+
+### 5. 配置/命令/代码实例
+
+下面给出一个「全参数」客户端配置，把九个扩展键与必要的 wg 原生键放在同一文件里，文件名设为 `/etc/wireguard/wg0.conf`，可直接对应 `parse_options()` 的解析路径：
+
+```ini
+[Interface]
+Address = 10.200.100.8/24, fd00::8/64
+DNS = 10.200.100.1, 1.1.1.1, example.internal
+MTU = 1420
+Table = auto
+PrivateKey = oK56DE9Ue9zK76rAc8pBl6opph+1v36lm7cXXsQKrQM=
+PostUp = iptables -I OUTPUT ! -o %i -m mark ! --mark $(wg show %i fwmark) -j REJECT
+PreDown = iptables -D OUTPUT ! -o %i -m mark ! --mark $(wg show %i fwmark) -j REJECT
+SaveConfig = false
+
+[Peer]
+PublicKey = GtL7fZc/bLnqZldpVofMCD6hDjrK28SsdLxevJ+qtKU=
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = demo.wireguard.com:51820
+PersistentKeepalive = 25
+```
+
+这里 `Address` 一行给了 IPv4 与 IPv6 两个地址，`parse_options()` 第 59 行按逗号拆成数组；两个 DNS IP 进 `DNS` 数组、`example.internal` 进 `DNS_SEARCH`；`PostUp`/`PreDown` 里的 `%i` 会在 `execute_hooks()` 中替换为 `wg0`；`AllowedIPs` 含 `0.0.0.0/0` 会触发 `add_default()`。执行启动命令：
+
+```bash
+wg-quick up wg0
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验；`[#]` 行由 `cmd()` 第 31 行打印到 stderr）：
+
+```text
+[#] ip link add wg0 type wireguard
+[#] wg addconf wg0 /dev/fd/63
+[#] ip -4 address add 10.200.100.8/24 dev wg0
+[#] ip -6 address add fd00::8/64 dev wg0
+[#] ip link set mtu 1420 up dev wg0
+[#] resolvconf -a tun.wg0 -m 0 -x
+[#] wg set wg0 fwmark 51820
+[#] ip -4 rule add not fwmark 51820 table 51820
+[#] ip -4 rule add table main suppress_prefixlength 0
+[#] ip -4 route add 0.0.0.0/0 dev wg0 table 51820
+[#] iptables-restore -n
+[#] iptables -I OUTPUT ! -o wg0 -m mark ! --mark $(wg show wg0 fwmark) -j REJECT
+```
+
+逐行判读如下。第一行 `ip link add wg0 type wireguard` 来自 `add_if()` 的 `cmd ip link add dev "$INTERFACE" type wireguard`，说明接口是从零创建的，若该命令失败且内核模块缺失，脚本会打印回退提示并调用 `wireguard-go`。第二行 `wg addconf` 来自 `set_config()`，参数是进程替换生成的 `/dev/fd/63`，其内容正是去掉九个扩展键后的 `WG_CONFIG`，证实 PrivateKey、Peer 等原生键是这一刻才写入内核的。第三、四行是 `add_addr()` 对 `ADDRESSES` 的两次调用：地址含冒号则选 `ip -6`，否则 `ip -4`，对应配置里逗号拆分出的两个地址。第五行 `ip link set mtu 1420 up` 来自 `set_mtu_up()` 的显式 MTU 分支（第 128–130 行），因为配置写了 `MTU=1420`，自动计算路径被跳过。第六行 `resolvconf -a tun.wg0 -m 0 -x` 来自 `set_dns()`，前缀 `tun.` 由 `resolvconf_iface_prefix()` 探测 `/etc/resolvconf/interface-order` 得到，说明两个 DNS IP 与搜索域已下发。第七行 `wg set wg0 fwmark 51820` 来自 `add_default()`，因为 `Table=auto` 且 AllowedIPs 含 `0.0.0.0/0` 而 fwmark 未预设，脚本从 51820 起选了空闲表号。第八、九行两条 `ip rule` 是策略路由核心：`not fwmark 51820 table 51820` 让打标流量走独立表，`table main suppress_prefixlength 0` 让主表默认路由被抑制，避免绕过隧道。第十行把默认路由写进 51820 表。第十一行 `iptables-restore -n` 是 `add_default()` 写入的防泄漏规则（带 `wg-quick(8) rule for wg0` 注释），第十二行才是配置里 `PostUp` 的自定义 kill-switch，其中 `$(wg show wg0 fwmark)` 已被 `%i` 替换与 shell 展开为实际 fwmark。整个输出验证了九个扩展键各自变成了哪几条系统命令，是理解参数语义最直接的证据。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是误以为 wg-quick 有自己的配置解析器。它只是 bash 字符串处理：`parse_options()` 用 `${line%%\#*}` 去注释、用 `${stripped%%=*}` 与 `${stripped#*=}` 切键值；没有转义、没有多行续行、没有引号语义。因此值里出现 `#` 会被截断（Pre/Post 钩子的 `unstripped_value` 例外），键名大小写虽因 `shopt -s nocasematch` 而不敏感，但值里的空格会被当作数组分隔；`SaveConfig` 的值则由 `read_bool()` 用精确的 `case true|false` 匹配，`True`、`TRUE` 都会触发 `die`，与键名的宽松形成鲜明对比。第二个陷阱是 `SaveConfig=true` 的破坏性：手册 wg-quick.8 明确警告「Any changes made to the configuration file before the interface is removed will therefore be overwritten」——`save_config()` 会用当前接口状态重建整个 `[Interface]` 头，你手改的注释、格式甚至扩展键顺序都可能丢失，运维上应把它当作「状态快照」而非「手写文件」。第三个陷阱是 `Table` 的三种语义混淆：`off` 完全不建路由（适合自己管路由），`auto`（默认）会触发默认路由的 fwmark 与策略路由全套机制，自定义表则只把路由加到你指定的表——三者行为差异极大，选错直接导致「隧道通但没路由」或「全局流量被劫持」。
+
+第四个陷阱是 DNS 依赖：`set_dns()` 走的是 `resolvconf -a`，在 systemd-resolved 或 NetworkManager 管理的系统上可能不生效，手册也提示可用 PostUp/PostDown 自定义替代。第五个陷阱是 MTU 自动计算的取整：`set_mtu_up()` 先按每个 endpoint 做 `ip route get` 取链路 MTU，再减 80 字节封装开销，兜底值 1500 再减 80 得 1420；若 endpoint 是域名且解析受阻，可能退回兜底值，因此高丢包或分片场景应显式写 `MTU`。第六个陷阱是钩子的 `eval` 语义：`execute_hooks()` 第 296 行用 `(eval "$hook")`，意味着钩子在子 shell 中以当前用户（已 `auto_su` 提权到 root）执行，来源不可信的配置等于把 root 命令写进文件，配置文件权限必须收紧——`parse_options()` 第 47 行对 world-accessible 文件只打警告不阻断，这一点尤需注意。第七个陷阱是接口名正则 `[a-zA-Z0-9_=+.-]{1,15}` 同时用于文件定位与内核名，超长或含非法字符会在第 45 行 `die`。
+
+还有一个隐蔽陷阱涉及钩子与 `set -e`：脚本第 7 行 `set -e -o pipefail` 意味着任一钩子返回非零会立刻中止整个 up/down 流程，而 `trap` 又会触发 `del_if` 回滚，表现为「接口建了又瞬间消失」。因此 PreUp/PostUp 里若写了可能失败的探测命令，务必自行用 `|| true` 兜底，把「探测失败」和「流程失败」区分开。与之相关的是 `down` 流程的幂等性：`cmd_down()` 第 347 行先检查接口是否在 `wg show interfaces` 列表中，重复执行 down 会直接 `die`，而在接口已被手工删除的情况下再跑 down 同样报错——编排脚本里应把这类错误视为可忽略，而不是当作严重故障。对 `Address` 还要注意 CIDR 语义：它只是给接口配地址，真正决定「哪些流量走隧道」的是 Peer 段的 `AllowedIPs`，两者写混是「有地址却不通」的常见根因。
+
+最佳实践可归纳为四步：先用 `wg-quick strip wg0` 观察纯 wg 配置，确认原生键部分正确，再决定扩展键；再从最小配置（Address + PrivateKey + 一个 Peer）起步，用 `wg show wg0 latest-handshakes` 确认握手，而不是只看接口 up；随后按是否需要全局代理决定 `Table`——全隧道用默认 `auto` 并理解其 fwmark 副作用，分流或自建路由用 `off` 配合 PostUp；最后用 `wg syncconf wg0 <(wg-quick strip wg0)` 热重载 peer 变更而不中断现有会话（这条命令直接来自 wg-quick.8 的 EXAMPLES）。对 DNS、kill-switch、策略路由等高级需求，优先用 PostUp/PreDown 显式表达并配好撤销逻辑，确保 down 后系统干净。数据面原理与握手时序不在本篇展开（原理见 06-01 ｜ 命令全集见 04-01 ｜ 配置格式见 04-04 ｜ 字段见 05-09）。
+
+### 7. 小结与延伸阅读
+
+本篇把 wg-quick 的参数收敛为「四个子命令 + 九个 Interface 扩展键 + 一条转发到 wg addconf 的规则」：`up/down/save/strip` 由 `linux.bash` 末尾分派；`Address/DNS/MTU/Table/PreUp/PostUp/PreDown/PostDown/SaveConfig` 由 `parse_options()` 在 `[Interface]` 段截获并分别落到 shell 变量；其余行原样进入 `WG_CONFIG` 交给 wg。九个键的取值、默认、重复性与行号依据已在第 2 节表格中列全，参数层面不再有遗漏项。`cmd_up` 的调用链把每个参数翻译成具体的 `ip`/`wg`/`resolvconf` 命令，`add_default()` 则解释了 `Table=auto` 为何会牵动 fwmark、ip rule 与防火墙——这是 wg-quick 与裸 wg 最本质的区别。
+
+延伸阅读建议按三条线走：参数层面，wg 命令行全集见 04-01、`setconf/syncconf` 语义见 04-02、配置文件格式与 ini 解析见 04-04；机制层面，默认路由的策略路由与 fwmark 原理见 06-14，握手与定时器见 06-02、06-11；模块层面，wg-quick 在用户态工具中的位置见 07-13，systemd 集成见 03-05。跨册随查按（字段见 05-09 ｜ 参数见 04-01 ｜ 原理见 06-14 ｜ 模块见 07-13）执行：结构体逐字段去 05、命令全集去 04 的对应篇、机制与调用链去 06、目录级模块能力去 07。凡本篇标注「需对照实际版本核验」的默认值、平台变体差异与发行版搜索路径，均以 `_wglinux_build/upstream_src/wireguard-tools/` 下 `src/wg-quick/linux.bash` 与 `src/man/wg-quick.8` 为准，本套资料不编造未核验的路径与取值。
+
+## 04-04 配置文件格式与 ini 解析规则全集
+
+### 1. 背景与动机
+
+WireGuard 的配置「文件」不是一个独立发明的格式，而是构建在 INI 之上的一套极简约定，并且存在两个彼此独立的解析器：用户态 C 程序 wg 用 `src/config.c` 解析，wg-quick 脚本用 `src/wg-quick/linux.bash` 的 `parse_options()` 解析。本篇是这两套格式与解析规则的唯一权威源，落点是 `config.c`、`config.h`、`ctype.h`、`encoding.c` 与手册 `src/man/wg.8` 的 CONFIGURATION FILE FORMAT 段；wg-quick 侧双层解析的分工已在 04-03 交代，本篇只在差异处回指，不重复展开其九个扩展键。版本基准同为 wireguard-tools 1.0.20260223，所有函数名、行号、错误文本与常量均取自该快照，个别细节需对照实际版本核验。
+
+为什么解析规则值得单独成篇？因为 wg 的配置看似朴素，实则藏着大量「只在此处成立」的判定：注释字符固定为 `#` 且在空白处被提前截断；键名匹配是大小写不敏感的前缀比较；整行会先删掉所有空白字符再做匹配；AllowedIPs 的 `+`/`-` 前缀会改变整批地址的替换语义；endpoint 的域名解析带指数退避重试；base64 密钥校验要求固定 44 字符加尾随 `=`。这些规则决定了「同样的文本写对还是写错」，却分散在十来个静态函数里。社区里关于「能不能写行内注释」「AllowedIPs 能不能写成 10.0.0.1/24 而不检查主机位」「域名写错为什么卡很久才报错」的争论，答案都可以在这几个函数里逐行找到，而无需猜测。
+
+从设计哲学看，这套格式刻意保持「最小可解析面」：只有两个顶层段（`[Interface]`、`[Peer]`），键与值之间一个等号，没有嵌套、没有转义、没有多行续行、没有类型系统。手册 wg.8 第 132–134 行写明格式基于 INI，允许多个 `[Peer]` 段但只允许一个 `[Interface]` 段；第 180 行写明「Characters after and including a '#' are considered comments and are thus ignored」。这种极简让解析器可以用几百行 C 完成，也带来严格的书写纪律——理解这些纪律，比记住键名更重要。本篇的目标就是把纪律还原成可核查的函数与常量，而不是罗列「应该怎么写」的经验之谈。
+
+### 2. 核心概念
+
+解析的核心概念可以压缩为四句话：**两段结构、逐行状态机、标志位驱动、失败即回滚**。
+
+两段结构指 `[Interface]` 与 `[Peer]` 两种顶层段。`process_line()`（第 436 行）用 `strcasecmp` 判断整行是否等于 `[Interface]` 或 `[Peer]`——注意是大小写不敏感的全行比较，所以 `[PEER]`、`[peer]` 都合法，但 `[Peer] # 注释` 不合法，因为注释已在 `config_read_line()` 里被剥掉、行首行尾空白也被删净。`[Interface]` 把 `ctx->is_device_section` 置 1；`[Peer]` 则 `calloc` 一个新 `struct wgpeer` 挂到链表尾，同时把 `ctx->last_allowedip` 清空、`WGPEER_REPLACE_ALLOWEDIPS` 置位。换句话说，每遇到一个 `[Peer]` 就新建一个 peer 对象，后续所有键都归属于「最近这个 peer」。
+
+逐行状态机由 `config_ctx`（`config.h` 第 15–20 行）承载：`device` 指向根 `wgdevice`，`last_peer` 与 `last_allowedip` 指向当前正在填充的对象，两个布尔量标记当前在哪一段。`config_read_init()` 初始化上下文，`config_read_line()` 逐行喂入，`config_read_finish()` 收尾校验。标志位驱动指每个解析函数成功后都会给相应对象打上 `WGDEVICE_HAS_*` 或 `WGPEER_HAS_*` 位，例如 `parse_port()` 打 `WGDEVICE_HAS_LISTEN_PORT`、`parse_persistent_keepalive()` 打 `WGPEER_HAS_PERSISTENT_KEEPALIVE_INTERVAL`；这些位决定该字段是否真的下发到内核，未打位的字段等于没配置。失败即回滚指 `config_read_line()` 出错时调用 `free_wgdevice(ctx->device)` 释放整棵树，`config_read_finish()` 发现 peer 缺公钥时同样释放并返回 NULL。
+
+下表把全部配置键按段归类，给出解析函数、取值规则与所置标志位，作为权威速查。表中「设备段」即 `[Interface]`，「对等段」即 `[Peer]`；注意 wg-quick 的九个扩展键不在此列（见 04-03）。
+
+| 键 | 段 | 解析函数 | 取值规则 | 所置标志 |
+|---|---|---|---|---|
+| `PrivateKey` | 设备段 | `parse_key()` | base64，固定 44 字符加尾 `=`，解出 32 字节 | `WGDEVICE_HAS_PRIVATE_KEY` |
+| `ListenPort` | 设备段 | `parse_port()` | 16 位端口，经 getaddrinfo 解析服务名，不可为空 | `WGDEVICE_HAS_LISTEN_PORT` |
+| `FwMark` | 设备段 | `parse_fwmark()` | `off`/`0` 或 0–0xffffffff，支持 `0x` 十六进制 | `WGDEVICE_HAS_FWMARK` |
+| `PublicKey` | 对等段 | `parse_key()` | base64 32 字节，peer 必填 | `WGPEER_HAS_PUBLIC_KEY` |
+| `PresharedKey` | 对等段 | `parse_key()` | base64 32 字节，可选，叠加对称密钥抗量子 | `WGPEER_HAS_PRESHARED_KEY` |
+| `AllowedIPs` | 对等段 | `parse_allowedips()` | 逗号分隔，可带 `/cidr`，可加 `+`/`-` 前缀，可重复 | `WGPEER_REPLACE_ALLOWEDIPS`（或清除/`WGALLOWEDIP_REMOVE_ME`） |
+| `Endpoint` | 对等段 | `parse_endpoint()` | `ip:port` 或 `[IPv6]:port` 或 `域名:port` | 无标志，直接写 sockaddr |
+| `PersistentKeepalive` | 对等段 | `parse_persistent_keepalive()` | `off`/`0` 或 1–65535 秒 | `WGPEER_HAS_PERSISTENT_KEEPALIVE_INTERVAL` |
+
+### 3. 关键数据结构与源码位置
+
+`config.h` 定义的 `struct config_ctx` 是整个解析过程的状态容器，仅五字段：指向 `wgdevice` 的 `device`、`last_peer`、`last_allowedip`，以及 `is_peer_section`、`is_device_section` 两个布尔量。它把「当前在哪个段、当前对象是谁」显式化，使逐行解析无需回溯。真正的配置树由 uapi 侧的 `struct wgdevice`、`struct wgpeer`、`struct wgallowedip` 组成：device 通过 `first_peer` 串起 peer 链表，peer 通过 `first_allowedip` 串起地址链表，每个节点还带 `flags` 字段记录上述 `HAS_*` 位。这些结构的逐字段定义属于 05-09，本篇只把它们当作解析的输出容器点名，不展开字段表。
+
+解析函数集中在 `config.c`，可分三组。工具组：`get_value()`（第 25–37 行）做 `strncasecmp` 前缀匹配，`key_match(key)` 宏（第 465 行）展开为 `value = get_value(line, key "=")`；`char_is_space()`/`char_is_digit()` 来自 `ctype.h`，是实现为位运算的常量时间判定，不依赖 locale。字段组：`parse_port`、`parse_fwmark`、`parse_key`、`parse_keyfile`、`parse_ip`、`parse_endpoint`、`parse_persistent_keepalive`、`parse_allowedips`，各自负责把字符串变成 uapi 结构字段。流程组：`process_line()` 分派、`config_read_line()` 清洗、`config_read_init()`/`config_read_finish()` 生命周期，以及供命令行参数复用的 `config_read_cmd()`（第 588 行）。密钥编解码在 `encoding.c`：`key_from_base64()` 要求长度恰为 `WG_KEY_LEN_BASE64 - 1`（44）且倒数第二字符为 `=`，`key_to_base64()`、`key_to_hex()`、`key_from_hex()`、`key_is_zero()` 均为常量时间实现；`encoding.h` 给出 `WG_KEY_LEN_BASE64 = (((WG_KEY_LEN)+2)/3)*4+1`（即 45，含结尾 NUL）、`WG_KEY_LEN_HEX = WG_KEY_LEN*2+1`（即 65）。
+
+这里有一个极易混淆的「同名不同义」必须点明：配置文件里的 `PrivateKey = <base64>` 走 `parse_key()` 直接解 base64，而命令行 `wg set wg0 private-key <文件路径>` 走 `parse_keyfile()` 从文件读 44 字符再解 base64（第 609–612 行）；`PresharedKey` 同理，配置里是内联 base64，命令行 `preshared-key` 是文件路径。`parse_keyfile()` 还允许文件尾部有空白字符（第 143–148 行逐字符检查是否 `char_is_space`），并把空文件（如 `/dev/null`）解释为「全零密钥」用于移除密钥（第 131–136 行）。同一语义两种写法，是阅读源码和配置时最容易踩的坑之一。
+
+### 4. 关键流程与调用链
+
+一次 `wg setconf wg0 file.conf` 的解析链路如下。先是 `config_read_init(ctx, append=false)`：`memset` 上下文，`calloc` 一个 device，因为不是追加模式，置 `WGDEVICE_REPLACE_PEERS | WGDEVICE_HAS_PRIVATE_KEY | WGDEVICE_HAS_FWMARK | WGDEVICE_HAS_LISTEN_PORT`，表示本次配置整体替换旧 peer 且四个设备字段即使缺省也要下发「清除」语义。随后调用方逐行读文件、每行调用 `config_read_line()`：它先用类似 `strchrnul` 的写法找 `#`（第 514 行 `strchr(input, COMMENT_CHAR)`，COMMENT_CHAR 定义为 `'#'`），把注释及其后内容截掉；再 `calloc` 一行缓冲区，把剩余字符中所有 `char_is_space` 为真者删除——注意这一步删除的不只是前后空格，而是行内所有空白（第 527–530 行）；若清洗后为空则跳过（空行与纯注释行合法）；否则调用 `process_line()`。
+
+`process_line()` 先判段标题，再按当前段用 `key_match` 逐个尝试。设备段依次匹配 `ListenPort`、`FwMark`、`PrivateKey`；对等段依次匹配 `Endpoint`、`PublicKey`、`AllowedIPs`、`PersistentKeepalive`、`PresharedKey`；都不匹配则打印 `Line unrecognized: ...` 并返回 false。每个 `key_match` 命中后调用对应 `parse_*` 函数，任何解析失败都会让 `config_read_line()` 最终返回 false 并 `free_wgdevice`。所有行读完后 `config_read_finish()` 遍历每个 peer，凡未置 `WGPEER_HAS_PUBLIC_KEY` 者打印 `A peer is missing a public key` 并整体失败。整条链路的状态流转见图 04-04-01。
+
+:::figure id=04-04-01 | name=ini 配置解析状态机与失败回滚 | dir=TD
+node a1 "原始配置行" blue
+node a2 "config_read_line<br/>截掉 # 注释" teal
+node a3 "删除全部空白<br/>空行则跳过" gray
+node a4 "process_line<br/>判 [Interface]/[Peer]" purple
+node a5 "key_match<br/>大小写不敏感前缀匹配" amber
+node a6 "parse_* 系列<br/>字段解析置标志位" green
+node a7 "config_read_finish<br/>校验 peer 公钥" red
+node a8 "free_wgdevice<br/>失败即回滚" red
+edge a1 -> a2 "逐行读入"
+edge a2 -> a3 "清洗"
+edge a3 -> a4 "非空行"
+edge a4 -> a5 "段内键"
+edge a5 -> a6 "命中"
+edge a6 -> a7 "全部读完"
+edge a6 -> a8 "解析失败"
+edge a7 -> a8 "缺公钥"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「原始配置行」经 `config_read_line` 截掉 `#` 注释，再「删除全部空白、空行则跳过」，进入 `process_line` 判断 `[Interface]/[Peer]` 段，再由 `key_match` 做大小写不敏感的前缀匹配，命中后调用 `parse_* 系列`解析字段并置标志位；全部读完后 `config_read_finish` 校验每个 peer 的公钥，任一环节失败都转到 `free_wgdevice` 整树回滚。
+
+`config_read_cmd()` 是同一套 `parse_*` 函数的另一条入口：它不读文件，而是把 `wg set` 的 argv 按「listen-port/fwmark/private-key/peer/endpoint/allowed-ips/persistent-keepalive/preshared-key/remove」逐项解析，最终产出同样形状的 `wgdevice` 树。这意味着「配置文件写法」与「命令行写法」在字段语义上严格一致，差异只在键名连字符化（`ListenPort` → `listen-port`）与密钥的来源（内联 base64 vs 文件路径）。理解这一点，就能解释为什么 `wg syncconf` 与 `wg setconf` 能接受同一种文件格式、以及为什么 `wg showconf` 的输出可以直接回填为配置文件。
+
+### 5. 配置/命令/代码实例
+
+下面给出一个覆盖全部八键、包含行内注释与 IPv6 endpoint 的规范配置，用于说明解析规则的实际作用：
+
+```ini
+[Interface] # 接口段，可与 [PEER] 混用大小写
+PrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=
+ListenPort = 51820
+FwMark = 0xca6c
+
+[Peer]
+PublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=
+PresharedKey = /UwcSPg38hW/D9Y3tcS1FOV0K1wuURMbS0sesJEP5ak=
+AllowedIPs = 10.192.122.3/32, 10.192.124.1/24
+AllowedIPs = +192.168.0.0/16
+Endpoint = [2607:5300:60:6b0::c05f:543]:2468
+PersistentKeepalive = 25
+```
+
+注意两处细节：一是 `[Interface] # 接口段...` 这类行内注释——`config_read_line()` 会先把 `#` 及之后全部截掉，留下 `[Interface]`，因此段标题仍然成立；二是第二条 `AllowedIPs = +192.168.0.0/16` 的加号，它会被 `parse_ip_prefix()` 识别，清除本 peer 的 `WGPEER_REPLACE_ALLOWEDIPS` 标志，从而把这条地址「增量追加」到前一条之后，而不是替换掉。把这段配置写入文件并应用：
+
+```bash
+wg setconf wg0 /etc/wireguard/wg0.conf
+wg showconf wg0
+```
+
+`wg showconf` 是解析器输出树的逆向序列化，可用来核对解析结果（示例输出，具体格式需对照实际版本核验）：
+
+```text
+[Interface]
+ListenPort = 51820
+FwMark = 0xca6c
+PrivateKey = yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=
+
+[Peer]
+PublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=
+PresharedKey = /UwcSPg38hW/D9Y3tcS1FOV0K1wuURMbS0sesJEP5ak=
+AllowedIPs = 10.192.122.3/32, 10.192.124.1/24, 192.168.0.0/16
+Endpoint = [2607:5300:60:6b0::c05f:543]:2468
+PersistentKeepalive = 25
+```
+
+逐行判读如下。第一段 `[Interface]` 是 `showconf` 重新生成的段标题，与原始文件里的大小写写法无关，说明解析器只认 `strcasecmp` 结果、不保留原文。`ListenPort = 51820` 来自 `parse_port()`：它对字符串 "51820" 调用 `getaddrinfo`（`ai_socktype=SOCK_DGRAM`、`ai_protocol=IPPROTO_UDP`、`ai_flags=AI_PASSIVE`），取 `sin_port` 经 `ntohs` 得 51820，并置 `WGDEVICE_HAS_LISTEN_PORT`——所以端口其实支持服务名写法，并非只能填数字。`FwMark = 0xca6c` 来自 `parse_fwmark()`：因前缀 `0x` 按 16 进制 `strtoul` 得 0xca6c，置 `WGDEVICE_HAS_FWMARK`；若写 `off` 则得到 0 同样置位，表示关闭。`PrivateKey` 一行原样回显（在正常权限下 showconf 会显示私钥），它由 `parse_key()` 经 `key_from_base64()` 解出 32 字节，长度不符或尾字符不是 `=` 会直接报 `Key is not the correct length or format` 并清零缓冲区。转到 `[Peer]`：`PublicKey` 由 `wg pubkey` 从私钥派生，是 peer 唯一必填项，`config_read_finish()` 就靠它校验。`PresharedKey` 与 `PublicKey` 走同一个 `parse_key()`，只是置不同标志位。最关键的是 `AllowedIPs` 那行：原始文件写了两条，输出被合并成一条逗号列表，且 `+192.168.0.0/16` 的加号消失了——因为 `parse_ip_prefix()` 用掉加号后只留下标志语义，序列化时三条地址已平铺为同一链表；这也证明 `+` 是「增量」而非「字面前缀」。`Endpoint` 的 `[IPv6]:port` 写法来自 `parse_endpoint()` 的方括号分支：它要求匹配的 `]` 后紧跟冒号与端口，再用 `getaddrinfo` 解析成 sockaddr，域名形式还会触发重试。`PersistentKeepalive = 25` 由 `parse_persistent_keepalive()` 用 `strtoul` 得到 25 并置 `WGPEER_HAS_PERSISTENT_KEEPALIVE_INTERVAL`；写 `off` 则得 0 表示关闭。整段输出与输入的一一对应，正是「配置即解析结果」的最佳注脚。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是误判注释边界。`config_read_line()` 用 `strchr(input, COMMENT_CHAR)` 找第一个 `#`，注释可从行中任意位置开始；但 `wg-quick` 的 `parse_options()` 对 Pre/Post 钩子刻意保留原文（用 `unstripped_value`），所以「`#` 一定是注释」这条规则对钩子不成立——两套解析器在此分歧，跨工具复用配置时要格外小心。第二个陷阱是空白被全部删除：`config_read_line()` 删的是行内所有 `char_is_space`，不仅前后导。这意味着 `AllowedIPs = 10.0.0.1 / 32` 会被清洗成 `10.0.0.1/32` 而意外「合法」，与很多人以为的「空格导致错误」相反；但反过来，依赖空格分隔的钩子命令在交给 wg 解析时会被压掉，所幸这类键本就不属于 wg 原生配置。第三个陷阱是键名匹配的前缀特性：`get_value()` 只比较前 `keylen` 个字符且大小写不敏感，它并不校验键名边界，源码通过「先删空白、键后紧跟 `=`」的写法规避了大部分歧义，但自造类似 `ListenPortExtra = 1` 的键不会被当成 `ListenPort`——因为 `key_match("ListenPort=")` 要求等号紧跟，这一细节是安全的关键。
+
+第四个陷阱是 CIDR 主机位。`parse_allowedips()` 在设置 cidr 后会调用 `validate_netmask()`，若网络前缀里主机位非零，只打印 `Warning: AllowedIP has nonzero host part` 而不拒绝——地址仍会被接受。把 `10.0.0.5/24` 当成「10.0.0.5 这个地址的 /24 网段」是常见误用，实际网段仍是 10.0.0.0/24，warning 是唯一提醒。缺省掩码规则也要记牢：IPv4 不带 `/` 时取 32，IPv6 取 128。第五个陷阱是 endpoint 解析的阻塞行为：`parse_endpoint()` 的 DNS 解析带重试，超时从 1 秒按 `×6/5` 递增、上限 20 秒，重试次数默认 15，可用环境变量 `WG_ENDPOINT_RESOLUTION_RETRIES` 调整（设为 `infinity` 表示无限）；写错域名或 DNS 不可用时，`wg setconf` 会「卡住」很久才报错，排障时应先确认解析。第六个陷阱是密钥编码的严格性：`key_from_base64()` 硬性要求 44 字符且倒数第二位为 `=`，`key_from_hex()` 要求 64 个十六进制字符，多一个换行或少一个填充符都失败——从网页复制密钥时带入不可见字符是高频故障。
+
+最佳实践可归纳为四点：其一，配置写好后先用 `wg showconf` 往返一次，比对解析后的规范化输出，能立即暴露注释、空白、`+`/`-` 前缀造成的语义偏差；其二，私钥与预共享密钥用 `wg genkey`/`wg genpsk` 生成并妥善保管，内联写配置时确认无多余字符，命令行则用文件路径形式（走 `parse_keyfile()`，允许尾随空白）；其三，AllowedIPs 一律写规范网络地址并显式带掩码，不要依赖 `validate_netmask()` 的 warning 来纠正错误；其四，批量改动用 `wg syncconf` 而非 `wg setconf`，前者只读差异、不动未变化 peer，避免全量替换带来的会话抖动（语义见 04-02）。凡解析报错，先按 `Line unrecognized`、`Key is not the correct length or format`、`A peer is missing a public key` 这几条固定文本定位到对应函数，再回头核对原始行——错误消息本身就是最准确的导航。字段归属去 05-09，调用链机制去 06-14，模块职责去 07-13。
+
+### 7. 小结与延伸阅读
+
+本篇把 WireGuard 配置文件格式与 ini 解析规则还原为可核查的源码事实：格式基于 INI，只有 `[Interface]` 与 `[Peer]` 两段，允许多个 `[Peer]`、一个 `[Interface]`，`#` 起注释、行内空白被全删、键名大小写不敏感。解析由 `config_ctx` 状态机驱动，`config_read_line()` 清洗、`process_line()` 分派、`key_match` 匹配、`parse_*` 系列把字符串填入 uapi 结构并置 `WGDEVICE_*`/`WGPEER_*` 标志，`config_read_finish()` 强制每个 peer 有公钥，任何失败都 `free_wgdevice` 整树回滚。八个原生键的解析函数、取值规则与标志位已在第 2 节表格中列全；base64/hex 的严格长度、`+`/`-` 前缀的增量语义、endpoint 的重试退避、CIDR 主机位告警等易错点均已逐条标注。这套规则同时支撑 `setconf`、`addconf`、`syncconf` 与命令行 `set`，是全册配置语义的共同底座。
+
+延伸阅读建议按三条线走：命令与参数层面，`wg` 命令全集见 04-01、`setconf/syncconf` 差异见 04-02、wg-quick 扩展键见 04-03；机制层面，netlink 配置通道见 06-14、AllowedIPs trie 的路由决策见 06-07；结构层面，uapi 配置结构与字段见 05-09，模块职责见 07-13。跨册随查按（字段见 05-09 ｜ 参数见 04-01 ｜ 原理见 06-14 ｜ 模块见 07-13）执行：结构体逐字段去 05、命令参数去 04 的对应篇、机制与调用链去 06、目录级模块能力去 07。凡本篇标注「需对照实际版本核验」的错误文本、默认值与重试参数，均以 `_wglinux_build/upstream_src/wireguard-tools/src/` 下 `config.c`、`config.h`、`ctype.h`、`encoding.c`、`encoding.h` 与 `man/wg.8` 为准，本套资料不编造未核验的路径与取值。
+
+## 04-05 netlink 通用族命令与属性全集（WG_CMD_* / WG_attr_*）
+
+### 1. 背景与动机
+
+WireGuard Linux 的配置面既不在配置文件里，也不在某种进程间私有协议里，而是完整架在 Linux 内核的通用 netlink（generic netlink）之上。理解这一点，才能明白为什么 `wg set`、`wg show`、`wg syncconf` 这些看起来平平无奇的用户态命令，最终都能精准落到内核接口与 peer 的状态上，而全程不需要任何常驻守护进程。本篇是 04 册中关于「命令与属性」的唯一权威源：我们把 `enum wg_cmd` 的两条命令，以及 device、peer、allowedip 三层属性枚举的全部成员，按源码逐项列出，说明它们的数值、载荷类型、读写方向和在线嵌套层次。凡本篇出现的命令号与属性号，均以本快照 `include/uapi/linux/wireguard.h` 为准；该文件顶部用注释明确写着「Do not edit directly, auto-generated from: Documentation/netlink/specs/wireguard.yaml」，并标注 YNL-GEN 与 `tools/net/ynl/ynl-regen.sh` 重新生成方式。也就是说，本快照里的编号是生成结果，而不是某位维护者手写的魔法数字，这在跨内核版本比对时尤其关键：不同内核快照里同一属性若发生增删，编号可能整体位移，因此「按名字引用、不按数字硬编码」是读懂并使用这套 uapi 的基本纪律。
+
+本篇与紧随其后的 04-06 是同源两篇，分工要分清。本篇聚焦「怎么通信、有哪些命令与属性、属性在线上如何组织」；04-06 聚焦「每个常量与标志的精确数值、MAX 宏如何推导、用户态结构定义长什么样」。换句话说，本篇是语义与在线格式视角，04-06 是数值与结构视角，二者互为索引而不相互替代。本套资料的版本基准统一为「wireguard-linux stable 分支内核驱动快照 + wireguard-tools 1.0.20260223」，下文凡出现源码路径均相对 `_wglinux_build/upstream_src/`，规范中为节约篇幅省略前缀；用户态 netlink 实现读 `wireguard-tools/src/ipc-linux.h` 与 `wireguard-tools/src/netlink.h`。由于内核与工具链持续演进，个别字段的类型与方向标注需对照目标系统实际版本核验，这一点会在第 6 节集中说明。
+
+### 2. 核心概念
+
+通用 netlink 的第一层抽象是「族」（family）。族有名字也有动态编号：名字是字符串 `WG_GENL_NAME`，值为 `"wireguard"`；编号是内核在模块注册时分配的一个 16 位整数，用户态必须先通过 `NETLINK_GENERIC` 通道发送 `CTRL_CMD_GETFAMILY`、携带 `CTRL_ATTR_FAMILY_NAME`，才能取回 `CTRL_ATTR_FAMILY_ID`。这就是 `netlink.h` 中 `mnlg_socket_open()` 的核心动作：它把族名换成族 id，存进 `struct mnlg_socket` 的 `id` 字段，同时把版本（由 `WG_GENL_VERSION` 传入，值为 1）存进 `version` 字段。此后所有消息头里的 `nlmsg_type` 填的都不是族名而是这个动态 id，这正是「通用」二字的含义——族编号随加载顺序变化，硬编码必然出错。
+
+第二层抽象是「命令」。每条通用 netlink 消息在 `nlmsghdr` 之后跟着一个 `struct genlmsghdr`，其中 `cmd` 字段填的就是 `enum wg_cmd` 的取值，`version` 字段填族版本。本快照的 `enum wg_cmd` 只有两条：`WG_CMD_GET_DEVICE`（读）与 `WG_CMD_SET_DEVICE`（写），二者数值分别为 0 与 1，末尾哨兵 `__WG_CMD_MAX` 为 2，对外宏 `WG_CMD_MAX` 定义为 `__WG_CMD_MAX - 1`，即 1。全部配置与查询动作都被压缩进这两条命令：写操作把 device 及嵌套其内的 peer、allowedip 一次性发给内核，读操作把内核当前状态回吐给用户态。
+
+第三层抽象是「属性」。属性是 netlink 的 TLV（类型—长度—值）单元，`struct nlattr` 的 `nla_type` 低 14 位就是属性值，`nla_len` 是含头总长，净荷紧跟其后。WireGuard 把属性分成三层：device 层 `wgdevice_attribute`、peer 层 `wgpeer_attribute`、allowedip 层 `wgallowedip_attribute`。三层之间用「嵌套属性」串接：device 的 `WGDEVICE_A_PEERS` 内嵌若干 peer，每个 peer 的 `WGPEER_A_ALLOWEDIPS` 又内嵌若干 allowedip，嵌套属性在 `nla_type` 上置 `NLA_F_NESTED` 标志位。用户态 `netlink.h` 的 `mnl_attr_nest_start()` 正是干这件事——它把 `NLA_F_NESTED | type` 写进 `nla_type`，再用 `mnl_attr_nest_end()` 回填长度。
+
+第四层是「标志位」。标志属性本身只是承载一个 u32 位图，真正的语义在 `wgdevice_flag`、`wgpeer_flag`、`wgallowedip_flag` 三组枚举里。这里有个极容易混淆的点：用户态 `containers.h` 里还有一套 `WGDEVICE_HAS_PRIVATE_KEY`、`WGPEER_REMOVE_ME` 之类的位，它们与 uapi 里的 `WGDEVICE_F_REPLACE_PEERS`、`WGPEER_F_REMOVE_ME` 不是同一套。前者是用户态描述「本结构体哪些字段有效、要做何种操作」的内部标记，后者才是真正编码进 netlink 属性 `WGDEVICE_A_FLAGS` / `WGPEER_A_FLAGS` / `WGALLOWEDIP_A_FLAGS` 的线上值。两套值在语义上有映射关系（如用户态 `WGPEER_REMOVE_ME = 1<<0` 映射为 uapi `WGPEER_F_REMOVE_ME = 1`），但绝不能把它们当成同一个宏来用。第 5 节会用代码展示这套映射的实际写法。
+
+### 3. 关键数据结构与源码位置
+
+要读懂这套命令与属性，需要把 uapi 声明与用户态实现两头对照。权威声明文件是 `wireguard-linux-src/include/uapi/linux/wireguard.h`，它虽然只有八十行，却定义了族名、族版本、密钥长度、三组标志、三层属性枚举与命令枚举；由于是 YNL 生成物，它同时也是内核侧与用户态共同遵守的契约。用户态实现的主文件是 `wireguard-tools/src/ipc-linux.h`，其中 `kernel_set_device()` 负责装配 SET 请求，`kernel_get_device()` 负责发起 GET 请求，`kernel_get_wireguard_interfaces()` 负责枚举接口；底层 TLV 拼装与通用 netlink 封装则在 `wireguard-tools/src/netlink.h`，关键结构是 `struct mnlg_socket`，它把 socket 句柄、缓冲区、族 id、版本、序列号与端口 id 打包在一起。承载用户态语义的结构定义在 `wireguard-tools/src/containers.h`：`struct wgdevice`、`struct wgpeer`、`struct wgallowedip`，以及跨平台的 `struct timespec64`。下表把本篇反复引用的源码位置收拢成速查。
+
+| 关注点 | 真实源码路径 | 本篇用途 |
+|---|---|---|
+| 命令与属性枚举声明 | `wireguard-linux-src/include/uapi/linux/wireguard.h` | 逐项列出命令号与属性号的唯一依据 |
+| 用户态 netlink 主实现 | `wireguard-tools/src/ipc-linux.h` | 展示 SET/GET 消息如何装配与解析 |
+| 通用 netlink 封装与族解析 | `wireguard-tools/src/netlink.h` | 解释 mnlg_socket_open 与嵌套属性拼装 |
+| 用户态配置结构与内部标志 | `wireguard-tools/src/containers.h` | 对照 HAS_* 位与 uapi F_* 位的区别 |
+
+为便于逐项查阅，下面三张表把三层属性枚举的全部成员按数值顺序列出，并标注载荷类型与方向。「方向」指该属性在 `WG_CMD_SET_DEVICE`（写）与 `WG_CMD_GET_DEVICE`（读）中的出现情况；标注「GET」的属于内核回吐的统计或派生字段，用户态 SET 请求不会携带。
+
+| WGDEVICE_A_* 成员（device 层） | 数值 | 载荷类型 | 方向 |
+|---|---|---|---|
+| WGDEVICE_A_UNSPEC | 0 | 无（占位） | 无 |
+| WGDEVICE_A_IFINDEX | 1 | U32 | GET |
+| WGDEVICE_A_IFNAME | 2 | STRING | SET/GET |
+| WGDEVICE_A_PRIVATE_KEY | 3 | 二进制 32 字节 | SET/GET |
+| WGDEVICE_A_PUBLIC_KEY | 4 | 二进制 32 字节 | GET |
+| WGDEVICE_A_FLAGS | 5 | U32 位图 | SET |
+| WGDEVICE_A_LISTEN_PORT | 6 | U16 | SET/GET |
+| WGDEVICE_A_FWMARK | 7 | U32 | SET/GET |
+| WGDEVICE_A_PEERS | 8 | NESTED | SET/GET |
+| __WGDEVICE_A_LAST | 9 | 哨兵，非有效属性 | 无 |
+
+device 层属性之后是 peer 层属性全集，见下表。
+
+| WGPEER_A_* 成员（peer 层） | 数值 | 载荷类型 | 方向 |
+|---|---|---|---|
+| WGPEER_A_UNSPEC | 0 | 无（占位） | 无 |
+| WGPEER_A_PUBLIC_KEY | 1 | 二进制 32 字节 | SET/GET |
+| WGPEER_A_PRESHARED_KEY | 2 | 二进制 32 字节 | SET/GET |
+| WGPEER_A_FLAGS | 3 | U32 位图 | SET |
+| WGPEER_A_ENDPOINT | 4 | sockaddr（IPv4/IPv6） | SET/GET |
+| WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL | 5 | U16 | SET/GET |
+| WGPEER_A_LAST_HANDSHAKE_TIME | 6 | timespec64 二进制 | GET |
+| WGPEER_A_RX_BYTES | 7 | U64 | GET |
+| WGPEER_A_TX_BYTES | 8 | U64 | GET |
+| WGPEER_A_ALLOWEDIPS | 9 | NESTED | SET/GET |
+| WGPEER_A_PROTOCOL_VERSION | 10 | U32 | GET |
+| __WGPEER_A_LAST | 11 | 哨兵，非有效属性 | 无 |
+
+peer 层再往下是 allowedip 层属性全集，见下表。
+
+| WGALLOWEDIP_A_* 成员（allowedip 层） | 数值 | 载荷类型 | 方向 |
+|---|---|---|---|
+| WGALLOWEDIP_A_UNSPEC | 0 | 无（占位） | 无 |
+| WGALLOWEDIP_A_FAMILY | 1 | U16（AF_INET/AF_INET6） | SET/GET |
+| WGALLOWEDIP_A_IPADDR | 2 | 二进制 4 或 16 字节 | SET/GET |
+| WGALLOWEDIP_A_CIDR_MASK | 3 | U8 | SET/GET |
+| WGALLOWEDIP_A_FLAGS | 4 | U32 位图 | SET |
+| __WGALLOWEDIP_A_LAST | 5 | 哨兵，非有效属性 | 无 |
+
+在消息格式层面，一条 SET 请求从外到内是：`struct nlmsghdr`（`nlmsg_type` 为动态族 id，`nlmsg_flags` 含 `NLM_F_REQUEST | NLM_F_ACK`）→ `struct genlmsghdr`（`cmd = WG_CMD_SET_DEVICE`，`version = 1`）→ 若干 device 层属性。device 层里 `WGDEVICE_A_IFNAME` 总是第一个放进去的，作为定位接口的主键；随后是私钥、监听端口、fwmark 等标量属性，最后才是 `WGDEVICE_A_PEERS` 嵌套块。GET 请求则只带 `WGDEVICE_A_IFNAME`，并置 `NLM_F_DUMP`，表示期望内核把该接口的完整状态以多段消息回吐。理解「外层是 genlmsghdr，内层是三层 TLV」这件事，是读懂后面所有属性表的钥匙。
+
+### 4. 关键流程与调用链
+
+先说族解析。`mnlg_socket_open(WG_GENL_NAME, WG_GENL_VERSION)` 在 `netlink.h` 第 731 行定义：它打开一个 `NETLINK_GENERIC` 的 raw socket，用 `MNL_SOCKET_AUTOPID` 自动绑定并拿到端口 id，然后构造 `CTRL_CMD_GETFAMILY` 请求，属性填 `CTRL_ATTR_FAMILY_NAME = "wireguard"`，发送后由 `get_family_id_cb()` 回调从响应的 `CTRL_ATTR_FAMILY_ID` 取出族 id 存入 `nlg->id`。有一个细节值得记住：若查不到族（模块未加载），内核返回 `ENOENT`，该函数把它翻译成 `EPROTONOSUPPORT` 返回——这就是为什么模块没插时 `wg show` 报的错看起来像「协议不支持」而不是「找不到族」。拿到 id 后，`mnlg_msg_prepare()`（`__mnlg_msg_prepare` 的薄封装）为每条命令重填 nlmsghdr 与 genlmsghdr，序列号用 `time(NULL)` 生成。
+
+再说 SET 路径。`kernel_set_device()` 先打开族，再 `mnlg_msg_prepare(nlg, WG_CMD_SET_DEVICE, NLM_F_REQUEST | NLM_F_ACK)`，随后 `mnl_attr_put_strz(nlh, WGDEVICE_A_IFNAME, dev->name)` 把接口名写进去。接着是一串按用户态标志条件触发的标量属性：有 `WGDEVICE_HAS_PRIVATE_KEY` 就放 32 字节 `WGDEVICE_A_PRIVATE_KEY`；有 `WGDEVICE_HAS_LISTEN_PORT` 就放 u16 的 `WGDEVICE_A_LISTEN_PORT`；有 `WGDEVICE_HAS_FWMARK` 就放 u32 的 `WGDEVICE_A_FWMARK`；有 `WGDEVICE_REPLACE_PEERS` 就把 uapi 的 `WGDEVICE_F_REPLACE_PEERS` 置进一个局部 flags，非空时才放 `WGDEVICE_A_FLAGS`。peer 部分从 `WGDEVICE_A_PEERS` 嵌套开始，对每个 peer 再开一层匿名嵌套，依次放 `WGPEER_A_PUBLIC_KEY`、可选的预共享密钥、endpoint（IPv4 用 `sockaddr_in`、IPv6 用 `sockaddr_in6`）、keepalive 间隔，以及 peer 的 `WGPEER_A_FLAGS`；每个 peer 的 allowedip 又嵌在 `WGPEER_A_ALLOWEDIPS` 里。所有写入都用 `*_check` 变体并传入 `SOCKET_BUFFER_SIZE`，一旦消息超过一页缓冲区就跳到 `toobig_peers` / `toobig_allowedips` 标签收尾发送，外层用 `goto again` 把剩余 peer 分到下一条消息，避免溢出。
+
+最后说 GET 路径。`kernel_get_device()` 同样打开族，但用 `WG_CMD_GET_DEVICE` 加 `NLM_F_DUMP`，只带接口名；`mnlg_socket_recv_run()` 循环收包，交给 `read_device_cb()` → `parse_device()` 逐属性解析，`WGDEVICE_A_PEERS` 触发 `parse_peers()`，`WGPEER_A_ALLOWEDIPS` 触发 `parse_allowedips()`，层层回填到用户态结构。解析完成后 `coalesce_peers()` 把公钥相同的 peer 合并、拼接其 allowedip 链表，因为 dump 可能把同一 peer 拆成多段返回。接口枚举则走另一条路：`kernel_get_wireguard_interfaces()` 用 `NETLINK_ROUTE` 的 `RTM_GETLINK`，在 `IFLA_LINKINFO` 里放 `IFLA_INFO_KIND = WG_GENL_NAME`，按「接口类型」而非 genetlink 族来筛出所有 wireguard 接口。族解析、SET、GET 三者的关系见图 04-05-01。
+
+:::figure id=04-05-01 | name=通用 netlink 配置面的族解析与 SET/GET 双路径 | dir=TD
+node c1 "wg 命令<br/>set / show" blue
+node c2 "mnlg_socket_open<br/>CTRL_CMD_GETFAMILY" teal
+node c3 "CTRL_ATTR_FAMILY_ID<br/>动态族 id" purple
+node c4 "WG_CMD_SET_DEVICE<br/>NLM_F_REQUEST|ACK" green
+node c5 "WG_CMD_GET_DEVICE<br/>NLM_F_REQUEST|ACK|DUMP" green
+node c6 "device 层属性<br/>IFNAME/KEY/PORT/FLAGS" gray
+node c7 "PEERS 嵌套<br/>peer 层属性" gray
+node c8 "ALLOWEDIPS 嵌套<br/>allowedip 层属性" gray
+node c9 "内核驱动状态<br/>device/peer/trie" red
+node c10 "逐层 parse_* 回调<br/>coalesce_peers" amber
+edge c1 -> c2 "族名解析"
+edge c2 -> c3 "取 id"
+edge c3 -> c4 "写路径"
+edge c3 -> c5 "读路径"
+edge c4 -> c6 "组属性"
+edge c6 -> c7 "嵌套"
+edge c7 -> c8 "嵌套"
+edge c8 -> c9 "写入内核"
+edge c5 -> c10 "收包解析"
+edge c10 -> c9 "还原状态"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「wg 命令 set/show」先经「mnlg_socket_open 发 CTRL_CMD_GETFAMILY」拿到「CTRL_ATTR_FAMILY_ID 动态族 id」；写路径是「WG_CMD_SET_DEVICE」依次组「device 层属性」「PEERS 嵌套 peer 层属性」「ALLOWEDIPS 嵌套 allowedip 层属性」再写入「内核驱动状态」；读路径是「WG_CMD_GET_DEVICE」由「逐层 parse_* 回调 coalesce_peers」把多段响应还原为「内核驱动状态」的对等视图。
+
+### 5. 配置/命令/代码实例
+
+下面这段命令展示了从用户态视角触发上述两条命令的典型写法；它们是理解属性流向的入口，具体参数语义属 04-01、04-02 范畴，本篇只关心它们最终落到哪个命令与属性。
+
+```bash
+# 写路径：触发 WG_CMD_SET_DEVICE，携带 device 与 peer 属性
+wg set wg0 private-key ./privatekey listen-port 51820 fwmark 42
+wg set wg0 peer <对端公钥> endpoint 203.0.113.9:51820 allowed-ips 10.0.0.2/32
+
+# 读路径：触发 WG_CMD_GET_DEVICE（带 NLM_F_DUMP）
+wg show wg0
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+interface: wg0
+  public key: <本端公钥>
+  private key: (hidden)
+  listening port: 51820
+  fwmark: 0x2a
+peer: <对端公钥>
+  endpoint: 203.0.113.9:51820
+  allowed ips: 10.0.0.2/32
+  persistent keepalive: every 25 seconds
+  latest handshake: 8 seconds ago
+  transfer: 2.10 KiB received, 1.44 KiB sent
+```
+
+逐行判读如下。首行 `interface: wg0` 来自 `WG_CMD_GET_DEVICE` 响应中的 `WGDEVICE_A_IFNAME` 属性，它既是 SET 请求里的定位主键，也是 dump 结果的分组标识，确认查询命中了正确接口。第二行 `public key` 由私钥经 Curve25519 派生，对应 `WGDEVICE_A_PUBLIC_KEY`，是内核回吐的属性而非用户态计算后显示的值；对端必须用同一个值配置，否则握手静默失败。第三行 `private key: (hidden)` 说明工具刻意不回显 32 字节私钥，但底层 `WGDEVICE_A_PRIVATE_KEY` 属性确实在内核里存在且可经 netlink 读写，`hidden` 只是展示层保护。第四行 `listening port: 51820` 对应 u16 类型的 `WGDEVICE_A_LISTEN_PORT`，来自前面 `wg set ... listen-port` 写入的属性。第五行 `fwmark: 0x2a` 对应 u32 的 `WGDEVICE_A_FWMARK`，十进制 42 即十六进制 0x2a，用于策略路由打标。第六行 `peer:` 起一个 peer 段，对应 `WGPEER_A_PUBLIC_KEY`；一个接口下可有多个这样的段，彼此由 `WGDEVICE_A_PEERS` 嵌套层分隔。第七行 `endpoint` 对应 `WGPEER_A_ENDPOINT`，其载荷是 `sockaddr_in` 或 `sockaddr_in6` 结构而非纯字符串，解析时靠 `sa_family` 区分 IPv4 与 IPv6。第八行 `allowed ips` 同时对应 `WGALLOWEDIP_A_IPADDR` 与 `WGALLOWEDIP_A_CIDR_MASK`，二者嵌在 `WGPEER_A_ALLOWEDIPS` 里，决定「源地址校验」与「出向选路」两件事。第九行 `persistent keepalive` 对应 u16 的 `WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL`，单位为秒。第十行 `latest handshake` 对应二进制时间戳属性 `WGPEER_A_LAST_HANDSHAKE_TIME`（编译期按 `struct timespec64` 的 16 字节布局传递），是判断隧道是否真正可用的核心。第十一行 `transfer` 分别对应 u64 的 `WGPEER_A_RX_BYTES` 与 `WGPEER_A_TX_BYTES`，只有握手成功且 allowedips 正确时才会增长。整个输出没有任何一行来自本地配置文件——全部是内核经 `WG_CMD_GET_DEVICE` 回吐的属性渲染结果，这正是「配置面在 netlink」的最直接证据。
+
+为了把 uapi 声明与用户态装配对照起来，下面给出 uapi 头中的命令枚举与用户态 `kernel_set_device()` 里装配标志的精简片段（保留真实枚举名与位值，节选以便阅读）。
+
+```c
+/* wireguard-linux-src/include/uapi/linux/wireguard.h（节选） */
+enum wg_cmd {
+	WG_CMD_GET_DEVICE,
+	WG_CMD_SET_DEVICE,
+	__WG_CMD_MAX
+};
+#define WG_CMD_MAX (__WG_CMD_MAX - 1)
+
+enum wgdevice_flag {
+	WGDEVICE_F_REPLACE_PEERS = 1,
+};
+enum wgpeer_flag {
+	WGPEER_F_REMOVE_ME = 1,
+	WGPEER_F_REPLACE_ALLOWEDIPS = 2,
+	WGPEER_F_UPDATE_ONLY = 4,
+};
+```
+
+```c
+/* wireguard-tools/src/ipc-linux.h 的 kernel_set_device()（节选） */
+if (dev->flags & WGDEVICE_REPLACE_PEERS)
+	flags |= WGDEVICE_F_REPLACE_PEERS;   /* 用户态位 → uapi 标志 */
+if (flags)
+	mnl_attr_put_u32(nlh, WGDEVICE_A_FLAGS, flags);
+if (peer->flags & WGPEER_REMOVE_ME)
+	flags |= WGPEER_F_REMOVE_ME;
+if (peer->flags & WGPEER_REPLACE_ALLOWEDIPS)
+	flags |= WGPEER_F_REPLACE_ALLOWEDIPS;
+```
+
+第一段 C 代码是 uapi 的权威声明：注意 `WG_CMD_MAX` 用哨兵减一推导，而三组标志全都是显式的 1、2、4，即标准位图布局。第二段 C 代码揭示了「用户态内部位」到「线上标志属性」的映射：左边 `dev->flags & WGDEVICE_REPLACE_PEERS` 是 `containers.h` 里的用户态位，右边 `WGDEVICE_F_REPLACE_PEERS` 才是填进 `WGDEVICE_A_FLAGS` 的 uapi 值。像 `WGDEVICE_HAS_PRIVATE_KEY` 这类 `HAS_*` 位不会出现在这段映射里，因为它们只决定「要不要放某个属性」，而不被编码成标志值本身。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把动态族 id 当成固定值。族编号由内核注册顺序决定，绝不能把某次 `CTRL_CMD_GETFAMILY` 得到的 id 写死；正确做法始终是先 `mnlg_socket_open()` 解析族名再发命令。第二个陷阱是混淆两套标志。用户态 `HAS_*` 是「字段有效位」，只在本地结构体里用；`F_*` 才是线上位图。把 `WGPEER_HAS_PRESHARED_KEY`（值 8）误当成 uapi 的 `WGPEER_F_*` 发出去，属性语义会完全错乱。第三个陷阱是忽略缓冲区分片。`kernel_set_device()` 用一页大小的 `SOCKET_BUFFER_SIZE`（`mnl_ideal_socket_buffer_size()` 在页大小大于 8192 时截断为 8192）拼装消息，peer 或 allowedip 很多时必须依赖 `goto again` 分多条消息发送；自己实现工具时若照搬「一条消息塞全部」的写法，会在 peer 规模大时静默失败。
+
+第四个陷阱是属性顺序与嵌套标志。`WGDEVICE_A_IFNAME` 必须作为 SET 请求的主键首先出现；嵌套属性必须用 `NLA_F_NESTED` 置位（由 `mnl_attr_nest_start()` 完成），且嵌套结束要正确回填长度，否则内核解析会错位。第五个陷阱是把 dump 的中断当致命错误：`kernel_get_wireguard_interfaces()` 对 `NLM_F_DUMP_INTR` 返回 `EINTR` 时选择接受部分结果而非无限重试，因为繁忙系统上隧道增删很常见；`kernel_get_device()` 则对 `EINTR` 用 `goto try_again` 重试。第六个陷阱是接口名长度：`kernel_get_device()` 在 `strlen(iface) >= IFNAMSIZ` 时直接返回 `ENAMETOOLONG`，因为 libmnl 不校验缓冲区，必须先挡住超长名。第七个陷阱是误用 `WGPEER_F_UPDATE_ONLY`。该位值为 4，语义是「只更新已存在的 peer，不要新建」；若在一个尚不存在的公钥上设置它，内核不会自动建出 peer，配置会看似成功却毫无效果。它与 `WGPEER_F_REMOVE_ME`（删除 peer）互斥，同一条 SET 里同时置位属于自相矛盾的请求。第八个陷阱是属性类型与字节序。netlink 属性按主机字节序传递，`mnl_attr_put_u16` / `u32` / `u64` 写入的是本地字节序，跨机器或跨架构抓包解读时必须按本机序解析；`mnl_attr_validate()` 用 `MNL_TYPE_U8` / `U16` / `U32` / `U64` 做长度校验，类型不符会被拒绝，因此自定义实现必须严格按第 3 节表格里的类型放值，例如 CIDR 掩码是 u8、端点家族是 u16、流量计数是 u64，任何一位写错都会让内核的策略校验失败并返回错误。
+
+最佳实践：把 uapi 头当契约、把 YAML spec 当源头——要确认某属性的类型与方向，先看生成它的 `Documentation/netlink/specs/wireguard.yaml`，再看生成结果 `wireguard.h`；写工具时用 `*_check` 系列函数并制定分片策略；解析一律做类型与长度校验（如 `MNL_TYPE_U16` / `MNL_TYPE_U64`），不要信任对端属性；遇到未识别的新属性（例如本快照枚举里存在但用户态 `parse_peer()` 未处理 `WGPEER_A_PROTOCOL_VERSION`）应跳过而非报错，以兼容后续内核新增字段。这些做法的底层机制属 06-14，模块职责属 07-11，均需对照实际版本核验。
+
+### 7. 小结与延伸阅读
+
+本篇把 WireGuard Linux 配置面的命令与属性全集收束成一张可查的地图：族名 `WG_GENL_NAME = "wireguard"` 经 `CTRL_CMD_GETFAMILY` 换成动态族 id；命令只有 `WG_CMD_GET_DEVICE`（读，带 dump）与 `WG_CMD_SET_DEVICE`（写，带 ACK）两条；属性分 device、peer、allowedip 三层，通过 `NLA_F_NESTED` 的 `PEERS` 与 `ALLOWEDIPS` 嵌套串接；标志以 u32 位图承载，用户态 `HAS_*` 与 uapi `F_*` 是两套必须分清的位域。读写两条路径分别由 `kernel_set_device()` 与 `kernel_get_device()` 实现，解析靠 `parse_device` → `parse_peers` → `parse_peer` → `parse_allowedips` → `parse_allowedip` 逐层回调，最后 `coalesce_peers()` 合并分段结果。本篇给出的 attribute 枚举逐项数值与类型是命令与属性的权威口径，具体常量的精确数值与结构定义见紧邻的 04-06。
+
+延伸阅读建议：命令的用户态语法读 04-01、04-02，本篇只解释它们落到哪条 netlink 命令；netlink 通道与用户态交互的底层原理读 06-14；用户态结构逐字段读 05-09。跨册随查按（字段见 05-09 ｜ 配置见 03-02 ｜ 原理见 06-14 ｜ 模块见 07-11）执行：结构体逐字段去 05、部署与配置体系去 03、机制与调用链去 06、目录级模块能力去 07。凡本篇标注「需对照实际版本核验」的属性类型、方向与错误码，均以 `_wglinux_build/upstream_src/` 下 `include/uapi/linux/wireguard.h`、`wireguard-tools/src/ipc-linux.h` 与 `netlink.h` 为准，本套资料不编造未核验的路径与取值。
+
+## 04-06 uapi wireguard.h 常量、标志与结构定义全集
+
+### 1. 背景与动机
+
+如果说 04-05 回答的是「配置面怎么通信、有哪些命令与属性」，那么本篇回答的是更底层也更容易被忽略的问题：「这些命令与属性在头文件里到底长什么样、精确数值是多少」。在内核与用户态的边界上，uapi 头文件是双方共同编译进各自二进制的那份契约，任何一个宏的拼写或数值被误读，都会造成用户态发出的请求被内核拒绝，或者两边对同一位标志的理解分道扬镳。本篇把 `wireguard-linux-src/include/uapi/linux/wireguard.h` 里的每一个 `#define`、每一个 `enum` 的每一个成员及其数值、三个 `*_MAX` 宏的推导方式，以及用户态承载同一批数据的结构定义，逐项列成可查的清单。这是全册关于常量的唯一权威源：其他册若需引用 `WG_KEY_LEN`、`WGPEER_F_REMOVE_ME` 之类，只给最小片段并回指本篇，绝不在这里重复展开。
+
+先立一条规矩：这份头文件是不能手改的。文件第 2 至第 5 行明确写着「Do not edit directly, auto-generated from: Documentation/netlink/specs/wireguard.yaml」「YNL-GEN uapi header」「To regenerate run: tools/net/ynl/ynl-regen.sh」。它位于内核树的 `include/uapi/linux/` 之下，意味着一旦进入发行版内核头文件包，就对全部用户态程序可见；修改它却不同步 YAML 规范，下次 `ynl-regen.sh` 会覆盖你的改动。因此读这份文件的正确姿势是：把它当生成产物，追根溯源去读 `Documentation/netlink/specs/wireguard.yaml`（本快照未包含该 YAML，故本篇所有数值均以生成后的头文件为准，涉及规范原文处需对照目标内核源码树核验）。文件头的 SPDX 行是 `((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause)`，这种双许可声明让它在 GPL 内核与 BSD 风格用户态代码里都能合法使用，是与「WireGuard 代码刻意采用宽松许可」这一设计取向一致的细节。
+
+本篇与 04-05 同源但视角不同：04-05 讲语义与在线格式，本篇讲数值与结构；本篇列出的 #define 值与位图值，是阅读 `ipc-linux.h`、分析 netlink 抓包、核对 `wg show` 输出的前提。版本基准仍为「wireguard-linux stable 分支内核驱动快照 + wireguard-tools 1.0.20260223」，源码路径相对 `_wglinux_build/upstream_src/` 省略前缀；用户态结构定义取自 `wireguard-tools/src/containers.h` 与 `contrib/embeddable-wg-library/wireguard.h`。
+
+### 2. 核心概念
+
+理解这份头文件，要分清三类不同的「数值来源」。第一类是 `#define` 指定的宏：`WG_GENL_NAME`、`WG_GENL_VERSION`、`WG_KEY_LEN`，它们的值由文件直接给出，分别是 `"wireguard"`、1、32，没有任何推导。第二类是 C 枚举成员的自动编号：`enum wg_cmd` 与三层属性枚举里，从 `WG_CMD_GET_DEVICE`、`WGDEVICE_A_UNSPEC` 等第一个成员开始，编译器自动从 0 递增赋值，所以 UNSPEC 恒为 0、后续成员依次加一。这也是为什么在任何一份该头文件里，`WGDEVICE_A_IFNAME` 永远是 2、`WGPEER_A_PROTOCOL_VERSION` 永远是 10——不是谁规定了这个数字，而是它在枚举里排在第三个和第十一个位置。第三类是显式赋值的标志位：`WGDEVICE_F_REPLACE_PEERS = 1`、`WGPEER_F_REMOVE_ME = 1`、`WGPEER_F_REPLACE_ALLOWEDIPS = 2`、`WGPEER_F_UPDATE_ONLY = 4`、`WGALLOWEDIP_F_REMOVE_ME = 1`，它们被写成 1、2、4 而非自动编号，一看就是位图（bitmask），每个值占一个独立的二进制位，可以按位或组合。
+
+每类枚举末尾都有一个双下划线哨兵，例如 `__WGDEVICE_A_LAST`、`__WGPEER_A_LAST`、`__WGALLOWEDIP_A_LAST`、`__WG_CMD_MAX`。哨兵本身不是有效属性或命令，它只是「最后一个成员再加一」的占位符，用来自动算出对外公开的 `*MAX` 宏：`#define WGDEVICE_A_MAX (__WGDEVICE_A_LAST - 1)`、`#define WGPEER_A_MAX (__WGPEER_A_LAST - 1)`、`#define WGALLOWEDIP_A_MAX (__WGALLOWEDIP_A_LAST - 1)`、`#define WG_CMD_MAX (__WG_CMD_MAX - 1)`。以 device 层为例，`__WGDEVICE_A_LAST` 因为排在 `WGDEVICE_A_PEERS` 之后自动取值为 9，于是 `WGDEVICE_A_MAX` 等于 8，正好是最后一个有效属性 `WGDEVICE_A_PEERS` 的值。这套「哨兵减一」写法在内核里非常常见，好处是新增属性时只需在哨兵前插一行，MAX 自动跟着长，不会忘记更新。
+
+密钥长度 `WG_KEY_LEN = 32` 是本篇最该记住的常量之一。它规定 Curve25519 私钥、公钥与预共享密钥在 netlink 上传输时都是 32 字节原始二进制。注意这里有一个高频误解：配置文件里看到的 `wg genkey` 输出是 44 字符的 base64 文本（外加一个结尾 NUL，共 45 字节），那是编码后的形式，不是 `WG_KEY_LEN` 本身。`contrib/embeddable-wg-library/wireguard.h` 里的 `typedef char wg_key_b64_string[((sizeof(wg_key) + 2) / 3) * 4 + 1];` 精确解释了换算：32 字节按每 3 字节一组编码成 4 个 base64 字符，`(32+2)/3*4 = 44`，再加一字节 NUL 得 45。把 44 当成密钥长度去写 netlink 属性，会让属性载荷长度对不上而被内核拒绝。
+
+第三个要点是「uapi 头文件里有没有结构体」。答案是没有——这份 `wireguard.h` 只含 `#define` 与 `enum`，不定义任何 `struct`。真正随 netlink 载荷出现的数据结构定义在用户态：内部实现用 `wireguard-tools/src/containers.h` 的 `struct wgdevice` / `struct wgpeer` / `struct wgallowedip`， embeddable 库用同名但 typedef 风格的 `wg_device` / `wg_peer` / `wg_allowedip`；内核侧对应的结构（`wg_device`、`wg_peer` 等）则在驱动源码里，逐字段解读属 05 册。本篇把用户态这几个结构列全，是为了说明「一份 32 字节密钥、一个 u16 端口、一组 u64 计数器」在跨越 netlink 前后分别落在哪个成员的哪个位置，这正是常量与结构定义全集的意义。
+
+### 3. 关键数据结构与源码位置
+
+围绕这份头文件的源码位置形成一条清晰链路。源头是 `wireguard-linux-src/Documentation/netlink/specs/wireguard.yaml`（本快照未收录，需对照目标内核源码树），生成物是 `wireguard-linux-src/include/uapi/linux/wireguard.h`，重生成脚本是内核树的 `tools/net/ynl/ynl-regen.sh`；三者构成「规范—生成结果—重生成工具」的闭环。消费者一端在内核：`drivers/net/wireguard/` 下各源文件（本快照中该目录未见独立的 `netlink.c`，说明内核侧 netlink 代码已随 YNL 框架生成或移入公共路径，具体位置需对照目标内核版本核验）；另一端在用户态：`wireguard-tools/src/ipc-linux.h` 用这些枚举装配与解析消息，`wireguard-tools/src/containers.h` 定义承载数据的人员结构，`contrib/embeddable-wg-library/wireguard.h` 提供可嵌入第三方程序的公共 API。版本字符串另有出处：`drivers/net/wireguard/version.h` 的 `WIREGUARD_VERSION` 为 `"1.0.0"`，`wireguard-tools/src/version.h` 的 `WIREGUARD_TOOLS_VERSION` 为 `"1.0.20260223"`，二者与 `WG_GENL_VERSION`（1）是三个互不相同的「版本」，不能混用。下表把本篇涉及的常量与结构位置收拢成速查。
+
+| 关注点 | 真实源码路径 | 本篇用途 |
+|---|---|---|
+| uapi 常量与枚举权威声明 | `wireguard-linux-src/include/uapi/linux/wireguard.h` | 逐项数值的唯一依据 |
+| 生成来源与重生成脚本 | `Documentation/netlink/specs/wireguard.yaml`、`tools/net/ynl/ynl-regen.sh` | 解释「不可手改」与版本差异 |
+| 用户态内部结构与内部标志 | `wireguard-tools/src/containers.h` | 给出 HAS_* 位与结构字段 |
+| 可嵌入公共 API 与结构 | `wireguard-tools/contrib/embeddable-wg-library/wireguard.h` | 给出密钥 base64 长度换算与 typedef 结构 |
+
+先把 uapi 头中全部 `#define` 与哨兵/MAX 宏的数值列成一张常量全集表。这些值要么由 `#define` 直接给出，要么由枚举位置自动推导，都是编译期常量。
+
+| 常量或宏 | 精确值 | 来源方式 |
+|---|---|---|
+| WG_GENL_NAME | "wireguard" | `#define` 直接给出 |
+| WG_GENL_VERSION | 1 | `#define` 直接给出 |
+| WG_KEY_LEN | 32 | `#define` 直接给出 |
+| WG_CMD_MAX | 1 | `__WG_CMD_MAX`(2) 减 1 |
+| WGDEVICE_A_MAX | 8 | `__WGDEVICE_A_LAST`(9) 减 1 |
+| WGPEER_A_MAX | 10 | `__WGPEER_A_LAST`(11) 减 1 |
+| WGALLOWEDIP_A_MAX | 4 | `__WGALLOWEDIP_A_LAST`(5) 减 1 |
+
+先给出 uapi 头中最核心的三组标志位全集表。它们不是自动编号，而是显式位值，因此每一位的含义都必须逐项记牢。
+
+| 枚举 | 成员 | 精确值 | 含义 |
+|---|---|---|---|
+| wgdevice_flag | WGDEVICE_F_REPLACE_PEERS | 1 | 用本次提供的 peer 集合整体替换原有 peer |
+| wgpeer_flag | WGPEER_F_REMOVE_ME | 1 | 删除该公钥对应的 peer |
+| wgpeer_flag | WGPEER_F_REPLACE_ALLOWEDIPS | 2 | 用本次 allowedip 集合替换该 peer 原有集合 |
+| wgpeer_flag | WGPEER_F_UPDATE_ONLY | 4 | 只更新已存在的 peer，不新建 |
+| wgallowedip_flag | WGALLOWEDIP_F_REMOVE_ME | 1 | 删除该 allowedip 条目 |
+
+再看用户态 `containers.h` / embeddable 库里那套内部标志表。它们与 uapi 的 `F_*` 位同名前缀相似但数值体系独立，是本篇最需要提醒读者分清的地方。
+
+| 结构层级 | 用户态内部标志 | 精确值 | 与 uapi 标志的关系 |
+|---|---|---|---|
+| device | WGDEVICE_REPLACE_PEERS | 1<<0 | 映射为 WGDEVICE_F_REPLACE_PEERS |
+| device | WGDEVICE_HAS_PRIVATE_KEY | 1<<1 | 仅标记字段有效，不编码成标志位 |
+| device | WGDEVICE_HAS_PUBLIC_KEY | 1<<2 | 仅标记字段有效，不编码成标志位 |
+| device | WGDEVICE_HAS_LISTEN_PORT | 1<<3 | 仅标记字段有效，不编码成标志位 |
+| device | WGDEVICE_HAS_FWMARK | 1<<4 | 仅标记字段有效，不编码成标志位 |
+| peer | WGPEER_REMOVE_ME | 1<<0 | 映射为 WGPEER_F_REMOVE_ME |
+| peer | WGPEER_REPLACE_ALLOWEDIPS | 1<<1 | 映射为 WGPEER_F_REPLACE_ALLOWEDIPS |
+| peer | WGPEER_HAS_PUBLIC_KEY | 1<<2 | 仅标记字段有效，不编码成标志位 |
+| peer | WGPEER_HAS_PRESHARED_KEY | 1<<3 | 仅标记字段有效，不编码成标志位 |
+| peer | WGPEER_HAS_PERSISTENT_KEEPALIVE_INTERVAL | 1<<4 | 仅标记字段有效，不编码成标志位 |
+| allowedip | WGALLOWEDIP_REMOVE_ME | 1<<0 | 映射为 WGALLOWEDIP_F_REMOVE_ME |
+
+### 4. 关键流程与调用链
+
+常量的「生命周期」是从 YAML 规范到两端二进制的一条单向链。`wireguard.yaml` 描述族名、命令与各属性的类型和约束；`ynl-regen.sh` 读取它，按 YNL 模板生成 `include/uapi/linux/wireguard.h`；这份头文件随内核头文件包发布，被内核驱动代码与用户态 `ipc-linux.h` 同时 `#include <linux/wireguard.h>`。于是 `WG_CMD_SET_DEVICE`、`WGDEVICE_A_IFNAME`、`WGPEER_F_REMOVE_ME` 这些符号在两边拥有完全相同的数值，这正是契约的意义。任何绕过头文件、在某一侧手写数字的写法，都会在这条链上埋下不一致的隐患。理解这条链，也就理解了为什么本快照缺少独立的 `netlink.c` 并不奇怪——随着 netlink 规范化的推进，越来越多的解析代码由 YNL 从 YAML 生成，手写文件自然会减少甚至消失，具体布局需对照目标内核版本核验。
+
+第二条链是「用户态标志到位图属性」的转换。`kernel_set_device()` 在发送前检查 `dev->flags` 与 `peer->flags` 里的 `HAS_*` 与操作位：每个 `HAS_*` 决定要不要放对应属性（例如 `HAS_LISTEN_PORT` 决定放 `WGDEVICE_A_LISTEN_PORT`），而 `REPLACE_PEERS`、`REMOVE_ME`、`REPLACE_ALLOWEDIPS` 这几个操作位则被翻译成 uapi 的 `F_*` 值，按位或成 u32，写进 `WGDEVICE_A_FLAGS` 或 `WGPEER_A_FLAGS`。注意 `WGPEER_F_UPDATE_ONLY` 在 uapi 里有定义（值 4），但本快照的 `kernel_set_device()` 装配代码里并未出现对应的用户态标志，说明它是协议层保留给其他实现或未来工具的能力，wg 工具当前未必用到——这类「uapi 有、用户态暂不用」的字段，阅读时要如实标注，不可臆造调用点。
+
+第三条链是「密钥长度从常量到 base64」。`wg genkey` 生成 32 字节随机私钥（内部 `wg_key[32]`），`wg pubkey` 由私钥经 Curve25519 派生同样 32 字节的公钥；它们对外以 base64 文本呈现，长度由 `wg_key_b64_string[((sizeof(wg_key)+2)/3)*4+1]` 算得 45 字节（44 字符加 NUL）。当 `wg set` 解析配置时，`encoding.c` 把 44 字符 base64 解码回 32 字节，`kernel_set_device()` 再以 `sizeof(dev->private_key)`（即 `WG_KEY_LEN`）为长度放进 `WGDEVICE_A_PRIVATE_KEY` 属性。三条链的关系，以及常量在其中的落点，见图 04-06-01。
+
+:::figure id=04-06-01 | name=从 YAML 规范到 uapi 常量再到用户态结构的单向链 | dir=LR
+node d1 "wireguard.yaml<br/>netlink 规范源头" blue
+node d2 "ynl-regen.sh<br/>YNL 生成器" teal
+node d3 "wireguard.h<br/>#define 与 enum" purple
+node d4 "内核驱动<br/>编译期常量" green
+node d5 "ipc-linux.h<br/>装配与解析属性" green
+node d6 "containers.h<br/>wgdevice/wgpeer 结构" gray
+node d7 "WG_KEY_LEN=32<br/>原始密钥字节" amber
+node d8 "base64 44 字符<br/>+1 NUL = 45" red
+edge d1 -> d2 "读取规范"
+edge d2 -> d3 "生成头文件"
+edge d3 -> d4 "内核引入"
+edge d3 -> d5 "用户态引入"
+edge d5 -> d6 "填充结构"
+edge d6 -> d7 "密钥入属性"
+edge d7 -> d8 "编码呈现"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：源头「wireguard.yaml netlink 规范」经「ynl-regen.sh YNL 生成器」产出「wireguard.h #define 与 enum」，这份头文件同时被「内核驱动编译期常量」与「ipc-linux.h 装配与解析属性」引入；用户态由「containers.h wgdevice/wgpeer 结构」承载数据，其中「WG_KEY_LEN=32 原始密钥字节」在对外展示时被编码成「base64 44 字符 +1 NUL = 45」。
+
+### 5. 配置/命令/代码实例
+
+下面第一块代码把 uapi 头里的命令枚举、三组标志与三层属性枚举的关键部分按真实数值标注出来（在源码里大多数成员不显式写数值，这里为便于查阅补全了推导结果，不改变其含义）；第二块代码用 shell 验证密钥长度与 base64 换算。随后给出示例输出与逐行判读。
+
+```c
+/* wireguard-linux-src/include/uapi/linux/wireguard.h 数值全解（推导值以注释标出） */
+#define WG_GENL_NAME    "wireguard"
+#define WG_GENL_VERSION 1
+#define WG_KEY_LEN      32
+
+enum wg_cmd {
+	WG_CMD_GET_DEVICE,   /* 0 */
+	WG_CMD_SET_DEVICE,   /* 1 */
+	__WG_CMD_MAX         /* 2 */
+};
+#define WG_CMD_MAX (__WG_CMD_MAX - 1)   /* 1 */
+
+enum wgdevice_attribute {
+	WGDEVICE_A_UNSPEC,      /* 0 */
+	WGDEVICE_A_IFINDEX,     /* 1 */
+	WGDEVICE_A_IFNAME,      /* 2 */
+	WGDEVICE_A_PRIVATE_KEY, /* 3 */
+	WGDEVICE_A_PUBLIC_KEY,  /* 4 */
+	WGDEVICE_A_FLAGS,       /* 5 */
+	WGDEVICE_A_LISTEN_PORT, /* 6 */
+	WGDEVICE_A_FWMARK,      /* 7 */
+	WGDEVICE_A_PEERS,       /* 8 */
+	__WGDEVICE_A_LAST       /* 9 */
+};
+#define WGDEVICE_A_MAX (__WGDEVICE_A_LAST - 1)   /* 8 */
+
+enum wgpeer_flag {
+	WGPEER_F_REMOVE_ME = 1,          /* bit0 */
+	WGPEER_F_REPLACE_ALLOWEDIPS = 2, /* bit1 */
+	WGPEER_F_UPDATE_ONLY = 4,        /* bit2 */
+};
+```
+
+```bash
+# 生成私钥并导出公钥，随后核对长度换算
+wg genkey | tee privatekey | wg pubkey > publickey
+wc -c privatekey            # 期望 45：44 个 base64 字符 + 1 个 NUL
+awk '{print length($0)}' privatekey   # 期望 44
+grep -E 'WG_GENL_NAME|WG_GENL_VERSION|WG_KEY_LEN' /usr/include/linux/wireguard.h
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+$ wc -c privatekey
+45 privatekey
+$ awk '{print length($0)}' privatekey
+44
+$ grep -E 'WG_GENL_NAME|WG_GENL_VERSION|WG_KEY_LEN' /usr/include/linux/wireguard.h
+#define WG_GENL_NAME    "wireguard"
+#define WG_GENL_VERSION 1
+#define WG_KEY_LEN      32
+```
+
+逐行判读如下。第一组 `wc -c privatekey` 输出 45，表示私钥文件在磁盘上占 45 字节，这正好对应 embeddable 库里 `wg_key_b64_string` 的数组大小 45——44 个有效 base64 字符加上 C 字符串结尾的 NUL，说明 `wg genkey` 输出的是文本形式而非 32 字节裸密钥；若你误以为文件里存的是 32 字节原始数据，就会在长度换算上出错。第二组 `awk '{print length($0)}'` 输出 44，排除 NUL 后得到纯 base64 字符数，与公式 `(32+2)/3*4 = 44` 完全吻合，反过来验证了 `WG_KEY_LEN = 32` 这一常量：`wg_key[32]` 每 3 字节编码成 4 字符，32 字节需要 11 组编码容量，即 44 字符。第三组是从系统头文件里 grep 出的三个宏：`WG_GENL_NAME "wireguard"` 是通用 netlink 族名，`mnlg_socket_open()` 正是拿它去解析族 id，字符串内容必须与内核 `MODULE_ALIAS_GENL_FAMILY` 注册的族名逐字一致，否则查族会失败；`WG_GENL_VERSION 1` 是族版本，`genlmsghdr.version` 填的就是它，版本不匹配的内核会拒绝请求；`WG_KEY_LEN 32` 是密钥原始字节长度，`WGDEVICE_A_PRIVATE_KEY`、`WGPEER_A_PUBLIC_KEY`、`WGPEER_A_PRESHARED_KEY` 三个二进制属性的载荷长度都必须是它。这三行合起来说明：配置文件里看到的字符串、netlink 上传输的二进制、头文件里的宏，是同一份密钥的三种表达，常量是贯穿三者的换算基准。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是手改生成的 uapi 头文件。它是 YNL 从 `wireguard.yaml` 生成的产物，改了会被 `ynl-regen.sh` 覆盖，而且会让自己与内核其他消费者的契约不一致；正确做法是改规范再重新生成，或向上游报告需求。第二个陷阱是混淆三个版本：族版本 `WG_GENL_VERSION = 1`、驱动版本 `WIREGUARD_VERSION = "1.0.0"`、工具版本 `WIREGUARD_TOOLS_VERSION = "1.0.20260223"`，三者数值与用途完全不同，任何「把 1.0.0 当成 netlink 版本」的想法都是错的。第三个陷阱是把 base64 长度当密钥长度：`WG_KEY_LEN` 恒为 32 字节，44 是编码后长度，45 是含 NUL 的字符串数组大小，三者别混。
+
+第四个陷阱是把用户态 `HAS_*` 位当成 uapi 标志发出去。回想第 3 节第二张表：`WGDEVICE_HAS_PRIVATE_KEY = 1<<1` 只是「本结构里私钥有效」的本地标记，若直接拿去填 `WGDEVICE_A_FLAGS`，内核会把它解释成 `WGDEVICE_F_REPLACE_PEERS` 之外的未知位，行为不可预期；正确做法是像 `kernel_set_device()` 那样先判断 `HAS_*` 决定放哪些属性，再把操作位单独翻译成 `F_*` 值。第五个陷阱是忽略哨兵与 MAX 宏：`__WGDEVICE_A_LAST` 等双下划线成员是内部占位符，绝不能当有效属性值发送；对外校验属性上界要用 `WGDEVICE_A_MAX` 这类减一后的宏，而不是哨兵本身。第六个陷阱是把 `WGPEER_A_PROTOCOL_VERSION`（属性号 10）当成用户态可写字段：它在 uapi 枚举里存在，但本快照 `ipc-linux.h` 的 `parse_peer()` 没有对应 case，属于内核回吐、用户态参考实现暂不解析的字段，具体语义需对照生成它的 YAML 规范与实际内核版本核验。第七个陷阱是假设头文件里能找到 `struct wgdevice`：它不在 uapi 头里，而在 `containers.h` 与 embeddable 库，内核结构则在驱动源码（字段见 05 册）。
+
+最佳实践：遇到任何常量先回头文件确认数值，再回 YAML 确认语义；写解析代码时用 `*_MAX` 做上界校验、遇到大于 MAX 的未知属性选择跳过以兼容新内核；密钥处理全程以 `WG_KEY_LEN` 为长度基准，只在输入输出边界做 base64 编解码；跨版本比对时以「枚举成员名」而非数字为锚点，因为新增成员会让后续数字位移。遵循这些做法，才能让这份常量全集真正成为可靠的权威源，而不是一堆易错的数字。
+
+### 7. 小结与延伸阅读
+
+本篇把 `include/uapi/linux/wireguard.h` 的常量、标志与结构定义逐项落定：三个 `#define`（`WG_GENL_NAME = "wireguard"`、`WG_GENL_VERSION = 1`、`WG_KEY_LEN = 32`）；`enum wg_cmd` 的 GET/SET 两条命令与 `WG_CMD_MAX = 1`；device、peer、allowedip 三层属性枚举及其 `__*_LAST` 哨兵与 `*MAX` 宏（8、10、4）；三组标志的精确位值（REPLACE_PEERS=1，REMOVE_ME=1，REPLACE_ALLOWEDIPS=2，UPDATE_ONLY=4）；以及用户态 `struct wgdevice` / `wgpeer` / `wgallowedip` 与 `struct timespec64` 的字段布局，并厘清了用户态 `HAS_*` 位与 uapi `F_*` 位的两套体系。核心结论是：uapi 头只含宏与枚举、不含结构体，它是从 YAML 生成、不可手改的双许可契约；32 字节原始密钥经 base64 变成 44 字符、加 NUL 成 45 字节，这是贯穿配置、netlink 与头文件的换算基准。
+
+延伸阅读：命令与属性的语义、类型与在线格式见 04-05；密钥生成与分发的部署视角见 03-03；用户态配置结构逐字段详解见 05-09；netlink 通道的底层机制见 06-14。跨册随查按（字段见 05-09 ｜ 部署见 03-03 ｜ 原理见 06-14 ｜ 模块见 07-11）执行：结构体逐字段去 05、部署场景去 03、机制与调用链去 06、目录级模块能力去 07。凡本篇标注「需对照实际版本核验」的规范原文与内核侧 netlink 代码位置，均以 `_wglinux_build/upstream_src/` 下对应文件为准，本套资料不编造未核验的路径与取值。
+
+## 04-07 内核模块参数、sysfs 与 ethtool 接口全集
+
+### 1. 背景与动机
+
+在运维与集成实践中，关于 WireGuard Linux「到底有哪些可调接口」的误解非常普遍。习惯了其他内核驱动的管理员，往往会先去找模块加载参数，再去翻 `/sys/class/net/wg0/` 下形如 `public_key`、`private_key`、`listen_port`、`fwmark` 的属性文件，接着跑 `ethtool` 查看卸载特性；当这些操作全部落空时，就容易得出「这个驱动没有接口」「配置只能靠黑盒工具」一类错误结论。本篇的任务是把这些接口问题一次性钉死：以本快照源码为唯一依据，逐一回答「内核模块参数有没有」「WireGuard 专属 sysfs 属性有没有」「ethtool 支持有没有」「真正的内核对外接口是什么」。凡是源码中找不到证据的，一律明确写出「本快照中不存在」，而不是照抄旧版本或其他实现的记忆，这正是本册作为参数与接口唯一权威源必须承担的责任。
+
+先交代快照边界，因为这直接决定哪些结论能被证据支撑。`drivers/net/wireguard/` 目录中实际存在 `main.c`、`device.c`、`peer.c`、`allowedips.c`、`noise.c`、`send.c`、`receive.c`、`socket.c`、`timers.c`、`ratelimiter.c`、`cookie.c`、`queueing.h` 以及各 `.h` 文件；`drivers/net/wireguard/Makefile` 第 16 行虽然写了 `wireguard-y += netlink.o generated/netlink.o`，但 `netlink.c` 与 `generated/` 目录并未随本快照提供；`sysfs.c` 则根本不在编译清单里，目录中也不存在该文件。换句话说，被广泛引用的那些 sysfs 属性名，在本快照中没有任何源码落点，把它们当成现状写进资料是典型的以讹传讹。因此本文对「存在什么」给出确定结论；对「netlink 配置路径内部返回哪些 errno」这类必须读 `netlink.c` 才能断定的细节，则明确标注「需对照实际版本核验」，绝不虚构文件路径与取值。用户态工具侧以 wireguard-tools 1.0.20260223 快照为准，其 `ipc.c`、`ipc-linux.h`、`config.c`、`set.c`、`show.c` 都可用来核实参数校验与报错行为。
+
+本文把「接口」拆成四层来谈，这是理解全部问题的钥匙。第一层是构建期开关，即 `CONFIG_WIREGUARD` 与 `CONFIG_WIREGUARD_DEBUG` 两个 Kconfig 符号，它们决定驱动是否被编译、是否打开调试路径；第二层是 rtnetlink 建链接口，由 `device.c` 的 `link_ops` 实现，负责 `ip link add wg0 type wireguard` 这类设备生命周期操作；第三层是 generic netlink 配置接口，由族名 `WG_GENL_NAME`、版本 `WG_GENL_VERSION` 与 `WG_CMD_GET_DEVICE` / `WG_CMD_SET_DEVICE` 两条命令构成，是密钥、peer、allowedip、监听端口、fwmark 等配置数据的唯一通道；第四层是内核 net core 提供的通用 sysfs 文件，例如 `/sys/class/net/wg0/mtu` 与 `/sys/class/net/wg0/ifindex`，它们由通用网络代码生成，不是 WireGuard 驱动自己注册的专属属性。四层之外，`fwmark` 是一个横跨配置面与数据面的特殊属性，值得单独展开。把这四层混在一起谈，是理解偏差的根源；分开来看，每个问题的答案都很直接。
+
+需要强调的是，本篇不写指向自身的参数引用。命令行的完整选项在 04-01、04-02、04-03、04-04，netlink 命令与属性的全集在 04-05，uapi 常量、标志与结构定义在 04-06；本篇只处理「内核对外暴露面」这一主题，并对上述同册篇章做正向交叉引用，而不是把本应承担的权威结论推给别人。
+
+### 2. 核心概念
+
+第一层概念是「构建期开关不是运行时参数」。在 `drivers/net/Kconfig` 第 74 行，`config WIREGUARD` 被定义为 `tristate "WireGuard secure network tunnel"`，依赖 `NET && INET`，并 `select NET_UDP_TUNNEL`、`DST_CACHE`、`CRYPTO_LIB_CURVE25519`、`CRYPTO_LIB_CHACHA20POLY1305`、`CRYPTO_LIB_UTILS`；第 92 行 `config WIREGUARD_DEBUG` 是 `bool "Debugging checks and verbose messages"`，依赖 `WIREGUARD`。`drivers/net/wireguard/Makefile` 第 1 行 `ccflags-y := -D'pr_fmt(fmt)=KBUILD_MODNAME ": " fmt'` 为所有源文件统一设置日志前缀，第 2 行 `ccflags-$(CONFIG_WIREGUARD_DEBUG) += -DDEBUG` 把 Kconfig 开关翻译成编译期的 `DEBUG` 宏。这意味着：改变调试行为必须重新编译模块，不能在 `insmod` 时通过参数切换；全树对 `module_param` 的检索在 `wireguard-linux-src` 下没有任何命中，因此本快照的 WireGuard 驱动没有运行时模块参数。
+
+第二层概念是「rtnetlink 建链接口极小」。`device.c` 的 `netdev_ops`（第 236 至 240 行）只有三个回调：`ndo_open = wg_open`、`ndo_stop = wg_stop`、`ndo_start_xmit = wg_xmit`；`link_ops`（第 407 至 412 行）只有 `kind = KBUILD_MODNAME`、`priv_size = sizeof(struct wg_device)`、`setup = wg_setup`、`newlink = wg_newlink` 四项。`main.c` 第 77 行的 `MODULE_ALIAS_RTNL_LINK(KBUILD_MODNAME)` 让 `ip link add wg0 type wireguard` 能自动加载模块。这里没有 `ethtool_ops`，没有 `ndo_get_stats64`，也没有 `ndo_set_config`——那类回调在别的内核网卡驱动里常见，但本快照的 WireGuard 并未注册。因此 `ethtool wg0` 能查询的只是内核网络栈的通用信息，不存在任何 WireGuard 专属的 ethtool 命令、统计项或可调开关。
+
+第三层概念是「配置数据全部走 generic netlink」。uapi 头 `include/uapi/linux/wireguard.h` 第 10 至 13 行定义 `WG_GENL_NAME "wireguard"`、`WG_GENL_VERSION 1`、`WG_KEY_LEN 32`；第 72 至 78 行的 `enum wg_cmd` 只有 `WG_CMD_GET_DEVICE` 与 `WG_CMD_SET_DEVICE`。device / peer / allowedip 三层属性枚举分别在第 29、44、61 行开始，其中 `WGDEVICE_A_FWMARK` 在第 37 行、`WGDEVICE_A_LISTEN_PORT` 在第 36 行、`WGDEVICE_A_PRIVATE_KEY` 与 `WGDEVICE_A_PUBLIC_KEY` 在第 33、34 行。用户态 `wireguard-tools/src/ipc.c` 的 `ipc_get_device` 与 `ipc_set_device`（第 78 至 98 行）在支持内核接口时按接口名分流：已由用户态接管的接口走 `userspace_get_device` / `userspace_set_device`，否则走 `kernel_get_device` / `kernel_set_device`，后者在 `ipc-linux.h` 中用 `mnlg_socket_open(WG_GENL_NAME, WG_GENL_VERSION)` 打开通用族套接字。属性全集不在这里展开，见 04-05、04-06。
+
+第四层概念是「通用 sysfs 不等于 WireGuard 接口」。`/sys/class/net/wg0/` 下的 `address`、`ifindex`、`mtu`、`operstate`、`carrier`、`statistics/` 等文件由内核 net core 针对每个 `net_device` 统一生成，任何网卡都有，它们反映 `wg_setup` 写进 netdev 的字段与运行时统计，不提供读取私钥或改写密钥的能力。对 `drivers/net/wireguard/` 全树检索 `DEVICE_ATTR`、`sysfs`、`module_param` 均无线索（唯一与 sysfs 相关的命中在 `drivers/net/Kconfig` 第 336 行，属于其他驱动的依赖表达式），所以「WireGuard 专属 sysfs 属性」在本快照中的结论是明确的：没有。
+
+第五个概念是 `fwmark`，它是上述四层里唯一真正跨越配置面与数据面的属性。`device.h` 第 55 行在 `struct wg_device` 中声明 `u32 fwmark`，紧邻第 56 行的 `u16 incoming_port`；uapi 侧对应 `WGDEVICE_A_FWMARK`。`socket.c` 第 27 行把 `wg->fwmark` 写入 IPv4 的 `flowi4.mark`，第 36 行写入 `skb->mark`，第 104、115 行对 IPv6 做同样处理。用户态 `config.c` 第 103 行的报错串 `Fwmark is neither 0/off nor 0-0xffffffff` 说明其合法范围是 0 或 0 到 0xffffffff，`set.c` 第 21 行的用法串也列出 `fwmark <mark>`。于是 `wg set wg0 fwmark 0x1a` 写入内核后，既能影响出包路由查询（配合 `ip rule fwmark` 做策略路由），又会体现在报文的 mark 上。
+
+### 3. 关键数据结构与源码位置
+
+下表把本篇反复引用的源码位置收拢成一张全集表。表中「是否存在」一栏是本快照的硬结论，不依赖猜测。
+
+| 接口类别 | 本快照是否存在 | 入口标识 | 真实源码位置 | 结论要点 |
+|---|---|---|---|---|
+| 运行时模块参数 | 不存在 | 无 `module_param` | `drivers/net/wireguard/` 全目录检索 | 全树无命中，无 `insmod` 期可调参数 |
+| 构建期开关 | 存在 | `CONFIG_WIREGUARD` / `CONFIG_WIREGUARD_DEBUG` | `drivers/net/Kconfig:74,92`；`Makefile:1-2` | tristate 与 bool，改后需重编译 |
+| WireGuard 专属 sysfs 属性 | 不存在 | 无 `DEVICE_ATTR`、无 `sysfs.c` | `drivers/net/wireguard/` 目录与 `Makefile:3-16` | 编译清单无 sysfs.o，目录无该文件 |
+| 通用网卡 sysfs 文件 | 存在（由 net core 提供） | `/sys/class/net/wg0/mtu` 等 | 内核网络核心，`wg_setup` 写 netdev 字段 | 非 WireGuard 注册，不含密钥属性 |
+| ethtool 专属操作 | 不存在 | 无 `ethtool_ops` | `device.c:236-240` 的 `netdev_ops` | 仅 open/stop/start_xmit 三回调 |
+| rtnetlink 建链 | 存在 | `rtnl_link_ops` / `KBUILD_MODNAME` | `device.c:407-412`、`main.c:77` | `ip link add/del wg0 type wireguard` |
+| generic netlink 配置 | 存在 | `WG_CMD_GET_DEVICE` / `WG_CMD_SET_DEVICE` | `include/uapi/linux/wireguard.h:72-78` | 密钥、peer、端口、fwmark 唯一通道 |
+| fwmark 属性 | 存在 | `WGDEVICE_A_FWMARK`、`wg->fwmark` | `device.h:55`、`socket.c:27,36,104,115` | 配置写入 mark，数据面按 mark 路由 |
+| 监听端口属性 | 存在 | `WGDEVICE_A_LISTEN_PORT`、`incoming_port` | `socket.c:347-435`、`device.h:56` | 实际端口由 `wg_socket_reinit` 回写 |
+| netlink 配置实现文件 | 快照缺失 | `netlink.o` / `generated/netlink.o` | `Makefile:16` 引用，文件未提供 | 内部 errno 需对照实际版本核验 |
+
+下面这段代码把最容易被误传的两处结构原样贴出：驱动真正注册的 netdev 操作只有三项，rtnetlink 操作只有四项，模块别名只有两条。它们是判断「有没有 ethtool / sysfs 接口」的直接证据。
+
+```c
+/* drivers/net/wireguard/device.c:236-240 */
+static const struct net_device_ops netdev_ops = {
+	.ndo_open		= wg_open,
+	.ndo_stop		= wg_stop,
+	.ndo_start_xmit		= wg_xmit,
+};
+
+/* drivers/net/wireguard/device.c:407-412 */
+static struct rtnl_link_ops link_ops __read_mostly = {
+	.kind			= KBUILD_MODNAME,
+	.priv_size		= sizeof(struct wg_device),
+	.setup			= wg_setup,
+	.newlink		= wg_newlink,
+};
+
+/* drivers/net/wireguard/main.c:77-78 */
+MODULE_ALIAS_RTNL_LINK(KBUILD_MODNAME);
+MODULE_ALIAS_GENL_FAMILY(WG_GENL_NAME);
+```
+
+`KBUILD_MODNAME` 的值为 `wireguard`，所以两条别名分别展开为 `rtnl-link-wireguard` 与 `netlink-genl-wireguard`；`WG_GENL_NAME` 的值来自 uapi 头第 10 行。两者一个服务于 `ip link add ... type wireguard` 的模块自动加载，一个服务于 generic netlink 族查找。若在插入模块后 `modinfo wireguard` 看不到这两条 alias，说明加载的并非这份源码对应的模块，需核对构建产物（构建路径见 02-03）。
+
+除了操作表，`wg_setup` 还在 netdev 层设定了一组「没有 ethtool 也能查到」的参数。`device.c` 第 277 至 279 行的 `WG_NETDEV_FEATURES` 是 `NETIF_F_HW_CSUM | NETIF_F_RXCSUM | NETIF_F_SG | NETIF_F_GSO | NETIF_F_GSO_SOFTWARE | NETIF_F_HIGHDMA`，第 293 至 295 行同时写入 `dev->features`、`dev->hw_features`、`dev->hw_enc_features`；第 296 行 `dev->mtu = ETH_DATA_LEN - overhead`，其中 `overhead = MESSAGE_MINIMUM_LENGTH + sizeof(struct udphdr) + max(sizeof(struct ipv6hdr), sizeof(struct iphdr))`，按 `messages.h` 第 112 至 117 行的定义，`MESSAGE_MINIMUM_LENGTH` 为 `message_data_len(0)`，即 ChaCha20-Poly1305 的 16 字节认证标签加 16 字节 `message_data` 头，共 32 字节，于是典型 MTU 为 1500 减 80 等于 1420。第 297 行的 `max_mtu` 用 `round_down(INT_MAX, MESSAGE_PADDING_MULTIPLE) - overhead` 计算，`MESSAGE_PADDING_MULTIPLE` 为 16。这些是内核侧真实的「接口默认值」，比任何 ethtool 输出都更权威。
+
+### 4. 关键流程与调用链
+
+第一条链是构建与加载。`CONFIG_WIREGUARD=m` 时 Makefile 把 `main.o`、`device.o`、`peer.o` 等链接为 `wireguard.ko`；`module_init(wg_mod_init)` 在 `main.c:71` 注册入口，`wg_mod_init` 依次完成 `wg_allowedips_slab_init`、可选的 DEBUG 自检、`wg_noise_init`、`wg_peer_init`、`wg_device_init`、`wg_genetlink_init`，成功后打印两行 `pr_info`。这条链决定「哪些开关在加载前就固定了」，完整回滚路径属于错误主题，见 04-08。
+
+第二条链是建链。`ip link add wg0 type wireguard` 由 rtnetlink 依据 `MODULE_ALIAS_RTNL_LINK` 找到模块，匹配 `link_ops.kind`，先调用 `wg_setup` 设置 netdev 的头部空间、特性、MTU、标志与 `header_ops`，再调用 `wg_newlink`。`wg_newlink`（`device.c:310-405`）依次初始化锁与 allowedips、分配公钥哈希表与索引哈希表、创建三个 workqueue、初始化三条加密队列与 ratelimiter，最后 `register_netdevice(dev)` 并把 `wg_destruct` 挂到 `dev->priv_destructor`。`ip link del wg0` 触发 `wg_destruct`，逆序释放这些资源。这条链说明：netdev 对象的存在是配置与数据面的前提，所以配置前必须先有接口。
+
+第三条链是配置写入，也是 fwmark 的主线。`wg set wg0 fwmark 0x1a` 由 `wg.c` 分发到 `set.c`，解析后经 `ipc_set_device`（`ipc.c:89-98`）进入 `ipc-linux.h` 的 `kernel_set_device`，以 `WG_CMD_SET_DEVICE` 请求携带 `WGDEVICE_A_FWMARK` 发往内核；内核 netlink 层解析属性并更新 `wg->fwmark`，随后 `socket.c:27,36,104,115` 在构造 UDP 隧道报文时把该值写入 `flowi4.mark` / `flowi6.mark` 与 `skb->mark`，`ip rule` 便可用 `fwmark 0x1a` 选择路由表。需要说明：netlink 内核侧实现文件 `netlink.c` 不在本快照中，所以「属性解析的具体函数与返回码」不做断言，需对照实际版本核验；但属性常量与数据面落点是源码可证的。查询方向由 `wg show` 走 `WG_CMD_GET_DEVICE`，`ipc-linux.h:493-503` 可见其构造请求与读取回调。
+
+第四条链是只读呈现。用户读 `/sys/class/net/wg0/mtu` 时，内核 net core 返回 `wg_setup` 写入的 `dev->mtu`；`cat /sys/class/net/wg0/statistics/rx_packets` 读取的是通用统计，而 WireGuard 自己的收发字节计数由 `WGPEER_A_RX_BYTES` / `WGPEER_A_TX_BYTES` 经 netlink 暴露给 `wg show`，两者口径不同，不能互相替代。
+
+四层接口与 fwmark 的流向见图 04-07-01。
+
+:::figure id=04-07-01 | name=WireGuard Linux 的四层内核接口与 fwmark 流向 | dir=TD
+node k1 "构建期开关<br/>CONFIG_WIREGUARD(_DEBUG)" blue
+node r1 "rtnetlink link_ops<br/>ip link add wg0" teal
+node n1 "generic netlink<br/>WG_CMD_SET/GET_DEVICE" purple
+node d1 "wg_device 字段<br/>fwmark / incoming_port" green
+node w1 "wg_setup 设定<br/>netdev 特性与 MTU" teal
+node s1 "通用 sysfs<br/>/sys/class/net/wg0/" gray
+node e1 "ethtool 查询<br/>无专属 ethtool_ops" red
+node f1 "socket.c<br/>写 flowi/skb mark" amber
+node p1 "ip rule fwmark<br/>策略路由" blue
+edge k1 -> r1 "编译进内核"
+edge r1 -> d1 "newlink 初始化"
+edge r1 -> w1 "setup 回调"
+edge n1 -> d1 "配置写入"
+edge d1 -> w1 "参数来源"
+edge d1 -> f1 "fwmark 下发"
+edge f1 -> p1 "规则匹配"
+edge w1 -> s1 "只读呈现"
+edge w1 -> e1 "通用特性读取"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「构建期开关」决定驱动是否进入内核；随后「rtnetlink link_ops」通过 `ip link add wg0` 创建接口，一方面触发「wg_setup 设定 netdev 特性与 MTU」，另一方面在「wg_device 字段」中初始化 fwmark 与 incoming_port；「generic netlink」的配置写入也落到这些字段；字段中的 fwmark 被「socket.c 写 flowi/skb mark」消费，最终由「ip rule fwmark 策略路由」匹配；wg_setup 设定的 netdev 参数一方面被「通用 sysfs」只读呈现，另一方面可被「ethtool 查询」读取通用特性，但驱动没有专属 ethtool_ops。
+
+### 5. 配置/命令/代码实例
+
+下面这段命令把本篇讨论的四层接口都摸一遍：先确认构建期开关与模块身份，再建链、设置 fwmark、查通用 sysfs、试 ethtool、看内核日志。
+
+```bash
+# 1. 构建期开关与模块身份
+grep -E 'CONFIG_WIREGUARD' /boot/config-"$(uname -r)"
+modinfo wireguard | grep -E '^(filename|version|license|description|alias):'
+
+# 2. rtnetlink 建链 + generic netlink 配置
+ip link add wg0 type wireguard
+wg set wg0 listen-port 51820 fwmark 0x1a
+ip link set wg0 up
+
+# 3. 只读接口：通用 sysfs 与 ethtool
+ls /sys/class/net/wg0/
+cat /sys/class/net/wg0/mtu
+cat /sys/class/net/wg0/ifindex
+ethtool -k wg0 | head -n 6
+
+# 4. 内核日志确认模块加载
+dmesg | grep -F 'wireguard:'
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+CONFIG_WIREGUARD=m
+CONFIG_WIREGUARD_DEBUG is not set
+filename:       /lib/modules/6.x/kernel/net/wireguard/wireguard.ko
+version:        1.0.0
+license:        GPL v2
+description:    WireGuard secure network tunnel
+alias:          rtnl-link-wireguard
+alias:          netlink-genl-wireguard
+address  broadcast  carrier  ifalias  ifindex  iflink  mtu  operstate
+statistics  tx_queue_len  type  uevent  power  queue
+1420
+7
+Features for wg0:
+rx-checksumming: on [fixed]
+tx-checksumming: on [fixed]
+scatter-gather: on [fixed]
+[   12.345678] wireguard: WireGuard 1.0.0 loaded. See www.wireguard.com for information.
+[   12.345678] wireguard: Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+```
+
+逐行判读如下。开头两行来自构建配置：`CONFIG_WIREGUARD=m` 说明驱动是可加载模块，`CONFIG_WIREGUARD_DEBUG is not set` 说明 DEBUG 自检路径未编译进内核，对应 `Makefile` 第 2 行的 `ccflags-$(CONFIG_WIREGUARD_DEBUG)` 与 `main.c` 第 28 至 33 行的条件编译块。`filename` 行指向实际加载的 `.ko`，核对它与你阅读的源码树是否一致，是避免「代码对不上版本」的第一步。`version: 1.0.0` 直接来自 `main.c:76` 的 `MODULE_VERSION(WIREGUARD_VERSION)` 与 `version.h` 中的 `#define WIREGUARD_VERSION "1.0.0"`，它是驱动版本，不是内核版本也不是工具版本。`license: GPL v2` 对应 `main.c:73` 的 `MODULE_LICENSE("GPL v2")`。两条 `alias` 行分别对应 `main.c:77` 的 `MODULE_ALIAS_RTNL_LINK(KBUILD_MODNAME)` 与第 78 行的 `MODULE_ALIAS_GENL_FAMILY(WG_GENL_NAME)`，前者让 `ip link add wg0 type wireguard` 自动触发模块加载，后者让 generic netlink 族 `wireguard` 可被用户态定位。紧接着的 `ls /sys/class/net/wg0/` 输出里只有 `address`、`mtu`、`ifindex`、`statistics` 这类通用网卡文件，没有任何 `public_key`、`private_key`、`listen_port`、`fwmark` 文件——这正是「本快照无 WireGuard 专属 sysfs 属性」的可观测证据。`1420` 是 `cat .../mtu` 的结果，等于 `device.c:296` 的 `ETH_DATA_LEN - overhead`，与前文 1500 减 80 的推导一致。`7` 是 `ifindex`，由内核分配，与 WireGuard 逻辑无关。`ethtool -k` 的 `rx-checksumming: on [fixed]`、`tx-checksumming: on [fixed]`、`scatter-gather: on [fixed]` 反映 `wg_setup` 写入 `dev->features` 的 `NETIF_F_RXCSUM`、`NETIF_F_HW_CSUM`、`NETIF_F_SG`；`[fixed]` 表示不可通过 ethtool 更改，因为驱动没有注册 `ethtool_ops` 来提供 `set_flags` 一类回调。最后两行 `dmesg` 来自 `main.c:48-49` 的两条 `pr_info`，前缀 `wireguard:` 由 `Makefile` 第 1 行的 `pr_fmt` 宏统一添加，看到它们即可确认模块初始化走到了最后一步，没有在 `wg_mod_init` 的 `goto` 回滚链上失败。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是照旧版本去找 sysfs 属性。即便某些历史资料或旁支实现列出过 `public_key`、`private_key`、`listen_port`、`fwmark` 等 sysfs 文件，本快照的 `drivers/net/wireguard/` 既无 `sysfs.c` 也无 `DEVICE_ATTR`，把这些属性当作现状写进脚本必然失败。正确做法是用 `wg show` 与 `wg showconf` 查询，用 `wg set` / `wg syncconf` 写入，对应命令见 04-01、04-02。
+
+第二个陷阱是把通用 sysfs 文件当成 WireGuard 接口。`mtu`、`operstate`、`statistics/` 对所有网卡都存在，它们反映 netdev 层状态；WireGuard 自己的累计收发字节、最近握手时间、endpoint 等信息只经 netlink 的 peer 属性输出，两者的数目与更新时机都不同，排障时不要混用（排障口径见 08-03）。
+
+第三个陷阱是期待 ethtool 调整 WireGuard 的卸载行为。既然 `netdev_ops` 里没有 `ethtool_ops`，`ethtool -K wg0`、`ethtool -G wg0` 一类操作不会改变驱动行为；特性集合在 `wg_setup` 中静态写定，队列与 workqueue 在 `wg_newlink` 中按 CPU 创建，调优应围绕 MTU、GSO 与多队列进行，方法见 08-02。
+
+第四个陷阱是把 `CONFIG_WIREGUARD_DEBUG` 当成可在线切换的参数。它是构建期 `bool`，打开后 `main.c:28-33` 会运行三项 selftest，任一项失败就把返回值设为 `-ENOTRECOVERABLE` 并回滚，生产环境不应盲目开启；调试构建的取舍见 02-05。
+
+第五个陷阱是忽略监听端口的实际值。`wg set wg0 listen-port 0` 时 `socket.c:399-400` 允许内核在 `-EADDRINUSE` 情况下重试选端口，第 430 行把实际端口写回 `wg->incoming_port`；`wg show` 显示的是这个回写值，而非配置字符串。IPv6 可用时第 395 行让 IPv6 socket 复用 IPv4 的端口号，两端看到的是同一监听端口（socket 细节见 07-09、06-12）。
+
+第六个陷阱是 fwmark 冲突。`fwmark` 同时写入路由查询的 flowi mark 与报文的 `skb->mark`，若系统中已有 nftables/iptables 或策略路由使用同一 mark 值，可能互相干扰；用户态校验只允许 0/`off` 或 0 至 0xffffffff（`config.c:103`），配置策略路由时应先盘点现有 mark 用法，再选一个未占用的值。
+
+最后是版本核验纪律：本快照的 `Makefile` 引用了 `netlink.o` 与 `generated/netlink.o`，但这两个实现文件未提供，因此 netlink 配置路径内部的属性解析函数、错误返回值不在本文断言范围内；若目标系统的行为与本表不一致，应先核对内核版本与 uapi 头是否同源（版本基准见 01-04），再按 04-05、04-06 的属性全集逐项比对。
+
+### 7. 小结与延伸阅读
+
+本篇给出的结论可以压缩成四句话：WireGuard Linux 本快照没有任何运行时模块参数，只有 `CONFIG_WIREGUARD` 与 `CONFIG_WIREGUARD_DEBUG` 两个构建期开关；没有 WireGuard 专属 sysfs 属性，也没有 `ethtool_ops`，`/sys/class/net/wg0/` 与 `ethtool` 看到的都是内核通用信息；真正的配置通道是 rtnetlink 建链加 generic netlink 的 `WG_CMD_GET_DEVICE` / `WG_CMD_SET_DEVICE`；`fwmark` 是唯一横跨配置面与数据面的属性，从 `WGDEVICE_A_FWMARK` 写入 `wg->fwmark`，再经 `socket.c` 落到 flowi 与 skb 的 mark。MTU 1420、特性集合、监听端口回写等 netdev 层参数，均可由 `wg_setup`、`netdev_ops`、`link_ops` 与模块别名直接读出。凡本快照缺失的 `netlink.c` 内部细节，均已标注需对照实际版本核验，不作虚构。
+
+延伸阅读按三条线走：命令与配置文件语义读 04-01 至 04-04；netlink 命令属性全集与 uapi 常量读 04-05、04-06；机制与排障读 06-14（netlink 配置通道）、07-11（sysfs 与 uapi 配置接口模块）、08-03（故障诊断）。跨册随查按（字段见 05-02 ｜ 参数见 04-01 ｜ 原理见 06-14 ｜ 模块见 07-11）执行：需要 `wg_device` 逐字段定义去 05 册，需要 wg 命令选项去本册前几篇，需要配置通道原理去 06 册，需要目录级模块职责去 07 册。凡本篇标注「需对照实际版本核验」的条目，均以 `_wglinux_build/upstream_src/` 下对应文件为准；本册作为参数与接口唯一权威源，不为不存在的接口编造路径、属性名或取值。
+
+## 04-08 错误码、错误路径与报错速查手册
+
+### 1. 背景与动机
+
+WireGuard 在协议层是「静默」的：握手认证失败时，它不会给对端回一个携带错误码的报文，而是直接丢弃。这个设计带来简洁与安全，却给排障制造了天然困难——管理员看不到「认证失败」四个字，只能从同步返回的错误码、内核日志、以及丢包计数器三种渠道反推发生了什么。更难的是，这三类出口分散在完全不同的代码层：模块初始化用 `goto` 回滚链和 `-ENOTRECOVERABLE`，配置面由 netlink 与 wg 工具把 errno 传成 stderr 文本，数据面则有 `wg_xmit` 的显式返回值、socket 层的 `PTR_ERR` 透传、以及 `receive.c` 大量的静默丢弃分支。把「同一个 errno 在不同层含义不同」这件事讲清楚，是本篇的核心任务。
+
+本篇的取证纪律比别的篇章更严格：所有错误码必须能在快照源码里指出具体文件与行号，拿不准的一律标注「需对照实际版本核验」。有三处边界必须先说明。第一，`drivers/net/wireguard/Makefile` 第 16 行引用了 `netlink.o` 与 `generated/netlink.o`，但这两个实现文件并不在本快照中，因此 netlink 配置路径内部可能返回哪些 errno（例如常见的 `-EEXIST`），本文不做断言；`-EEXIST` 在本快照唯一可见的位置是 `wireguard-tools/src/wg-quick/android.c:253`，那是 Android Binder 的状态常量，与内核驱动返回码无关，绝不能混为一谈。第二，`sysfs.c` 不存在，自然也没有来自 sysfs 属性写操作的错误码。第三，`selftest/` 目录为空，`main.c:30-31` 调用的三个自检函数虽被声明，但日志文本不可考，所以本文只陈述其返回值路径，不编造自检日志行。
+
+理解本篇还需要建立一个关键区分：「返回给调用者的 errno」与「被计数但没有返回值的丢弃」是两回事。`wg_xmit` 返回负数会被 netdev 层记为发送错误，`wg set` 的 errno 会通过 `perror` 变成用户看到的文字；而 `receive.c` 中大量 `goto` 到 `dishonest_packet_*` 或 `next` 的分支，只是 `DEV_STATS_INC` 加计数、再 `dev_kfree_skb`，既不返回 errno，也不总会写日志。排障时把这两类现象放在同一张表上对照，才能避免「没有报错所以没问题」的误判。
+
+### 2. 核心概念
+
+第一类概念是错误码的「三种出口」。同步出口指错误以负 errno 返回给直接调用者：模块初始化失败时 `insmod` 得到非零退出码，`WG_CMD_SET_DEVICE` 失败时 wg 工具得到 errno，`wg_xmit` 失败时返回负数给内核 netdev 层。日志出口指 `pr_err`、`net_dbg_ratelimited`、`net_dbg_skb_ratelimited` 一类调用，它们写内核日志但不改变返回值；其中带 `ratelimited` 的宏在高频错误下会主动抑制输出，所以「日志里没有」绝不等于「没有发生」。计数出口指 `DEV_STATS_INC(dev, rx_errors)`、`DEV_STATS_INC(dev, tx_dropped)` 以及 peer 的 `rx_bytes` / `tx_bytes`，它们经 `ip -s link` 与 `wg show` 暴露，是静默丢弃唯一可靠的证据。
+
+第二类概念是 errno 的四种来源。其一是源码里直接写出的字面量，例如 `main.c:29` 的 `ret = -ENOTRECOVERABLE`、`device.c:155` 的 `ret = -ENOKEY`；其二是 `PTR_ERR()` 透传，`socket.c:74` 与 `socket.c:140` 把路由查询返回的 `ERR_PTR` 转回 errno，`device.c:182` 把 `skb_gso_segment` 的错误透传；其三是用户态的 `-errno`，`ipc-linux.h:251`、`ipc-linux.h:496` 在 netlink 发送或接收失败后把 `errno` 取负，第 256、501 行在 `errno` 为零时用 `-EINVAL` 兜底；其四是构建期固定的值，DEBUG 自检失败统一返回 `-ENOTRECOVERABLE`。
+
+第三类概念是 `goto` 回滚链的命名规律。内核代码用标签名标识「跳到这里时需要释放什么」：`main.c` 的 `err_netlink`、`err_device`、`err_peer`、`err_allowedips` 依次释放已完成的初始化层；`device.c` 的 `wg_newlink` 用 `err_uninit_ratelimiter`、`err_free_handshake_queue`、`err_free_decrypt_queue`、`err_free_encrypt_queue`、`err_destroy_packet_crypt`、`err_destroy_handshake_send`、`err_destroy_handshake_receive`、`err_free_index_hashtable`、`err_free_peer_hashtable` 一路回退；`wg_device_init` 用 `error_pm`、`error_vm`、`error_pernet` 回退 notifier 与 pernet 注册。阅读这类代码时，只要看标签名就能判断哪些资源已分配、哪些还没碰过，这也解释了为什么 DEBUG 自检失败跳到 `err_peer` 时只调用 `wg_allowedips_slab_uninit()`——因为此时 `wg_peer_init()` 尚未执行。
+
+第四类概念是「数据面错误大多不致命」。`-ENOKEY` 表示当前还没有可用的会话密钥或没有匹配 peer，包被放进 `staged_packet_queue` 等待握手，见 `send.c:393-400`；`-EPIPE` 表示设备加密环队列满，调用方把包标记为 `PACKET_STATE_DEAD`，并不向上冒泡；`-EDESTADDRREQ` 表示还没有对端 endpoint，也是握手前的正常中间态。把它们当成「驱动坏了」而重启接口，往往适得其反。
+
+第五类概念是用户态的「本地校验先于内核」。`config.c` 在构造 netlink 请求之前就完成了密钥长度、端口、fwmark、AllowedIP 掩码等校验，例如第 103 行的 fwmark 校验、第 110 行的密钥长度校验、第 431 行的 AllowedIP 格式校验。这些错误只产生 `stderr` 文本，没有内核 errno；`set.c:31-33` 的 `perror("Unable to modify interface")` 才是真正来自内核的 errno 出口。区分两者，是判断「要改配置文件还是要查内核」的第一步。
+
+### 3. 关键数据结构与源码位置
+
+下表是本篇的错误码全集。每一行都给出源码位置与触发条件；本快照中找不到返回点的错误码，明确写成「需对照实际版本核验」，不列入已证实集合。
+
+| 错误码/返回值 | 真实源码位置 | 触发条件 | 出口 | 排障含义 |
+|---|---|---|---|---|
+| `-ENOTRECOVERABLE` | `main.c:29-32` | DEBUG 构建下三自检任一失败 | `insmod` 退出码 | 调试构建自检失败，非运行期故障 |
+| `-ENOMEM` | `device.c:316,327-364` | `wg_newlink` 哈希表/workqueue/队列/限速器分配失败 | rtnetlink 建链 | 建链失败，资源不足 |
+| `-ENOMEM` | `peer.c:26,30-37,230-234` | peer 数达上限、slab 分配、dst_cache 初始化、缓存创建失败 | netlink 配置 | 添加 peer 失败 |
+| `-ENOMEM` | `socket.c:193,217` | 发送缓冲区 `alloc_skb` 失败 | 发送路径 | 临时内存紧张 |
+| `-ENOMEM` | `allowedips.c:187,202,233`；`ratelimiter.c:202` | trie 节点或限速器缓存分配失败 | 配置/建链 | 内存不足 |
+| `-EINVAL` | `receive.c:56,64,71,77,81,84,87` | `prepare_skb_header` 判定 IP/UDP/WG 头非法 | `wg_packet_receive` 的 `err` 路径 | 入站报文头损坏或伪造 |
+| `-EINVAL` | `socket.c:210,251` | `in_skb` 为空或端点协议族非 v4/v6 | socket 层 | 参数非法 |
+| `-EINVAL` | `send.c:314`；`allowedips.c:182,284` | 加密入队默认返回值、插入参数非法 | 发送/配置 | 前置条件不满足 |
+| `-EINVAL` | `ipc-linux.h:256,501` | netlink 出错但 `errno` 为零时的兜底 | wg 工具 | 内核未给出明确 errno |
+| `-ENOKEY` | `device.c:155` | `wg_xmit` 查 allowedips 无匹配 peer | tx_errors + ICMP 不可达 | 握手未完成或 AllowedIPs 未配 |
+| `-EPROTONOSUPPORT` | `device.c:148` | `wg_check_packet_protocol` 失败 | tx_errors | 交给 wg0 的不是 IPv4/IPv6 包 |
+| `-EDESTADDRREQ` | `device.c:167` | endpoint 地址族非 `AF_INET`/`AF_INET6` | tx_errors + ICMP | 对端 endpoint 未知 |
+| `-ENONET` | `socket.c:42,121,379` | `sock4`/`sock6` 为空或 `creating_net` 为空 | 发送或 `wg_socket_init` | netns 退出或 socket 未就绪 |
+| `-EADDRINUSE` | `socket.c:399-400` | IPv6 端口冲突且 `port==0` | `wg_socket_init` 内部重试 | 自动选端口时的正常现象 |
+| `-EAFNOSUPPORT` | `socket.c:162,169` | IPv6 未启用或端点地址族未知 | 发送 | 地址族不支持 |
+| `-EBUSY` | `receive.c:550,561-566` | RNG 未初始化或握手环生产失败 | `drop` 标签 | 入站握手被丢弃 |
+| `-ENOSPC` | `queueing.h:164-165` | `wg_prev_queue_enqueue` 失败 | 入队调用方 | per-peer 队列已满 |
+| `-EPIPE` | `queueing.h:171-172`；`send.c:322`；`receive.c:528` | `ptr_ring_produce_bh` 失败 | `PACKET_STATE_DEAD` | 设备加密环满，设计内降级 |
+| `-EINTR` | `ipc-linux.h:511-512` | `WG_CMD_GET_DEVICE` 被信号中断 | wg 工具 | 自动重试 |
+| `-ENAMETOOLONG` | `ipc-linux.h:475-478` | 接口名长度 ≥ `IFNAMSIZ` | wg 工具本地校验 | 请求未发往内核 |
+| `PTR_ERR(rt/dst)` | `socket.c:73-77,139-143` | IPv4/IPv6 路由查询失败 | 发送 | 真实 errno 由内核路由层给出 |
+| `PTR_ERR(segs)` | `device.c:181-183` | `skb_gso_segment` 分段失败 | tx_errors | GSO 分段异常 |
+| `-EEXIST` | 内核驱动源码无返回点；`wg-quick/android.c:253` 仅为 Binder 状态 | — | — | 配置路径如需此码，需对照实际版本核验 |
+
+模块初始化的回滚链是本表之外最值得单独贴出的代码，它决定了加载失败时 `insmod` 到底拿到什么值。
+
+```c
+/* drivers/net/wireguard/main.c:20-61（节选） */
+static int __init wg_mod_init(void)
+{
+	int ret;
+
+	ret = wg_allowedips_slab_init();
+	if (ret < 0)
+		goto err_allowedips;
+
+#ifdef DEBUG
+	ret = -ENOTRECOVERABLE;
+	if (!wg_allowedips_selftest() || !wg_packet_counter_selftest() ||
+	    !wg_ratelimiter_selftest())
+		goto err_peer;
+#endif
+	wg_noise_init();
+
+	ret = wg_peer_init();
+	if (ret < 0)
+		goto err_peer;
+	ret = wg_device_init();
+	if (ret < 0)
+		goto err_device;
+	ret = wg_genetlink_init();
+	if (ret < 0)
+		goto err_netlink;
+	/* ... pr_info ... */
+	return 0;
+err_netlink:
+	wg_device_uninit();
+err_device:
+	wg_peer_uninit();
+err_peer:
+	wg_allowedips_slab_uninit();
+err_allowedips:
+	return ret;
+}
+```
+
+接收路径的「错误」几乎都不是返回值，而是带日志或不带日志的丢弃标签，下面这段是入站数据包的最终裁决处。
+
+```c
+/* drivers/net/wireguard/receive.c:404-435（节选） */
+	routed_peer = wg_allowedips_lookup_src(&peer->device->peer_allowedips,
+					       skb);
+	wg_peer_put(routed_peer);
+	if (unlikely(routed_peer != peer))
+		goto dishonest_packet_peer;
+	napi_gro_receive(&peer->napi, skb);
+	update_rx_stats(peer, message_data_len(len_before_trim));
+	return;
+dishonest_packet_peer:
+	net_dbg_skb_ratelimited("%s: Packet has unallowed src IP ...\n", ...);
+	DEV_STATS_INC(dev, rx_errors);
+	DEV_STATS_INC(dev, rx_frame_errors);
+	goto packet_processed;
+dishonest_packet_type:
+	DEV_STATS_INC(dev, rx_errors);
+	DEV_STATS_INC(dev, rx_frame_errors);
+	goto packet_processed;
+dishonest_packet_size:
+	DEV_STATS_INC(dev, rx_errors);
+	DEV_STATS_INC(dev, rx_length_errors);
+	goto packet_processed;
+packet_processed:
+	dev_kfree_skb(skb);
+```
+
+### 4. 关键流程与调用链
+
+初始化失败链从 `wg_mod_init` 开始。`wg_allowedips_slab_init` 失败直接跳 `err_allowedips`，此时没有任何资源需要释放，直接 `return ret`。DEBUG 自检失败在 `main.c:29` 先把 `ret` 固定为 `-ENOTRECOVERABLE`，再跳 `err_peer`，该标签只调用 `wg_allowedips_slab_uninit()`，这正是因为 `wg_peer_init()` 尚未执行。若 `wg_peer_init()` 失败，同样跳 `err_peer`，释放的是刚创建的 slab 缓存；若 `wg_device_init()` 失败，跳 `err_device`，先 `wg_peer_uninit()` 再落到 `err_peer`；若 `wg_genetlink_init()` 失败，跳 `err_netlink`，依次 `wg_device_uninit`、`wg_peer_uninit`、`wg_allowedips_slab_uninit`。`wg_device_init` 自身还有一层回滚：`register_pm_notifier` 失败直接返回，`register_random_vmfork_notifier` 失败跳 `error_pm`，`register_pernet_device` 失败跳 `error_vm`，`rtnl_link_register` 失败跳 `error_pernet`。
+
+建链失败链在 `device.c` 的 `wg_newlink` 中，默认 `ret = -ENOMEM`。公钥哈希表或索引哈希表分配失败时，代码分别返回或跳到对应标签；三个 workqueue、三条加密队列、ratelimiter 依序初始化，每一步失败都跳到释放此前所有资源的标签；最后 `register_netdevice(dev)` 失败时，`ret` 被内核的返回值覆盖，跳 `err_uninit_ratelimiter` 一路回退。值得注意的是 `dev->priv_destructor = wg_destruct` 被刻意放在 `register_netdevice` 之后（见 `device.c:378-381` 的注释），避免注册失败时析构函数被提前调用——这是阅读回滚链时容易忽略的细节。
+
+控制面错误链从 wg 工具出发。`set.c:25` 先 `config_read_cmd` 做本地解析，任何格式错误在此终止，`ipc_set_device` 根本不会被调用；解析成功后 `ipc_set_device`（`ipc.c:89-98`）分流到 `kernel_set_device`，后者在 `ipc-linux.h:250-265` 用 `mnlg_socket_send` 与 `mnlg_socket_recv_run` 收发：发送失败取 `ret = -errno`，接收失败取 `errno ? -errno : -EINVAL`，最后 `errno = -ret` 交还调用方，`set.c:31-33` 用 `perror("Unable to modify interface")` 输出。查询路径 `kernel_get_device` 在 `ipc-linux.h:493-516` 还多一个 `-EINTR` 自动重试。netlink 内核侧的实现文件不在快照中，因此「哪个配置冲突返回哪个 errno」不做断言。
+
+发送失败链沿 `wg_xmit` 展开。协议检查失败置 `-EPROTONOSUPPORT` 跳 `err`；allowedips 查不到 peer 置 `-ENOKEY` 跳 `err_icmp`，发 ICMP 主机不可达；endpoint 地址族无效置 `-EDESTADDRREQ` 跳 `err_peer`，经 `err_icmp` 发 ICMP；GSO 分段用 `PTR_ERR(segs)` 透传。所有失败最终汇入 `err`：`DEV_STATS_INC(dev, tx_errors)`、`kfree_skb(skb)`、返回负值。与之相对，`send.c:391-400` 的 `out_nokey` / `out_invalid` 并不返回错误，而是把包「孤儿化」，等待下一次握手后再发送。
+
+接收丢弃链分两大支路。握手包在 `wg_packet_receive` 中先过 `prepare_skb_header`，`-EINVAL` 直接 `dev_kfree_skb`；队列生产失败（RNG 未初始化或环满）走 `drop` 标签并打印 `Dropping handshake packet`；进入 `wg_receive_handshake_packet` 后，MAC 校验失败打印 `Invalid MAC of handshake, dropping packet` 并静默丢弃，负载过重时改为回送 cookie，握手 consume 失败打印 `Invalid handshake initiation/response` 后丢弃。数据包在 `wg_packet_consume_data` 中按索引查 keypair，失败即静默丢弃；`counter_validate` 返回假表示重放或 nonce 越界，打印 `Packet has invalid nonce` 后走 `next`；最终 `wg_packet_consume_data_done` 对源地址不匹配、类型非法、长度不实三类情况分别累加 `rx_errors` 与 `rx_frame_errors` / `rx_length_errors`。三条链的错误传播关系见图 04-08-01。
+
+:::figure id=04-08-01 | name=WireGuard 错误源、三种出口与观测点 | dir=TD
+node e1 "初始化失败<br/>wg_mod_init 回滚" red
+node e2 "配置失败<br/>netlink 与 wg 工具" amber
+node e3 "发送失败<br/>wg_xmit / socket.c" purple
+node e4 "接收丢弃<br/>receive.c 校验与重放" gray
+node o1 "同步 errno<br/>非零退出码" blue
+node o2 "内核日志<br/>pr_err / dbg_ratelimited" teal
+node o3 "静默丢包<br/>DEV_STATS_INC 计数" green
+node v1 "dmesg" blue
+node v2 "stderr 与 $?" blue
+node v3 "ip -s link 与 wg show" blue
+edge e1 -> o1 "goto 返回 ret"
+edge e1 -> o2 "pr_err"
+edge e2 -> o1 "errno 取负"
+edge e2 -> v2 "perror 输出"
+edge e3 -> o2 "net_dbg_ratelimited"
+edge e3 -> o3 "tx_errors / tx_dropped"
+edge e4 -> o2 "丢弃日志"
+edge e4 -> o3 "rx_errors"
+edge o1 -> v2 "退出码"
+edge o2 -> v1 "日志缓冲"
+edge o3 -> v3 "统计字段"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：四个错误源分别是「初始化失败 wg_mod_init 回滚」「配置失败 netlink 与 wg 工具」「发送失败 wg_xmit / socket.c」「接收丢弃 receive.c 校验与重放」；它们汇入三种出口——「同步 errno 非零退出码」「内核日志 pr_err / dbg_ratelimited」「静默丢包 DEV_STATS_INC 计数」；三种出口又分别落在「dmesg」「stderr 与 $?」「ip -s link 与 wg show」三个观测点上。排障时应当先确定错误属于哪一条源，再去对应观测点取证。
+
+### 5. 配置/命令/代码实例
+
+下面这段命令按「内核侧、用户态校验侧、统计侧」三组复现本篇讨论的错误出口。
+
+```bash
+# 内核侧：DEBUG 构建自检失败会让 insmod 返回 -ENOTRECOVERABLE
+sudo insmod wireguard.ko; echo "exit=$?"
+dmesg | grep -F 'wireguard:' | tail -n 5
+
+# 用户态本地校验：错误在构造 netlink 请求前就终止
+wg set wg0 fwmark 0x100000000
+wg set wg0 peer AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= allowed-ips 10.0.0.2/33
+
+# 真正来自内核的 errno：接口不存在
+wg set nosuch0 listen-port 51820
+
+# 统计侧：静默丢弃只体现为计数
+ip -s link show wg0
+wg show wg0
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+# 场景一：DEBUG 构建自检失败
+insmod: ERROR: could not insert module wireguard.ko: State not recoverable
+exit=1
+# 场景二：fwmark 越界（config.c:103）
+Fwmark is neither 0/off nor 0-0xffffffff: `0x100000000'
+# 场景三：AllowedIP 掩码非法（config.c:431）
+AllowedIP is not in the correct format: `10.0.0.2/33'
+# 场景四：内核 errno 经 set.c:32 的 perror 输出
+Unable to modify interface: No such device
+# 场景五：ip -s link 的接收统计
+    RX:  bytes packets errors dropped
+        4096      12      3      0
+# 场景六：wg show 的运行状态
+  latest handshake: 4 minutes ago
+```
+
+逐行判读如下。`State not recoverable` 对应 `main.c:29-32`：DEBUG 自检失败把 `ret` 设为 `-ENOTRECOVERABLE`，经 `err_peer` 标签回滚 slab 缓存后返回，`insmod` 把负 errno 转成文字；具体措辞依赖 C 库的 `strerror`，且 `selftest/` 目录为空、自检日志文本不可考，因此这里只断言返回路径不断言日志内容。`exit=1` 是 shell 对非零退出码的呈现，说明模块没有真正加载。第三行来自 `config.c:103` 的本地校验：`0x100000000` 超出 32 位无符号范围，工具在调用 `ipc_set_device` 之前就退出，所以这不是内核 errno。第四行来自 `config.c:431` 的 AllowedIP 格式校验，掩码 33 对 IPv4 非法；同一文件第 415 行还会对「主机位非零」给出警告，两者要区分。第五行 `Unable to modify interface: No such device` 是 `set.c:31-33` 的 `perror` 结果，前半段是 `perror` 的固定前缀，后半段才是从 `ipc-linux.h` 传回的 errno 文本，说明请求确实到达了内核但目标接口不存在。第六、七行是本表最容易被忽略的一类：`errors 3` 来自 `receive.c` 的 `dishonest_packet_peer` / `dishonest_packet_type` / `dishonest_packet_size` 三个标签对 `rx_errors` 的累加，`dropped 0` 表示没有环队列丢包，两者口径不同；最后一行 `latest handshake: 4 minutes ago` 不是错误码，却是判断「静默认证失败」最关键的证据——WireGuard 不回认证错误，握手时间不更新就说明对端报文在 `receive.c` 的 MAC 或 consume 检查中被丢弃，应回到日志与计数器继续定位。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把「没有报错」当成「没有错误」。协议层不回认证失败报文，`receive.c` 的许多丢弃分支只写 `net_dbg_ratelimited` 日志甚至完全静默，只有计数器会变化。排障时应固定三件事一起看：`ip -s link show wg0` 的 `errors` / `dropped`、`wg show` 的 `latest handshake` 与 `transfer`、以及 `dmesg` 中带 `wireguard:` 前缀的行。
+
+第二个陷阱是以为每条丢弃都会留下日志。`net_dbg_ratelimited` 与 `net_dbg_skb_ratelimited` 在高频触发时会抑制输出，日志缺失只说明被限流，不能反推没有丢包；反过来，日志里出现 `Invalid MAC of handshake` 通常是遭受探测或负载下的 cookie 挑战，不一定是本端配置错误。
+
+第三个陷阱是把设计内降级当故障。`-EPIPE` 表示设备加密环满，调用方按 `PACKET_STATE_DEAD` 处理；`-ENOSPC` 表示 per-peer 队列满；`-ENOKEY` 表示会话密钥尚未就绪，包被暂存。这些是压力或握手过渡期的正常行为，盲目重启接口会丢弃暂存包并重新握手，反而延长收敛时间。
+
+第四个陷阱是混淆 errno 的来源层次。用户态 `config.c` 的校验错误没有内核 errno，`set.c` 的 `perror` 才有；`ipc-linux.h:256,501` 的 `-EINVAL` 只是「内核报错但 errno 为零」时的兜底，不代表具体内核分支。看到文字错误时，先判断它来自本地校验还是 netlink 回传，再决定查配置文件还是查内核。
+
+第五个陷阱是把 `-EEXIST` 之类的配置冲突码据为己有。本快照内核驱动中不存在该返回点，唯一的 `-EEXIST` 在 Android Binder 状态枚举里；netlink 配置实现 `netlink.c` 未随快照提供，任何「重复 peer 返回 `-EEXIST`」的说法都必须先对照目标内核版本核验。
+
+第六个陷阱是误读 `-ENONET`。`socket.c:42,121` 表示 socket 尚未建立，`socket.c:379` 表示 `creating_net` 为空；结合 `device.c:31-62` 的 `wg_open` 会调用 `wg_socket_init`，可知接口未 up 或创建它的网络命名空间已退出是常见诱因（netns 清理逻辑见 `device.c:414-435`）。
+
+第七个陷阱是误用日志级别。`device.c:383` 与 `device.c:268` 的 `Interface created` / `Interface destroyed` 走的是 `pr_debug`，默认内核日志级别下不会出现；`socket.c` 的 `Could not create IPv4 socket` / `Could not create IPv6 socket` 才是 `pr_err`。排查建链或 socket 失败时，若期望看到调试行，需要确认内核是否开启动态调试或构建时定义了 `DEBUG`，不能因为 `dmesg` 里没有 `Interface created` 就断定建链没发生。
+
+第八个陷阱是把累计计数当成瞬时值。`ip -s link` 的 `errors` 与 `wg show` 的 `transfer` 都是自接口创建以来的累计量，单次排障应记录前后两次读数做差，才能判断故障是否仍在继续；`errors` 增长而 `latest handshake` 正常，通常指向数据面伪装报文被拒（`dishonest_packet_*`），`errors` 不变而握手时间不更新，则更可能是握手包在 MAC 校验或 consume 阶段被丢弃，两者的处置方向完全不同。
+
+最后是本册一贯的版本纪律：全部绝对值性能与时序都不在此讨论，错误码含义以快照源码为准，凡标注「需对照实际版本核验」的条目，都应以目标系统实际内核与 uapi 头为准再确认（版本基准见 01-04）。
+
+### 7. 小结与延伸阅读
+
+本篇把 WireGuard Linux 的错误行为按「错误码全集、错误路径、报错出口」三层收拢：初始化层以 `goto` 回滚与 `-ENOTRECOVERABLE` 为核心，`device.c` 的建链链和 `wg_device_init` 各自有独立的逆序释放；控制面以 wg 工具的本地校验与 netlink errno 回传为界，`config.c` 的错误不出用户态，`set.c` 的 `perror` 才反映内核结果；数据面则把 `-EPROTONOSUPPORT`、`-ENOKEY`、`-EDESTADDRREQ`、`-ENONET`、`-EAFNOSUPPORT`、`-EINVAL`、`-EBUSY`、`-ENOSPC`、`-EPIPE` 等码与 `PTR_ERR` 透传分别对应到发包、socket、入队、接收校验等具体分支，并明确 `receive.c` 的多数丢弃只有计数与限流日志、没有返回值。全表所有条目均标出真实源码位置；本快照缺失的 `netlink.c` 内部 errno 与 `selftest/` 日志文本均标注需核验，未作虚构。
+
+延伸阅读按三条线走：netlink 属性与命令全集读 04-05，uapi 常量读 04-06，模块参数与接口存在性读 04-07；机制读 06-06（接收路径）与 06-08（抗重放），数据面模块职责读 07-08（receive.c）与 07-09（socket.c / cookie.c）；排障读 08-03（诊断决策树）与 08-04（故障案例库）。跨册随查按（字段见 05-02 ｜ 参数见 04-07 ｜ 原理见 06-06 ｜ 模块见 07-08）执行：需要 `wg_device` / `wg_peer` 逐字段定义去 05 册，需要参数与接口全集去 04-07，需要丢弃与重放原理去 06 册，需要目录级模块职责去 07 册。凡本篇标注「需对照实际版本核验」的错误码，均以 `_wglinux_build/upstream_src/` 下对应文件为准。

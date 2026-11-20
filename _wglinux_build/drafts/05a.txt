@@ -1,0 +1,264 @@
+## 05-01 全册结构地图与跨文档索引
+
+### 1. 背景与动机
+
+05 册是整套 WireGuard Linux 技术资料中「关键数据结构字段」的唯一权威源。设立唯一权威源的目的，是从制度上消除跨册重复：其他任何册在需要讲清楚某个结构体有哪些字段时，都只点名结构、给出真实源码路径，然后写「字段见 05-XX」，由本册承担逐字段解释的责任。这样做有两个好处：其一，读者查一个字段只需到一个地方，不必在九册之间反复比对同一份定义；其二，字段描述只有一处维护，避免不同册用不同措辞描述同一字段而产生歧义。本篇是全册的入口，负责给出结构地图与索引，逐字段内容从 05-02 开始。
+
+需要先把「结构」的边界说清楚。WireGuard Linux 的内核驱动主要是 C 代码，其「数据结构」指 `struct`（结构体）与少数关键 `enum`（枚举），而非面向对象意义上的类。本册覆盖两类：一类是内核驱动内部的实现结构，定义在 `drivers/net/wireguard/` 的头文件中，如 `wg_device`（device.h）、`wg_peer`（peer.h）、`allowedips_node` / `allowedips`（allowedips.h）、`noise_handshake` / `noise_keypair`（noise.h）、`endpoint`（peer.h）、`cookie`（cookie.h）、`ratelimiter`（ratelimiter.h）；另一类是内核与用户态之间的接口结构，定义在 `include/uapi/linux/wireguard.h`，如三层属性枚举 `wgdevice_attribute` / `wgpeer_attribute` / `wgallowedip_attribute`，以及命令枚举 `wg_cmd`。前者是内核内部实现细节，后者是稳定的 ABI 契约，两者性质不同，阅读时要分清。
+
+本套资料的事实锚点是 `_wglinux_build/upstream_src/wireguard-linux-src/`（stable 分支内核驱动快照）与 `_wglinux_build/upstream_src/wireguard-tools/`（版本 1.0.20260223）。凡出现结构体字段名、类型、位宽，均逐字取自上述源码文件，并在表格中标注定义所在文件。由于内核版本演进可能改变结构布局，本册的字段表以本快照为准，落到具体系统时「需对照实际版本核验」——这是必须遵守的口径，任何字段偏移、位宽、新增字段都不可凭记忆断言。
+
+### 2. 核心概念
+
+理解 WireGuard Linux 的结构，抓住「一棵树、两条队列、三种生命周期」即可。
+
+一棵树，指 allowedips trie。它是 v4/v6 混合的前缀树，`allowedips` 结构持 `root4` 与 `root6` 两个根，每个 `allowedips_node` 代表一个前缀节点，叶子关联到 peer。查找时按目的地址（发方向）或源地址（收方向）沿 bit 路径下行，命中叶子即得到目标 peer 的强引用。这棵树把「地址前缀」与「peer」绑定，是 WireGuard 路由模型的核心数据结构（逐字段见 05-04，查找原理见 06-07）。
+
+两条队列，指 `wg_device` 中的 `crypt_queue` 与 `wg_peer` 中的 `prev_queue`。`crypt_queue` 包装了 `ptr_ring` 与 per-CPU 的 `multicore_worker`，用于把加解密任务分发到多个 CPU 并行处理；`prev_queue` 是单生产者单消费者的无锁队列，用于 staged packet 的暂存。这两类队列决定了数据面的并发模型（逐字段见 05-08，并发原理见 06-13）。
+
+三种生命周期，由三种引用计数机制体现。peer 用 `kref`（`wg_peer.refcount`）管理生命周期，取用时 `wg_peer_get`、释放时 `wg_peer_put`；keypair 也用 `kref`（`noise_keypair.refcount`）并配合 `rcu_head` 做延迟释放；而 net_device 与 socket 的生命周期分别由内核 netdev 框架与 RCU（`sock4`、`sock6` 的 `__rcu`）保护。理解每种对象用哪种生命周期机制，是读懂并发安全的前提（密钥生命周期原理见 06-03）。
+
+之所以要特意区分这三种机制，是因为它们解决的是不同的并发问题。`kref` 解决的是「对象什么时候可以安全释放」——只要还有引用者，对象就不能销毁；`rcu_head` 解决的是「读者正在遍历时写者不能立即回收内存」——RCU 通过延迟回收让读者在无锁状态下安全访问；而 spinlock 与 mutex 解决的是「多个写者同时修改同一状态时如何串行化」。WireGuard 把这几种机制组合使用：peer 用 `kref` 管生命周期、用 `rcu_head` 配合哈希表做无锁查找、用 `endpoint_lock` 保护 endpoint 字段、用多个 `timer_list` 管理时限。读代码时若分不清某个字段到底由哪种机制保护，就容易写出竞态。本册在每张字段表的「注意事项」列里标注保护机制，正是为了建立这种对应关系。
+
+还有一个贯穿全册的概念是「强引用」。allowedips 的查找函数 `wg_allowedips_lookup_dst` 与 `wg_allowedips_lookup_src` 的注释明确写着「return a strong reference to a peer」，意思是查到 peer 的同时已经替调用者取了一次 `kref`，调用者用完必须 `wg_peer_put` 归还。这类「函数隐式取引用」的约定在内核代码里很常见，也是泄漏的高发点——读到返回 peer 指针的函数时，第一件事应该是确认它有没有帮你取引用，而不是直接拿去用。同理，`wg_peer_get_maybe_zero` 带 `__must_check` 标记，是因为它可能返回 NULL（peer 正在销毁），调用者必须检查。这些约定不属于任何单个结构字段，却决定了字段该如何使用，所以放在本册入口篇统一说明。
+
+下表给出全册结构地图与索引，是本册最重要的导航表。
+
+| 结构 / 枚举 | 定义文件 | 职责 | 详解篇 |
+|---|---|---|---|
+| `wg_device` | `drivers/net/wireguard/device.h` | 接口全局状态，内嵌 netdev、队列、socket、trie | 05-02 |
+| `wg_peer` | `drivers/net/wireguard/peer.h` | 单个对等体状态，握手、密钥、队列、定时器 | 05-03 |
+| `allowedips_node` / `allowedips` | `drivers/net/wireguard/allowedips.h` | v4/v6 混合前缀树节点与表 | 05-04 |
+| `noise_handshake` | `drivers/net/wireguard/noise.h` | Noise_IK 握手状态机上下文 | 05-05 |
+| `noise_keypair` / `noise_keypairs` | `drivers/net/wireguard/noise.h` | 当前/前/next 三组会话密钥与抗重放 | 05-05 |
+| `message_*` 系列 | `drivers/net/wireguard/messages.h` | 握手与数据消息的线上布局 | 05-05 |
+| `sk_buff` 扩展用法 | 内核 `skbuff.h`（驱动在 send/receive 中使用） | 包元数据与 headroom 操作 | 05-06 |
+| `endpoint` | `drivers/net/wireguard/peer.h` | v4/v6 endpoint 与源地址绑定 | 05-07 |
+| `cookie` / `cookie_checker` | `drivers/net/wireguard/cookie.h` | cookie 质询状态 | 05-07 |
+| `crypt_queue` / `prev_queue` | `drivers/net/wireguard/device.h`、`peer.h` | 加解密分发队列与暂存队列 | 05-08 |
+| 定时器与 `ratelimiter` | `drivers/net/wireguard/timers.c`、`ratelimiter.h` | keepalive/重传/过期与握手限速 | 05-08 |
+| 加密原语上下文 | `lib/crypto/*.c`（chacha/poly1305/curve25519/blake2s/siphash） | 底层密码学状态 | 05-09 |
+| 三层属性枚举与 `wg_cmd` | `include/uapi/linux/wireguard.h` | 用户态/内核 ABI 契约 | 05-09（常量详见 04-05、04-06） |
+
+### 3. 关键数据结构与源码位置
+
+作为全册索引篇，本节不展开任何字段表，只说明「字段表怎么读」与「结构之间怎么关联」，把逐字段内容交给后续各篇。
+
+字段表的读法统一为五列：字段名、类型、所在文件、职责、注意事项。类型逐字取自源码，比如 `wg_device.fwmark` 是 `u32`、`incoming_port` 是 `u16`、`num_peers` 是 `unsigned int`；凡涉及指针与 RCU，会在类型中保留 `__rcu` 标记，因为这不是修饰词而是语义（该指针受 RCU 保护，读取必须在 RCU 读侧临界区内）。「注意事项」列专门记录容易踩坑的地方，比如某字段只在持锁时有效、某字段按字节序存储（`__le32`）、某字段位于 cache line 之外（allowedips_node 的注释明确把很少用的成员放在底部以避开 cache line）。
+
+结构之间的关联关系可以归纳为：一个 `wg_device` 通过 `peer_list` 链表和 `peer_hashtable` 哈希表管理多个 `wg_peer`；每个 `wg_peer` 通过 `allowedips_list` 挂到 device 的 `peer_allowedips` 树上；每个 peer 的 `keypairs` 持有最多三组 `noise_keypair`；每个 keypair 内含发送/接收两条 `noise_symmetric_key` 与一个 `noise_replay_counter`。这条链把 device → peer → keypair → key 串起来，是理解状态组织的骨架（关联关系见图 05-01-01）。
+
+下表把本篇引用最多的头文件收拢成速查，方便对照后文字段表。
+
+| 头文件 | 包含的关键结构 | 本册处理方式 |
+|---|---|---|
+| `device.h` | `wg_device`、`crypt_queue`、`prev_queue`、`multicore_worker` | 字段见 05-02、05-08 |
+| `peer.h` | `wg_peer`、`endpoint` | 字段见 05-03、05-07 |
+| `allowedips.h` | `allowedips_node`、`allowedips` | 字段见 05-04 |
+| `noise.h` | `noise_handshake`、`noise_keypair`、`noise_keypairs`、`noise_replay_counter` | 字段见 05-05 |
+| `messages.h` | `message_handshake_initiation` 等消息结构 | 字段见 05-05 |
+| `cookie.h` / `ratelimiter.h` | `cookie`、`cookie_checker`、`ratelimiter` | 字段见 05-07、05-08 |
+| `include/uapi/linux/wireguard.h` | 属性/命令/标志枚举 | 常量详见 04-05、04-06 |
+
+### 4. 关键流程与调用链
+
+结构地图的价值在于把「数据流」映射到「状态」。以一次出站包为例：内核路由选中 wg0，驱动在 `send.c` 中调用 `wg_allowedips_lookup_dst(&wg->peer_allowedips, skb)` 查树得到 `wg_peer`；随后 `wg_peer_get(peer)` 取强引用，读取 `peer->keypairs.current_keypair` 得到会话密钥；包被放入 `peer->tx_queue`（`prev_queue`），由 worker 取出加密；加密任务若走 `wg_device.encrypt_queue`（`crypt_queue`），则由 per-CPU worker 并行处理；加密后的包封装为 UDP 从 `wg->sock4` 或 `wg->sock6` 发出。这条链路每一步都对应一个结构字段，读源码时可按此顺序对照（发送原理见 06-05，字段见 05-02、05-03、05-04、05-05、05-06、05-08）。
+
+入站方向对称：socket 收到包后经 `receive.c` 解析消息类型，握手消息交 `noise_handshake` 状态机，数据包先查 `wg->cookie_checker` 与 `peer->ratelimiter` 做防护，再用 keypair 的 `receiving_counter`（`noise_replay_counter`）验重放，解密成功后调用 `wg_allowedips_lookup_src` 校验源地址是否属于该 peer 的 allowedip，最后注入协议栈（接收原理见 06-06，字段见 05-05、05-07、05-08）。
+
+设备与 peer 的生命周期由引用计数串起：`wg_newlink` 创建 device 并初始化各结构；`wg_peer_create` 创建 peer 并置 `kref` 初值；运行期取用 peer 一律 `wg_peer_get`/`wg_peer_put` 配对；删除 peer 时 `wg_peer_remove` 摘链并置 `is_dead`，待引用归零后由 `kref` 回调释放。任何漏掉一次 `put` 都会导致 peer 无法释放，任何多取一次 `get` 都可能提前释放——这是内核态编程最常见的两类缺陷（密钥生命周期详见 06-03）。
+
+结构地图不只是阅读辅助，也是排障时的定位框架。当用户报告「隧道建立但流量不通」时，有经验的人会顺着状态链逐段排查：先看 `wg_device` 是否注册成功、socket 是否在预期端口监听，这对应 device 层；再看 peer 是否被正确创建、公钥哈希能否命中，这对应 peer 与 hashtable 层；然后看 allowedips 树里是否有匹配目的地址的条目，这对应 trie 层；最后看 current keypair 是否存在、抗重放计数器是否异常推进，这对应 keypair 层。四层中的任何一层断裂，症状都可能是「不通」，但根因完全不同。把这张结构地图记在脑子里，排障时就能按层收敛，而不是在几十个命令输出里碰运气（故障定位决策树见 08-03）。这也是为什么本册要按 device、peer、trie、keypair 的顺序组织字段篇，而不是按字母或源码行号排列——顺序本身就是一种因果线索。
+
+核心结构的嵌套关系见图 05-01-01。
+
+:::figure id=05-01-01 | name=WireGuard Linux 核心结构的嵌套关系 | dir=TD
+node d1 "wg_device<br/>接口全局状态" teal
+node d2 "wg_peer<br/>对等体状态" blue
+node d3 "allowedips trie<br/>前缀到 peer" purple
+node d4 "noise_keypairs<br/>current/prev/next" green
+node d5 "noise_keypair<br/>收发密钥与计数器" gray
+node d6 "crypt_queue / prev_queue<br/>并发队列" amber
+edge d1 -> d2 "peer_list / hashtable"
+edge d2 -> d3 "allowedips_list"
+edge d2 -> d4 "keypairs"
+edge d4 -> d5 "三组密钥"
+edge d1 -> d6 "加解密队列"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：顶层「wg_device 接口全局状态」通过「peer_list / hashtable」管理多个「wg_peer 对等体状态」，每个 peer 通过「allowedips_list」挂到「allowedips trie 前缀到 peer」、并持有「noise_keypairs current/prev/next」，每组 keypair 含「noise_keypair 收发密钥与计数器」；device 侧另有「crypt_queue / prev_queue 并发队列」用于加解密分发。
+
+### 5. 配置/命令/代码实例
+
+本篇给出如何从源码定位一个结构字段的实操方法，这是阅读本册所有字段表的基础技能。以查 `wg_device.incoming_port` 为例：
+
+```bash
+# 在源码快照中定位结构定义与字段引用
+cd _wglinux_build/upstream_src/wireguard-linux-src
+grep -rn "incoming_port" drivers/net/wireguard/
+grep -rn "struct wg_device" drivers/net/wireguard/device.h
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+drivers/net/wireguard/device.h:48:	u16 incoming_port;
+drivers/net/wireguard/socket.c:...:	if (wg->incoming_port == port)
+drivers/net/wireguard/socket.c:...:	wg->incoming_port = port;
+drivers/net/wireguard/device.c:...:	netdev_dbg(wg->dev, "Listening port: %u\n", wg->incoming_port);
+```
+
+逐行判读如下。第一行来自 `device.h` 的结构定义，确认 `incoming_port` 的类型是 `u16`，即 16 位无符号整数，正好容纳 0–65535 的 UDP 端口号；类型取自定义而非推断，这是字段表的第一原则。第二、三行显示该字段在 `socket.c` 中被读取和写入，说明它记录的是当前实际监听的 UDP 端口；注意 socket.c 的读取往往发生在持 `socket_update_lock` 或 RCU 临界区内，因为 `sock4`/`sock6` 受 RCU 保护，端口与 socket 是配套更新的。第四行来自 `device.c` 的调试输出，把端口打印出来，印证这是对外可见的监听端口而非内部临时值。这个「定义→引用→用途」三步定位法适用于本册所有字段：先在头文件确认类型与语义，再 grep 引用点理解读写时机与加锁要求，最后结合 06 册的机制说明理解它在流程中的角色。若 grep 结果显示某字段只在单一文件出现，通常说明它是内部状态；若出现在 uapi 头中，则说明它是跨边界的 ABI 字段，改动会影响用户态兼容性。清理环节：grep 是只读操作，无需清理。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把内核内部结构与 uapi 接口结构混为一谈。`wg_device`、`wg_peer` 等定义在驱动头文件，是内核内部实现，布局可随版本变化；`include/uapi/linux/wireguard.h` 的枚举与常量是用户态 ABI，必须保持稳定。前者改了只需重编译内核，后者改了会破坏用户态工具兼容性。本册标注字段来源文件时，务必让读者看清这一区别。
+
+第二个陷阱是照抄字段偏移或假设内存布局。C 结构体的字段排布受对齐、编译器与配置影响，本册只给字段名、类型与职责，不给字节偏移，也不假设某个字段位于特定 cache line——除非源码注释明确说明（如 `allowedips_node` 把少用成员放在底部、allowedips 表 `__aligned(4)` 的注释）。第三个陷阱是忽略 `__rcu`、`__le32` 这类标记：`__rcu` 表示受 RCU 保护，读取必须在正确上下文；`__le32` 表示小端字节序存储，直接当主机序解读会出错（`noise_keypair.remote_index` 即为 `__le32`）。
+
+第四个陷阱是把引用计数当成普通整数。`kref` 的 get/put 必须严格配对，且 put 可能触发释放回调，之后不能再访问对象；`wg_peer_get_maybe_zero` 这种「可能返回 NULL」的取用函数要检查返回值（函数声明带 `__must_check` 正是为此）。第五个陷阱是凭旧版本记忆写字段：内核持续演进，本快照 uapi 头已由 netlink spec 自动生成，字段集合可能与旧文章不同，一切以本快照源码为准。
+
+最佳实践：读字段表时先定位定义文件，判断是内部结构还是 uapi ABI；再看类型与标记，注意 `__rcu`/`__le32`/位宽；然后 grep 引用点，弄清读写时机与加锁要求；最后结合 06 册机制理解字段在流程中的角色。四步做完，才算真正理解一个字段，而不是记住一个名字。
+
+### 7. 小结与延伸阅读
+
+本篇建立了 05 册的全景索引：WireGuard Linux 的结构可分为内核内部实现结构与 uapi ABI 结构两类，核心关联是 device → peer → keypair → key 的嵌套，加上 allowedips trie 完成路由绑定、`crypt_queue`/`prev_queue` 完成并发分发。读字段的统一方法是「定位定义→看类型标记→grep 引用→结合机制」四步。
+
+延伸阅读：逐字段从 05-02 的 `wg_device` 开始，按 05-02 到 05-09 顺序阅读可形成完整结构图景；机制与调用链去 06 册，命令参数去 04 册（uapi 常量在 04-05、04-06），模块职责去 07 册。跨册随查按（字段见 05-01 ｜ 参数见 04-01 ｜ 原理见 06-01 ｜ 模块见 07-01）执行。凡本册字段表，均以 `_wglinux_build/upstream_src/wireguard-linux-src/` 下对应头文件为准，需对照实际版本核验。
+
+## 05-02 wg_device 结构字段详解
+
+### 1. 背景与动机
+
+`wg_device` 是 WireGuard Linux 中最重要的结构，定义在 `drivers/net/wireguard/device.h`，代表一个 WireGuard 接口的完整运行状态。每创建一个 `wg0`、`wg1` 这样的接口，内核就有一个对应的 `wg_device` 实例。它把 netdev、加解密队列、UDP socket、静态身份、cookie 检查器、peer 哈希表、allowedips 树、各种锁与计数器组织在一个结构里，是理解整个驱动的枢纽。本篇逐字段拆解 `wg_device`，并连带说明它直接内嵌的 `crypt_queue` 与 `prev_queue`（这两个结构的完整字段在 05-08 展开，本篇只讲它们在 device 中的角色）。
+
+为什么先讲 `wg_device`？因为它是其他所有结构的容器：`wg_peer` 通过 `device` 指回它，socket 与队列挂在它上面，netlink 配置的最终落点也是它的字段。读懂了这个结构，再读 peer、keypair、allowedips 就有了一张地图。本篇严格基于 `device.h` 的字段顺序讲解，不增删字段、不改变类型。
+
+### 2. 核心概念
+
+`wg_device` 的字段可以按职责分成六组：netdev 与网络命名空间、加解密队列、socket 与端口、身份与防护、peer 容器与路由、锁与计数。分组不是源码里的注释，而是为便于理解所做的归纳，字段本身逐字取自 `device.h`。
+
+netdev 与网络命名空间组只有 `dev` 一个字段：`struct net_device *dev`，指向该接口对应的内核网络设备。WireGuard 没有独立的设备对象，`wg_device` 与 `net_device` 通过 `netdev_priv(dev)` 相互定位——`wg_setup` 设置私有数据大小，`wg_newlink` 拿到 netdev 后取其 `wg_device`。理解这一点就明白为什么 wg0 在 `ip link` 中表现为普通网卡。
+
+这种「 netdev 外壳 + 私有数据」的设计是 Linux 网络设备驱动的标准范式。`netdev_priv` 返回的是紧随 `net_device` 之后分配的一段内存，其大小由 `wg_setup` 通过 `ndo_setup` 回调设定的 `sizeof(struct wg_device)` 决定。因此从 netdev 指针可以一步算出 `wg_device` 地址，反过来 `wg_device.dev` 又指回 netdev，两者是同一块分配的两个视图。理解这个内存布局有个实际价值：在调试器中查看 wg0 状态时，只要拿到 `net_device` 指针就能定位整个 WireGuard 状态；反过来，任何持有 `wg_device` 的代码都能通过 `dev` 访问 netdev 的统计、标志与队列。代价是这种强耦合要求两者生命周期严格一致——netdev 注销时必须确保没有残留的 `wg_device` 引用，否则 `dev` 就成了悬空指针。
+
+加解密队列组包括 `encrypt_queue`、`decrypt_queue`、`handshake_queue` 三个 `crypt_queue`。它们分别承载加密、解密、握手三类任务的分发。每类队列内含 `ptr_ring` 环形缓冲与 per-CPU 的 `multicore_worker`，用于把 CPU 密集的加解密摊到多个核（完整字段见 05-08，并发原理见 06-13）。
+
+三类队列分开而非共用，是有意为之的设计。加密与解密的数据包数量可能相差悬殊——一个只在接收大量流量的客户端，其解密队列会很忙而加密队列几乎空闲；若共用单一队列，繁忙方向会挤占另一个方向的 worker 时间，造成不必要的队头阻塞。握手队列独立则有更强理由：握手涉及密钥派生与状态转换，计算成本高但频率低，且对延迟敏感（客户端重传握手包有超时），把它和数据包队列混在一起会让握手被大批数据包淹没。与握手队列配套的 `handshake_queue_len` 是原子计数而非普通整数，原因正在于生产者（收包路径）与消费者（握手 worker）分属不同执行上下文，用原子操作做长度统计可以避免为一读一写引入锁开销。这三个队列是 WireGuard Linux 实现多核并行的数据面骨架，理解它们的分工，就理解了为什么该实现在加解密密集场景下显著优于单线程的用户态方案（并发全景见 06-13，性能调优见 08-02）。
+
+socket 与端口组包括 `sock4`、`sock6` 两个 `__rcu` 保护的 `struct sock *`，以及 `u16 incoming_port`。前者是 IPv4/IPv6 的 UDP socket，后者是当前监听端口。`creating_net`（`struct net __rcu *`）记录接口创建时所在的网络命名空间，用于 socket 绑定与查找。这四个字段受 `socket_update_lock` 保护并配合 RCU 使用（socket 原理见 06-12）。
+
+`creating_net` 这个字段值得单独解释。Linux 的网络命名空间允许把网络设备、socket、路由表隔离到不同实例，容器与网络虚拟化广泛依赖它。WireGuard 接口在一个命名空间里创建，其 UDP socket 就绑定在该命名空间；但配置操作可能从另一个命名空间发起。驱动必须记住「接口属于哪个命名空间」，才能把 socket 的创建、绑定、查找都放在正确的上下文里，这就是 `creating_net` 的作用。它标了 `__rcu`，是因为命名空间可能在接口存续期间被销毁，读取时要防止访问到已释放的 `net` 结构。这也是为什么在容器里跑 WireGuard 时，把接口移到另一个命名空间常常导致隧道不通——socket 仍绑在原来的命名空间，包的收发路径被切断。理解 `creating_net` 与 socket 的这层关系，就能解释一类常见的容器部署故障（部署见 03-05，排障见 08-03）。
+
+身份与防护组包括 `static_identity`（`noise_static_identity`）与 `cookie_checker`（`cookie_checker`）。前者保存本接口的静态私钥与公钥及读写信号量，后者用于 cookie 质询机制的密钥与状态（cookie 原理见 06-09）。
+
+peer 容器与路由组包括 `peer_hashtable`（`pubkey_hashtable *`）、`index_hashtable`（`index_hashtable *`）、`peer_allowedips`（`allowedips`）、`device_list` 与 `peer_list` 两个链表头，以及 `num_peers`。公钥哈希表用于按公钥找 peer，索引哈希表用于握手消息的 index 查找，allowedips 树用于地址到 peer 的路由（查找原理见 06-07）。
+
+锁与计数组包括 `device_update_lock`、`socket_update_lock` 两把 mutex，`atomic_t handshake_queue_len`，以及 `u32 fwmark`、`unsigned int device_update_gen`。两把锁分别保护配置更新与 socket 更新；`handshake_queue_len` 是原子计数，避免为统计而加锁；`fwmark` 是给封装包设置的 firewall mark，用于策略路由；`device_update_gen` 是配置代数，用于并发配置时识别陈旧更新。
+
+### 3. 关键数据结构与源码位置
+
+下表逐字段列出 `wg_device`，全部取自 `drivers/net/wireguard/device.h` 的 `struct wg_device` 定义。「详解」列指向 deeper 篇，避免本册跨篇重复。
+
+| 字段名 | 类型 | 职责 | 详解/注意 |
+|---|---|---|---|
+| `dev` | `struct net_device *` | 关联的内核网络设备 | netdev 形态见 01-01 |
+| `encrypt_queue` | `struct crypt_queue` | 加密任务分发队列 | 字段见 05-08 |
+| `decrypt_queue` | `struct crypt_queue` | 解密任务分发队列 | 字段见 05-08 |
+| `handshake_queue` | `struct crypt_queue` | 握手任务分发队列 | 字段见 05-08 |
+| `sock4` | `struct sock __rcu *` | IPv4 UDP socket | RCU 保护，原理见 06-12 |
+| `sock6` | `struct sock __rcu *` | IPv6 UDP socket | RCU 保护，原理见 06-12 |
+| `creating_net` | `struct net __rcu *` | 创建时的网络命名空间 | 用于 socket 绑定 |
+| `static_identity` | `struct noise_static_identity` | 本接口静态密钥身份 | 密钥结构见 05-05 |
+| `cookie_checker` | `struct cookie_checker` | cookie 质询状态 | 见 05-07、06-09 |
+| `peer_hashtable` | `struct pubkey_hashtable *` | 公钥到 peer 的哈希 | 按公钥查 peer |
+| `index_hashtable` | `struct index_hashtable *` | 握手 index 到对象的哈希 | 握手消息分发 |
+| `peer_allowedips` | `struct allowedips` | 地址前缀到 peer 的 trie | 字段见 05-04 |
+| `device_update_lock` | `struct mutex` | 保护配置更新 | 配置串行化 |
+| `socket_update_lock` | `struct mutex` | 保护 socket 更新 | 与 RCU 配合 |
+| `device_list` | `struct list_head` | 全局设备链表节点 | 设备枚举 |
+| `peer_list` | `struct list_head` | 本设备的 peer 链表头 | peer 枚举 |
+| `handshake_queue_len` | `atomic_t` | 握手队列长度计数 | 原子操作，免锁统计 |
+| `num_peers` | `unsigned int` | peer 数量 | 配置统计 |
+| `device_update_gen` | `unsigned int` | 配置代数 | 识别陈旧更新 |
+| `fwmark` | `u32` | 封装包的 firewall mark | 用于策略路由，见 03-04 |
+| `incoming_port` | `u16` | 当前 UDP 监听端口 | 0–65535 |
+
+注意 `crypt_queue`、`prev_queue`、`multicore_worker` 三个结构也定义在 `device.h`（`crypt_queue` 与 `multicore_worker`）和 `peer.h`（`prev_queue`）。它们不是 `wg_device` 的字段类型细节，而是独立结构，完整字段在 05-08。此处只说明 `encrypt_queue`、`decrypt_queue`、`handshake_queue` 三个实例的类型是 `crypt_queue`。
+
+### 4. 关键流程与调用链
+
+`wg_device` 的初始化在 `device.c` 的 `wg_device_init`（全局初始化，主要是 slab 与 workqueue）与 `wg_newlink`（创建单个接口时）。`wg_newlink` 收到 rtnetlink 的建链请求后，分配 netdev 与 `wg_device`，初始化 `device_update_lock`、`socket_update_lock`，挂接 netdev 操作，把 peer_hashtable、index_hashtable、allowedips 初始化，然后注册 netdev。模块加载顺序由 `main.c` 的 `wg_mod_init` 决定（device 在 peer 之后、netlink 之前初始化，见 01-03、06-01）。
+
+运行期，netlink 的 `WG_CMD_SET_DEVICE` 最终落到 `device.c` 的配置更新函数：持 `device_update_lock`，更新私钥（`static_identity`）、`fwmark`、监听端口（`incoming_port`，经 socket 更新路径持 `socket_update_lock`），并递增 `device_update_gen`。读路径如 `wg show` 走 `WG_CMD_GET_DEVICE`，在 RCU 保护下读取这些字段生成属性。这种「写加锁、读走 RCU 或持锁快照」的模式贯穿驱动（netlink 原理见 06-14）。
+
+销毁方向：接口删除时 `wg_destruct` 摘除 socket、释放 hashtable、清空 allowedips、注销 netdev；全局卸载时 `wg_device_uninit` 释放 workqueue 与 slab。整个过程要保证所有 `wg_peer` 已先移除、所有引用已归零，否则会触发 use-after-free（生命周期见 06-03）。
+
+这里面有个容易忽略的顺序约束：销毁必须走「先断流、再释放资源」的两阶段。第一步先让接口 down、摘掉 socket，使新的包不再进入数据面；第二步才清空 peer 与 allowedips、释放哈希表。若顺序颠倒，在释放过程中仍有 worker 从队列取包访问 peer，就会踩到已经回收的内存。`device_update_lock` 在这个阶段同样起作用——它保证配置更新与销毁互斥，不会出现「一边删接口一边改配置」的竞态。理解这个顺序，对排查卸载模块时的偶发崩溃很有帮助：这类崩溃往往不是某行代码的错误，而是生命周期交接处的竞态（并发与 RCU 原理见 06-13）。
+
+device 初始化与配置更新的调用关系见图 05-02-01。
+
+:::figure id=05-02-01 | name=wg_device 的初始化与配置更新路径 | dir=TD
+node s1 "wg_mod_init<br/>模块加载" blue
+node s2 "wg_device_init<br/>全局资源" gray
+node s3 "wg_newlink<br/>创建接口" teal
+node s4 "device_update_lock<br/>配置串行化" purple
+node s5 "socket_update_lock<br/>端口与socket" amber
+node s6 "netlink GET<br/>wg show" green
+edge s1 -> s2
+edge s2 -> s3
+edge s3 -> s4
+edge s4 -> s5
+edge s4 -> s6 "读快照"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「wg_mod_init 模块加载」先调「wg_device_init 全局资源」，建接口时走「wg_newlink 创建接口」；配置更新持「device_update_lock 配置串行化」，涉及端口/socket 时再持「socket_update_lock 端口与socket」；查询侧「netlink GET wg show」从配置锁取读快照。
+
+### 5. 配置/命令/代码实例
+
+下面用一段真实风格的源码片段说明 `wg_device` 字段如何在配置路径中被访问（片段基于 device.c 的结构，用于说明字段用法，非逐字源码引用）：
+
+```c
+/* 配置更新路径：持锁后修改 device 字段 */
+mutex_lock(&wg->device_update_lock);
+wg->fwmark = new_fwmark;
+wg->device_update_gen++;
+if (new_port != wg->incoming_port)
+    wg_socket_rebind(wg, new_port);   /* 内部再取 socket_update_lock */
+mutex_unlock(&wg->device_update_lock);
+
+/* 读路径：在 RCU 临界区内取 socket */
+rcu_read_lock();
+sock = rcu_dereference(wg->sock4);
+rcu_read_unlock();
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+字段访问规则：
+  fwmark          写：device_update_lock 保护    读：配置快照
+  incoming_port   写：socket_update_lock 间接保护  读：配置快照
+  sock4/sock6     写：socket_update_lock + RCU 发布  读：rcu_dereference
+  device_update_gen 写：device_update_lock 保护     读：并发识别用
+```
+
+逐行判读如下。第一段代码展示写路径：`fwmark` 与 `device_update_gen` 在 `device_update_lock` 保护下修改，保证并发配置串行化；端口变化时才调用 socket 重绑函数，避免无谓的 socket 重建。第二段展示读路径：`sock4` 用 `rcu_dereference` 在 `rcu_read_lock` 临界区内读取，这是 `__rcu` 标记字段的标准读法，保证在写者替换 socket 时读者不会访问到已释放对象。示例输出表把四个字段的读写保护规则列清楚：`fwmark` 与 `device_update_gen` 由 `device_update_lock` 保护；`incoming_port` 通过 socket 更新路径间接受 `socket_update_lock` 保护；`sock4`/`sock6` 是写侧加 `socket_update_lock` 并用 RCU 发布、读侧用 `rcu_dereference` 的典型模式。理解这张表，就理解了为什么这些字段不能随意在无锁上下文读写。
+
+这段代码还要额外说明一点：把 `device_update_gen++` 放在锁内、与 `fwmark` 修改放在一起，不是随意的书写顺序，而是刻意的原子性设计。配置代数的作用是标记「这一批配置属于同一代」，读侧在构造快照时会读取代数并在必要时重试。如果自增与字段修改不在同一把锁的临界区内，读侧可能看到「字段已更新但代数未变」的中间状态，从而把新数据误判为旧数据。这类「逻辑上必须一起变」的字段组，在并发编程里称为不变量，锁的边界必须覆盖整个不变量，而不只是单个字段。这也是为什么本册反复强调「先看字段属于哪组、需要哪把锁」——锁保护的往往是一组字段的联合一致性，而非单个变量。清理环节：代码片段仅作说明，不涉及实际资源分配。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把 `__rcu` 当普通指针。`sock4`、`sock6`、`creating_net` 都标了 `__rcu`，读取必须用 `rcu_dereference` 并处于读侧临界区，直接解引用在并发更新时可能读到已释放对象。第二个陷阱是忽略 `device_update_gen` 的作用：它用于并发配置时识别陈旧更新，改动配置逻辑时若绕过它，可能出现旧配置覆盖新配置的竞态。
+
+第三个陷阱是混淆 `atomic_t handshake_queue_len` 与普通整数：它用原子操作更新，为的是免锁统计；对它做非原子的读改写会破坏计数。第四个陷阱是把 `fwmark` 当作普通标记位：它是 `u32` 的 firewall mark，配合策略路由使用（部署见 03-04），在收到 fwmark 更新时要同步更新 socket 的 SO_MARK，否则不生效（具体同步路径需对照实际版本核验）。
+
+第五个陷阱是误以为三个 `crypt_queue` 可以随意增删。它们是模块初始化时按 CPU 数量动态创建的 per-CPU 资源，队列数量与 worker 绑定关系在初始化阶段确定；运行期改动队列结构会破坏 worker 与队列的映射，导致任务分发错乱。第六个陷阱是把 `num_peers` 当成精确实时值用于业务判断。它是配置统计，随 peer 增删更新，但在并发配置与销毁路径上，读取瞬间的值可能与实际操作存在时间差，不适合作为强一致的容量依据。真正需要精确对账的场景应当遍历 peer 链表并在持锁快照下计数，而不能只依赖这个累计值。
+
+最佳实践：读 `wg_device` 字段时，先看它在哪组，判断需要哪把锁或 RCU；写配置一律持 `device_update_lock`，涉及 socket 再取 `socket_update_lock`；读 socket 用 `rcu_dereference`；把 `device_update_gen` 当作并发一致性信号而非普通计数器；把三个队列视为初始化期固定的基础设施而非运行期可调参数。字段的完整机制解释在 06 册，本册只负责「字段是什么、由谁保护」。
+
+### 7. 小结与延伸阅读
+
+`wg_device` 是 WireGuard 接口的全局状态容器，20 个字段可归为 netdev 与命名空间、加解密队列、socket 与端口、身份与防护、peer 容器与路由、锁与计数六组。关键点：`dev` 关联 netdev；三个 `crypt_queue` 用于并行加解密；`sock4`/`sock6`/`creating_net` 受 RCU 与 `socket_update_lock` 保护；`peer_hashtable`/`index_hashtable`/`peer_allowedips` 组织 peer 与路由；`device_update_lock`/`socket_update_lock` 串行化配置；`fwmark` 服务策略路由。
+
+延伸阅读：`crypt_queue`/`prev_queue` 字段见 05-08，noise 身份见 05-05，allowedips 见 05-04，cookie 见 05-07；初始化与配置链去 06-01、06-14，socket 去 06-12，并发去 06-13。跨册随查按（字段见 05-02 ｜ 参数见 04-01 ｜ 原理见 06-01 ｜ 模块见 07-01）执行。本表字段以 `drivers/net/wireguard/device.h` 为准，需对照实际版本核验。作为全册第一个逐字段篇，本篇演示的「分组理解、标注保护机制、交叉引用让位」三种写法会在 05-03 到 05-09 一以贯之，读者可以据此形成固定的阅读节奏。

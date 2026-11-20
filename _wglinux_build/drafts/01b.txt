@@ -1,0 +1,297 @@
+## 01-03 WireGuard Linux 整体架构：内核模块、netlink 配置面与 wg 工具的分工
+
+### 1. 背景与动机
+
+读懂一套系统，先要划清它的边界与层次。WireGuard Linux 常被笼统地称为「一个 VPN」，但从源码看，它其实是三套彼此协作、又各自独立的部件拼起来的：运行在内核态、承担加解密与包转发的**内核模块**；作为内核与用户态之间契约的 **netlink 通用族配置面**；以及运行在用户态、被人直接敲命令的 **wg 工具**。把这三层的职责混在一起，是初读上游代码时最常见的困惑来源——比如有人满世界找一个叫「wireguard 进程」的东西，却怎么也找不到，因为数据面根本没有进程；也有人以为 `wg set` 直接改了某个配置文件，实际上它只是把 netlink 属性序列化后发给了内核。本篇的任务就是把这三层拆开，说明每层做什么、不做什么、层与层之间靠什么接口通信，并用真实源码位置佐证每一个结论。
+
+为什么这个拆解对后续阅读如此重要？因为本套资料后面十几册，本质上都是在这三层里往下钻。02 册讲怎么把内核模块和工具编译出来；03 册讲怎么把工具的配置落到一次隧道建立；04 册把工具命令与 netlink 属性的参数全集列成手册；05 册逐字段拆内核结构；06 册把调用链展开；07 册按目录讲每个模块文件的职责；08 册讲运维与排障。如果不在开篇建立一个准确的三层心智模型，读到「`wg genetlink init`」「`WG_CMD SET DEVICE`」「`ndo start xmit`」这些名字时就会失去坐标。本篇正是提供这个坐标的一篇。
+
+先明确事实锚点与取数纪律。本篇所有关于函数、字段、常量、命令的结论，均来自本快照源码：`_wglinux_build/upstream_src/wireguard-linux-src/`（内核驱动快照）与 `_wglinux_build/upstream_src/wireguard-tools/`（工具快照），下文路径相对这两个根目录。需要特别说明一处快照特征：驱动 Makefile 中列出了 `netlink.o`、`generated/netlink.o` 与 `peerlookup.o` 等目标，`main.c` 也 `#include "netlink.h"` 并调用 `wg_genetlink_init()`，但本快照的 `drivers/net/wireguard/` 目录并未包含 `netlink.c`、`peerlookup.c` 以及 `device.h`、`peer.h`、`netlink.h` 这几个头文件。这与 uapi 头 `include/uapi/linux/wireguard.h` 顶部「auto-generated from Documentation/netlink/specs/wireguard.yaml」的注释相互印证，说明该快照对应的是 netlink 定义已纳入 YAML 规范、内核侧 netlink 粘合层部分生成化的版本形态。因此，凡涉及内核 netlink 回调的具体函数体，本篇只描述其在初始化序列中的位置与对外契约，不臆造文件内细节，并统一标注「需对照实际版本核验」。这种克制不是回避，而是本套资料「基于真实源码、不编造路径与取值」纪律的直接体现。
+
+### 2. 核心概念
+
+三层分工可以浓缩成一句话：**内核模块管数据，netlink 管契约，wg 管人**。下面把它们逐一拆开。
+
+第一层是内核模块。它的载体是一个标准的 `net_device`，接口名通常是 `wg0`。`device.c` 的 `wg_setup` 把这个网卡的操作表设成 `wg_open`、`wg_stop`、`wg_xmit` 三项（`netdev_ops` 只挂了这三项），并把它标记为 `ARPHRD_NONE`、`IFF_POINTOPOINT | IFF_NOARP`，关闭 ARP、不需要硬件地址。内核协议栈按路由把出站包交给 `ndo_start_xmit`（这里对应 `wg_xmit`），WireGuard 就在内核里完成查路由、封装、加密、UDP 发出；入站则由 UDP socket 收包、验重放、解密、校验源地址后重新注入协议栈。整个过程没有用户态进程参与，也没有内核与用户态之间的数据拷贝。这是「内核态数据面」的准确含义。
+
+第二层是 netlink 通用族配置面。它是内核与用户态之间的一组**约定**，由 uapi 头 `include/uapi/linux/wireguard.h` 定义：族名 `WG_GENL_NAME` 为 `"wireguard"`，版本 `WG_GENL_VERSION` 为 `1`，命令只有两条——`WG_CMD_GET_DEVICE`（读）与 `WG_CMD_SET_DEVICE`（写），属性分 `wgdevice_attribute`、`wgpeer_attribute`、`wgallowedip_attribute` 三层。注意 uapi 头本身只是「契约文本」，它不执行任何逻辑；真正的内核侧解析与响应由 netlink 粘合层完成（在本快照中其实现文件未随快照提供，需对照实际版本核验，机制详见 06-14）。契约的稳定性远大于实现：只要属性枚举与命令号不变，内核内部怎么改写都不影响工具互通。
+
+第三层是 wg 工具，即 `wireguard-tools` 编译出的 `wg` 与 `wg-quick`。`wg.c` 的子命令表清晰地列出了它对外提供的能力：`show`、`showconf`、`set`、`setconf`、`addconf`、`syncconf`、`genkey`、`genpsk`、`pubkey`。`wg` 是**一次性命令**，跑完就退出，没有常驻守护进程；它把人类可读的配置解析成内核能懂的属性，通过 netlink 发出去，或从内核读回状态渲染成人可读文本。工具侧的 netlink 实现位于 `wireguard-tools/src/ipc-linux.h`，它用 libmnl 构造与解析 netlink 消息；这是「用户态控制面」的全部。
+
+理解这三层，还要抓住两条「自动加载路径」。内核模块声明里有两个别名：`MODULE_ALIAS_RTNL_LINK(KBUILD_MODNAME)` 与 `MODULE_ALIAS_GENL_FAMILY(WG_GENL_NAME)`。前者让 `ip link add wg0 type wireguard` 能通过 rtnetlink 自动加载本模块（因为 `link_ops.kind` 就是 `KBUILD_MODNAME`）；后者让工具打开 `wireguard` 通用族时能按需触发模块加载。也就是说，用户即使没手动 `modprobe`，两条路径中的任意一条都会把模块带起来。这是「分工」在加载环节的具体体现：rtnetlink 负责「建网卡」，genetlink 负责「配置它」，二者缺一不可。
+
+### 3. 关键数据结构与源码位置
+
+作为架构篇，本节只点名每层的关键结构与真实源码路径，逐字段定义统一交给 05 册，不在这里展开字段表。需要建立的结构地图分四层。
+
+**模块入口层**，以 `drivers/net/wireguard/main.c` 为代表。它本身不定义复杂结构，而是整个模块的生命周期网关：`wg_mod_init` 与 `wg_mod_exit` 在这里编排各层的初始化与回收，模块身份也在这里用 `MODULE_LICENSE`、`MODULE_VERSION`、`MODULE_ALIAS_*` 等宏声明。模块能力清单交给 07-01。
+
+**设备与状态层**，以 `device.c`、`socket.c`、`peer.c`、`allowedips.c` 为代表，核心结构是 `wg_device` 与 `wg_peer`。`wg_device` 内嵌 `net_device`，把私钥、监听端口、peer 链表、allowedips trie、socket、工作队列与锁组织在一起（字段见 05-02）；`wg_peer` 持有公钥、endpoint、握手状态、计数器与发送队列（字段见 05-03）。`socket.c` 围绕 UDP socket 与 `endpoint` 组织收发（字段见 05-07），`allowedips.c` 实现 v4/v6 混合 trie（字段见 05-04）。本册只点名，不展开。
+
+**netlink 契约层**，以 uapi 头 `include/uapi/linux/wireguard.h` 和内核 netlink 粘合层为代表。头里定义三层属性枚举、三组标志位与两条命令；完整常量与标志交给 04-05、04-06，uapi 配置结构字段交给 05-09。内核侧粘合层（Makefile 中的 `netlink.o`/`generated/netlink.o`）在本快照未含源码，其初始化入口 `wg_genetlink_init()` 仅能从 `main.c` 的调用顺序确认，细节需对照实际版本核验。
+
+**用户态工具层**，以 `wireguard-tools/src/` 为代表：`wg.c` 是命令入口，`config.c` 解析 ini 配置，`encoding.c` 做 base64 与密钥编解码，`curve25519.c` 做密钥运算，`ipc.c` 与 `ipc-linux.h` 是 IPC 抽象及其 Linux netlink 实现，另有 `set.c`、`show.c`、`setconf.c` 等子命令文件与 `wg-quick` 脚本。工具各模块的职责交给 07-13，命令参数全集交给 04-01。
+
+下表把本篇反复引用的源码位置收拢成速查，便于与后文对照。
+
+| 层次 | 代表源码路径 | 关键对象 | 本册处理方式 |
+|---|---|---|---|
+| 模块入口 | `drivers/net/wireguard/main.c` | `wg_mod_init`、`wg_mod_exit` | 讲分层顺序，模块细节见 07-01 |
+| 设备与网卡 | `drivers/net/wireguard/device.c` | `wg_device`、`netdev_ops`、`link_ops` | 只点名，字段见 05-02 |
+| socket 与端点 | `drivers/net/wireguard/socket.c` | `wg_socket_init`、`send4`、`send6` | 只点名，字段见 05-07 |
+| netlink 契约 | `include/uapi/linux/wireguard.h` | `wg_cmd`、三层属性枚举 | 只给最小片段，全集见 04-05 |
+| netlink 粘合 | Makefile 的 `netlink.o`（本快照未含源码） | `wg_genetlink_init` | 需对照实际版本核验，原理见 06-14 |
+| 用户态工具 | `wireguard-tools/src/wg.c`、`ipc-linux.h` | 子命令表、`mnlg_socket_open` | 只点名，模块见 07-13 |
+
+### 4. 关键流程与调用链
+
+最先要看清的是内核模块的**分层初始化链**。`main.c` 的 `wg_mod_init` 顺序非常清晰：先调 `wg_allowedips_slab_init()` 为 trie 节点准备 slab 缓存；随后在 `DEBUG` 编译下运行 `wg_allowedips_selftest()`、`wg_packet_counter_selftest()`、`wg_ratelimiter_selftest()` 三项自检，任一失败就把返回值设为 `-ENOTRECOVERABLE` 并跳到错误标签；接着 `wg_noise_init()` 初始化握手引擎，`wg_peer_init()` 初始化对等体层，`wg_device_init()` 注册设备层，`wg_genetlink_init()` 最后注册 netlink 族；全部成功后才用两行 `pr_info` 打印加载信息。这个顺序体现的是依赖关系：allowedips 与 noise 是基础，peer 依赖它们，device 又依赖 peer，netlink 最后注册以便用户态能开始配置。卸载函数 `wg_mod_exit` 严格逆序回收：`wg_genetlink_uninit()`、`wg_device_uninit()`、`wg_peer_uninit()`、`wg_allowedips_slab_uninit()`。初始化中任何一层失败，都通过 `goto err_netlink`、`err_device`、`err_peer`、`err_allowedips` 等标签回滚已完成的层。这是内核模块的标准写法，也是「分层」二字最字面的体现（完整启动链见 06-01）。
+
+第二要看清 `wg_device_init()` 内部做了什么。`device.c` 里它依次调用 `register_pm_notifier`、`register_random_vmfork_notifier`、`register_pernet_device`、`rtnl_link_register(&link_ops)`，每一步失败都回滚前一步。`link_ops` 的 `.kind` 是 `KBUILD_MODNAME`、`.priv_size` 是 `sizeof(struct wg_device)`、`.setup` 指向 `wg_setup`、`.newlink` 指向 `wg_newlink`。这解释了「为什么 `ip link add` 能建出 wg0」：rtnetlink 按 kind 找到这份 `link_ops`，先调 `wg_setup` 设定 netdev 的固定属性，再调 `wg_newlink` 做真正初始化。后者分配 peer 与 index 两张哈希表，创建 `wg-kex-%s`（握手收/发）与 `wg-crypt-%s`（加解密）三类工作队列，初始化 encrypt、decrypt、handshake 三个包队列与 ratelimiter，最后 `register_netdevice` 把网卡登记进内核。这些队列与工作队列是把加密从软中断上下文卸载到工作线程的机制基础（原理见 06-13）。
+
+第三是**配置链**。工具侧 `ipc-linux.h` 的 `kernel_set_device` 先用 `mnlg_socket_open(WG_GENL_NAME, WG_GENL_VERSION)` 打开到 wireguard 族的 netlink 套接字，再用 `mnlg_msg_prepare(nlg, WG_CMD_SET_DEVICE, ...)` 准备一条 SET 消息，把 `WGDEVICE_A_IFNAME`、`WGDEVICE_A_PRIVATE_KEY`、`WGDEVICE_A_LISTEN_PORT`、`WGDEVICE_A_FWMARK` 等属性依次放入，随后嵌套 `WGDEVICE_A_PEERS`，每个 peer 再嵌套 `WGPEER_A_ALLOWEDIPS`；若消息过大则通过 `toobig_peers`、`toobig_allowedips` 标签分批发送。读方向的 `kernel_get_device` 则发 `WG_CMD_GET_DEVICE`，用 `read_device_cb` 一路 `parse_device`→`parse_peers`→`parse_peer`→`parse_allowedips` 把内核回包还原成本地结构，再用 `coalesce_peers` 合并同一公钥的 peer 段。此外 `kernel_get_wireguard_interfaces` 走的是另一条 netlink 路由：`NETLINK_ROUTE` 上的 `RTM_GETLINK` 请求，用 `IFLA_INFO_KIND` 等于 `WG_GENL_NAME` 过滤出所有 wireguard 接口。可见工具同时用到了 rtnetlink（枚举与建链）与 genetlink（读写配置）两套 netlink 通道。
+
+第四是**数据链**。出站：`wg_xmit` 先做协议检查，再用 `wg_allowedips_lookup_dst` 按目的地址找到 peer，检查 endpoint 家族，处理 GSO 分段，把包挂入 `peer->staged_packet_queue`，最后 `wg_packet_send_staged_packets` 进入 `send.c`；`socket.c` 的 `send4`/`send6` 构造 `flowi4`/`flowi6`，`flowi4_proto` 为 `IPPROTO_UDP`、`flowi4_mark` 取 `wg->fwmark`，经 `udp_tunnel_xmit_skb` 从物理网卡发出。入站：`wg_socket_init` 建立 UDP socket 时用 `udp_tunnel_sock_cfg` 把 `.encap_rcv` 设为 `wg_receive`，后者拿到包就调 `wg_packet_receive` 进入 `receive.c`。三条链路的逐段实现分别在 06-05、06-06、06-14，本节只给骨架。
+
+三条链路与三层分工的关系见图 01-03-01。
+
+:::figure id=01-03-01 | name=三层分工与三条链路 | dir=TD
+node u1 "用户与 wg 工具<br/>一次性命令" amber
+node u2 "netlink 契约<br/>GET/SET 属性" blue
+node k1 "内核 netlink 粘合<br/>解析并更新状态" purple
+node k2 "wg_device 状态<br/>peer 与 allowedips" gray
+node k3 "wg_xmit 数据面<br/>查 trie 选 peer" teal
+node k4 "UDP socket<br/>封装加密发出" green
+node u3 "rtnetlink<br/>ip link add wg0" amber
+edge u1 -> u2 "序列化"
+edge u2 -> k1 "genetlink"
+edge k1 -> k2 "更新"
+edge u3 -> k2 "建链"
+edge k2 -> k3 "查状态"
+edge k3 -> k4 "封装"
+edge k4 -> k1 "收包回调"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「用户与 wg 工具 一次性命令」把配置序列化为「netlink 契约 GET/SET 属性」，经 genetlink 到「内核 netlink 粘合 解析并更新状态」，落到「wg_device 状态 peer 与 allowedips」；另一路「rtnetlink ip link add wg0」直接建出这份状态。数据到来后由「wg_xmit 数据面 查 trie 选 peer」经「UDP socket 封装加密发出」，收包再由回调回到内核处理链。
+
+### 5. 配置/命令/代码实例
+
+下面用一组命令把三层同时「照出来」：既有工具层的版本与状态，也有内核层的模块身份与加载日志。完整参数交给 04 册，这里只取能说明分工的最小集。
+
+```bash
+# 第三层：用户态工具身份
+wg --version
+
+# 第二层：内核模块身份（版本、许可、别名、描述）
+modinfo wireguard | grep -E '^(version|license|alias|description|author):'
+
+# 第一层是否真的在内核里跑
+lsmod | grep wireguard
+dmesg | grep -i 'wireguard: WireGuard'
+
+# 配置面的一次读操作：wg 通过 netlink GET 拉状态
+wg show wg0
+```
+
+为了对照内核侧的层次，这里节选 `main.c` 的初始化骨架（保留原控制流，略去自检细节）：
+
+```c
+static int __init wg_mod_init(void)
+{
+	int ret = wg_allowedips_slab_init();
+	if (ret < 0) goto err_allowedips;
+	wg_noise_init();
+	ret = wg_peer_init();     if (ret < 0) goto err_peer;
+	ret = wg_device_init();   if (ret < 0) goto err_device;
+	ret = wg_genetlink_init(); if (ret < 0) goto err_netlink;
+	pr_info("WireGuard " WIREGUARD_VERSION " loaded.\n");
+	return 0;
+err_netlink: wg_device_uninit();
+err_device:  wg_peer_uninit();
+err_peer:    wg_allowedips_slab_uninit();
+err_allowedips: return ret;
+}
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+wireguard-tools v1.0.20260223 - https://git.zx2c4.com/wireguard-tools/
+version:        1.0.0
+license:        GPL v2
+description:    WireGuard secure network tunnel
+author:         Jason A. Donenfeld <Jason@zx2c4.com>
+alias:          rtnl-link-wireguard
+alias:          net-pf-16-proto-16-family-wireguard
+wireguard              20480  0
+wireguard: WireGuard 1.0.0 loaded. See www.wireguard.com for information.
+interface: wg0
+  public key: <本端公钥>
+  private key: (hidden)
+  listening port: 51820
+peer: <对端公钥>
+  endpoint: 203.0.113.9:51820
+  allowed ips: 10.0.0.2/32
+  latest handshake: 25 seconds ago
+  transfer: 2.10 KiB received, 1.44 KiB sent
+```
+
+逐行判读如下。`wireguard-tools v1.0.20260223` 来自 `wg.c` 对 `WIREGUARD_TOOLS_VERSION` 的 `printf`，这是**第三层**工具的版本，与内核无关。`version: 1.0.0` 来自模块 `MODULE_VERSION(WIREGUARD_VERSION)`，而 `WIREGUARD_VERSION` 在 `drivers/net/wireguard/version.h` 定义为 `"1.0.0"`，这是**第一层**内核驱动的版本；两者独立，不可混谈（版本基准见 01-04）。`license: GPL v2` 对应 `main.c` 的 `MODULE_LICENSE("GPL v2")`，与每个源文件顶部的 `SPDX-License-Identifier: GPL-2.0` 一致（许可细节见 01-04）。`description` 与 `author` 分别对应 `MODULE_DESCRIPTION` 与 `MODULE_AUTHOR`。两条 `alias` 正是 `MODULE_ALIAS_RTNL_LINK` 与 `MODULE_ALIAS_GENL_FAMILY` 展开的结果，分别对应 rtnetlink 建链与 genetlink 配置两条自动加载路径——这是三层分工在模块元数据上的直接烙印。`wireguard 20480 0` 是 `lsmod` 输出，第三列引用计数为 0 说明没有其它模块依赖它，但模块确实已加载（数据面在内核，所以不会有「进程」出现在 `ps` 里）。那行 `wireguard: WireGuard 1.0.0 loaded` 来自 `wg_mod_init` 末尾的 `pr_info`，前缀 `wireguard:` 是 Makefile 里 `pr_fmt` 用 `KBUILD_MODNAME` 拼出来的，看到它就说明分层初始化全部成功走到了最后一步。最后 `wg show wg0` 的每一段则是**第二层**契约的渲染：`public key`/`private key`/`listening port` 来自 device 属性，`peer` 段来自 peer 属性，`allowed ips` 来自 allowedip 属性，`latest handshake` 与 `transfer` 分别来自 `WGPEER_A_LAST_HANDSHAKE_TIME`、`WGPEER_A_RX_BYTES`/`WGPEER_A_TX_BYTES`（字段见 05-03）。三行输出恰好把「工具—契约—内核」三层串成了一次可读的往返。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把三层当成一层。典型表现是到用户态去找数据面进程，或在内核里找配置解析逻辑——两者都不存在。正确的心智是：转发与加解密只在内核模块里，`wg` 命令跑完即退出，netlink 只是两者之间的消息约定。任何把「工具配置」直接等同于「改文件」的说法都是错的：wg-quick 才会写 `wg0.conf`，而 `wg set` 走的是 netlink。
+
+第二个陷阱是因快照缺文件而误判架构。本快照的 `drivers/net/wireguard/` 没有 `netlink.c`/`peerlookup.c` 与若干头文件，但 Makefile 明确引用了它们。这不是「内核不做 netlink」，而是本快照的生成化/裁剪形态所致。遇到引用了却找不到的文件，应标注「需对照实际版本核验」并转向权威册，而不是据此断言功能缺失。
+
+第三个陷阱是把三个版本号混为一谈：`version.h` 的 `1.0.0` 是内核驱动版本，`WIREGUARD_TOOLS_VERSION` 的 `1.0.20260223` 是工具版本，`uname -r` 给出的又是第三个数（目标内核版本）。三者独立演进（版本基准见 01-04）。第四个陷阱是夸大 `wg` 的能力：它不含守护进程、不做密钥自动分发、不下发地址，这些都要靠上层控制面；命令全集见 04-01，配置体系见 03 册。
+
+最佳实践可以归纳为四步排错顺序：**先看内核层**——用 `lsmod` 与 `dmesg` 确认模块已加载、分层初始化成功（构建见 02-03）；**再看建链**——用 `ip link show wg0` 确认 rtnetlink 路径通畅、网卡存在；**然后看配置面**——用 `wg show` 的 `latest handshake` 判断 netlink 写入是否生效、握手是否真的完成（排障见 08-03）；**最后才看数据面**——用 `transfer` 字节与路由表确认流量确实经过 wg0（路由见 03-04）。这个顺序不能颠倒，因为下层没起来时上层的现象具有迷惑性：模块没加载时 `wg set` 会报「No such device」，而路由没配好时握手成功但字节数为零，两种故障的定位方向完全不同。
+
+### 7. 小结与延伸阅读
+
+本篇把 WireGuard Linux 拆成三层：**内核模块**以 `net_device` 形态承载数据面，`wg_mod_init` 按 allowedips→noise→peer→device→netlink 的顺序分层初始化、`wg_mod_exit` 逆序回收；**netlink 配置面**以 uapi 头定义的 `WG_CMD_GET_DEVICE`/`WG_CMD_SET_DEVICE` 与 device/peer/allowedip 三层属性作为内核与用户态的稳定契约；**wg 工具**以一次性命令把人读配置翻译成 netlink 属性，无守护进程。两条模块别名 `MODULE_ALIAS_RTNL_LINK` 与 `MODULE_ALIAS_GENL_FAMILY` 分别对应「建网卡」与「配置网卡」两条自动加载路径，是三层分工在加载环节的具体体现。
+
+延伸阅读建议按三条线走：想看模块入口与每一层的内部实现，读 `main.c` 并按 07-01、07-02、07-09、07-11 逐模块展开；想看 netlink 消息如何被解析与响应，读 06-14 与 04-05、04-06；想看工具如何把配置序列化，读 07-13 与 04-01。跨册随查按（字段见 05-02 ｜ 参数见 04-01 ｜ 原理见 06-14 ｜ 模块见 07-01）执行：结构体的逐字段定义去 05，命令与属性全集去 04，机制与调用链去 06，目录级模块职责去 07，运维与排障去 08。凡本篇标注「需对照实际版本核验」的 netlink 粘合层细节，均以 `_wglinux_build/upstream_src/` 下对应文件与实际内核版本为准，本套资料不编造未核验的路径与取值。
+
+## 01-04 版本基准、源码地图、许可与资料使用约定
+
+### 1. 背景与动机
+
+一套基于源码的技术资料，必须先交代清楚「你读的是哪一份源码、按什么版本口径、依据什么纪律写成」，否则再详细的结论都可能因版本漂移而失效。这正是本篇的使命：它不深入任何一条调用链，也不展开任何一张字段表，而是为本套资料立四根柱子——**版本基准、源码地图、许可、使用约定**。看起来是「元信息」，实际决定了后面每一册的可信度。
+
+先看为什么版本基准如此要紧。WireGuard Linux 至少同时存在三个互不相同的版本号，且各自独立演进：内核驱动自己的 `WIREGUARD_VERSION`，用户态工具的 `WIREGUARD_TOOLS_VERSION`，以及运行环境的 Linux 内核版本。把它们混为一谈，会直接导致排障方向错误——比如有人看到 `modinfo` 显示 `1.0.0`、而 `wg --version` 显示 `1.0.20260223`，就认定两者不配套、必须降级工具；实际上这是两个项目的独立版本，本来就该不同。反过来，若一台机器装的是发行版回移植的旧内核，即便工具是新版，某些 uapi 属性也可能不被内核识别。因此本套资料统一声明：事实锚点是 `_wglinux_build/upstream_src/wireguard-linux-src/`（内核驱动快照）与 `_wglinux_build/upstream_src/wireguard-tools/`（工具快照），二者版本分别为下述的具体值；凡落到目标机器，一律要求对照该机实际内核与工具版本核验。
+
+再看源码地图的必要性。内核驱动、加密原语、uapi 头、用户态工具分散在两棵目录树里，且像 netlink 定义这样的部分已经从手写 C 迁移到 YAML 规范生成。若不在开篇给出一张「哪个目录放什么、哪个文件管什么」的地图，读者很容易在 `drivers/net/wireguard/` 里翻半天找不到 `netlink.c`，或误以为 `include/uapi/linux/wireguard.h` 是手写的、可以随意改。地图的作用就是把「找得到」变成「一开始就找对地方」。
+
+最后是许可与资料纪律。WireGuard 内核驱动与用户态工具采用不同的许可组合，uapi 头又是一套双许可声明；闭源集成、再分发、内核 upstreaming 时，这些差异都会变成合规问题。而资料使用约定——尤其是「不编造路径与取值」「拿不准就标注核验」「非权威册用交叉引用让出细节」——是本套十几册能保持一致、不互相矛盾、不与权威册重复的根本保证。本篇把这三条规矩讲透，后面所有篇章都受它约束。
+
+### 2. 核心概念
+
+本篇的四个关键词对应四组核心概念，逐一厘清。
+
+**版本基准**不是一个数，而是一组三元组：`drivers/net/wireguard/version.h` 定义的 `WIREGUARD_VERSION "1.0.0"`；`wireguard-tools/src/version.h` 定义的 `WIREGUARD_TOOLS_VERSION "1.0.20260223"`；以及目标系统的内核版本（由 `uname -r` 给出，本套资料不预设）。第一个值经 `MODULE_VERSION(WIREGUARD_VERSION)` 暴露给 `modinfo`，并在 `wg_mod_init` 里被 `pr_info` 打印；第二个值经 `wg.c` 的 `printf` 暴露给 `wg --version`。重要认识：这两个版本号分属两个 Git 项目，没有同步关系，出现差异是常态而非故障（版本基准与核验见 08-01）。
+
+**源码地图**是按「职责域」划分的四块。内核驱动域是 `drivers/net/wireguard/`，负责 netdev、握手、收发、定时器、路由 trie、限速与 cookie；加密原语域位于内核树 `lib/crypto/`（本快照置于 `wireguard-linux-src/lib/crypto/`），提供 ChaCha20、Poly1305、Curve25519、BLAKE2s、SipHash 等实现；uapi 契约域是 `include/uapi/linux/wireguard.h`，由 YAML 规范生成；用户态工具域是 `wireguard-tools/src/`，提供 wg 与 wg-quick。四块通过 netlink 与 uapi 头连成一体。逐目录、逐文件的职责清单是 07 册的权威内容，本篇只给坐标，不抢其展开（模块见 07-01、07-12、07-13）。
+
+**许可**在本项目里是分层的。内核驱动每个源文件的 `SPDX-License-Identifier` 是 `GPL-2.0`，模块整体又以 `MODULE_LICENSE("GPL v2")` 对外声明；uapi 头是 `((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause)` 的双许可；而 `wireguard-tools/src/` 下多数 C 文件是 `GPL-2.0 OR MIT`，其中 `ipc-linux.h` 单独标为 `MIT`。这组差异的实务含义是：把内核驱动当作 GPLv2 代码对待，把工具按其双许可条款对待，uapi 头因带 syscall-note 例外可安全地用于用户态头文件包含。需要注意的是，不同实现的许可各自独立（例如 wireguard-go 采用 MIT），跨实现复用代码时要分别评估。
+
+**使用约定**是一套可执行的写作纪律，可概括为四条：事实来源唯一权威（只认本快照源码，不凭记忆写路径与取值）；不确定即标注（拿不准的统一写「需对照实际版本核验」）；权威册去重（04 管参数、05 管字段、06 管原理、07 管模块、08 管运维基准，其他册只给最小片段并交叉引用）；口径克制（不写绝对性能数字，一律「需在目标机型实测」）。四条里最容易违反的是第三条——看到字段就想顺手解释清楚，结果把 05 册的内容抄了一遍。本篇与 01-03 都严格克制，只点名、不给字段表。
+
+### 3. 关键数据结构与源码位置
+
+本篇不引入新的运行时结构，而是给出「源码地图」这张元结构。下表按域列出代表性路径与本篇的处理边界，真正的逐文件职责在 07 册。
+
+| 域 | 代表路径 | 关键内容 | 本册处理方式 |
+|---|---|---|---|
+| 内核驱动 | `drivers/net/wireguard/main.c` | 模块入口、`wg_mod_init`/`wg_mod_exit` | 只给版本与许可事实，模块见 07-01 |
+| 内核驱动 | `drivers/net/wireguard/device.c`、`socket.c` | 设备生命周期、UDP socket | 只点名，字段见 05-02、05-07 |
+| 加密原语 | `lib/crypto/chacha20.c`、`poly1305.c`、`curve25519.c`、`blake2s.c`、`siphash.c` | 对称加密、哈希、椭圆曲线 | 只点名，模块见 07-12 |
+| uapi 契约 | `include/uapi/linux/wireguard.h` | 族名、版本、命令、三层属性枚举 | 只给最小片段，全集见 04-05、04-06 |
+| 用户态工具 | `wireguard-tools/src/wg.c`、`ipc-linux.h`、`version.h` | 子命令表、netlink IPC、工具版本 | 只点名，模块见 07-13 |
+
+把内核驱动域再展开一层，能看清这份快照的「文件清单与缺项」。驱动 `Makefile` 用 `wireguard-y` 逐个列出编译单元：`main.o`、`noise.o`、`device.o`、`peer.o`、`timers.o`、`queueing.o`、`send.o`、`receive.o`、`socket.o`、`peerlookup.o`、`allowedips.o`、`ratelimiter.o`、`cookie.o`、`netlink.o` 与 `generated/netlink.o`，最终 `obj-$(CONFIG_WIREGUARD) := wireguard.o`。对照实际目录会发现 `peerlookup.c`、`netlink.c` 与 `generated/netlink.c` 并未随本快照提供，同样缺失的还有 `device.h`、`peer.h`、`netlink.h` 等头文件。这是阅读本快照时最需要警惕的一处：**Makefile 引用了、目录里却没有**。正确的解读是这份快照对应 netlink 定义生成化之后的版本形态——`generate/netlink` 相关代码由工具链从 YAML 规范生成，未纳入本快照的源码收集；uapi 头顶部「auto-generated from Documentation/netlink/specs/wireguard.yaml；To regenerate run: tools/net/ynl/ynl-regen.sh」的注释正是这一判断的直接证据。凡涉及这些缺失文件的内部实现，本套资料一律标注「需对照实际版本核验」，机制层面统一指向 06-14，模块层面指向 07-11。
+
+用户态工具域同样值得点名。`wireguard-tools/src/` 下除 `wg.c` 入口外，还有 `config.c`（ini 配置解析）、`encoding.c`（base64 与密钥编解码）、`curve25519.c`（配合 `curve25519-hacl64.h` / `curve25519-fiat32.h` 两套实现做密钥运算）、`ipc.c` 与多个 `ipc-*.h`（IPC 抽象及各平台实现，其中 `ipc-linux.h` 为 Linux netlink 实现）、`genkey.c`、`pubkey.c`、`set.c`、`setconf.c`、`show.c`、`showconf.c` 等子命令文件，以及 `wg-quick` 脚本与 `man/`、`systemd/`、`completion/` 等配套目录。工具域的模块能力清单与逐文件职责是 07-13 的权威内容，命令参数全集是 04-01，本篇不重复。
+
+### 4. 关键流程与调用链
+
+作为「元信息」篇，这里的「流程」指版本号与许可信息从源码走向用户所见输出的**溯源链**，共三条。
+
+第一条是内核驱动版本链。`version.h` 里的一行 `#define WIREGUARD_VERSION "1.0.0"` 是源头；`main.c` 通过 `#include "version.h"` 引入它，一方面用 `MODULE_VERSION(WIREGUARD_VERSION)` 把它写进模块元数据，另一方面在 `wg_mod_init` 末尾用 `pr_info("WireGuard " WIREGUARD_VERSION " loaded...")` 把它拼进加载日志；用户端分别用 `modinfo wireguard` 与 `dmesg` 看到这两个出口。链条上任何一环的版本差异都指向「源头不同」，而非「源码不一致」。
+
+第二条是工具版本链。`wireguard-tools/src/version.h` 的 `#define WIREGUARD_TOOLS_VERSION "1.0.20260223"` 是源头；`wg.c` 包含该头后，在 `main` 里判断参数 `-v`/`--version`/`version`，命中就 `printf("wireguard-tools v%s - ...", WIREGUARD_TOOLS_VERSION)`。用户敲 `wg --version` 看到的就是这条链的终点。它与第一条链没有任何共享节点，这就是「两个版本号不必相等」的原因。
+
+第三条是许可与契约的生成链。许可信息从每个文件的 `SPDX-License-Identifier` 注释出发，内核侧再经 `MODULE_LICENSE("GPL v2")` 汇总为模块级声明，最终由 `modinfo` 的 `license` 字段呈现；而 uapi 头则从 `Documentation/netlink/specs/wireguard.yaml` 出发，经 `tools/net/ynl/ynl-regen.sh` 生成，同时产出 `include/uapi/linux/wireguard.h` 与内核侧的 `generated/netlink.o` 相关代码。这也解释了 01-03 里那个悬案：netlink 粘合层之所以「在 Makefile 里、不在源码目录里」，是因为它由规范生成，而非手写。
+
+三条溯源链见图 01-04-01。
+
+:::figure id=01-04-01 | name=版本、许可与 uapi 的三条溯源链 | dir=TD
+node a "驱动 version.h<br/>1.0.0" teal
+node b "MODULE_VERSION<br/>pr_info 加载日志" blue
+node c "modinfo / dmesg<br/>看到的驱动版本" green
+node d "工具 version.h<br/>1.0.20260223" amber
+node e "wg.c 的 printf<br/>wg --version" blue
+node f "wireguard.yaml<br/>netlink 规范源" purple
+node g "ynl-regen.sh<br/>生成 uapi 头" gray
+node h "SPDX 头<br/>GPL-2.0 / OR MIT" red
+node i "MODULE_LICENSE<br/>GPL v2" red
+edge a -> b "引入"
+edge b -> c "呈现"
+edge d -> e "引入"
+edge f -> g "生成"
+edge h -> i "汇总"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：驱动版本链从「驱动 version.h 1.0.0」经「MODULE_VERSION / pr_info 加载日志」到「modinfo / dmesg 看到的驱动版本」；工具版本链从「工具 version.h 1.0.20260223」到「wg.c 的 printf wg --version」；契约链从「wireguard.yaml netlink 规范源」经「ynl-regen.sh 生成 uapi 头」；许可链从「SPDX 头 GPL-2.0 / OR MIT」经「MODULE_LICENSE GPL v2」汇总出模块许可。
+
+### 5. 配置/命令/代码实例
+
+下面这组命令用来「现场核验」本篇所有元信息。它们是核验动作，不是配置动作；参数全集见 04 册。
+
+```bash
+# 版本三元组：目标内核 + 驱动 + 工具
+uname -r
+cat drivers/net/wireguard/version.h
+cat wireguard-tools/src/version.h
+wg --version
+modinfo wireguard | grep -E '^(version|license):'
+
+# 许可：源码 SPDX 头与模块声明
+grep -m1 SPDX drivers/net/wireguard/main.c
+grep -m1 SPDX wireguard-tools/src/ipc-linux.h
+grep 'MODULE_LICENSE' drivers/net/wireguard/main.c
+
+# uapi 头的生成来源
+head -5 include/uapi/linux/wireguard.h
+```
+
+三条溯源链的源码最小片段如下（保留原字面值）：
+
+```c
+/* drivers/net/wireguard/version.h */
+#define WIREGUARD_VERSION "1.0.0"
+
+/* wireguard-tools/src/version.h */
+#define WIREGUARD_TOOLS_VERSION "1.0.20260223"
+
+/* drivers/net/wireguard/main.c */
+MODULE_LICENSE("GPL v2");
+MODULE_VERSION(WIREGUARD_VERSION);
+
+/* include/uapi/linux/wireguard.h 首行 */
+/* SPDX-License-Identifier: ((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause) */
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+6.12.0-generic
+#define WIREGUARD_VERSION "1.0.0"
+#define WIREGUARD_TOOLS_VERSION "1.0.20260223"
+wireguard-tools v1.0.20260223 - https://git.zx2c4.com/wireguard-tools/
+version:        1.0.0
+license:        GPL v2
+// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: MIT
+MODULE_LICENSE("GPL v2");
+/* SPDX-License-Identifier: ((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause) */
+/* Do not edit directly, auto-generated from: */
+/*	Documentation/netlink/specs/wireguard.yaml */
+```
+
+逐行判读如下。第一行 `6.12.0-generic` 来自 `uname -r`，是**目标系统内核版本**，与驱动、工具版本都不同，它是判断「快照是否适用于当前机器」的基准（性能基准方法见 08-01，注意那是性能基准，与版本基准不同）。第二行 `WIREGUARD_VERSION "1.0.0"` 出自驱动 `version.h`，是内核驱动版本源头；第三行 `WIREGUARD_TOOLS_VERSION "1.0.20260223"` 出自工具 `version.h`，是工具版本源头，两者并列出现恰好证明它们独立。第四行 `wireguard-tools v1.0.20260223` 是 `wg.c` 中 `printf` 加上 `WIREGUARD_TOOLS_VERSION` 的输出，说明工具链的终点与源头一致。第五、六行 `version: 1.0.0`、`license: GPL v2` 来自 `modinfo`，分别对应 `MODULE_VERSION` 与 `MODULE_LICENSE` 两个宏——注意 `modinfo` 显示的许可字符串是 `GPL v2` 而不是 SPDX 的 `GPL-2.0`，这是因为内核模块元数据用的是后者映射后的传统写法，二者语义一致、格式不同，不可当成两个许可。第七行驱动的 `SPDX-License-Identifier: GPL-2.0` 说明内核侧每个源文件按 SPDX 标注；第八行 `ipc-linux.h` 的 `SPDX-License-Identifier: MIT` 说明工具侧这个文件单独采用 MIT，与多数 `GPL-2.0 OR MIT` 的工具文件又不相同，复用代码时必须逐文件看 SPDX，不能按目录一概而论（许可见本节第 2 点）。第九行再次印证模块级 `MODULE_LICENSE("GPL v2")`。最后三行 `Do not edit directly`、`wireguard.yaml`、`auto-generated` 提醒读者：uapi 头是生成物，任何手写修改都会在下次 `ynl-regen.sh` 时被覆盖，要改命令与属性必须先改 YAML 规范（命令全集见 04-05）。这一组输出从版本到许可再到生成来源，把本篇四根柱子各核验了一遍。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把三个版本号混为一谈。再强调一次：`1.0.0` 是驱动版本，`1.0.20260223` 是工具版本，`uname -r` 是内核版本，三者不必相等、也不应相等。看到差异先确认各自来源，不要贸然「对齐版本」。第二个陷阱是把 uapi 头当可编辑文件。`include/uapi/linux/wireguard.h` 顶部明写「Do not edit directly」，它由 YAML 生成；直接改头文件或手改 `generated/netlink.o` 都是无效且危险的，正确路径是改规范再重新生成。第三个陷阱是按目录推断许可：工具域里多数文件是 `GPL-2.0 OR MIT`，但 `ipc-linux.h` 单独是 `MIT`，uapi 头又是带 syscall-note 例外的双许可；闭源集成前必须逐文件读 SPDX 头，必要时寻求法务意见。
+
+第四个陷阱是因快照缺文件而误判版本。本快照的驱动目录缺 `netlink.c`、`peerlookup.c`、`netlink.h` 等，但 Makefile 引用了它们；这属于生成化与收集范围问题，不是「该版本没有 netlink 功能」。遇到引用与文件对不上，正确做法是标注「需对照实际版本核验」并转向 06-14、07-11，而不是断言功能不存在。第五个陷阱是照抄绝对性能数字：吞吐、pps、握手速率一律需在目标机型实测，本套资料不给绝对值（基准方法见 08-01，调优见 08-02）。第六个陷阱是跨册重复展开细节：看到 `wg_device` 就想把字段全列出来，看到 `wg set` 就想把参数全抄一遍——这些都由 05、04 册负责，本篇只用交叉引用让出去。
+
+最佳实践可归纳为四步。第一步，**先固定基准再谈细节**：任何讨论开始前，先用本篇命令组确认目标机器的内核、驱动、工具三者版本，把它写进排障记录。第二步，**每个结论都给真实路径**：写「`wg_xmit` 查 allowedips」就必须能指到 `device.c`，指不到就标注核验，绝不凭记忆编路径。第三步，**用权威册去重**：参数去 04、字段去 05、原理去 06、模块职责去 07、运维与性能去 08，本篇与 01-03 只做定位与约定；四段式交叉引用就是这套纪律的落地形式。第四步，**区分「快照事实」与「目标机事实」**：本套资料给出的是基于真实源码的深度解读，不是对某个发行版某个内核版本的逐字说明书；凡落到具体机器，都要以该机实际版本复核。把这两类事实分开，是正确使用本套资料的前提。
+
+### 7. 小结与延伸阅读
+
+本篇为全套资料立下四根柱子。**版本基准**是三元组：驱动 `1.0.0`、工具 `1.0.20260223`、目标内核 `uname -r`，三者独立，差异是常态。**源码地图**分四域：内核驱动 `drivers/net/wireguard/`、加密原语 `lib/crypto/`、uapi 契约 `include/uapi/linux/wireguard.h`、用户态工具 `wireguard-tools/src/`；其中 netlink 粘合层由 YAML 规范生成，故 Makefile 引用了本快照未含的 `netlink.o`/`generated/netlink.o`，相关细节一律标注需对照实际版本核验。**许可**分层：内核驱动 SPDX 为 `GPL-2.0` 且 `MODULE_LICENSE("GPL v2")`，uapi 头为 `((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause)`，工具多为 `GPL-2.0 OR MIT` 而 `ipc-linux.h` 单独为 `MIT`。**使用约定**四条：事实来源唯一权威、不确定即标注核验、权威册去重、口径克制不写绝对性能数字。
+
+延伸阅读建议按三条线走：想核验版本与构建，读 02 册（源码获取见 02-01，构建配置见 02-02）与 08-01 的性能基准方法；想逐文件深入，按 07-01、07-02、07-11、07-12、07-13 展开模块职责；想查具体字段与参数，去 05 册与 04 册。跨册随查按（字段见 05-01 ｜ 参数见 04-05 ｜ 原理见 06-01 ｜ 模块见 07-01）执行：结构地图与逐字段定义去 05，命令与 netlink 属性全集去 04，启动与调用链去 06，目录级模块职责去 07，运维与基准去 08。凡本篇标注「需对照实际版本核验」的版本号、文件路径与生成物细节，均以 `_wglinux_build/upstream_src/` 下对应文件与目标系统实际版本为准，本套资料不编造未核验的路径与取值。

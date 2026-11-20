@@ -1,0 +1,954 @@
+# WireGuard Linux 技术资料 · 03 集成与部署
+
+## 03-01 最小可用部署：第一次点对点隧道
+
+### 1. 背景与动机
+
+本篇是 03 册「集成与部署」的开篇，任务是把一条 WireGuard 隧道从零跑通到「两端能互相 ping 通」的最小闭环。它在整套资料中的位置很明确：02 册解决了模块与工具「能不能用」的编译构建问题，03 册回答「怎么用起来」，而 04 册负责把所有参数、命令与常量收拢成权威手册。本册刻意选择从最裸的 `wg` 与 `ip` 命令起步，而不是一上来就用 `wg-quick`，原因在于：只有先看清楚一条命令到底往内核写了什么，才能真正理解 03-02 里 `wg0.conf` 的每个字段最终落到何处，也才能在隧道不通时判断问题出在配置、路由还是握手。
+
+所谓「最小可用」，本套资料给出一个可验证的严格定义，包含四个同时满足的条件：其一，两端各有一个名为 `wg0`（或自定义名）的 WireGuard 接口，且接口处于 `up` 状态；其二，每个接口都配置了本端私钥与对端公钥，且双方的公钥互为对方的身份标识；其三，两端各自为隧道分配了一个地址并配置了对端地址段，路由能把目标流量送进 `wg0`；其四，`wg show` 中能看到一次成功的 `latest handshake`，并且 `ping` 对端隧道地址有去有回。缺少任何一条，都不算可用——尤其是第四条，很多新手把「接口 up 了」当成隧道通了，而 WireGuard 是静默协议，握手失败时只会丢包、不返回错误，这是本篇后半段要反复强调的判据。
+
+部署的前置条件必须先确认，否则排查会事倍功半。第一，内核模块可用：要么内核已内置 `CONFIG_WIREGUARD`，要么能加载 `drivers/net/wireguard/` 编译出的模块，验证方法是 `ip link add test type wireguard` 后立刻 `ip link del test`，构建路径见 02-03。第二，用户态工具可用：`wg --version` 能打印 `wireguard-tools v1.0.20260223` 一类版本串（版本号来自 `wireguard-tools/src/version.h` 的 `WIREGUARD_TOOLS_VERSION`，构建见 02-04）。第三，网络可达：至少一端有可被对端访问的 UDP 端口（默认 51820），中间防火墙放行 UDP；若两端都在 NAT 后且无端口映射，本篇的最小模型不成立，需要 03-04 的打洞或 03-06 的中继思路。第四，时钟基本同步：握手消息带时间戳，时钟偏差过大会让握手被判为过期（握手时序见 06-03）。
+
+口径声明：本篇所有命令语义、字段与常量均以两套快照为准——内核侧 `_wglinux_build/upstream_src/wireguard-linux-src/`，工具侧 `_wglinux_build/upstream_src/wireguard-tools/`（版本 1.0.20260223）。下文凡出现源码路径均相对这两个根目录，为节约篇幅省略前缀。凡涉及具体选项取值、输出格式的地方，一律提示「需对照实际版本核验」，本套资料不编造未核验的路径与取值，也不给出任何绝对性能数字。
+
+### 2. 核心概念
+
+最小点对点部署可以压缩成四句话：**两节点、一套密钥、双向 AllowedIPs、一条独立路由**。
+
+两节点，指拓扑里没有中心服务器、没有证书机构、没有地址分配服务。两端地位在协议上完全对等，差异只体现在「谁有可达地址」：把 A 端放在有公网或端口可达的位置，配置 `Endpoint`；B 端可以藏在 NAT 后，只配公钥与 AllowedIPs，被动等待 A 端来连。一旦 A 端先发出数据包触发握手，B 端会从已认证的数据包里自动学到 A 端的真实来源地址与端口，后续即可双向通信。这种「一端声明地址、另一端动态学习」的模型是 WireGuard 区别于需要双向静态配置的传统隧道的关键，也意味着 `Endpoint` 不是必须两端都填（endpoint 更新语义见 06-12）。
+
+一套密钥，指每端各持一把 Curve25519 私钥，并由它派生出公钥。核心纪律是「密钥即身份」：A 端配置里写的是「我自己的私钥」加「B 的公钥」，B 端配置里写的是「我自己的私钥」加「A 的公钥」，任何一端不得持有对端的私钥。`wg genkey` 生成私钥、`wg pubkey` 由私钥导出公钥、`wg genpsk` 生成可选的预共享密钥（PSK，用于叠加一层对称密钥以增强抗量子能力）。密钥长度由 uapi 头 `include/uapi/linux/wireguard.h` 的 `WG_KEY_LEN 32` 规定，即 32 字节，对外用 base64 表示。密钥的完整生成、分发与边界纪律交给 03-03 展开，本篇只用到最小生成流程。
+
+双向 AllowedIPs，指两端必须正确填写「对端会用的隧道地址段」。A 端写 `AllowedIPs = 10.0.0.2/32`，含义是「来自 B 的、源地址在 10.0.0.2/32 的包才被接受；发往 10.0.0.2/32 的包交给 B」。B 端对称地写 `10.0.0.1/32`。这里体现的是 AllowedIPs 的双重语义——它既是入站源地址的白名单，又是出站选 peer 的路由依据，由 `allowedips.c` 的 trie 实现（原理见 06-07、字段见 05-04）。填反或掩码写错，隧道就会静默不通，这是初学者最高频的错误。
+
+一条独立路由，指地址与路由不属于 WireGuard 配置本身，而由内核网络栈负责。接口创建用 `ip link add ... type wireguard`，隧道地址用 `ip address add`，路由用 `ip route add`；`wg` 工具只负责 WireGuard 特有的部分（私钥、监听端口、peer、AllowedIPs）。这一分工源于接口本质是标准 `net_device`（见 01-01），工具链把它拆成 `ip` 与 `wg` 两条命令路径。正因如此，03-02 的 `wg-quick` 才会用脚本把这两条路径封装起来——它本质上是对 `wg` 与 `ip` 调用的薄包装（`wireguard-tools/README.md` 与 `src/man/wg-quick.8` 都明确这样描述）。
+
+下表按「配置项归属」给出最小部署涉及的字段及其处理者，这是理解后续所有封装的分界。
+
+| 配置项 | 归属层级 | 由谁写入内核 | 在最小部署中的作用 |
+|---|---|---|---|
+| 私钥 PrivateKey | device | `wg set private-key` | 本端身份，派生公钥参与握手 |
+| 监听端口 ListenPort | device | `wg set listen-port` | UDP 监听端口，默认 51820 |
+| 对端公钥 PublicKey | peer | `wg set peer` | 标识对端身份，握手认证依据 |
+| 端点 Endpoint | peer | `wg set peer endpoint` | 对端可达地址，至少一端需配置 |
+| 允许地址 AllowedIPs | allowedip | `wg set peer allowed-ips` | 入站源校验与出站选路双重语义 |
+| 隧道地址 Address | 内核地址 | `ip address add` | 接口自身的隧道内 IP，wg 不负责 |
+| 路由 route | 内核路由 | `ip route add` | 把目标流量导向 wg0，wg 不负责 |
+
+### 3. 关键数据结构与源码位置
+
+最小部署虽然只敲几条命令，但每条命令背后都对应一组确定的源码实体。先把命令入口理清：`wireguard-tools/src/wg.c` 的全局数组 `subcommands[]` 列出九个一级子命令及其处理函数——`show` 对应 `show_main`、`showconf` 对应 `showconf_main`、`set` 对应 `set_main`、`setconf` / `addconf` / `syncconf` 都对应 `setconf_main`、`genkey` 与 `genpsk` 共用 `genkey_main`、`pubkey` 对应 `pubkey_main`。`main` 函数按 `argv[1]` 字符串匹配这张表并分派；不带参数时默认走 `show`。理解这张表，就能明白为什么 `wg set` 与 `wg setconf` 是不同的代码路径：前者走参数解析，后者走文件解析。
+
+密钥生成的落点在 `wireguard-tools/src/genkey.c`。`genkey_main` 先调用 `get_random_bytes` 取 32 字节随机数——该函数在 Linux 上依次尝试 `getentropy`、系统调用 `getrandom`（`__NR_getrandom`）、最后回退到读 `/dev/urandom`；随后对 `genkey` 子命令调用 `curve25519_clamp_secret` 做 Curve25519 的标量钳制，最后用 `key_to_base64` 输出。注意 `genpsk` 走同一个 `genkey_main`，但不做钳制，因为它不是密钥对而是任意随机对称密钥。这段逻辑说明：密钥质量完全依赖内核随机源，部署时不应试图用自造的伪随机替代（密钥流程见 03-03）。
+
+`wg set` 的参数解析落在 `wireguard-tools/src/config.c` 的 `config_read_cmd`。这个函数把命令行参数转成内存中的三个结构体：`struct wgdevice`（接口级）、`struct wgpeer`（对等体级）、`struct wgallowedip`（地址前缀级），结构体定义见 `config.h` 与 `containers.h`。它逐个识别 `listen-port`、`fwmark`、`private-key`（经 `parse_keyfile` 从文件读）、`peer`（后跟 base64 公钥）、`endpoint`、`allowed-ips`、`persistent-keepalive`、`preshared-key`、`remove` 等关键字；其中 `allowed-ips` 支持以 `+` 或 `-` 前缀做增量增减——`parse_ip_prefix` 会据此设置 `WGALLOWEDIP_F_REMOVE_ME` 并清掉 `WGPEER_F_REPLACE_ALLOWEDIPS` 标志（标志常量见 04-06）。解析完成后，`set_main` 调用 `ipc_set_device` 把结构体序列化为 netlink 请求。
+
+内核侧的配置契约是 `include/uapi/linux/wireguard.h`。它定义通用族名 `WG_GENL_NAME "wireguard"`、版本 `WG_GENL_VERSION 1`、两条命令 `WG_CMD_GET_DEVICE` 与 `WG_CMD_SET_DEVICE`，以及三层属性枚举 `wgdevice_attribute`（含 `WGDEVICE_A_PRIVATE_KEY`、`WGDEVICE_A_LISTEN_PORT`、`WGDEVICE_A_FWMARK`、`WGDEVICE_A_PEERS` 等）、`wgpeer_attribute`（含 `WGPEER_A_PUBLIC_KEY`、`WGPEER_A_ENDPOINT`、`WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL`、`WGPEER_A_LAST_HANDSHAKE_TIME`、`WGPEER_A_RX_BYTES`、`WGPEER_A_TX_BYTES`、`WGPEER_A_ALLOWEDIPS` 等）、`wgallowedip_attribute`（含 `WGALLOWEDIP_A_IPADDR`、`WGALLOWEDIP_A_CIDR_MASK` 等）。该文件顶部注明由 `Documentation/netlink/specs/wireguard.yaml` 自动生成，全集与标志见 04-05、04-06，这里只点名最小部署会触及的属性。
+
+接口创建之所以能用 `ip link add ... type wireguard` 触发模块加载，是因为 `drivers/net/wireguard/main.c` 用 `MODULE_ALIAS_RTNL_LINK(KBUILD_MODNAME)` 声明了 rtnetlink 链路别名；同一文件还用 `MODULE_ALIAS_GENL_FAMILY(WG_GENL_NAME)` 声明了通用族别名。前者让 `ip` 在建链时自动加载模块，后者让 netlink 族可被按需加载（模块入口见 07-01、注册链见 06-01）。
+
+下表把本篇反复引用的源码位置收拢为速查，便于与命令实例逐条对照。
+
+| 关注实体 | 真实源码路径 | 本篇处理方式 |
+|---|---|---|
+| 子命令分派 | `wireguard-tools/src/wg.c` 的 `subcommands[]` | 讲用途，模块见 07-13 |
+| 密钥生成 | `wireguard-tools/src/genkey.c` 的 `genkey_main` | 讲最小流程，完整见 03-03 |
+| set 参数解析 | `wireguard-tools/src/config.c` 的 `config_read_cmd` | 只点名关键字，参数见 04-01 |
+| 配置契约 | `include/uapi/linux/wireguard.h` | 只给用到属性，全集见 04-05、04-06 |
+| 模块加载别名 | `drivers/net/wireguard/main.c` | 讲触发机制，注册见 06-01 |
+| 运行时状态展示 | `wireguard-tools/src/show.c` | 讲判读，命令见 04-01 |
+
+### 4. 关键流程与调用链
+
+把最小部署拆成调用链，可以清晰看到「配置面写入」与「数据面握手」两条互不混淆的路径。
+
+配置面写入路径以 A 端为例。第一步 `ip link add wg0 type wireguard` 经 rtnetlink 请求创建 `net_device`，`MODULE_ALIAS_RTNL_LINK` 触发 `drivers/net/wireguard/main.c` 的 `wg_mod_init`（若模块尚未加载），随后 `device.c` 的 `wg_newlink` / `wg_setup` 完成设备初始化。第二步 `wg set wg0 private-key ./a.key listen-port 51820` 进入 `wg.c` 分派的 `set_main`，由 `config.c` 的 `config_read_cmd` 解析出 `struct wgdevice`，经 `ipc_set_device` 发 `WG_CMD_SET_DEVICE`，内核把私钥写入 `WGDEVICE_A_PRIVATE_KEY`、把端口写入 `WGDEVICE_A_LISTEN_PORT`。第三步 `wg set wg0 peer <B公钥> endpoint <B地址:端口> allowed-ips 10.0.0.2/32` 走同一路径，但解析出的是 `struct wgpeer` 与 `struct wgallowedip`，分别落到 `WGPEER_A_PUBLIC_KEY`、`WGPEER_A_ENDPOINT`、`WGALLOWEDIP_A_IPADDR` 与 `WGALLOWEDIP_A_CIDR_MASK`。第四步 `ip link set wg0 up` 让设备进入运行状态，私钥配置完成后接口才会真正监听 UDP 端口。第五步 `ip address add 10.0.0.1/32 dev wg0` 与 `ip route add 10.0.0.2/32 dev wg0`（或依靠 AllowedIPs 由 wg-quick 自动推导，见 03-02）补齐地址与路由。配置链路的完整 netlink 交互原理见 06-14。
+
+数据面握手则由流量触发，与配置面异步。当 A 端有第一个发往 10.0.0.2 的包进入 `wg0`，发送路径（`send.c`）查 allowedips 命中 B 这个 peer，若没有可用会话密钥，就在 `noise.c` 的驱动下发出握手发起消息；B 端 `socket.c` 收包、`receive.c` 判定为握手消息后交 `noise.c` 处理，返回握手响应；双方据此派生会话密钥，之后数据包才能加密传输（握手状态机见 06-02、密钥派生见 06-03、收发见 06-05 与 06-06）。这里有一个重要推论：**配置完成后若没有任何流量，握手不会发生**，`wg show` 的 `latest handshake` 会一直为空。最小部署因此必须以一次 `ping` 作为验证动作的收尾，而不是停在配置完成。
+
+查询状态是另一条独立路径：`wg show wg0` 走 `show_main`，经 `ipc_get_device` 发 `WG_CMD_GET_DEVICE`，把内核返回的 device 与 peer 属性渲染成终端友好的文本；脚本化场景可用 `wg show wg0 dump`、`endpoints`、`latest-handshakes` 等机器可读变体（命令全集见 04-01）。
+
+下面用图 03-01-01 把「配置面写入」与「数据面握手」两条路径画在一起，突出它们通过 `wg0` 这个 net_device 汇合、但时机不同的关系。
+
+:::figure id=03-01-01 | name=最小点对点部署的配置面与数据面调用链 | dir=TD
+node f1 "运维命令<br/>wg set / ip" amber
+node f2 "config.c<br/>config_read_cmd" blue
+node f3 "netlink<br/>WG_CMD_SET_DEVICE" purple
+node f4 "wg0 net_device<br/>内核配置状态" teal
+node f5 "首个 ping 包<br/>触发出站" green
+node f6 "send.c / noise.c<br/>发起握手" red
+node f7 "UDP 51820<br/>对端接收" gray
+node f8 "wg show<br/>WG_CMD_GET_DEVICE" blue
+edge f1 -> f2 "解析参数"
+edge f2 -> f3 "序列化"
+edge f3 -> f4 "写入属性"
+edge f5 -> f4 "查 allowedips"
+edge f4 -> f6 "无会话密钥"
+edge f6 -> f7 "握手消息"
+edge f8 -> f4 "读取状态"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「运维命令 wg set / ip」经「config.c config_read_cmd 解析参数」变成「netlink WG_CMD_SET_DEVICE 序列化请求」，写入「wg0 net_device 内核配置状态」；另一路，「首个 ping 包触发出站」查同一 wg0 的 allowedips，若无会话密钥则进入「send.c / noise.c 发起握手」，经「UDP 51820 对端接收」完成握手；「wg show WG_CMD_GET_DEVICE」则从 wg0 读回状态用于验证。两条路径在 wg0 汇合，但配置面先写、数据面后触发。
+
+### 5. 配置/命令/代码实例
+
+下面给出一条最小点对点隧道的完整命令序列。为便于对照，假设 A 端有可达公网地址 `203.0.113.10`，B 端位于 NAT 后；隧道内 A 为 `10.0.0.1`、B 为 `10.0.0.2`。两端都要先生成自己的密钥，并安全地把公钥交给对方。
+
+```bash
+# ===== 两端各自生成密钥（umask 077 保证私钥文件仅本人可读） =====
+umask 077
+wg genkey | tee private.key | wg pubkey > public.key
+
+# ===== A 端（有可达地址，监听 51820） =====
+ip link add wg0 type wireguard
+ip address add 10.0.0.1/32 dev wg0
+wg set wg0 private-key ./private.key listen-port 51820
+wg set wg0 peer <B 的公钥> endpoint 198.51.100.20:51820 allowed-ips 10.0.0.2/32
+ip link set wg0 up
+ip route add 10.0.0.2/32 dev wg0
+
+# ===== B 端（NAT 后，不声明 endpoint，由 A 来连） =====
+ip link add wg0 type wireguard
+ip address add 10.0.0.2/32 dev wg0
+wg set wg0 private-key ./private.key
+wg set wg0 peer <A 的公钥> allowed-ips 10.0.0.1/32
+# A 有可达地址，所以 B 端补一行 endpoint 指向 A
+wg set wg0 peer <A 的公钥> endpoint 203.0.113.10:51820
+ip link set wg0 up
+ip route add 10.0.0.1/32 dev wg0
+
+# ===== 验证：B 端 ping A，触发握手 =====
+ping -c 3 10.0.0.1
+wg show wg0
+```
+
+这段序列有三个细节值得点明。第一，`umask 077` 必须在生成密钥前设置，`genkey_main` 在检测到标准输出指向「世界可读」的普通文件时会打印警告（`genkey.c` 第 86 至 88 行），这是工具层对私钥泄露的最后一道提醒。第二，B 端本来不必配 `Endpoint`——WireGuard 会从 A 发来的已认证包里学出地址；这里为了让 B 也能主动发起，额外补了一行指向 A 的 `endpoint`，两种写法都能工作，差别只在于谁先开口。第三，`ip route add ... dev wg0` 这一步在纯命令式部署里是必需的，因为 `wg` 工具不会自动建路由；03-02 的 `wg-quick` 正是把这一步从 AllowedIPs 自动推导出来，从而省掉手工路由。
+
+配置完成后，用 `wg show wg0` 验证握手是否真正建立。对应输出如下。
+
+```text
+示例输出，具体格式需对照实际版本核验
+interface: wg0
+  public key: <本端公钥>
+  private key: (hidden)
+  listening port: 51820
+peer: <对端公钥>
+  endpoint: 203.0.113.10:51820
+  allowed ips: 10.0.0.1/32
+  latest handshake: 8 seconds ago
+  transfer: 1.80 KiB received, 1.80 KiB sent
+```
+
+逐行判读如下。`interface: wg0` 一行来自 `wg show` 对 `WG_CMD_GET_DEVICE` 返回的 `WGDEVICE_A_IFNAME` 的渲染，确认查询命中的是预期接口；多接口环境下若这里显示别的名字，说明选错了对象，应改用 `wg show <接口名>` 明确指定。`public key` 对应 `WGDEVICE_A_PUBLIC_KEY`，由本端私钥经 Curve25519 派生，它应当与分发给对端的公钥逐字节一致；若双方写反了公钥，握手会静默失败，而这一行本身不会报错，所以必须人工核对。`private key: (hidden)` 是工具刻意的展示保护（对应环境变量 `WG_HIDE_KEYS` 的默认行为），并不表示私钥缺失，真实私钥仍在内核接口的 `WGDEVICE_A_PRIVATE_KEY` 中，任何要求「从 show 输出复制私钥」的说法都是错误的。`listening port: 51820` 对应 `WGDEVICE_A_LISTEN_PORT`，说明接口已配置私钥并已监听 UDP；若此行为空或为 0，通常是私钥没设或接口未 `up`。`peer:` 段对应一个 `WGPEER_A_PUBLIC_KEY`，一个接口可有多个这样的段，本例只有对端 A 一个。`endpoint` 对应 `WGPEER_A_ENDPOINT`，这里显示 B 端学到的 A 的地址加端口；NAT 场景若没有 keepalive，动态学到的 endpoint 可能过期（keepalive 见 06-11）。`allowed ips: 10.0.0.1/32` 对应 `WGALLOWEDIP_A_IPADDR` 与 `WGALLOWEDIP_A_CIDR_MASK`，含义是「只接受源地址为此段的该 peer 流量，且发往此段的流量走该 peer」，掩码写宽或写窄都会导致流量被错误路由或丢弃（原理见 06-07）。`latest handshake: 8 seconds ago` 对应 `WGPEER_A_LAST_HANDSHAKE_TIME`，是整段输出里最关键的可用性判据——为非空且时间很近，才说明握手真正成功；若长期为空，优先排查公钥是否写反、endpoint 是否可达、时钟是否同步（握手时序见 06-03）。最后的 `transfer` 两数分别对应 `WGPEER_A_RX_BYTES` 与 `WGPEER_A_TX_BYTES`，是累计收发字节数；只有握手成功且 AllowedIPs 正确时它才会增长，若握手成功但字节为 0，多半是路由没把目标流量送进 wg0。至此，`ping -c 3 10.0.0.1` 有回包加上 `latest handshake` 为近值，即满足本篇开头给出的「最小可用」四条件。收尾清理用 `ip link del wg0` 删除接口即可释放全部内核状态，无需停止任何进程，因为数据面本就在内核中。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把公钥与私钥写反。正确规则只有一条：配置里永远写「本端私钥」与「对端公钥」，绝不会出现对端私钥。初学者常把 `wg pubkey` 导出的公钥误当成自己要写进 `PrivateKey` 的值，或两端都填了同一个私钥，结果是握手永远不成立且没有任何显式报错。牢记 `genkey.c` 的分工——`genkey` 生成的是私钥，`pubkey` 从标准输入读私钥、输出公钥，二者不可混用（密钥流程见 03-03）。
+
+第二个陷阱是私钥文件的权限。`umask 077` 不是可选项而是纪律；私钥一旦被世界可读，等同于身份泄露。工具虽然会在输出世界可读文件时打印警告，但那只是提醒，不会替你收紧权限。第三个陷阱是 AllowedIPs 的掩码。最小点对点场景对端地址是单个 IP，应写 `/32`（IPv6 为 `/128`），不要图省事写 `/24` 或 `0.0.0.0/0`——后者意味着把该 peer 当作默认网关，会劫持本不该走隧道的流量，属于 03-04 的路由部署范畴，不是最小模型该做的事。`config.c` 的 `validate_netmask` 会在主机位非零时给出警告，但只是警告而非拒绝，仍需人工保证正确。
+
+第四个陷阱是「配完即通」的错觉。WireGuard 是静默协议，没有握手的显式失败回显，所以配置完成时 `latest handshake` 为空是正常的；必须主动产生一次流量（如 `ping`）才能触发握手，并再次查看状态确认。第五个陷阱是忽略时钟同步：握手消息含时间戳，两端时钟偏差过大时握手会被判为过期，表现为「配置都对但就是不通」（时序见 06-03）。第六个陷阱是忘了放行 UDP 51820 或选中了被占用的端口；监听端口未设置时为随机值，若为可复现部署应显式指定并在防火墙放行。第七个陷阱是把 `ip link set wg0 up` 当成隧道可用的终点——`up` 只表示接口进入运行态，与握手是否成功是两回事，判断可用性始终以 `latest handshake` 与 `transfer` 为准（排障决策树见 08-03）。
+
+最佳实践可以归纳为一条可复用的顺序：先确认模块与工具可用（02-03、02-04），再以 `umask 077` 规范生成并安全分发密钥（03-03），随后按「建接口 → 配私钥与端口 → 配 peer → up → 配地址与路由」五步完成两端配置，最后用一次 `ping` 触发握手并以 `wg show` 的两个关键行验收；若隧道不通，按「公钥 → endpoint → 防火墙 → 时钟 → 路由」的顺序逐项排查。验证通过后，若要长期运行或跨重启保留，就应把这套命令改写成 03-02 的 `wg0.conf` 由 `wg-quick` 托管，并进一步用 03-05 的 systemd 单元实现开机自启；多 peer 与站点互联则扩展到 03-06。
+
+### 7. 小结与延伸阅读
+
+本篇把一条最小点对点隧道的部署收敛为可验证的四条件闭环：两端各有 `up` 的 wg0 接口、互认公钥且私钥不出本机、隧道地址与路由齐备、`wg show` 出现近期 `latest handshake` 且 `ping` 有回包。我们沿源码看清了每条命令的落点：`wg.c` 的 `subcommands[]` 负责分派，`genkey.c` 的 `genkey_main` 从内核随机源生成密钥，`config.c` 的 `config_read_cmd` 把 `wg set` 参数解析成 `wgdevice` / `wgpeer` / `wgallowedip` 三层结构并经 `ipc_set_device` 发往 `WG_CMD_SET_DEVICE`，`include/uapi/linux/wireguard.h` 定义两层命令与三层属性，`MODULE_ALIAS_RTNL_LINK` 让 `ip link add type wireguard` 自动加载模块，而 `wg show` 经 `WG_CMD_GET_DEVICE` 回读状态。最关键的认知是：配置面写入与数据面握手是两条异步路径，配置完成后必须有流量触发握手，隧道才真正可用。
+
+延伸阅读建议按三条线走：想把这些命令固化成配置文件，接着读 03-02；想深入密钥分发与边界纪律，读 03-03；想理解握手为什么需要流量触发、以及会话密钥如何派生，读 06-02 与 06-03。跨册随查按（字段见 05-01 ｜ 参数见 04-01 ｜ 原理见 06-03 ｜ 模块见 07-13）执行：结构体的逐字段定义去 05 册、命令与参数全集去 04 册、握手机制与调用链去 06 册、工具模块职责去 07 册、排障与基准去 08 册。凡本篇标注「需对照实际版本核验」的输出格式、选项取值与版本号，均以 `_wglinux_build/upstream_src/` 下对应文件为准，本套资料不编造未核验的路径与取值。
+
+## 03-02 wg0.conf 配置体系与 wg-quick 使用
+
+### 1. 背景与动机
+
+03-01 用一串 `ip` 与 `wg` 命令跑通了最小隧道，但那种方式有三个无法回避的问题：命令冗长且顺序固定，敲错一步就得从头再来；配置只存在于当前内核状态中，机器重启即丢失；多 peer 场景下参数列表迅速膨胀，难以审阅与版本管理。把配置固化成文件、再用一个工具按文件把接口拉起，是顺理成章的下一步。本篇的主角就是这套组合：`wg0.conf` 配置文件，以及读取它并调用 `wg` 与 `ip` 完成部署的 `wg-quick`。
+
+`wg0.conf` 的名字不是随意的。按 `wireguard-tools/src/man/wg-quick.8`，传入配置文件时其文件名须是接口名后接 `.conf`；若只传接口名（如 `wg0`），工具自动到 `/etc/wireguard/wg0.conf` 查找。接口名本身受正则 `[a-zA-Z0-9_=+.-]{1,15}` 约束——这条正则在 `wg-quick` 的 Linux 脚本 `parse_options` 中以 `[[ $CONFIG_FILE =~ ^[a-zA-Z0-9_=+.-]{1,15}$ ]]` 的形式出现，决定了合法接口名的字符集与长度上限。
+
+必须一开始就认清 `wg-quick` 的定位，否则容易对它抱有不切实际的期待。`wireguard-tools/README.md` 把它描述为「a very quick and dirty bash script」，用于从 wg(8) 风格配置里读取几个额外变量并自动配置接口；`wg-quick(8)` 手册也直言它只是对 `wg(8)` 与 `ip(8)` 调用的薄包装，面向「需求简单」的用户，并「强烈鼓励」更高级的用户改用更完整的网络管理工具，或干脆按惯例直接用 `wg` 与 `ip`。换句话说，`wg-quick` 不是守护进程、不是控制面、不做状态维护，它是一段一次性执行的 bash 脚本。这个定位决定了本篇的讲法：我们会逐行对照脚本源码，看清它究竟替我们做了哪几件事，而不是把它当成黑盒。
+
+配置文件格式本身分两层，这是本篇最需要建立的心智模型。底层是 `wg` 工具原生支持的 INI 格式，由 `wireguard-tools/src/config.c` 解析，认识 `[Interface]` 与 `[Peer]` 两类段及其中若干字段；上层是 `wg-quick` 额外解释的几个字段，`[Interface]` 里出现 `Address`、`DNS`、`MTU`、`Table`、钩子与 `SaveConfig` 时，由脚本先行处理、并不交给 `wg`。两层叠加后，一份 `wg0.conf` 同时描述了 WireGuard 密码学配置与内核网络配置。理解了这条分界线，就理解了 03-01 那些命令与 03-02 那些字段的一一对应关系。
+
+版本与路径口径同 03-01：工具侧以 `_wglinux_build/upstream_src/wireguard-tools/`（版本 1.0.20260223）为准，核心文件是 `src/config.c`、`src/wg-quick/linux.bash`、`src/man/wg.8`、`src/man/wg-quick.8`；内核侧以 `_wglinux_build/upstream_src/wireguard-linux-src/` 为准，配置契约见 `include/uapi/linux/wireguard.h`。下文省略这两个前缀。本篇聚焦「配置体系和工具用法」本身，字段的参数全集交给 04 册：wg-quick 参数见 04-03，配置文件格式与 ini 解析规则见 04-04；更细的运行时原理见 06-14，模块职责见 07-13。
+
+### 2. 核心概念
+
+`wg0.conf` 的核心可以压缩成四句话：**两段结构、两套字段、一条剥离流水线、一次路由推导**。
+
+两段结构，指 INI 文件只有两种顶层段：`[Interface]` 与 `[Peer]`。`wg.8` 明确：可以有多个 `[Peer]` 段，但只能有一个 `[Interface]` 段。`config.c` 的 `process_line` 用两个布尔状态 `is_device_section` 与 `is_peer_section` 跟踪当前所在段：遇到「[Interface]」就把前者置真、后者置假，遇到「[Peer]」就 new 一个新的 `struct wgpeer` 挂到链表尾、把后者置真、前者置假。段名匹配用 `strcasecmp`，所以大小写不敏感；键名匹配也用 `strncasecmp`，因此 `PrivateKey`、`privatekey` 等价。
+
+两套字段，是本节的焦点。第一套是 wg 原生字段，由 `config.c` 的 `process_line` 直接认识：`[Interface]` 下有 `ListenPort`（经 `parse_port`）、`FwMark`（经 `parse_fwmark`）、`PrivateKey`（经 `parse_key`）；`[Peer]` 下有 `Endpoint`（`parse_endpoint`）、`PublicKey`（`parse_key`）、`AllowedIPs`（`parse_allowedips`）、`PersistentKeepalive`（`parse_persistent_keepalive`）、`PresharedKey`（`parse_key`）。任何不在这张清单里的键都会触发 `Line unrecognized` 错误。第二套是 wg-quick 扩展字段，由 `src/wg-quick/linux.bash` 的 `parse_options` 认识，且只在 `[Interface]` 段内生效：`Address`（可多次、逗号分隔）、`DNS`、`MTU`、`Table`、`PreUp` / `PostUp` / `PreDown` / `PostDown`、`SaveConfig`。脚本用 `interface_section` 标志判断当前是否在 `[Interface]`，仅在该标志为 1 时用 `case` 分支把这些行收进对应数组变量。
+
+一条剥离流水线，描述了脚本如何把两套字段分开。`parse_options` 逐行读取配置：对每行先用 `stripped="${line%%\#*}"` 去掉 `#` 之后的内容得到键与值，然后在 `[Interface]` 段内匹配扩展字段；凡是匹配到的行都 `continue`，不会进入后续拼接；凡是没匹配到的行（包括所有 `[Peer]` 段内容，以及 `[Interface]` 里的 `PrivateKey` / `ListenPort` 等原生字段）都会被追加进 `WG_CONFIG` 变量。循环结束后，`set_config` 函数执行 `wg addconf "$INTERFACE" <(echo "$WG_CONFIG")`，把这份「剥离后的纯 wg 配置」通过进程替换喂给 `wg addconf`。这条流水线解释了为什么 wg-quick 扩展字段不能写进 `[Peer]`——那里不会触发剥离，扩展字段会原样进入 `WG_CONFIG`，最终被 `config.c` 判为 `Line unrecognized`。
+
+一次路由推导，是 wg-quick 相对纯命令式部署最大的便利。`wg-quick(8)` 明确：工具从各 peer 的 AllowedIPs 推断所有路由并加入系统路由表；若其中含默认路由（`0.0.0.0/0` 或 `::/0`），则用 `ip rule` 处理默认网关覆盖。脚本 `cmd_up` 的对应实现是：执行 `wg show "$INTERFACE" allowed-ips` 取出每个 peer 的地址前缀，按掩码长度排序后逐个调用 `add_route`；`add_route` 对非默认前缀直接 `ip route add ... dev wg0`，对默认前缀则转入 `add_default`，后者分配 fwmark、添加策略路由规则（`ip rule add not fwmark ... table ...` 与 `ip rule add table main suppress_prefixlength 0`），并用 nftables 或 iptables 建立 kill switch 规则防止明文泄漏（策略路由原理见 06-07、部署场景见 03-04）。
+
+下表把两套字段按处理者归类，这是审阅一份 `wg0.conf` 时最实用的速查。
+
+| 字段 | 所属段 | 处理者 | 是否进入 wg addconf |
+|---|---|---|---|
+| PrivateKey / ListenPort / FwMark | Interface | `config.c` | 是（原样保留） |
+| PublicKey / PresharedKey / Endpoint / AllowedIPs / PersistentKeepalive | Peer | `config.c` | 是（原样保留） |
+| Address / DNS / MTU / Table | Interface | `wg-quick` 脚本 | 否（被剥离） |
+| PreUp / PostUp / PreDown / PostDown / SaveConfig | Interface | `wg-quick` 脚本 | 否（被剥离） |
+
+### 3. 关键数据结构与源码位置
+
+要真正掌握配置体系，必须把两份解析代码并排来看。
+
+第一份是 `wireguard-tools/src/config.c`，它是 wg 原生配置格式的唯一解析器。入口 `config_read_line` 先按 `COMMENT_CHAR '#'` 截掉注释，再剔除所有空白字符得到紧凑行，交给 `process_line`。`process_line` 按段状态与键名分派到各个 `parse_*` 函数：`parse_port` 借 `getaddrinfo` 把端口字符串解析成 16 位端口并置 `WGDEVICE_HAS_LISTEN_PORT`；`parse_fwmark` 接受 `off`、十进制或 `0x` 开头的十六进制并置 `WGDEVICE_HAS_FWMARK`；`parse_key` 用 `key_from_base64` 解码 32 字节密钥；`parse_keyfile` 从文件读取密钥并校验尾部无多余字符；`parse_endpoint` 处理带方括号的 IPv6 字面量与主机名，并对非永久性 DNS 错误做递增退避重试（重试次数由环境变量 `WG_ENDPOINT_RESOLUTION_RETRIES` 控制，默认 15）；`parse_allowedips` 用逗号分隔、支持 `+` / `-` 前缀增量更新、并调用 `validate_netmask` 检查主机位。配置解析使用的数据结构是 `config_ctx`（定义于 `config.h`），内含 `device`、`last_peer`、`last_allowedip` 三个游标和两个段状态布尔量。文件末尾的 `config_read_finish` 会校验每个 peer 都有公钥，否则报 `A peer is missing a public key`——这是配置文件层的最后一道完整性检查（格式全集见 04-04）。
+
+第二份是 `wireguard-tools/src/wg-quick/linux.bash`，它用一组全局数组/变量承载扩展字段：`ADDRESSES`、`DNS`、`DNS_SEARCH`、`MTU`、`TABLE`、`PRE_UP`、`POST_UP`、`PRE_DOWN`、`POST_DOWN`、`SAVE_CONFIG`、`WG_CONFIG`、`INTERFACE`。核心函数按职责排列：`parse_options` 解析文件并剥离扩展字段；`add_if` 执行 `ip link add dev "$INTERFACE" type wireguard`，失败时若内核模块缺失则回退到 `wireguard-go`（这是脚本里唯一涉及用户态实现的地方）；`set_config` 调用 `wg addconf`；`add_addr` 按地址族选择 `ip -4` 或 `ip -6`；`set_mtu_up` 在未显式指定 MTU 时，从 endpoint 的 `ip route get` 结果或默认路由推断底层 MTU，并减去 80（为 WireGuard 封装预留的开销）作为接口 MTU，实在取不到则用 1500 再减 80；`set_dns` / `unset_dns` 通过 `resolvconf` 注册与注销 DNS；`add_route` / `add_default` 处理路由与策略路由；`remove_firewall` 清理 nftables / iptables 规则；`save_config` 在 down 时回写配置；`execute_hooks` 用 `eval` 执行钩子并把 `%i` 展开为接口名。`cmd_up` 与 `cmd_down` 是编排这些函数的主流程。
+
+第三份是命令侧的两个文件。`src/setconf.c` 的 `setconf_main` 同时服务 `setconf` / `addconf` / `syncconf` 三个子命令：它读文件、逐行喂给 `config_read_line`、`config_read_finish` 后设置设备名，最后 `ipc_set_device`。三者的差异由参数与标志决定：`addconf` 调用 `config_read_init(&ctx, true)` 开启追加模式（不置 `WGDEVICE_REPLACE_PEERS`），`setconf` 走替换模式，而 `syncconf` 额外调用 `sync_conf`——后者先用 `ipc_get_device` 读回运行时配置，把文件视图与运行时视图的 peer 按公钥排序比对，只为需要删除或改动的 peer 生成操作，从而「不打乱当前 peer 会话」（`wg.8` 明确 syncconf 比 setconf 低效但不中断会话）。`src/showconf.c` 的 `showconf_main` 则从运行时读出配置并重新渲染成 INI：它打印 `[Interface]` 的 `ListenPort`、`FwMark`、`PrivateKey`，再为每个 peer 打印 `[Peer]` 段及各字段——这正是 `SaveConfig` 与 `wg-quick save` 能回写文件的基础。
+
+下表把本篇涉及的源码位置收拢为速查。
+
+| 关注实体 | 真实源码路径 | 本册处理方式 |
+|---|---|---|
+| 原生格式解析 | `wireguard-tools/src/config.c` | 讲分派规则，全集见 04-04 |
+| wg-quick 扩展解析与编排 | `wireguard-tools/src/wg-quick/linux.bash` | 讲流程，参数见 04-03 |
+| setconf 族语义 | `wireguard-tools/src/setconf.c` | 讲差异，命令见 04-02 |
+| 配置回写 | `wireguard-tools/src/showconf.c` | 讲机制，字段见 05-01 |
+| 格式权威文档 | `wireguard-tools/src/man/wg.8`、`man/wg-quick.8` | 引用定义，不复制全文 |
+| 配置契约 | `include/uapi/linux/wireguard.h` | 只点名属性，全集见 04-05、04-06 |
+| 开机自启单元 | `wireguard-tools/src/systemd/wg-quick@.service` | 讲用途，集成见 03-05 |
+
+### 4. 关键流程与调用链
+
+`wg-quick up wg0` 的执行顺序完全由 `cmd_up` 函数决定，逐行对照源码可得一条确定无疑的链路。第一步，`auto_su` 在 UID 非 0 时用 `sudo` 重新执行自身，保证后续 `ip` 命令有权限。第二步，`parse_options` 解析 `/etc/wireguard/wg0.conf`（或传入的路径）：校验文件名与接口名、检查文件权限并在世界可读时打印警告、逐行剥离扩展字段、把剩余文本存入 `WG_CONFIG`。第三步，`cmd_up` 先检查接口是否已存在，存在则报 `already exists` 退出；随后设下 `trap 'del_if; exit'` 以便中途失败时回滚。第四步，`add_if` 创建接口。第五步，`execute_hooks "${PRE_UP[@]}"` 执行所有 `PreUp`。第六步，`set_config` 把剥离后的配置通过 `wg addconf` 写入内核。第七步，遍历 `ADDRESSES` 调用 `add_addr` 配置隧道地址。第八步，`set_mtu_up` 设置 MTU 并把接口置 `up`。第九步，`set_dns` 注册 DNS。第十步，遍历 `wg show allowed-ips` 的结果调用 `add_route` 建路由。第十一步，`execute_hooks "${POST_UP[@]}"` 执行 `PostUp`；最后清除 trap 正常返回。这条顺序有一个重要后果：`wg addconf` 发生在 `ip link set up` 之前，所以私钥与 peer 配置先写入、接口后启用，这与 03-01 手工命令的顺序一致。
+
+`wg-quick down wg0` 的链路同样清晰：`cmd_down` 先确认接口是 WireGuard 接口；依次执行 `PreDown` 钩子、若 `SAVE_CONFIG` 为真则 `save_config` 回写、`del_if` 拆除接口（内部又依次注销 DNS、清理防火墙规则、删除 `Table auto` 产生的策略路由规则、最后 `ip link delete`）、再次 `unset_dns`、`remove_firewall`、最后执行 `PostDown`。`save` 子命令只调用 `save_config` 而不拆接口；`strip` 子命令则把 `WG_CONFIG`（即剥离掉所有扩展字段后的纯 wg 配置）打到标准输出——这正是热重载技巧的基础：`wg syncconf wg0 <(wg-quick strip wg0)`，先 strip 出不 Interrupt 会话的纯 wg 配置，再用 syncconf 增量下发，从而在不中断现有会话的前提下更新配置（`wg-quick(8)` 与 systemd 单元的 `ExecReload` 都采用这条命令）。
+
+下图把一份 `wg0.conf` 的字段分流、up 流程与配置写入/查询两条链路画在一起。
+
+:::figure id=03-02-01 | name=wg0.conf 字段分流与 wg-quick up 调用链 | dir=TD
+node g1 "wg0.conf<br/>INI 两段" amber
+node g2 "parse_options<br/>逐行剥离" blue
+node g3 "扩展字段数组<br/>Address/DNS/MTU/Table" green
+node g4 "WG_CONFIG<br/>纯 wg 配置" teal
+node g5 "wg addconf<br/>setconf.c" purple
+node g6 "ip 命令族<br/>地址/MTU/路由" gray
+node g7 "钩子 PreUp/PostUp<br/>execute_hooks" red
+node g8 "wg0 接口<br/>运行态" blue
+edge g1 -> g2 "读文件"
+edge g2 -> g3 "匹配扩展字段"
+edge g2 -> g4 "其余行拼接"
+edge g4 -> g5 "进程替换喂入"
+edge g3 -> g6 "转为 ip 调用"
+edge g7 -> g8 "执行 shell"
+edge g5 -> g8 "写 WireGuard 配置"
+edge g6 -> g8 "写地址与路由"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「wg0.conf INI 两段」进入「parse_options 逐行剥离」后分成两路——匹配到的扩展字段进「扩展字段数组 Address/DNS/MTU/Table」，其余行进「WG_CONFIG 纯 wg 配置」；前者转为「ip 命令族 地址/MTU/路由」调用，后者经「wg addconf setconf.c」用进程替换喂入；「钩子 PreUp/PostUp execute_hooks」执行 shell；三路最终都汇入「wg0 接口运行态」。这正是一份配置文件同时完成密码学配置与网络配置的全貌。
+
+### 5. 配置/命令/代码实例
+
+下面给出一份典型的客户端 `wg0.conf`，把两套字段都放进来看它们如何分工。假设这是 03-01 中的 B 端，隧道地址 `10.0.0.2/32`，对端是 A，且把全部流量引向隧道（默认路由）。
+
+```ini
+[Interface]
+Address = 10.0.0.2/32
+DNS = 10.0.0.1
+MTU = 1420
+Table = auto
+PrivateKey = <本端私钥>
+PreUp = echo starting wg0
+PostUp = ip route add 192.168.1.0/24 dev %i
+
+[Peer]
+PublicKey = <A 的公钥>
+PresharedKey = <可选预共享密钥>
+AllowedIPs = 0.0.0.0/0
+Endpoint = 203.0.113.10:51820
+PersistentKeepalive = 25
+```
+
+这份文件里，`Address`、`DNS`、`MTU`、`Table`、`PreUp`、`PostUp` 是 wg-quick 扩展字段，会被 `parse_options` 剥离并收进对应数组；`PrivateKey` 与整个 `[Peer]` 段是 wg 原生字段，会原样进入 `WG_CONFIG` 交给 `wg addconf`。`AllowedIPs = 0.0.0.0/0` 会让脚本走 `add_default`，用 fwmark 与策略路由接管默认网关，并用防火墙规则建立 kill switch；这正是把 `Table` 留在 `auto` 的含义。下面是用 `wg-quick` 管理这份配置的常用命令族。
+
+```bash
+# 拉起接口（按接口名自动找 /etc/wireguard/wg0.conf）
+wg-quick up wg0
+
+# 也可显式指定配置文件路径
+wg-quick up /etc/wireguard/wg0.conf
+
+# 查看/保存/拆除
+wg-quick save wg0        # 把当前运行态回写到配置文件
+wg-quick down wg0        # 拆除接口并按 SaveConfig 决定是否回写
+
+# 热重载：strip 去掉扩展字段，再交给 syncconf 增量下发，不中断会话
+wg syncconf wg0 <(wg-quick strip wg0)
+
+# systemd 场景（单元来自 src/systemd/wg-quick@.service）
+systemctl enable --now wg-quick@wg0
+```
+
+`wg-quick up wg0` 会把每条实际执行的命令以 `[#] ` 前缀打到标准错误（由脚本的 `cmd()` 函数产生）。对应输出如下。
+
+```text
+示例输出，具体格式需对照实际版本核验
+[#] ip link add dev wg0 type wireguard
+[#] wg addconf wg0 /dev/fd/63
+[#] ip -4 address add 10.0.0.2/32 dev wg0
+[#] ip link set mtu 1420 up dev wg0
+[#] resolvconf -a wg0 -m 0 -x
+[#] wg show wg0 allowed-ips
+[#] ip -4 route add 0.0.0.0/0 dev wg0 table 51820
+[#] ip -4 rule add not fwmark 51820 table 51820
+[#] ip -4 rule add table main suppress_prefixlength 0
+[#] echo starting wg0
+```
+
+逐行判读如下。第一行 `ip link add dev wg0 type wireguard` 由 `add_if` 产生，对应 03-01 的手工建接口步骤，依赖 `MODULE_ALIAS_RTNL_LINK` 自动加载模块；若接口已存在，`cmd_up` 会在这一步之前直接报 `already exists` 退出。第二行 `wg addconf wg0 /dev/fd/63` 来自 `set_config`，`/dev/fd/63` 是 bash 进程替换 `<(echo "$WG_CONFIG")` 的匿名文件描述符，里面正是被剥离掉扩展字段后的纯 wg 配置，由 `config.c` 解析——注意这里是 `addconf` 而非 `setconf`，因为脚本刚建好空接口，追加与替换效果相同，但脚本统一用追加。第三行 `ip -4 address add 10.0.0.2/32 dev wg0` 对应 `add_addr`，参数来自扩展字段 `Address`，是 wg-quick 替我们补上的内核地址配置，wg 工具本身不做这件事。第四行 `ip link set mtu 1420 up dev wg0` 对应 `set_mtu_up`，这里 1420 来自显式配置的 `MTU` 字段；若未配置，脚本会从 endpoint 路由或默认路由推断底层 MTU 再减 80，取不到则回退 1500 减 80，所以「MTU = 底层 MTU − 80」是理解这一行的关键。第五行 `resolvconf -a wg0 -m 0 -x` 来自 `set_dns`，由 `DNS` 字段触发，把 `10.0.0.1` 注册为该接口的 DNS 服务器；down 时会有对应的 `resolvconf -d wg0`。第六行 `wg show wg0 allowed-ips` 是脚本为自动推导路由而读取每个 peer 的地址前缀，这一步解释了为什么路由不需要在配置里手写。第七行 `ip -4 route add 0.0.0.0/0 dev wg0 table 51820` 来自 `add_default`：因为 `AllowedIPs = 0.0.0.0/0` 是默认路由，脚本没有把它加进主表，而是加进编号为 51820 的独立路由表（该编号是脚本从 51820 起找第一个空闲表得到的，若被占用会递增）。第八行与第九行 `ip -4 rule add not fwmark 51820 table 51820` 和 `ip -4 rule add table main suppress_prefixlength 0` 是策略路由的核心：前者让带 51820 标记以外的数据包查新表，后者抑制主表的默认路由，两者配合把默认网关切换到隧道而不破坏本地直连流量（`Table` 为 `off` 时 `add_route` 直接返回，不产生这些规则）。最后一行 `echo starting wg0` 来自 `PreUp` 钩子，由 `execute_hooks` 经 `eval` 执行，其中的 `%i` 若出现会被替换成接口名——本例的 `PostUp` 就含 `%i`，会在建好接口后展开为 `ip route add 192.168.1.0/24 dev wg0`。整段输出把一份静态配置如何变成一串内核状态写入完整呈现出来，也印证了 wg-quick「薄封装」的定位。
+
+热重载时 `wg-quick strip wg0` 的输出值得单独一提：它正是 `WG_CONFIG` 的内容，即剥掉所有扩展字段后只剩 `[Interface]` 的 `PrivateKey` 等与 `[Peer]` 段，可以直接喂给 `wg syncconf`。这也是为什么扩展字段绝不能写进 `[Peer]`——strip 不会剥离那里的内容，最终结果会带着扩展字段进入 `config.c` 而报 `Line unrecognized`。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱，也是审阅配置时最该先查的：wg-quick 扩展字段只能写在 `[Interface]` 段。`parse_options` 只在 `interface_section` 为 1 时剥离 `Address`、`DNS`、`MTU`、`Table` 与四个钩子及 `SaveConfig`；若把它们误写进 `[Peer]`，这些行会原样进入 `WG_CONFIG`，被 `config.c` 的 `process_line` 判为 `Line unrecognized`，导致 `wg addconf` 失败、接口拉不起来。反过来，把 `[Peer]` 专属字段（如 `Endpoint`）写进 `[Interface]`，同样会因 `config.c` 在 device 段不认识它而报错。记住分界线：`config.c` 认识的字段交给它，wg-quick 认识的字段放在 `[Interface]`。
+
+第二个陷阱是 `SaveConfig = true` 的副作用。`wg-quick(8)` 明确：设为 true 时，接口关闭时会用当前状态回写配置文件，down 之前对配置文件做的手动修改会被覆盖。这适合「运行时动态加 peer、自动固化」的场景，却不适合「配置文件由版本控制管理、禁止运行时改写」的场景；后者应显式关闭 `SaveConfig`，并把变更走配置管理系统（持久化与集成见 03-05）。第三个陷阱是文件权限。`parse_options` 会检查配置文件及其目录的世界可读位，命中时打印 `Warning: ... is world accessible`；由于配置文件含私钥，应 `chmod 600` 并确认目录权限，这与 03-01 的 `umask 077` 一脉相承。第四个陷阱是接口名不合法：必须用匹配 `[a-zA-Z0-9_=+.-]{1,15}` 的字符串，超出长度或含斜杠等字符会被 `parse_options` 的校验拒绝。
+
+第五个陷阱是低估 `Table` 的三个取值差异。`off` 完全不建路由，适合自己用策略路由精细控制的场景；`auto`（默认）把普通路由加进主表、默认路由交给 fwmark 策略路由处理；显式数字（如 `Table = 1234`）则把所有路由加进指定表，配合 `PostUp` 的 `ip rule` 做策略路由。混淆三者会导致「隧道起来了但路由不对」（路由部署见 03-04）。第六个陷阱是 DNS 依赖：`set_dns` 调用 `resolvconf`，若系统没装或不想用，应改用 `PostUp` / `PostDown` 钩子自行管理 DNS——`wg-quick(8)` 明确指出这一点。第七个陷阱是把 wg-quick 当成万能工具：README 与手册都强调它面向简单场景，复杂的多链路、策略路由、与 NetworkManager 协同等需求应使用更完整的网络管理器或直接用 `wg` 与 `ip`（集成方案见 03-05、多 peer 见 03-06）。
+
+最佳实践可归纳为一条审阅清单：先确认文件名与接口名合法、权限收紧；再按「两套字段」分界逐段核对，原生字段归位到正确段、扩展字段只留在 `[Interface]`；然后用 `wg-quick up` 的 `[#]` 输出逐行核对是否执行了预期的 `ip` 与 `wg` 命令；需要改配置时优先用 `wg syncconf wg0 <(wg-quick strip wg0)` 热重载以免中断会话；最后用 systemd 单元 `wg-quick@wg0.service` 实现开机自启（`ExecReload` 已内置 strip + syncconf 写法）。验收标准与 03-01 一致：以 `wg show` 的 `latest handshake` 与 `transfer` 为准，而不是只看接口是否 `up`（排障见 08-03）。
+
+### 7. 小结与延伸阅读
+
+本篇把 03-01 的命令序列固化为 `wg0.conf` 配置体系，并逐行对照源码讲清了 `wg-quick` 这个薄封装如何工作。核心结论有四点：其一，配置文件是两段 INI，多个 `[Peer]`、一个 `[Interface]`，由 `config.c` 的 `process_line` 按段状态解析；其二，字段分两套——wg 原生字段由 `config.c` 认识并经 `WG_CMD_SET_DEVICE` 写入内核，wg-quick 扩展字段由 `linux.bash` 的 `parse_options` 在 `[Interface]` 段剥离，绝不能写进 `[Peer]`；其三，`cmd_up` 按「建接口 → PreUp → wg addconf → 地址 → MTU → DNS → 路由 → PostUp」的固定顺序编排，`wg addconf` 先于接口 up，路由从 AllowedIPs 自动推导，默认路由交给 fwmark 策略路由与 kill switch；其四，`strip` + `syncconf` 是热重载不中断会话的关键技巧，systemd 单元已经内置这条写法。
+
+延伸阅读建议按三条线走：想扩展成多 peer、站点互联与远程接入，读 03-06；想实现开机自启与网络管理器集成，读 03-05；想把 AllowedIPs 与默认路由的推导用到策略路由场景，读 03-04。参数层面，wg-quick 参数全集见 04-03、配置文件格式与 ini 解析规则见 04-04、setconf 族语义见 04-02。跨册随查按（字段见 05-01 ｜ 参数见 04-04 ｜ 原理见 06-14 ｜ 模块见 07-13）执行：结构体的逐字段定义去 05 册、命令与参数全集去 04 册、netlink 配置通道与用户态交互原理去 06 册、工具模块职责去 07 册、运维与排障去 08 册。凡本篇标注「需对照实际版本核验」的输出格式、选项取值与版本号，均以 `_wglinux_build/upstream_src/` 下对应文件为准，本套资料不编造未核验的路径与取值。
+
+## 03-03 密钥生成与分发：curve25519、私钥边界与 setup 流程
+
+### 1. 背景与动机
+
+WireGuard 把安全身份直接绑定到密钥对上，这一设计常被概括为「密钥即身份」。与 TLS 或 IPsec 不同，WireGuard 协议里没有证书颁发机构、没有中心化的注册服务器、也没有任何自动的密钥协商分发机制：一台设备「是谁」，完全由它持有哪一把私钥、以及对端配置了它的哪一把公钥来决定。这个决定的好处是配置面极简、审计面极小；代价是把密钥的生成、保管与分发责任完整地推给了运维者或上层控制面。本篇就聚焦这条责任链的第一段——密钥怎样从系统熵源变成配置文件里那一串 44 字符的 base64，又怎样通过 netlink 注入到内核接口，以及在这条链路上「私钥边界」究竟应该怎么划。
+
+先把本篇的口径与取材讲清楚。本套资料的事实锚点是 `_wglinux_build/upstream_src/wireguard-linux-src/`（内核驱动与加密原语快照）与 `_wglinux_build/upstream_src/wireguard-tools/`（用户态工具快照），下文出现的源码路径均相对这两个根目录，为节约篇幅省略前缀。密钥生成这一环完全落在用户态工具侧：核心文件是 `wireguard-tools/src/genkey.c`（三个密钥子命令的入口）、`wireguard-tools/src/curve25519.h` 与 `curve25519.c`（曲线运算与标量钳制）、`wireguard-tools/src/encoding.c` 与 `encoding.h`（常量时间 base64/hex 编解码）；而内核侧的对应实现在 `lib/crypto/curve25519.c`，负责握手阶段的 ECDH 运算。密钥长度常量 `WG_KEY_LEN` 定义在 uapi 头 `include/uapi/linux/wireguard.h`，值为 32。需要强调的是，genkey 只负责「造出合格的字节并将其编码输出」，把私钥送进内核是另一条由 `wg set` 经 netlink 完成的路径，二者合起来才是完整的 setup 流程，这也是本篇标题把它单列出来的原因。
+
+为什么私钥边界值得用一整篇来讲？因为 WireGuard 的保密性几乎全部押在「私钥绝不离开本机」这一条纪律上。协议没有证书撤销、没有在线认证、没有二次校验，一旦某台机器的私钥泄露，攻击者就可以克隆这台设备的身份、与所有信任它的对端完成握手。而 WireGuard 又是静默协议——认证失败只会丢包，不会在日志里留下醒目报错，私钥泄露往往在造成危害后才被发现。因此，从熵源选择、文件权限、编码输出到配置分发，每一步都需要有明确的边界意识。本篇不重复 01-01 已经讲过的「两类密钥」概览，而是沿着源码把这条链路逐段拆开，给出可执行的生成与分发方法，并指出那些看似无害、实则会破坏边界的操作习惯。
+
+### 2. 核心概念
+
+理解密钥生成，先要理解 Curve25519 在这套实现里承担的两个不同角色。第一个角色是「由私钥派生公钥」：这是一个单向的标量乘法，公钥 = 标量 × 基点，基点取 u 坐标 9；它不可逆，所以公钥可以公开分发。第二个角色是握手阶段的 ECDH 共享密钥计算：本地私钥与对端公钥做标量乘，得到只有双方知道的共享秘密。前者发生在用户态 `wg pubkey` 命令里，后者发生在内核 `lib/crypto/curve25519.c` 的 `curve25519()` 里。两者用的是同一个曲线算法，但调用场景与安全含义不同，阅读源码时不要混为一谈。
+
+标量钳制（clamp）是第一个关键概念，也是最容易理解错的一步。`curve25519.h` 里 `curve25519_clamp_secret` 只有两行：
+
+```c
+static inline void curve25519_clamp_secret(uint8_t secret[static CURVE25519_KEY_SIZE])
+{
+	secret[0] &= 248;
+	secret[31] = (secret[31] & 127) | 64;
+}
+```
+
+第一行 `secret[0] &= 248`（248 即二进制 11111000）清掉最低 3 位，使标量成为 8 的倍数，从而避开 Curve25519 的 8 阶小子群、让 ECDH 结果落在安全子群；第二行 `secret[31] = (secret[31] & 127) | 64` 清掉最高位、置位次高位，把标量固定到 2^254 量级，既防止实现间因约化方式不同产生歧义，也保证标量落在有效范围内。注意这是「就地修改」：genkey 把钳制后的字节当作私钥输出，因此用户看到的私钥已经是合法标量，后续 `wg pubkey` 可以直接拿它乘基点，不必再次钳制。
+
+第二个关键概念是编码。`encoding.h` 定义 `WG_KEY_LEN_BASE64` 为 `((((WG_KEY_LEN) + 2) / 3) * 4 + 1)`，代入 32 得 45——这是数组大小，含结尾 NUL；实际可见的 base64 字符串是 44 个字符，末位固定为一个 `=`。这是因为 32 字节按每 3 字节一组编码，余下 2 字节补一个 `=`。`encoding.c` 的注释明确写着这是「constant-time base64/hex implementation that resists side-channel attacks」：编解码全部用位运算完成，不查表，避免缓存时序泄露密钥内容。这一点常被低估——密钥处理函数的侧信道安全与算法本身同样重要。
+
+第三个关键概念是私钥边界。完整链路存在三类密钥材料：私钥（`WGDEVICE_A_PRIVATE_KEY`）、公钥（`WGDEVICE_A_PUBLIC_KEY` / `WGPEER_A_PUBLIC_KEY`）与可选的预共享密钥 PSK（`WGPEER_A_PRESHARED_KEY`）。边界规则是：私钥只在生成它的本机、以受限权限落盘，并注入本机内核接口；公钥可以、也应该分发给所有对端；PSK 是对两端共享的额外对称秘密，必须经带外安全通道分发。三者里只有公钥可以走明文渠道。第四个点需要提前澄清：genkey 命令对 `genkey` 与 `genpsk` 做了区分——只有 `genkey` 会调用 `curve25519_clamp_secret`，因为私钥必须是合法标量；`genpsk` 生成的是任意 32 字节随机串，不需要满足标量约束。把 PSK 当成私钥去钳制，虽然不至于立刻出错，却是对源码语义的误解。
+
+### 3. 关键数据结构与源码位置
+
+密钥生成链路涉及的源码可按「入口—运算—编码—内核对应」四层来建结构地图。入口层是 `wireguard-tools/src/genkey.c`，`genkey_main` 是 `genkey`、`pubkey`、`genpsk` 三个子命令共用的主函数，靠 `argv[0]` 区分行为。运算层是 `curve25519.h` 与 `curve25519.c`，前者给出 `CURVE25519_KEY_SIZE = 32` 与 `curve25519_clamp_secret`，后者用 `curve25519_generic`（依编译器是否支持 `__SIZEOF_INT128__` 选择 `curve25519-hacl64.h` 或 `curve25519-fiat32.h`）实现标量乘，基点常量 `basepoint[32] = { 9 }` 就在这里。编码层是 `encoding.c` / `encoding.h`，提供 `key_to_base64`、`key_from_base64`、`key_to_hex`、`key_from_hex`、`key_is_zero` 五个函数。内核对应层是 `lib/crypto/curve25519.c`，它用 `curve25519_null_point`（全零）与 `curve25519_base_point`（9）两个常量，导出 `curve25519()` 与 `curve25519_generate_public()` 两个接口供握手调用。uapi 层则在 `include/uapi/linux/wireguard.h`，`WG_KEY_LEN 32` 与三层属性枚举都在这里（完整常量见 04-06，字段见 05-09）。下表把本篇反复引用的源码位置收拢成速查。
+
+| 关注点 | 真实源码路径 | 关键符号 | 本册处理方式 |
+|---|---|---|---|
+| 密钥子命令入口 | `wireguard-tools/src/genkey.c` | `genkey_main`、`get_random_bytes` | 讲流程，命令全集见 04-01 |
+| 标量钳制 | `wireguard-tools/src/curve25519.h` | `curve25519_clamp_secret` | 展开语义，结构字段见 05-09 |
+| 用户态曲线运算 | `wireguard-tools/src/curve25519.c` | `curve25519_generate_public`、`basepoint` | 只点名，原理见 06-03 |
+| 常量时间编解码 | `wireguard-tools/src/encoding.c` | `key_to_base64`、`key_from_base64` | 展开边界，参数见 04-02 |
+| 内核曲线运算 | `lib/crypto/curve25519.c` | `curve25519`、`curve25519_null_point` | 只点名，模块见 07-12 |
+| 密钥属性定义 | `include/uapi/linux/wireguard.h` | `WG_KEY_LEN`、`WGDEVICE_A_PRIVATE_KEY` | 给最小片段，全集见 04-05 |
+
+需要特别提示一个容易踩空的版本差异：内核态 `lib/crypto/curve25519.c` 的 `curve25519()` 与 `curve25519_generate_public()` 都返回 `bool`，用 `crypto_memneq` 做常量时间比较，检查输出是否为全零（即是否落在低阶点），全零则返回 `false`；而用户态 `wireguard-tools/src/curve25519.c` 的同名函数是 `void`，不做 nil-potent 检查。同一份算法、两个不同的接口契约，读写源码时务必看清身处哪一层。字段级展开（如 `wg_device` 如何存放私钥）交给 05 册，本篇只给理解生成边界所需的最小片段。
+
+### 4. 关键流程与调用链
+
+先讲熵的来路。`genkey_main` 调用 `get_random_bytes(key, WG_KEY_LEN)`，这个函数按平台做了三级回退：在 glibc 2.25 以上、OpenBSD、macOS 10.12 以上，优先用 `getentropy(out, len)`；在 Linux 上退一步用 `syscall(__NR_getrandom, out, len, 0)`；再退一步 `open("/dev/urandom", O_RDONLY)` 循环读取；Windows 则走 `RtlGenRandom`。函数开头还有一道 `len > 256` 就设 `errno = EOVERFLOW` 并返回的护栏，防止一次性索取过多随机字节。理解了这条链，就能回答「wg genkey 的随机性可靠吗」——它直接绑定操作系统 CSPRNG，不引入用户态自造的伪随机源。
+
+再看 genkey 主流程，可压缩为五步：分配 `uint8_t key[WG_KEY_LEN]` 与 `char base64[WG_KEY_LEN_BASE64]`；`fstat(STDOUT_FILENO, &stat)` 检查标准输出是否是 world-accessible 的普通文件，若是则打印「Warning: writing to world accessible file. Consider setting the umask to 077 and trying again.」；`get_random_bytes` 填充 32 字节；若 `argv[0]` 等于 `genkey` 则 `curve25519_clamp_secret(key)`；最后 `key_to_base64(base64, key)` 并 `puts(base64)`。`pubkey` 走的是另一条路：从标准输入读入私钥字符串，`key_from_base64` 解码为 32 字节，再 `curve25519_generate_public` 乘基点得到公钥，同样 base64 输出。上述链路与配置注入链路的关系见图 03-03-01。
+
+:::figure id=03-03-01 | name=密钥生成、派生与注入内核的链路 | dir=TD
+node e1 "OS 熵源<br/>getentropy/getrandom/urandom" teal
+node e2 "genkey_main<br/>32 字节随机" blue
+node e3 "curve25519_clamp_secret<br/>低3位清零 次高位置位" purple
+node e4 "key_to_base64<br/>44 字符常量时间编码" gray
+node e5 "私钥文件<br/>umask 077 落盘" red
+node e6 "curve25519_generate_public<br/>私钥乘基点9" purple
+node e7 "公钥分发<br/>给对端" green
+node e8 "wg set private-key<br/>netlink SET_DEVICE" amber
+node e9 "内核接口<br/>WGDEVICE_A_PRIVATE_KEY" blue
+edge e1 -> e2 "get_random_bytes"
+edge e2 -> e3 "genkey 钳制"
+edge e3 -> e4 "编码"
+edge e4 -> e5 "tee 落盘"
+edge e5 -> e6 "wg pubkey"
+edge e6 -> e7 "安全分发"
+edge e5 -> e8 "读取私钥"
+edge e8 -> e9 "写入属性"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：起点是「OS 熵源 getentropy/getrandom/urandom」，经「genkey_main 32 字节随机」进入「curve25519_clamp_secret 低3位清零 次高位置位」，再由「key_to_base64 44 字符常量时间编码」输出并「tee 落盘」到 umask 077 保护的「私钥文件」；一条分支是「curve25519_generate_public 私钥乘基点9」派生公钥后「公钥分发 给对端」，另一条分支是用「wg set private-key netlink SET_DEVICE」把私钥写入「内核接口 WGDEVICE_A_PRIVATE_KEY」。
+
+配置注入链路的落点是这样的：`wg set wg0 private-key <文件>` 读取私钥文件，经 `key_from_base64` 校验并解码，通过 `wireguard-tools/src/ipc-linux.h` 的 netlink 套接字把 `WG_CMD_SET_DEVICE` 请求发给内核，内核在 netlink 层解析出 `WGDEVICE_A_PRIVATE_KEY` 属性写入 `wg_device`；用户态再调用 `curve25519_generate_public` 从同一私钥派生公钥，作为 `WGDEVICE_A_PUBLIC_KEY` 一并上报，所以 `wg show` 才能显示本端公钥。握手时内核用这把私钥在 `lib/crypto/curve25519.c` 里与对端公钥做 ECDH（逐段调用链见 06-03，netlink 通道见 06-14，模块职责见 07-13）。
+
+### 5. 配置/命令/代码实例
+
+下面给出一套规范的生成与分发操作。关键点是用管道一次生成私钥、同步派生公钥，并对私钥文件施加严格权限：
+
+```bash
+# 生成密钥对：umask 077 保证私钥文件仅本人可读写
+umask 077
+wg genkey | tee privatekey | wg pubkey > publickey
+
+# 单独生成预共享密钥（可选，不做标量钳制）
+wg genpsk > presharedkey
+
+# 用私钥建立接口，公钥分发给对端后由对端写入 peer
+ip link add wg0 type wireguard
+wg set wg0 private-key ./privatekey listen-port 51820
+wg set wg0 peer <对端公钥> preshared-key ./presharedkey allowed-ips 10.0.0.2/32
+ip link set wg0 up
+
+# 查看本端状态，核对派生公钥是否与分发给对端的一致
+wg show wg0
+```
+
+这段写法体现了三条纪律：其一，`wg genkey | tee privatekey | wg pubkey` 中私钥经 `tee` 落到本地 `privatekey`，公钥从同一私钥派生后单独写入 `publickey`，私钥永不进入分发文件；其二，`umask 077` 让新建文件权限为 600，规避 `genkey.c` 里那条 world-accessible 警告；其三，PSK 用 `wg genpsk` 单独生成，经带外安全通道传给对端，绝不与公钥一起明文发送。命令参数全集见 04-01、04-02。
+
+下面给出验证密钥是否真正生效的典型输出，用 `wg show` 观察与密钥相关的各行：
+
+```bash
+wg show wg0
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+interface: wg0
+  public key: AbCdEf...（44 字符 base64）
+  private key: (hidden)
+  listening port: 51820
+peer: XyZ123...（对端公钥）
+  preshared key: (hidden)
+  allowed ips: 10.0.0.2/32
+  latest handshake: 8 seconds ago
+```
+
+逐行判读如下。第一行 `interface: wg0` 来自 `WG_CMD_GET_DEVICE` 返回的 `WGDEVICE_A_IFNAME`，确认查询命中了正确的接口；多接口环境下这一步能防止把 A 接口的密钥误判到 B 接口。第二行 `public key` 是本端私钥经 `curve25519_generate_public` 乘基点 9 派生、再由 `key_to_base64` 编码的结果，对应 `WGDEVICE_A_PUBLIC_KEY`，其 44 字符形态正来自 `WG_KEY_LEN_BASE64` 数组减去末尾 NUL；把这一行与分发给对端的 `publickey` 文件逐字符比对，是验证派生正确性的最直接方法，对端若写入了不同公钥，握手会静默失败。第三行 `private key: (hidden)` 是工具刻意的展示层保护：私钥真实存在于内核接口的 `WGDEVICE_A_PRIVATE_KEY` 中，但 `wg show` 绝不回显，任何要求你「从 show 输出里复制私钥」的说法都是错误的。第四行 `listening port` 对应 `WGDEVICE_A_LISTEN_PORT`，若为 0 通常意味着私钥未设置或接口未 up。第五行 `peer:` 后是对端公钥，对应 `WGPEER_A_PUBLIC_KEY`，一个接口下可有多个 peer 段。`preshared key: (hidden)` 对应 `WGPEER_A_PRESHARED_KEY`，同样被隐藏，它的存在表示本 peer 启用了额外的对称密钥层，为握手叠加了后量子混合防护。`allowed ips` 对应 `WGALLOWEDIP_A_IPADDR` 与 `WGALLOWEDIP_A_CIDR_MASK`，与密钥分工明确：它只决定路由与源校验，不参与身份认证（路由部署见 03-04）。最后 `latest handshake` 对应 `WGPEER_A_LAST_HANDSHAKE_TIME`，是检验密钥链是否真正打通的核心指标——若长期为空，优先回查公钥是否分发错、PSK 两端是否一致、以及系统时钟是否偏差过大（握手时序见 06-03，排障见 08-03）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把 world-accessible 警告当成无害提示。`genkey.c` 在检测到标准输出是权限含 `S_IRWXO` 的普通文件时会明确警告，因为把私钥写进全局可读文件等于直接泄露身份；正确做法是先 `umask 077` 再生成，或把输出重定向到已被保护的目录。第二个陷阱是混淆三种密钥的生成方式：`genkey` 会钳制标量，`genpsk` 不会；把 `wg genpsk` 的输出当作私钥配置，或反过来把私钥当 PSK，都会埋下难以定位的互通问题。
+
+第三个陷阱是忽略编码的常量时间特性而自行「优化」。`encoding.c` 的位运算实现看似繁琐，实则刻意避免查表带来的缓存侧信道；自己写脚本用标准 base64 库处理私钥并非不可用，但要意识到那不在本工具的侧信道防护范围内。第四个陷阱是把公钥当敏感信息藏着不给对端：公钥本身就是公开派生量，`wg pubkey` 的输出可以安全地在任何渠道传递，过度保护公钥只会增加分发错误的机会。第五个陷阱是私钥轮换时不更新对端配置：轮换本端私钥后，公钥随之改变，所有信任旧公钥的对端都必须同步替换，否则隧道会静默中断；轮换窗口内应保留旧 peer 直到确认新握手建立（密钥管理与加固见 08-05）。
+
+最佳实践可以归纳为四条：第一，始终在受控环境中生成密钥，`umask 077`、受限目录、生成后立即核对文件权限，杜绝把私钥写入管线中间文件；第二，用 `tls`、带外信道或配置管理工具分发公钥与 PSK，公钥可明文、PSK 必须加密，私钥永不出本机；第三，生成后用 `wg show` 的 `public key` 行与分发文件逐字符比对，并用 `latest handshake` 确认链路打通，而不是只看接口 up；第四，建立轮换流程时先分发新公钥、再切换私钥、最后清理旧配置，全程以握手时间与 `transfer` 字节增长为成功判据。还要提醒一句：本篇给出的随机性来源、标量约束与编码长度均以本快照源码为准，不同版本的 wireguard-tools 在熵源优先级或输出格式上可能有细微差异，部署时应以目标系统实际版本核验（命令全集见 04-01，配置语义见 04-02）。
+
+### 7. 小结与延伸阅读
+
+本篇沿着源码把密钥链路拆成四段：熵源（`getentropy` → `getrandom` → `/dev/urandom` 三级回退）产出 32 字节随机数；`curve25519_clamp_secret` 通过「低 3 位清零、最高位清零、次高位置位」把私钥约束为合法标量；`key_to_base64` 以常量时间的位运算编码成 44 字符字符串；`wg set private-key` 经 netlink 把私钥写入 `WGDEVICE_A_PRIVATE_KEY`，公钥由 `curve25519_generate_public` 乘基点 9 派生后作为 `WGDEVICE_A_PUBLIC_KEY` 上报。私钥边界的核心纪律是：私钥只留本机并受限落盘，公钥可公开分发，PSK 经带外安全通道共享，`wg show` 对私钥与 PSK 一律隐藏。
+
+延伸阅读建议按三条线走：想深入标量乘与安全子群的数学原理读 `lib/crypto/curve25519.c` 与 06-03；想看结构字段逐项定义去 05 册，想看 netlink 属性全集去 04 册，想看各源文件职责去 07 册。跨册随查按（字段见 05-09 ｜ 参数见 04-02 ｜ 原理见 06-03 ｜ 模块见 07-13）执行：结构体逐字段去 05、参数与命令全集去 04、机制与调用链去 06、目录级模块能力去 07、密钥加固去 08-05。凡本篇标注「需对照实际版本核验」的字段、函数名签名、命令选项与输出格式，均以 `_wglinux_build/upstream_src/` 下对应文件为准，本套资料不编造未核验的路径与取值。下一篇 03-04 将把视角从「密钥是谁」转向「流量走哪条路」，讨论 AllowedIPs 的双重语义与路由部署。
+
+## 03-04 AllowedIPs 路由、策略路由与 NAT 部署
+
+### 1. 背景与动机
+
+如果说密钥决定了「谁可以接入」，AllowedIPs 就决定了「哪些流量走隧道、以哪把密钥发往哪个对端」。这是 WireGuard 与传统 VPN 差异最大的一点：它没有独立的路由协议下发，也没有中心控制器推送策略，而是把路由信息直接编码进每个 peer 的 `allowed-ips` 列表，由内核在发包时用目的地址查表选 peer、在收包时用源地址查表校验。上游把这套机制称为「crypto key routing」——加密密钥与路由条目是同一件事的两面。理解这一点，是正确部署分流、全流量代理、站点互联与 NAT 的前提；把它当成普通静态路由去配，是隧道「接口 up 但就是不通」的最常见根因。
+
+本篇的定位需要先把边界划清楚。AllowedIPs 的底层数据结构是一棵 v4/v6 混合的压缩 trie，实现在 `drivers/net/wireguard/allowedips.c` 与 `allowedips.h`；它的查找、最长前缀匹配、RCU 并发与节点压缩等**原理**属于 06-07 的权威范围，本篇不展开算法细节，只讲清楚它在部署层表现出的语义与行为，并给出可执行的配置方法。换句话说，本篇回答「应该怎么配、为什么会这样表现、出错时往哪查」，而「trie 节点怎么分裂与压缩」留给 06-07。这种分工贯穿全册：机制归 06 册，参数全集归 04 册，字段定义归 05 册，本篇作为集成与部署册，只做本节主题——把 AllowedIPs 语义落实到策略路由与 NAT 的部署方案上。
+
+为什么策略路由与 NAT 需要和 AllowedIPs 一起讲？因为 WireGuard 只负责「把匹配 AllowedIPs 的包加密送进隧道」，并不替你解决「如何让原本走默认路由的流量改道进 wg0」，也不解决「隧道另一端的私有地址如何访问互联网」。前者靠 Linux 的策略路由（`ip rule` + 多路由表 + fwmark），后者靠 NAT（`iptables`/`nftables` 的 MASQUERADE）与内核转发开关。这三者叠加才构成一套可用的远程接入或站点互联方案。本章的口径与本册一致：所有函数、字段、属性名均先读源码核实，配置参数以 04 册为权威源，本篇只给最小必要片段并写明交叉引用；涉及绝对吞吐与性能的数字一律「需在目标机型实测」，本篇不提供。
+
+### 2. 核心概念
+
+AllowedIPs 的第一层语义是**出站选路**。发送方向，内核按普通路由把包交给 wg0 的 `ndo_start_xmit`，`send.c` 调用 `wg_allowedips_lookup_dst(table, skb)`，它以 IP 头的目的地址 `ip_hdr(skb)->daddr`（IPv6 为 `ipv6_hdr(skb)->daddr`）在 trie 中查找，命中哪个节点就取该节点的 `peer`，于是这个包就用那个 peer 的会话密钥加密发走。所以「AllowedIPs 里写了什么网段」等价于「发往这些网段的流量交给哪个对端」。
+
+第二层语义是**入站源校验**。接收方向，报文解密后，`receive.c` 调用 `wg_allowedips_lookup_src(table, skb)`，以源地址 `saddr` 查表，确认这个源地址确实属于刚才解密所用的那个 peer；不属于就丢弃。这一层常被忽略，却极其关键：它意味着客户端必须在自己的 `AllowedIPs` 里包含「对端发来的源地址」，否则服务端回包会被客户端当作伪造源而丢弃。双重语义合起来，正好构成一条闭合的信任链——出去按目的选密钥，回来按源验身份（trie 查找原理见 06-07，字段见 05-04）。
+
+第三层概念是**最长前缀匹配**。`allowedips.c` 的 `find_node` 沿 trie 向下走时，会把「最后一个拥有 peer 的节点」记为结果；由于前缀从短到长排列，这等价于选出掩码最长、最精确的那条 AllowedIP。部署上的直接后果是：你可以用 `0.0.0.0/0` 兜底，再用 `10.0.0.0/8` 这类更具体条目把特定网段导向另一个 peer，具体条目优先。第四层是**双栈分离**：`struct allowedips` 有 `root4` 与 `root6` 两棵独立的树，`0.0.0.0/0` 只覆盖 IPv4，`::/0` 才覆盖 IPv6；只写前者会导致 IPv6 流量绕过隧道，这是一个隐蔽的泄露点。
+
+第五层是**分流形态**。按 AllowedIPs 的写法，部署可归为三类：精确分流（`AllowedIPs = 10.0.0.0/24`，只有该网段进隧道，其余流量按主路由表走，最简单也最安全）；全流量代理（`AllowedIPs = 0.0.0.0/0, ::/0`，所有流量进隧道，需配合策略路由避免路由环路）；多 peer 分流（不同 peer 配不同 AllowedIPs，内核按目的地址自动选择出口）。下表把三种形态与所需配套机制对照列出。
+
+| 分流形态 | AllowedIPs 写法 | 出站选路依据 | 是否需要策略路由 | 是否需要 NAT |
+|---|---|---|---|---|
+| 精确分流 | `10.0.0.0/24` | 目的地址命中该前缀才进隧道 | 通常不需要，走主路由表 | 视对端网络而定 |
+| 全流量代理 | `0.0.0.0/0, ::/0` | 所有目的地址均命中 | 需要，避免覆盖默认路由 | 服务端通常需要 |
+| 多 peer 分流 | 每个 peer 各自网段 | 最长前缀决定目标 peer | 视出口数量而定 | 视出口拓扑而定 |
+
+### 3. 关键数据结构与源码位置
+
+从部署视角看 AllowedIPs，需要认识三组源码位置。第一组是 trie 的实现 `drivers/net/wireguard/allowedips.c` 与 `allowedips.h`：`struct allowedips` 持有 `root4`、`root6` 两棵根与一个递增序号 `seq`；`struct allowedips_node` 含 `peer`、`bit[2]` 子指针、`cidr`、`bits[16]` 等字段。对外 API 中，部署最需要记住的是四个函数——`wg_allowedips_insert_v4`、`wg_allowedips_insert_v6`（按前缀插入），`wg_allowedips_lookup_dst`（出站按目的查）、`wg_allowedips_lookup_src`（入站按源查）。`MAX_ALLOWEDIPS_DEPTH = 129` 决定了树深上限，`swap_endian` 负责把网络序地址转成便于位运算的主机序。字段逐项定义见 05-04，算法原理见 06-07，模块职责见 07-04，本篇只点名不展开。
+
+第二组是 uapi 属性定义 `include/uapi/linux/wireguard.h`。AllowedIP 条目在 netlink 层由 `enum wgallowedip_attribute` 描述，四个有效属性是 `WGALLOWEDIP_A_FAMILY`（地址族，AF_INET/AF_INET6）、`WGALLOWEDIP_A_IPADDR`（地址本身）、`WGALLOWEDIP_A_CIDR_MASK`（掩码位数）、`WGALLOWEDIP_A_FLAGS`；标志位目前只有 `WGALLOWEDIP_F_REMOVE_ME`，用于删除单条。peer 侧另有 `WGPEER_A_ALLOWEDIPS` 作为条目容器，以及 `WGPEER_F_REPLACE_ALLOWEDIPS` 标志表示整体替换。理解这些属性，就能看懂 `wg set` 的 `allowed-ips` 参数最终落到哪里（属性全集见 04-05、04-06）。
+
+第三组是策略路由与 NAT 的内核设施，它们不属于 WireGuard 源码，而是 Linux 网络栈的通用能力：`ip rule` 操作策略路由规则、`ip route ... table` 操作路由表、`WGDEVICE_A_FWMARK` 是 WireGuard 给隧道包打标记的 uapi 属性（便于 `ip rule ... fwmark` 匹配），`net.ipv4.ip_forward` 控制转发，`iptables -t nat` 或 `nftables` 完成地址伪装。下表把部署要素收拢成速查，方便与后文实例对照。
+
+| 关注点 | 真实源码路径 / 设施 | 关键符号 | 本册处理方式 |
+|---|---|---|---|
+| AllowedIPs trie | `drivers/net/wireguard/allowedips.c`、`allowedips.h` | `wg_allowedips_lookup_dst`、`lookup_src` | 只讲语义，原理见 06-07 |
+| AllowedIP 属性 | `include/uapi/linux/wireguard.h` | `WGALLOWEDIP_A_IPADDR`、`CIDR_MASK` | 给最小片段，全集见 04-05 |
+| 隧道标记属性 | `include/uapi/linux/wireguard.h` | `WGDEVICE_A_FWMARK` | 只点名，参数见 04-03 |
+| 策略路由 | `ip rule` / `ip route table`（内核网络栈） | fwmark、 lookup table | 给部署片段 |
+| NAT 与转发 | `iptables` / `nftables` / sysctl | MASQUERADE、ip_forward | 给部署片段 |
+
+### 4. 关键流程与调用链
+
+出站流程可概括为「选路 → 进隧道 → 查表选 peer → 加密发出」。当应用层发包，内核按策略路由或主路由表决定下一跳是 wg0；包进入 `ndo_start_xmit` 后，`send.c` 调 `wg_allowedips_lookup_dst`，该函数按 `skb->protocol` 区分 IPv4/IPv6，分别用目的地址查 `root4`（32 位）或 `root6`（128 位）。查表在 RCU 读锁下完成，`find_node` 记录最长前缀命中的节点并返回其 peer 的强引用；随后用该 peer 的会话密钥经 ChaCha20-Poly1305 加密，封装成 UDP 从底层物理网卡发出。整个查表过程不睡眠、并发安全（并发机制见 06-13）。
+
+入站流程则是「收 UDP → 解密 → 源校验 → 注入」。socket 收到报文后经握手/数据路径解密，`receive.c` 调 `wg_allowedips_lookup_src` 用源地址查表，确认源地址归属解密所用的 peer；若查不到或归属不符，包被丢弃。通过后包被注入内核协议栈，由普通路由转发到内网或本机。注意入站校验用的是**源**地址，出站选路用的是**目的**地址，二者共用同一棵 trie 但取 IP 头的不同字段——这正是 crypto key routing 的核心（收发全流程见 06-05、06-06）。上面两条链路以及策略路由、NAT 在整个部署中的位置见图 03-04-01。
+
+:::figure id=03-04-01 | name=AllowedIPs 双重语义与策略路由 NAT 部署 | dir=TD
+node n1 "出站 IP 包<br/>取 daddr 目的地址" blue
+node n2 "lookup_dst<br/>root4/root6 查 trie" teal
+node n3 "最长前缀匹配<br/>命中条目的属主 peer" purple
+node n4 "加密为 UDP<br/>从物理网卡发出" red
+node n5 "入站解密包<br/>取 saddr 源地址" blue
+node n6 "lookup_src<br/>校验源归属该 peer" teal
+node n7 "合法注入协议栈<br/>非法丢弃" green
+node n8 "策略路由 fwmark<br/>ip rule 查自定义表" amber
+node n9 "NAT MASQUERADE<br/>出口改写源地址" gray
+edge n8 -> n1 "选路进 wg0"
+edge n1 -> n2 "目的地址"
+edge n2 -> n3 "find_node"
+edge n3 -> n4 "选定 peer"
+edge n5 -> n6 "源地址"
+edge n6 -> n7 "前缀匹配"
+edge n4 -> n9 "经物理网卡"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：出站侧，「策略路由 fwmark ip rule 查自定义表」把「出站 IP 包 取 daddr 目的地址」送进 wg0，经「lookup_dst root4/root6 查 trie」与「最长前缀匹配 命中条目的属主 peer」选定目标 peer，再由「加密为 UDP 从物理网卡发出」，出口处经「NAT MASQUERADE 出口改写源地址」；入站侧，「入站解密包 取 saddr 源地址」经「lookup_src 校验源归属该 peer」判定后「合法注入协议栈 非法丢弃」。
+
+配置落地链路则从 `wg set wg0 peer <公钥> allowed-ips <网段>` 开始：工具把网段拆成地址与掩码，序列化为 `WGALLOWEDIP_A_FAMILY`、`WGALLOWEDIP_A_IPADDR`、`WGALLOWEDIP_A_CIDR_MASK` 属性，经 `WG_CMD_SET_DEVICE` 发给内核；内核解析后调用 `wg_allowedips_insert_v4/v6` 插入 trie 并递增 `seq`。`wg-quick` 在此之上把 `AllowedIPs` 转为主机路由或策略路由规则（具体参数见 04-03，配置体系见 03-02）。这就是为什么改一行 `AllowedIPs` 会同时改变「本端发包走哪」和「对端回包是否合法」两侧的行为。
+
+### 5. 配置/命令/代码实例
+
+下面给出两种典型部署。第一种是全流量远程接入，客户端用策略路由避免隧道自锁：`FwMark` 给隧道包打标记，`Table` 让 wg-quick 使用独立路由表，`PostUp`/`PreDown` 手工补充规则，使得到达服务端 endpoint 自身流量仍走物理网卡。
+
+```bash
+# /etc/wireguard/wg0.conf —— 客户端：全流量经隧道
+[Interface]
+Address = 10.0.0.2/32
+PrivateKey = <本端私钥>
+FwMark = 51820
+Table = off
+DNS = 10.0.0.1
+PostUp = ip route add default dev %i table 100
+PostUp = ip rule add fwmark 51820 table 100 priority 100
+PreDown = ip rule del table 100 priority 100
+PreDown = ip route flush table 100
+
+[Peer]
+PublicKey = <服务端公钥>
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = 203.0.113.9:51820
+PersistentKeepalive = 25
+```
+
+```bash
+# 服务端：开启转发并对隧道出口做 NAT
+sysctl -w net.ipv4.ip_forward=1
+sysctl -w net.ipv6.conf.all.forwarding=1
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+# 或对 IPv6：nftables 的 masquerade 规则，需对照实际版本核验
+```
+
+这段配置体现了三个要点：`AllowedIPs = 0.0.0.0/0, ::/0` 覆盖双栈，对应两棵 trie 各写一条默认前缀；`FwMark = 51820`（即 `WGDEVICE_A_FWMARK`）配合 `ip rule ... fwmark` 让标记流量查独立表，避免把发往 endpoint 的包也送进隧道形成环路；服务端 `ip_forward` 加 MASQUERADE 让 `10.0.0.2` 的流量以服务端公网地址出网（策略路由与 NAT 参数全集见 04-03，命令全集见 04-01）。
+
+下面用 `wg show` 与 `ip` 命令验证 AllowedIPs 与策略路由是否按预期生效：
+
+```bash
+wg show wg0 allowed-ips
+ip rule show | grep 51820
+ip route get 8.8.8.8 mark 51820
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+peer: XyZ123...（服务端公钥）
+  0.0.0.0/0
+  ::/0
+32765: from all fwmark 0xca6c lookup 100
+8.8.8.8 via 10.0.0.1 dev wg0 table 100 src 10.0.0.2 uid 0
+```
+
+逐行判读如下。第一段三行是 `wg show wg0 allowed-ips`：`peer:` 后的公钥标识这是服务端这个 peer，对应 `WGPEER_A_PUBLIC_KEY`；紧随其后的 `0.0.0.0/0` 与 `::/0` 是该 peer 的两条 AllowedIP，分别来自 `WGALLOWEDIP_A_IPADDR` 与 `WGALLOWEDIP_A_CIDR_MASK`（掩码为 0），地址族由 `WGALLOWEDIP_A_FAMILY` 区分，正好落进 `struct allowedips` 的 `root4` 与 `root6` 两棵树；这两行说明「所有 IPv4 与 IPv6 目的地址都按最长前缀匹配选中这个 peer」，与 `wg_allowedips_lookup_dst` 用 `daddr` 查表的行为一致。第二段 `32765: from all fwmark 0xca6c lookup 100` 是 `ip rule` 输出，`0xca6c` 正是十进制 51820，说明带该 fwmark 的包被引导到 100 号路由表——这对应 `WGDEVICE_A_FWMARK` 被打标后由策略路由接管，是避免隧道自锁的关键。第三段 `ip route get 8.8.8.8 mark 51820` 的结果显示下一跳是 `via 10.0.0.1 dev wg0 table 100`，证明发包确实进了隧道而不是走物理网卡；这里的 `via 10.0.0.1` 来自 wg0 的对端地址，`src 10.0.0.2` 是本端 Address，若这一行仍显示物理网卡，说明策略路由未生效，应回查 `ip rule` 优先级是否与主表冲突（排障见 08-03、08-04）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是全流量代理时的「隧道自锁」：若 `AllowedIPs = 0.0.0.0/0` 却不做策略路由，发往服务端 endpoint 的 UDP 封装包本身也会被目的地址匹配进隧道，形成永远建不起来的环路。解决方法是像上例那样用 fwmark + 独立路由表，或 `wg-quick` 默认策略，把封装流量排除在外（参数见 04-03）。第二个陷阱是双栈遗漏：只写 `0.0.0.0/0` 不写 `::/0`，IPv6 流量会绕过隧道泄露真实地址，务必成对配置。
+
+第三个陷阱是掩码写错。AllowedIPs 是「网段 + 掩码」的完整前缀，`/32`（或 `/128`）表示单主机，写成过宽的掩码会把本不该走隧道的流量送进去，写成过窄则导致对端回包被源校验丢弃；`allowedips.c` 的 `add` 会校验 `cidr > bits` 返回 `-EINVAL`，但掩码「合法却错误」不会报错，只能靠 `wg show allowed-ips` 逐行核对。第四个陷阱是忽略入站源校验：客户端若期望收到来自 `192.168.1.0/24` 的流量，却没把该网段写进 AllowedIPs，服务端回包会被 `wg_allowedips_lookup_src` 判定为不属于该 peer 而丢弃，表现为「能发不能收」。
+
+第五个陷阱是 NAT 位置搞反：MASQUERADE 应做在「隧道出口后面的公网接口」上（服务端 `eth0`），客户端通常不需要对 wg0 做 NAT；把 NAT 加错位置会造成回包路径不对称。第六个陷阱是 MTU 与 MSS：UDP 封装带来额外开销，若上层 MSS/MTU 未相应下调，会出现「小包通、大包不通」的假性故障，需在目标机型实测调整（调优见 08-02）。第七个陷阱是 `rp_filter` 严格模式导致隧道内网地址被反向路径过滤丢弃，需在接口上放宽（排障见 08-03）。
+
+最佳实践归纳为四条：先用最精确分流起步（`AllowedIPs` 只写必要网段），确认隧道打通后再按需扩大；全流量场景一定配合 fwmark + 独立路由表，并用 `ip route get ... mark` 验证；多 peer 时用最长前缀原理规划网段，让具体路由优先于兜底路由；NAT、转发与防火墙规则纳入版本化配置，变更时同步核对 `wg show allowed-ips`、策略路由与 NAT 三处状态。所有数值（吞吐、pps、握手速率）需在目标机型实测，本篇不给绝对值（基准见 08-01）。
+
+补充一个在站点互联中经常遇到的规划问题：当一台机器同时作为多个分支的汇聚节点时，每个分支 peer 的 AllowedIPs 应写成该分支的内网网段，而不是 `0.0.0.0/0`；否则所有分支流量都会被前缀相同的先匹配 peer 吸走，后加入的 peer 几乎收不到包。汇聚节点自身若要访问互联网，应另设一个出口 peer 并只用兜底前缀，依赖最长前缀匹配让各分支的具体网段优先命中。这种规划把选路决策完全交给内核 trie，通常无需额外的策略路由规则，但前提是各分支网段互不重叠且掩码规划清晰（多 peer 站点互联实例见 03-06）。
+
+### 7. 小结与延伸阅读
+
+本篇把 AllowedIPs 从源码语义落到部署：出站由 `wg_allowedips_lookup_dst` 按目的地址查 trie 选 peer，入站由 `wg_allowedips_lookup_src` 按源地址校验归属，二者共用 `root4`/`root6` 两棵树并按最长前缀匹配；uapi 层由 `WGALLOWEDIP_A_FAMILY`、`WGALLOWEDIP_A_IPADDR`、`WGALLOWEDIP_A_CIDR_MASK` 描述条目。部署上，精确分流靠主路由表、全流量代理靠 fwmark + 策略路由避免自锁、服务端靠 `ip_forward` + MASQUERADE 完成出口地址转换；双栈要同时写 `0.0.0.0/0` 与 `::/0`，掩码与源校验是最易出错的两处。
+
+延伸阅读按三条线走：想透彻理解 trie 的查找与压缩算法读 06-07，想看逐字段定义去 05 册，想看参数全集去 04 册，想看模块职责去 07 册，排障与调优去 08 册。跨册随查按（字段见 05-04 ｜ 参数见 04-03 ｜ 原理见 06-07 ｜ 模块见 07-04）执行：结构体逐字段去 05、参数与 wg-quick 选项去 04 、查找与路由决策原理去 06、allowedips.c 模块职责去 07、运维场景与基准去 08。凡本篇标注「需对照实际版本核验」的字段、命令选项与输出格式，均以 `_wglinux_build/upstream_src/` 下对应文件为准；策略路由与 NAT 属 Linux 通用网络栈设施，具体行为以目标系统内核版本与工具版本核验，本套资料不编造未核验的路径与取值。至此，03 册的密钥生成（03-03）与路由部署（03-04）两篇闭环：前者回答「身份怎么建立」，后者回答「流量怎么选路」。
+
+## 03-05 systemd / NetworkManager 集成与持久化
+
+### 1. 背景与动机
+
+一条只能撑到下次重启的隧道，谈不上真正的部署。前面几篇讲的 `wg-quick up wg0`、`wg set wg0 peer ...` 都是一次性命令，它们在内核里写下的接口、地址、路由与 peer 状态，会随着接口被删除或机器重启而全部消失。生产环境需要的是「开机自动拉起、配置变更可平滑重载、进程异常可观测、关机可干净回收」这一整套生命周期管理，而这正是初始化系统与网络管理器要解决的问题。本篇聚焦 Linux 上两条主流的持久化路径：systemd 服务单元（上游 wireguard-tools 直接随源码分发）与 NetworkManager（上游并不随 wireguard-tools 分发脚本，需依赖网络管理器自身的能力）。
+
+先把事实边界划清楚，避免后续叙述张冠李戴。上游 `wireguard-tools/src/systemd/` 目录下只有两个文件：`wg-quick@.service` 与 `wg-quick.target`，前者是用 `wg-quick(8)` 管理单个接口的模板单元，后者是一个仅含 `Description` 的聚合目标，用于把多个接口实例收拢成一个统一开关。这两个文件的安装由 `src/Makefile` 的 `install` 目标负责，受 `WITH_SYSTEMDUNITS` 变量控制；该变量默认由 `pkg-config --variable=systemdsystemunitdir systemd` 探测安装目录，探测失败时回退到 `$(PREFIX)/lib/systemd/system`（见 `src/Makefile` 第 13、32 至 36、104 至 105 行）。换句话说，systemd 集成是「工具自带、装了就有」的能力；而 NetworkManager 集成在上游工具树里**没有任何脚本或单元**——`README.md` 在安装说明里明确写道：如果你已经有一套能用的网络管理工具，应当把 `wg(8)` 或直接把 WireGuard API 集成进你的网络管理器，而不是用 `wg-quick(8)`。这一句定调很关键：它说明 wg-quick 与 systemd 单元是「简单场景」的官方方案，复杂场景官方更倾向让网络管理器接管。
+
+为什么需要区分这两条路径？因为它们解决的是不同层次的问题。systemd 单元解决的是「服务生命周期」——何时启动、依赖谁、如何重载、如何停止，它的配置语言是单元文件，落点是 `/usr/lib/systemd/system/`；NetworkManager 解决的是「网络连接配置」——把 VPN 当作一种连接类型，用 `nmcli` 或图形界面管理，并与其他网络连接的激活顺序、DNS、路由策略协同，它的落点是 `/etc/NetworkManager/system-connections/`。前者是进程与服务视角，后者是连接与配置视角。本篇会分别给出两者的落地方法，并对上游未直接提供、需依赖发行版或 NetworkManager 版本的部分明确标注「需对照实际版本核验」。
+
+持久化还有一个容易被忽视的维度：配置文件本身的安全边界。`wg-quick` 在解析配置时会检查文件与所在目录的权限：`src/wg-quick/linux.bash` 第 47 行用 `stat` 取配置文件与父目录的模式位，若与世界可访问位（`0007`）有交集就打印 `Warning: ... is world accessible`；`src/Makefile` 第 99 行更直接把 `/etc/wireguard` 目录以 `0700` 安装。systemd 单元与这些权限约束叠加，构成了一条完整的「密钥落盘—开机加载—平滑重载—关机回收」链条。理解这条链条，是理解持久化的前提（密钥流程另见 03-03，此处只谈集成与落盘后的生命周期）。
+
+### 2. 核心概念
+
+systemd 集成的核心概念可以压缩为四组：**模板单元与实例、依赖时序、重载语义、环境变量注入**。
+
+模板单元与实例。`wg-quick@.service` 文件名里的 `@` 是 systemd 模板单元的标记，`%i` 与 `%I` 是实例占位符。当执行 `systemctl enable --now wg-quick@wg0` 时，systemd 把实例名 `wg0` 代入单元文件中的 `%i`，于是 `ExecStart=/usr/bin/wg-quick up %i` 变成 `wg-quick up wg0`，`Description=WireGuard via wg-quick(8) for %I` 变成针对 wg0 的描述。这意味着一个模板单元可以派生出任意多个接口实例——`wg-quick@wg0`、`wg-quick@wg1`、`wg-quick@siteA` 各管一条隧道，互不干扰。注意 `%i` 与 `%I` 的区别：前者会做转义（对含特殊字符的实例名更重要），后者不转义；本单元里 `ExecStart` 用 `%i`、`Description` 用 `%I`，符合 systemd 的常规用法。实例名必须同时满足接口名约束：`linux.bash` 的 `parse_options` 用正则 `[a-zA-Z0-9_=+.-]{1,15}` 校验配置文件名（第 43、45 行），因此实例名不能含斜杠、空格等字符，否则 `wg-quick` 会直接报错退出。
+
+依赖时序决定隧道能否在开机时真正建立起来。单元文件的 `[Unit]` 段写了四行关键指令：`After=network-online.target nss-lookup.target`、`Wants=network-online.target nss-lookup.target`、`Before=wg-quick.target`、`PartOf=wg-quick.target`。`After` 只规定启动顺序而不建立强依赖，`Wants` 才建立弱依赖——两者搭配表示「尽量等网络在线与名称解析就绪后再启动我，但即使它们没起来我也会跑」。这对使用域名作为 `Endpoint` 的配置至关重要：若 DNS 尚未就绪，`wg` 解析 endpoint 会失败，而 `WG_ENDPOINT_RESOLUTION_RETRIES` 环境变量正是为这种情况准备的兜底（下文详述）。`Before=wg-quick.target` 与 `PartOf=wg-quick.target` 则是聚合语义：前者让本实例排在聚合目标之前，后者让「停止或重启 wg-quick.target」这个动作传播到所有实例——对 `wg-quick.target` 执行一次 `systemctl restart`，所有以此为 `PartOf` 的接口实例都会跟着重启，这就是聚合目标的价值（它自身在源码里只有一行 `Description=WireGuard Tunnels via wg-quick(8)`，是个纯粹的锚点）。
+
+重载语义区分「重建接口」与「同步配置」。单元的 `ExecReload` 写的是 `/bin/bash -c 'exec /usr/bin/wg syncconf %i <(exec /usr/bin/wg-quick strip %i)'`。这条命令是两个工具的组合：`wg-quick strip %i` 读取 `/etc/wireguard/%i.conf`，把 wg-quick 私有字段（Address、DNS、MTU、Table、PreUp 等）剔除，只留下 `wg(8)` 能懂的 `[Interface]`/`[Peer]` 部分（对应 `linux.bash` 的 `cmd_strip` 与 `man/wg-quick.8` 关于 strip 的说明）；`wg syncconf` 则把这份「裸配置」同步进正在运行的接口。二者的组合效果是关键：**已建立的会话不会被打断**，因为 `syncconf` 只增删 peer 与更新字段，不会像 `setconf` 那样重置接口。这正是 `man/wg-quick.8` 强调 strip「适合在不中断活动会话的情况下重载配置文件」的原因（命令语义全集见 04-02，参数见 04-03）。
+
+环境变量注入解决启动时序的兜底。`[Service]` 段的 `Environment=WG_ENDPOINT_RESOLUTION_RETRIES=infinity` 把重试次数设为无限。这个变量由用户态 `wg` 工具读取：`src/config.c` 的 `parse_dns_retries()`（第 177 至 193 行）在未设置时返回默认值 `15`，值为字符串 `infinity` 时返回 `-1`（表示无限重试），否则用 `strtoul` 解析为数字，解析失败则打印错误并退出。systemd 单元把它设成 `infinity`，意味着「开机时若解析不了 endpoint 域名，就一直重试直到成功」，这与 `Wants=nss-lookup.target` 形成双保险：前者尽力保证 DNS 就绪，后者在 DNS 暂时不可用时让配置命令不轻言失败。
+
+NetworkManager 的概念体系则完全不同。它把 VPN 当作一种「连接」（connection profile），用 `connection.type=wireguard` 描述，配置里包含接口名、私钥、监听端口，以及一个个 peer（公钥、allowed-ips、endpoint、持久 keepalive）。`nmcli connection up/down` 激活或停用连接，`autoconnect=yes` 实现开机自动连接。需要强调的是：NetworkManager 的 WireGuard 支持是 NetworkManager 自身从某个版本起才引入的功能，**不在 wireguard-tools 源码树内**，其字段命名、支持的能力（如是否支持 PSK、是否支持 fwmark 策略路由）随版本变化，因此本篇只描述概念模型与操作范式，所有具体字段与版本要求均标注「需对照实际版本核验」。这与本篇对 systemd 单元的源码级断言形成对照——前者可逐行核实，后者只能给方法骨架。
+
+### 3. 关键数据结构与源码位置
+
+本篇是集成部署册，不展开内核结构字段（那属于 05 册），重点是把「集成与持久化」涉及的真实源码位置与文件角色列清楚，做到每个结论都能落到路径。
+
+systemd 侧的关键文件有三个。`src/systemd/wg-quick@.service` 是模板单元本体，23 行，分 `[Unit]`、`[Service]`、`[Install]` 三段：`[Install]` 段的 `WantedBy=multi-user.target wg-quick.target` 决定了 `systemctl enable` 时在哪两个目标下建立软链接——`multi-user.target` 保证多用户模式下自动启动，`wg-quick.target` 保证被聚合目标一并拉起。`src/systemd/wg-quick.target` 是聚合目标，仅一行 `Description`，作为 `PartOf`/`Before` 的锚点。`src/Makefile` 的 `install` 目标（第 93 至 105 行）决定这些文件装到哪里：`SYSTEMDUNITDIR` 由 `pkg-config` 探测，默认回退 `$(PREFIX)/lib/systemd/system`，并用 `install -v -m 0644 systemd/*` 安装整个目录；`WITH_SYSTEMDUNITS` 为 `no` 时不安装（构建与安装细节见 02-04）。
+
+wg-quick 脚本本体是本册持久化的执行引擎，Linux 平台实现是 `src/wg-quick/linux.bash`（390 行）。与集成直接相关的函数有：`parse_options`（第 40 至 75 行）解析配置并填充 `ADDRESSES`、`DNS`、`TABLE`、`PRE_UP`/`POST_UP` 等全局数组，同时用正则校验接口名与检查权限；`cmd_up`（第 327 至 344 行）与 `cmd_down`（第 346 至 354 行）是启停主流程，`cmd_up` 依次执行 `add_if` → `execute_hooks PRE_UP` → `set_config` → `add_addr` → `set_mtu_up` → `set_dns` → `add_route` → `execute_hooks POST_UP`，并用 `trap` 保证中途失败时回滚（`del_if`）；`cmd_strip`（第 361 至 363 行）输出纯 `wg` 配置，供 ExecReload 使用；`save_config`（第 255 至 289 行）实现 `SaveConfig=true` 时的状态回写，用 `umask 077` 与原子 `mv` 保护文件。`src/wg-quick/wg` 内容只有一行 `../wg`，是指向 `wg` 二进制的相对符号链接目标，供 wg-quick 在自身目录里找到 `wg`（`linux.bash` 第 11 至 12 行把脚本所在目录前置到 `PATH`）。`src/man/wg-quick.8` 是手册页，第 55 至 111 行列出 wg-quick 扩展字段的权威语义，第 254 至 257 行给出 strip + syncconf 的重载范式。
+
+用户态 `wg` 工具里与集成相关的位置：`src/config.c` 的 `parse_dns_retries()`（前文已述）读取 `WG_ENDPOINT_RESOLUTION_RETRIES`；`src/completion/wg-quick.bash-completion` 提供命令行补全，其 `_wg_quick_completion`（第 4 至 41 行）在 `up` 时从 `/etc/wireguard/*.conf` 枚举候选（第 6、17 至 27 行），在 `down` 时用 `wg show interfaces` 枚举活动接口（第 36 行）——这解释了一个常见现象：为什么 `wg-quick down` 的补全只列出正在运行的接口，而 `up` 的补全列出磁盘上的配置文件。补全文件由 `src/Makefile` 第 102 至 103 行在 `WITH_BASHCOMPLETION=yes` 且 wg-quick 启用时安装。
+
+`contrib/` 下的两个辅助脚本与持久化密切相关，但要注意它们不是随安装默认部署的官方单元。`contrib/reresolve-dns/reresolve-dns.sh` 配合 cron 使用，README 明确写「每三十秒左右跑一次」，用于动态 DNS 场景下把解析变化的 endpoint 更新进内核：它解析配置文件的每个 `[Peer]`，读取 `PublicKey` 与 `Endpoint`，用 `wg show INTERFACE latest-handshakes` 取最近握手时间戳，若距今超过 `135` 秒（脚本第 19 行 `(( ($EPOCHSECONDS - ...) > 135 ))`）就执行 `wg set INTERFACE peer PUBLIC_KEY endpoint ENDPOINT`（第 20 行）。`contrib/dns-hatchet/` 则是另一套 DNS 处理思路的示例。这些 contrib 脚本属于「灵感来源」而非生产组件（`README.md` 第 70 至 74 行对 contrib 的定位是「多数不适合直接生产使用，仅供启发」），引用时应注明出处与版本核验要求。
+
+下表把本篇反复引用的文件收拢成速查。
+
+| 关注点 | 真实源码路径 | 本册处理方式 |
+|---|---|---|
+| 模板服务单元 | `wireguard-tools/src/systemd/wg-quick@.service` | 逐指令讲，落在生命周期 |
+| 聚合目标 | `wireguard-tools/src/systemd/wg-quick.target` | 只点名，讲聚合语义 |
+| 单元安装路径 | `wireguard-tools/src/Makefile`（第 13、104 行） | 给变量来源，全集见 02-04 |
+| 启停与重载引擎 | `wireguard-tools/src/wg-quick/linux.bash` | 讲 up/down/strip 流程 |
+| 重试环境变量 | `wireguard-tools/src/config.c`（第 177 行） | 讲语义，命令参数见 04-01 |
+| 手册与补全 | `wireguard-tools/src/man/wg-quick.8`、`src/completion/wg-quick.bash-completion` | 点名语义与补全来源 |
+| 动态 DNS 辅助 | `wireguard-tools/contrib/reresolve-dns/` | 讲用法，标注非官方单元 |
+
+### 4. 关键流程与调用链
+
+开机启动链路从内核与 systemd 的共同作用开始。机器加电后 systemd 进入 `multi-user.target`，因为 `wg-quick@.service` 的 `[Install]` 段声明了 `WantedBy=multi-user.target`，enable 操作已在该目标下建立软链接，于是实例被纳入启动事务。`[Unit]` 段的 `After`/`Wants` 把 `network-online.target` 与 `nss-lookup.target` 排到前面，systemd 尽量等网络在线与名称查找就绪；随后进入 `[Service]`：`Type=oneshot` 表示这是一次性任务而非常驻守护进程，`RemainAfterExit=yes` 让服务在 `ExecStart` 进程退出后仍被标记为 active（否则 oneshot 跑完就变 inactive，无法表达「隧道仍在运行」的状态）。真正执行的是 `ExecStart=/usr/bin/wg-quick up wg0`，它把控制权交给 `linux.bash` 的 `cmd_up`：先 `add_if` 调用 `ip link add dev wg0 type wireguard`（若内核模块缺失则按第 93 至 96 行回退到 `wireguard-go` 用户态实现并打印警告），再依次设置私钥与 peer、地址、MTU、DNS、路由，最后执行 `PostUp` 钩子。整条链路上任何一步失败，`trap 'del_if; exit'` 都会删除接口回滚，避免留下半配置的隧道（完整 up 流程见 03-02，命令语义见 04-03）。
+
+重载链路是「不中断会话」的关键。运维修改 `/etc/wireguard/wg0.conf` 后执行 `systemctl reload wg-quick@wg0`，systemd 调用 `ExecReload`：bash 进程先执行 `wg-quick strip wg0`，后者读入配置、剔除 wg-quick 私有字段，通过一个进程替换（`<(...)`）把结果作为文件描述符喂给 `wg syncconf wg0`。`syncconf` 在内核侧对比现有 peer 集合，增量地新增、更新或删除 peer，而不触碰已建立的握手会话与会话密钥。这与 `systemctl restart wg-quick@wg0` 形成鲜明对比——restart 会先 `ExecStop`（`wg-quick down wg0` 删除接口、清空全部状态）再 `ExecStart` 重建，期间隧道中断、会话归零。因此「改 peer 用 reload，改 Address/MTU/Table 等必须由 wg-quick 处理的字段才用 restart」是一条重要经验：因为 strip 会剔除这些字段，`syncconf` 根本看不到它们。
+
+停止与关机链路体现干净回收。`systemctl stop wg-quick@wg0` 触发 `ExecStop=/usr/bin/wg-quick down wg0`，`cmd_down` 先跑 `PreDown`，若 `SaveConfig=true` 则 `save_config` 把当前接口的 Address、DNS、MTU、Table 与钩子连同 `wg showconf` 导出的密钥/peer 一起原子回写配置文件（第 255 至 289 行），然后 `del_if`：先撤销 DNS（`unset_dns`）与防火墙规则（`remove_firewall`），再删除策略路由规则（当 Table 为 `auto` 或空且存在 `0.0.0.0/0` 类 allowedips 时，清理 `ip rule` 与 `suppress_prefixlength 0` 规则，第 103 至 116 行），最后 `ip link delete dev wg0`。由于数据面在内核，接口一删，所有会话密钥、计数器、定时器随之释放，无需也无进程可杀——用 `ps` 找不到「WireGuard 进程」是正常的（原理见 06-01）。开机自停用 `systemctl disable wg-quick@wg0`，删除的是软链接，不影响当前运行；`systemctl stop` 才真正下发 `down`。
+
+动态 DNS 的辅助链路是「配置之外的补丁」。当 peer 的 `Endpoint` 是域名且对端 IP 会变（家庭宽带、云主机重建），仅靠开机解析一次不够。cron 周期调用 `reresolve-dns.sh`，它读入配置文件，对每个带 `PublicKey` 与 `Endpoint` 的 `[Peer]`，用 `wg show wg0 latest-handshakes` 取该公钥的最近握手 epoch 秒数；若握手距今超过 135 秒（说明对端可能换了地址导致握手停滞），就用 `wg set wg0 peer <公钥> endpoint <域名:端口>` 重新下发 endpoint，让 `wg` 重新解析。注意脚本比较的是「握手新旧」而非「DNS 记录是否变化」——它不做主动探测，只是周期性把配置里的 endpoint 重新 set 一遍，依赖 `wg` 每次 set 都重新解析域名。这是一种朴素但有效的自愈手段（原理见 06-11、排障见 08-03）。
+
+下面用一张图把开机启动、重载、停止三条链路以及 DNS 自愈旁路串起来。
+
+:::figure id=03-05-01 | name=wg-quick 服务单元的生命周期与重载链路 | dir=TD
+node n1 "multi-user.target<br/>开机多路复用目标" blue
+node n2 "wg-quick.target<br/>聚合目标 PartOf" teal
+node n3 "wg-quick@wg0.service<br/>oneshot 实例" purple
+node n4 "network-online.target<br/>nss-lookup.target" gray
+node n5 "wg-quick up wg0<br/>读 /etc/wireguard/wg0.conf" green
+node n6 "wg syncconf + strip<br/>重载不中断会话" amber
+node n7 "reresolve-dns cron<br/>动态 DNS 自愈" red
+edge n1 -> n2 "WantedBy"
+edge n2 -> n3 "PartOf"
+edge n4 -> n3 "After/Wants"
+edge n3 -> n5 "ExecStart"
+edge n3 -> n6 "ExecReload"
+edge n7 -> n3 "wg set endpoint"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「multi-user.target 开机多路复用目标」通过 `WantedBy` 拉起「wg-quick.target 聚合目标 PartOf」，后者以 `PartOf` 关系统辖「wg-quick@wg0.service oneshot 实例」；「network-online.target nss-lookup.target」经 `After/Wants` 排在实例之前保证解析就绪；实例的 `ExecStart` 触发「wg-quick up wg0 读 /etc/wireguard/wg0.conf」完成建链，`ExecReload` 触发「wg syncconf + strip 重载不中断会话」实现平滑更新；旁路「reresolve-dns cron 动态 DNS 自愈」通过周期性的 `wg set endpoint` 把解析变化写回实例。
+
+### 5. 配置/命令/代码实例
+
+先看模板单元本身，这是全部 systemd 集成的事实锚点。以下是 `src/systemd/wg-quick@.service` 的关键骨架（省略部分 Documentation 行）：
+
+```ini
+[Unit]
+Description=WireGuard via wg-quick(8) for %I
+Before=wg-quick.target
+After=network-online.target nss-lookup.target
+Wants=network-online.target nss-lookup.target
+PartOf=wg-quick.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/wg-quick up %i
+ExecStop=/usr/bin/wg-quick down %i
+ExecReload=/bin/bash -c 'exec /usr/bin/wg syncconf %i <(exec /usr/bin/wg-quick strip %i)'
+Environment=WG_ENDPOINT_RESOLUTION_RETRIES=infinity
+
+[Install]
+WantedBy=multi-user.target wg-quick.target
+```
+
+这段单元文件里，`%i` 是实例名占位符，`ExecReload` 用 bash 的进程替换把 strip 输出作为文件描述符传给 syncconf——这不是笔误，而是 `wg syncconf` 需要一个可读文件路径（进程替换正好提供 `/dev/fd/63` 这样的路径），从而无需生成临时文件。安装后，日常运维通过下列命令管理单条隧道：
+
+```bash
+# 首次启用：建立开机软链接并立即启动
+systemctl enable --now wg-quick@wg0
+# 修改 /etc/wireguard/wg0.conf 后平滑重载（不中断已建会话）
+systemctl reload wg-quick@wg0
+# 查看服务状态与底层接口状态
+systemctl status wg-quick@wg0 --no-pager
+wg show wg0
+# 停止并取消开机自启
+systemctl disable --now wg-quick@wg0
+# 修改单元文件后需通知 systemd 重新加载单元定义
+systemctl daemon-reload
+```
+
+下面给出 `systemctl status wg-quick@wg0` 的典型输出，用它来验证单元是否真正按预期工作。
+
+```text
+示例输出，具体格式需对照实际版本核验
+● wg-quick@wg0.service - WireGuard via wg-quick(8) for wg0
+     Loaded: loaded (/usr/lib/systemd/system/wg-quick@.service; enabled; vendor preset: enabled)
+     Active: active (exited) since Wed 2026-03-11 09:12:03 UTC; 2h 14min ago
+       Docs: man:wg-quick(8)
+             man:wg(8)
+    Process: 1241 ExecStart=/usr/bin/wg-quick up wg0 (code=exited, status=0/SUCCESS)
+   Main PID: 1241 (code=exited, status=0/SUCCESS)
+        Tasks: 0 (limit: 4915)
+       Memory: 0B
+      CGroup: /system.slice/system-wg\x2dquick.slice/wg-quick@wg0.service
+
+Mar 11 09:12:03 host systemd[1]: Starting WireGuard via wg-quick(8) for wg0...
+Mar 11 09:12:03 host wg-quick[1241]: [#] ip link add wg0 type wireguard
+Mar 11 09:12:03 host wg-quick[1241]: [#] wg setconf wg0 /dev/fd/63
+Mar 11 09:12:03 host wg-quick[1241]: [#] ip -4 address add 10.0.0.2/24 dev wg0
+Mar 11 09:12:03 host systemd[1]: Finished WireGuard via wg-quick(8) for wg0.
+```
+
+逐行判读如下。第一行 `Loaded` 行的 `/usr/lib/systemd/system/wg-quick@.service` 正是 `src/Makefile` 用 `SYSTEMDUNITDIR` 安装的位置，括号里的 `enabled` 说明 `systemctl enable` 已在 `multi-user.target` 与 `wg-quick.target` 下建立软链接；若这里显示 `disabled` 或 `masked`，隧道不会开机自启。第二行 `Active: active (exited)` 是理解 `Type=oneshot` + `RemainAfterExit=yes` 的窗口：`exited` 表示 `ExecStart` 进程（PID 1241）已经跑完退出，`active` 表示由于 `RemainAfterExit=yes`，systemd 仍把服务视为已激活——这两者同时出现恰恰是单元工作正常的标志，而不是故障；若只看到 `inactive (dead)`，说明 oneshot 跑完未被标记为保持，隧道状态无从表达。第三行 `Process: ... ExecStart=/usr/bin/wg-quick up wg0 (code=exited, status=0/SUCCESS)` 对应单元里的 `ExecStart` 指令，`%i` 已被替换为 `wg0`，`status=0/SUCCESS` 说明 `cmd_up` 全链路（含 trap 保护）顺利走完；非零退出码则意味着中途失败并已触发 `del_if` 回滚。第四行 `Docs: man:wg-quick(8) man:wg(8)` 来自单元的 `Documentation=` 指令，只是提示信息。第五行 `CGroup: /system.slice/system-wg\x2dquick.slice/...` 里的 `\x2d` 是 systemd 对连字符 `-` 的十六进制转义，说明该实例被归入 `system-wg-quick.slice` 这一按模板名自动生成的切片，多个 wg-quick 实例会共享该切片——这也是 `systemd-cgtop` 里能看到的位置。最后几行日志里 `[#] ip link add wg0 type wireguard`、`[#] wg setconf wg0 /dev/fd/63`、`[#] ip -4 address add 10.0.0.2/24 dev wg0` 是 `linux.bash` 的 `cmd()` 函数打印的（第 30 至 33 行，前缀 `[#]`），分别对应 `add_if`、`set_config`（注意它调用的是 `wg addconf`/`setconf` 经由进程替换）、`add_addr`；`/dev/fd/63` 正是进程替换产生的文件描述符，与 `ExecReload` 里 strip 的用法同源。日志末行 `Finished ...` 表示事务完成。整段输出没有任何「WireGuard 进程常驻」的迹象，再次印证数据面在内核、systemd 管的只是一次性配置任务（数据结构字段见 05-03 中 peer 状态，参数见 04-03，netlink 配置原理见 06-14，工具模块见 07-13）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把 `After` 当成强依赖。`After=network-online.target` 只规定顺序，不保证目标「成功」；真正建立弱依赖的是 `Wants=`。但即便两者齐备，`network-online.target` 的「在线」语义也取决于网络管理器是否正确实现了 `wait-online` 通知——在配置不当的机器上，它可能在地址还没拿到时就报告在线。这就是为什么单元还要配 `WG_ENDPOINT_RESOLUTION_RETRIES=infinity`：开机时若域名暂时解析不出，`wg` 会一直重试而不是直接失败退出（`src/config.c` 第 184 至 185 行把 `infinity` 解析为 `-1`）。实践中若发现开机后隧道 handshake 为空，应优先检查这两行是否生效，而不是盲目重启。
+
+第二个陷阱是用 `restart` 代替 `reload`。前文已述，restart 会走 `down`→`up`，清空所有会话；而 `ExecReload` 用 strip + syncconf 实现增量更新。更进一步，strip 会剔除 `Address`、`DNS`、`MTU`、`Table` 等 wg-quick 私有字段，所以**只有** `[Peer]` 的公钥、allowed-ips、endpoint、keepalive 这类 `wg` 原生字段的变更能通过 reload 生效；改地址或 MTU 必须 restart。把这条记牢，可以避免「我明明 reload 了，地址怎么没变」的困惑。
+
+第三个陷阱是混淆 `%i` 与实例名约束。实例名必须符合 `[a-zA-Z0-9_=+.-]{1,15}`，因为它同时被 systemd 用作单元实例名、被 wg-quick 用作接口名与配置文件名。用下划线、短横线没问题，用点号需谨慎（接口名含点在 Linux 上合法但可能触发别名语义），用空格或斜杠会直接失败。另外 `wg-quick@.service` 单元里的路径写死了 `/usr/bin/wg-quick` 与 `/bin/bash`——若发行版把工具装在 `/usr/local/bin`（自行 `make install` 且 `PREFIX=/usr/local`），单元会因找不到可执行文件而失败，此时需按实际安装路径调整单元或改用发行版打包的版本（构建安装见 02-04，需对照实际版本核验）。
+
+第四个陷阱是忽视 `SaveConfig=true` 的破坏性。`man/wg-quick.8` 第 102 至 104 行明确警告：设为 `true` 后，接口 down 时会从当前状态回写配置，任何在停机前手工编辑配置文件的改动都会被覆盖。`save_config` 的实现（第 255 至 289 行）会重建整个 `[Interface]` 段并拼接 `wg showconf` 的输出，意味着注释、字段顺序、手动排版全部丢失。它适合「用 `wg set` 临时加 peer、关机固化」的场景，不适合作为手工维护配置文件的常规手段。最佳实践是默认不开 `SaveConfig`，把配置文件的变更纳入版本控制或配置管理。
+
+第五个陷阱是把 contrib 脚本当官方组件。`reresolve-dns.sh` 用 cron 每 30 秒轮询、以 135 秒握手阈值触发重解析，这套阈值是示例值，未考虑大量 peer 时的 `wg show` 解析开销与域名滥用风险；`contrib/nat-hole-punching/`、`contrib/ncat-client-server/` 的 README 更是反复声明「绝不可用于生产」「horribly insecure」。它们只是展示 `wg` 命令行表现力的教学样例，引用时应注明「示例，需按实际环境改造」。
+
+NetworkManager 路径的注意事项单独列出：其一，上游 wireguard-tools 不含任何 NetworkManager 集成脚本，本册所述 `nmcli connection type wireguard` 等能力来自 NetworkManager 自身，字段与版本要求需对照实际版本核验；其二，NetworkManager 与 wg-quick 不要同时管理同一个接口——两者都会写地址与路由，叠加会导致规则冲突、路由表被反复改写，排障时极难定位（排障方法见 08-03）；其三，若同时启用 systemd 单元与 NetworkManager 连接，务必二选一，用 `nmcli` 管理时禁用对应 `wg-quick@` 单元，用 systemd 单元时把连接设为不自动连接。选型上，简单静态隧道用 wg-quick + systemd 单元（源码可逐行审计、行为可预测）；需要与其他连接协同、多用户桌面、图形化管理或复杂策略路由时，倾向 NetworkManager（其 WireGuard 支持从特定版本起才具备，需核验目标系统版本）。
+
+### 7. 小结与延伸阅读
+
+本篇把持久化拆成两条路径：systemd 侧，模板单元 `wg-quick@.service` 以 `Type=oneshot` + `RemainAfterExit=yes` 表达「一次性配置、长期有效」的隧道语义，靠 `After/Wants=network-online.target nss-lookup.target` 与 `Environment=WG_ENDPOINT_RESOLUTION_RETRIES=infinity` 化解启动时序风险，靠 `ExecReload` 的 `wg syncconf` + `wg-quick strip` 实现不中断会话的平滑重载，靠 `PartOf=wg-quick.target` 实现多接口聚合开关；NetworkManager 侧，上游工具树不提供集成脚本，须依赖网络管理器自身的 WireGuard 连接能力，且不得与 wg-quick 同时管理同一接口。两条路径的落点不同——前者是服务生命周期，后者是连接配置——但共同目标都是把一次性的 `wg-quick up` 变成可开机自启、可观测、可回收的稳定能力。
+
+延伸阅读建议按三条线走：想逐行核实单元行为，读 `wireguard-tools/src/systemd/wg-quick@.service` 与 `src/wg-quick/linux.bash` 的 `cmd_up`/`cmd_down`/`cmd_strip`；想理解重载为何不中断会话，读 `src/man/wg-quick.8` 关于 strip 的说明与 06 册的配置通道原理；想落地 NetworkManager，查目标系统的 NetworkManager 版本文档（本册不对其字段做源码级断言）。跨册随查按（字段见 05-03 ｜ 参数见 04-03 ｜ 原理见 06-14 ｜ 模块见 07-13）执行：peer 与 device 的逐字段去 05、wg-quick 配置参数全集去 04-03、netlink 配置与会话保持原理去 06-14、wg 与 wg-quick 的模块职责去 07-13、构建安装去 02-04、排障去 08-03。凡本篇标注「需对照实际版本核验」的 NetworkManager 字段、安装路径与 contrib 阈值，均以目标系统实际版本为准，本套资料不编造未核验的路径与取值。
+
+## 03-06 站点互联、远程接入与多 peer 部署实例
+
+### 1. 背景与动机
+
+前面几篇解决了「一条隧道怎么建、怎么开机自启」，本篇解决「一组隧道怎么组织成一个能用的网络」。实际落地时，WireGuard 几乎从不只连两个点：分支办公室要访问总部机房的子网，出差员工要从咖啡厅连回内网，云服务器要同时接纳几十台移动设备——这些都是多 peer 场景。与许多 VPN 不同，WireGuard 协议层没有「服务端/客户端」角色之分，所有参与者都是对等体（peer）；所谓中心网关、分支、远程客户端，只是配置上的差异：谁配置固定的 `ListenPort` 并暴露在公网，谁配置 `Endpoint` 主动发起连接，谁把 `AllowedIPs` 写成 `0.0.0.0/0` 接管默认路由。理解这种「角色由配置涌现」的模型，是设计多 peer 部署的第一步。
+
+上游源码为这些场景提供了直接的范式。`src/man/wg-quick.8` 的 EXAMPLES 段（第 174 至 240 行）给出了三个典型样例：一个接入公共 VPN 网关的全流量客户端（第 120 至 148 行，`AllowedIPs = 0.0.0.0/0`、`DNS`、`Endpoint` 一应俱全），一个带「kill-switch」的防泄露配置（第 150 至 166 行，用 `PostUp`/`PreDown` 加 iptables 规则），以及一个面向服务器的多 peer 配置（第 174 至 211 行，两个 `Address` 行、`SaveConfig = true`、三个 `[Peer]` 各自带不同的 `AllowedIPs`）。这三个样例恰好对应本篇要讲的三大场景：远程接入、安全加固、中心辐射式多 peer。`contrib/` 目录则提供了更具体的小例子：`contrib/synergy/` 用一条 `/32` 点对点隧道把 Synergy 键鼠共享流量加密（服务器/客户端脚本各建一个名为 `synergy` 的接口，监听 29184 端口），`contrib/nat-hole-punching/` 演示两个都在 NAT 后的 peer 如何借一台公网服务器打洞互通，`contrib/ncat-client-server/client-quick.sh` 展示客户端如何从演示服务器自动获取地址与配置，`contrib/extract-keys/` 则用于把会话密钥导出给抓包分析器。这些例子多数被 README 明确标注「不可生产使用」，本篇引用它们只为说明机制，绝不照搬其密钥与参数。
+
+场景设计的另一个现实约束是「地址由谁分配」。WireGuard 协议不分配 IP，每个隧道地址都要写进配置的 `Address`（由 wg-quick 处理）或用 `ip address` 手工加。这意味着多 peer 部署必须自己规划地址空间、保证每个 peer 的隧道地址唯一、并让 `AllowedIPs` 与地址规划严格对应——这是配置管理的工作量，也是多 peer 部署最容易出错的地方。本篇会用一份中心网关配置串讲地址规划、AllowedIPs 分配、NAT 穿越与路由协同，并给出可核验的源码依据；对源码未覆盖的运维细节（如路由协议、动态地址分配控制面）只给方法骨架并标注版本核验。
+
+### 2. 核心概念
+
+多 peer 部署的核心概念可以压缩为四组：**角色涌现、AllowedIPs 双重语义、拓扑形态、NAT 穿越**。
+
+角色涌现。协议里只有 peer，但配置让它们分化出三种角色。中心网关配置固定的 `ListenPort`（通常是 51820，对应 `WGDEVICE_A_LISTEN_PORT`），有公网可达地址，不配 `Endpoint`（或只给客户端配），被动等待连接；分支站点有固定公网 IP 时也可不配 `Endpoint`，否则配域名并依赖 keepalive 维持映射；远程客户端通常没有 `ListenPort`，只配 `Endpoint` 指向网关，并设 `PersistentKeepalive` 周期性发送保活包。注意 `PersistentKeepalive` 与 `Endpoint` 的关系：前者对应 uapi 的 `WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL`，它让本端定期向对端发包，从而在 NAT 上维持端口映射——这对「NAT 后的 peer 作为被连接方」或「双方都在 NAT 后」至关重要（原理见 06-11）。`contrib/synergy/synergy-client.sh` 里客户端配置 `endpoint 10.10.10.100:29184` 但没有 keepalive，是因为两端在同一局域网、无需穿 NAT；一旦客户端移到外网，就必须补上 keepalive 并把 endpoint 改成域名。
+
+AllowedIPs 双重语义是理解多 peer 路由的钥匙。对某个 peer 配置 `AllowedIPs = 10.1.0.0/24` 同时表达两件事：其一，**出站**——发往 10.1.0.0/24 的包查 allowedips trie 后走这个 peer；其二，**入站**——只接受来自这个 peer 且源地址落在 10.1.0.0/24 的包，源地址不符的会被丢弃（`receive.c` 在解密后校验源地址，原理见 06-07）。这两重语义直接推导出两条铁律：**同一接口内不同 peer 的 AllowedIPs 不得重叠**（否则 trie 查找与源校验产生歧义，流量可能走错 peer 或被丢弃），**AllowedIPs 必须与对端实际使用的源地址范围一致**（写窄了丢包，写宽了有 spoof 风险）。在多 peer 中心网关上，每个远程客户端通常只分配一个 `/32` 隧道地址，对应一条 `AllowedIPs = 10.0.0.x/32`；分支站点则分配整个网段，如 `AllowedIPs = 10.1.0.0/24, 10.1.1.0/24`。`man/wg-quick.8` 的服务器样例正是这种写法：三个 peer 分别用 `10.192.122.3/32, 10.192.124.1/24`、`10.192.122.4/32, 192.168.0.0/16`、`10.10.10.230/32`——可见「隧道地址 /32 + 身后网段」的组合是标准模式（字段见 05-03、05-04）。
+
+拓扑形态分三类。点对点（两台机器）最简单，双方互配对方公钥与 `/32`，`contrib/synergy/` 就是这种。中心辐射（hub-and-spoke）是远程接入与分支互联的主流：中心网关配多个 peer，每个分支/客户端只与中心通信，分支之间经中心转发；它的优点是密钥与 AllowedIPs 规划集中、客户端配置极简，缺点是中心成为单点与瓶颈。全互联（full mesh）是每台机器与其他所有机器直接建隧道，优点是路径最优、无中心瓶颈，缺点是 peer 数量按 N×(N-1) 增长，配置管理复杂度高； WireGuard 本身支持全互联（allowedips 负责选路），但密钥分发与配置生成通常需要外部控制面。本篇的实例以中心辐射为主，因为它最能体现「多 peer」的配置要点，且能自然退化出点对点与全互联的特例。
+
+NAT 穿越有两个支撑点。其一是 endpoint 漫游：WireGuard 以「最近收到合法数据包的源地址」更新 peer 的 endpoint，因此移动客户端换网络后，只要能发出一个合法包（keepalive 正好充当这个角色），网关就能自动学到新地址——这就是漫游接入的原理。其二是保活：在 NAT 后的 peer 配置 `PersistentKeepalive = 25`（秒量级，示例值需在目标网络核验），维持 NAT 映射不老化。两个都在 NAT 后的极端场景需要打洞，`contrib/nat-hole-punching/README` 演示了借公网服务器交换地址信息的思路，但明确声明是概念验证、不可生产。对生产环境，更稳妥的做法是让至少一端有公网可达地址，或用中继/控制面辅助（控制面选型超出本册范围，需对照实际方案核验）。
+
+### 3. 关键数据结构与源码位置
+
+本篇不展开结构字段（逐字段见 05-03、05-04），只把多 peer 部署依赖的 uapi 属性、配置字段与示例脚本的真实位置列清楚。
+
+uapi 头 `include/uapi/linux/wireguard.h` 的 peer 属性枚举 `wgpeer_attribute` 定义了多 peer 配置的全部可用字段（第 44 至 59 行）：`WGPEER_A_PUBLIC_KEY`（对端公钥，peer 身份）、`WGPEER_A_PRESHARED_KEY`（可选预共享密钥）、`WGPEER_A_ENDPOINT`（对端地址端口）、`WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL`（保活间隔）、`WGPEER_A_LAST_HANDSHAKE_TIME`（最近握手时间）、`WGPEER_A_RX_BYTES` / `WGPEER_A_TX_BYTES`（累计收发字节）、`WGPEER_A_ALLOWEDIPS`（允许的 IP 列表）、`WGPEER_A_PROTOCOL_VERSION`。device 层 `wgdevice_attribute`（第 29 至 42 行）提供 `WGDEVICE_A_LISTEN_PORT`、`WGDEVICE_A_FWMARK` 等，allowedip 层 `wgallowedip_attribute`（第 61 行起）提供 `WGALLOWEDIP_A_IPADDR` 与 `WGALLOWEDIP_A_CIDR_MASK`。命令仍是 `WG_CMD_GET_DEVICE` 与 `WG_CMD_SET_DEVICE` 两条（第 73 至 78 行）。这些常量与标志的完整定义属于 04 册（04-05、04-06），此处只点名与部署相关的字段（字段见 05-03、05-04）。
+
+配置字段的权威语义在 `src/man/wg-quick.8`：`Address` 可多次指定（第 75 至 76 行，对应中心网关的两个地址行）、`DNS` 经 `resolvconf` 配置（第 78 至 84 行）、`Table` 控制路由表（第 90 至 93 行，`off`/`auto`/自定义值）、`PreUp`/`PostUp`/`PreDown`/`PostDown` 钩子（第 95 至 100 行，`%i` 展开为接口名）。多 peer 服务器样例在第 174 至 211 行，kill-switch 样例在第 150 至 166 行，基于 `Table = 1234` 的策略路由样例在第 216 至 240 行（这些字段的完整参数见 04-03，命令语义见 04-02）。
+
+`contrib/` 的示例脚本提供了可运行的部署骨架。`contrib/synergy/synergy-server.sh` 与 `synergy-client.sh` 各建一个 `synergy` 接口：`ip link add dev synergy type wireguard`，服务器端 `ip address add 10.193.125.38/32 peer 10.193.125.39/32 dev synergy`、监听 29184、`wg set ... peer ... allowed-ips 10.193.125.39/32`，客户端对称配置并加 `endpoint 10.10.10.100:29184`（脚本第 7 至 17 行）。注意它们用 `ip address add ... peer ...` 的写法建立 `/32` 点对点链路，这是不经过 wg-quick 时手工配置隧道地址的典型方式。`contrib/nat-hole-punching/README` 第 11 至 33 行给出打洞步骤：公网服务器 1.2.3.4 接受 UDP:49918，两个 NAT 后的客户端各自 `ip link add wg0 type wireguard`、`ip addr add 10.200.200.1 peer 10.200.200.2 dev wg0`、`wg set wg0 private-key ... peer ... allowed-ips ...`，再运行 `./client 1.2.3.4 wg0` 交换地址信息后互 ping。`contrib/ncat-client-server/client-quick.sh` 第 15 至 40 行演示自动配置：生成私钥、把公钥发给演示服务器、解析返回的 `status:pubkey:port:ip`、写 `/etc/wireguard/demo.conf`（`Address = $internal_ip/24`、`AllowedIPs = 0.0.0.0/0`）。`contrib/extract-keys/README` 说明如何从内核导出 ChaCha20-Poly1305 会话密钥供抓包器使用——这是排障与协议学习工具，与部署配置本身无关，但可以帮助理解「会话密钥由握手动态生成」这一事实（原理见 06-03）。
+
+下表收拢本篇引用的实例与位置。
+
+| 部署场景 | 真实源码/文档位置 | 本册处理方式 |
+|---|---|---|
+| 多 peer 服务器样例 | `wireguard-tools/src/man/wg-quick.8`（第 174 至 211 行） | 逐字段讲规划，参数见 04-03 |
+| 全流量客户端样例 | `wireguard-tools/src/man/wg-quick.8`（第 120 至 148 行） | 讲默认路由与 DNS |
+| kill-switch 样例 | `wireguard-tools/src/man/wg-quick.8`（第 150 至 166 行） | 讲防泄露思路 |
+| 点对点隧道实例 | `wireguard-tools/contrib/synergy/synergy-*.sh` | 点名命令，标注示例 |
+| NAT 打洞实例 | `wireguard-tools/contrib/nat-hole-punching/README` | 讲机制，标注不可生产 |
+| 会话密钥导出 | `wireguard-tools/contrib/extract-keys/README` | 点名，用于排障学习 |
+| peer 属性常量 | `wireguard-linux-src/include/uapi/linux/wireguard.h` | 只点名，全集见 04-05 |
+
+### 4. 关键流程与调用链
+
+站点互联的出站链路从分支 LAN 上的一台主机开始。主机发往总部子网 10.0.0.0/24 的包，经分支网关的路由被送到本地 wg0 接口，进入 `ndo_start_xmit` 与 `send.c`：内核查 allowedips trie，按目标地址找到对应中心网关的 peer，取该 peer 的会话密钥，把包封装为 WireGuard 数据消息并用 UDP 发往中心网关的 `Endpoint`。中心网关的 UDP socket（`socket.c`）收到后，经 `receive.c` 验重放、解密、并用 allowedips 校验源地址是否在配置的 10.x 网段内，通过后注入内核协议栈，再按路由转发到总部 LAN。回程对称：中心网关查 trie 找到「源地址属于该分支网段的 peer」，把回包发回。这段链路说明一个常被忽略的前提——**站点互联要求两端网关各自开启 IP 转发并配好回程路由**，否则包到了 wg0 却出不了 LAN，或回包找不到隧道（转发与路由配置属运维细节，需对照实际系统核验；trie 原理见 06-07、收发链见 06-05、06-06）。
+
+远程接入的全流量链路多了一步默认路由接管。客户端配置 `AllowedIPs = 0.0.0.0/0` 后，`wg-quick up` 的 `cmd_up` 在用 `wg show allowed-ips` 收集路由时发现 `*/0`，就调用 `add_default`（`linux.bash` 第 213 至 249 行）：先 `get_fwmark` 取或分配一个 fwmark（没有则用 51820 起递增找空闲表号），执行 `wg set INTERFACE fwmark <mark>`；然后添加 `ip rule add not fwmark <mark> table <table>` 与 `ip rule add table main suppress_prefixlength 0`，并把默认路由写进该表。这套「策略路由 + fwmark」的组合让「除 WireGuard 自身封装包以外的所有流量」走隧道表，从而避免把封装用的 UDP 包又送回隧道形成环路（环路防护机理见 06-07）。同时 `set_dns` 经 `resolvconf -a` 下发 DNS（第 154 至 166 行）。客户端的 `PostUp` 还可加 kill-switch：`man/wg-quick.8` 第 154 至 156 行用 iptables 在 OUTPUT 链拒绝「非隧道出口、非本地、未打 fwmark」的包，防止隧道断开时明文泄露——手册特意注明 PF_PACKET 套接字（多数 DHCP 客户端使用）会绕过 Netfilter，因此 DHCP 流量仍被放行。
+
+中心网关接入多 peer 的链路体现 trie 的分流作用。网关的 wg0 上挂着 N 个 peer，每个 peer 有不同的 `AllowedIPs`（客户端 `/32`、分支网段）。收到一个解密后的包，`receive.c` 用包的源地址查 allowedips：命中哪个 peer 的 allowedip，就确认该包确实来自那个 peer（源校验），并据此更新该 peer 的 endpoint（漫游）；若源地址不在任何 peer 的允许范围内，包被丢弃。发送方向同理，目标地址决定走哪个 peer。这就是为什么 AllowedIPs 必须无重叠——重叠会让 trie 查找结果不确定，进而导致源校验与转发错乱。对运维而言，这条链路还给出一个排障抓手：`wg show wg0` 的每个 peer 段里 `latest handshake` 与 `transfer` 两行，分别对应 `WGPEER_A_LAST_HANDSHAKE_TIME` 与 `WGPEER_A_RX_BYTES`/`WGPEER_A_TX_BYTES`，能快速判断「哪个 peer 活、哪个 peer 哑」（排障见 08-03、08-04）。
+
+多 peer 配置变更链路与上一篇衔接。中心网关新增或删除 peer 时，不必整接口重建：按 03-05 的 `systemctl reload wg-quick@wg0`，单元里的 `ExecReload` 用 `wg-quick strip` 生成裸配置再交给 `wg syncconf`，增量更新 peer 集合且不打断既有会话（命令语义见 04-02）。地址规划变更（如给分支增加网段）同样只改对应 peer 的 AllowedIPs 即可经 reload 生效，因为 AllowedIPs 属于 `wg` 原生字段、strip 不会剔除它。只有当需要改 `Address`、`Table` 这类 wg-quick 私有字段时才 restart。把「日常增删 peer 用 reload」写进运维手册，是多 peer 部署稳定运行的关键。
+
+下图给出中心辐射式多 peer 部署的拓扑，把上述链路的节点关系可视化。
+
+:::figure id=03-06-01 | name=中心辐射式多 peer 部署拓扑 | dir=TD
+node n1 "中心网关 wg0<br/>ListenPort 51820" teal
+node n2 "分支站点 A<br/>LAN 10.1.0.0/24" blue
+node n3 "分支站点 B<br/>LAN 10.2.0.0/24" blue
+node n4 "远程接入客户端<br/>AllowedIPs 0.0.0.0/0" green
+node n5 "移动客户端<br/>NAT 后 + keepalive" amber
+node n6 "allowedips trie<br/>按源地址区分 peer" purple
+node n7 "策略路由 fwmark<br/>全流量隧道" gray
+node n8 "PSK + 唯一密钥对<br/>每个 peer 独立" red
+edge n1 -> n6 "下发 allowedips"
+edge n2 -> n1 "站点互联隧道"
+edge n3 -> n1 "站点互联隧道"
+edge n4 -> n1 "全流量隧道"
+edge n5 -> n1 "漫游接入"
+edge n6 -> n8 "身份校验"
+edge n4 -> n7 "默认路由接管"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「中心网关 wg0 ListenPort 51820」是整个拓扑的汇聚点，它向「allowedips trie 按源地址区分 peer」下发各 peer 的允许网段；「分支站点 A LAN 10.1.0.0/24」与「分支站点 B LAN 10.2.0.0/24」各以「站点互联隧道」接入中心，「远程接入客户端 AllowedIPs 0.0.0.0/0」以「全流量隧道」接入并经「策略路由 fwmark 全流量隧道」接管默认路由，「移动客户端 NAT 后 + keepalive」以「漫游接入」方式加入；trie 在转发时结合「PSK + 唯一密钥对 每个 peer 独立」完成身份校验，保证多 peer 之间身份与路由互不混淆。
+
+### 5. 配置/命令/代码实例
+
+先给中心网关的多 peer 配置，它把地址规划、AllowedIPs 分配与 NAT 穿越集中体现。以下写法参考 `man/wg-quick.8` 第 174 至 211 行的服务器样例，并补入保活字段：
+
+```ini
+[Interface]
+Address = 10.0.0.1/24
+Address = 10.10.0.1/16
+SaveConfig = true
+PrivateKey = <中心网关私钥，仅本机持有>
+ListenPort = 51820
+
+[Peer]
+# 分支站点 A：隧道地址 + 身后 LAN
+PublicKey = <站点A公钥>
+PresharedKey = <与站点A协商的PSK>
+AllowedIPs = 10.0.0.2/32, 10.1.0.0/24
+
+[Peer]
+# 分支站点 B
+PublicKey = <站点B公钥>
+AllowedIPs = 10.0.0.3/32, 10.2.0.0/24
+
+[Peer]
+# 远程接入客户端：NAT 后，需保活
+PublicKey = <客户端公钥>
+AllowedIPs = 10.0.0.4/32
+```
+
+对应的分支站点 A 与远程客户端用 `wg-quick` 风格的客户端配置。分支站点 A 只把回中心及总部网段交给隧道；远程客户端则接管全部流量并配 DNS：
+
+```ini
+# 分支站点 A 的 /etc/wireguard/wg0.conf
+[Interface]
+Address = 10.0.0.2/24
+PrivateKey = <站点A私钥>
+PostUp = ip route add 10.0.0.0/24 dev %i
+PostDown = ip route del 10.0.0.0/24 dev %i
+
+[Peer]
+PublicKey = <中心网关公钥>
+PresharedKey = <与中心协商的PSK>
+Endpoint = vpn.example.com:51820
+AllowedIPs = 10.0.0.1/32, 10.10.0.0/16
+PersistentKeepalive = 25
+
+# 远程客户端的 /etc/wireguard/wg0.conf（全流量）
+[Interface]
+Address = 10.0.0.4/32
+DNS = 10.0.0.1
+PrivateKey = <客户端私钥>
+
+[Peer]
+PublicKey = <中心网关公钥>
+Endpoint = vpn.example.com:51820
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+```
+
+部署完成后，用 `wg show wg0` 检查中心网关上三个 peer 是否都建立了会话：
+
+```bash
+wg show wg0
+```
+
+```text
+示例输出，具体格式需对照实际版本核验
+interface: wg0
+  public key: <中心网关公钥>
+  private key: (hidden)
+  listening port: 51820
+  fwmark: 0xca6c
+peer: <站点A公钥>
+  preshared key: (hidden)
+  endpoint: 203.0.113.9:51820
+  allowed ips: 10.0.0.2/32, 10.1.0.0/24
+  latest handshake: 47 seconds ago
+  transfer: 1.82 MiB received, 3.41 MiB sent
+peer: <站点B公钥>
+  endpoint: 198.51.100.7:51820
+  allowed ips: 10.0.0.3/32, 10.2.0.0/24
+  latest handshake: 2 minutes ago
+  transfer: 512 KiB received, 900 KiB sent
+peer: <客户端公钥>
+  endpoint: 192.0.2.88:39122
+  allowed ips: 10.0.0.4/32
+  latest handshake: 19 seconds ago
+  transfer: 8.20 KiB received, 42.6 KiB sent
+```
+
+逐行判读如下。开头 `interface: wg0` 段来自 device 属性，确认查询命中的是中心网关的 wg0；`listening port: 51820` 对应 `WGDEVICE_A_LISTEN_PORT`，与配置的 `ListenPort` 一致，说明网关被动监听正常；`fwmark: 0xca6c` 是十六进制的 fwmark（十进制 51820 恰为 0xca6c），来自 `WGDEVICE_A_FWMARK`，说明该接口曾因全流量客户端被 wg-quick 打上fwmark——即使网关自身不接管默认路由，这个字段也会因配置里存在 `0.0.0.0/0` 的 peer 而被 `add_default` 设置，用于策略路由环路防护。第一个 `peer:` 段的 `preshared key: (hidden)` 对应 `WGPEER_A_PRESHARED_KEY`，工具刻意不回显，确认该 peer 配了 PSK；`endpoint: 203.0.113.9:51820` 对应 `WGPEER_A_ENDPOINT`，站点 A 有固定公网 IP，所以端点稳定，这里端口恰为 51820 是因为它同时 listens；`allowed ips` 一行同时列出 `/32` 隧道地址与 `/24` 身后网段，与网关配置逐字对应，是 trie 查找与源校验的依据；`latest handshake: 47 seconds ago` 对应 `WGPEER_A_LAST_HANDSHAKE_TIME`，47 秒说明会话活跃，若该值持续增大或为空，应优先检查对端公钥、端点与时钟（握手时序见 06-03）；`transfer` 对应 `WGPEER_A_RX_BYTES`/`WGPEER_A_TX_BYTES`，MiB 级流量说明站点互联已在承载业务。第二、第三个 `peer:` 段结构相同，重点看差异：站点 B 的 `latest handshake: 2 minutes ago` 比站点 A 旧，但只要小于 keepalive 与握手超时阈值就仍属正常；客户端的 `endpoint: 192.0.2.88:39122` 端口是随机高位端口且非 51820，正是 NAT 后设备的典型特征——它能出现在网关的 show 输出里，归功于客户端 `PersistentKeepalive = 25` 维持了 NAT 映射并让网关学到这个「漫游」地址；若去掉 keepalive，这个端点会在 NAT 映射老化后失效，隧道静默中断。三个 peer 的 `allowed ips` 彼此不重叠（10.0.0.2/32、10.0.0.3/32、10.0.0.4/32 及各自网段），这正是多 peer 路由不冲突的前提（字段见 05-03、05-04，原理见 06-07，模块见 07-13）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是 AllowedIPs 重叠或写错。多 peer 网关上，若两个 peer 的 AllowedIPs 都包含某地址，trie 查找结果不确定，且入站源校验可能把包归给错误的 peer；若把客户端的 `/32` 误写成 `/24`，会让本应走别的客户端的流量被它接收。铁律是：先做地址规划表，保证每个 peer 的隧道地址唯一、AllowedIPs 互斥，再写配置。`contrib/synergy/` 用 `/32 peer` 的点对点写法保证两端地址严格分离，值得借鉴（示例脚本需按实际环境改造）。
+
+第二个陷阱是密钥复用与 PSK 滥用。每个 peer 必须有独立的密钥对；`PresharedKey` 是可选叠加在 Noise_IK 之上的对称密钥，用于抗量子顾虑或额外身份绑定，但它是**每 peer 一条**的，不是全接口共用。把同一个 PSK 配给所有 peer 或不小心把某 peer 的私钥写进网关配置，都会破坏「密钥即身份」的安全模型。私钥只应留在本地：`man/wg-quick.8` 的样例里 `PrivateKey` 出现在接口段、`PublicKey` 出现在 peer 段，正是这个边界的体现（密钥流程见 03-03）。`contrib/nat-hole-punching/`、`contrib/ncat-client-server/` 的 README 反复声明其密钥是硬编码演示值、绝不可生产，务必区分教学样例与真实密钥管理。
+
+第三个陷阱是 NAT 场景漏配 keepalive。移动客户端或任何位于 NAT 后的被连接方，若没有 `PersistentKeepalive`，NAT 映射老化后网关就找不到它，表现是「握手时间越来越旧、transfer 不再增长」。典型间隔是 25 秒量级（示例值，需按 NAT 设备的 UDP 映射超时核验）。但 keepalive 不是越多越好——它产生持续背景流量，对电池与计量网络不友好；中心网关有公网 IP 且只被动等待时不需要给每个客户端配 keepalive。另一个相关陷阱是端点域名：动态 DNS 的客户端要配合 03-05 讲的 `reresolve-dns.sh` 或 systemd 单元的无限重试，否则域名解析变化后隧道无法自愈。
+
+第四个陷阱是全流量隧道的 DNS 泄露与路由环路。客户端 `AllowedIPs = 0.0.0.0/0` 时，必须同时配 `DNS` 指向隧道内可达的解析器，否则 DNS 查询仍走物理网卡导致泄露；wg-quick 通过 `resolvconf -a` 下发 DNS（第 154 至 166 行），但某些发行版用 systemd-resolved 或 NetworkManager 管理 DNS，此时 `resolvconf` 可能不可用或不生效，需改用 `PostUp` 调用相应工具（需对照实际版本核验）。`man/wg-quick.8` 的 kill-switch 样例用 iptables 拒绝未加密外泄包，但其自身注明 DHCP 的 PF_PACKET 流量会绕过 Netfilter，所以「完全零泄露」不能只靠这几条规则。路由环路方面，wg-quick 的 `add_default` 已用 fwmark + `suppress_prefixlength 0` 做了环路防护，不要手工删除这些 `ip rule`，否则封装包会被送回隧道形成环路。
+
+第五个陷阱是忽视 MTU 与转发。隧道封装增加约 60 至 80 字节开销，`wg-quick` 的 `set_mtu_up`（第 126 至 143 行）会根据 endpoint 路径 MTU 自动把接口 MTU 设为「路径 MTU 减 80」（无路径 MTU 时用 1500 减 80），这是经验值；若链路经过 PPPoE 等小 MTU 环境，可能仍需手工 `MSS clamp` 或调 MTU（调优见 08-02）。站点互联还要求两端网关开启 IP 转发并正确配置回程路由，否则会出现「隧道通、LAN 不通」的半通状态——这类问题的定位方法是逐跳检查 `ip route get`、`wg show` 的 transfer 与对端 tcpdump（排障决策树见 08-03，案例见 08-04）。
+
+第六个陷阱是把 contrib 演示当生产方案。`contrib/nat-hole-punching/` 与 `contrib/ncat-client-server/` 的密钥硬编码、依赖演示服务器，README 用「never」「horribly insecure」等措辞警告；它们只适合学习 `wg` 命令行的表现力，不能承载真实业务。生产环境的打洞、动态地址分配与密钥分发，应引入成熟的控制面或多方中继方案（具体选型需对照实际方案核验）。
+
+最佳实践可归纳为六步：先画地址规划表，确定每个 peer 的隧道地址与身后网段，保证 AllowedIPs 互斥；再为每个 peer 独立生成密钥对，按需叠加 PSK；中心网关配固定 `ListenPort` 并开放 UDP 防火墙，分支与客户端配 `Endpoint` 域名；NAT 后或移动 peer 配 `PersistentKeepalive` 并配合 DNS 自愈脚本；全流量客户端同时配 `DNS` 与 kill-switch，防止泄露；最后把 peer 增删纳入 `systemctl reload` 流程（见 03-05），用 `wg show` 的 handshake 与 transfer 两行做日常健康巡检（上线检查单见 08-06）。
+
+### 7. 小结与延伸阅读
+
+本篇以中心辐射式拓扑为主线，串讲了三类多 peer 部署：站点互联靠「隧道地址 `/32` + 身后网段」的 AllowedIPs 组合与两端网关的转发/回程路由，把分支 LAN 接到总部；远程接入靠 `AllowedIPs = 0.0.0.0/0` 加 wg-quick 的 fwmark 策略路由接管默认流量，并配 DNS 与 kill-switch 防泄露；多 peer 网关靠 allowedips trie 按源地址区分各 peer，配合每 peer 独立密钥、可选 PSK 与 NAT 后保活，实现集中、可扩展的接入。贯穿三者的两个核心约束是「AllowedIPs 互斥且与源地址一致」与「角色由配置涌现而非协议定义」，前者决定路由是否正确，后者决定如何规划网关、分支与客户端的差异配置。
+
+延伸阅读建议按三条线走：想核对配置字段，读 `wireguard-tools/src/man/wg-quick.8` 的 EXAMPLES 段与 04-03 的参数全集；想理解 trie 为何要求 AllowedIPs 无重叠，读 06-07 与 05-04；想看可运行的最小实例，读 `contrib/synergy/` 与 `contrib/nat-hole-punching/` 的脚本与 README（注意其不可生产的声明）。跨册随查按（字段见 05-03 ｜ 参数见 04-03 ｜ 原理见 06-07 ｜ 模块见 07-13）执行：peer 与 allowedip 的逐字段去 05-03、05-04，wg-quick 与 wg 的参数全集去 04-02、04-03，netlink 属性常量去 04-05、04-06，trie 与收发原理去 06-05、06-06、06-07，工具模块职责去 07-13，服务重载见 03-05，密钥分发见 03-03，排障与上线检查见 08-03、08-06。凡本篇涉及 IP 转发、DNS 后端、MTU 调优与第三方控制面的细节，均需对照目标系统与所选方案的实际版本核验，本套资料不编造未核验的路径与取值。

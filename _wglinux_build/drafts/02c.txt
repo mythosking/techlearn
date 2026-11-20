@@ -1,0 +1,174 @@
+## 02-05 调试构建、动态调试、selftest 与静态检查
+
+### 1. 背景与动机
+
+前面几篇解决的是「怎么把模块和工具编出来、装上去」，本篇解决一个更容易被忽略的问题：怎么确认你手里这份构建是可信的。WireGuard Linux 有一个很特别的性质——它是内核模块，没有独立进程，加载成功不等于工作正常。一个配置错误、宏没打开、或者某处数据结构操作越界的构建，完全可能安静地 `insmod` 成功、安静地丢弃所有报文，既不崩溃也不报错。用户态程序出问题时通常有段错误、有栈回溯、有 core dump 可查；内核模块出问题时的默认表现是「什么都没发生」，这恰恰是最难排查的状态。因此，上游在源码里预埋了多道「主动把问题喊出来」的机关，理解并正确使用它们，是从「会编译」走向「敢上线」的关键一步。
+
+这些机关按介入时机可以分成四类。第一类是**编译期开关**：`drivers/net/Kconfig` 中的 `config WIREGUARD_DEBUG` 决定是否定义 `DEBUG` 宏，它把自检代码和详细日志一起编进模块。第二类是**加载期自检**：`drivers/net/wireguard/main.c` 的 `wg_mod_init` 在 `DEBUG` 下调用三个 `*_selftest()` 函数，任何一项失败就拒绝加载。第三类是**运行期日志**：散布在 `device.c`、`peer.c`、`timers.c`、`cookie.c` 中的 `pr_debug` 与 `net_dbg_ratelimited`，在调试构建下把握手、建链、销毁、限速等事件打印到内核日志。第四类是**用户态的离线检查**：`wireguard-tools/src/fuzz/` 下的六个 libFuzzer 目标用 ASan 兜住解析器的内存错误，`wireguard-tools/src/Makefile` 的 `check` 目标用 `scan-build` 跑 Clang 静态分析。四类手段作用在软件的不同阶段，合起来构成一条从「编码正确」到「解析正确」的验证链。
+
+为什么要专门写一节讲这些？因为这几类手段在同一个仓库里用了**三个同名但语义完全不同的 `DEBUG`**，新手极易混淆：内核 Kconfig 的 `WIREGUARD_DEBUG`、内核 Makefile 里的 `-DDEBUG`、以及用户态工具 Makefile 里的 `DEBUG=yes`（它只加 `-g`，不启用任何自检）。把它们当成一回事，轻则以为打开了调试却什么日志都没有，重则把带大量日志和额外校验的调试构建当成生产构建部署。本篇的动机就是把这三者的边界、每一项检查的入口与覆盖对象、以及它们各自能证明什么和不能证明什么，逐一钉死在源码路径上。
+
+口径声明：本篇所有结论以本快照 `_wglinux_build/upstream_src/wireguard-linux-src/` 与 `_wglinux_build/upstream_src/wireguard-tools/` 为准。一个必须提前说明的事实是——三个自检函数的**声明**与**调用点**都清晰可见，它们的**实现**通过 `#include "selftest/*.c"` 从 `selftest/` 目录注入，而该目录在本快照中为空。因此本篇只描述可核验的调用契约与覆盖意图，不臆造 selftest 内部代码；凡涉及自测具体实现细节，均标注「需对照实际版本核验」（构建主路径见 02-03，参数全集见 04-01）。
+
+### 2. 核心概念
+
+把本篇 jargon 压缩成一句话：**一个开关、三项自检、两类日志、六个 fuzz 目标，外加一个静态分析目标**。
+
+「一个开关」指 `config WIREGUARD_DEBUG`。它在 `drivers/net/Kconfig:92` 定义为 bool，提示语是「Debugging checks and verbose messages」，依赖 `WIREGUARD`，帮助文本明确写着会「write log messages for handshake and other events」「perform some extra validation checks and unit tests at various points」，最后一句是「Say N here unless you know what you're doing」。这句话本身就是上游给出的最佳实践：调试构建是开发用的，不是默认选项。「一个开关」还包含一个落地动作——`drivers/net/wireguard/Makefile:2` 的 `ccflags-$(CONFIG_WIREGUARD_DEBUG) += -DDEBUG`，把 Kconfig 的选择翻译成编译器的 `-DDEBUG` 宏；同一文件第 1 行的 `ccflags-y := -D'pr_fmt(fmt)=KBUILD_MODNAME ": " fmt'` 则给所有 `pr_*` 日志统一加上模块名前缀，所以你在 dmesg 里看到的行首是 `wireguard:`。
+
+「三项自检」指 `wg_allowedips_selftest()`、`wg_packet_counter_selftest()`、`wg_ratelimiter_selftest()`。三者都返回 `bool`，且约定 **true 表示通过**——这一点从 `main.c` 的 `if (!fn1() || !fn2() || !fn3()) goto err_peer` 可以反推出来：取反后为真意味着失败。它们的声明分别藏在三个头文件的 `#ifdef DEBUG` 里：`allowedips.h:56-57`、`queueing.h:202-203`、`ratelimiter.h:15-16`。这种「声明在头文件、实现靠 include 注入」的写法很有讲究：实现文件 `allowedips.c:424` 末尾有 `#include "selftest/allowedips.c"`，`ratelimiter.c:223` 末尾有 `#include "selftest/ratelimiter.c"`，`receive.c:333` 末尾有 `#include "selftest/counter.c"`。selftest 代码因此能直接访问所在文件的 `static` 内部函数（比如 `add()`、`lookup()`、`wg_ratelimiter_allow()`），这是独立编译的测试文件做不到的。换言之，这些自检是**白盒测试**，不是外部黑盒工具。
+
+「两类日志」指编译期受控的 `pr_debug` / `net_dbg_ratelimited`，以及断言式的 `WARN_ON(IS_ENABLED(DEBUG) && ...)`。前者如 `peer.c:63` 的 `Peer %llu created`、`timers.c:47` 的握手重试放弃、`cookie.c:230` 的 cookie 解密失败提示，属于「发生了什么」的叙事；后者如 `allowedips.c:45` 在 trie 栈深度达到 `MAX_ALLOWEDIPS_DEPTH`（该常量在 `allowedips.c:9` 定义为 129）时告警、`noise.c:351` 的握手路径校验，属于「不该发生却发生了」的告警。按内核通用语义，定义 `DEBUG` 时 `pr_debug` 会被无条件编入，未定义时通常依赖 `CONFIG_DYNAMIC_DEBUG` 在运行期控制（具体以目标内核配置为准）。
+
+「六个 fuzz 目标」指 `wireguard-tools/src/fuzz/Makefile:5` 的 `FUZZERS := config uapi stringlist cmd set setconf`。它们都围绕 libFuzzer 的 `LLVMFuzzerTestOneInput` 入口工作，用 `fmemopen`、`hacked_fopen`、宏替换 `stat` 等手法，把原本要访问真实文件或 netlink 的用户态代码，改造成接受内存输入的纯函数。「一个静态分析目标」则是工具主 Makefile 第 107–108 行的 `check: clean` 规则，调用 `scan-build ... $(MAKE) wg`，用 Clang Static Analyzer 在编译过程中做路径敏感的检查。一个是「喂随机数据看会不会崩」，一个是「不运行只读代码找可疑路径」，两者互补而不互相替代。
+
+### 3. 关键数据结构与源码位置
+
+作为构建与检查主题，本节只点名被自检覆盖的关键结构与可核验的源码位置，字段逐项解释交给 05 册，不在这里展开字段表。
+
+限速自检围绕 `ratelimiter.c:26-32` 的 `struct ratelimiter_entry` 展开：它把 `last_time_ns`、`tokens`、`ip`、`net`、自旋锁 `lock`、哈希节点 `hash` 与 RCU 回调 `rcu` 组织在一起（字段见 05-08）。同文件 `34-39` 行的匿名枚举给出令牌桶口径：`PACKETS_PER_SECOND = 20`、`PACKETS_BURSTABLE = 5`、`PACKET_COST = NSEC_PER_SEC / PACKETS_PER_SECOND`、`TOKEN_MAX = PACKET_COST * PACKETS_BURSTABLE`。`wg_ratelimiter_allow()`（`ratelimiter.c:84`）用 `hsiphash_2u32(net_word, ip, &key)` 给 IPv4 选桶，IPv6 则取源地址前 64 位用 `hsiphash_3u32` 选桶，注释明确说「ratelimit the whole /64」；表大小 `table_size` 在 `wg_ratelimiter_init()` 中按 `totalram_pages()` 计算，内存大于 1 GiB 时取 8192，`max_entries = table_size * 8`（原理见 06-10）。自检之所以能覆盖这些，是因为它和被测函数在同一个编译单元里。
+
+allowedips 自检围绕 trie 节点与 `MAX_ALLOWEDIPS_DEPTH = 129` 的栈深度上限（`allowedips.c:9`），通过 include 注入后可直接调用 `static` 的 `add()`、`remove()`、`find_node()`、`lookup()`、`common_bits()` 等内部函数，验证 IPv4/IPv6 前缀的插入、精确匹配、最长前缀查找与删除回收（结构见 05-04，原理见 06-07）。packet counter 自检的实现由 `receive.c:333` 注入，覆盖 `queueing.h` 定义的包状态枚举在收发路径上的计数一致性（字段见 05-06）。cookie 本身在本快照中**没有**独立的 selftest include；`cookie.c` 提供的是 `wg_cookie_validate_packet()` 的四级判定状态机（`INVALID_MAC`、`VALID_MAC_BUT_NO_COOKIE`、`VALID_MAC_WITH_COOKIE_BUT_RATELIMITED`、`VALID_MAC_WITH_COOKIE`，见 `cookie.c:119-154`），其中限速那一环调用 `wg_ratelimiter_allow()`，因而被 ratelimiter 自检间接覆盖（cookie 原理见 06-09，模块见 07-09）。
+
+下表把三项加载期自检的声明、注入点与覆盖对象收拢成速查。注意「实现位置」列写的是注入点而非完整实现文件，因为 `selftest/` 目录在本快照为空，需对照实际版本核验。
+
+| 自检函数 | 声明位置（#ifdef DEBUG 内） | 实现注入点 | 覆盖对象 |
+|---|---|---|---|
+| `wg_allowedips_selftest` | `allowedips.h:56-57` | `allowedips.c:424` include `selftest/allowedips.c` | v4/v6 trie 的插入、查找、最长前缀与删除 |
+| `wg_packet_counter_selftest` | `queueing.h:202-203` | `receive.c:333` include `selftest/counter.c` | 包状态计数在收发路径的一致性 |
+| `wg_ratelimiter_selftest` | `ratelimiter.h:15-16` | `ratelimiter.c:223` include `selftest/ratelimiter.c` | 令牌桶速率、突发与哈希表条目管理 |
+
+用户态六个 fuzz 目标的入口与打桩手法汇总如下，均可在 `wireguard-tools/src/fuzz/` 逐个核对。
+
+| 目标 | 被测入口 | 关键打桩手法 |
+|---|---|---|
+| `config` | `config_read_line` / `config_read_cmd` | 首字节最高位区分文件模式与命令模式 |
+| `uapi` | `userspace_get_device` | 宏替换 `stat`，用 `union hackiface` 伪造接口文件 |
+| `stringlist` | `string_list_add` | 插入后逐条断言缓冲区内容与输入一致 |
+| `cmd` | `wg_main` | 重写 `main` 为 `wg_main`，重定向三个标准流到 `/dev/null` |
+| `set` | `set_main` | `hacked_fopen` 把路径本身当内存文件打开 |
+| `setconf` | `setconf_main` | 把结构体指针编码成十进制字符串经 `argv[2]` 传入 |
+
+### 4. 关键流程与调用链
+
+编译链路只有三跳。`drivers/net/Kconfig:92` 的 `WIREGUARD_DEBUG` 被选中后，Kbuild 把 `CONFIG_WIREGUARD_DEBUG=y` 传给 Makefile；`drivers/net/wireguard/Makefile:2` 据此向 `ccflags` 追加 `-DDEBUG`；于是所有 `#ifdef DEBUG` 块参与编译。注意第 3–16 行的目标列表里并没有单独的 selftest 目标，因为自检代码是被 `#include` 拼进 `allowedips.o`、`ratelimiter.o`、`receive.o` 的——这也是为什么 `selftest/*.c` 不需要也不应该独立编译。
+
+加载链路在 `main.c:20-61`。`wg_mod_init` 先 `wg_allowedips_slab_init()`，失败跳 `err_allowedips`；随后进入 `DEBUG` 块，把 `ret` 预设为 `-ENOTRECOVERABLE`，再依次取反调用三项自检，任一返回 false 就用短路或提前失败，统一跳到 `err_peer`。这里有两个容易看漏的细节：其一，`err_peer` 标签下只有 `wg_allowedips_slab_uninit()`，因为此刻 peer、device、netlink 都还没初始化，回滚范围必须精确；其二，`wg_noise_init()`（第 34 行）在自检之后、且没有检查返回值，说明它在此快照的接口是 void。自检全过之后才依次 `wg_peer_init()`、`wg_device_init()`、`wg_genetlink_init()`，每层失败各跳自己的 `err_*` 标签；全部成功后打印两行 `pr_info`（第 48–49 行），模块进入可用状态。卸载函数 `wg_mod_exit` 按 `wg_genetlink_uninit` → `wg_device_uninit` → `wg_peer_uninit` → `wg_allowedips_slab_uninit` 逆序回收。用户态 `wg` 的配置链路走 netlink（`WG_CMD_SET_DEVICE` / `WG_CMD_GET_DEVICE`），与自检链路完全独立——自检发生在加载瞬间，不受后续配置影响（netlink 原理见 06-14）。
+
+用户态检查链路分两支。`fuzz/Makefile` 用 `clang` 加 `-fsanitize=fuzzer -fsanitize=address -std=gnu11 -idirafter ../uapi -D_GNU_SOURCE` 编译六个目标，每个目标把被测源文件直接 `#include` 进来以复用内部函数；libFuzzer 生成变长字节流，各 harness 将其切成参数、配置行或接口名，调用真实解析入口，ASan 负责捕获越界与释放后使用。主 Makefile 的 `check` 目标则先 `clean` 再 `scan-build --html-title=wireguard-tools -maxloop 100 --view --keep-going $(MAKE) wg`，在不运行程序的前提下扫描 `wg` 的编译过程。三条路径与两类检查的关系见图 02-05-01。
+
+:::figure id=02-05-01 | name=WireGuard 调试构建、加载期自检与用户态检查的三条路径 | dir=TD
+node n1 "CONFIG_WIREGUARD_DEBUG<br/>Kconfig 布尔开关" blue
+node n2 "wireguard/Makefile<br/>追加 -DDEBUG" teal
+node n3 "main.c wg_mod_init<br/>#ifdef DEBUG 分支" purple
+node n4 "wg_allowedips_selftest<br/>trie 插入查找删除" green
+node n5 "wg_packet_counter_selftest<br/>包状态计数器" green
+node n6 "wg_ratelimiter_selftest<br/>令牌桶与哈希表" green
+node n7 "pr_debug 系列<br/>动态调试输出" amber
+node n8 "fuzz 六个目标<br/>libFuzzer 加 ASan" red
+node n9 "scan-build<br/>Clang 静态分析" gray
+node n10 "wireguard-tools/src<br/>用户态解析面" blue
+edge n1 -> n2 "选中后"
+edge n2 -> n3 "定义宏"
+edge n3 -> n4 "加载时调用"
+edge n3 -> n5 "加载时调用"
+edge n3 -> n6 "加载时调用"
+edge n2 -> n7 "打印生效"
+edge n10 -> n8 "fuzz Makefile"
+edge n10 -> n9 "check 目标"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「CONFIG_WIREGUARD_DEBUG Kconfig 布尔开关」被选中后，经「wireguard/Makefile 追加 -DDEBUG」向下游传导；一路进入「main.c wg_mod_init #ifdef DEBUG 分支」，加载时依次调用「wg_allowedips_selftest trie 插入查找删除」「wg_packet_counter_selftest 包状态计数器」「wg_ratelimiter_selftest 令牌桶与哈希表」三项自检，同时让「pr_debug 系列 动态调试输出」生效；另一路在用户态，由「wireguard-tools/src 用户态解析面」分别经 fuzz Makefile 驱动「fuzz 六个目标 libFuzzer 加 ASan」、经 check 目标驱动「scan-build Clang 静态分析」。
+
+### 5. 配置/命令/代码实例
+
+先看自检的调用契约，这是 `main.c:24-38` 的原样片段（省略空行）：
+
+```c
+ret = wg_allowedips_slab_init();
+if (ret < 0)
+    goto err_allowedips;
+
+#ifdef DEBUG
+ret = -ENOTRECOVERABLE;
+if (!wg_allowedips_selftest() || !wg_packet_counter_selftest() ||
+    !wg_ratelimiter_selftest())
+    goto err_peer;
+#endif
+wg_noise_init();
+
+ret = wg_peer_init();
+if (ret < 0)
+    goto err_peer;
+```
+
+再看两条Makefile 片段，左边是内核驱动、右边是用户态工具，对比最直观：
+
+```makefile
+# drivers/net/wireguard/Makefile（节选）
+ccflags-y := -D'pr_fmt(fmt)=KBUILD_MODNAME ": " fmt'
+ccflags-$(CONFIG_WIREGUARD_DEBUG) += -DDEBUG
+obj-$(CONFIG_WIREGUARD) := wireguard.o
+
+# wireguard-tools/src/Makefile（节选）
+CFLAGS ?= -O3
+CFLAGS += -std=gnu99 -D_GNU_SOURCE
+CFLAGS += -Wall -Wextra
+ifeq ($(DEBUG),yes)
+CFLAGS += -g
+endif
+check: clean
+	scan-build --html-title=wireguard-tools -maxloop 100 --view --keep-going $(MAKE) wg
+```
+
+注意用户态的 `DEBUG=yes` 只追加 `-g`（调试符号），既不打开 `-DDEBUG`，也不影响自检；这与内核侧的 `WIREGUARD_DEBUG=y` 是两件不同的事。下面给出一次带自检的调试构建与加载命令，然后用内核日志验证三项自检是否真的跑过：
+
+```bash
+# 以模块方式构建并显式打开内核调试开关
+make -C /lib/modules/$(uname -r)/build M=$PWD/drivers/net/wireguard \
+     CONFIG_WIREGUARD=m CONFIG_WIREGUARD_DEBUG=y modules
+sudo insmod drivers/net/wireguard/wireguard.ko
+# 查看加载日志与自检相关信息
+sudo dmesg | grep -i wireguard
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+示例输出，具体格式需对照实际版本核验
+[ 4120.881233] wireguard: allowedips self-test passed
+[ 4120.882014] wireguard: packet counter self-test passed
+[ 4120.883107] wireguard: ratelimiter self-test passed
+[ 4120.884522] wireguard: WireGuard 1.0.0 loaded. See www.wireguard.com for information.
+[ 4120.884537] wireguard: Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+```
+
+逐行判读如下。首行是本篇按规范加的免责声明，不是真实 dmesg 内容，提醒你下面的时间戳与自检打印串均需在目标版本核对——本快照的 `selftest/` 目录为空，因此「self-test passed」这类字符串只能作为示意，不能当作上游的逐字输出。第二行到第四行对应 `main.c:30-31` 的三项自检：它们按 `wg_allowedips_selftest()` → `wg_packet_counter_selftest()` → `wg_ratelimiter_selftest()` 的短路顺序出现，任一项返回 false，`goto err_peer` 就会执行 `wg_allowedips_slab_uninit()` 并以 `-ENOTRECOVERABLE` 结束加载，所以「三行都出现」是自检全过的直接证据；如果只看到前两行就停住，问题基本可以锁定在 ratelimiter 自检覆盖的令牌桶或哈希表逻辑上（原理见 06-10）。行首的 `wireguard:` 前缀来自 `Makefile:1` 的 `pr_fmt` 定义，用 `KBUILD_MODNAME` 统一标注模块名；如果日志里没有这个前缀，说明你看的不是本模块的输出，或目标版本改用了别的 `pr_fmt`。第五、六行是 `main.c:48-49` 那两行 `pr_info` 的逐字内容，版本串 `1.0.0` 来自 `version.h`，与用户态工具的 `1.0.20260223` 无关，看到这两行才说明 `wg_genetlink_init()` 也成功了、模块真正进入可用状态（版本基准见 01-04）。反过来，若 dmesg 里完全没有 `pr_debug` 事件（如 `Peer %llu created`），不一定是自检没跑，更可能是 `pr_debug` 未被编译进或未通过 dynamic debug 打开（日志机制见 06-01）。清理时 `sudo rmmod wireguard` 触发 `wg_mod_exit` 的逆序回收（模块职责见 07-01）。
+
+用户态的 fuzz 与静态检查同样可以一键复现：
+
+```bash
+# 六个 fuzz 目标，需 clang 与 libFuzzer/ASan 运行库
+make -C wireguard-tools/src/fuzz clean all
+./wireguard-tools/src/fuzz/config -runs=10000 corpus_config
+# 静态分析（扫描 wg 的编译过程，不运行程序）
+make -C wireguard-tools/src check
+```
+
+`config` harness 的手法是六个目标里最易读的一个：它把输入首字节的最高位当作模式位（`file = !!(data[0] >> 7)`），余下字节复制成以 NUL 结尾的字符串；文件模式下逐行喂给 `config_read_line()`，遇到返回 false 就重新 `config_read_init()` 模拟新配置段，命令模式下按空格切词后调用 `config_read_cmd()`，最后统一 `free_wgdevice()`。这种「一个字节决定解析路径」的设计让 fuzzer 用极少输入就能同时覆盖两条分支。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是混淆三个 `DEBUG`。内核 `CONFIG_WIREGUARD_DEBUG=y` 打开三项自检与详细日志；`wireguard-tools/src/Makefile` 的 `make DEBUG=yes` 只追加 `-g`；`fuzz/Makefile` 里的 `-D'RUNSTATEDIR="/var/empty"'` 与 `-D'main(a,b)=wg_main(a,b)'`（见第 23 行）则是给 harness 改写入口与路径，与调试开关无关。给工具加 `DEBUG=yes` 不会让内核模块多打印一行，给内核加 `WIREGUARD_DEBUG=y` 也不会让 `wg` 多输出任何东西。
+
+第二个陷阱是把本快照中为空的 `selftest/` 目录当成「上游没有自检」。恰恰相反，三个声明、三处调用、三处 `#include` 都真实存在，只是实现文件未随本快照分发；据此断言「自检不存在」或「自检内部如何如何」都不可靠，正确做法是标注需对照实际版本核验。第三个陷阱是认为调试构建可以上线。`WIREGUARD_DEBUG` 的帮助文本自己就写着「Say N here unless you know what you're doing」：额外校验、详细日志与 `WARN_ON` 会带来开销与噪声，生产构建应关闭（部署口径见 03-01，调优见 08-02）。
+
+第四个陷阱是夸大 fuzz 的证明范围。六个 harness 都通过宏替换把外部依赖换成了内存桩，例如 `uapi.c:9` 用 `#define stat(a, b) ({ return hacked_userspace_interface_file(iface); 0; })` 劫持 `stat`，`setconf.c:38-42` 把 `struct hacked_pointers` 指针编码成十进制字符串再 `strtoul` 还原。这意味着 fuzz 验证的是**纯解析逻辑在受控桩下的内存安全**，不验证真实 socket、真实 netlink 与内核侧行为；ASan 没报错不等于协议实现正确。第五个陷阱是把静态分析当成正确性证明：`check` 目标只扫描编译期路径，不发现运行期竞态与协议逻辑错误；`--view` 还会尝试打开浏览器展示报告，在无图形环境需留意。第六个陷阱是把「自检通过」等同于「隧道可用」：自检只在模块加载瞬间跑一次，之后密钥、endpoint、路由任何一项配错都会让隧道静默不通，仍须用 `wg show` 的 `latest handshake` 与 `transfer` 判断（排障见 08-03）。
+
+最佳实践按此顺序执行：先在构建阶段用 `CONFIG_WIREGUARD_DEBUG=y` 做一次开发验证，确认三行自检与两行 `pr_info` 齐全；再把 fuzz 与 `make check` 纳入持续集成，专门守住用户态解析面；随后用不带调试开关的干净构建做功能与性能验证（基准方法见 08-01）；最后才按生产配置关闭调试并上线（上线 checklist 见 08-06）。顺序不能颠倒——先在调试构建上跑通解析与加载，再切回生产构建，可以把「自检失败」与「生产配置差异」两类问题分开定位；反过来先上生产再补调试，往往要在客户现场重新编模块。
+
+### 7. 小结与延伸阅读
+
+本篇把 WireGuard Linux 的检查体系拆成四层：编译期由 `Kconfig:92` 的 `WIREGUARD_DEBUG` 经 `Makefile:2` 转成 `-DDEBUG`；加载期由 `main.c:28-33` 在 `DEBUG` 下短路调用 allowedips、packet counter、ratelimiter 三项白盒自检，失败以 `-ENOTRECOVERABLE` 拒绝加载；运行期靠 `pr_debug` 与 `WARN_ON(IS_ENABLED(DEBUG) && ...)` 输出事件与异常；用户态靠 `fuzz/` 六个 libFuzzer 目标和 `make check` 的 `scan-build` 守住解析器。三处自检声明都在头文件 `#ifdef DEBUG` 内、三处实现都靠 `#include "selftest/*.c"` 注入本快照为空的目录，这是本篇最需要对照实际版本核验的地方。
+
+延伸阅读按三条线走：构建开关与命令全集回到 02 册前四篇，结构字段去 `05 册`（限速与队列见 05-08、trie 见 05-04），机制与调用链去 06 册（握手与包处理见 06-01、cookie 见 06-09、限速见 06-10），目录级模块职责去 07 册（网络模块见 07-09、时限与限速见 07-10）。跨册随查按（字段见 05-08 ｜ 参数见 02-02 ｜ 原理见 06-10 ｜ 模块见 07-10）执行：结构体逐字段去 05、构建参数去 02、令牌桶与哈希表原理去 06、限速模块职责去 07、运维与排障去 08。凡本篇标注「需对照实际版本核验」的自检实现细节与日志字符串，均以 `_wglinux_build/upstream_src/` 下对应文件为准，本套资料不编造未核验的路径与取值。

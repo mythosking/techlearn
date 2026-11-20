@@ -1,0 +1,369 @@
+## 05-07 socket、endpoint 与 cookie 结构字段详解
+
+### 1. 背景与动机
+
+WireGuard Linux 的数据面要完成两件看似无关却紧密耦合的事：把封装后的 UDP 包准确送达对端，以及把未经授权的握手洪泛挡在协议栈之外。前者依赖 `endpoint` 结构与 UDP socket，后者依赖 cookie 质询机制。本篇把这三组结构放在一篇里讲，是因为它们在源码中彼此紧邻、相互调用：`endpoint` 定义在 `peer.h`，却几乎全部由 `socket.c` 的收发函数读写；`cookie` 与 `cookie_checker` 定义在 `cookie.h`，其验证过程又会调用握手限速判定（原理见 06-10）；而 socket 的创建、替换与端口记录则散落在 `device.h` 与 `socket.c` 两个文件。把这三组结构集中在一篇，读者可以先建立"地址如何表示、包如何收发、攻击如何被挡"的整体图景，再逐字段深入。
+
+作为 05 册的字段权威源，本篇坚持一个原则：所有字段名、类型、数组长度一律逐字取自 `_wglinux_build/upstream_src/wireguard-linux-src/drivers/net/wireguard/` 下的真实源码，不凭记忆补全，也不给字节偏移。需要特别说明的是，`cookie` 相关数组的长度由 `messages.h` 的枚举常量决定，例如 `COOKIE_LEN = 16`、`NOISE_HASH_LEN = BLAKE2S_HASH_SIZE`、`NOISE_SYMMETRIC_KEY_LEN = CHACHA20POLY1305_KEY_SIZE`；这些常量本身属于 04 册的参数权威范围，本篇只引用其值以说明字段宽度，完整常量清单见 04-06。落到具体内核版本时，字段集合可能变化，一切以本快照源码为准，需对照实际版本核验。
+
+为什么把 endpoint 与 socket 绑在一起讲？因为 endpoint 是"对端是谁"的静态描述，socket 是"用什么通道发"的动态句柄，二者在发送路径上必须一致：一个 v4 的 endpoint 必须交给 v4 的 socket 发送，否则 `send4` 与 `send6` 的地址族判断就会失配。源码用 `peer->endpoint.addr.sa_family` 做分支，正是把这份一致性约束写进了代码。为什么把 cookie 也放进来？因为 cookie 的本质是"给尚未建立会话的握手包一个廉价的合法性证明"，它作用于 socket 收到包之后、握手状态机之前，是数据面入口的第一道门。三组结构串起来，恰好是"收包—判断—发送"的一条完整链路。
+
+### 2. 核心概念
+
+理解本篇的三组结构，抓住"两个 union、两把锁、四态判定"即可。
+
+两个 union，指 `endpoint` 内部的两个匿名联合。第一个联合包含 `addr`、`addr4`、`addr6` 三个成员，分别对应通用套接字地址、IPv4 套接字地址、IPv6 套接字地址；由于 `struct sockaddr_inet` 被注释为"足够容纳两种地址族"，访问 `addr.sa_family` 就能在不预先知道地址族的情况下读出族类型，再据此选择读 `addr4` 还是 `addr6`。第二个联合包含 `src4` 与 `src_if4` 组成的匿名结构、以及 `src6`，分别对应 IPv4 的源地址加入口接口、以及 IPv6 的源地址。两个 union 叠加的设计目的，是在一个紧凑结构里同时容纳 v4/v6 的地址与源绑定信息，避免为两个地址族各准备一份完整字段。读这类 union 结构时，必须先判 `sa_family` 再取成员，这是最重要的使用约定。
+
+两把锁，指 `cookie_checker.secret_lock` 与 `cookie.lock`，两者类型都是 `struct rw_semaphore`（读写信号量），但保护对象不同。`secret_lock` 是全局 cookie 检查器（挂在 `wg_device.cookie_checker` 上）的保护锁，守护 `secret` 与 `secret_birthdate` 这两个每两分钟轮换一次的秘密；`cookie.lock` 是每个 peer 的 `latest_cookie` 的保护锁，守护该 peer 最近一次收到的 cookie 与 mac1 状态。注意它们与 endpoint 的保护锁 `endpoint_lock`（`rwlock_t`）类型不同：前者是睡眠锁，可在持有它时做较重的计算；后者是自旋读写锁，要求临界区短小，故源码在 `wg_socket_send_skb_to_peer` 中用 `read_lock_bh` 包住整个发送流程，且临界区内不做睡眠操作。分清这三把锁各自保护哪些字段，是读懂并发安全的关键。
+
+四态判定，指 `enum cookie_mac_state` 的四个取值，它们描述一个握包包在 cookie 验证链上走到哪一步：`INVALID_MAC` 表示 mac1 校验失败，直接丢弃；`VALID_MAC_BUT_NO_COOKIE` 表示 mac1 正确但 mac2 为零（对端尚未拿到 cookie）；`VALID_MAC_WITH_COOKIE_BUT_RATELIMITED` 表示 mac1 与 mac2 都正确但握手限速未通过；`VALID_MAC_WITH_COOKIE` 表示全部通过。这四态构成一条逐步收紧的判定阶梯，源码 `wg_cookie_validate_packet` 用连续的 `goto out` 实现"在哪一步失败就停在哪一格"，最终返回值决定收包路径是继续处理、发送 cookie 质询、还是静默丢弃。
+
+还有一个贯穿三组结构的概念是"源地址绑定"。endpoint 里的 `src4`/`src_if4`/`src6` 记录的不是对端地址，而是"我们发给对端时应当使用的源地址"。当一台主机有多个出口地址时，回包必须从对端当初收到请求的那个地址发出，否则对端会因源地址不符而丢弃。`wg_socket_endpoint_from_skb` 从入站包提取 `ip_hdr(skb)->daddr` 填入 `src4`、提取 `skb->skb_iif` 填入 `src_if4`，正是为了记住这个源；发送时 `send4` 又把它写进 `flowi4.saddr`。理解这层因果，就明白为什么源地址字段会和目的地址字段并列放在同一个 union 结构里。
+
+### 3. 关键数据结构与源码位置
+
+本节逐字段列出三组结构，全部取自 `peer.h`、`cookie.h`、`device.h` 的真实定义。为避免本册跨篇重复，socket 相关的设备级字段只讲其在收发中的角色，socket 收发的完整机制见 06-12，getname/接口语义见 07-09。
+
+先给 `endpoint` 字段表（定义于 `peer.h` 的 `struct endpoint`）：
+
+| 字段名 | 类型 | 职责 | 注意事项 |
+|---|---|---|---|
+| `addr` | `struct sockaddr_inet` | 通用地址视图，读 `sa_family` | 匿名 union 成员，与 addr4/addr6 重叠 |
+| `addr4` | `struct sockaddr_in` | IPv4 地址与端口 | 存对端 IPv4 目的地址与端口 |
+| `addr6` | `struct sockaddr_in6` | IPv6 地址、端口、scope | `sin6_scope_id` 用作流 id |
+| `src4` | `struct in_addr` | IPv4 源地址绑定 | 与 src_if4 同属一匿名结构 |
+| `src_if4` | `int` | IPv4 入口接口索引 | 语义近似 addr6 的 scope_id |
+| `src6` | `struct in6_addr` | IPv6 源地址绑定 | 与 src4/src_if4 同属第二 union |
+
+`addr` 是理解整个结构的钥匙。源码注释写明 `struct sockaddr_inet` 是"Large enough for both address families"，意思是它的尺寸足以容纳任意地址族的地址结构。因此 `endpoint_eq` 比较函数第一步总是读 `a->addr.sa_family`，确认双方同为 AF_INET 或同为 AF_INET6，才继续比较 `addr4` 或 `addr6` 的具体字段；如果两个 endpoint 的 `sa_family` 都是零（即都未初始化），`endpoint_eq` 也认为它们相等——这个分支用 `unlikely` 标注，说明是罕见情形。`addr4.sin_port` 与 `addr6.sin6_port` 在网络字节序下保存，由 `wg_socket_endpoint_from_skb` 直接取自 `udp_hdr(skb)->source`，再由 `send4`/`send6` 原样填入 `flowi4.fl4_dport` 与 `flowi6.fl6_dport`。
+
+第二个 union 里的 `src4` 与 `src_if4` 被包在一个匿名结构里，源码注释说 `src_if4` "Essentially the same as addr6->scope_id"。这句话点破了设计意图：IPv4 靠接口索引选源，IPv6 靠 scope id 选源，二者在各自地址族里扮演相同角色。正因为语义对等，它们才能和 `src6` 共用一个 union——同一时刻只会用到其中一种。需要留意 `wg_socket_clear_peer_endpoint_src` 的写法：它执行 `memset(&peer->endpoint.src6, 0, sizeof(peer->endpoint.src6))`。由于 `src6` 是第二个 union 中尺寸最大的成员，清掉它等于把整个 union 归零，顺带清掉 `src4` 与 `src_if4`；这是一种依赖 union 布局的紧凑写法，移植时不能改成只清某一成员。
+
+接着给 `cookie_checker` 字段表（定义于 `cookie.h`，实例挂在 `wg_device.cookie_checker`）：
+
+| 字段名 | 类型 | 职责 | 注意事项 |
+|---|---|---|---|
+| `secret` | `u8[NOISE_HASH_LEN]` | 生成 cookie 的随机秘密 | 每 COOKIE_SECRET_MAX_AGE 秒轮换 |
+| `cookie_encryption_key` | `u8[NOISE_SYMMETRIC_KEY_LEN]` | 加密 cookie 消息的密钥 | 由静态公钥与标签预计算 |
+| `message_mac1_key` | `u8[NOISE_SYMMETRIC_KEY_LEN]` | 计算 mac1 的密钥 | 由静态公钥与标签预计算 |
+| `secret_birthdate` | `u64` | secret 的出生时间戳 | 纳秒级 boottime，判过期 |
+| `secret_lock` | `struct rw_semaphore` | 保护 secret 与出生时间 | 写锁轮换、读锁计算 |
+| `device` | `struct wg_device *` | 指回所属设备 | 用于取 netdev 与静态身份 |
+
+`cookie_checker` 的三个密钥数组各有分工。`secret` 是纯粹的随机秘密，由 `wg_cookie_checker_init` 通过 `get_random_bytes(checker->secret, NOISE_HASH_LEN)` 初始化，并被 `make_cookie` 用作带密钥 BLAKE2s 的密钥，对源地址与 UDP 源端口做哈希生成 cookie。另外两个密钥 `cookie_encryption_key` 与 `message_mac1_key` 不是随机的，而是由本接口的静态公钥经 `precompute_key` 派生：前者用标签 `"cookie--"`，后者用标签 `"mac1----"`，两者都经过 BLAKE2s 压缩。`wg_cookie_checker_precompute_device_keys` 要求调用者持有 `static_identity` 的锁，若无静态身份则把两个密钥清零——这一点在配置私钥变更时必须重新预计算，否则 mac1 校验会用旧密钥。
+
+`secret_birthdate` 由 `ktime_get_coarse_boottime_ns` 取粗粒度启动时间，单位纳秒。`make_cookie` 每次调用都先用 `wg_birthdate_has_expired(checker->secret_birthdate, COOKIE_SECRET_MAX_AGE)` 判断是否过期；`COOKIE_SECRET_MAX_AGE = 2 * 60` 即一百二十秒。若过期，则先 `down_write` 拿写锁，重新记录出生时间并刷新 `secret`，再 `up_write`；随后 `down_read` 拿读锁完成哈希，`up_read` 释放。这种"写锁短暂轮换、读锁覆盖计算"的模式，保证多个 CPU 同时收到握手包时不会各自刷新秘密，也不会读到刷新到一半的秘密。
+
+再给 `cookie` 字段表（定义于 `cookie.h`，作为 `wg_peer.latest_cookie` 内嵌）：
+
+| 字段名 | 类型 | 职责 | 注意事项 |
+|---|---|---|---|
+| `birthdate` | `u64` | 本 peer cookie 的出生时间 | 判是否超过有效窗口 |
+| `is_valid` | `bool` | 该 cookie 是否有效 | 解密成功才置真 |
+| `cookie` | `u8[COOKIE_LEN]` | 收到的 cookie 值 | 长度十六字节 |
+| `have_sent_mac1` | `bool` | 是否已发出含 mac1 的包 | 消费 cookie 前必须为真 |
+| `last_mac1_sent` | `u8[COOKIE_LEN]` | 最近一次发出的 mac1 | 作为解密 cookie 的 nonce |
+| `cookie_decryption_key` | `u8[NOISE_SYMMETRIC_KEY_LEN]` | 解密 cookie 的密钥 | 由对端静态公钥派生 |
+| `message_mac1_key` | `u8[NOISE_SYMMETRIC_KEY_LEN]` | 生成 mac1 的密钥 | 由对端静态公钥派生 |
+| `lock` | `struct rw_semaphore` | 保护本 cookie 全部字段 | 写锁改状态、读锁计算 |
+
+`cookie` 与 `cookie_checker` 虽然字段相似，方向却相反：`cookie_checker` 站在"服务端"角度生成 cookie 并验证对端发来的 mac1/mac2；`cookie` 站在"客户端"角度保存自己收到的 cookie，并在后续握手包里附上 mac2。这种对称关系在字段命名上一目了然：检查器侧是 `cookie_encryption_key`（加密），peer 侧是 `cookie_decryption_key`（解密）；检查器侧是 `message_mac1_key`（算 mac1 校验），peer 侧同名 `message_mac1_key`（算 mac1 发出）。`wg_cookie_checker_precompute_peer_keys` 负责用对端静态公钥 `peer->handshake.remote_static` 派生 peer 侧的两个密钥，与设备侧用 `static_identity.static_public` 派生形成镜像。
+
+`have_sent_mac1` 与 `last_mac1_sent` 是一对默契字段。`wg_cookie_add_mac_to_packet` 在写锁内计算 mac1、把它拷进 `last_mac1_sent`、并把 `have_sent_mac1` 置真；随后 `wg_cookie_message_consume` 在收到 cookie 响应包时，先读锁检查 `have_sent_mac1` 是否为真，若为假则直接放弃，因为"从没发过 mac1"却收到 cookie 响应是不合逻辑的。解密时 `last_mac1_sent` 被当作 XChaCha20Poly1305 的附加认证数据或 nonce 参与运算，这正是"cookie 绑定了当初那次握手请求"的体现——攻击者无法把一个旧 cookie 重放到一次新的、mac1 不同的请求上。解密成功后，写锁内更新 `cookie`、`birthdate`、`is_valid`，并把 `have_sent_mac1` 清回假，等待下一轮。
+
+最后给 socket 相关字段表（`device.h` 的 `wg_device` 与 `peer.h` 的 `wg_peer` 中相关成员）：
+
+| 字段名 | 类型 | 所在结构 | 职责 |
+|---|---|---|---|
+| `sock4` | `struct sock __rcu *` | `wg_device` | IPv4 UDP socket，RCU 保护 |
+| `sock6` | `struct sock __rcu *` | `wg_device` | IPv6 UDP socket，RCU 保护 |
+| `creating_net` | `struct net __rcu *` | `wg_device` | 创建接口时的网络命名空间 |
+| `incoming_port` | `u16` | `wg_device` | 当前 UDP 监听端口 |
+| `socket_update_lock` | `struct mutex` | `wg_device` | 串行化 socket 更新 |
+| `endpoint` | `struct endpoint` | `wg_peer` | 对端地址与源绑定 |
+| `endpoint_lock` | `rwlock_t` | `wg_peer` | 保护 endpoint 与 src 字段 |
+| `endpoint_cache` | `struct dst_cache` | `wg_peer` | 缓存目的路由项 |
+
+`sock4` 与 `sock6` 都带 `__rcu` 标记，读路径必须用 `rcu_dereference_bh` 并处于 RCU 读侧临界区；`socket.c` 的 `send4`/`send6` 正是用 `rcu_read_lock_bh` 加 `rcu_dereference_bh(wg->sock4)` 的组合读取。写路径 `wg_socket_reinit` 则相反：先 `mutex_lock(&wg->socket_update_lock)`，再用 `rcu_dereference_protected` 取出旧 socket（断言持锁），用 `rcu_assign_pointer` 发布新 socket，接着 `synchronize_net()` 等待所有读者离开旧版本，最后 `sock_free` 释放旧 socket。`incoming_port` 在发布 v4 socket 后由 `ntohs(inet_sk(new4)->inet_sport)` 更新——当配置端口为零时，内核会分配临时端口，这行代码记录的就是内核最终选定的端口。`creating_net` 在 `wg_socket_init` 里通过 `rcu_dereference(wg->creating_net)` 读取并用 `maybe_get_net` 取引用，保证 socket 建在接口所属的命名空间。
+
+### 4. 关键流程与调用链
+
+socket 初始化走 `wg_socket_init`：它先读 `creating_net` 取命名空间引用，然后构造 `udp_port_cfg`。IPv4 配置 `family = AF_INET`、`local_ip.s_addr = htonl(INADDR_ANY)`、`local_udp_port = htons(port)`、`use_udp_checksums = true`；IPv6 配置 `family = AF_INET6`、`local_ip6 = IN6ADDR_ANY_INIT`、收发光校验和均开启、`ipv6_v6only = true`。接着 `udp_sock_create` 建 socket、`set_sock_opts` 设置 `sk_allocation = GFP_ATOMIC`、`sk_sndbuf = INT_MAX` 并 `sk_set_memalloc`，再用 `setup_udp_tunnel_sock` 把 `sk_user_data` 设为 `wg`、`encap_type` 设为 1、`encap_rcv` 设为 `wg_receive`。若 v6 启用且 IPv4 已分配端口，则让 v6 socket 复用同一端口；若遇 `-EADDRINUSE` 且请求端口为零，最多重试一百次。最后调用 `wg_socket_reinit` 原子替换 `sock4`/`sock6`。
+
+endpoint 的学习走接收路径：`wg_socket_endpoint_from_skb` 把入站包的源地址与源端口写入 `addr4`/`addr6`，把目的地址写入 `src4`/`src6`，把入接口写入 `src_if4` 或 `sin6_scope_id`；随后 `wg_socket_set_peer_endpoint` 先无锁调用 `endpoint_eq` 做快速判断，若地址没变就直接返回，变了才 `write_lock_bh` 更新对应字段并 `dst_cache_reset` 清掉旧路由缓存。发送路径 `wg_socket_send_skb_to_peer` 则 `read_lock_bh(&peer->endpoint_lock)`，按 `sa_family` 分派 `send4`/`send6`：前者用 `endpoint->src4.s_addr`、`addr4.sin_addr.s_addr`、`addr4.sin_port` 填 `flowi4`，后者用 `src6`、`addr6.sin6_addr`、`addr6.sin6_port`、`sin6_scope_id` 填 `flowi6`。
+
+cookie 验证走 `wg_cookie_validate_packet`：先用检查器的 `message_mac1_key` 算 mac1 与包尾 `macs->mac1` 比较，不等则返回 `INVALID_MAC`；相等则进入 `VALID_MAC_BUT_NO_COOKIE`；若要求检查 cookie，则 `make_cookie` 生成期望 cookie、算 mac2 与 `macs->mac2` 比较，不等则停在这一态；相等则进入 `VALID_MAC_WITH_COOKIE_BUT_RATELIMITED`，再调用 `wg_ratelimiter_allow`，通过才返回 `VALID_MAC_WITH_COOKIE`。这条阶梯式判定把"廉价校验"放在前面、"昂贵校验"放在后面，让无效包尽早被丢弃。三组结构的调用关系见图 05-07-01。
+
+:::figure id=05-07-01 | name=socket 初始化、endpoint 收发与 cookie 验证链路 | dir=TD
+node s1 "wg_socket_init<br/>建 UDP socket" blue
+node s2 "wg_socket_reinit<br/>RCU 替换 sock4/sock6" teal
+node s3 "endpoint_from_skb<br/>提取对端与源地址" green
+node s4 "set_peer_endpoint<br/>持锁更新与清缓存" teal
+node s5 "send4 / send6<br/>填 flowi 发送" blue
+node s6 "wg_cookie_validate<br/>四态判定" purple
+node s7 "wg_ratelimiter_allow<br/>握手限速" amber
+edge s1 -> s2 "发布 socket"
+edge s2 -> s3 "收包入口"
+edge s3 -> s4 "学习地址"
+edge s4 -> s5 "读 endpoint_lock"
+edge s5 -> s6 "握手包校验"
+edge s6 -> s7 "mac2 通过后"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「wg_socket_init 建 UDP socket」经「wg_socket_reinit RCU 替换 sock4/sock6」发布 socket；收包侧「endpoint_from_skb 提取对端与源地址」交给「set_peer_endpoint 持锁更新与清缓存」，发送侧「send4 / send6 填 flowi 发送」读取该 endpoint；握手包还要经过「wg_cookie_validate 四态判定」，mac2 通过后再过「wg_ratelimiter_allow 握手限速」。
+
+### 5. 配置/命令/代码实例
+
+下面用一段贴近 `socket.c` 风格的源码片段，说明 socket 更新与 endpoint 收发如何读写本篇字段（片段用于说明字段用法，非逐字源码引用，需对照实际版本核验）：
+
+```c
+/* 发布新 socket：写侧持锁 + RCU，读侧 bh 读锁 */
+mutex_lock(&wg->socket_update_lock);
+old4 = rcu_dereference_protected(wg->sock4,
+        lockdep_is_held(&wg->socket_update_lock));
+rcu_assign_pointer(wg->sock4, new4);
+if (new4)
+    wg->incoming_port = ntohs(inet_sk(new4)->inet_sport);
+mutex_unlock(&wg->socket_update_lock);
+synchronize_net();
+sock_free(old4);
+
+/* 发送：按地址族分派，endpoint 受 read_lock_bh 保护 */
+read_lock_bh(&peer->endpoint_lock);
+if (peer->endpoint.addr.sa_family == AF_INET)
+    ret = send4(peer->device, skb, &peer->endpoint, ds,
+                &peer->endpoint_cache);
+read_unlock_bh(&peer->endpoint_lock);
+```
+
+对应的字段访问规则如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+示例输出，具体格式需对照实际版本核验
+sock4/sock6      写：socket_update_lock + rcu_assign_pointer  读：rcu_dereference_bh
+incoming_port    写：socket_update_lock 内 ntohs(inet_sport)   读：配置快照
+creating_net     写：接口创建期设定                           读：rcu_dereference + maybe_get_net
+endpoint.addr    写：write_lock_bh + endpoint_eq 快速判断      读：read_lock_bh
+endpoint.src4/6  写：set_peer_endpoint / clear_src            读：send4/send6 填 flowi
+cookie.*         写：cookie.lock 写锁                         读：cookie.lock 读锁
+```
+
+逐行判读如下。第一段代码是 `wg_socket_reinit` 的核心：`rcu_dereference_protected` 在持有 `socket_update_lock` 的前提下安全取出旧 socket，`lockdep_is_held` 是给锁依赖检查器的断言；`rcu_assign_pointer` 完成新指针的发布，保证读者要么看到旧版本要么看到新版本；`incoming_port` 用 `ntohs` 把网络字节序的 `inet_sport` 转为主机序，这正是字段表里 `u16` 端口的来源；`synchronize_net` 等待所有读侧临界区退出后，`sock_free` 才安全释放旧 socket。第二段代码是 `wg_socket_send_skb_to_peer` 的骨架：`read_lock_bh` 同时禁止软中断与写者，保护 `endpoint` 在发送期间不被改；用 `addr.sa_family` 判族体现了两个 union 成员必须配套使用。示例输出表把六组字段的读写保护逐一列明：socket 三字段走 RCU 加 `socket_update_lock`，endpoint 走 `rwlock_t`，cookie 走读写信号量——三套机制互不混用，正对应核心概念里的"两把锁加一个 rwlock"。
+
+作为补充，下面给出从源码定位字段的实操命令，这是阅读本册所有字段表的基础技能：
+
+```bash
+cd _wglinux_build/upstream_src/wireguard-linux-src
+grep -n "struct endpoint" drivers/net/wireguard/peer.h
+grep -n "have_sent_mac1\|last_mac1_sent" drivers/net/wireguard/cookie.h drivers/net/wireguard/cookie.c
+grep -n "rcu_dereference_bh(wg->sock4)\|rcu_assign_pointer(wg->sock4" drivers/net/wireguard/socket.c
+```
+
+这段命令分别定位 endpoint 的结构定义、cookie 的一对默契字段、以及 socket 的 RCU 读写点，输出会直接给出源码行号；这是"定义→引用→用途"三步定位法的第一步，清理环节均为只读，无需特殊处理。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把 `endpoint` 的两个 union 当成独立字段。它们内存重叠，同一时刻只有一种地址族有效，且第二个 union 的 `src6` 与 `src4`/`src_if4` 也互斥。任何绕过 `sa_family` 判断直接读 `addr4` 或 `addr6` 的代码，在另一地址族下都会读到无意义数据；同理，读写源地址前必须清楚当前是 v4 还是 v6 上下文。
+
+第二个陷阱是忽略 `endpoint_lock` 的类型与持锁方式。它是 `rwlock_t` 而非 mutex，读用 `read_lock_bh`、写用 `write_lock_bh`，临界区内不可睡眠。发送路径把整个 `send4`/`send6` 放进读锁，是因为这些函数内部要读多个 endpoint 字段，必须保证它们在一次发送中保持一致；若在锁外分别读取，可能读到更新到一半的地址。
+
+第三个陷阱是把 cookie 的两把信号量混用。`secret_lock` 属于设备级 `cookie_checker`，`lock` 属于 peer 级 `cookie`；前者保护随机秘密的轮换，后者保护单个 peer 的 cookie 状态。两者都是 `struct rw_semaphore`，但生命周期与保护对象完全不同，拿错锁会导致对错误对象加解锁。
+
+第四个陷阱是误判 cookie 的生效条件。`have_sent_mac1` 为假时收到 cookie 响应必须忽略，因为无法用 `last_mac1_sent` 解密；`is_valid` 为假或 `birthdate` 超过 `COOKIE_SECRET_MAX_AGE - COOKIE_SECRET_LATENCY` 时，mac2 会被清零而非计算——`COOKIE_SECRET_LATENCY = 5` 是留给对端时钟与网络延迟的余量。若把这段窗口判断删掉，过期 cookie 会被当作有效，削弱抗重放能力。
+
+第五个陷阱是把 `__rcu` 当普通指针。`sock4`、`sock6`、`creating_net` 都必须配 `rcu_dereference` 系列读取；直接解引用在 socket 热替换时会访问已释放对象。第六个陷阱是认为 `incoming_port` 等于配置的端口：当配置为零时它是内核分配的临时端口，必须以 `inet_sport` 读回值为准。
+
+最佳实践：读 endpoint 先看 `sa_family` 再取 union 成员，写 endpoint 先 `endpoint_eq` 快速判断再持写锁；读 cookie 状态一律持对应信号量的读锁，改状态持写锁；socket 读走 `rcu_dereference_bh`、写走 `socket_update_lock` 加 `rcu_assign_pointer`；把常量 `COOKIE_LEN` 等视为随版本变化的 ABI 参数（常量清单见 04-06），把 cookie 的四态判定与限速衔接理解为 06-09、06-10 的机制，把 socket 收发细节让给 06-12、07-09。
+
+### 7. 小结与延伸阅读
+
+本篇逐字段拆解了三组结构：`endpoint` 用两个 union 紧凑表达 v4/v6 地址与源绑定，靠 `endpoint_lock` 保护、`sa_family` 判族；`cookie_checker` 与 `cookie` 分别站在服务端与客户端角度保存秘密、密钥与状态，用四态 `cookie_mac_state` 实现渐进式握手校验；socket 侧 `sock4`/`sock6`/`creating_net` 受 RCU 与 `socket_update_lock` 保护，`incoming_port` 记录内核实际分配的端口。三组结构串成"收包—判 cookie—学 endpoint—发包"的完整链路。
+
+延伸阅读：本组常量见 04-06，wg 命令参数见 04-01；cookie 机制与 DoS 防护原理见 06-09，握手限速见 06-10，socket 收发与 UDP 封装见 06-12，发送与接收路径见 06-05、06-06；socket.c 与 cookie.c 的模块职责见 07-09。跨册随查按（字段见 05-07 ｜ 参数见 04-06 ｜ 原理见 06-09 ｜ 模块见 07-09）执行。凡本篇字段表，均以 `drivers/net/wireguard/` 下 `peer.h`、`cookie.h`、`device.h`、`socket.c` 为准，需对照实际版本核验。
+
+## 05-08 定时器、ratelimiter 与队列结构字段详解
+
+### 1. 背景与动机
+
+如果说 05-07 讲的是"包往哪里发、攻击怎么挡"，本篇要讲的就是"什么时候做、以多大代价做、由哪个核做"。WireGuard Linux 的运行期行为由三类结构驱动：定时器决定握手重传、keepalive 发送、密钥清零的时机；ratelimiter 决定握手请求是否过于频繁而应当丢弃；队列决定加解密任务如何在多个 CPU 之间分发。这三类结构散落在 `timers.c`、`ratelimiter.c`、`device.h`、`peer.h`、`queueing.h` 五个文件中，但它们共同回答一个核心问题：如何在保证安全时序的前提下充分利用多核。
+
+本篇作为 05 册字段权威源，必须先纠正两处常见误传，这也是逐字读源码的价值所在。第一，`ratelimiter.h` 里并没有定义名为 `ratelimiter` 的结构，它只有三个函数声明（`wg_ratelimiter_init`、`wg_ratelimiter_uninit`、`wg_ratelimiter_allow`）和一个条件编译的自测声明；真正的限速结构定义在 `ratelimiter.c` 中，名字是 `struct ratelimiter_entry`。因此本篇的字段表取自 `ratelimiter.c`，而非头文件。第二，`wg_peer` 并没有名为 `timer_handshake_expire` 的字段，`timers.c` 源码中负责"握手超时重传"的字段叫 `timer_retransmit_handshake`；凭旧印象杜撰字段名，是阅读内核代码时最危险的习惯。本篇所有字段一律以本快照源码为准，并标注定义位置，需对照实际版本核验。
+
+为什么把定时器、限速、队列放在一篇？因为它们在数据面上是协同工作的：一个握包包进来，先经 ratelimiter 判定是否超速，再由队列分发到工作线程处理，处理过程中又不断改写 peer 的各个定时器。三者共享同一个执行上下文——软中断与工作队列——也都依赖原子操作与锁来保证并发安全。把它们放在一起，读者才能看清"时间如何驱动状态、状态如何进入队列、队列如何跨核"这条完整链，而不是只见树木不见森林。
+
+### 2. 核心概念
+
+理解本篇，抓住"五个定时器、一个令牌桶、两类队列"即可。
+
+五个定时器，指 `wg_peer` 中五个 `struct timer_list` 字段：`timer_retransmit_handshake` 在握手发起后超时重传，`timer_send_keepalive` 在收到包但久未发包时补发空包，`timer_new_handshake` 在发包后久未收包时发起新握手，`timer_zero_key_material` 在久未收到新密钥时清零临时密钥，`timer_persistent_keepalive` 按用户设定的固定间隔发送保活。配合它们的是几个辅助字段：`timer_handshake_attempts` 记录已重试次数，`persistent_keepalive_interval` 存用户配置的周期间隔，`timer_need_another_keepalive` 标记是否还需再发一次 keepalive，`sent_lastminute_handshake` 与 `walltime_last_handshake` 供状态查询使用。这些定时器由 `wg_timers_init` 用 `timer_setup` 绑定回调，由 `wg_timers_stop` 用 `timer_delete_sync` 统一撤销。
+
+一个令牌桶，指 `ratelimiter_entry` 实现的限速算法。它为每个"源 IP 加网络命名空间"维护一个条目，条目里 `tokens` 是剩余令牌，`last_time_ns` 是上次结算时间。每次握手包到来，按距上次的时间差补充令牌，但不超过 `TOKEN_MAX`；若令牌数达到 `PACKET_COST` 就扣除一个令牌并放行，否则拒绝。源码常量 `PACKETS_PER_SECOND = 20`、`PACKETS_BURSTABLE = 5`、`PACKET_COST = NSEC_PER_SEC / PACKETS_PER_SECOND`、`TOKEN_MAX = PACKET_COST * PACKETS_BURSTABLE`，合起来表达"平均每秒二十个包、允许五个包的突发"。这类算法让突发流量可通过、持续洪泛被抑制，是抗 DoS 的经典手段（完整原理见 06-10）。
+
+两类队列，指设备级的 `crypt_queue` 与 peer 级的 `prev_queue`。`crypt_queue` 内含 `ptr_ring` 环形缓冲和 per-CPU 的 `multicore_worker` 数组，配合 `last_cpu` 做轮转，把加解密任务摊到多个核；`prev_queue` 是单生产者单消费者无锁队列，用 `head`、`tail`、`peeked` 三个指针和原子 `count` 暂存待处理包。两者在入队路径上串联：一个包先进 peer 的 `prev_queue`，再进设备的 `crypt_queue` 环形缓冲，由 per-CPU worker 取走处理。包身上还挂着 `packet_cb` 元数据，其中 `state` 字段用原子值在入队者与消费者之间传递"未加密/已加密/废弃"三态。
+
+还有一个贯穿三类的概念是"上下文安全"。`mod_peer_timer` 用 `rcu_read_lock_bh` 包住 `mod_timer`，并在 `netif_running` 且 `!READ_ONCE(peer->is_dead)` 时才真正改写定时器；ratelimiter 用 `spin_lock` 保护单个条目的令牌计算、用 `table_lock` 保护哈希表插入、用 RCU 保护遍历；队列用 `atomic_set_release` 发布包状态、用 `ptr_ring_produce_bh` 在软中断上下文中入队。这些看似琐碎的加锁动作，都是为了保证"一个字段在同一时刻只被一个写者修改，读者要么看到旧值要么看到新值"。
+
+### 3. 关键数据结构与源码位置
+
+本节逐字段列出各结构。先给 peer 定时器字段表（定义于 `peer.h` 的 `struct wg_peer`，由 `timers.c` 操作）：
+
+| 字段名 | 类型 | 职责 | 超时/触发 |
+|---|---|---|---|
+| `timer_retransmit_handshake` | `struct timer_list` | 握手发起后重传 | REKEY_TIMEOUT + jitter |
+| `timer_send_keepalive` | `struct timer_list` | 收包后补发空包 | KEEPALIVE_TIMEOUT |
+| `timer_new_handshake` | `struct timer_list` | 久未收包发起新握手 | KEEPALIVE_TIMEOUT + REKEY_TIMEOUT |
+| `timer_zero_key_material` | `struct timer_list` | 清零临时密钥 | REJECT_AFTER_TIME * 3 |
+| `timer_persistent_keepalive` | `struct timer_list` | 按间隔发保活 | interval * HZ |
+| `timer_handshake_attempts` | `unsigned int` | 握手重试次数 | 超过 MAX_TIMER_HANDSHAKES 放弃 |
+| `persistent_keepalive_interval` | `u16` | 用户设定保活间隔 | 零表示关闭 |
+| `timer_need_another_keepalive` | `bool` | 是否还需再发一次 | data_received 时置位 |
+| `sent_lastminute_handshake` | `bool` | 近期是否握手过 |  handshake_complete 时清 |
+| `walltime_last_handshake` | `struct timespec64` | 上次握手墙钟时间 | ktime_get_real_ts64 更新 |
+
+`timer_retransmit_handshake` 是握手可靠性的核心。`wg_timers_handshake_initiated` 在每次发出握手发起消息时把它设为 `jiffies + REKEY_TIMEOUT * HZ + get_random_u32_below(REKEY_TIMEOUT_JITTER_MAX_JIFFIES)`；`REKEY_TIMEOUT = 5`、`REKEY_TIMEOUT_JITTER_MAX_JIFFIES = HZ / 3`，即五秒加最多三分之一秒的随机抖动。抖动的作用是让多个 peer 的重传错开，避免同时洪泛。回调 `wg_expired_retransmit_handshake` 检查 `timer_handshake_attempts > MAX_TIMER_HANDSHAKES`（`MAX_TIMER_HANDSHAKES = 90 / REKEY_TIMEOUT` 即十八次）：超过则删除 `timer_send_keepalive`、清空暂存包、并设置 `timer_zero_key_material`；否则自增计数、调用 `wg_socket_clear_peer_endpoint_src` 清掉可能出错的源绑定、重发握手发起消息。
+
+`timer_send_keepalive` 与 `timer_need_another_keepalive` 是一对。`wg_timers_data_received` 在收到数据包后，若该定时器未 pending 就设 `jiffies + KEEPALIVE_TIMEOUT * HZ`（十秒），否则把 `timer_need_another_keepalive` 置真；回调 `wg_expired_send_keepalive` 发完空包后若发现该标记为真，就清掉标记并再设一个十秒定时器。这样连续收到包的对端不会被过早判定为静默。`timer_new_handshake` 由 `wg_timers_data_sent` 在发出已认证数据包后设置，超时为 `(KEEPALIVE_TIMEOUT + REKEY_TIMEOUT) * HZ` 加抖动；回调会清源绑定并发起新握手。
+
+`timer_zero_key_material` 的超时是 `REJECT_AFTER_TIME * 3 * HZ`，`REJECT_AFTER_TIME = 180`，即九分钟。它有两种设置路径：`wg_timers_session_derived` 在派生临时密钥时设置，`wg_expired_retransmit_handshake` 在放弃握手时设置。回调 `wg_expired_zero_key_material` 并不直接清零，而是在 `rcu_read_lock_bh` 内取 peer 引用，把 `clear_peer_work` 排入 `handshake_send_wq`；真正清 `handshake` 与 `keypairs` 的工作在 `wg_queued_expired_zero_key_material` 中完成，若入队失败则归还引用。把清密钥放到工作队列而非定时器回调，是因为清密钥涉及 RCU 与 kref，不适合在定时器软中断上下文做。`timer_persistent_keepalive` 最简单：`wg_timers_any_authenticated_packet_traversal` 在每次双向已认证包往来后，若 `persistent_keepalive_interval` 非零就设 `jiffies + interval * HZ`；回调只在间隔仍非零时发包。
+
+接着给 ratelimiter 字段表（定义于 `ratelimiter.c` 的 `struct ratelimiter_entry`）：
+
+| 字段名 | 类型 | 职责 | 注意事项 |
+|---|---|---|---|
+| `last_time_ns` | `u64` | 上次令牌结算时间 | 纳秒 boottime，gc 判过期 |
+| `tokens` | `u64` | 当前剩余令牌数 | 上限 TOKEN_MAX |
+| `ip` | `u64` | 限速对象的源 IP | v6 取前 64 位，按 /64 限速 |
+| `net` | `void *` | 所属网络命名空间 | 与 ip 共同标识条目 |
+| `lock` | `spinlock_t` | 保护本条目的令牌 | 短临界区，不可睡眠 |
+| `hash` | `struct hlist_node` | 哈希表链节点 | 用 hlist_add_head_rcu 插入 |
+| `rcu` | `struct rcu_head` | 延迟释放回调 | call_rcu 异步回收 |
+
+`last_time_ns`、`tokens`、`ip`、`net` 四个字段构成条目的主体。`wg_ratelimiter_allow` 先在哈希表里按 `net` 与 `ip` 找到条目，命中后在 `spin_lock(&entry->lock)` 内做令牌结算：`tokens = min_t(u64, TOKEN_MAX, entry->tokens + now - entry->last_time_ns)`，其中 `now` 来自 `ktime_get_coarse_boottime_ns()`；随后 `entry->last_time_ns = now`，`ret = tokens >= PACKET_COST`，再按结果扣减令牌。注意算法注释明确说明它是"受 nft_limit.c 启发但略有不同"——突发量被算进令牌上限而非速率，这正是 `TOKEN_MAX = PACKET_COST * PACKETS_BURSTABLE` 的含义。
+
+`ip` 字段对 v4 与 v6 的填法不同。v4 取 `ip_hdr(skb)->saddr` 强转为 u64；v6 用 `memcpy` 拷贝 `ipv6_hdr(skb)->saddr` 的前八字节，源码注释解释这是为了"ratelimit the whole /64"，即按整个 /64 网段限速，避免攻击者用同一网段内海量 IPv6 地址绕过。`net` 字段实际存的是 `struct net *`，但被转成 `u32 net_word = (unsigned long)net` 参与哈希，注释解释只取指针低半部分可让 siphash 的三个字刚好契合。哈希用 `hsiphash_2u32(net_word, ip, &key)`（v4）或 `hsiphash_3u32(net_word, ip >> 32, ip, &key)`（v6），再与 `table_size - 1` 相与定位桶。
+
+`hash` 与 `rcu` 字段服务于生命周期。新条目通过 `hlist_add_head_rcu(&entry->hash, bucket)` 插入；回收时 `entry_uninit` 先 `hlist_del_rcu`，再 `call_rcu(&entry->rcu, entry_free)`，最终由 `entry_free` 用 `kmem_cache_free` 归还到 `entry_cache`。`gc_work` 是 `DECLARE_DEFERRABLE_WORK` 声明的可延迟工作，每秒（`HZ`）由 `system_power_efficient_wq` 调度一次 `wg_ratelimiter_gc_entries`，遍历两张表，把 `now - entry->last_time_ns > NSEC_PER_SEC`（超过一秒未活动）的条目回收。全局还有 `total_entries` 原子计数与 `max_entries = table_size * 8` 上限，防止条目无限增长耗尽内存。
+
+再给队列结构字段表。`crypt_queue` 与 `multicore_worker` 定义于 `device.h`：
+
+| 结构 | 字段名 | 类型 | 职责 |
+|---|---|---|---|
+| `multicore_worker` | `ptr` | `void *` | 指向所属 crypt_queue |
+| `multicore_worker` | `work` | `struct work_struct` | 挂到工作队列的 work |
+| `crypt_queue` | `ring` | `struct ptr_ring` | 包指针环形缓冲 |
+| `crypt_queue` | `worker` | `struct multicore_worker __percpu *` | per-CPU worker 数组 |
+| `crypt_queue` | `last_cpu` | `int` | 轮转选择的上一个 CPU |
+
+`prev_queue` 也定义于 `device.h`，其字段表如下：
+
+| 字段名 | 类型 | 职责 | 注意事项 |
+|---|---|---|---|
+| `head` | `struct sk_buff *` | 队首包 | 消费者从此处取 |
+| `tail` | `struct sk_buff *` | 队尾包 | 生产者从此处追加 |
+| `peeked` | `struct sk_buff *` | 消费者已窥视未取出的包 | peek 后暂存 |
+| `empty` | 匿名结构 | 占位，匹配 sk_buff 前两成员 | 含 next/prev 指针 |
+| `count` | `atomic_t` | 队列长度 | 原子操作免锁统计 |
+
+`wg_device` 里有三个 `crypt_queue` 实例：`encrypt_queue`、`decrypt_queue`、`handshake_queue`，分别承载加密、解密、握手任务。`wg_packet_queue_init` 为每个队列分配 per-CPU worker 数组并初始化 `ptr_ring`；worker 的 `ptr` 指回所属队列，`work` 被 `queue_work_on` 排到指定 CPU。`last_cpu` 由 `wg_cpumask_next_online` 在在线 CPU 位图上轮转更新：取 `cpumask_next`，越过末位则回到 `cpumask_first`。源码注释坦承这个函数是 racy 的——`last_cpu` 未加锁，可能两次返回同一 CPU，但注释明确说后果无害，加锁反而更慢，因此刻意容忍。
+
+`prev_queue` 的 `empty` 成员是个匿名结构 `{ struct sk_buff *next, *prev; }`，注释写明它"Match first 2 members of struct sk_buff"。这是一种内存布局技巧：让队列的空壳节点与 sk_buff 的链表指针同构，从而复用内核链表操作。队列 API 标注了生产者与消费者约束：`wg_prev_queue_enqueue` 标为"Multi producer"，`wg_prev_queue_dequeue`、`wg_prev_queue_peek`、`wg_prev_queue_drop_peeked` 标为"Single consumer"。`peeked` 字段让消费者可以先看包再决定是否取出，`wg_prev_queue_peek` 在 `peeked` 为空时才真正 dequeue 并缓存。
+
+最后是 `packet_cb` 元数据，定义于 `queueing.h`，字段表如下：
+
+| 字段名 | 类型 | 职责 | 注意事项 |
+|---|---|---|---|
+| `nonce` | `u64` | 加密随机数 | 经 `PACKET_CB(skb)` 访问 |
+| `keypair` | `struct noise_keypair *` | 关联会话密钥 | `PACKET_PEER` 由它取 peer |
+| `state` | `atomic_t` | 包处理状态三态 | 用 atomic_set_release 发布 |
+| `mtu` | `u32` | 分片相关 MTU | 发送路径使用 |
+| `ds` | `u8` | DSCP 字段 | 封装时写入 |
+
+`packet_cb` 通过宏 `PACKET_CB(skb)` 定位到 `skb->cb`，`PACKET_PEER(skb)` 再由 `keypair->entry.peer` 取出所属 peer。`state` 的三种取值来自 `enum packet_state`：`PACKET_STATE_UNCRYPTED`、`PACKET_STATE_CRYPTED`、`PACKET_STATE_DEAD`。入队时 `atomic_set_release(&PACKET_CB(skb)->state, PACKET_STATE_UNCRYPTED)` 先把包标记为未加密，消费者等到状态变为 CRYPTED 或 DEAD 才继续处理——这套原子状态机是生产消费者之间的握手协议，免去了加锁。
+
+### 4. 关键流程与调用链
+
+入队路径 `wg_queue_enqueue_per_device_and_peer` 把两类队列串起来：先 `atomic_set_release` 把包状态设为 UNCRYPTED，再 `wg_prev_queue_enqueue(peer_queue, skb)` 进 peer 暂存队列；随后 `wg_cpumask_next_online(&device_queue->last_cpu)` 选一个在线 CPU，用 `ptr_ring_produce_bh` 把包放进设备环形缓冲，最后 `queue_work_on(cpu, wq, &per_cpu_ptr(device_queue->worker, cpu)->work)` 唤醒该 CPU 的 worker。若环形缓冲满则返回 `-EPIPE`，若暂存队列满则返回 `-ENOSPC`。加密完成后，`wg_queue_enqueue_per_peer_tx` 取 peer 引用、用 `atomic_set_release` 设置目标状态、把 `transmit_packet_work` 排到按 `internal_id` 选定的 CPU，再 `wg_peer_put` 归还引用；接收侧 `wg_queue_enqueue_per_peer_rx` 类似，但改为 `napi_schedule(&peer->napi)`。
+
+定时器触发链由包处理事件驱动：发送已认证包调 `data_sent`（设 new_handshake）、收到已认证包调 `data_received`（设 send_keepalive）、握手发起调 `handshake_initiated`（设 retransmit）、握手完成调 `handshake_complete`（删 retransmit、清计数、记时间）、派生会话调 `session_derived`（设 zero_key_material）、任意已认证包往来调 `any_authenticated_packet_traversal`（设 persistent_keepalive）。这些函数把"包的来去"翻译成"定时器的改写"，是协议状态机的时钟。各结构与执行上下文的关系见图 05-08-01。
+
+:::figure id=05-08-01 | name=队列分发、定时器时钟与 ratelimiter 判定 | dir=TD
+node q1 "enqueue_per_device<br/>先入 prev_queue" blue
+node q2 "ptr_ring + last_cpu<br/>选 CPU 入队" teal
+node q3 "per-CPU worker<br/>并行加解密" green
+node t1 "timers.c<br/>包事件改写定时器" purple
+node t2 "timer_retransmit<br/>重传与清零" amber
+node r1 "ratelimiter_allow<br/>令牌桶判定" red
+node r2 "gc_work<br/>回收过期条目" gray
+edge q1 -> q2 "暂存后入环"
+edge q2 -> q3 "queue_work_on"
+edge q3 -> t1 "包往来事件"
+edge t1 -> t2 "超时回调"
+edge q1 -> r1 "握手包先限速"
+edge r1 -> r2 "条目按时间回收"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「enqueue_per_device 先入 prev_queue」后经「ptr_ring + last_cpu 选 CPU 入队」到「per-CPU worker 并行加解密」；「timers.c 包事件改写定时器」把包往来翻译成「timer_retransmit 重传与清零」等超时回调；握手包在入队前先过「ratelimiter_allow 令牌桶判定」，其条目由「gc_work 回收过期条目」定期清理。
+
+### 5. 配置/命令/代码实例
+
+下面用贴近 `ratelimiter.c` 风格的源码片段说明 ratelimiter 的令牌结算与定时器改写（片段用于说明字段用法，非逐字源码引用，需对照实际版本核验）：
+
+```c
+/* ratelimiter：在 entry->lock 内结算令牌 */
+spin_lock(&entry->lock);
+now = ktime_get_coarse_boottime_ns();
+tokens = min_t(u64, TOKEN_MAX,
+               entry->tokens + now - entry->last_time_ns);
+entry->last_time_ns = now;
+ret = tokens >= PACKET_COST;
+entry->tokens = ret ? tokens - PACKET_COST : tokens;
+spin_unlock(&entry->lock);
+
+/* 定时器：rcu_read_lock_bh 内安全改写 */
+rcu_read_lock_bh();
+if (likely(netif_running(peer->device->dev) &&
+           !READ_ONCE(peer->is_dead)))
+    mod_timer(&peer->timer_retransmit_handshake, expires);
+rcu_read_unlock_bh();
+```
+
+对应的字段—阈值—回调关系如下（示例输出，具体格式需对照实际版本核验）：
+
+```text
+示例输出，具体格式需对照实际版本核验
+timer_retransmit_handshake   REKEY_TIMEOUT(5)+jitter   -> wg_expired_retransmit_handshake
+timer_send_keepalive         KEEPALIVE_TIMEOUT(10)     -> wg_expired_send_keepalive
+timer_new_handshake          (10+5)+jitter             -> wg_expired_new_handshake
+timer_zero_key_material      REJECT_AFTER_TIME(180)*3  -> wg_expired_zero_key_material
+timer_persistent_keepalive   interval*HZ               -> wg_expired_send_persistent_keepalive
+ratelimiter_entry.tokens     TOKEN_MAX=COST*5          -> 每秒 20 包，突发 5
+```
+
+逐行判读如下。第一段代码是 `wg_ratelimiter_allow` 命中条目后的核心：`spin_lock` 保护单个条目的 `tokens` 与 `last_time_ns`，避免多 CPU 同时结算；`min_t(u64, TOKEN_MAX, ...)` 实现"令牌补满即封顶"，`entry->tokens + now - entry->last_time_ns` 用时间差补充令牌；`ret = tokens >= PACKET_COST` 判断是否够一个令牌，`entry->tokens = ret ? tokens - PACKET_COST : tokens` 决定扣减与否；`spin_unlock` 释放锁。第二段代码是 `mod_peer_timer`：`rcu_read_lock_bh` 同时禁止软中断与 RCU 回收，`netif_running` 与 `!READ_ONCE(peer->is_dead)` 双条件确保接口在运行且 peer 未死，`mod_timer` 才真正改写定时器。示例输出表把五个定时器的超时值与回调一一对应，并标出 ratelimiter 的令牌上限与速率——读这张表时要把超时值当常量看（常量权威在 04 册，机制在 06-11、06-10），把回调名当源码事实核对。理解这张表，就理解了"什么时候哪个字段被改写"。
+
+作为补充，给出从源码定位字段的命令：
+
+```bash
+cd _wglinux_build/upstream_src/wireguard-linux-src
+grep -n "timer_retransmit_handshake\|timer_zero_key_material" drivers/net/wireguard/peer.h drivers/net/wireguard/timers.c
+grep -n "struct ratelimiter_entry\|last_time_ns\|TOKEN_MAX" drivers/net/wireguard/ratelimiter.c
+grep -n "struct crypt_queue\|struct prev_queue\|struct packet_cb" drivers/net/wireguard/device.h drivers/net/wireguard/queueing.h
+```
+
+三条命令分别定位定时器字段、ratelimiter 条目与常量、三类队列结构，输出直接给出真实行号，印证本篇字段表取自源码而非记忆；这些命令均为只读，清理环节无需特殊处理。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把 ratelimiter 结构从 `ratelimiter.h` 里找。该头文件只有函数声明，结构定义在 `ratelimiter.c`；照着头文件找字段会一无所获，甚至误以为不存在结构。第二个陷阱是凭旧印象写 `timer_handshake_expire`。本快照真实字段是 `timer_retransmit_handshake`，任何字段名都必须先在 `peer.h` 里核对，不能想当然。
+
+第三个陷阱是忽略 `spin_lock` 与 `rcu_read_lock_bh` 的上下文要求。`entry->lock` 是自旋锁，临界区内不能睡眠；`mod_peer_timer` 用 `rcu_read_lock_bh` 而非普通 `rcu_read_lock`，是因为定时器回调可能在软中断中触发，必须同时禁止软中断抢占。第四个陷阱是把 `wg_cpumask_next_online` 当作无竞态函数：源码注释明确说它 racy、可能返回重复 CPU，但后果无害且加锁更慢，不建议"修复"这种刻意设计。
+
+第五个陷阱是误解 `prev_queue.empty` 的作用。它不是数据字段，而是为匹配 sk_buff 前两个成员而设的占位结构，改动其布局会破坏内核链表操作假设。第六个陷阱是无视 `packet_cb.state` 的发布语义：`atomic_set_release` 提供释放屏障，消费者需配相应获取语义读取，用普通赋值会破坏跨核可见性。第七个陷阱是把 ratelimiter 常量写死：`PACKETS_PER_SECOND`、`PACKETS_BURSTABLE` 是源码枚举常量，不同内核版本可能调整，应以本快照为准并标注需对照实际版本核验。
+
+最佳实践：读定时器字段先看 `timers.c` 的哪个回调操作它、超时由哪个常量决定；读 ratelimiter 先认清结构在 `ratelimiter.c`、条目由 `net` 与 `ip` 共同标识；读队列先分清设备级 `crypt_queue` 与 peer 级 `prev_queue` 的生产消费约束，再核对 `packet_cb.state` 的原子发布。把定时器原理让给 06-11、限速原理让给 06-10、并发与多核让给 06-13，把常量清单让给 04 册，把 timers.c/ratelimiter.c 的模块职责让给 07-10。
+
+### 7. 小结与延伸阅读
+
+本篇逐字段拆解了三类结构：五个 `timer_list` 加若干辅助字段构成 `wg_peer` 的时钟体系，由 `wg_timers_init` 绑定、`mod_peer_timer` 安全改写；`ratelimiter_entry` 在 `ratelimiter.c` 中以令牌桶加 RCU 哈希表实现握手限速，纠正了"结构在 ratelimiter.h、字段叫 ratelimiter"的误传；`crypt_queue`、`multicore_worker`、`prev_queue`、`packet_cb` 构成多核并发的数据面骨架，配合原子状态与 per-CPU worker 完成加解密分发。三类结构共同回答"何时做、多大代价、哪个核做"。
+
+延伸阅读：本组常量见 04 册（超时与限速常量），wg 命令参数见 04-01；定时器体系原理见 06-11，握手限速原理见 06-10，多核并发与 padata 见 06-13，包处理流水线见 06-01；timers.c 与 ratelimiter.c 的模块职责见 07-10，queueing.h 相关见 07-07、07-08。跨册随查按（字段见 05-08 ｜ 参数见 04-07 ｜ 原理见 06-11 ｜ 模块见 07-10）执行。凡本篇字段表，均以 `drivers/net/wireguard/` 下 `peer.h`、`device.h`、`timers.c`、`ratelimiter.c`、`queueing.h` 为准，需对照实际版本核验。

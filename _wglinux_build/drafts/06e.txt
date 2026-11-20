@@ -1,0 +1,279 @@
+## 06-09 cookie 机制与 DoS 防护
+
+### 1. 背景与动机
+
+WireGuard 把数据面放在内核态，换来了高性能，也带来一个必须正面回答的安全问题：一个公开的 UDP 端口如何抵御来自互联网的泛洪。任何人都可以在没有密钥的情况下向监听端口发送一个握手发起报文（MESSAGE_HANDSHAKE_INITIATION），而接收端在处理这类报文时，要付出远大于发送端的代价——Curve25519 标量乘、BLAKE2s 密钥派生、构造会话密钥与定时器，这些运算在一次握手里都要跑一遍。攻击者只需用伪造的源地址灌入大量握手报文，就能让响应端的 CPU 在密码学运算上耗尽，这就是典型的拒绝服务（DoS）威胁模型。更隐蔽的是反射放大：若响应端对每个伪造源地址都回一个大包，攻击者可以把流量反射到无辜的第三方。
+
+cookie 机制正是为这个威胁模型设计的。它的思想并不新鲜，DTLS、IKEv2 都有类似的 cookie 质询，但 WireGuard 把它压缩到了极简：响应端不保存任何针对客户端的状态，而是用一个周期性轮换的秘密，把报文的源 IP 与源端口算进一个 16 字节的 cookie 值，并在系统负载升高时才要求对端证明它真的拥有这个源地址。本篇逐函数解读这一机制在内核驱动中的实现。事实锚点是 `_wglinux_build/upstream_src/wireguard-linux-src/`，下文出现的源码路径均相对该根目录，凡具体字段与常量均来自本快照，个别细节需对照目标内核版本核验。需要先把边界说清楚：cookie 解决的是「源地址归属证明」与「反射放大抑制」，它不替代握手本身的身份认证，也不替代 ratelimiter 的握手频率限制，两者是串联关系（详见 06-10）。
+
+把威胁模型拆开，可以更清楚地看到 cookie 针对的是哪一类攻击者。第一类是在线盲注入者，他不知道响应端公钥，只是朝端口乱发 UDP 报文，这类包会被 mac1 这一层极廉价的校验直接丢弃，连 BLAKE2s 之外的密码学运算都跑不到。第二类是有公钥但伪造源地址者，他知道对端公钥，因而能算出 mac1，却无法收到发往伪造源地址的应答，这类包在平时会被照常处理（因为负载不高），一旦负载升高就会被要求提供 cookie，而他拿不到这个绑定了真实源地址的 cookie，于是被挡在第二道门之外。第三类是控制了一个真实源地址、但想高速灌握手的攻击者，他能通过 cookie 校验，这时就轮到 ratelimiter 基于源 IP 的令牌桶把他压到每秒约二十次的握手速率。三层防线各管一段，cookie 处在中间这一层，它的精妙之处在于「无状态」：响应端不需要为每一个可能的攻击者分配内存，cookie 只是对当前报文的一个纯函数计算结果。
+
+### 2. 核心概念
+
+理解 cookie 机制，要抓住四个概念：两段式 MAC、无状态 cookie、负载触发、以及与 ratelimiter 的串联。
+
+所谓两段式 MAC，指每个握手报文尾部都带一个 `struct message_macs`，里面有 `mac1` 与 `mac2` 两个 16 字节认证值（字段布局见 05-05）。`mac1` 的计算密钥来自「标签字符串 `mac1----` 拼上本端静态公钥」的 BLAKE2s 派生，覆盖范围是从报文开头到 `mac1` 之前的所有内容；`mac2` 的计算密钥则是 cookie 本身，覆盖范围是从报文开头一直到 `mac1` 结束（不含 `mac2`）。这里的顺序很关键：先算 mac1，再把 mac1 当成 mac2 输入的一部分，于是 mac2 把 mac1 也绑定了进来。必须强调一个极易误解的点：`mac1` 的派生密钥只用到了静态公钥，而静态公钥是公开的，任何想连接的人都持有它，因此 mac1 **不是**对发送者身份的认证，它只是一道廉价的项目过滤——让发给别的响应端（公钥不同）的报文在这里被丢弃，并让反射攻击无法把应答放大到无关地址。
+
+所谓无状态 cookie，指 `make_cookie` 并不查任何以客户端为键的表。它把 `cookie_checker` 里一个随机生成的 `secret`（长度 `NOISE_HASH_LEN`，即 BLAKE2s 的 32 字节输出长度）作为带密钥 BLAKE2s 的密钥，依次喂入报文源 IP（IPv4 为 4 字节 `saddr`，IPv6 为 16 字节 `saddr`）与 UDP 源端口（2 字节），输出 16 字节 cookie。这个 secret 有寿命限制，超过 `COOKIE_SECRET_MAX_AGE`（120 秒）就在写锁下重新随机生成。于是同一个源地址在不同时间段会得到不同的 cookie，旧的伪造请求无法长期复用；而响应端从头到尾没有为这个源地址保存任何东西，只是每隔一段时间换一次全局秘密。
+
+所谓负载触发，指 cookie 不是每次握手都要，而是仅在系统「压力过大」时才强制。接收路径用全局握手队列长度 `handshake_queue_len` 判断：当它达到 `MAX_QUEUED_INCOMING_HANDSHAKES / 8`（即 4096/8 = 512）时进入 under_load 状态，并用静态变量 `last_under_load` 做一秒的迟滞，避免队列在阈值附近抖动时反复开关。平时只验 mac1，负载高时才验 mac2，这是性能与安全的折中：绝大多数时间省掉一次 RTT 的质询往返。
+
+所谓与 ratelimiter 串联，指 cookie 校验通过后还要过一道基于源 IP 的令牌桶。在 `wg_cookie_validate_packet` 的返回值枚举 `cookie_mac_state` 里，从坏到好依次是 `INVALID_MAC`、`VALID_MAC_BUT_NO_COOKIE`、`VALID_MAC_WITH_COOKIE_BUT_RATELIMITED`、`VALID_MAC_WITH_COOKIE`。只有最后一种才被接收路径放行；第三名说明 mac1 与 cookie 都对，但源 IP 的握手频率超了令牌桶，同样会被丢。这条返回链把「mac1 廉价过滤 → cookie 源地址归属 → ratelimiter 频率限制」三段串成一条流水线。四段式随查如下：（字段见 05-07 ｜ 参数见 04-06 ｜ 原理见 06-06 ｜ 模块见 07-09）。
+
+### 3. 关键数据结构与源码位置
+
+cookie 机制涉及的结构集中在三个头文件。`cookie.h` 定义 `struct cookie_checker`（位于响应端，持有 `secret`、`cookie_encryption_key`、`message_mac1_key`、`secret_birthdate`、`secret_lock` 与 `device` 指针）、`struct cookie`（位于发起端的 peer 上，持有 `birthdate`、`is_valid`、`cookie`、`have_sent_mac1`、`last_mac1_sent`、`cookie_decryption_key`、`message_mac1_key` 与 `lock`），以及四态枚举 `enum cookie_mac_state`。这些结构的逐字段含义交给 05-07，本篇只点名不展开。`messages.h` 定义 `struct message_macs`、`struct message_handshake_cookie`（字段为 `header`、`receiver_index`、`nonce`、`encrypted_cookie`）、`enum message_type` 中的 `MESSAGE_HANDSHAKE_COOKIE = 3`，以及常量枚举 `enum cookie_values`：`COOKIE_SECRET_MAX_AGE = 2*60`、`COOKIE_SECRET_LATENCY = 5`、`COOKIE_NONCE_LEN`、`COOKIE_LEN = 16`。`device.h` 把 `cookie_checker` 内嵌进 `wg_device`，`peer.h` 把 `latest_cookie` 内嵌进 `wg_peer`。
+
+下面这张表把本篇反复引用的源码位置收拢成速查，便于与调用链对照。
+
+| 关注点 | 真实源码路径 | 本册处理方式 |
+|---|---|---|
+| checker 与 cookie 结构、状态枚举 | `cookie.h` | 只点名，字段见 05-07 |
+| 密钥预计算与两段 MAC | `cookie.c` 的 `precompute_key`、`compute_mac1`、`compute_mac2` | 逐函数讲机制 |
+| cookie 生成与校验 | `cookie.c` 的 `make_cookie`、`wg_cookie_validate_packet` | 逐函数讲机制 |
+| cookie 质询报文的创建与消费 | `cookie.c` 的 `wg_cookie_message_create`、`wg_cookie_message_consume` | 讲调用链与加密封装 |
+| 报文尾部 MAC 布局与质询报文布局 | `messages.h` 的 `message_macs`、`message_handshake_cookie` | 最小片段，字段见 05-05 |
+| 负载判定与质询触发 | `receive.c` 的 `wg_receive_handshake_packet` | 讲 under_load 迟滞逻辑 |
+| 发送端加 MAC 与发质询 | `send.c` 的 `wg_cookie_add_mac_to_packet`、`wg_packet_send_handshake_cookie` | 讲调用链 |
+| checker 初始化 | `device.c` 的 `wg_cookie_checker_init` 调用点 | 只点名，模块见 07-09 |
+
+### 4. 关键流程与调用链
+
+先看初始化。设备创建时 `device.c` 调用 `wg_cookie_checker_init`，后者初始化 `secret_lock` 读写信号量、把 `secret_birthdate` 设为当前启动时间、用 `get_random_bytes` 填满 32 字节 `secret`，并记住所属 `wg_device`。因为 mac1 与 cookie 的派生密钥只依赖静态公钥，驱动把它们预计算好以免每次握手重算：`wg_cookie_checker_precompute_device_keys` 在本端配置了静态身份时，用 `precompute_key` 分别以 `cookie_key_label`（`"cookie--"`）和 `mac1_key_label`（`"mac1----"`）派生 `cookie_encryption_key` 与 `message_mac1_key`；没有静态身份时把两者清零。对端一侧，`peer.c` 在建立 peer 时调用 `wg_cookie_checker_precompute_peer_keys`，用对端的 `remote_static` 派生出 `cookie_decryption_key` 与 `message_mac1_key`——注意这里派生用的是对端（也就是握手的响应端）的静态公钥，与响应端用自己的公钥派生出的加密密钥正好配对，这是两边能算到同一个 MAC 与cookie 的根本原因。
+
+发送方向上，无论是发起报文还是响应报文，构造完 Noise 内容后都会调用 `wg_cookie_add_mac_to_packet`。它先把消息尾部的 `macs` 定位出来，在写锁下用 `message_mac1_key` 算好 `mac1`，把它拷进 `last_mac1_sent` 并置 `have_sent_mac1 = true`；随后在读锁下判断本地缓存的 cookie 是否仍然有效且未过期（过期阈值是 `COOKIE_SECRET_MAX_AGE - COOKIE_SECRET_LATENCY`，即 115 秒），有效就用它算 `mac2`，否则把 `mac2` 清零。也就是说，发起端第一次握手只带 mac1、mac2 为零；只有收到过质询并解出 cookie 后，后续握手才会带上有效的 mac2。
+
+接收方向是整条链的核心。`receive.c` 的 `wg_receive_handshake_packet` 先判断是不是 cookie 应答，是则直接交给 `wg_cookie_message_consume`；否则做 under_load 判定，再调用 `wg_cookie_validate_packet`（把 `under_load` 作为 `check_cookie` 参数传入）。该函数从报文尾部取出 `macs`，第一步用 `message_mac1_key` 算 mac1 并做常量时间比较 `crypto_memneq`，不等就返回 `INVALID_MAC`；第二步若 `check_cookie` 为真，用 `make_cookie` 重算 cookie、再用它算 mac2 比较，不等就返回 `VALID_MAC_BUT_NO_COOKIE`；第三步调用 `wg_ratelimiter_allow` 做频率限制，超了返回 `VALID_MAC_WITH_COOKIE_BUT_RATELIMITED`；全部通过返回 `VALID_MAC_WITH_COOKIE`。回到接收路径，只有「平时且仅 mac1 有效」或「负载高且 cookie 有效」才继续处理握手；若「负载高且只有 mac1 有效」，就调用 `wg_packet_send_handshake_cookie` 回一个质询报文并丢弃原包；其余情况一律丢弃。
+
+质询报文的生成与消费构成一次完整的往返。`wg_cookie_message_create` 把类型设为 `MESSAGE_HANDSHAKE_COOKIE`，把 `receiver_index` 填成原报文的 `sender_index`，取随机 nonce，用 `make_cookie` 算出 cookie，再用 `xchacha20poly1305_encrypt` 以 `cookie_encryption_key` 加密，并把原报文的 mac1 作为附加认证数据——这一点是防反射的关键：质询只对「确实发过那个 mac1」的一方有用。对端收到后，`wg_cookie_message_consume` 用 `receiver_index` 在 index 哈希表中找回 peer，检查 `have_sent_mac1`，以 `last_mac1_sent` 为附加数据、`cookie_decryption_key` 为密钥解密，成功后把 cookie、时间戳与 `is_valid = true` 写回 `latest_cookie`，并清掉 `have_sent_mac1`。整条流程见图 06-09-01。
+
+:::figure id=06-09-01 | name=cookie 质询的两段式校验与往返流程 | dir=TD
+node n1 "发起端构造握手<br/>加 mac1" blue
+node n2 "响应端收包<br/>判定 under_load" teal
+node n3 "校验 mac1<br/>廉价过滤" purple
+node n4 "负载高则回<br/>COOKIE 质询" amber
+node n5 "发起端解密<br/>缓存 cookie" green
+node n6 "再握手带<br/>mac2" blue
+node n7 "校验 cookie<br/>再过 ratelimiter" purple
+node n8 "通过则进入<br/>Noise 握手" green
+node n9 "失败则静默<br/>丢弃" red
+edge n1 -> n2 "UDP"
+edge n2 -> n3 "总是"
+edge n3 -> n4 "仅负载高"
+edge n4 -> n5 "加密 cookie"
+edge n5 -> n6 "带 mac2"
+edge n6 -> n7 "重入"
+edge n7 -> n8 "全通过"
+edge n3 -> n9 "mac1 错"
+edge n7 -> n9 "超限或 cookie 错"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：发起端「构造握手并加 mac1」经 UDP 到「响应端收包判定 under_load」，总是先「校验 mac1 做廉价过滤」；平时直接放行，负载高时「回 COOKIE 质询」，发起端「解密并缓存 cookie」后「再握手带 mac2」，响应端「校验 cookie 再过 ratelimiter」，全通过才「进入 Noise 握手」，而 mac1 错、cookie 错或超限都「静默丢弃」。
+
+### 5. 配置/命令/代码实例
+
+cookie 没有用户态开关，所有行为由源码常量与运行时负载决定，因此这里从代码与可观测日志两个角度给实例。先看校验函数的骨架，它最能说明四态返回值的来源（为便于阅读做了节选，具体格式需对照实际版本核验）：
+
+```c
+enum cookie_mac_state wg_cookie_validate_packet(struct cookie_checker *checker,
+						struct sk_buff *skb, bool check_cookie)
+{
+	struct message_macs *macs = (void *)(skb->data + skb->len - sizeof(*macs));
+	u8 computed_mac[COOKIE_LEN], cookie[COOKIE_LEN];
+	enum cookie_mac_state ret = INVALID_MAC;
+
+	compute_mac1(computed_mac, skb->data, skb->len, checker->message_mac1_key);
+	if (crypto_memneq(computed_mac, macs->mac1, COOKIE_LEN)) goto out;
+	ret = VALID_MAC_BUT_NO_COOKIE;
+	if (!check_cookie) goto out;
+	make_cookie(cookie, skb, checker);
+	compute_mac2(computed_mac, skb->data, skb->len, cookie);
+	if (crypto_memneq(computed_mac, macs->mac2, COOKIE_LEN)) goto out;
+	ret = VALID_MAC_WITH_COOKIE_BUT_RATELIMITED;
+	if (!wg_ratelimiter_allow(skb, dev_net(checker->device->dev))) goto out;
+	ret = VALID_MAC_WITH_COOKIE;
+out:
+	return ret;
+}
+```
+
+运维侧能做的是打开内核动态调试来观察丢弃与质询是否发生，命令如下（动态调试挂载点需对照目标系统核验）：
+
+```bash
+# 打开 wireguard 模块的动态调试输出
+echo 'module wireguard +p' > /sys/kernel/debug/dynamic_debug/control
+# 再查看接口状态，确认握手是否仍在进行
+wg show wg0
+```
+
+下面是对应的日志与状态输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+wg0: Invalid MAC of handshake, dropping packet from 198.51.100.77:41234
+wg0: Sending cookie response for denied handshake message for 198.51.100.77:41234
+wg0: Receiving cookie response from 198.51.100.77:41234
+interface: wg0
+  public key: <本端公钥>
+  listening port: 51820
+peer: <对端公钥>
+  endpoint: 198.51.100.77:41234
+  latest handshake: 8 seconds ago
+```
+
+逐行判读如下。第一行 `Invalid MAC of handshake` 来自 `receive.c` 在 `cookie_mac_state` 落到 `else` 分支时打印的 `net_dbg_skb_ratelimited`，说明该包的 mac1 与期望值不符（或负载下 cookie 不符）而被丢弃，对应源码中的 `crypto_memneq` 比较失败；注意这类日志本身是限频打印的，看不到它不等于没有丢弃。第二行 `Sending cookie response` 来自 `send.c` 的 `wg_packet_send_handshake_cookie`，表明接收路径判定为「负载高且仅 mac1 有效」，于是 `packet_needs_cookie` 被置真，响应端回了一个 `MESSAGE_HANDSHAKE_COOKIE`；这行出现意味着系统当时确实处于 under_load，握手队列已越过阈值。第三行 `Receiving cookie response` 来自 `receive.c` 对 `MESSAGE_HANDSHAKE_COOKIE` 的处理分支，随后调用 `wg_cookie_message_consume` 解密并缓存 cookie，它是「发起端已拿到 cookie、后续握手会带 mac2」的直接证据。第四到第六行是 `wg show` 对 `WG_CMD_GET_DEVICE` 结果的渲染：`public key` 与 `listening port` 是 device 属性（常量见 04-06），`peer` 段来自 `WGPEER_A_*`，`endpoint` 对应 `WGPEER_A_ENDPOINT`。第七行 `latest handshake` 是最关键的一行，对应 `WGPEER_A_LAST_HANDSHAKE_TIME`；若期间经历了质询往返，这里的时间会略微推后，因为质询引入了一个额外的往返延迟。把三行调试日志与这一行合起来读，就能还原「负载升高 → 质询 → 解出 cookie → 握手恢复」的完整时序。清理层面无需任何操作，cookie 状态随接口与 peer 的生命周期自动回收。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把 mac1 当作身份认证。前面已经说明，mac1 的密钥只由公开的静态公钥派生，任何持有公钥者都能计算，它只做廉价项目过滤与防反射绑定，绝不意味着「带合法 mac1 的就是可信对端」。真正的身份认证发生在之后的 Noise_IK 握手里。第二个陷阱是把 cookie 当成免费的：负载高时每个新源地址都要多一次质询往返，握手建立会多一个 RTT 的延迟，在链路抖动或丢包的链路上表现为握手偶发失败或 `latest handshake` 变旧，这是设计使然而非故障。
+
+第三个陷阱是忽略 cookie 与源地址的绑定关系。`make_cookie` 把源 IP 与源端口都算进 cookie，若发起端与响应端之间有 NAT 且端口在质询往返期间发生变化，解出的 cookie 会在下一包校验时对不上，表现为负载下握手反复失败；因此部署时应尽量保持 endpoint 稳定，NAT 后的 peer 配合持久 keepalive（定时器体系见 06-11）。第四个陷阱是以为有专门的日志能计数丢弃：cookie 相关日志全部走 `net_dbg_*_ratelimited`，天然限频，不能用它做精确的攻击计数；要做量化分析应结合握手队列长度与其他可观测指标（排障口径见 08-03）。
+
+最佳实践可以归纳为四点。其一，理解三层防线的分工：mac1 挡盲注入与跨响应端报文，cookie 挡伪造源地址，ratelimiter 挡高频真实源，缺一层就会出现特定形态的攻击面。其二，在上游网络启用入口源地址防伪造（ingress filtering），让伪造源包根本进不来，与 cookie 形成纵深。其三，部署前在目标机型实测负载阈值的行为——`MAX_QUEUED_INCOMING_HANDSHAKES / 8` 这个阈值决定何时开始质询，过早会拖慢正常握手，过晚会给攻击者留出 CPU 耗尽窗口，本资料不给绝对数字，需在目标环境实测（基准方法见 08-01）。其四，把 cookie 与密钥管理、 AllowedIPs 收敛一起看待：cookie 只解决握手层的 DoS，数据面的源地址仍然由 allowedips trie 校验（原理见 06-07），两者不可互相替代。最后提醒，本快照中 `selftest` 目录的实现文件可能未随快照提供，涉及自检函数的细节以目标内核源码为准。
+
+### 7. 小结与延伸阅读
+
+本篇把 cookie 机制定位为「负载触发的、无状态的源地址归属证明」：握手报文尾部的 `mac1` 用公开公钥派生的密钥做廉价过滤，`mac2` 用响应端周期性轮换的秘密对源 IP 与端口派生出的 cookie 做归属校验，只有在握手队列越过阈值时才会发起 `MESSAGE_HANDSHAKE_COOKIE` 质询，质询用 XChaCha20-Poly1305 加密并以 mac1 为附加数据防止反射放大；四态枚举 `cookie_mac_state` 把 mac1、cookie、ratelimiter 三段串成一条返回链，只有 `VALID_MAC_WITH_COOKIE` 才被放行。理解它的关键是记住两条：mac1 不是身份认证，cookie 不占客户端状态。
+
+延伸阅读建议按三条线走：报文尾部 MAC 布局与 cookie 报文格式见 `messages.h`（格式原理见 06-04），接收路径如何消费这些状态见 `receive.c`（完整链路见 06-06），源 IP 的令牌桶如何与 cookie 串联见 06-10。跨册随查按（字段见 05-07 ｜ 参数见 04-06 ｜ 原理见 06-06 ｜ 模块见 07-09）执行：结构体逐字段去 05，常量全集去 04，机制与调用链去 06，目录级模块能力去 07，运维与排障去 08。凡本篇标注「需对照实际版本核验」的字段、常量与函数名，均以 `_wglinux_build/upstream_src/` 下对应文件为准，本套资料不编造未核验的路径与取值。
+
+## 06-10 ratelimiter 握手限速原理
+
+### 1. 背景与动机
+
+上一篇讲的 cookie 机制解决了「这个源地址是不是真的能被回应」的问题，但它并没有解决「一个真实源地址能不能无限快地灌握手」的问题。握手在 WireGuard 里是昂贵操作：一次发起报文的处理涉及 Curve25519 标量乘、BLAKE2s 密钥派生、消息认证与会话结构初始化，响应端做这些运算的成本远高于攻击者用 UDP 伪造一个包的成本。攻击者完全可以不去伪造源地址，而是老实通过 cookie 质询（因为他确实控制那个源地址），然后以极高的频率重复发起握手，照样能把响应端的 CPU 拖垮。ratelimiter 就是为这种情况准备的第三道防线：它把「每个源 IP 每秒允许处理多少个握手」压到一个很低的固定值，让单个来源无法用握手洪泛耗尽 CPU。
+
+值得强调的是 ratelimiter 在驱动里是全局基础设施，而不是某个接口私有的开关。它在 `main.c` 的模块初始化链路里随 `wg_device_init` 一并初始化（`device.c` 调用 `wg_ratelimiter_init`），用引用计数支持多次初始化与反初始化。更关键的是，它校验的对象是「网络命名空间加源 IP」这个二元组，而不是 peer——因为在握手发起阶段，响应端根本还不知道对方是哪个 peer：发起报文里的静态身份是加密的，必须先做昂贵的握手才能解出来。正因为身份认证之前就需要限速，限速键只能是源 IP。这一点决定了 ratelimiter 的实现形态：一个以源 IP 指纹为键、跨所有接口共享的全局哈希表，配上基于令牌桶的频率判定与一套垃圾回收机制。本篇逐函数解读这套实现。事实锚点仍是 `_wglinux_build/upstream_src/wireguard-linux-src/`，下文路径相对该根目录，具体常量与字段均来自本快照，个别细节需对照目标内核版本核验。
+
+从设计哲学看，ratelimiter 与 cookie 是互补的两层：cookie 是「准入证」，验证源地址归属且只在负载高时启用；ratelimiter 是「节流阀」，对通过准入的源地址施加持续的频率上限，且始终启用。两者在代码上直接串联——`wg_cookie_validate_packet` 的最后一步就是调用 `wg_ratelimiter_allow`，只有令牌桶也放行，返回值才是最高等级 `VALID_MAC_WITH_COOKIE`。另有第三层在更前面：Noise 握手的发起频率在 `send.c` 里由 `REKEY_TIMEOUT` 与 `last_sent_handshake` 约束，那是发送端的自我节流；ratelimiter 则是接收端对外部世界的强制节流。三层叠加，才构成「既不误伤正常 handshake，又扛得住洪泛」的完整防护（cookie 那层见 06-09）。
+
+### 2. 核心概念
+
+理解 ratelimiter，抓住五个概念：令牌桶、源 IP 指纹、哈希分片、垃圾回收、RCU 与锁的分工。
+
+令牌桶是本实现的核心算法，但它用一个很讨巧的计量单位——纳秒。常量定义在 `ratelimiter.c` 的 `enum` 里：`PACKETS_PER_SECOND = 20` 规定稳态速率，`PACKETS_BURSTABLE = 5` 规定突发容量，`PACKET_COST = NSEC_PER_SEC / PACKETS_PER_SECOND` 即每个包花费 50 毫秒的「额度」，`TOKEN_MAX = PACKET_COST * PACKETS_BURSTABLE` 即桶的上限为 250 毫秒。每个条目保存一个 `tokens`（单位纳秒）和 `last_time_ns`；每次请求到来，先按真实流逝时间补充令牌并封顶到 `TOKEN_MAX`，再判断 `tokens >= PACKET_COST`，够就扣掉 50 毫秒并放行，不够就拒绝。稳态下补充速率与消耗速率相等，于是每个源地址稳定在每秒约 20 个握手；而桶里最多存 250 毫秒额度，允许短时间突发约 5 个包。源码注释明确说它「灵感来自 nft_limit.c，但略有不同」——不同点在于它把突发额度并入令牌上限，而不是并入速率。这些是编译期常量，不是用户可调参数（常量全集见 04-06）。
+
+源 IP 指纹指限速键不是五元组，而是「网络命名空间指针 + 源 IP」。IPv4 取完整的 32 位 `saddr`；IPv6 只取前 64 位，源码注释写明「只用 64 位，以便按整个 /64 限速」。二元组用 `hsiphash` 加随机密钥哈希到桶索引，哈希密钥在初始化时由 `get_random_bytes` 生成，攻击者无法预测，也就无法通过精心构造源 IP 来制造哈希碰撞、把条目都挤到同一个桶里。哈希密钥随机化是抗哈希洪泛攻击的关键设计。
+
+哈希分片指全局有两张哈希表 `table_v4` 与 `table_v6`（后者受 `CONFIG_IPV6` 保护），每张是 `table_size` 个 `hlist_head` 桶的数组。表大小按内存估算：内存大于 1GB 时固定 8192，否则按内存大小折算并向上取 2 的幂、最小 16；最大条目数 `max_entries = table_size * 8`。每张表由全局自旋锁 `table_lock` 保护插入与删除，但查找走 RCU，不需要持这把锁。
+
+垃圾回收指超过一秒没有更新的条目会被 `wg_ratelimiter_gc_entries` 回收，避免表被长期不活跃的源地址占满。它挂在一个可延迟工作队列 `gc_work` 上，每 `HZ`（即一秒）调度一次，工作队列选的是 `system_power_efficient_wq`，属于 deferrable 类型——系统空闲时不会因为回收任务而额外唤醒 CPU。回收条目的判定条件是 `now - entry->last_time_ns > NSEC_PER_SEC`，与调度周期正好对齐。
+
+RCU 与锁的分工体现了典型的内核并发套路：遍历查找用 `rcu_read_lock` 加 `hlist_for_each_entry_rcu`，可以无锁并发读；条目的令牌字段由条目自己的 `spinlock_t lock` 保护，避免同桶多条目互相阻塞；插入用 `hlist_add_head_rcu` 且持 `table_lock`，删除用 `hlist_del_rcu` 后 `call_rcu` 延迟释放，保证正在进行的读者不会访问到已释放内存。四段式随查如下：（字段见 05-08 ｜ 参数见 04-06 ｜ 原理见 06-13 ｜ 模块见 07-10）。
+
+### 3. 关键数据结构与源码位置
+
+ratelimiter 的对外接口极简，全部声明在 `ratelimiter.h`：`wg_ratelimiter_init`、`wg_ratelimiter_uninit` 与 `wg_ratelimiter_allow`，另有一个 `DEBUG` 编译下才存在的 `wg_ratelimiter_selftest`。真正的实现集中在 `ratelimiter.c`，其中 `struct ratelimiter_entry` 是核心结构，字段为 `last_time_ns`、`tokens`、`ip`、`net`、`lock`、`hash` 与 `rcu`；全局量包括 `entry_cache`、`key`、`table_lock`、`init_lock`、`init_refcnt`、`total_entries`、`max_entries`、`table_size`、`gc_work`、`table_v4` 与 `table_v6`。这些结构的逐字段含义交给 05-08，本篇只点名不展开。调用侧，除 `device.c` 的初始化调用与 `cookie.c` 的 `wg_ratelimiter_allow` 调用外，`main.c` 在 `DEBUG` 构建下会跑 `wg_ratelimiter_selftest()` 自检，失败则模块加载返回 `-ENOTRECOVERABLE`。
+
+下面这张表把本篇反复引用的源码位置收拢成速查。
+
+| 关注点 | 真实源码路径 | 本册处理方式 |
+|---|---|---|
+| 对外 API 声明 | `ratelimiter.h` | 只点名，字段见 05-08 |
+| 条目结构与常量 | `ratelimiter.c` 的 `ratelimiter_entry`、`PACKETS_PER_SECOND`、`TOKEN_MAX` | 讲机制，不列字段表 |
+| 令牌桶判定 | `ratelimiter.c` 的 `wg_ratelimiter_allow` | 逐段讲算法 |
+| 哈希表与 RCU 插入 | `ratelimiter.c` 的 `wg_ratelimiter_allow` 中 `hlist_add_head_rcu`、`table_lock` | 讲并发模型 |
+| 垃圾回收与延迟释放 | `ratelimiter.c` 的 `wg_ratelimiter_gc_entries`、`entry_uninit`、`entry_free` | 讲回收链路 |
+| 初始化与反初始化 | `ratelimiter.c` 的 `wg_ratelimiter_init`、`wg_ratelimiter_uninit` | 讲引用计数与回滚 |
+| 模块入口调用点 | `main.c`、`device.c` | 只点名，模块见 07-10 |
+
+### 4. 关键流程与调用链
+
+先看初始化。`wg_ratelimiter_init` 在 `init_lock` 互斥下把 `init_refcnt` 加一，只有等于 1 时才真正建表，否则直接返回——这让初始化可重入且线程安全。真正的建表分四步：用 `KMEM_CACHE` 创建 `ratelimiter_entry` 的 slab 缓存；按内存算出 `table_size` 与 `max_entries`；用 `kvzalloc_objs` 分别分配 v4 与 v6 的桶数组；最后把 `gc_work` 挂到 `system_power_efficient_wq` 延迟一秒执行，并用 `get_random_bytes` 生成 hsiphash 密钥。任何一步失败都走 `goto` 标签回滚已分配的资源并返回 `-ENOMEM`，这是内核模块的标准写法。反初始化 `wg_ratelimiter_uninit` 对称执行：引用计数减到零时先用 `cancel_delayed_work_sync` 取消回收工作，再以 `NULL` 为参数调用 `wg_ratelimiter_gc_entries` 清空全部条目，随后 `rcu_barrier` 等待所有延迟释放完成，最后释放两张表并销毁 slab 缓存。
+
+再看核心判定函数 `wg_ratelimiter_allow`。它先取 `net_word = (unsigned long)net`，注释解释只取指针的低半部分，这样 hsiphash 的 `len` 参数能放进最后一个 u32，省掉一轮哈希。IPv4 分支把 `saddr` 强转为 u64 的 `ip`，用 `hsiphash_2u32(net_word, ip, &key)` 与 `table_size - 1` 按位与得到桶下标；IPv6 分支把 `saddr` 前 8 字节拷进 `ip`，用 `hsiphash_3u32(net_word, ip >> 32, ip, &key)` 定位（注意传入的两个 32 位半字合起来就是那个 /64 指纹）。随后在 `rcu_read_lock` 下遍历桶，若某条目的 `net` 与 `ip` 都匹配，就在条目自旋锁下更新令牌：先算 `tokens = min(TOKEN_MAX, entry->tokens + now - entry->last_time_ns)`，把 `last_time_ns` 设为当前时间，再判 `tokens >= PACKET_COST` 决定放行与否，放行则扣掉一个包的花费。没找到匹配条目时，先 `atomic_inc_return(&total_entries)` 并检查是否超过 `max_entries`，超了则回退计数并返回 false；否则从 slab 分配新条目，初始化 `last_time_ns` 为当前时间、`tokens = TOKEN_MAX - PACKET_COST`，在 `table_lock` 下用 `hlist_add_head_rcu` 插入桶首并返回 true——所以某个源 IP 的第一个握手总是被放行，这也解释了为什么单靠 ratelimiter 挡不住「一个包」的探测，那正是 cookie 层要补的位。
+
+回收链路 `wg_ratelimiter_gc_entries` 接受一个 `work` 参数：为空表示清空全部条目（反初始化路径），非空表示常规回收。它遍历两张表的每个桶，在 `table_lock` 下用 `hlist_for_each_entry_safe` 检查每个条目，`!work` 或空闲超过一秒就调用 `entry_uninit`；后者用 `hlist_del_rcu` 摘链再 `call_rcu` 注册 `entry_free` 回调，回调里 `kmem_cache_free` 释放对象并 `atomic_dec` 减计数。每处理完一个桶若处于常规回收模式就 `cond_resched` 让出 CPU，避免大表扫描造成调度延迟；扫描结束后重新 `queue_delayed_work` 把回收工作再次排入队列，形成周期循环。整条链路见图 06-10-01。
+
+:::figure id=06-10-01 | name=ratelimiter 令牌桶判定与回收链路 | dir=TD
+node r1 "握手到达<br/>取 net 与源 IP" blue
+node r2 "hsiphash 定位<br/>v4/v6 桶" teal
+node r3 "RCU 查找<br/>匹配条目" purple
+node r4 "补令牌并封顶<br/>扣 50ms" green
+node r5 "放行握手" green
+node r6 "拒绝并返回 false" red
+node r7 "新建条目<br/>插桶首" blue
+node r8 "超 max_entries" red
+node r9 "gc 扫描<br/>空闲超 1 秒" amber
+node r10 "call_rcu<br/>延迟释放" gray
+edge r1 -> r2 "指纹"
+edge r2 -> r3 "遍历"
+edge r3 -> r4 "命中"
+edge r4 -> r5 "够 50ms"
+edge r4 -> r6 "不够"
+edge r3 -> r7 "未命中"
+edge r7 -> r8 "条目满"
+edge r7 -> r5 "首包放行"
+edge r9 -> r10 "回收"
+edge r10 -> r3 "释放后"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「握手到达取 net 与源 IP」经「hsiphash 定位 v4/v6 桶」到「RCU 查找匹配条目」；命中则「补令牌并封顶扣 50ms」，令牌够就「放行握手」、不够就「拒绝并返回 false」；未命中则「新建条目插桶首」，若「超 max_entries」则拒绝，否则「首包放行」；旁路是「gc 扫描空闲超 1 秒」的条目经「call_rcu 延迟释放」后再回到查找流程。
+
+### 5. 配置/命令/代码实例
+
+ratelimiter 没有用户态参数，速率由编译期常量固化。下面这段节选最能说明令牌桶判定的实质（为便于阅读做了简化，具体格式需对照实际版本核验）：
+
+```c
+bool wg_ratelimiter_allow(struct sk_buff *skb, struct net *net)
+{
+	/* ... 省略协议分支与 hsiphash 定位桶的代码 ... */
+	rcu_read_lock();
+	hlist_for_each_entry_rcu(entry, bucket, hash) {
+		if (entry->net == net && entry->ip == ip) {
+			spin_lock(&entry->lock);
+			now = ktime_get_coarse_boottime_ns();
+			tokens = min_t(u64, TOKEN_MAX,
+				       entry->tokens + now - entry->last_time_ns);
+			entry->last_time_ns = now;
+			ret = tokens >= PACKET_COST;
+			entry->tokens = ret ? tokens - PACKET_COST : tokens;
+			spin_unlock(&entry->lock);
+			rcu_read_unlock();
+			return ret;
+		}
+	}
+	rcu_read_unlock();
+	/* ... 未命中则新建条目并 hlist_add_head_rcu ... */
+}
+```
+
+这段代码有两处值得反复读：`min_t` 的封顶保证令牌不会无限累积，从而把突发限制在 `TOKEN_MAX`；`last_time_ns = now` 无条件更新，意味着即使这次被拒绝，时间也照常推进，被拒绝的源不会被「欠费累积」而在下一刻突然放行。运维侧无法直接查看令牌桶读数，但可以借动态调试与状态输出间接判断握手是否被压住：
+
+```bash
+# 打开 wireguard 模块动态调试
+echo 'module wireguard +p' > /sys/kernel/debug/dynamic_debug/control
+# 查看握手是否持续推进
+wg show wg0
+# 观察握手相关的内核日志
+dmesg | grep -i wireguard | tail -n 20
+```
+
+下面是对应的输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+interface: wg0
+  public key: <本端公钥>
+  listening port: 51820
+peer: <对端公钥>
+  endpoint: 198.51.100.9:51820
+  latest handshake: 2 minutes ago
+  transfer: 640 B received, 320 B sent
+[12345.678] wireguard: wg0: Receiving handshake initiation from peer 3 (198.51.100.9:51820)
+[12346.101] wireguard: wg0: Sending handshake response to peer 3 (198.51.100.9:51820)
+```
+
+逐行判读如下。第一至第三行是 `wg show` 对 `WG_CMD_GET_DEVICE` 结果的渲染，`interface`、`public key`、`listening port` 分别对应 device 层的接口名、公钥与 UDP 监听端口（常量见 04-06）。第四至第六行是 peer 段：`endpoint` 对应 `WGPEER_A_ENDPOINT`；`latest handshake` 对应 `WGPEER_A_LAST_HANDSHAKE_TIME`，显示「2 minutes ago」说明握手已经很旧，结合下两行日志能区分是「根本没收到握手」还是「收到但处理受限」；`transfer` 对应 `WGPEER_A_RX_BYTES` 与 `WGPEER_A_TX_BYTES`，只有握手成功后才会增长。第七、第八行是动态调试日志：`Receiving handshake initiation` 来自 `receive.c` 成功进入发起报文处理分支后的 `net_dbg_ratelimited`，`Sending handshake response` 来自 `send.c` 的 `wg_packet_send_handshake_response`，两者成对出现说明一次握手被正常处理。关键判断在于：ratelimiter 被拒绝时并不会打印专门日志（`wg_ratelimiter_allow` 只返回 false），因此若日志里发起报文稀疏、间隔明显拉长，且 `latest handshake` 持续变旧而流量停滞，就要怀疑该源 IP 被令牌桶限住——稳态上限来自 `PACKET_COST = 50ms` 推得的每秒约 20 次，突发上限来自 `TOKEN_MAX / PACKET_COST = 5`。这些是源码常量推导，不是绝对性能承诺，实际握手速率需在目标机型实测（基准方法见 08-01）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把限速理解成「每 peer 每秒 20 次」。实际上键是「网络命名空间 + 源 IP」，与 peer 无关；多个 peer 若在同一个 NAT 后面共享一个公网源 IP，它们会共用同一个令牌桶，可能出现「一个 peer 频繁重握手把其他 peer 的握手额度吃掉」的现象。排查多 peer 握手异常时，这一点必须纳入考虑。第二个陷阱是把 IPv6 当成按单地址限速：源码明确只取前 64 位，也就是按整个 /64 网段限速，同一 /64 下的多个地址共享额度。
+
+第三个陷阱是期待通过配置调速率。`PACKETS_PER_SECOND`、`PACKETS_BURSTABLE` 都是编译期常量，没有 sysfs 或模块参数暴露给用户态；需要改变速率只能改源码重编译，这在实践中很少做，因为 20/秒对正常握手已经足够宽裕。第四个陷阱是把 ratelimiter 当作数据面限速器：它只作用于 `wg_cookie_validate_packet` 这条握手校验路径，数据报文的速率不受它约束，数据面靠会话密钥与抗重放窗口处理（抗重放见 06-08）。第五个陷阱是忽略首包放行：新源 IP 的第一个握手总是被接受（条目以 `TOKEN_MAX - PACKET_COST` 初始化），所以单个伪造包的探测无法被 ratelimiter 挡住，必须与 cookie 配合。
+
+最佳实践可归纳为三点。其一，把三层防护作为一个整体看待：发送端 `REKEY_TIMEOUT` 自我节流、cookie 源地址归属证明、ratelimiter 频率上限，任何一层单独拿出来都有缺口（三层分工见 06-09）。其二，部署多 peer 或 NAT 场景时，留意源 IP 共享桶带来的相互影响，必要时通过调整 keepalive 与重传节奏降低握手密度（定时器体系见 06-11），而不是指望放宽 ratelimiter。其三，做容量规划时以「每秒每源约 20 次握手、突发约 5 次」为源码推导的量级参考，绝不当作实测数字，具体表现需在目标机型与真实流量下验证（调优见 08-02）。另外提醒，本快照的 `selftest` 目录可能未随快照提供完整实现，涉及自检细节以目标内核源码为准。
+
+### 7. 小结与延伸阅读
+
+本篇把 ratelimiter 定位为「基于源 IP 指纹的、全局无状态令牌桶握手限速器」：它以「网络命名空间 + 源 IP」（IPv6 为 /64）为键，用随机密钥的 hsiphash 定位 v4/v6 全局哈希表，靠 `wg_ratelimiter_allow` 在条目自旋锁下按纳秒计量补充并扣除令牌，稳态约每秒 20 次、突发约 5 次；新条目首包放行、超限则拒绝；超过一秒不活跃的条目由 `wg_ratelimiter_gc_entries` 经 `call_rcu` 延迟回收，查找走 RCU、插入删除由 `table_lock` 串行化。它与 cookie 在 `wg_cookie_validate_packet` 末尾直接串联，共同构成「准入证 + 节流阀」的组合防线。
+
+延伸阅读建议按三条线走：令牌桶算法与哈希表的并发细节见 06-13，条目字段的逐项解释见 05-08，初始化在模块链路中的位置见 06-01。跨册随查按（字段见 05-08 ｜ 参数见 04-06 ｜ 原理见 06-13 ｜ 模块见 07-10）执行：结构体逐字段去 05，常量全集去 04，机制与调用链去 06，目录级模块能力去 07，运维与基准去 08。凡本篇标注「需对照实际版本核验」的字段、常量与函数名，均以 `_wglinux_build/upstream_src/` 下对应文件为准，本套资料不编造未核验的路径与取值。

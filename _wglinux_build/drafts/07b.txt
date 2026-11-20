@@ -1,0 +1,327 @@
+## 07-03 peer.c 对等体管理模块
+
+### 1. 背景与动机
+
+如果说 `device.c` 回答的是「一个 WireGuard 接口如何诞生与消亡」，那么 `peer.c` 回答的就是「接口下的每一个对等体如何诞生与消亡」。在 WireGuard Linux 中，对等体并不是一条静态配置记录，而是一个被多条执行路径同时引用的活对象：配置面通过 netlink 创建它，发送路径通过 allowedips trie 找到它，握手引擎在它身上维护握手状态与三把密钥，定时器模块为它挂上重传、keepalive 与密钥清零定时器，接收路径又通过 index 哈希表在它身上做运行时查找。这些路径运行在不同的上下文——进程上下文、软中断、workqueue、NAPI poll——它们对同一个 `wg_peer` 的引用可以并存且相互交错。于是 `peer.c` 的核心职责不是「增删一个配置条目」，而是为这个活对象定义一套在所有上下文都成立的生命周期规则：谁可以引用它，引用何时有效，删除何时才真正释放内存。
+
+这份职责的复杂度集中在销毁一侧。内核不能在一个数据包正持有 peer 指针、或一个 workqueue 任务正在处理 peer 队列时，就把 peer 的内存释放掉，否则会产生释放后使用（use-after-free）。但销毁又必须及时：一旦用户执行删除对等体，新的握手、新的数据包就不能再绑定到这个 peer 上。Linux 内核给出的标准答案是「引用计数 + RCU 宽限期」的双阶段释放，再叠加一个单向的 `is_dead` 闸门。`peer.c` 全文不到 240 行，却把这套机制完整落实在 `wg_peer_create`、`wg_peer_remove`、`peer_make_dead`、`peer_remove_after_dead`、`kref_release`、`rcu_release` 这一组函数里。读懂它们，就读懂了 WireGuard Linux 并发模型的骨架（并发与 RCU 总论见 06-13）。
+
+本篇以源码为准逐函数解读。事实锚点是 `_wglinux_build/upstream_src/wireguard-linux-src/drivers/net/wireguard/` 下的 `peer.c`、`peer.h`、`peerlookup.h`，以及被调用到的 `noise.c`、`timers.c`、`device.c`、`allowedips.c`、`messages.h`。这里先声明一个快照边界：`Makefile` 中列有 `peerlookup.o` 与 `netlink.o`，但本快照的驱动目录里并没有 `peerlookup.c` 与 `netlink.c` 的实体文件；因此本篇对两张哈希表的讲解严格限定在 `peerlookup.h` 的声明与 `peer.c`、`noise.c` 的调用点，哈希函数的内部实现与 netlink 侧的插入、删除调用链需对照完整上游树核验，绝不凭空补写。这种「只讲源码里看得见的部分」的口径贯穿全篇，凡超出快照的内容都会显式标注需要核验。
+
+### 2. 核心概念
+
+理解 `peer.c` 要先建立四个概念。
+
+第一，**peer 是配置面与数据面的汇合点**。一个 `wg_peer` 代表一个对端身份，它的身份标识是对端公钥，但它在内核里同时携带握手状态、当前/前一个/下一个三把密钥、endpoint 与目的缓存、 staging 队列、发送与接收 prev_queue、若干定时器、两个 work_struct、一个 NAPI 结构、一条 `peer_list` 链表节点、一条 `allowedips_list` 链表节点，以及一个 `internal_id`。这种「一个结构承载多种状态」的设计，正是它能成为汇合点的原因，也决定了销毁时必须逐一清理这些子状态，不能只 `kfree` 了事。结构的逐字段定义属于 05 册的范围（字段见 05-03），本篇只讲这些字段在生命周期中何时被初始化、何时被清理。
+
+第二，**三套查找结构各司其职**。配置态用 `peer_list`（`wg_device` 里的双链表）与 `pubkey_hashtable`（按公钥查 peer）；运行态用 `index_hashtable`（按报文里的 32 位 index 查握手条目或密钥对）；路由态用 allowedips trie（按 IP 前缀查 peer）。`peer.c` 同时操作前两套：创建时 `list_add_tail` 挂入 `peer_list` 并 `wg_pubkey_hashtable_add` 挂入公钥哈希表；销毁时对应地摘链与 `wg_pubkey_hashtable_remove`。运行态的 `index_hashtable` 则不在 `peer.c` 直接增删条目，而是在引用归零的 `kref_release` 里通过 `wg_index_hashtable_remove` 摘掉握手条目，密钥对条目的摘除由 `noise.c` 的 `wg_noise_keypairs_clear` 代为完成。把「配置态查找」与「运行态查找」分开，是理解 `peer_make_dead` 为何先摘前者、后摘后者的关键。
+
+第三，**双阶段释放**。强引用由 `kref` 计数；当最后一个 `wg_peer_put` 让计数归零，`kref_release` 被调用，它把 peer 从运行态 index 哈希表摘除、清理尚未发出的暂存包，然后调用 `call_rcu(&peer->rcu, rcu_release)`。注意此时内存并没有释放：RCU 要保证所有在 `rcu_read_lock_bh()` 临界区里已经拿到 peer 指针的读者都走完，才会回调 `rcu_release`。`rcu_release` 里先销毁 `endpoint_cache` 的目的缓存，断言发送与接收 prev_queue 已空，再用 `memzero_explicit` 把整个 peer 结构清零——这一步顺带抹掉残留的握手密钥材料——最后才 `kmem_cache_free`。因此「引用归零」与「内存释放」之间隔着一段 RCU 宽限期，这段窗口是设计使然，不是内存泄漏。
+
+第四，**`is_dead` 是单向闸门**。`peer_make_dead` 用 `WRITE_ONCE(peer->is_dead, true)` 打上死亡标记，之后不再允许新的引用从一个上下文跳到另一个上下文。源码注释给出的推理很具体：标记后 `add_new_keypair` 不再创建密钥对（`is_dead` 保护），于是 `wg_index_hashtable_lookup` 最终总返回空；从公钥哈希表摘除后，握手响应最多只能发生一次，且不会再拿到新的引用。闸门一旦置位永不复位——用同一公钥重新添加对等体，得到的是一个拥有全新 `internal_id` 的新 `wg_peer`，而不是复活旧对象。这一点在按日志排查时非常重要（日志关联见 08-04）。
+
+下表把本篇反复用到的源码位置收拢成速查表，便于与后文对照。
+
+| 关注点 | 真实源码路径 | 本册处理方式 |
+|---|---|---|
+| peer 创建与销毁主逻辑 | `drivers/net/wireguard/peer.c` | 本篇逐函数讲实现 |
+| peer 结构定义 | `drivers/net/wireguard/peer.h` | 只点名，字段见 05-03 |
+| 两张查找表声明 | `drivers/net/wireguard/peerlookup.h` | 讲声明与用途，实现需核验 |
+| 设备侧容器与锁 | `drivers/net/wireguard/device.h` 的 `wg_device` | 只点名，字段见 05-02 |
+| 路由 trie 接入 | `drivers/net/wireguard/allowedips.c` | 只讲调用，实现见 07-04 |
+| 握手与密钥对清理 | `drivers/net/wireguard/noise.c` | 只讲调用，原理见 06-02、06-03 |
+| 定时器停止 | `drivers/net/wireguard/timers.c` | 只讲调用，原理见 06-11 |
+| 上限常量 | `drivers/net/wireguard/messages.h` 的 `enum limits` | 只给取值，常量全集见 04-06 |
+
+### 3. 关键数据结构与源码位置
+
+`struct wg_peer` 定义在 `peer.h:37`，是本篇的主角。它与 `peer.c` 的调用关系可以这样理解：`wg_peer_create` 负责一次性初始化其中的绝大多数成员，`peer_make_dead` 与 `peer_remove_after_dead` 负责分期注销，`kref_release` 与 `rcu_release` 负责最终清零与释放。成员包括反向指向 `wg_device` 的 `device`、握手状态 `handshake`、密钥对集合 `keypairs`、endpoint 与 `endpoint_cache`、`endpoint_lock` 读写锁、五个 `timer_list`、`refcount` 与 `rcu`、两条链表节点 `peer_list` 与 `allowedips_list`、`napi` 结构，以及单调递增的 `internal_id`。逐字段含义与偏移属于 05 册（字段见 05-03），这里只强调三个与生命周期直接相关的成员：`refcount` 是强引用计数，`is_dead` 是单向闸门，`parent_bit_packed` 式的编码技巧在本模块没有出现但会出现在 trie 模块（见 07-04）。
+
+`peerlookup.h` 声明了两张内核哈希表。第一张是 `struct pubkey_hashtable`，用 `DECLARE_HASHTABLE(hashtable, 11)` 声明，即 2 的 11 次方共 2048 个桶，配一把 `siphash_key_t` 类型的 `key` 与一把 `struct mutex lock`；对外提供 `wg_pubkey_hashtable_alloc`、`_add`、`_remove`、`_lookup` 四个操作。它服务于配置态与握手入口：收到握手请求时，用对端公钥查表定位 peer（`noise.c` 的 `wg_pubkey_hashtable_lookup` 即为一处调用点）。第二张是 `struct index_hashtable`，用 `DECLARE_HASHTABLE(hashtable, 13)` 声明，即 8192 个桶，配一把 `spinlock_t lock`；其条目 `struct index_hashtable_entry` 含 `peer` 指针、`hlist_node index_hash`、`enum index_hashtable_type type` 与 `__le32 index`。类型枚举只有两个取值：`INDEX_HASHTABLE_HANDSHAKE`（值为 `1U << 0`）与 `INDEX_HASHTABLE_KEYPAIR`（值为 `1U << 1`），分别对应握手条目与密钥对条目。对外提供 `_alloc`、`_insert`、`_replace`、`_remove`、`_lookup` 五个操作。这张表服务于运行态：`noise.c` 用它按报文 index 找握手或密钥对，`peer.c` 在 `kref_release` 里摘除握手条目。
+
+`struct wg_device` 定义在 `device.h:40`，它把 `peer_hashtable`、`index_hashtable`、`peer_allowedips`、`peer_list`、`num_peers` 与 `device_update_lock` 组织在一起（字段见 05-02）。`peer.c` 的每个公开函数开头几乎都有一行 `lockdep_assert_held(&wg->device_update_lock)`，这是在告诉锁依赖检查器：调用者必须已经持有这把 mutex。换言之，peer 的创建与删除是配置面串行化的操作，不是任意上下文都能调用的。与之相对，查找路径走 RCU，不加这把锁，这是读写分离的关键。
+
+常量方面，`messages.h` 的 `enum limits` 给出两个与本篇直接相关的取值：`MAX_PEERS_PER_DEVICE = 1U << 20`（即 1048576），是单个接口允许的对等体上限；`MAX_STAGED_PACKETS = 128`，是 `staged_packet_queue` 在 `device.c` 中被裁剪到的长度。前者决定 `wg_peer_create` 的提前返回条件，后者与 `kref_release` 里 `wg_packet_purge_staged_packets` 的清理对象相关。常量的完整清单在 04 册（常量见 04-06），本册只引用与本模块直接相关的两个。
+
+`wg_peer_create` 在分配成功后依次调用了多个子系统的初始化函数，这构成一张模块间依赖图：`wg_noise_handshake_init`（握手）、`wg_cookie_init` 与 `wg_cookie_checker_precompute_peer_keys`（cookie）、`wg_timers_init`（定时器）、`wg_prev_queue_init`（收发队列）、`netif_napi_add` 与 `napi_enable`（NAPI）、`wg_pubkey_hashtable_add`（配置态查找表）。这些调用的函数体分布在本册其他篇章（握手引擎见 07-05，时限与限速模块见 07-10），本篇只说明「创建时它们被调用、销毁时它们被逆序或分阶段撤销」。这种对称性是审阅内核生命周期代码时的常用检查方法：把创建序列倒过来看，就能大致推出销毁序列应该包含哪些动作。
+
+### 4. 关键流程与调用链
+
+创建链路由配置面驱动。用户执行 `wg set wg0 peer <公钥> ...` 后，netlink 层在持有 `device_update_lock` 的前提下调用 `wg_peer_create(wg, public_key, preshared_key)`（netlink 侧调用点不在本快照，需对照完整上游核验）。函数首先做两项防御：`lockdep_assert_held` 校验锁已持有；`wg->num_peers >= MAX_PEERS_PER_DEVICE` 时直接返回 `ERR_PTR(-ENOMEM)`——注意上限触发时返回的是 `-ENOMEM` 而非其他错误码。随后 `kmem_cache_zalloc(peer_cache, GFP_KERNEL)` 从 slab 缓存取出并清零一个 peer，`dst_cache_init` 初始化 endpoint 的目的缓存；二者任一失败都走 `err` 标签释放 slab 对象。
+
+初始化阶段按固定顺序展开：设置 `peer->device` 反向指针；`wg_noise_handshake_init` 把 `handshake.entry.type` 设为 `INDEX_HASHTABLE_HANDSHAKE`、`handshake.entry.peer` 指向自身，复制对端公钥与可选预共享密钥，把状态置为 `HANDSHAKE_ZEROED` 并预计算静态静态共享密钥；`internal_id` 取自全局原子计数器 `peer_counter` 的 `atomic64_inc_return`，`serial_work_cpu` 初始化为 `nr_cpumask_bits`；cookie、定时器、密钥对更新锁、两个 work_struct、两个 prev_queue、`endpoint_lock` 读写锁、`refcount`、暂存包队列、`last_sent_handshake` 依次初始化；NAPI 侧先 `set_bit(NAPI_STATE_NO_BUSY_POLL, ...)`，再 `netif_napi_add` 并 `napi_enable`。最后把 peer 挂入两套配置态结构——`list_add_tail(&peer->peer_list, &wg->peer_list)` 与 `wg_pubkey_hashtable_add(wg->peer_hashtable, peer)`，`INIT_LIST_HEAD(&peer->allowedips_list)` 准备好后续 trie 节点挂载点，`++wg->num_peers`，并打印 `pr_debug("%s: Peer %llu created\n", ...)`。
+
+单个 peer 的删除链路是本篇最需要逐行理解的部分。`wg_peer_remove(peer)` 同样要求持有 `device_update_lock`，它按顺序做三件事：`peer_make_dead(peer)`、`synchronize_net()`、`peer_remove_after_dead(peer)`。第一步 `peer_make_dead` 先把 `peer_list` 摘掉（`list_del_init`），再调用 `wg_allowedips_remove_by_peer` 把该 peer 的全部 trie 前缀删除，再 `wg_pubkey_hashtable_remove` 从公钥表摘除，最后 `WRITE_ONCE(peer->is_dead, true)`。源码在此处留下一句关键注释：调用者现在必须执行 `synchronize_net()` 才能让它生效。这句话点破了双阶段的意义——`synchronize_net()` 等待所有已经进入 RCU 读侧临界区的读者退出，从而保证闸门真正「关严」。
+
+第二步 `peer_remove_after_dead` 以 `WARN_ON(!peer->is_dead)` 开头确认前置条件。它先 `wg_noise_keypairs_clear(&peer->keypairs)`：该函数在 `keypair_update_lock` 保护下，按 next、previous、current 的顺序把三把密钥置空，每把都调用 `wg_noise_keypair_put(old, true)`，后者从 index 哈希表摘除对应条目并递减密钥对引用。接着 `wg_timers_stop(peer)` 停掉在途定时器。随后是针对各执行上下文的两次 flush 与一次 NAPI 关闭：先 `flush_workqueue(packet_crypt_wq)` 处理加解密并行队列，再刷一次同一个工作队列以覆盖发送方向；然后 `napi_disable` 加 `netif_napi_del` 处理接收方向，源码注释强调 `netif_napi_del` 必须在进程上下文中做；最后 `flush_workqueue(handshake_send_wq)` 确保 `transmit_handshake_work`、`clear_peer_work` 之类的 work 不再在用。收尾是 `--peer->device->num_peers` 与 `wg_peer_put(peer)`——删除路径自己也要把「创建时持有的那一个引用」还回去。
+
+整表删除走的是批量路径。`wg_peer_remove_all(wg)` 在设备销毁（`device.c` 的 `wg_destruct`）时被调用。它先用 `wg_allowedips_free` 一次性释放整张 trie，避免逐 peer 遍历 trie；再用 `list_for_each_entry_safe` 遍历 `peer_list`，对每个 peer 执行 `peer_make_dead` 并把它移到临时的 `dead_peers` 链表；只做一次 `synchronize_net()` 覆盖全部 peer；最后遍历 `dead_peers` 逐个调用 `peer_remove_after_dead`。把「摘配置态」与「等宽限期 + 清运行态」拆成两个循环，是这段代码的性能要点：昂贵的 `synchronize_net()` 只付一次代价。
+
+释放链路由引用计数收口。最后一个 `wg_peer_put` 触发 `kref_put(&peer->refcount, kref_release)`。`kref_release` 打印 `Peer %llu ... destroyed` 的调试日志，用 `wg_index_hashtable_remove(peer->device->index_hashtable, &peer->handshake.entry)` 摘掉握手条目，调用 `wg_packet_purge_staged_packets(peer)` 丢弃未来得及发送的暂存包，然后 `call_rcu(&peer->rcu, rcu_release)`。宽限期过后 `rcu_release` 做真正的收尾：`dst_cache_destroy`、`WARN_ON` 断言收发 prev_queue 已空、`memzero_explicit(peer, sizeof(*peer))` 清零敏感材料、`kmem_cache_free` 归还 slab 对象。`device.c` 在 `wg_peer_remove_all` 之后还调用了 `rcu_barrier()`，确保在释放哈希表本身之前所有 peer 都已被真正回收。
+
+引用获取有两条路径，区别必须记牢。`peer.h` 里的内联函数 `wg_peer_get(peer)` 直接 `kref_get`，不做归零检查，调用者必须已经持有一个有效引用（例如刚从 RCU 查找拿到且仍在临界区内）。`peer.c` 里的 `wg_peer_get_maybe_zero(peer)` 则用 `RCU_LOCKDEP_WARN(!rcu_read_lock_bh_held(), ...)` 强制要求持有 RCU 读锁，再用 `kref_get_unless_zero` 尝试加引用；若对象已经归零则返回 `NULL`。这个「可能失败」的获取方式正是 allowedips 查找与 index 查找在并发删除下仍然安全的根本原因（路由查找见 07-04，index 查找原理见 06-06）。
+
+下面这张图把 peer 从创建到释放的状态迁移串起来，重点标出闸门、宽限期与双阶段释放的位置。
+
+:::figure id=07-03-01 | name=wg_peer 从创建到释放的生命周期状态机 | dir=TD
+node p1 "wg_peer_create<br/>slab 分配与初始化" teal
+node p2 "配置态挂载<br/>peer_list 与 pubkey_hash" blue
+node p3 "活跃期<br/>kref 与 RCU 多上下文引用" green
+node p4 "peer_make_dead<br/>摘链并置 is_dead" amber
+node p5 "synchronize_net<br/>等待 RCU 宽限期" purple
+node p6 "peer_remove_after_dead<br/>清密钥定时器与 NAPI" red
+node p7 "kref_release<br/>摘 index 表并 call_rcu" blue
+node p8 "rcu_release<br/>清零并归还 slab" gray
+edge p1 -> p2 "初始化完成"
+edge p2 -> p3 "对外可见"
+edge p3 -> p4 "收到删除请求"
+edge p4 -> p5 "闸门关闭"
+edge p5 -> p6 "读者已退出"
+edge p6 -> p7 "put 归零"
+edge p7 -> p8 "宽限期结束"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：`wg_peer_create` 经 slab 分配与初始化后进入「配置态挂载」，把 peer 挂进 `peer_list` 与公钥哈希表；此后是「活跃期」，多个上下文通过 kref 与 RCU 同时引用；删除请求到来先走 `peer_make_dead` 摘链并置位 `is_dead`，再由 `synchronize_net` 等待 RCU 宽限期，随后 `peer_remove_after_dead` 清理密钥、定时器与 NAPI，并把创建时持有的引用 `put` 掉；引用归零触发 `kref_release` 摘除运行态 index 条目并 `call_rcu`，最终 `rcu_release` 清零内存并归还 slab。
+
+### 5. 配置/命令/代码实例
+
+从运维视角看，`peer.c` 的行为通过 netlink 间接暴露：添加、修改、删除对等体分别对应 `wg set wg0 peer <公钥> ...`、`wg set wg0 peer <公钥> ...` 与 `wg set wg0 peer <公钥> remove`。下面这段用最小配置演示一个 peer 从创建到删除的过程；参数全集与配置语义不在本册展开（参数见 04-02）。
+
+```bash
+# 建立接口并添加一个对等体：这一步最终走到 wg_peer_create
+ip link add wg0 type wireguard
+ip address add 10.0.0.1/24 dev wg0
+wg set wg0 private-key ./privatekey listen-port 51820
+wg set wg0 peer <对端公钥> endpoint 203.0.113.9:51820 allowed-ips 10.0.0.2/32
+ip link set wg0 up
+wg show wg0
+# 删除该对等体：这一步最终走到 wg_peer_remove
+wg set wg0 peer <对端公钥> remove
+wg show wg0
+```
+
+为了把源码与命令对应起来，下面摘录删除链路的骨架代码（去掉了锁断言与部分日志，保留调用顺序；完整实现见 `peer.c`）。它展示了「摘配置态—等宽限期—清运行态—归还引用」的四段式结构。
+
+```c
+void wg_peer_remove(struct wg_peer *peer)
+{
+	if (unlikely(!peer))
+		return;
+	lockdep_assert_held(&peer->device->device_update_lock);
+
+	peer_make_dead(peer);          /* 摘 peer_list / allowedips / pubkey_hash，置 is_dead */
+	synchronize_net();             /* 等待已存在的 RCU 读者退出 */
+	peer_remove_after_dead(peer);  /* 清 keypairs、timers、wq、napi，最后 wg_peer_put */
+}
+
+static void peer_make_dead(struct wg_peer *peer)
+{
+	list_del_init(&peer->peer_list);
+	wg_allowedips_remove_by_peer(&peer->device->peer_allowedips, peer,
+				     &peer->device->device_update_lock);
+	wg_pubkey_hashtable_remove(peer->device->peer_hashtable, peer);
+	WRITE_ONCE(peer->is_dead, true);
+}
+```
+
+`wg show wg0` 在删除前的典型输出如下，用它来把每一行映射回 `wg_peer` 的成员与 `peer.c` 的动作。
+
+```text
+示例输出，具体格式需对照实际版本核验
+interface: wg0
+  public key: <本端公钥>
+  private key: (hidden)
+  listening port: 51820
+peer: <对端公钥>
+  endpoint: 203.0.113.9:51820
+  allowed ips: 10.0.0.2/32
+  latest handshake: 8 seconds ago
+  transfer: 2.40 KiB received, 1.88 KiB sent
+```
+
+逐行判读如下。首行 `interface: wg0` 来自 netlink 返回的 device 属性，确认操作对象是接口 wg0，而不是同名但位于其他网络命名空间的接口。第二行 `public key` 是本端静态身份的公钥，由 `static_identity` 派生，它不随 peer 增删而变化；本快照的 peer 公钥来自 `wg_peer_create` 的 `public_key` 入参。第三行 `private key: (hidden)` 是工具的展示层保护，私钥实际存在于内核 `wg_device` 的静态身份中，任何要求从此处复制私钥的说法都是错误的。第四行 `listening port` 对应设备的 UDP 监听端口，与单个 peer 无关。第五行 `peer:` 后是对端公钥，它在源码里被复制到 `handshake.remote_static`，同时是 `pubkey_hashtable` 的查找键——执行 `wg set ... remove` 时，正是靠这个键调用 `wg_pubkey_hashtable_remove` 把 peer 从配置态摘除；删除成功后第二次 `wg show` 将不再出现这一整段。第六行 `endpoint` 对应 `wg_peer` 的 `endpoint` 联合结构，它由运行时学习或配置写入，受 `endpoint_lock` 读写锁保护；`peer_make_dead` 并不在这里清零 endpoint，真正的清零发生在 `rcu_release` 的 `memzero_explicit`。第七行 `allowed ips` 对应挂在 `peer->allowedips_list` 上的 trie 节点，由 `wg_allowedips_insert_v4` 创建（插入与删除流程见 07-04），删除 peer 时 `peer_make_dead` 通过 `wg_allowedips_remove_by_peer` 把它们整批摘掉。第八行 `latest handshake` 对应 `walltime_last_handshake`，是判断 peer 是否真正可用的关键字段；若长期为空，说明握手从未成功，此时即使 peer 对象存在也无数据可发。第九行 `transfer` 对应 `rx_bytes` 与 `tx_bytes` 两个累计计数器，只有握手成功且 trie 路由命中时才会增长。把这两行与 `internal_id` 一起看，就能在 `pr_debug` 日志里把「某次创建/销毁」与「show 输出里的某个 peer」对应起来（排障方法见 08-03、08-04）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把 peer 当静态配置对象。很多初次阅读者以为「删除 peer 就是把它从链表摘掉再释放」，但源码明确分成 `peer_make_dead`、`synchronize_net`、`peer_remove_after_dead` 与最后的 `kref_release`/`rcu_release` 四步。若把 `synchronize_net` 省掉，或误以为 `wg_peer_put` 之后内存立即可回收，就会在并发下遇到释放后使用；理解这一点是理解整篇的门槛（并发模型见 06-13）。
+
+第二个陷阱是混用两种引用获取方式。`wg_peer_get` 不做归零检查，`wg_peer_get_maybe_zero` 才用 `kref_get_unless_zero` 容错并强制 RCU 读锁。在非 RCU 临界区里对可能已死的 peer 调用前者，等于使用悬空指针；`RCU_LOCKDEP_WARN` 只会在打开锁依赖检查的内核配置下报警，不能当成运行期保险。正确的心智模型是：凡从哈希表或 trie 拿到 peer 指针，要么立刻用 maybe_zero 加引用并判断返回值，要么在受 RCU 保护的临界区内使用完即走。
+
+第三个陷阱是期待 `is_dead` 能复位。它是单向标志，`peer_make_dead` 用 `WRITE_ONCE` 置位后没有任何清零路径。用同一公钥重新添加对等体会得到一个新 `wg_peer`，其 `internal_id` 因全局 `peer_counter` 递增而不同。因此按 `internal_id` 关联日志时，不要假设同一公钥必然对应同一 id。
+
+第四个陷阱是把 `internal_id` 当成线上协议标识。它只是本地单调计数器，出现在 `pr_debug` 与 `net_dbg` 日志里，绝不进入报文；线上用来定位握手与密钥对的是 index 哈希表里的 `__le32 index`。把两者混淆会导致对报文字段的错误解读（消息格式见 06-04、字段见 05-05）。
+
+第五个陷阱是忽略 `wg_peer_create` 的错误返回值类型。超过 `MAX_PEERS_PER_DEVICE` 时它返回 `ERR_PTR(-ENOMEM)`，调用者必须用 `IS_ERR` 判断，不能直接当指针解引用。同理，slab 分配与 `dst_cache_init` 失败也走 `ERR_PTR` 路径，`err` 标签只释放 slab 对象，不会去碰尚未初始化的子状态——这是内核错误路径「按已初始化程度反向回滚」的典范。
+
+最佳实践可归纳为四条。其一，任何调用 `wg_peer_create`、`wg_peer_remove`、`wg_peer_remove_all` 的代码都必须先持有 `device_update_lock`，让 `lockdep_assert_held` 通过；其二，接口销毁时优先用 `wg_peer_remove_all` 的批量路径，让昂贵的 `synchronize_net()` 与 `wg_allowedips_free` 各只做一次，而不是循环调用 `wg_peer_remove`；其三，排查「peer 删不掉或内存不释放」时，按 `is_dead → synchronize_net → kref 归零 → call_rcu → rcu_release` 的顺序逐段确认，尤其留意 workqueue 与 NAPI 是否被正确 flush，这是最常被遗漏的两个环节；其四，把 `wg show` 的 `latest handshake` 与 `transfer` 作为用户态确认手段，因为内核内部的 RCU 宽限期对运维不可见——删除命令返回后对象可能仍在宽限期内，但配置态已经不可查找，这已经满足语义。另外要提醒：本模块的安全边界依赖 slab 分配器与 RCU 的正确配合，`rcu_release` 里的 `memzero_explicit` 是敏感材料清零的最后一道防线，任何绕过该路径的「优化」都应被视为高风险改动。
+
+### 7. 小结与延伸阅读
+
+`peer.c` 是 WireGuard Linux 中等等体生命周期的唯一权威实现：创建时从 slab 分配并初始化握手、密钥对、cookie、定时器、队列、NAPI 与两套配置态查找结构；删除时先 `peer_make_dead` 摘掉 `peer_list`、allowedips 前缀与公钥哈希表并置位 `is_dead`，经 `synchronize_net` 等待宽限期，再由 `peer_remove_after_dead` 清理密钥对、定时器、工作队列与 NAPI；最后一个引用归零后，`kref_release` 摘除运行态 index 条目并 `call_rcu`，`rcu_release` 在宽限期结束后清零内存并归还 slab。三套查找结构（配置态链表与公钥哈希表、运行态 index 哈希表、路由态 allowedips trie）分工明确，`kref + RCU` 双阶段释放与 `is_dead` 单向闸门共同保证了并发删除的安全性。
+
+延伸阅读建议按三条线展开：想看结构全貌去 05 册读 `wg_peer` 与两张哈希表的字段（字段见 05-03）；想看配置命令与错误码去 04 册（参数见 04-02、错误码见 04-08）；想看 RCU 与多核并发的通用机制去 06 册（原理见 06-13），想看接口销毁如何调用本模块去本册相邻篇（模块见 07-02）。跨册随查按（字段见 05-03 ｜ 参数见 04-02 ｜ 原理见 06-13 ｜ 模块见 07-02）执行。凡涉及 `peerlookup.c` 内部实现、`netlink.c` 的配置入口调用链等本快照缺失的内容，均需对照 `_wglinux_build/upstream_src/` 下的完整上游树核验，本篇不编造未核验的路径与取值。
+
+## 07-04 allowedips.c 路由 trie 模块
+
+### 1. 背景与动机
+
+WireGuard 的 AllowedIPs 从来不只是一个「允许列表」。每个报文都要回答两个路由问题：出站时，目的地址属于哪个对等体，从而该把包封装发给谁；入站时，源地址是否真的属于刚刚解密出这个包的那个对等体，从而该收下还是丢弃。前者是查路由，后者是防欺骗，二者共用同一份「IP 前缀到 peer」的映射。用一个数组线性扫描前缀当然可以实现，但那意味着每个包都要做 O(n) 次比较，且 peer 数量越多越慢；WireGuard Linux 的做法是维护一棵按位分叉的二进制 trie，把查找变成沿比特位逐层下降的路径遍历，并把后缀判断压缩成几次整数运算。承载这棵 trie 的代码就是 `allowedips.c`，它对外通过 `allowedips.h` 暴露一组 API，是整个驱动里相对独立、可单独自检的一个模块。
+
+这棵 trie 的设计有几个值得先说明的约束。第一，IPv4 与 IPv6 必须共存，所以模块维护两棵树根：`root4` 处理 32 位地址，`root6` 处理 128 位地址；`MAX_ALLOWEDIPS_DEPTH` 定为 129，正好覆盖 IPv6 的 128 位加一层根节点。第二，查找必须能在软中断与 NAPI 上下文中无锁进行，因为发送路径 `device.c` 的 `wg_xmit` 与接收路径 `receive.c` 的数据处理都在这里跑；因此所有读操作都在 `rcu_read_lock_bh()` 临界区内完成，节点的释放则通过 `kfree_rcu` 或 `call_rcu` 延迟到宽限期之后。第三，写操作必须串行化，所有变更类 API 都接收一个 `struct mutex *` 参数，驱动里传入的都是 `wg_device` 的 `device_update_lock`；这与 peer 模块创建、删除时的锁要求完全一致（模块职责见 07-03）。
+
+本篇以源码为唯一权威，逐函数解读 `allowedips.c` 与 `allowedips.h`。先明确快照边界：在本驱动快照中，`wg_allowedips_insert_v4/v6`、`wg_allowedips_remove_v4/v6` 只有定义没有调用点，调用它们的代码应位于 `netlink.c`，而该文件不在本快照中；`allowedips.c` 末尾 `#include "selftest/allowedips.c"` 引用的自检文件同样不在快照目录里。因此本篇对插入、删除 API 的讲解以函数实现为准，对配置面调用链与自检覆盖只作定位说明，具体调用点需对照完整上游树核验。这种处理既保证不编造，又能把模块的对外契约讲清楚。
+
+### 2. 核心概念
+
+理解 trie 模块要抓住五个概念。
+
+第一，**双根与前缀节点**。顶层结构 `struct allowedips` 只有三个成员：指向 IPv4 树根的 `root4`、指向 IPv6 树根的 `root6`，以及一个 `u64 seq`。两个根都是 `struct allowedips_node __rcu *` 类型，结构整体以 `__aligned(4)` 声明，源码注释解释这是为了在 m68k 这类只保证 16 位对齐的平台上仍能_pack_ 根指针的低两位。`seq` 是版本号，初始化为 1，插入、删除、按 peer 删除、整表释放都会让它自增；本快照里没有看到它的消费方，配置导出侧如何使用需对照完整上游核验，本篇只陈述「自增」这一事实。
+
+第二，**节点即前缀，也可是分叉点**。`struct allowedips_node` 同时承担两种角色：当 `peer` 指针非空时，它代表一条具体的 allowedip 前缀；当 `peer` 为空时，它只是为了让两条前缀分叉而存在的中间节点。节点用 `cidr` 记录前缀长度，`bits[16]` 保存对齐到 64 位的地址字节，`bit[2]` 是按下一个比特分出的两个孩子，`bit_at_a` 与 `bit_at_b` 把「第几位」拆成字节下标与位下标，`bitlen` 记录地址族位数（32 或 128）。这些字段的逐项解释属于 05 册（字段见 05-04），本篇关注的是它们的运行语义：`choose(node, key)` 用 `(key[node->bit_at_a] >> node->bit_at_b) & 1` 取出下一个比特，从而决定往 `bit[0]` 还是 `bit[1]` 下降。
+
+第三，**最长前缀匹配由遍历顺序自然得到**。`common_bits` 用异或加 `fls`/`fls128` 计算两个地址从最高位起相同了多少位；`prefix_matches` 判断 `common_bits(node, key, bits) >= node->cidr`，即待查地址是否落在该节点前缀内。`find_node` 从根开始，只要当前节点前缀匹配就继续下降，并在每次遇到 `peer` 非空的节点时把它记为候选 `found`，直到 `cidr == bits` 或不再匹配为止；函数返回的是路径上最后一个挂了 peer 的节点。这正好实现「越具体的前缀越优先」：`10.0.0.2/32` 与 `0.0.0.0/0` 同时命中目的地址 `10.0.0.2` 时，遍历先经过 `/0` 节点记下候选，再下降到 `/32` 节点覆盖候选，最终返回 `/32` 对应的 peer。
+
+第四，**查找返回强引用**。`lookup()` 在 RCU 读侧临界区内用 `wg_peer_get_maybe_zero` 把节点里的 peer 指针升级为强引用；如果 peer 已经归零（说明删除路径正在收尾），就 `goto retry` 重新查一次。这个重试循环是与 peer 模块的双阶段释放直接咬合的地方：删除时 `peer_make_dead` 先把节点从 trie 摘掉，但如果读者在摘掉前已经看到旧指针，maybe_zero 会失败并触发重试，重试时 trie 已是新版本，从而不会拿到将死对象。调用者拿到返回值后必须 `wg_peer_put`，否则泄漏一个引用。强引用的生产与消费在 peer 模块有完整说明（见 07-03）。
+
+第五，**写者用指针交换，读者用 RCU**。插入通过 `connect_node` 完成：先把新节点的 `parent_bit_packed` 编码为「父槽位地址 | 分支位」，再用 `rcu_assign_pointer(*parent, node)` 发布。删除通过 `remove_node` 完成：清空 `peer` 指针、必要时把唯一孩子接到祖父节点、再用 `kfree_rcu` 延迟释放。`parent_bit_packed` 的低两位承载分支信息，取父槽位时必须 `& ~3UL` 掩码，这是阅读 `remove_node` 时最容易看漏的细节。由于读者只沿 `rcu_dereference_bh` 取指针，这些写操作不需要阻塞读者，读写可以真正并发。
+
+### 3. 关键数据结构与源码位置
+
+`allowedips.h` 是模块的对外契约。`allowedips.h:15` 定义 `struct allowedips_node`，其成员依次为 `struct wg_peer __rcu *peer`、`struct allowedips_node __rcu *bit[2]`、`u8 cidr, bit_at_a, bit_at_b, bitlen`、`u8 bits[16] __aligned(__alignof(u64))`，然后是放在缓存行之外、很少使用的 `unsigned long parent_bit_packed`，最后是一个 `union { struct list_head peer_list; struct rcu_head rcu; }`。这个联合很关键：节点挂着 peer 时用 `peer_list` 串进 `wg_peer` 的 `allowedips_list`，以便按 peer 批量删除；节点进入 RCU 回收流程后，同一块内存被解释为 `rcu_head`。两者复用同一存储，避免了额外指针开销。字段全集见 05-04。
+
+`allowedips.h:29` 定义 `struct allowedips`，含双根与 `seq`，并以 `__aligned(4)` 收尾。`allowedips.h:35` 起声明对外 API，可分成四组：生命周期类 `wg_allowedips_init`、`wg_allowedips_free`、`wg_allowedips_slab_init`、`wg_allowedips_slab_uninit`；变更类 `wg_allowedips_insert_v4/v6`、`wg_allowedips_remove_v4/v6`、`wg_allowedips_remove_by_peer`；查询类 `wg_allowedips_lookup_dst`、`wg_allowedips_lookup_src`；辅助类 `wg_allowedips_read_node` 与调试构建下的 `wg_allowedips_selftest`。头里还特别注明：传给 `read_node` 的 IP 指针必须按 `__alignof(u64)` 对齐，否则内部的 64 位读取会出问题。这与 `allowedips.c` 里 `u8 key[4] __aligned(__alignof(u32))`、`u8 ip[16] __aligned(__alignof(u64))` 的局部数组遥相呼应——对齐不是装饰，而是 `fls` 系列位运算能正确工作的前提。
+
+`allowedips.c` 的内部函数可以按层次归类。基础工具层有 `swap_endian`（32 位用 `be32_to_cpu`，128 位用两次 `get_unaligned_be64`）、`copy_and_assign_cidr`、`choose`、`fls128`、`common_bits`、`prefix_matches`；其中 `copy_and_assign_cidr` 在 `__LITTLE_ENDIAN` 下对 `bit_at_a` 做一次异或修正，这是字节序差异的集中处理点。遍历层有 `find_node` 与 `lookup`；插入层有 `node_placement`、`connect_node`、`choose_and_connect_node`、`add`；删除层有 `remove_node`、`remove`、`root_remove_peer_lists`、`root_free_rcu`。`push_rcu` 是释放与摘链共用的小型栈压入助手，配合 `MAX_ALLOWEDIPS_DEPTH` 大小的数组与 DEBUG 下的 `WARN_ON` 做深度保护。
+
+下表把对外 API 的契约收拢成速查表，特别注意「是否需要持锁」一列——这是本模块最容易误用的地方。
+
+| API | 作用 | 锁与上下文 | 源码位置 |
+|---|---|---|---|
+| `wg_allowedips_init` | 双根置空、`seq` 置 1 | 建链时调用，无需额外锁 | `allowedips.c:293` |
+| `wg_allowedips_insert_v4/v6` | 插入或覆盖一条前缀 | 须持传入的 `device_update_lock` | `allowedips.c:322`、`333` |
+| `wg_allowedips_remove_v4/v6` | 按前缀与 peer 精确删除 | 须持传入的 `device_update_lock` | `allowedips.c:344`、`355` |
+| `wg_allowedips_remove_by_peer` | 删除某 peer 的全部前缀 | 须持传入的 `device_update_lock` | `allowedips.c:366` |
+| `wg_allowedips_free` | 整表摘除并异步释放 | 须持传入的 `device_update_lock` | `allowedips.c:299` |
+| `wg_allowedips_lookup_dst/src` | 按目的/源地址查 peer | RCU 读侧，调用方不持写锁 | `allowedips.c:391`、`402` |
+| `wg_allowedips_read_node` | 从节点还原 IP 与掩码 | 遍历节点时调用 | `allowedips.c:378` |
+| `wg_allowedips_slab_init/uninit` | 节点 slab 的创建与销毁 | 模块初始化/退出 | `allowedips.c:412`、`418` |
+
+模块在驱动中的调用位置可以用四处证据定位：`device.c` 的 `wg_newlink` 在接口创建时调用 `wg_allowedips_init` 初始化 `wg->peer_allowedips`；`device.c` 的 `wg_xmit` 在发送路径调用 `wg_allowedips_lookup_dst` 按目的地址选 peer；`receive.c` 在解密后的数据校验中调用 `wg_allowedips_lookup_src` 按源地址反查 peer，若与解出报文的那个 peer 不一致就判为 `dishonest_packet_peer` 丢弃；`peer.c` 的 `peer_make_dead` 与 `wg_peer_remove_all` 分别调用 `wg_allowedips_remove_by_peer` 与 `wg_allowedips_free`。这四处把 trie 与设备、发送、接收、peer 四个模块连成闭环（发送模块见 07-07、接收模块见 07-08）。
+
+### 4. 关键流程与调用链
+
+插入链路从四个公开入口开始。`wg_allowedips_insert_v4` 与 `wg_allowedips_insert_v6` 的第一步都是 `++table->seq`，接着 `swap_endian` 把网络序地址转成主机序整数（IPv4 转成 32 位、IPv6 转成两个 64 位），再分别以 `bits = 32` 和 `bits = 128` 调用内部 `add(&table->root4/root6, bits, key, cidr, peer, lock)`。`add` 先挡掉 `cidr > bits` 或 `peer == NULL` 的非法输入，返回 `-EINVAL`。若目标树为空，它分配一个节点、把 peer 用 `RCU_INIT_POINTER` 挂上、`list_add_tail` 挂进 peer 的 `allowedips_list`、调用 `copy_and_assign_cidr` 写入前缀，再用 `connect_node(trie, 2, node)` 发布为根——这里的位参数 2 是根槽位的特殊编码。
+
+若树非空，`add` 调用 `node_placement` 寻找落点。该函数沿 `node->cidr <= cidr && prefix_matches(...)` 的条件下降，记录最后一个祖先 `parent`；若遇到 `cidr` 完全相等的节点就置 `exact = true` 并跳出。命中 exact 时 `add` 直接 `rcu_assign_pointer(node->peer, peer)` 并用 `list_move_tail` 把该节点从旧 peer 的链表移到新 peer 的链表——这正是「同一前缀改配给另一个 peer」在 trie 里的实现，不需要新建节点。否则分配 `newnode`，先挂在 peer 链表上，再根据 `node_placement` 返回的 `parent` 决定挂载点：若父节点的对应分支为空就直接连接；若已有孩子 `down`，则取 `cidr = min(cidr, common_bits(down, key, bits))` 作为分叉长度。接下来分两种情况：若 `newnode->cidr == cidr`，把 `down` 变成 `newnode` 的孩子并把 `newnode` 接到父节点；否则再分配一个中间节点，把 `down` 与 `newnode` 分别接到它的两个分支，再把中间节点接到父节点。第二种情况分配失败时要回滚 `newnode`：先从链表摘除再释放 slab 对象，源码在这里做了明确的错误路径处理。
+
+删除链路分「按前缀」和「按 peer」两种。按前缀的 `wg_allowedips_remove_v4/v6` 同样先 `++seq`、`swap_endian`，再调用内部 `remove`。`remove` 在树为空、`node_placement` 未命中、或命中节点的 `peer` 不等于传入 peer 时直接返回 0——注意这是静默成功，不是报错；只有命中且 peer 相符才调用 `remove_node`。`remove_node` 是整段代码最精巧的部分：先用 `list_del_init` 摘掉 peer 链表节点并用 `RCU_INIT_POINTER(node->peer, NULL)` 清除归属；若节点有两个孩子，说明它是必要的分叉点，清完 peer 就直接返回，保留节点。若只有一个孩子 `child`，先让 `child->parent_bit_packed` 继承当前节点的编码，再把孩子写进父槽位（父槽位地址由 `node->parent_bit_packed & ~3UL` 还原）。随后判断是否可以连带回收父节点：当前节点无孩子、分支位不超过 1、且父节点自身不挂 peer 时，`free_parent` 为真；此时取出父节点另一侧的兄弟，用 `kfree_rcu(node, rcu)` 释放当前节点，并把兄弟接到祖父槽位、用 `kfree_rcu(parent, rcu)` 释放父节点。这组压缩动作让「删除一条前缀」不会在 trie 里留下无用的单点分叉链。
+
+按 peer 删除走的是快捷路径。`wg_allowedips_remove_by_peer` 先看 `peer->allowedips_list` 是否为空，为空直接返回；否则 `++seq` 后用 `list_for_each_entry_safe` 遍历该链表，对每个节点调用 `remove_node`。由于每个节点都通过 `peer_list` 挂在 peer 上，这条路径不需要按地址重新查树，复杂度正比于该 peer 的前缀数。整表删除则更彻底：`wg_allowedips_free` 先 `++seq`，再用 `RCU_INIT_POINTER` 把两个根一次性置空，相当于把整棵树从逻辑视图中摘除；对旧的 v4、v6 根分别调用 `root_remove_peer_lists` 逐节点从 peer 链表摘除，再 `call_rcu(&node->rcu, root_free_rcu)`。`root_free_rcu` 在宽限期后用显式栈遍历整棵树，逐个 `kmem_cache_free`；用栈而不是递归，是为了避免深树导致内核栈溢出，这也是 `MAX_ALLOWEDIPS_DEPTH` 常量存在的意义之一。
+
+查询链路分成两条对称的公开函数。`wg_allowedips_lookup_dst` 检查 `skb->protocol`：`ETH_P_IP` 时取 `ip_hdr(skb)->daddr` 查 `root4`，`ETH_P_IPV6` 时取 `ipv6_hdr(skb)->daddr` 查 `root6`，其他协议返回 `NULL`。`wg_allowedips_lookup_src` 结构完全相同，只是取 `saddr`。两者都转进内部 `lookup(table->rootN, bits, be_ip)`：先把地址拷进按 64 位对齐的 `u8 ip[16]` 并 `swap_endian`，再 `rcu_read_lock_bh()`，进入 `retry` 标签，用 `rcu_dereference_bh` 取根并交给 `find_node`。若 `find_node` 返回了节点，就用 `wg_peer_get_maybe_zero` 升级 peer 引用；升级失败说明 peer 正在被删除，跳回 `retry` 重查；成功则 `rcu_read_unlock_bh()` 并返回强引用。调用方拿到后必须配对 `wg_peer_put`：`device.c` 的 `wg_xmit` 在成功与多个错误标签处都放了引用，`receive.c` 则在比较完 `routed_peer` 与 `peer` 之后立刻放掉，因为那里只需要校验值、不需要长期持有。
+
+最后补一句自检与 slab。`wg_allowedips_slab_init` 用 `KMEM_CACHE(allowedips_node, 0)` 创建节点缓存，成功返回 0、失败返回 `-ENOMEM`；`wg_allowedips_slab_uninit` 先 `rcu_barrier()` 等待所有 RCU 回调完成，再 `kmem_cache_destroy`。`allowedips.c` 末尾无条件 `#include "selftest/allowedips.c"`，自检函数声明在头文件里以 `#ifdef DEBUG` 保护——本快照没有 selftest 实体文件，因此自检覆盖的具体用例需对照完整上游树核验。从设计意图看，把自检编译进驱动并在 DEBUG 构建下运行，说明 trie 的位操作与删除压缩被认为是容易出错、值得用穷举用例守住的部分。
+
+下图把一次发送方向查路由的完整路径画出来，并标出接收方向如何复用同一个 `find_node`。
+
+:::figure id=07-04-01 | name=allowedips 查找路径与最长前缀匹配 | dir=TD
+node t1 "wg_xmit 取 skb<br/>目的 IP 地址" blue
+node t2 "wg_allowedips_lookup_dst<br/>按协议选 root4/root6" teal
+node t3 "lookup<br/>swap_endian 与 RCU 读锁" purple
+node t4 "find_node<br/>prefix_matches 与 choose" gray
+node t5 "最长匹配节点<br/>node->peer" green
+node t6 "wg_peer_get_maybe_zero<br/>升级为强引用" amber
+node t7 "返回 peer<br/>调用方负责 put" blue
+node t8 "lookup_src<br/>接收侧校验源地址" red
+edge t1 -> t2 "发送路径"
+edge t2 -> t3 "bits=32/128"
+edge t3 -> t4 "进入遍历"
+edge t4 -> t5 "记录候选"
+edge t5 -> t6 "取 peer"
+edge t6 -> t7 "成功返回"
+edge t8 -> t4 "源地址复用"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：发送侧 `wg_xmit` 取出目的 IP，交给 `wg_allowedips_lookup_dst` 按协议选 `root4` 或 `root6`；`lookup` 先做 `swap_endian` 并进入 RCU 读侧临界区，再由 `find_node` 依靠 `prefix_matches` 与 `choose` 沿比特下降、记录最后一个挂了 peer 的候选节点；候选节点的 `peer` 经 `wg_peer_get_maybe_zero` 升级为强引用后返回，调用方负责 `wg_peer_put`；接收侧的 `lookup_src` 用源地址复用同一套 `find_node` 逻辑，用来校验「源地址是否属于解出该包的 peer」。
+
+### 5. 配置/命令/代码实例
+
+从用户视角看，trie 的变化来自 `wg set` 的 `allowed-ips` 参数；下面这段配置演示两条重叠前缀如何同时进入同一棵 v4 树。参数写法与配置语义的完整清单在 04 册（参数见 04-01）。
+
+```bash
+# peer-A 拥有具体到主机的 /32 前缀
+wg set wg0 peer <peer-A 公钥> allowed-ips 10.0.0.2/32
+# peer-B 拥有默认路由，因此会与上面的 /32 重叠
+wg set wg0 peer <peer-B 公钥> allowed-ips 0.0.0.0/0,fd00::/8
+# IPv6 前缀进入 root6，与 v4 树互不影响
+wg set wg0 peer <peer-A 公钥> allowed-ips 10.0.0.2/32,fd00:1234::/64
+wg show wg0 allowed-ips
+```
+
+插入之后，查表路径的关键代码只有十几行，却浓缩了 RCU、字节序与重试三重处理。下面摘录 `lookup` 的骨架（去掉少数细节，保留控制流；完整实现见 `allowedips.c`）。
+
+```c
+static struct wg_peer *lookup(struct allowedips_node __rcu *root, u8 bits,
+			      const void *be_ip)
+{
+	u8 ip[16] __aligned(__alignof(u64));
+	struct allowedips_node *node;
+	struct wg_peer *peer = NULL;
+
+	swap_endian(ip, be_ip, bits);
+	rcu_read_lock_bh();
+retry:
+	node = find_node(rcu_dereference_bh(root), bits, ip);
+	if (node) {
+		peer = wg_peer_get_maybe_zero(rcu_dereference_bh(node->peer));
+		if (!peer)
+			goto retry;   /* peer 正在被删除，重查新版本 trie */
+	}
+	rcu_read_unlock_bh();
+	return peer;              /* 返回强引用，调用方必须 wg_peer_put */
+}
+```
+
+`wg show wg0 allowed-ips` 的典型输出如下，用它把每一行映射回 trie 的节点与查找行为。
+
+```text
+示例输出，具体格式需对照实际版本核验
+interface: wg0
+  public key: <本端公钥>
+  private key: (hidden)
+  listening port: 51820
+peer: <peer-A 公钥>
+  endpoint: 203.0.113.9:51820
+  allowed ips: 10.0.0.2/32, fd00:1234::/64
+  latest handshake: 21 seconds ago
+  transfer: 7.14 KiB received, 5.02 KiB sent
+peer: <peer-B 公钥>
+  endpoint: 198.51.100.4:51820
+  allowed ips: 0.0.0.0/0, fd00::/8
+  latest handshake: 2 minutes ago
+  transfer: 1.02 KiB received, 3.88 KiB sent
+```
+
+逐行判读如下。首行与第二、三、四行描述接口自身，与 trie 无关，它们来自 netlink 的 device 属性，用于确认查询对象正确。第五行 `peer:` 段标识一个对等体，其后的公钥在 trie 里对应 `node->peer` 指向的 `wg_peer` 对象；一个接口下可以有多个这样的段，它们在树里可能命中同一棵 `root4`。第六行 `allowed ips` 中 `10.0.0.2/32` 是一个 v4 前缀节点，`cidr` 为 32、`bitlen` 为 32，挂在 `root4` 的较深位置，对应 peer-A；`fd00:1234::/64` 则进入 `root6`，因为 `wg_allowedips_insert_v6` 以 `bits = 128` 调用 `add`。第七、八行是 peer-A 的握手时间与流量计数，属于 `wg_peer` 成员，不是 trie 字段，但它们能反过来验证最长前缀匹配是否生效：若目的 `10.0.0.2` 的流量被计入 peer-A 而不是 peer-B，说明 `find_node` 正确用 `/32` 覆盖了 `/0` 候选。第九行开始是 peer-B 的段，`0.0.0.0/0` 的 `cidr` 为 0，是 `root4` 上最浅的候选节点；任何未被更具体前缀覆盖的 IPv4 目的地址都会落到它上面，这也是默认路由的实现方式。同段的 `fd00::/8` 挂在 `root6` 的浅层，与 peer-A 的 `fd00:1234::/64` 构成 v6 侧的重叠：`fd00:1234::1` 命中 `/64` 走 peer-A，`fd00:abcd::1` 只命中 `/8` 走 peer-B。第十二行 peer-B 的 `latest handshake` 较旧但非零，说明它仍在被默认路由使用；若这一行长期为空而 `0.0.0.0/0` 已配置，往往是默认路由把本不该走隧道的流量引入了 wg0。值得注意的是 `seq` 不出现在任何 show 输出里，它是内部版本号，每次 `wg set allowed-ips` 变更都会自增，但本快照没有展示它的消费方式（需核验）。删除一侧，执行 `wg set wg0 peer <peer-A 公钥> allowed-ips` 清空或 `wg set wg0 peer <peer-A 公钥> remove` 后，trie 里对应节点经 `remove_node` 摘除并 `kfree_rcu`，在本 peer 被删除时则由 `peer_make_dead` 通过 `wg_allowedips_remove_by_peer` 整批清理（调用关系见 07-03）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把 allowedips 只当访问控制列表。它同时是入站源地址校验表：`receive.c` 用 `wg_allowedips_lookup_src` 反查源地址所属 peer，若结果与实际解出报文的 peer 不一致，就记录 `Packet has unallowed src IP` 并丢弃。因此「给 peer 配一个过宽的源前缀」不只是路由问题，更是安全问题——它降低了对端伪造源地址的门槛。收敛前缀是部署阶段的首要动作（部署见 03-04）。
+
+第二个陷阱是以为查表需要加锁。所有写 API 都要求传入 `device_update_lock` 且以 `lockdep_is_held` 校验，但查询路径刻意设计成无锁 RCU：在 `rcu_read_lock_bh()` 里用 `rcu_dereference_bh` 读指针即可。若在调用 `lookup_dst` 时误持写锁或调用 `wg_peer_put` 时不在正确上下文，轻则锁依赖报警，重则破坏 RCU 语义。理解「写者交换指针、读者走 RCU」这一分工，是正确使用本模块的前提（并发机制见 06-13）。
+
+第三个陷阱是忘记释放强引用。`wg_allowedips_lookup_dst` 与 `wg_allowedips_lookup_src` 都返回强引用；`device.c` 的 `wg_xmit` 在成功路径和各错误标签都放了引用，`receive.c` 在校验后立刻放掉。任何新增调用点若只取不放，都会让 `kref` 永远归不了零，peer 内存无法回收——表现为 `wg show` 里 peer 已删除但内核内存不降。排查这类泄漏时应从「查表调用方是否配对 `wg_peer_put`」入手（引用机制见 07-03）。
+
+第四个陷阱是误解重叠前缀的优先级。`find_node` 返回路径上最后一个挂 peer 的节点，因此更具体的 `/32` 一定覆盖 `/0`，与配置顺序无关。把 `0.0.0.0/0` 配给某个 peer 后，若没有更具体的前缀兜底，所有未匹配的出站流量都会涌向它；反之，若某前缀被误配到错误的 peer，即使还有一个更宽的正确前缀，流量也不会回退到正确的 peer——trie 不做「第二匹配」的兜底。
+
+第五个陷阱是忽略 `parent_bit_packed` 的低两位编码。`remove_node` 里用 `node->parent_bit_packed & ~3UL` 还原父槽位地址、用 `& 1` 取分支位，并用 `offsetof` 反算父节点首地址。这不是普通的指针字段，修改相关代码时必须成对维护「指针 | 分支位」的编码与解码，且要记得 `struct allowedips` 有 `__aligned(4)` 的对齐声明。误改这会导致删除时挂错槽位，且往往在压力测试下才暴露。
+
+第六个陷阱是低估字节序与对齐。`copy_and_assign_cidr` 在 `__LITTLE_ENDIAN` 分支里对 `bit_at_a` 做异或修正；`swap_endian` 对 32 位和 128 位分别处理。局部缓冲必须按 `__alignof(u64)` 对齐，头文件也对 `read_node` 的入参提出同样要求。把这些当成可省略的细节，会让 trie 在小端平台或特定地址上出现难以复现的错误匹配。
+
+最佳实践可归纳为四条。其一，前缀配置遵循最小必要原则，能用 `/32` 或主机段就不要用 `/0`，既提高安全性也让最长前缀匹配的结果更可预期。其二，重叠前缀要有意为之：默认路由只给确实承担兜底角色的 peer，并为需要特殊处理的目的地址配置更具体的例外前缀。其三，编写任何调用 trie API 的新代码时，都先确认「这是写路径还是读路径」，写路径持 `device_update_lock`，读路径进 `rcu_read_lock_bh` 并配对 `wg_peer_put`，两不可混。其四，调试位操作相关问题时优先打开 DEBUG 构建运行自检——`allowedips.c` 末尾包含 `selftest/allowedips.c`，其目的正是穷举前缀插入、删除与查找的组合；本快照缺少该文件，启用前需对照完整上游树核验（自检构建见 02-05）。
+
+### 7. 小结与延伸阅读
+
+`allowedips.c` 是 WireGuard Linux 路由 trie 的唯一权威实现：它用 `root4`/`root6` 双根维护 IPv4 与 IPv6 两棵按位分叉的树，用 `swap_endian`、`choose`、`common_bits` 与 `prefix_matches` 把前缀比较压缩为整数运算，用 `find_node` 的遍历顺序自然实现最长前缀匹配，并以 `wg_peer_get_maybe_zero` 的重试循环保证删除并发下的引用安全。写侧通过 `connect_node` 与 `remove_node` 维护指针与 `parent_bit_packed` 编码，读侧完全运行在 `rcu_read_lock_bh` 之下；整表与按 peer 的删除分别走 `root_free_rcu` 与 `peer->allowedips_list`，并通过 `kfree_rcu`/`call_rcu` 与 slab 销毁前的 `rcu_barrier` 保证内存安全。模块在驱动中连接设备创建、发送选路、接收校验与 peer 删除四条调用链，是理解 WireGuard「AllowedIPs 即路由」模型的代码落点。
+
+延伸阅读建议按三条线展开：想看节点与顶层结构的逐字段定义去 05 册（字段见 05-04），想看最长前缀匹配与路由决策的数学原理去 06 册（原理见 06-07），想看接收侧如何用 `lookup_src` 做源地址校验去本册相邻篇（模块见 07-08）；命令写法与配置语义去 04 册（参数见 04-01）。跨册随查按（字段见 05-04 ｜ 参数见 04-01 ｜ 原理见 06-07 ｜ 模块见 07-08）执行。凡涉及 `netlink.c` 中的插入、删除调用点与 `selftest/allowedips.c` 的自检用例，均需对照 `_wglinux_build/upstream_src/` 下的完整上游树核验，本篇不编造未核验的路径与取值。

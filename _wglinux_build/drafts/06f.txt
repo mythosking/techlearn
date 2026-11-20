@@ -1,0 +1,270 @@
+## 06-11 定时器体系：keepalive、重传、过期与 gc
+
+### 1. 背景与动机
+
+WireGuard 是一个「静默」协议：它对端认证失败时不会回送任何错误报文，只是把包悄悄丢弃。这种设计换来了极小的攻击面与简单的状态机，但也带来一个直接后果——隧道的「活性」不能靠报错来感知，只能靠计时器主动驱动。 timers.c 开头的注释把这套机制的目的写得非常清楚：重传未获响应的握手、在收到包后长时间未发包时补发一个空包、在发包后长时间未收到任何包时发起新握手、在长期没有新密钥时把临时密钥归零，以及按用户配置周期性发送保活包。换言之，WireGuard Linux 把「什么时候该做点什么」这件事，几乎全部压在了每个 peer 携带的一组定时器上。
+
+要理解为什么定时器体系是机制册里不可绕过的一章，需要把它和握手、密钥、收发三条线连起来看。握手发起后若对端不回响应，靠 `timer_retransmit_handshake` 定时重传，重传次数用尽就放弃并清理暂存包（握手时序见 06-03）；会话建立后，双方用「最近一次收到认证包的时间」来判断对端是否还活着，这由 `timer_send_keepalive` 与 `timer_new_handshake` 两个定时器接力完成；会话密钥与握手临时状态有严格的有效期，过期后由 `timer_zero_key_material` 触发归零，这是协议级前向保密与重放防护的重要一环（密钥轮换见 06-03、抗重放见 06-08）；而穿越 NAT 的场景需要一个按固定 Interval 发送的空包维持映射，这由 `timer_persistent_keepalive` 负责。可以说，定时器体系是「把协议规范里的时间约束翻译成内核 timer_list 调度」的那一层。
+
+本篇以本快照 `drivers/net/wireguard/timers.c` 全文为依据，逐函数梳理六个过期回调与八个事件函数，并把它们与 peer 结构中的五个 timer_list 字段对应起来。所有时长常量都逐字核对到 `messages.h` 的 `enum limits`，不照搬早期资料里的旧名字——一个典型的坑是：很多文章把握手重传超时写成 `RETRANSMIT_TIMEOUT`，但本快照的源码里根本没有这个名字，取而代之的是 `REKEY_TIMEOUT`（值 5 秒）。凡涉及字段布局只点名结构、给路径，逐字段定义交给 05-08（结构与字段见 05-08、peer 结构见 05-03），参数与命令全集交给 04 册，模块职责交给 07-10。
+
+### 2. 核心概念
+
+这套体系可以归纳为「五个定时器、两类回调、三条时间线」。
+
+五个定时器，是每个 `wg_peer` 都会持有的五个 `struct timer_list` 实例：`timer_retransmit_handshake`、`timer_send_keepalive`、`timer_new_handshake`、`timer_zero_key_material`、`timer_persistent_keepalive`。它们都在 `wg_timers_init` 中通过 `timer_setup` 挂上各自的过期回调，标志位参数均为 0，说明都是普通的、非 per-CPU 引脚、无迁移提示的内核定时器。
+
+两类回调，指「过期回调」与「事件函数」。过期回调是内核在定时器到期时调用的函数，共有六个实体：五个 timer 回调加上一个由工作队列派发的 `wg_queued_expired_zero_key_material`。之所以有第六个，是因为密钥归零不能在 softirq/定时器软中断上下文里直接做——它需要拿引用、可能睡眠，于是 `wg_expired_zero_key_material` 只负责把 `clear_peer_work` 投递到 `handshake_send_wq` 工作队列，真正的清理由 `wg_queued_expired_zero_key_material` 完成。事件函数是收发路径在特定时刻主动调用的通知函数，用于「重置」或「取消」定时器，共八个：`wg_timers_data_sent`、`wg_timers_data_received`、`wg_timers_any_authenticated_packet_sent`、`wg_timers_any_authenticated_packet_received`、`wg_timers_handshake_initiated`、`wg_timers_handshake_complete`、`wg_timers_session_derived`、`wg_timers_any_authenticated_packet_traversal`。
+
+三条时间线，是这套机制服务的三个目的。第一条是「握手活性线」：`handshake_initiated` 启动重传定时器，每次重传累加 `timer_handshake_attempts`，超过 `MAX_TIMER_HANDSHAKES` 就放弃；`handshake_complete` 则删除重传定时器并把计数清零。第二条是「数据流活性线」：收到认证包会取消 `timer_new_handshake` 并可能安排 `timer_send_keepalive`，发出认证包会取消 `timer_send_keepalive`，二者配合实现「有来有往就不打扰、长时间单向才动作」。第三条是「密钥生命周期线」：`session_derived` 启动 `timer_zero_key_material`，到期后清理握手临时状态与全部密钥对，保证临时密钥不会无限期驻留内存。
+
+这里有一个贯穿始终的抽象值得强调：`mod_peer_timer` 是所有「设置/修改定时器」的统一入口。它先用 `rcu_read_lock_bh` 进入 RCU 读侧临界区并禁用下半部，然后仅在 `netif_running(peer->device->dev)` 为真且 `peer->is_dead` 为假时才真正调用 `mod_timer`。这意味着一旦接口被 down 掉、或 peer 已被标记为死亡，任何定时器修改都会被静默丢弃——这是防止设备销毁过程中定时器回调访问已释放对象的关键护栏。理解了这个入口，就能明白为什么事件函数里改时间从来不直接调 `mod_timer`。
+
+### 3. 关键数据结构与源码位置
+
+定时器体系的数据载体全部落在 `struct wg_peer` 上，定义在 `drivers/net/wireguard/peer.h:53-60`。与定时器直接相关的字段分两组。第一组是五个 `struct timer_list`：`timer_retransmit_handshake`、`timer_send_keepalive`（第 53 行），`timer_new_handshake`、`timer_zero_key_material`（第 54 行），`timer_persistent_keepalive`（第 55 行）。第二组是配套状态：`unsigned int timer_handshake_attempts`（重传计数）、`u16 persistent_keepalive_interval`（用户配置的持久保活间隔，单位为秒）、`bool timer_need_another_keepalive`（临时保活到期后是否还需要再补一个）、`bool sent_lastminute_handshake`、`struct timespec64 walltime_last_handshake`（最后一次握手的实际时间，供 `wg show` 展示）。此外，第 49 行的 `struct work_struct ... clear_peer_work` 是密钥归零的延迟执行体。这些字段的完整逐字段说明属于 05-08，本篇只点名与主题直接相关者。
+
+时长常量并不在 timers.c 里，而集中在 `drivers/net/wireguard/messages.h:40-54` 的 `enum limits`。逐字核对如下：`REKEY_TIMEOUT = 5`（秒，握手重传基准间隔）；`REKEY_TIMEOUT_JITTER_MAX_JIFFIES = HZ / 3`（抖动上限，用于打散多个 peer 同时重传）；`REKEY_AFTER_TIME = 120`（会话密钥建议重协商时间）；`REJECT_AFTER_TIME = 180`（密钥拒收时间）；`KEEPALIVE_TIMEOUT = 10`（临时保活与数据流超时基准）；`MAX_TIMER_HANDSHAKES = 90 / REKEY_TIMEOUT`（即 18 次最大握手尝试）；`INITIATIONS_PER_SECOND = 50`（每秒握手发起上限，与重传节流相关）；`REKEY_AFTER_MESSAGES = 1ULL << 60` 与 `REJECT_AFTER_MESSAGES = U64_MAX - COUNTER_WINDOW_SIZE - 1`（按消息数计的轮换与拒收阈值）。需要特别提醒：`MAX_TIMER_HANDSHAKES` 是用表达式 `90 / REKEY_TIMEOUT` 定义的，不是写死的数字，改动 `REKEY_TIMEOUT` 会联动改变它。
+
+下表把五个定时器、其过期回调、设置它们的事件函数与时长表达式收拢成一张速查表，便于对照源码阅读。
+
+| 定时器（peer 字段） | 过期回调 | 主要设置者（事件函数） | 时长表达式 |
+|---|---|---|---|
+| `timer_retransmit_handshake` | `wg_expired_retransmit_handshake` | `wg_timers_handshake_initiated` | `REKEY_TIMEOUT*HZ + jitter` |
+| `timer_send_keepalive` | `wg_expired_send_keepalive` | `wg_timers_data_received` | `KEEPALIVE_TIMEOUT*HZ` |
+| `timer_new_handshake` | `wg_expired_new_handshake` | `wg_timers_data_sent` | `(KEEPALIVE_TIMEOUT+REKEY_TIMEOUT)*HZ + jitter` |
+| `timer_zero_key_material` | `wg_expired_zero_key_material` → `clear_peer_work` | `wg_timers_session_derived`、放弃重传分支 | `REJECT_AFTER_TIME*3*HZ` |
+| `timer_persistent_keepalive` | `wg_expired_send_persistent_keepalive` | `wg_timers_any_authenticated_packet_traversal` | `persistent_keepalive_interval*HZ` |
+
+源码位置速查：`drivers/net/wireguard/timers.c`（六个过期回调与八个事件函数的定义，以及 `wg_timers_init` / `wg_timers_stop`）、`drivers/net/wireguard/peer.h`（五个 timer_list 与配套字段）、`drivers/net/wireguard/messages.h` 的 `enum limits`（全部时长常量）。发送侧的触发点在 `send.c`，接收侧的触发点在 `receive.c`，密钥清理函数 `wg_noise_handshake_clear` 与 `wg_noise_keypairs_clear` 在 `noise.c`（原理见 06-02、模块见 07-10）。
+
+### 4. 关键流程与调用链
+
+先看成对出现的「握手活性线」。发起握手时，`send.c` 的 `wg_packet_send_handshake_initiation` 在成功构造并发出 initiation 后调用 `wg_timers_handshake_initiated`，后者把 `timer_retransmit_handshake` 设为 `jiffies + REKEY_TIMEOUT*HZ + get_random_u32_below(REKEY_TIMEOUT_JITTER_MAX_JIFFIES)`——注意末尾叠加的随机抖动，它把多个 peer 的重传时刻打散到 0 到 HZ/3 之间，避免同一时刻的握手风暴。定时器到期进入 `wg_expired_retransmit_handshake`：若 `timer_handshake_attempts > MAX_TIMER_HANDSHAKES`（即大于 18），打印 giving up 日志，删除 `timer_send_keepalive`，调用 `wg_packet_purge_staged_packets` 清空暂存包队列，并在 `timer_zero_key_material` 未排队时把它设为 `jiffies + REJECT_AFTER_TIME*3*HZ`；否则把 `timer_handshake_attempts` 加一，调用 `wg_socket_clear_peer_endpoint_src` 清掉 endpoint 的源地址（ suspect 是老化的源地址导致握手失败），再以 `is_retry=true` 调 `wg_packet_send_queued_handshake_initiation` 重传。当收到握手响应，或收到用新密钥加密的第一个数据帧完成密钥确认时，`receive.c` 调用 `wg_timers_handshake_complete`：删除重传定时器、把 `timer_handshake_attempts` 归零、`sent_lastminute_handshake` 置假，并用 `ktime_get_real_ts64` 记录 `walltime_last_handshake`。
+
+再看「数据流活性线」，它由四个事件函数协作。`wg_timers_any_authenticated_packet_sent` 在发送任何认证包（保活、数据、握手均可）后调用，动作只有一个：`timer_delete(&peer->timer_send_keepalive)`——既然刚发了包，就没必要再补发临时保活。`wg_timers_data_received` 在收到认证数据包后调用：若 `timer_send_keepalive` 未排队就把它设为 `jiffies + KEEPALIVE_TIMEOUT*HZ`，否则把 `timer_need_another_keepalive` 置真，表示这一轮已经安排过、下一轮还要再补。`wg_expired_send_keepalive` 到期时调用 `wg_packet_send_keepalive`，若发现 `timer_need_another_keepalive` 为真则清掉该标志并再排一个 `KEEPALIVE_TIMEOUT*HZ`——这就是「收包后 10 秒未发包则补一个空包」的实现。反向地，`wg_timers_data_sent` 在真正发出数据包后，若 `timer_new_handshake` 未排队，就把它设为 `(KEEPALIVE_TIMEOUT+REKEY_TIMEOUT)*HZ + jitter`；一旦长时间没收到任何回包，`wg_expired_new_handshake` 会清 endpoint 源地址并以 `is_retry=false` 发起新握手，而 `wg_packet_send_queued_handshake_initiation` 在 `is_retry` 为假时会先把 `timer_handshake_attempts` 归零，重新计次。任何认证包被收到时，`wg_timers_any_authenticated_packet_received` 都会删除 `timer_new_handshake`，掐断这条超时线。
+
+第三条「密钥生命周期线」以 `wg_timers_session_derived` 为起点。每当创建新的临时密钥（发送握手响应之前、或收到握手响应之后），`send.c` 与 `receive.c` 都会调用它，把 `timer_zero_key_material` 设为 `jiffies + REJECT_AFTER_TIME*3*HZ`（即 540 秒）。到期后 `wg_expired_zero_key_material` 在 RCU 读侧临界区内检查 `is_dead`，对活着的 peer 取引用并把 `clear_peer_work` 投递到 `handshake_send_wq`（若已在队列则丢弃多余引用），由 `wg_queued_expired_zero_key_material` 在可睡眠的工作队列上下文里执行 `wg_noise_handshake_clear(&peer->handshake)` 与 `wg_noise_keypairs_clear(&peer->keypairs)`，最后 `wg_peer_put` 释放引用。第四类定时器 `timer_persistent_keepalive` 独立于数据活性：只要 `persistent_keepalive_interval` 非零，`wg_timers_any_authenticated_packet_traversal` 就会在每次认证包收发前后把它重置为 `jiffies + interval*HZ`，到期回调 `wg_expired_send_persistent_keepalive` 再次确认间隔非零后发送保活——这个「每次流量都续期」的设计意味着持续有数据流时不会额外叠加保活包。
+
+下图把三条时间线的起点、到期回调与重置关系串在一起。
+
+:::figure id=06-11-01 | name=WireGuard 定时器三条时间线与重置关系 | dir=TD
+node t1 "握手发起<br/>handshake_initiated" blue
+node t2 "重传握手<br/>retransmit_handshake" amber
+node t3 "握手完成<br/>handshake_complete" green
+node t4 "收到数据包<br/>data_received" teal
+node t5 "临时保活<br/>send_keepalive" blue
+node t6 "发出数据包<br/>data_sent" teal
+node t7 "发起新握手<br/>new_handshake" amber
+node t8 "派生会话密钥<br/>session_derived" purple
+node t9 "密钥归零<br/>zero_key_material" red
+node t10 "持久保活<br/>persistent_keepalive" green
+edge t1 -> t2 "启动/重传+1"
+edge t2 -> t3 "收到响应清零"
+edge t4 -> t5 "安排10秒"
+edge t5 -> t6 "补发空包"
+edge t6 -> t7 "15秒无回包"
+edge t3 -> t8 "建立会话"
+edge t8 -> t9 "540秒后清理"
+edge t4 -> t10 "流量续期间隔"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：握手线从「握手发起 handshake_initiated」到「重传握手 retransmit_handshake」，收到响应后由「握手完成 handshake_complete」清零；数据流线从「收到数据包 data_received」安排「临时保活 send_keepalive」，补发空包后经「发出数据包 data_sent」若 15 秒无回包则「发起新握手 new_handshake」；密钥线由「握手完成」经「派生会话密钥 session_derived」到「密钥归零 zero_key_material」在 540 秒后清理；「持久保活 persistent_keepalive」由每次「收到数据包」按配置间隔续期。
+
+### 5. 配置/命令/代码实例
+
+定时器体系对运维最直接的可观测面，是 `wg show` 展示的持久保活间隔与最近握手时间，它们分别来自 `persistent_keepalive_interval` 与 `walltime_last_handshake`。下面这条命令给某个 peer 设置 25 秒持久保活并查看结果（参数全集见 04-01、04-02）：
+
+```bash
+# 给 peer 设置持久 keepalive（秒），0 表示关闭
+wg set wg0 peer <对端公钥> persistent-keepalive 25
+# 查看定时器体系对外呈现的状态
+wg show wg0
+```
+
+内核侧统一改时间的入口 `mod_peer_timer` 是本机制的核心，其源码片段如下（摘自 `timers.c`，保留原始语句结构）：
+
+```c
+static inline void mod_peer_timer(struct wg_peer *peer,
+				  struct timer_list *timer,
+				  unsigned long expires)
+{
+	rcu_read_lock_bh();
+	if (likely(netif_running(peer->device->dev) &&
+		   !READ_ONCE(peer->is_dead)))
+		mod_timer(timer, expires);
+	rcu_read_unlock_bh();
+}
+```
+
+执行 `wg show wg0` 后，典型输出如下。示例输出，具体格式需对照实际版本核验：
+
+```text
+interface: wg0
+  public key: <本端公钥>
+  private key: (hidden)
+  listening port: 51820
+peer: <对端公钥>
+  endpoint: 203.0.113.9:51820
+  persistent keepalive: every 25 seconds
+  latest handshake: 41 seconds ago
+  transfer: 4.02 KiB received, 3.10 KiB sent
+```
+
+逐行判读如下。`interface` 与 `public key`、`listening port` 三行确认查询命中 wg0 接口，`listening port` 对应 UDP 监听端口（socket 创建见 06-12）。`peer:` 段对应一个 `wg_peer`。关键在 `persistent keepalive: every 25 seconds` 一行：它直接渲染自 peer 的 `persistent_keepalive_interval` 字段，说明 `wg set ... persistent-keepalive 25` 已生效，进而意味着 `wg_timers_any_authenticated_packet_traversal` 会把 `timer_persistent_keepalive` 设为 `jiffies + 25*HZ`，到期由 `wg_expired_send_persistent_keepalive` 发空包；若这里显示 0 或缺失，则持久保活定时器不会被安排。`latest handshake: 41 seconds ago` 来自 `walltime_last_handshake`，由 `wg_timers_handshake_complete` 用 `ktime_get_real_ts64` 写入；这个数值若持续增大且不再刷新，说明会话已过期、重传可能已放弃，应优先排查公钥、endpoint 与时钟。注意 41 秒仍小于 `REJECT_AFTER_TIME`（180 秒），密钥尚在有效期；一旦接近 180 秒仍未握手，`timer_zero_key_material` 的 540 秒清理线将成为最后兜底。`transfer` 两行是累计收发字节，与状态字段 `rx_bytes`、`tx_bytes` 对应。综上，`wg show` 的这两行恰好是定时器体系对外 observable 的两个字段，排障时应把它们与本篇的时长常量对照着看（排障流程见 08-03）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是照搬旧常量名。网上大量资料写握手重传超时为 `RETRANSMIT_TIMEOUT`、`KEEPALIVE_TIMEOUT` 为 10 秒之外的别值，但本快照 `messages.h` 明确是 `REKEY_TIMEOUT = 5`、`KEEPALIVE_TIMEOUT = 10`、`REJECT_AFTER_TIME = 180`、`REKEY_AFTER_TIME = 120`，务必以源码为准，不能凭记忆。
+
+第二个陷阱是混淆「临时 keepalive」与「持久 keepalive」。前者由 `timer_send_keepalive` 驱动，触发条件是「收到包后 10 秒没发包」，目的是让对端刷新其 `timer_new_handshake`，属于协议自发的双向活性维护；后者由 `timer_persistent_keepalive` 驱动，按用户配置的固定间隔发送，主要目的是维持 NAT 映射。两者互不替代：配了持久保活不代表临时保活不存在，反之亦然。第三个陷阱是以为保活包会无限叠加：`wg_expired_send_keepalive` 用 `timer_need_another_keepalive` 标志保证同一时刻只排一个后续定时器，`wg_timers_any_authenticated_packet_sent` 又会在任何真实包发出后删除 `timer_send_keepalive`，所以持续有数据流时不会额外发空包。
+
+第四个陷阱是忽略 `mod_peer_timer` 的静默丢弃语义。它在接口 down 或 `is_dead` 为真时不设定时器且不报错，因此排障时若发现某个定时器「不工作」，先确认接口处于 running 状态、peer 未被删除，而不是怀疑 `mod_timer` 失效。第五个陷阱是把密钥归零当成纯定时器操作：`wg_expired_zero_key_material` 只在软中断上下文投递工作，真正清理由工作队列里的 `wg_queued_expired_zero_key_material` 完成；若工作队列积压，归零会有延迟。第六个陷阱是误读 `MAX_TIMER_HANDSHAKES` 为常数——它由 `90 / REKEY_TIMEOUT` 算得，随 `REKEY_TIMEOUT` 变化。
+
+最佳实践：先用 `wg show` 确认 `latest handshake` 在持续刷新，再判断是否需要配持久保活；NAT 后或对端长期静默的场景配一个 20 到 25 秒的 `persistent-keepalive`，既能维持映射又不过度耗电耗流量（配置见 03-05）；排障握手失败时把 `latest handshake` 的时间与 `REKEY_TIMEOUT`（5 秒重传）、`MAX_TIMER_HANDSHAKES`（18 次约 90 秒放弃）对照，判断是还在重传还是已放弃；涉及密钥寿命的问题则对照 `REJECT_AFTER_TIME`（180 秒）与归零线（540 秒）。所有绝对数值都需结合目标环境核验，本册不给出与平台无关的性能或时延断言。
+
+### 7. 小结与延伸阅读
+
+本篇以 `timers.c` 全文为骨架，把 WireGuard Linux 的定时器体系拆成五个 timer_list、六个过期回调与八个事件函数：握手线由 `wg_timers_handshake_initiated` 启动、`wg_expired_retransmit_handshake` 按 `REKEY_TIMEOUT` 加抖动重传、超过 `MAX_TIMER_HANDSHAKES` 放弃，`wg_timers_handshake_complete` 负责收尾清零；数据流线由 `wg_timers_data_received` 与 `wg_timers_data_sent` 分别安排临时保活与新握手超时，`wg_timers_any_authenticated_packet_sent` / `received` 负责取消；密钥线由 `wg_timers_session_derived` 启动、`wg_expired_zero_key_material` 投递工作、由 `wg_queued_expired_zero_key_material` 真正归零；`timer_persistent_keepalive` 独立完成 NAT 保活。所有时长常量集中在 `messages.h` 的 `enum limits`，所有定时器修改统一走 `mod_peer_timer` 这一 RCU 护栏。这套体系把协议规范的时间约束落地为内核调度，是理解握手、密钥轮换与数据流活性的枢纽。
+
+延伸阅读建议：握手重传与密钥轮换的时间语义见 06-03、握手状态机见 06-02、抗重放与密钥寿命见 06-08；socket 与 endpoint 清理（含 `wg_socket_clear_peer_endpoint_src`）见 06-12；结构字段全集见 05-08 与 05-03，参数与命令见 04-01、04-02，模块职责见 07-10。跨册随查按（字段见 05-08 ｜ 参数见 04-01 ｜ 原理见 06-03 ｜ 模块见 07-10）执行。凡本篇涉及的常量名、数值与函数签名，均以 `_wglinux_build/upstream_src/` 下 `drivers/net/wireguard/` 的对应文件为准，本册不编造未核验的路径与取值。
+
+## 06-12 socket 收发、GSO/GRO 与 UDP 封装
+
+### 1. 背景与动机
+
+WireGuard 的所有报文都运行在 UDP 之上：握手消息、数据消息、cookie 消息无一例外。承担这一封装职责的，是 `drivers/net/wireguard/socket.c`。如果说 `send.c` / `receive.c` 负责「把明文变成密文、把密文还原成明文」，那么 socket.c 负责的就是「把密文字节串装进 UDP 数据报、选好路由与端口发出去，以及从 UDP socket 读到数据报并交回收发路径」。本篇要回答的核心问题是：内核接口 wg0 到底持有哪些 UDP socket，这些 socket 如何创建与热更新，报文中 UDP 头与 fwmark 如何填写，GSO/GRO 的批量分段与重组怎样和加密路径配合，以及 peer 的 endpoint 如何随收到的包自动漫游。
+
+理解 socket.c 的一个重要前提，是把它与「网卡抽象」区分开。wg0 本身是一个 `net_device`，但它并不直接挂在物理网卡上，而是持有两个 UDP socket（IPv4 一个、IPv6 一个）作为真正的承载通道。加密后的字节通过 `udp_tunnel_xmit_skb` 从这两个 socket 发出，底层再走普通 IP 路由从物理网卡出去；收到的数据报则由 UDP 隧道层的 `encap_rcv` 回调接住，交回 `wg_receive`。这种「net_device + UDP 隧道 socket」的双层结构，是 WireGuard Linux 既能表现为网卡、又能穿越 NAT 与防火墙的根本原因。
+
+本篇以本快照 `socket.c` 全文为主线，逐函数读 `send4` / `send6`、`wg_socket_send_skb_to_peer`、`wg_receive`、`wg_socket_set_peer_endpoint_from_skb` 与 `sock_free`，并结合 `device.c` 中 `wg_setup` 声明的 `WG_NETDEV_FEATURES` 讲清 GSO/GRO 的落点。字段布局（如 `struct endpoint`、`dst_cache`、`wg_device` 的 socket 指针）只点名并给路径，逐字段交给 05-07 与 05-02；命令与常量全集交给 04 册；模块职责交给 07-09。所有函数签名与常量都以源码为准，拿不准处标注需核验。
+
+为什么选择 UDP 作为唯一承载？这既是对协议简洁性的取舍，也是穿透能力的需要。TCP 自带连接状态、重传与拥塞控制，若在其上再叠加一层加密隧道的重传与保活，会产生「重传叠加」与队头阻塞；裸 IP 则缺乏端口号，无法做 NAT 多实例复用与基于五元组的管理。UDP 只提供无连接的端到端校验覆盖与端口复用，正好把可靠性、顺序与拥塞控制留给它所承载的内层 TCP 去处理。代价是 WireGuard 必须在 UDP 之上自建会话跟踪、重传、抗重放与保活，这正是 06-11 定时器体系与 06-08 抗重放窗口存在的原因。把这两篇与本篇对照阅读，就能看清「在 UDP 之上重建可靠性」这一完整闭环：定时器负责节奏，抗重放负责顺序与去重，而 socket.c 负责把这二者产生的字节送进送出。 三条线相互咬合，缺一不可。
+
+### 2. 核心概念
+
+这套收发机制可以用「两类 socket、三条路径、两个卸载」来概括。
+
+两类 socket，指 wg0 持有的 IPv4 socket（`wg->sock4`）与 IPv6 socket（`wg->sock6`）。二者由 `wg_socket_init` 创建，经 `wg_socket_reinit` 用 RCU 指针原子替换。它们都是 UDP socket，通过 `setup_udp_tunnel_sock` 注册为 UDP 隧道，配置结构体 `udp_tunnel_sock_cfg` 里把 `sk_user_data` 设为 wg、`encap_type` 设为 1、`encap_rcv` 设为 `wg_receive`——正是这个 `encap_rcv` 回调，让内核把目的端口匹配的 UDP 数据报直接交给 WireGuard，而不必走普通 socket 的接收队列。
+
+三条路径，指出站、入站与漫游三条数据通路。出站路径由 `wg_socket_send_skb_to_peer` 按 endpoint 的地址族分派到 `send4` 或 `send6`，二者构造 `flowi4` / `flowi6`、查路由（可经 `dst_cache` 缓存）、填 UDP 头与 fwmark，最后调用 `udp_tunnel_xmit_skb` / `udp_tunnel6_xmit_skb` 发出。入站路径由 `wg_receive` 从 `sk->sk_user_data` 取回 wg，转交 `wg_packet_receive`。漫游路径则由 `wg_socket_endpoint_from_skb` 从入站包提取源地址与端口，经 `wg_socket_set_peer_endpoint` 更新 peer 的 endpoint——这就是对端换 IP 或换端口后隧道仍能自动恢复的关键。
+
+两个卸载，指 GSO（Generic Segmentation Offload，通用分段卸载）与 GRO（Generic Receive Offload，通用接收卸载）。GSO 让内核把大于 MTU 的 TCP 段以单个 skb 交给发送路径，推迟到接近物理网卡时才分段；GRO 则反向把多个小包在接收侧聚合成大包再送上协议栈。wg0 在 `wg_setup` 中声明 `NETIF_F_SG`、`NETIF_F_GSO`、`NETIF_F_GSO_SOFTWARE` 等特性，从而向内核承诺自己能处理散射聚集与 GSO 大包，加密时用 `skb_to_sgvec` 把多段 skb 组成 scatterlist 一次性交给 ChaCha20-Poly1305。
+
+需要建立一个关键认知：WireGuard 自己不做 GSO 的软件分段，而是把「分段」这件事交给内核与网卡。发送侧 `send4` / `send6` 里那句 `skb->ignore_df = 1` 允许不分片的大包通过，把分段推迟给下层；接收侧 `wg_packet_rx_poll` 解密完成后调用 `napi_gro_receive`，让每个 peer 的 NAPI 实例完成 GRO 聚合后注入协议栈。理解了这一点，就不会误以为 socket.c 里藏着分段逻辑。
+
+补充一点关于路由缓存的理解。`peer->endpoint_cache` 是一个 `struct dst_cache`，它把「目的地址加源地址」对应的路由结果（`dst_entry`）缓存下来。`send4` 先调 `dst_cache_get_ip4`，命中就跳过昂贵的 `ip_route_output_flow`；只有当 endpoint 变化（`wg_socket_set_peer_endpoint` 调 `dst_cache_reset`）或源绑定被清除（`wg_socket_clear_peer_endpoint_src` 调 `dst_cache_reset_now`）时才失效。这解释了为什么漫游路径必须同时更新 endpoint 与清理缓存：只改地址而不清缓存，后续包仍会沿旧路由发出，表现为「wg show 的 endpoint 显示变了但流量仍不通」的诡异现象。理解了缓存与 endpoint 的这种耦合，排障时就能有意识地同时检查两者。
+
+### 3. 关键数据结构与源码位置
+
+socket 收发涉及的核心对象分三层。设备层是 `struct wg_device`，它持有 `sock4`、`sock6`、`incoming_port`、`fwmark`、`creating_net`、`socket_update_lock` 与 `endpoint` 相关的路由缓存（字段见 05-02）；`wg_socket_init` 用 `creating_net` 确定在哪个网络命名空间创建 socket，`wg_socket_reinit` 用 `socket_update_lock` 保护 RCU 指针替换。对等体层是 `struct wg_peer`，它持有 `endpoint`、`endpoint_cache`（dst_cache）、`endpoint_lock`（读写锁）与 `rx_bytes` / `tx_bytes` 计数（字段见 05-03、05-07）。端点层是 `struct endpoint`，定义在 `peer.h:21-35`，用联合体同时容纳 `sockaddr_in` 与 `sockaddr_in6`，并附带源地址 `src4` / `src6` 与 `src_if4`——后者用于记录绑定的源接口。
+
+关键函数与真实位置如下，均相对 `drivers/net/wireguard/`：`socket.c` 的 `send4`（第 20 行）、`send6`（第 96 行）、`wg_socket_send_skb_to_peer`（第 166 行）、`wg_socket_send_buffer_to_peer`（第 187 行）、`wg_socket_endpoint_from_skb`（第 233 行）、`endpoint_eq`（第 256 行）、`wg_socket_set_peer_endpoint`（第 271 行）、`wg_socket_set_peer_endpoint_from_skb`（第 297 行）、`wg_socket_clear_peer_endpoint_src`（第 306 行）、`wg_receive`（第 314 行）、`sock_free`（第 332 行）、`set_sock_opts`（第 340 行）、`wg_socket_init`（第 347 行）、`wg_socket_reinit`（第 417 行）。GSO 相关在 `device.c:274-298` 的 `wg_setup`，GRO 相关在 `receive.c:411` 的 `napi_gro_receive` 与 `receive.c:438` 的 `wg_packet_rx_poll`，NAPI 初始化在 `peer.c:56-58`。
+
+下表把 socket.c 的对外函数按职责归类，便于把握调用关系（更多字段定义见 05-07）。
+
+| 函数 | 职责 | 关键调用者 |
+|---|---|---|
+| `wg_socket_init` / `wg_socket_reinit` | 创建 socket、RCU 原子替换与旧 socket 释放 | 设备 open / 端口变更（见 06-01） |
+| `send4` / `send6` | 构造 flow、查路由、填 UDP 头与 fwmark 并发出 | `wg_socket_send_skb_to_peer` |
+| `wg_socket_send_skb_to_peer` | 按地址族分派、加锁、累计 tx_bytes | `send.c` 的数据与握手发送 |
+| `wg_socket_endpoint_from_skb` | 从入站包提取源地址/端口为 endpoint | 漫游、cookie 回复 |
+| `wg_socket_set_peer_endpoint` | 无锁快检后写锁更新 endpoint 与路由缓存 | `receive.c` 收包路径 |
+| `wg_receive` | UDP 隧道收包回调，转交 `wg_packet_receive` | `setup_udp_tunnel_sock` 的 `encap_rcv` |
+
+### 4. 关键流程与调用链
+
+socket 创建走 `wg_socket_init`。它先准备 `udp_tunnel_sock_cfg`：`sk_user_data = wg`、`encap_type = 1`、`encap_rcv = wg_receive`；再准备 IPv4 端口配置 `port4`（地址 `INADDR_ANY`、端口 `htons(port)`、`use_udp_checksums = true`）与 IPv6 配置 `port6`（`IN6ADDR_ANY_INIT`、收发校验和均开启、`ipv6_v6only = true`）。随后在 RCU 读侧取 `creating_net` 并 `maybe_get_net`，拿不到网络命名空间就返回 `-ENONET`。`udp_sock_create` 创建 v4 socket 后，`set_sock_opts` 把 `sk_allocation` 设为 `GFP_ATOMIC`、`sk_sndbuf` 设为 `INT_MAX` 并用 `sk_set_memalloc` 锁定内存——数据面不能在分配内存时失败或睡眠，这几项是性能与稳定性的前提。接着 `setup_udp_tunnel_sock` 把它注册为 UDP 隧道。若 IPv6 模块可用，`port6.local_udp_port` 被设为 v4 socket 的实际端口 `inet_sk(new4->sk)->inet_sport`，使 v4 与 v6 共用同一端口；创建 v6 socket 遇到 `-EADDRINUSE` 且端口参数为 0（系统自动分配）时会 `goto retry`，最多重试 100 次。最后调用 `wg_socket_reinit` 安装新 socket。
+
+`wg_socket_reinit` 是 RCU 热更新的范本：先拿 `socket_update_lock`，用 `rcu_dereference_protected` 读出旧 `sock4` / `sock6`，再用 `rcu_assign_pointer` 原子写入新 socket，若新 v4 socket 存在则更新 `wg->incoming_port = ntohs(inet_sk(new4)->inet_sport)`，然后释放锁、`synchronize_net()` 等待所有旧读者退出临界区，最后 `sock_free(old4)` 与 `sock_free(old6)`。`sock_free` 先 `sk_clear_memalloc` 解除内存锁定，再 `udp_tunnel_sock_release` 释放 socket。这套「RCU 替换 + synchronize_net + 延迟释放」保证端口变更时正在收发的包不会访问已释放的 socket。
+
+出站发送以 `wg_socket_send_skb_to_peer` 为入口。它先 `read_lock_bh(&peer->endpoint_lock)`，按 `peer->endpoint.addr.sa_family` 分派：AF_INET 调 `send4`、AF_INET6 调 `send6`，地址族无效则 `dev_kfree_skb`。发送成功（`ret == 0`）时把 `skb->len` 累加到 `peer->tx_bytes`，最后解读锁。`send4` 内部构造 `flowi4`，其中 `flowi4_mark = wg->fwmark` 把用户配置的 fwmark 带入路由与策略，`flowi4_proto = IPPROTO_UDP`；它把 `skb->mark` 也设为 `wg->fwmark`，使包的 mark 与 flow 一致。路由先尝试 `dst_cache_get_ip4` 命中缓存，未命中则校验源地址（`__ip_dev_find`）、必要时清零 `endpoint->src4` 并 `dst_cache_reset`，再 `ip_route_output_flow`，成功后 `dst_cache_set_ip4` 回填缓存。最后 `skb->ignore_df = 1`，调用 `udp_tunnel_xmit_skb` 完成 UDP 封装与发送，`ds` 参数承载 DSCP。`send6` 逻辑对称，用 `ip6_dst_lookup_flow` 与 `udp_tunnel6_xmit_skb`，并在 `CONFIG_IPV6` 关闭时返回 `-EAFNOSUPPORT`。
+
+还有一条容易被忽略的发送支线是 cookie 回复。`wg_socket_send_buffer_as_reply_to_skb` 用于把 cookie 消息作为对入站包的应答发回：它先用 `wg_socket_endpoint_from_skb` 从触发消息里提取 endpoint，再分配 skb 并按地址族调 `send4` / `send6`，但传入的 cache 参数为 NULL——cookie 回复必须严格回到包来源，不能复用 peer 的路由缓存，否则可能被诱导发往错误地址。这也是为什么 `wg_socket_endpoint_from_skb` 被设计成独立可复用的函数：它既服务 endpoint 漫游，也服务 cookie 回复与握手响应。把这条支线与主发送路径对照，可以看出 socket.c 在「按现有 endpoint 发送」与「按入站包来源回复」之间做了清晰区分，前者带缓存、后者不带。
+
+入站与漫游是同一条链的两面。UDP 隧道收到包后，`wg_receive` 从 `sk->sk_user_data` 取回 wg，`skb_mark_not_on_list` 后调用 `wg_packet_receive`，把包交给收发引擎。在解密完成后的 `wg_packet_rx_poll` 里，每个包经 nonce 校验后由 `wg_socket_endpoint_from_skb` 从 IP 与 UDP 头提取源地址、源端口、目的地址与入接口，构造 endpoint；随后 `wg_packet_consume_data_done` 调用 `wg_socket_set_peer_endpoint(peer, &endpoint)`。`wg_socket_set_peer_endpoint` 先用 `endpoint_eq` 无锁快检——因为 endpoint 变化很罕见——相同则直接返回，不同才拿写锁更新地址并 `dst_cache_reset` 清掉旧路由缓存。`wg_socket_set_peer_endpoint_from_skb` 只是「提取 + 设置」的组合封装，在握手响应处理处（receive.c 第 172 行）与数据包处理处被调用。凡是收到认证包，源地址就会更新，这就是 endpoint 自动漫游；而 `wg_socket_clear_peer_endpoint_src` 则在握手重传时被调用，清掉 `src6` 并立即重置缓存，给老化的源绑定一次纠错机会。
+
+下图把 socket 创建、出站、入站与漫游四条线汇在一起。
+
+:::figure id=06-12-01 | name=socket 创建、UDP 封装收发与 endpoint 漫游调用链 | dir=TD
+node s1 "wg_socket_init<br/>创建v4/v6 UDP socket" blue
+node s2 "wg_socket_reinit<br/>RCU替换+synchronize_net" purple
+node s3 "send4 / send6<br/>flow+路由+fwmark" teal
+node s4 "udp_tunnel_xmit_skb<br/>UDP封装发出" green
+node s5 "encap_rcv=wg_receive<br/>UDP隧道收包" green
+node s6 "wg_packet_rx_poll<br/>解密+nonce校验" teal
+node s7 "endpoint_from_skb<br/>提取源地址端口" amber
+node s8 "set_peer_endpoint<br/>漫游更新+清缓存" red
+node s9 "napi_gro_receive<br/>GRO重组注入栈" purple
+edge s1 -> s2 "安装socket"
+edge s2 -> s3 "出方向"
+edge s3 -> s4 "封装"
+edge s5 -> s6 "收方向"
+edge s6 -> s7 "提取"
+edge s7 -> s8 "地址变化"
+edge s6 -> s9 "解密后"
+edge s8 -> s3 "更新endpoint"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「wg_socket_init 创建v4/v6 UDP socket」经「wg_socket_reinit RCU替换+synchronize_net」安装后分两路——出站「send4 / send6 flow+路由+fwmark」调「udp_tunnel_xmit_skb UDP封装发出」；入站由「encap_rcv=wg_receive UDP隧道收包」进入「wg_packet_rx_poll 解密+nonce校验」，一路经「endpoint_from_skb 提取源地址端口」到「set_peer_endpoint 漫游更新+清缓存」并回头影响出站 endpoint，另一路经「napi_gro_receive GRO重组注入栈」送进协议栈。
+
+### 5. 配置/命令/代码实例
+
+socket 收发的两个可观测面是 UDP 封装与 endpoint 漫游。出站分派的核心代码如下（摘自 `socket.c:166-185`，保留原始语句结构）：
+
+```c
+int wg_socket_send_skb_to_peer(struct wg_peer *peer, struct sk_buff *skb, u8 ds)
+{
+	size_t skb_len = skb->len;
+	int ret = -EAFNOSUPPORT;
+
+	read_lock_bh(&peer->endpoint_lock);
+	if (peer->endpoint.addr.sa_family == AF_INET)
+		ret = send4(peer->device, skb, &peer->endpoint, ds,
+			    &peer->endpoint_cache);
+	else if (peer->endpoint.addr.sa_family == AF_INET6)
+		ret = send6(peer->device, skb, &peer->endpoint, ds,
+			    &peer->endpoint_cache);
+	else
+		dev_kfree_skb(skb);
+	if (likely(!ret))
+		peer->tx_bytes += skb_len;
+	read_unlock_bh(&peer->endpoint_lock);
+	return ret;
+}
+```
+
+要观察 UDP 封装与实际通信端口，可在承载网卡上抓包（端口由 `WGDEVICE_A_LISTEN_PORT` 配置，全集见 04-05、04-06）：
+
+```bash
+# 观察 wg 的 UDP 封装流量（端口需与本机 listening port 一致）
+tcpdump -ni eth0 'udp port 51820'
+# 同时查看接口与 peer 状态，确认 endpoint 是否已漫游到新地址
+wg show wg0
+```
+
+执行 `tcpdump -ni eth0 'udp port 51820'` 后，典型输出如下。示例输出，具体格式需对照实际版本核验：
+
+```text
+IP 198.51.100.7.51820 > 203.0.113.9.51820: UDP, length 68
+IP 203.0.113.9.51820 > 198.51.100.7.51820: UDP, length 32
+IP 198.51.100.7.51820 > 203.0.113.9.51820: UDP, length 1452
+```
+
+逐行判读如下。第一行源 `198.51.100.7.51820` 指向目的 `203.0.113.9.51820`，是一次出站数据报：`length 68` 是 UDP 载荷长度，对应一条较短的加密数据消息（明文加 WireGuard data 头、认证标签与填充），它由 `wg_socket_send_skb_to_peer` 分派到 `send4`，经 `udp_tunnel_xmit_skb` 封装，源端口正是 `wg->incoming_port`。第二行是入站回包，`length 32` 恰好对应一条 keepalive 或握手类小消息的长度；这类包到达后，`wg_receive` 接住并触发接收链，若是认证包则会刷新 endpoint 与定时器（见 06-11）。第三行 `length 1452` 是一条接近 MTU 的大包，体现 GSO 后的典型分段尺寸——它作为较大载荷经 `send4` 发出，`skb->ignore_df = 1` 允许其通过，最终由下层分段。三行里都看不到明文 IP 头，因为内层 IP 已被 ChaCha20-Poly1305 加密封装在 UDP 载荷里；fwmark 也不会出现在抓包文本中，但它已在 `send4` 里被写入 `flowi4_mark` 与 `skb->mark`，影响本机策略路由。若对端换了公网 IP，后续行的目的地址会随之变化，这正是 `wg_socket_set_peer_endpoint_from_skb` 完成漫游的表现，可用 `wg show` 的 `endpoint` 行交叉确认。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是以为 wg0 直接收发以太网帧。它没有硬件地址（`addr_len = 0`、`ARPHRD_NONE`），真正的承载是 UDP socket；抓包应在物理网卡上看 UDP 51820，而不是在 wg0 上看「WireGuard 帧」。第二个陷阱是混淆 v4/v6 两个 socket 的端口关系：`wg_socket_init` 刻意让 v6 socket 复用 v4 socket 的实际端口（`inet_sport`），并用 `ipv6_v6only = true` 避免协议族冲突，所以通常只看到一个监听端口。
+
+第三个陷阱是忽略 `endpoint_lock` 的读写语义。发送路径用 `read_lock_bh` 保护 endpoint 读取，漫游更新用 `write_lock_bh`，`endpoint_eq` 的无锁快检只在「相同时直接返回」这一分支安全；任何新增的 endpoint 读写都必须遵守这把锁。第四个陷阱是轻视 socket 热更新的复杂性：端口变更必须走 `wg_socket_reinit` 的 RCU 替换加 `synchronize_net`，直接赋值 socket 指针会让在途包访问已释放对象。第五个陷阱是误以为 GSO/GRO 在 socket.c 里分段：分段卸载由 `NETIF_F_GSO` 特性声明与底层网卡完成，socket.c 只负责 `ignore_df = 1` 放行与 udp_tunnel 封装；接收侧 GRO 由 `napi_gro_receive` 完成。
+
+第七个陷阱是把 `sk_sndbuf = INT_MAX` 与 `sk_set_memalloc` 当成普通调优项而随意改动：`set_sock_opts` 的这两个设置是为了让数据面在原子上下文里分配内存时既不因发送缓冲区不足而阻塞、也不因内存回收而睡眠；改动它们可能在高负载下引发丢包或 sleeping 调用。第八个陷阱是以为抓包里能看到 fwmark：fwmark 只存在于内核的 `flowi4_mark` 与 `skb->mark` 中用于策略路由，不会出现在数据报线上，验证它应查 `ip rule` 与 `ip route` 的 mark 匹配，而不是在 tcpdump 输出里找。
+
+最佳实践：抓包排障时先确认 `wg show` 的 `listening port` 与抓包过滤端口一致；NAT 场景配合持久 keepalive（见 06-11）维持映射，并观察 `wg show` 的 `endpoint` 是否随对端变化而更新，以验证漫游是否生效；若使用 fwmark 做策略路由，确认 `wg set wg0 fwmark <值>` 已设置且与 `ip rule` 的 mark 匹配（参数见 04-01、04-05）；调优 GSO 时关注 MTU 与网卡卸载特性是否匹配，本册不给与平台无关的绝对吞吐数字，需在目标机型实测（基准见 08-01、调优见 08-02）。
+
+### 7. 小结与延伸阅读
+
+本篇以 `socket.c` 全文为主线，讲清了 WireGuard Linux 的 UDP 承载层：`wg_socket_init` 创建 v4/v6 两个 UDP socket 并注册 `encap_rcv = wg_receive` 的隧道回调，`wg_socket_reinit` 用 RCU 原子替换加 `synchronize_net` 实现端口热更新，`sock_free` 负责延迟释放；出站由 `wg_socket_send_skb_to_peer` 按地址族分派到 `send4` / `send6`，构造 flow、融合 fwmark、查并缓存路由、`ignore_df = 1` 后用 `udp_tunnel_xmit_skb` 完成 UDP 封装；入站由 `wg_receive` 转交收发引擎，解密后经 `wg_socket_endpoint_from_skb` 与 `wg_socket_set_peer_endpoint` 完成 endpoint 自动漫游；GSO/GRO 则分别由 `device.c` 的特性声明与 `receive.c` 的 `napi_gro_receive` 落地，socket.c 只负责放行与封装，不自行分段。
+
+延伸阅读建议：socket 与 endpoint 的字段全集见 05-07、设备字段见 05-02、peer 字段见 05-03；UDP 承载与封装在发送/接收总链中的位置见 06-01、发送路径见 06-05、接收路径见 06-06、定时器与 endpoint 源清理的联动见 06-11；fwmark 与监听端口的参数定义见 04-05、04-06，命令见 04-01；模块职责见 07-09。跨册随查按（字段见 05-07 ｜ 参数见 04-06 ｜ 原理见 06-05 ｜ 模块见 07-09）执行。凡本篇涉及的函数签名、字段与常量，均以 `_wglinux_build/upstream_src/` 下 `drivers/net/wireguard/` 的对应文件为准，本册不编造未核验的路径与取值。

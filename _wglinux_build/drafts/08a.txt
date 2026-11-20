@@ -1,0 +1,259 @@
+## 08-01 性能基准方法、测试模型与实测口径
+
+### 1. 背景与动机
+
+关于 WireGuard 的性能，最常见的提问方式是「它到底有多快」。这个问题之所以很难有单一答案，是因为吞吐速率从来都不是协议本身的一个常量，而是协议实现与运行环境共同决定的系统属性。同样一份 `drivers/net/wireguard/` 驱动，在配备 AVX2 与 AVX-512 的服务器 CPU 上，与在低功耗 ARM 小板上，会给出完全不同的结果；64 字节的小包与 1500 字节的满帧会撞上不同的瓶颈；单条 TCP 流与十六条并行流对多核的利用程度也天差地别。脱离这些前置条件抛出一个「标准吞吐数字」，既不可复现，也没有工程价值。本册作为运维、性能基准与排障的唯一权威源，在这里先把口径立清楚：所有性能结论一律标注「需在目标机型实测验证」，示例输出中的数字仅用于说明命令格式与判读方法，绝不构成任何性能承诺。
+
+那么性能基准究竟要解决什么问题？归纳起来有三层。第一层是**可复现**：让不同人、不同时间在相同环境下跑出可以互相比较的结果，为此必须固定包长、流数、测试时长、CPU 亲和性与内核版本，并把这些条件写进报告。第二层是**可归因**：当吞吐不达预期时，能把瓶颈定位到加密、队列、socket 封装、物理网卡还是对端，为此需要同时观察应用层的 iperf3 速率、WireGuard 接口层的 `wg show` 计数器和内核 netdev 的统计，三层口径互相印证。第三层是**可对照**：为调优（08-02）提供基线，任何优化措施都必须有调优前的基线数据作参照，否则无法证明改动是否真的带来收益。
+
+WireGuard Linux 之所以具备良好的性能潜力，并不是偶然，而是有清晰的源码依据。它的数据面完全在内核态，包以 `sk_buff` 形态在协议栈各子系统之间传递，加解密函数直接调用内核 crypto 原语，全程不跨越内核态与用户态的边界，因而没有用户态 VPN 那种每包两次拷贝的开销（实现形态对比见 01-02）。更进一步，它在设计上就把并发放在第一位：`drivers/net/wireguard/device.h` 为设备定义了 `encrypt_queue`、`decrypt_queue`、`handshake_queue` 三个 `crypt_queue`，每个队列内嵌一个 `ptr_ring` 环形缓冲与一个 per-CPU 的 `multicore_worker` 指针；加解密工作被分发到多个 CPU 上并行执行，而不是挤在一个核上。理解这套「多队列 + 批量 + per-CPU worker」的设计，是读懂后面所有基准现象的钥匙——比如为什么单流跑不满多核、为什么小包场景 pps 会比吞吐更早撞墙。
+
+本篇的事实锚点延续全册约定：内核驱动以 `_wglinux_build/upstream_src/wireguard-linux-src/` 下的 `drivers/net/wireguard/` 为准，用户态工具以 `_wglinux_build/upstream_src/wireguard-tools/`（版本 1.0.20260223）为准，凡涉及函数、字段与命令均先读源码核实。本篇聚焦「怎么测、怎么读、怎么算口径」，调优手段放到 08-02，具体字段展开放到 05 册，机制与调用链放到 06 册，绝不在此重复。
+
+### 2. 核心概念
+
+性能基准首先要厘清四个指标维度，它们度量的是不同事物，不能互相替代。**吞吐**（throughput）是单位时间传输的字节数，常用 Mbits/sec 或 Gbits/sec 表示，是 iperf3 默认报告的主指标。**包转发率**（pps，packets per second）是单位时间处理的包个数，在小包场景它往往比吞吐更早触顶——因为每个包都要走一遍封装、加密、查路由、socket 发送的固定流程，这部分开销与包长无关。**延迟**（latency）及其抖动（jitter）度量单个包穿过隧道的时间，对交互式应用比对批量传输更重要。**CPU 效率**通常用「每字节消耗的 CPU 周期」或「每 GHz 能跑出的吞吐」表示，是横向比较不同机器、不同实现时的归一化指标。一台机器吞吐高，可能只是核多，未必效率高。
+
+第二个概念是**流模型**。单流（iperf3 不加 `-P`）只有一个 TCP 连接，其数据包通常落在同一条接收队列、由同一个加密 worker 处理，因此很难吃满多核——这与 WireGuard 的 per-CPU 队列设计直接相关（字段见 05-08，原理见 06-13）。多流（`-P N`）产生 N 条并行连接，内核可按流的哈希把包分散到不同队列，从而并行加解密。基准报告必须写明流数，否则「吞吐」数值无法解释。实践中应同时跑单流与多流：单流反映单核加密能力与延迟，多流反映整机聚合能力。
+
+第三个概念是**包长模型**。包长直接决定 pps 与吞吐的比值，也决定是否触发分片。常见的测试点包括：1500 字节满帧（标准以太网 MTU 下的典型大包，吞吐友好）、1400 字节左右（为隧道封装预留余量的常见内层长度）、以及包含多种包长的 IMIX 混合模型（用于逼近真实业务流量分布，其具体比例依测试定义而异，需对照所用基准规范核验）。UDP 打流可用 iperf3 的 `-l` 指定包长，TCP 则由内核按 MSS 自动分段。选包长的原则是覆盖「小包看 pps、大包看吞吐、混合看综合」三种情形。
+
+第四个概念是**测量层次与计数口径**。一次完整的性能观测至少涉及三层：应用层（iperf3 自己统计的传输字节与速率）、WireGuard 接口层（`wg show wg0 transfer` 展示的累计收发字节）、内核 netdev 层（`/sys/class/net/wg0/statistics/` 下由 `dev_sw_netstats` 维护的统计）。三层的字节口径并不相同，绝不能混为一谈。这里有一个极易踩坑的源码细节：`wg show` 的 transfer 字节来自 `wg_peer` 的 `rx_bytes` / `tx_bytes` 字段（字段见 05-03）。其中发送侧在 `socket.c` 的 `wg_socket_send_skb_to_peer` 里累加——函数先记录 `size_t skb_len = skb->len;`，在调用 `send4` / `send6` 经 `udp_tunnel_xmit_skb` 发出且确认无错后，执行 `peer->tx_bytes += skb_len`。这个 `skb_len` 是已完成加密、加上 `message_data` 头、认证标签与填充后的**WireGuard 数据消息长度**，既不含 UDP 与 IP 外层头，也不是原始内层明文。接收侧在 `receive.c` 的 `update_rx_stats` 中以 `message_data_len(len_before_trim)` 累加，口径与发送侧对称。因此 `wg show` 的字节与 iperf3 的应用层字节之间存在固定的封装开销差，直接拿两个数相除会得到错误结论。
+
+第五个概念是**累计值与速率的区别**。`wg show` 的 transfer 与 netdev 的 `rx_bytes` / `tx_bytes` 都是自接口创建以来的累计量，且为 64 位无符号整数，正常运行时不会回绕（源码中 `REJECT_AFTER_MESSAGES` 为 `U64_MAX - COUNTER_WINDOW_SIZE - 1`，远早于字节计数回绕就会触发密钥轮换，见 `messages.h`）。要得到速率，必须在测试前后各取一次快照，用差值除以时间间隔。相比之下，iperf3 直接给出区间速率，更适合快速读数，但它是应用层的数，不能替代接口层口径。把「取两次快照做差」写进测试流程，是取得可复现数据的关键一步。
+
+### 3. 关键数据结构与源码位置
+
+性能观测落点集中在少数几个结构与函数上，本节只点名位置并给出与测量相关的字段语义，逐字段定义交给 05 册，不在这里展开字段表。
+
+设备层的并发骨架在 `drivers/net/wireguard/device.h`：`struct crypt_queue` 由 `struct ptr_ring ring`、`struct multicore_worker __percpu *worker` 与 `int last_cpu` 组成；`struct wg_device` 持有 `encrypt_queue`、`decrypt_queue`、`handshake_queue` 三个队列，以及 `packet_crypt_wq`、`handshake_receive_wq`、`handshake_send_wq` 三个 workqueue。这些结构决定了「包会被放到哪个队列、由哪个 CPU 的 worker 处理」，是解释多流吞吐的唯一入口（字段见 05-02、05-08）。`drivers/net/wireguard/peer.h` 的 `struct wg_peer` 则持有 `tx_queue`、`rx_queue`（均为 `prev_queue`）、`napi`、`serial_work_cpu`，以及测量核心的 `u64 rx_bytes, tx_bytes`（字段见 05-03）。`drivers/net/wireguard/queueing.h` 定义了 `wg_cpumask_next_online` 与 `wg_cpumask_choose_online` 两个 CPU 选择函数，以及入队函数 `wg_queue_enqueue_per_device_and_peer`：它先把 skb 放入对等体的 `prev_queue`，再投入设备的 `ptr_ring`，最后用 `queue_work_on(cpu, wq, &per_cpu_ptr(device_queue->worker, cpu)->work)` 唤醒对应 CPU 的 worker（原理见 06-13）。
+
+收发与统计相关的函数分布在四处。`send.c` 的 `wg_packet_encrypt_worker` 用 `ptr_ring_consume_bh` 从环形队列批量取出一组 skb，再以 `skb_list_walk_safe` 逐个调用 `encrypt_packet`；后者通过 `skb_to_sgvec` 构造 scatterlist 并调用 `chacha20poly1305_encrypt_sg_inplace` 原地加密，这是 CPU 成为加密瓶颈时的直接观察点（模块见 07-07）。`receive.c` 的 `wg_packet_decrypt_worker` 对称地做批量解密，`update_rx_stats` 负责累加 `peer->rx_bytes` 与 netdev 的 `dev_sw_netstats_rx_add`，`wg_packet_rx_poll` 作为 NAPI poll 函数以 `budget` 为上限处理接收队列，并在 `wg_packet_consume_data_done` 中通过 `napi_gro_receive` 把解密后的包重新注入协议栈（模块见 07-08）。`socket.c` 的 `wg_socket_send_skb_to_peer` 负责发送侧 `peer->tx_bytes` 累加，`send4` / `send6` 通过 `udp_tunnel_xmit_skb` 完成 UDP 封装，并设置 `skb->ignore_df = 1`（模块见 07-09）。用户态展示在 `wireguard-tools/src/show.c`：`transfer` 行由 `bytes(peer->rx_bytes)` 与 `bytes(peer->tx_bytes)` 渲染，`latest handshake` 由 `ago(&peer->last_handshake_time)` 渲染。
+
+配置属性的权威定义在 `include/uapi/linux/wireguard.h`，与测量相关的是 `WGPEER_A_RX_BYTES`、`WGPEER_A_TX_BYTES` 与 `WGPEER_A_LAST_HANDSHAKE_TIME`（完整属性见 04-05、04-06）。`wg show` 命令的选项全集见 04-01。下表把本篇反复引用的源码位置收拢成速查。
+
+| 关注点 | 真实源码路径 | 本册处理方式 |
+|---|---|---|
+| 多队列与 per-CPU worker | `drivers/net/wireguard/device.h` 的 `crypt_queue` | 只点名，字段见 05-08 |
+| 收发字节计数器 | `drivers/net/wireguard/peer.h` 的 `wg_peer` | 只点名，字段见 05-03 |
+| 入队与 CPU 选择 | `drivers/net/wireguard/queueing.h` | 只点名，原理见 06-13 |
+| 批量加密与发送 | `drivers/net/wireguard/send.c` | 只点名，模块见 07-07 |
+| 批量解密与统计 | `drivers/net/wireguard/receive.c` | 只点名，模块见 07-08 |
+| UDP 封装与 tx 累加 | `drivers/net/wireguard/socket.c` | 只点名，模块见 07-09 |
+| 展示层渲染 | `wireguard-tools/src/show.c` | 只点名，命令见 04-01 |
+
+### 4. 关键流程与调用链
+
+把打流工具的流量与三处计数观察点叠在同一条链路上，读者就能明白「哪个数字在哪里产生」。出站方向：iperf3 客户端产生 TCP 或 UDP 数据，内核按路由把包交给 wg0 的 `ndo_start_xmit`，进入 `send.c` 的发送逻辑；`wg_packet_create_data` 调用 `wg_queue_enqueue_per_device_and_peer`，把 skb 同时挂到对等体 `tx_queue` 与设备 `encrypt_queue`，并唤醒某个 CPU 的加密 worker；`wg_packet_encrypt_worker` 批量取出并执行 `encrypt_packet`，完成后通过 `wg_queue_enqueue_per_peer_tx` 转交 `wg_packet_tx_worker`，后者调用 `wg_socket_send_skb_to_peer` 发出——正是在这里 `peer->tx_bytes` 增加。随后 `send4` / `send6` 经 `udp_tunnel_xmit_skb` 加上 UDP 与 IP 头，交给物理网卡。完整发送链路见 06-05，模块职责见 07-07。
+
+入站方向：物理网卡收到 UDP 报文，经 `socket.c` 的 `wg_receive` 回调进入 `wg_packet_receive`；它按消息类型分发，数据消息走 `wg_packet_consume_data`，通过 `wg_queue_enqueue_per_device_and_peer` 投入 `decrypt_queue`；`wg_packet_decrypt_worker` 批量解密后经 `wg_queue_enqueue_per_peer_rx` 触发 `napi_schedule`；`wg_packet_rx_poll` 在 NAPI 上下文中先做 `counter_validate` 抗重放检查，再进入 `wg_packet_consume_data_done`，其中 `update_rx_stats` 累加 `peer->rx_bytes`，`napi_gro_receive` 把包注入协议栈，最终送达 iperf3 服务端。完整接收链路见 06-06，抗重放原理见 06-08，模块职责见 07-08。
+
+图 08-01-01 把这条路径与三个观察点画在一起：应用层 iperf3 的速率、WireGuard 接口层的 `wg show transfer`、内核 netdev 的 statistics，分别落在链路的不同位置，读数时须记住它们的口径差异。
+
+:::figure id=08-01-01 | name=打流路径与三个计数器观察点 | dir=LR
+node s1 "iperf3 client<br/>应用层字节" blue
+node s2 "内核路由<br/>交给 wg0" gray
+node s3 "send.c 加密<br/>encrypt_queue" teal
+node s4 "socket.c<br/>UDP 封装发出" green
+node s5 "iperf3 server<br/>应用层字节" blue
+node s6 "wg show transfer<br/>peer rx/tx bytes" amber
+node s7 "netdev 统计<br/>/sys/class/net" purple
+edge s1 -> s2 "TCP/UDP"
+edge s2 -> s3 "ndo_start_xmit"
+edge s3 -> s4 "密文 skb"
+edge s4 -> s5 "物理网络"
+edge s3 -> s6 "tx_bytes 累加"
+edge s4 -> s7 "dev_sw_netstats"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「iperf3 client 应用层字节」经「内核路由 交给 wg0」进入「send.c 加密 encrypt_queue」，再由「socket.c UDP 封装发出」经物理网络到达「iperf3 server 应用层字节」；旁路观察点有两处——加密环节通过「tx_bytes 累加」反映到「wg show transfer peer rx/tx bytes」，封装环节通过「dev_sw_netstats」反映到「netdev 统计 /sys/class/net」。
+
+### 5. 配置/命令/代码实例
+
+下面给出一组可复现的测试命令。前提是一条已建立的 WireGuard 隧道，两端 wg0 地址已知、握手正常（握手可用性的判断见第 6 节与 01-01 的 `wg show` 判读）。第一组用 iperf3 打流，覆盖单流 TCP、多流 TCP 与指定包长的 UDP 三种情形：
+
+```bash
+# A 端启动服务端
+iperf3 -s -p 5201
+
+# B 端：单流 TCP，测 10 秒
+iperf3 -c <A端wg0地址> -p 5201 -t 10
+
+# B 端：4 条并行流 TCP
+iperf3 -c <A端wg0地址> -p 5201 -t 10 -P 4
+
+# B 端：UDP，指定 1400 字节包长，不设带宽上限
+iperf3 -c <A端wg0地址> -p 5201 -u -l 1400 -b 0 -t 10
+```
+
+第二组在测试**前后各执行一次**，用于取得接口层与 netdev 层的累计计数快照，随后做差除以时长得到速率：
+
+```bash
+# 测试前快照
+wg show wg0 transfer
+cat /sys/class/net/wg0/statistics/rx_bytes /sys/class/net/wg0/statistics/tx_bytes
+
+# 测试后再次执行同样两条命令，用后值减前值再除以测试秒数
+```
+
+第三组是 iperf3 单流测试的典型输出，紧接着给出判读。示例输出，具体格式需对照实际版本核验；示例数值需按实际环境验证，不作为承诺：
+
+```text
+Connecting to host 10.0.0.1, port 5201
+[  5] local 10.0.0.2 port 52344 connected to 10.0.0.1 port 5201
+[ ID] Interval           Transfer     Bitrate         Retr  Cwnd
+[  5] 0.00-10.00  sec   112 MBytes  94.0 Mbits/sec    0   1.20 MBytes
+[  5] 0.00-10.00  sec   112 MBytes  94.0 Mbits/sec    receiver
+```
+
+逐行判读如下。首行 `Connecting to host 10.0.0.1, port 5201` 表明客户端连的是对端 wg0 的地址与 iperf3 监听端口，确认流量确实要穿过隧道；若这里写成了物理网卡地址，测到的就是不经 WireGuard 的裸网性能，整个测试失去意义。第二行给出本地与对端的地址端口对，`local 10.0.0.2` 是本机 wg0 地址，说明源地址选在隧道网段，配合路由才能进入 wg0 的发送路径。表头行定义了后续各列：`Interval` 是统计区间，`Transfer` 是区间内传输字节，`Bitrate` 是换算后的速率，`Retr` 是重传次数，`Cwnd` 是拥塞窗口。第四行是发送端报告：`112 MBytes` 与 `94.0 Mbits/sec` 是应用层口径的传输量与速率，`Retr 0` 表示没有重传，说明隧道内没有明显丢包，`Cwnd 1.20 MBytes` 反映拥塞窗口大小；这一行的字节数是 iperf3 在应用层数的，与 `wg show` 的 `peer->tx_bytes` 存在封装开销差，二者不可直接相等。末行是接收端报告，`receiver` 标注表明这是对端回传的统计，正常情况下应与发送端接近；若接收端明显低于发送端，说明隧道内或物理链路上发生了丢包，需结合 `wg show` 的计数器与 netdev 的 `rx_errors` 等字段进一步定位（排障流程由本册后续篇章给出，此处不展开）。务必注意：这里的 `94.0 Mbits/sec` 只是示例数值，需在目标机型实测验证，不作为任何性能承诺；真实结果取决于 CPU、包长、流数与内核配置。最后强调口径：要把这次测试写成可复现记录，必须同时附上包长（TCP 由 MSS 决定、UDP 用 `-l` 指定）、流数（`-P`）、时长（`-t`）、内核版本与 `wg --version`，缺一项都可能导致他人无法复现你的数字。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是**只看单一指标**。只报吞吐不报包长与流数，等于没报——同样的机器跑 1500 字节大包和 64 字节小包，吞吐与 pps 的表现可能完全相反。最佳实践是固定一组「标准测试矩阵」：单流 TCP、多流 TCP、1500B UDP、小包 UDP、IMIX 混合，逐项记录。
+
+第二个陷阱是**拿 iperf3 数字直接对比 `wg show` 字节**。如前所述，后者统计的是封装后的 WireGuard 数据消息，不含 UDP/IP 外层头，也不是原始明文；iperf3 数是应用层字节。两者的差值来自封装开销，属于预期现象，不是丢包。要核对是否丢包，应比较 iperf3 收发两端的差值，以及 netdev 统计里的 `rx_errors`、`rx_dropped`、`tx_dropped`。
+
+第三个陷阱是**忽略累计值做差**。直接把 `wg show transfer` 的累计字节当成一次测试的吞吐，是典型错误。正确做法是在测试前后各取一次快照做差；由于该值是 64 位累计量且不会在正常测试时长内回绕，做差是安全的。
+
+第四个陷阱是**测试工具本身成为瓶颈**。单流 iperf3 可能受限于发送端 CPU 的单核性能或 TCP 拥塞控制，而非 WireGuard；跑多流时若客户端与服务端在同一台物理机上，还会引入本机回环与中断竞争。应尽量用两台独立主机，服务端与客户端分别固定到不同 CPU（用 `taskset` 绑定 iperf3 进程），避免测试工具与加密 worker 争抢同一组核。
+
+第五个陷阱是**忽略握手状态与 keepalive 的干扰**。测吞吐前应确认 `wg show` 的 `latest handshake` 是最近的值；若长期为空或很旧，说明握手从未成功或已过期，此时流量会被暂存或丢弃，测出的数字毫无意义。对于 NAT 后的 peer，缺少持久 keepalive 会导致 endpoint 漂移，进而中断打流（keepalive 原理见 06-11，参数见 04-01）。
+
+第六个陷阱是**把环境差异误当成实现差异**。CPU 是否支持 SIMD、内核是否启用 GSO/GRO、网卡是否开 RSS 多队列、irqbalance 如何分配中断，都会显著改变结果。因此跨平台比较时必须逐项记录这些条件，这些维度的具体调优放在 08-02。可复现性清单建议包含：主机型号与 CPU 型号、内核版本、`wg --version`、iperf3 版本、包长、流数、时长、MTU、GSO/GRO 状态、网卡队列数与中断亲和性、两端是否为独立主机。
+
+最后重申本册的口径纪律：任何没有附上上述条件的吞吐数字，都应视为不可复现；本套资料不提供「某型号必达多少 Gbps」这类断言，所有性能数值一律需在目标机型实测验证。
+
+### 7. 小结与延伸阅读
+
+本篇建立了 WireGuard Linux 性能基准的方法学：性能是系统属性而非协议常量，因此基准要解决可复现、可归因、可对照三个问题；基准围绕吞吐、pps、延迟、CPU 效率四个指标展开，并区分单流与多流、大包与小包/IMIX 两类模型；观测分为 iperf3 应用层、`wg show transfer` 接口层、内核 netdev 三层，三者口径不同——尤其 `peer->tx_bytes` 在 `socket.c` 累加的是封装后的 WireGuard 数据消息长度，`peer->rx_bytes` 在 `receive.c` 以 `message_data_len` 累加，二者都与 iperf3 的应用层字节存在封装开销差，累计值须做差才能得到速率。源码落点集中在 `device.h` 的三个 `crypt_queue`、`queueing.h` 的入队与 CPU 选择、`send.c` 与 `receive.c` 的批量加解密 worker、`socket.c` 的 UDP 封装与发送侧累加，以及 `show.c` 的展示渲染。所有示例数字均需在目标机型实测验证，不构成性能承诺。
+
+延伸阅读建议按三条线走：想深入计数器对应的结构体字段去 05 册，想理解加解密与收发的完整调用链去 06 册，想知道各源文件承担什么职责去 07 册；命令与属性的全集去 04 册。调优手段（多队列、GSO/GRO、MTU、CPU 特性）见 08-02。跨册随查按（字段见 05-03 ｜ 参数见 04-01 ｜ 原理见 06-05 ｜ 模块见 07-07）执行：结构体逐字段去 05、参数与命令全集去 04、机制与调用链去 06、目录级模块能力去 07。凡本篇标注「需对照实际版本核验」的函数名、字段与命令选项，均以 `_wglinux_build/upstream_src/` 下对应文件为准。
+
+## 08-02 性能调优：多线程、GSO、MTU 与 CPU 特性
+
+### 1. 背景与动机
+
+调优是建立在基准基线之上的定向改善，而不是凭感觉调整参数。08-01 已经把「怎么测、怎么读、怎么算口径」立清楚，本篇要回答的是「有哪些可调维度、每个维度改的是什么、如何判断改动有效」。WireGuard Linux 的性能由四个层面共同决定：包如何在多个 CPU 之间分发、发送与接收路径能否利用网卡的分段与聚合卸载、封装后的报文是否因 MTU 设置不当而触发分片或丢弃、以及底层加密原语能否吃到 CPU 的 SIMD 能力。这四层分别对应多线程与多队列、GSO/GRO、MTU/MSS、CPU 特性四个调优维度，本篇逐一展开。
+
+必须先立两条纪律。第一，调优的每一步都要有基线对照：先按 08-01 的标准矩阵测出基线，再只改动一个维度重测，否则无法归因——同时改队列数和 MTU，出了问题根本不知道是哪一项导致的。第二，所有性能数值一律标注「需在目标机型实测验证」，本篇不给出「调到某值即可达到多少 Gbps」这类断言。不同 CPU、不同网卡、不同内核版本的最优配置并不相同，照抄他人的配置往往适得其反。
+
+从源码看，WireGuard Linux 天生就是为多核与批量处理而设计的。`drivers/net/wireguard/device.h` 把每个设备的加解密工作拆成 `encrypt_queue`、`decrypt_queue`、`handshake_queue` 三个 `crypt_queue`，每个队列用 `ptr_ring` 做无锁环形缓冲、用 per-CPU 的 `multicore_worker` 承接工作；`send.c` 与 `receive.c` 的 worker 都是「一次取出一批 skb、逐个加解密」的批量模型。这意味着很多「调优」其实不是去改 WireGuard 的内部参数——它并没有暴露多少内部旋钮——而是去调整它所依赖的内核基础设施：网卡多队列、中断亲和性、GSO/GRO 开关、MTU 与 MSS、以及内核 crypto 后端的 SIMD 实现。理解这一点，才能明白为什么调优的命令大多是 `ethtool`、`taskset`、`ip` 与 `iptables/nftables`，而不是某条 WireGuard 专有命令（命令全集见 04-01、04-03）。
+
+### 2. 核心概念
+
+**多线程与多队列。** WireGuard 的并发单位是 per-CPU worker：`queueing.h` 的 `wg_queue_enqueue_per_device_and_peer` 通过 `wg_cpumask_next_online(&device_queue->last_cpu)` 在在线 CPU 之间轮转选核，再用 `queue_work_on` 把工作投递到该 CPU 的 worker。因此 worker 的数量实际上等于在线 CPU 数，并不是一个可直接配置的旋钮；换一个 peer 发送时，`wg_queue_enqueue_per_peer_tx` 用 `wg_cpumask_choose_online` 按 `peer->internal_id` 选择固定的 CPU，以保持同一 peer 的顺序性。真正可调的是「包从物理网卡到内核时能否分散到多个队列」——这由网卡的 RSS 多队列、中断亲和性与 irqbalance 决定。单流流量只有一条连接，哈希后通常落在同一队列、同一 worker，因此多队列对单流帮助有限；多流才能把负载摊到多个核。这是为什么基准必须同时测单流与多流（08-01）的根本原因。
+
+**GSO 与 GRO。** GSO（Generic Segmentation Offload）是发送侧的卸载：协议栈先构造一个远大于 MTU 的「大包」，推迟到接近网卡时才分段，从而减少协议栈逐包处理的次数；GRO（Generic Receive Offload）是接收侧的聚合：把同类小包在交给协议栈前合并成大包，减少上层处理次数。就本快照而言，据源码据实说明：`receive.c` 的 `wg_packet_consume_data_done` 明确调用 `napi_gro_receive(&peer->napi, skb)`，因此接收侧走的是 NAPI + GRO 路径；而 `send.c` 的 `encrypt_packet` 是通过 `skb_cow_data` 处理非线性 skb、以 `skb_to_sgvec` 构造 scatterlist 后调用 `chacha20poly1305_encrypt_sg_inplace` 完成原地加密，本快照中并未出现显式的发送侧 GSO 分段逻辑（例如设置 `skb->encapsulation` 或调用分段辅助函数）。较新的内核版本是否为 WireGuard 加入了发送侧 GSO 支持，必须对照目标内核源码核验，不能据本快照下断言。这也提示一条实践原则：GSO/GRO 的行为高度依赖内核版本与网卡驱动，任何结论都要在实际环境用 `ethtool -k` 观察当前状态并实测验证。
+
+**MTU 与 MSS。** WireGuard 把所有流量封装在 UDP 中，这带来了固定的封装开销。按本快照 `messages.h` 的定义：`struct message_data` 含 `header`（4 字节）、`key_idx`（4 字节）、`counter`（8 字节），合计 16 字节；`NOISE_AUTHTAG_LEN` 为 `CHACHA20POLY1305_AUTHTAG_SIZE`（16 字节）。两者相加，WireGuard 层开销为 32 字节；再叠加 UDP 头 8 字节与 IPv4 头 20 字节，IPv4 承载下总计约 60 字节（IPv6 承载因 40 字节 IP 头而约 80 字节，具体取值需对照实际版本核验）。因此物理口 MTU 为 1500 时，wg0 的内层 MTU 通常应设为 1500 减去这段开销（约 1440 或更低），否则内层满帧封装后会超过物理口 MTU，触发分片甚至被丢弃。TCP 场景还可用 MSS clamp 把 SYN 报文的 MSS 值压到合适大小，从源头避免分片。MTU 过大导致分片、过小导致有效载荷占比下降，两端都要兼顾。
+
+**CPU 特性。** 这里有一个必须澄清的常见误解：WireGuard 协议把对称加密固定为 ChaCha20-Poly1305，而 AES-NI 是加速 AES 的指令集，对 ChaCha20 没有直接加速作用，所以「开启 AES-NI 提升 WireGuard 性能」的说法并不成立。ChaCha20 是 ARX（加-旋转-异或）结构流密码，其加速依赖 SIMD 把多个 32 位通道打包并行。据本快照 `lib/crypto/chacha.c`：通用实现 `chacha_crypt_generic` 以 `CHACHA_BLOCK_SIZE` 为单位循环生成密钥流并异或；只有在定义 `CONFIG_CRYPTO_LIB_CHACHA_ARCH` 时，才通过 `#include "chacha.h" /* $(SRCARCH)/chacha.h */` 引入体系结构相关实现，否则把 `chacha_crypt_arch` 直接定义为 `chacha_crypt_generic`。所以真正值得关注的是：目标内核是否编译了对应架构的 ChaCha20 SIMD 后端（如 x86 的 AVX2/AVX-512 变体）、CPU 是否支持相应指令、以及运行时是否真的选中了 SIMD 路径。这些因素的具体取值与加速幅度均需对照内核配置、`/proc/cpuinfo` 与实测结果核验，不能凭指令集名称臆断。
+
+### 3. 关键数据结构与源码位置
+
+调优涉及的源码落点与 08-01 高度重叠，但关注角度不同：08-01 看「计数在哪里累加」，本篇看「并发与卸载在哪里发生」。
+
+设备与队列层在 `drivers/net/wireguard/device.h` 与 `drivers/net/wireguard/queueing.h`：`crypt_queue` 的 `ring`、`worker`、`last_cpu` 决定批量与轮转（字段见 05-08）；`wg_cpumask_next_online`、`wg_cpumask_choose_online` 与 `wg_queue_enqueue_per_device_and_peer` 决定包落到哪个 CPU（原理见 06-13）。`peer.h` 的 `wg_peer` 含 `serial_work_cpu` 与 `internal_id`，后者用于选择「同一 peer 固定 CPU」（字段见 05-03）。批量加解密在 `send.c` 的 `wg_packet_encrypt_worker` 与 `encrypt_packet`，以及 `receive.c` 的 `wg_packet_decrypt_worker`；`receive.c` 的 `wg_packet_rx_poll` 以 `budget` 为处理上限，`wg_packet_consume_data_done` 调用 `napi_gro_receive`（模块见 07-07、07-08，GSO/GRO 原理见 06-12）。封装与分片相关常量在 `messages.h`：`MESSAGE_PADDING_MULTIPLE = 16`、`MESSAGE_MINIMUM_LENGTH`、`SKB_HEADER_LEN`、`DATA_PACKET_HEAD_ROOM` 以及队列上限 `MAX_STAGED_PACKETS = 128`、`MAX_QUEUED_PACKETS = 1024`（常量全集见 04-06）。UDP 承载在 `socket.c`：`send4` / `send6` 调用 `udp_tunnel_xmit_skb` 并设置 `skb->ignore_df = 1`，`wg_socket_init` 把 `sk_sndbuf` 设为 `INT_MAX` 且调用 `sk_set_memalloc`（模块见 07-09，socket 原理见 06-12）。加密后端在 `lib/crypto/chacha.c` 与 `lib/crypto/poly1305.c`（模块见 07-12）。
+
+下表把四个调优维度与对应的源码位置、外部操作对象收拢成速查。
+
+| 调优维度 | 源码依据（本快照） | 外部操作对象 |
+|---|---|---|
+| 多线程与多队列 | `device.h` 的 `crypt_queue`、`queueing.h` 的 CPU 选择 | 网卡 RSS 队列、irqbalance、CPU 亲和性 |
+| GSO / GRO | `receive.c` 的 `napi_gro_receive`、`send.c` 的 scatterlist | `ethtool -k` 的 gro/gso 开关 |
+| MTU / MSS | `messages.h` 的 `message_data`、`NOISE_AUTHTAG_LEN` | `ip link set mtu`、`iptables/nftables` MSS clamp |
+| CPU 特性 | `lib/crypto/chacha.c` 的 `CONFIG_CRYPTO_LIB_CHACHA_ARCH` | 内核 crypto 配置、CPU flags |
+
+### 4. 关键流程与调用链
+
+多线程调优的链路是：物理网卡的多个 RSS 接收队列产生多路中断，每路中断经 irqbalance 或手工亲和性绑定到不同 CPU；每个 CPU 上的软中断把包送入对应的 UDP socket，由 `socket.c` 的 `wg_receive` 回调进入 `wg_packet_receive`；随后 `wg_queue_enqueue_per_device_and_peer` 按 `last_cpu` 轮转把包投入 `decrypt_queue` 并唤醒对应 CPU 的 `wg_packet_decrypt_worker`。这样形成「网卡队列 → CPU → per-CPU worker」的映射。若 RSS 只有一条队列或中断全绑在同一核，即便机器有很多核，加解密也会挤在一个 worker 上，多流吞吐因此上不去（字段见 05-08，原理见 06-13）。
+
+GSO/GRO 的链路要分两侧看。接收侧在 `wg_packet_consume_data_done` 里把解密后的 skb 通过 `napi_gro_receive` 注入协议栈，因此 GRO 是否有效与 NAPI 权重（`wg_packet_rx_poll` 的 `budget`）相关；发送侧本快照以 `skb_cow_data` + scatterlist 批量加密为主，没有显式 GSO 分段，较新内核的差异需核验（原理见 06-12）。MTU 则贯穿两端：入站 `prepare_skb_header` 对 UDP 长度做严格校验，封装后超过物理口 MTU 且被设置 `ignore_df` 的报文会依赖底层分片或丢弃；出站 `calculate_skb_padding` 以 `MESSAGE_PADDING_MULTIPLE` 对齐填充，MTU 设置直接影响最终报文大小（发送路径见 06-05，字段见 05-06）。
+
+图 08-02-01 把四个调优维度标注在包所经过的路径上，帮助读者建立「调哪一项、影响哪一段」的对应关系。
+
+:::figure id=08-02-01 | name=四个调优维度在收发路径上的位置 | dir=TD
+node t1 "物理网卡<br/>RSS 多队列" blue
+node t2 "中断亲和性<br/>irqbalance / taskset" gray
+node t3 "per-CPU worker<br/>批量加解密" teal
+node t4 "chacha.c<br/>SIMD 后端" red
+node t5 "GRO<br/>napi_gro_receive" purple
+node t6 "MTU / MSS<br/>封装开销" amber
+node t7 "UDP 封装<br/>socket.c" green
+edge t1 -> t2 "多路中断"
+edge t2 -> t3 "分核"
+edge t3 -> t4 "调用加密"
+edge t3 -> t5 "聚合注入"
+edge t6 -> t7 "决定报文大小"
+edge t7 -> t1 "发出"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「物理网卡 RSS 多队列」经「中断亲和性 irqbalance / taskset」分散到「per-CPU worker 批量加解密」；worker 一方面调用「chacha.c SIMD 后端」做加密，另一方面通过「GRO napi_gro_receive」聚合注入协议栈；「MTU / MSS 封装开销」在「UDP 封装 socket.c」处决定报文大小，最终经物理网卡发出。
+
+### 5. 配置/命令/代码实例
+
+第一组命令调整多队列与 CPU 亲和性。先查看网卡支持的组合队列数，再按需设置，最后用 `taskset` 把打流进程固定到不承载网卡中断的核上，避免测试工具与加密 worker 争抢同一组核：
+
+```bash
+# 查看并设置网卡组合队列数（需网卡驱动支持）
+ethtool -l eth0
+ethtool -L eth0 combined 4
+
+# 查看中断亲和性；关闭 irqbalance 后可手工绑核
+cat /proc/irq/125/smp_affinity_list
+echo 0-3 > /proc/irq/125/smp_affinity_list
+
+# 把 iperf3 固定到指定 CPU 核
+taskset -c 8,9 iperf3 -c <A端wg0地址> -t 10 -P 4
+```
+
+第二组命令调整 MTU 与 MSS。先看物理口与 wg0 的 MTU，再按封装开销设置 wg0 的 MTU，最后用 MSS clamp 让 TCP 从源头避免分片（规则仅为示例写法，需按实际防火墙框架与地址段调整）：
+
+```bash
+# 查看与设置 MTU（物理口 1500 时，wg0 需扣除封装开销）
+ip link show eth0
+ip link set wg0 mtu 1420
+
+# iptables 方式：把正向 SYN 的 MSS 压到 1360
+iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+# 查看当前卸载开关状态
+ethtool -k eth0 | grep -E 'generic-segmentation-offload|generic-receive-offload'
+```
+
+第三组是一份「调优前现状核查」的示例输出，用于确认多队列、亲和性与 SIMD 后端是否处于预期状态。示例输出，具体格式需对照实际版本核验；示例数值需按实际环境验证，不作为承诺：
+
+```text
+$ ethtool -l eth0 | grep Combined
+    Combined:  8
+    Combined:  4
+$ cat /proc/irq/125/smp_affinity_list
+0-3
+$ grep -m1 -o 'avx2\|avx512f' /proc/cpuinfo
+avx2
+$ wg show wg0 transfer
+  transfer: 12.4 GiB received, 8.91 GiB sent
+```
+
+逐行判读如下。第一组 `ethtool -l ... | grep Combined` 输出两行，上一行是 Pre-set maximums（硬件上限 8），下一行是 Current hardware settings（当前生效 4）；当前值小于上限意味着还有提升多队列的余地，对应 `device.h` 中 per-CPU worker 能否被多路中断喂饱，但队列数并非越多越好，需结合 08-01 的多流基线实测。`cat /proc/irq/125/smp_affinity_list` 输出 `0-3`，表示 125 号中断被限制在 CPU 0 到 3，若所有网卡中断都落在这几个核，而 iperf3 又被 `taskset` 绑到 8、9 核，就形成了「软中断在 0-3、加密 worker 按在线 CPU 轮转、打流进程在 8-9」的拓扑，是否均衡要看实际 pps 分布。`grep -m1 -o 'avx2\|avx512f' /proc/cpuinfo` 输出 `avx2`，说明 CPU 支持 AVX2，但是否真的被 ChaCha20 SIMD 后端使用，还取决于内核是否定义了 `CONFIG_CRYPTO_LIB_CHACHA_ARCH`（见 `lib/crypto/chacha.c`），仅凭 CPU flags 不能下结论。`wg show wg0 transfer` 的 `12.4 GiB received, 8.91 GiB sent` 是自接口建立以来的累计量，来自 `peer->rx_bytes` / `peer->tx_bytes`（字段见 05-03），要评估某次调优的效果必须在调优前后各取一次快照做差，并把差值除以测试时长，绝不能把累计值当成单次吞吐；这里的数值同样是示例，需在目标机型实测验证、不作为承诺。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是**把 worker 数当成可配置旋钮**。WireGuard 的加密 worker 是 per-CPU 的，数量随在线 CPU 数而定，`queueing.h` 的 `wg_cpumask_next_online` 只是在这些 CPU 间轮转；并不存在一条「设置 worker 数」的 WireGuard 命令。真正能调的是上游的队列与亲和性，把包均匀喂给这些 worker。强行追求「更多 worker」而忽视中断分布，不会有收益。
+
+第二个陷阱是**irqbalance 与手工亲和性互相打架**。若系统运行 irqbalance，手工写入 `/proc/irq/*/smp_affinity_list` 可能被守护进程覆盖。手工绑核前应先停止 irqbalance，并把「停止守护进程」这一动作记入变更单，因为它影响整机而非仅 WireGuard。操作前需确认这是目标机器的预期状态，避免影响同机其他业务。
+
+第三个陷阱是**MTU 设置走向两个极端**。设得过大，内层满帧封装后超过物理口 MTU，`socket.c` 又设置了 `skb->ignore_df = 1`，报文依赖底层分片或被丢弃，表现为大包吞吐骤降甚至连接不通；设得过小，协议头占比升高，有效吞吐下降。正确做法是从物理口 MTU 扣除实际封装开销（IPv4 约 60 字节、IPv6 约 80 字节，需对照版本核验）设置 wg0，并用 `ping -M do -s <大小>` 逐点验证不通分片的最大载荷。MSS clamp 只解决 TCP，UDP 仍要靠 MTU 本身控制。
+
+第四个陷阱是**夸大 GSO/GRO 的作用**。本快照接收侧确有 `napi_gro_receive`，但发送侧没有显式 GSO 分段，较新内核的差异必须核验；而且 GSO/GRO 的效果依赖网卡驱动与内核版本，打开不等于一定更快。调整前先用 `ethtool -k` 记录当前状态，只做单变量改动并复测。
+
+第五个陷阱是**AES-NI 迷思**。再强调一次：WireGuard 固定用 ChaCha20-Poly1305，AES-NI 加速的是 AES，对 ChaCha20 无直接作用。应关注的是内核 crypto 的 ChaCha20 SIMD 后端与 CPU 的 AVX2/AVX-512 支持，且加速幅度需实测。AVX-512 在部分 CPU 上可能触发降频，不一定比 AVX2 更优，这也必须实测验证。
+
+最佳实践可归纳为四步：一，按 08-01 跑出标准基线并完整记录环境；二，按「多队列与亲和性 → MTU/MSS → GSO/GRO → CPU 后端」的顺序逐项调整，每次只改一个维度；三，每项改动后重跑同一套测试矩阵，用 `wg show` 计数快照做差核算接口层速率，确认收益而非依赖主观感觉；四，把生效配置与前后数据一并归档，作为上线 checklist 的输入。任何一步得到的数值，若无完整环境说明与实测记录，都不应作为普遍结论传播。
+
+### 7. 小结与延伸阅读
+
+本篇围绕四个调优维度给出 WireGuard Linux 的性能优化框架：多线程与多队列的真正可调对象是网卡 RSS 队列、irqbalance 与 CPU 亲和性，因为加解密 worker 是 per-CPU 的（`device.h` 的 `crypt_queue`、`queueing.h` 的 CPU 选择），单流受限于单 worker、多流才能摊到多核；GSO/GRO 方面，本快照接收侧通过 `napi_gro_receive` 做 GRO，发送侧以 `skb_cow_data` + scatterlist 批量加密为主而未出现显式 GSO，较新内核差异需核验；MTU 须扣除 WireGuard 层 32 字节加 UDP/IP 头的封装开销，并配合 MSS clamp 从源头避免分片；CPU 特性上，ChaCha20 靠 SIMD 而非 AES-NI，是否启用体系结构后端取决于 `CONFIG_CRYPTO_LIB_CHACHA_ARCH` 与内核配置。所有调优都必须建立在 08-01 的可复现基线上，逐项单变量改动并实测验证，所有性能数值需在目标机型实测验证，不构成承诺。
+
+延伸阅读：想深入队列与计数字段去 05 册，想理解批量加解密、GSO/GRO 与多核并发的完整机制去 06 册，想知道各源文件职责去 07 册，命令与常量全集去 04 册。跨册随查按（字段见 05-08 ｜ 参数见 04-07 ｜ 原理见 06-13 ｜ 模块见 07-07）执行：结构体逐字段去 05、参数与常量全集去 04、机制与调用链去 06、目录级模块能力去 07。凡本篇标注「需对照实际版本核验」的字段、常量与命令选项，均以 `_wglinux_build/upstream_src/` 下对应文件为准。

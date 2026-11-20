@@ -1,0 +1,268 @@
+## 07-07 send.c 发送模块
+
+### 1. 背景与动机
+
+在WireGuard Linux内核驱动的分工版图里，`drivers/net/wireguard/send.c`是「出站方向的总调度室」。它不负责最底层的加解密原语（那是`lib/crypto/`的职责，模块族见07-12），也不负责把报文实际写到UDP套接字（那是`socket.c`的职责，见07-09），更不负责定义消息字节布局（那是`messages.h`，见07-06）。它做的事情可以一句话概括：把内核协议栈递下来的待发包、以及握手与保活这类控制包，组织成正确的队列顺序，分配密钥与随机数，喂给并行的加密工作者，最后把加密产物交给发送完成路径推入UDP。本篇是07册「模块与特性介绍」中关于发送模块的唯一权威源，重点讲「这个模块由哪些函数组成、它们如何分工、彼此通过什么队列接口衔接」，至于数据包封装与加密的完整流水线原理，交给06-05；握手状态机的数学与时序，交给06-02、06-03；多核并行加密的设计动机，交给06-13。
+
+为什么需要单独一个发送模块，而不是把逻辑塞进`ndo_start_xmit`里一次做完？根本原因在内核编程的两条硬约束。第一，网卡的发送入口`ndo_start_xmit`运行在软中断上下文，不能睡眠、不能做耗时操作，而ChaCha20-Poly1305加密一个GSO大包可能耗时不短；若在发送入口同步加密，会拉长临界区、恶化延迟。第二，WireGuard希望利用多核：加密是无状态、可并行的，理想情况是让多个CPU核心同时加密不同包。于是`send.c`把「接收待发包」与「执行加密」解耦：发送入口只做轻量的入队，把重活丢给工作队列（workqueue）里的加密worker；加密完成后再通过每peer的串行队列把结果交回一个发送完成worker，由它调用socket发出。这条「入队—加密—回队—发出」的流水线，正是本篇要剖析的模块组织。
+
+读懂这个模块还有一个实际收益：排障时你能把现象定位到具体函数。例如`transfer`发送字节不增长，问题可能出在`wg_packet_send_staged_packets`没能拿到有效密钥（走`out_nokey`分支重新握手），也可能出在加密worker把包标记为`PACKET_STATE_DEAD`；`wg show`里的`latest handshake`迟迟不刷新，则可能是握手发起被速率限制挡在`wg_birthdate_has_expired`检查之外。这些判断都需要以源码函数为锚点，这正是模块级解读的价值。
+
+### 2. 核心概念
+
+发送模块的概念可以压缩为「三类包、两套队列、三种worker、一个状态机」。
+
+三类包是模块处理的全部对象。第一类是握手控制包，包括握手发起（initiation）、握手响应（response）与cookie响应，它们的构造分别由`wg_noise_handshake_create_initiation`、`wg_noise_handshake_create_response`、`wg_cookie_message_create`完成（握手消息格式见06-04，cookie原理见06-09）。发送侧对它们的处理函数的命名很直白：`wg_packet_send_handshake_initiation`、`wg_packet_send_handshake_response`、`wg_packet_send_handshake_cookie`。第二类是数据包，来自内核协议栈，先被暂存入peer的`staged_packet_queue`，由`wg_packet_send_staged_packets`批量取走加密。第三类是保活包（keepalive），它本质上是一个载荷长度为零的数据消息，由`wg_packet_send_keepalive`在暂存队列为空时凭空构造一个最小长度的skb塞进去，再走与数据包相同的发送流程。
+
+两套队列是并行的关键。其一是「每设备加密队列」`wg_device.encrypt_queue`，它是一个无锁多生产者队列（底层为`ptr_ring`），所有待加密包先投到这里；`device.c`在初始化时用`wg_packet_queue_init(&wg->encrypt_queue, wg_packet_encrypt_worker, ...)`把`wg_packet_encrypt_worker`绑定为它的消费者。其二是「每peer前序队列」`wg_peer.tx_queue`，它是一个多生产者单消费者队列（`prev_queue`），承载「已入队等待状态变为CRYPTED或DEAD」的包。入队函数`wg_queue_enqueue_per_device_and_peer`（定义在`queueing.h`）做了一次精妙的「双入队」：先把skb放进peer的`prev_queue`并把状态置为`PACKET_STATE_UNCRYPTED`，再放进设备的`encrypt_queue`并wake up一个加密worker（queueing.h第160—174行）。这样，加密worker与发送完成worker通过 skb 的`cb`控制缓冲里的`state`字段（见05-06）解耦，无需额外的锁或条件变量。
+
+三种worker是执行的载体，都注册在同一个工作队列`packet_crypt_wq`（`device.c`中命名为`wg-crypt-%s`）上。第一种是加密worker `wg_packet_encrypt_worker`，它从`encrypt_queue`消费、调用内部函数`encrypt_packet`做实际加密、再把结果通过`wg_queue_enqueue_per_peer_tx`回投到peer队列。第二种是发送完成worker `wg_packet_tx_worker`，它从`tx_queue`消费已加密包，交给`wg_packet_create_data_done`经`wg_socket_send_skb_to_peer`发出。第三种是握手发送worker `wg_packet_handshake_send_worker`，它挂在另一个工作队列`handshake_send_wq`（命名`wg-kex-%s`）上，专门负责异步发起握手。注意一个容易搞错的点：真正构造握手发起包的`wg_packet_send_handshake_initiation`是`static`内部函数，只被握手发送worker调用；对外暴露的是`wg_packet_send_queued_handshake_initiation`，后者只做「检查速率限制、拿peer引用、入队」，不直接发包。
+
+一个状态机，就是`enum packet_state`。它在`queueing.h`第53—57行定义，只有三个值：`PACKET_STATE_UNCRYPTED`（待加密）、`PACKET_STATE_CRYPTED`（加密成功）、`PACKET_STATE_DEAD`（加密失败或异常）。这个状态机是加密worker与发送worker之间的握手信号：加密worker用`atomic_set_release`发布最终状态，发送worker用`atomic_read_acquire`读取，acquire/release语义保证加密产物对发送worker可见（并发与内存序原理见06-13）。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名发送模块依赖的关键结构与真实路径，逐字段定义统一交给05册，不在此展开字段表。
+
+发送模块的主战场是`drivers/net/wireguard/send.c`，全文约415行。它的函数可以清晰地分成「对外API」与「内部static辅助」两栏，这个区分在`queueing.h`第38—51行有权威声明：凡是出现在该头文件`/* send.c APIs: */`段里的，就是对外函数；没出现的`static`函数，是模块内部实现细节。下表把这两栏与各自职责列全，是全篇的索引骨架。
+
+| 类别 | 函数（send.c 行号） | 职责要点 |
+|---|---|---|
+| 对外：握手发起排队 | `wg_packet_send_queued_handshake_initiation`（55） | 速限检查、拿引用、投`handshake_send_wq` |
+| 对外：握手发送worker | `wg_packet_handshake_send_worker`（46） | 调用内部initiation构造、发送、放引用 |
+| 对外：握手响应 | `wg_packet_send_handshake_response`（85） | 构造响应、派生会话、发送 |
+| 对外：cookie响应 | `wg_packet_send_handshake_cookie`（110） | 构造cookie包、作为 reply 发出 |
+| 对外：保活 | `wg_packet_send_keepalive`（221） | 必要时造空包、转入暂存发送 |
+| 对外：清空暂存 | `wg_packet_purge_staged_packets`（333） | 计入`tx_dropped`、清空`staged_packet_queue` |
+| 对外：暂存发送 | `wg_packet_send_staged_packets`（342） | 取密钥、分配nonce、送加密队列 |
+| 对外：加密worker | `wg_packet_encrypt_worker`（287） | 消费`encrypt_queue`、加密、回投tx队列 |
+| 对外：发送完成worker | `wg_packet_tx_worker`（262） | 消费`tx_queue`、交给socket发出 |
+| 内部static | `wg_packet_send_handshake_initiation`（21） | 速限、构造initiation、发送、起定时器 |
+| 内部static | `keep_key_fresh`（124） | 判断当前密钥是否需刷新触发重握手 |
+| 内部static | `calculate_skb_padding`（141） | 按MTU与填充倍数算填充长度 |
+| 内部static | `encrypt_packet`（162） | 加数据头、填充、原地加密 |
+| 内部static | `wg_packet_create_data_done`（242） | 发送skb链表、更新定时器、查密钥新鲜度 |
+| 内部static | `wg_packet_create_data`（311） | 把包双入队到加密与peer队列 |
+
+这些函数围绕的核心数据结构分布在几个头文件里。`packet_cb`（`queueing.h`第59—65行）是通过宏`PACKET_CB(skb)`取回的每skb元数据，包含`nonce`、`keypair`、`state`、`mtu`、`ds`五个成员（逐字段见05-06）；`noise_keypair`承载收发密钥、`sending_counter`、`remote_index`、`i_am_the_initiator`等（逐字段见05-05）；`wg_peer`持有`staged_packet_queue`、`tx_queue`、`encrypt_queue`之外的各类work_struct与定时器（逐字段见05-03）；`wg_device`则持有`encrypt_queue`、`packet_crypt_wq`、`handshake_send_wq`等全局发送资源（逐字段见05-02）。发送模块自己不定义这些结构，它只是它们的「操作者」，这正是07册作为模块职责权威源与05册作为字段权威源之间的分工边界。
+
+队列接口集中在`queueing.h`：入队三叉戟`wg_queue_enqueue_per_device_and_peer`（第154行，设备与peer双入队）、`wg_queue_enqueue_per_peer_tx`（第177行，回投并设置状态）、`wg_queue_enqueue_per_peer_rx`（第190行，接收侧对称接口）；单消费者原语`wg_prev_queue_peek`/`wg_prev_queue_drop_peeked`（第140、149行）；以及设备间CPU轮转辅助`wg_cpumask_next_online`（第122行）。这些接口让`send.c`无需了解`ptr_ring`或`prev_queue`的内部实现，只通过稳定API交互。
+
+### 4. 关键流程与调用链
+
+发送模块有三条主干调用链，理解它们就理解了模块的运行全貌。
+
+第一条是握手发起链。定时器到点（重传、rekey或首次建链）时，`timers.c`调用对外函数`wg_packet_send_queued_handshake_initiation(peer, is_retry)`。它先在非重试时把`timer_handshake_attempts`清零，然后进入`rcu_read_lock_bh`临界区，用`wg_birthdate_has_expired`检查`last_sent_handshake`是否超过`REKEY_TIMEOUT`、并检查`peer->is_dead`——这两个前置检查是为了「非必要不入队」（send.c第62—69行）。通过后`wg_peer_get`拿引用，`queue_work(peer->device->handshake_send_wq, &peer->transmit_handshake_work)`把工作挂上握手发送队列；若work已在队列则立刻放掉多余引用。真正的活由`wg_packet_handshake_send_worker`完成：它通过`container_of`取回peer，调用`static`的`wg_packet_send_handshake_initiation`，后者再次做速限检查、更新时间戳、调用`wg_noise_handshake_create_initiation`构造报文、`wg_cookie_add_mac_to_packet`附加cookie MAC、`wg_timers_any_authenticated_packet_*`系列更新定时器、`wg_socket_send_buffer_to_peer`以`HANDSHAKE_DSCP`发出，最后`wg_timers_handshake_initiated`启动握手重传定时器；worker结束前`wg_peer_put`放引用。响应侧`wg_packet_send_handshake_response`与cookie侧`wg_packet_send_handshake_cookie`是平级的短函数，分别构造响应包并派生会话、构造cookie包并作为对端发起包的reply发出。
+
+第二条是数据发送主链，也是模块的核心。协议栈经`ndo_start_xmit`把包交进来后，先被暂存到`peer->staged_packet_queue`，随后触发`wg_packet_send_staged_packets`。该函数先把整个暂存链表「偷」到本地变量`packets`（用`skb_queue_splice_init`），检查是否为空；然后在RCU读锁下取`keypairs.current_keypair`并`wg_noise_keypair_get`拿引用，依次检查`sending.is_valid`与`sending.birthdate`是否超过`REJECT_AFTER_TIME`——任一失败走`out_invalid`/`out_nokey`，把包`skb_orphan`后插回暂存队列头部，并调用`wg_packet_send_queued_handshake_initiation`发起新握手，等待下次机会。检查通过后，为每个包用`ip_tunnel_ecn_encap`计算外层DS字段、用`atomic64_inc_return(&keypair->sending_counter) - 1`分配递增nonce；若nonce逼近`REJECT_AFTER_MESSAGES`则同样走`out_invalid`。最后把整条链表交给`static`的`wg_packet_create_data`，后者在`peer->is_dead`检查后调用`wg_queue_enqueue_per_device_and_peer`完成双入队。
+
+第三条是加密回投与发出链。`wg_packet_encrypt_worker`从`encrypt_queue`的`ptr_ring`里循环`ptr_ring_consume_bh`取包链，对每个skb调用`encrypt_packet`。后者是真正的加密实现：`skb_get_hash`先算哈希、用`calculate_skb_padding`算填充、`skb_cow_head`/`skb_cow_data`扩展头部与数据区、`memset`填零填充、`skb_push`插入`message_data`头（类型`MESSAGE_DATA`、`key_idx = keypair->remote_index`、`counter = nonce`），最后`chacha20poly1305_encrypt_sg_inplace`对scatterlist原地加密。任一skb加密失败就把整链状态置为`PACKET_STATE_DEAD`。加密worker通过`wg_queue_enqueue_per_peer_tx`把状态发布为CRYPTED或DEAD，并wake up对应peer的`transmit_packet_work`。`wg_packet_tx_worker`从`tx_queue`消费：`PACKET_STATE_CRYPTED`的交给`wg_packet_create_data_done`，后者遍历链表调`wg_socket_send_skb_to_peer`逐包发出，根据是否真的发出数据包决定是否`wg_timers_data_sent`，末尾再`keep_key_fresh`判断是否需要rekey；其他状态（DEAD）直接`kfree_skb_list`释放。整条链路把「重活并行、结果串行发出」体现得淋漓尽致。
+
+三条链的worker、队列与状态流转见图07-07-01。
+
+:::figure id=07-07-01 | name=send.c 三类包的队列与 worker 分工 | dir=TD
+node s1 "ndo_start_xmit<br/>内核协议栈入站" blue
+node s2 "staged_packet_queue<br/>每peer暂存" gray
+node s3 "wg_packet_send_<br/>staged_packets" teal
+node s4 "encrypt_queue<br/>每设备 ptr_ring" gray
+node s5 "wg_packet_<br/>encrypt_worker" purple
+node s6 "encrypt_packet<br/>ChaCha20-Poly1305" red
+node s7 "tx_queue<br/>每peer prev_queue" gray
+node s8 "wg_packet_<br/>tx_worker" teal
+node s9 "wg_socket_send<br/>_skb_to_peer" green
+node s10 "handshake_send_wq<br/>握手发起worker" amber
+edge s1 -> s2 "暂存"
+edge s2 -> s3 "批量取走"
+edge s3 -> s4 "双入队 UNCRYPTED"
+edge s4 -> s5 "消费"
+edge s5 -> s6 "加密"
+edge s6 -> s7 "回投 CRYPTED/DEAD"
+edge s7 -> s8 "消费"
+edge s8 -> s9 "发出"
+edge s10 -> s9 "握手包发出"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：数据从「ndo_start_xmit 内核协议栈入站」进入「staged_packet_queue 每peer暂存」，由「wg_packet_send_staged_packets 批量取走」经「双入队 UNCRYPTED」投入「encrypt_queue 每设备 ptr_ring」；「wg_packet_encrypt_worker 消费」后交「encrypt_packet ChaCha20-Poly1305 加密」，再以「回投 CRYPTED/DEAD」写入「tx_queue 每peer prev_queue」；「wg_packet_tx_worker 消费」后由「wg_socket_send_skb_to_peer 发出」。旁路「handshake_send_wq 握手发起worker」负责握手包的构造与发送。
+
+### 5. 配置/命令/代码实例
+
+作为模块册，这里给出「如何在运行时观察本模块行为」的实例：内核动态调试（dynamic debug）能按文件或函数打开`net_dbg_ratelimited`日志，正好对应`send.c`里那些发送事件的打印点。
+
+```bash
+# 打开 send.c 全部动态调试打印（需挂载 debugfs 且内核启用 CONFIG_DYNAMIC_DEBUG）
+echo 'file send.c +p' > /sys/kernel/debug/dynamic_debug/control
+
+# 或只打开握手发起这一个函数的打印，减少噪声
+echo 'func wg_packet_send_handshake_initiation +p' > /sys/kernel/debug/dynamic_debug/control
+
+# 制造一次握手后观察发送事件，并对照收发字节统计
+dmesg -w &
+wg set wg0 peer <对端公钥> endpoint 198.51.100.2:51820 allowed-ips 10.0.0.2/32
+wg show wg0
+```
+
+执行后，同一时间轴上会同时出现内核日志（来自本模块与接收模块）与`wg show`的状态输出（示例输出，具体格式需对照实际版本核验）。
+
+```text
+示例输出，具体格式需对照实际版本核验
+[1234.567890] wireguard: wg0: Sending handshake initiation to peer 2 (198.51.100.2:51820)
+[1234.612345] wireguard: wg0: Receiving handshake response from peer 2 (198.51.100.2:51820)
+[1234.612900] wireguard: wg0: Sending keepalive packet to peer 2 (198.51.100.2:51820)
+interface: wg0
+  public key: <本端公钥>
+  listening port: 51820
+peer: <对端公钥>
+  endpoint: 198.51.100.2:51820
+  allowed ips: 10.0.0.2/32
+  latest handshake: 4 seconds ago
+  transfer: 2.40 KiB received, 1.83 KiB sent
+```
+
+逐行判读如下。第一行`Sending handshake initiation to peer 2 ...`直接来自`send.c`第30行`wg_packet_send_handshake_initiation`里的`net_dbg_ratelimited`，打印时已经通过了速限与`is_dead`检查，说明`wg_packet_send_queued_handshake_initiation`成功入队、`wg_packet_handshake_send_worker`已经跑起来；其中`peer 2`是`peer->internal_id`，括号内是`&peer->endpoint.addr`。第二行`Receiving handshake response ...`并非本模块打印，而是接收侧`receive.c`的`wg_receive_handshake_packet`（第173行），放在这里是为了给出握手的完整时序对照（接收模块见07-08）；它意味着对端已回应，本端即将在`wg_packet_send_handshake_response`的对称逻辑中派生会话。第三行`Sending keepalive packet ...`来自本模块`wg_packet_send_keepalive`第234行，说明握手完成后`receive.c`调用了该函数，且当时`staged_packet_queue`为空，于是凭空造了一个`message_data_len(0)`长度的空数据包装入暂存队列再发送，用来立刻确认会话可用。`interface`、`public key`、`listening port`三行是`WG_CMD_GET_DEVICE`返回的device属性（完整参数见04-05）。`peer`、`endpoint`、`allowed ips`三行是`WGPEER_A_*`与`WGALLOWEDIP_A_*`属性，其中`allowed ips`正是发送时`ndo_start_xmit`查路由选peer的依据（原理见06-07）。`latest handshake: 4 seconds ago`对应`WGPEER_A_LAST_HANDSHAKE_TIME`，是判断刚才那次握手真正落地的关键。`transfer`里的`sent`对应`WGPEER_A_TX_BYTES`，只有`wg_packet_create_data_done`经`wg_socket_send_skb_to_peer`真正发出包后才会增长——若日志显示发了握手却始终`sent: 0`，应怀疑加密worker把包标成了`PACKET_STATE_DEAD`或路由没把流量送进wg0。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是混淆「对外函数」与「内部static函数」。阅读`send.c`时你会发现`wg_packet_send_handshake_initiation`、`wg_packet_create_data`、`encrypt_packet`、`keep_key_fresh`、`calculate_skb_padding`都是`static`，它们不会被其他模块直接调用；对外接口以`queueing.h`第38—51行的声明为准。把内部函数误当成可被外部调用的API，会在做代码改动或写补丁时犯下链接错误。
+
+第二个陷阱是以为「加密在发送入口同步完成」。实际上`ndo_start_xmit`所在路径只做到暂存与入队，加密与发出都发生在工作队列的异步上下文中；任何假设「`wg_packet_send_staged_packets`返回时包已发出」的推理都是错的。这也解释了为什么WireGuard要维护`packet_state`三态与两次引用计数（`wg_peer_get`/`wg_noise_keypair_get`）——因为生产者返回时消费者可能还没跑完，必须用引用计数保证对象不被提前释放。
+
+第三个陷阱是忽略nonce与密钥新鲜度的边界。`sending_counter`一旦逼近`REJECT_AFTER_MESSAGES`，`wg_packet_send_staged_packets`会把整批包退回暂存队列并强制重新握手（send.c第381、391—413行）；`sending.birthdate`超过`REJECT_AFTER_TIME`或发包数超过`REKEY_AFTER_MESSAGES`时，`keep_key_fresh`会触发rekey。这些常量的确切取值与语义属于参数/常量权威源（见04-06、04-08），本篇只讲它们如何驱动模块分支（时序原理见06-03）。
+
+第四个陷阱是丢弃统计口径。`wg_packet_purge_staged_packets`在设备卸载等场景清空暂存队列时，用`DEV_STATS_ADD(peer->device->dev, tx_dropped, ...qlen)`把丢弃数量计入`tx_dropped`——这是发送侧唯一的显式丢弃计数点；而加密失败的包被标为`PACKET_STATE_DEAD`后在`wg_packet_tx_worker`里直接`kfree_skb_list`，不单独计入`tx_dropped`（接收侧的丢弃统计更丰富，见07-08）。排障时把这两类"消失"区分开很重要。
+
+最佳实践：做性能分析时，用`perf`或ftrace跟踪`wg_packet_encrypt_worker`与`wg_packet_tx_worker`的CPU占用，可判断瓶颈是在加密并行度还是在串行发出（多核设计见06-13、调优见08-02）；做握手排障时，优先用动态调试打开`send.c`的握手打印，确认`Sending handshake initiation`是否周期性出现，再结合`latest handshake`判断（排障决策树见08-03）；做代码阅读时，始终以`queueing.h`的API声明为目录、以`packet_state`状态机为线索，顺着「暂存—双入队—加密—回投—发出」五步走，就不容易在workqueue与RCU的细节里迷路。
+
+### 7. 小结与延伸阅读
+
+本篇确立了`send.c`作为出站总调度室的模块画像：它对外提供九个工作函数（握手发起排队、握手发送worker、握手响应、cookie响应、保活、清空暂存、暂存发送、加密worker、发送完成worker），对内用六个static函数完成速限、填充计算、实际加密与发送收尾；它不碰密码学原语、不碰socket写、不碰消息布局，而是把三类包（握手、数据、保活）通过`encrypt_queue`与`tx_queue`两套队列、三种worker（加密、发送完成、握手发送）和`UNCRYPTED/CRYPTED/DEAD`三态状态机组织成一条异步流水线。「重活并行加密、结果串行发出」是这条流水线的设计精髓。
+
+延伸阅读建议：发送流水线与加密分片的完整原理见06-05，多核并发与padata并行加密见06-13，握手状态机与消息格式见06-02、06-04；`packet_cb`、`noise_keypair`、`wg_peer`的逐字段解释见05-06、05-05、05-03；`REKEY_TIMEOUT`、`REJECT_AFTER_MESSAGES`、`HANDSHAKE_DSCP`等常量的取值与参数全集见04-06、04-08；`wg`命令与netlink属性见04-01、04-05；socket写与UDP封装见07-09，消息编解码见07-06，定时器触发握手见07-10。跨册随查按（字段见 05-06 ｜ 参数见 04-06 ｜ 原理见 06-05 ｜ 模块见 07-06）执行：结构体逐字段去05、参数与常量全集去04、机制与调用链去06、目录级模块能力去07、运维场景与基准去08。凡本篇标注「需对照实际版本核验」的函数签名、日志格式与常量取值，均以`_wglinux_build/upstream_src/`下对应文件为准，本套资料不编造未核验的路径与取值。
+
+## 07-08 receive.c 接收模块
+
+### 1. 背景与动机
+
+`drivers/net/wireguard/receive.c`是WireGuard Linux内核驱动的「入站方向总调度室」，全文约587行，比配对的`send.c`更长，原因不在于解密比加密复杂，而在于接收侧多了一整套「不信任来包」的防御链。socket从UDP收到一个报文后，`receive.c`要依次回答一串问题：这个IP/UDP头是否合法、消息类型是哪一种、如果是握手包要不要过cookie关、如果是数据包密钥索引指向谁、nonce是否重放、源IP是否匹配allowedips、解封后的载荷是不是合法的IPv4/IPv6。只有全部通过，包才会被注入内核协议栈；任何一个环节失败，都要以恰当的统计口径丢弃。本篇是07册中关于接收模块的唯一权威源，聚焦「这个模块由哪些函数组成、NAPI与worker如何分工、丢弃计数如何统计」；解封装、解密与校验的完整流水线原理交给06-06，抗重放算法交给06-08，cookie与限速交给06-09、06-10，GSO/GRO与UDP封装交给06-12。
+
+接收侧最值得讲的是「两条并行车道」的设计。握手包与数据包走的是完全不同的通道：握手包进入每设备的握手队列`handshake_queue`，由工作队列`handshake_receive_wq`（`device.c`命名`wg-kex-%s`）上的worker处理，因为握手涉及繁重的curve25519运算与状态机，必须允许耗时与调度；数据包则先进入每设备解密队列`decrypt_queue`，由`packet_crypt_wq`（`wg-crypt-%s`）上的解密worker并行解密，解密完成后通过`napi_schedule`唤醒每peer的NAPI，在软中断上下文里以budget为限做抗重放检查与协议栈注入。这种「重运算交给workqueue、收尾注入交给NAPI」的分工，既拿到了多核并行的吞吐，又用NAPI的预算机制避免了单个peer用海量小包饿死其他任务（并发原理见06-13）。
+
+第三个动机是安全。WireGuard是静默协议，认证失败不会回错误包，攻击面集中在「能否用伪造握手淹没CPU」「能否重放旧包」「能否冒用他人源IP」三点。`receive.c`用cookie机制（`wg_cookie_validate_packet`）、RFC6479抗重放位图（`counter_validate`）、allowedips源地址反查（`wg_allowedips_lookup_src`）三道防线回应，并把每一类失败映射到`net_device`的统计计数器（`rx_errors`、`rx_frame_errors`、`rx_length_errors`），让运维能从`/proc/net/dev`或`ethtool -S`读出被丢弃的原因类别。读懂这些函数，排障时才能把「握手成功但数据不通」定位到具体某一道防线。
+
+### 2. 核心概念
+
+接收模块的概念可以压缩为「一个入口、两类消息、三条消费路径、一组丢弃计数」。
+
+一个入口，指对外函数`wg_packet_receive(wg, skb)`，它是socket层把UDP报文交给接收模块的总闸门（`receive.c`第542行，声明在`queueing.h`第31行）。它做两件事：先用`prepare_skb_header`剥掉IP/UDP封装、校验头合法性并定位WireGuard消息，再按`SKB_TYPE_LE32(skb)`消息类型分派到不同处理路径；分派失败时统一`dev_kfree_skb`释放。
+
+两类消息，由`messages.h`定义（消息格式见06-04）：握手类`MESSAGE_HANDSHAKE_INITIATION`、`MESSAGE_HANDSHAKE_RESPONSE`、`MESSAGE_HANDSHAKE_COOKIE`，与数据类`MESSAGE_DATA`。宏`SKB_TYPE_LE32(skb)`（receive.c第26行）把skb数据开头强转为`struct message_header`并读`type`字段，是整条分派逻辑的钥匙（该字段逐位定义见05-05）。
+
+三条消费路径。第一条是握手队列路径：`wg_packet_receive`把握手包投进`handshake_queue.ring`，唤醒`wg_packet_handshake_receive_worker`，后者循环调用`static`的`wg_receive_handshake_packet`处理initiation/response/cookie。第二条是数据解密路径：`wg_packet_consume_data`按`key_idx`查`index_hashtable`找到`noise_keypair`与peer，双入队到`decrypt_queue`与`rx_queue`，`wg_packet_decrypt_worker`解密后`napi_schedule`，由`wg_packet_rx_poll`做抗重放与最终注入。第三条是错误与丢弃路径：从`prepare_skb_header`失败，到`counter_validate`拒绝重放包，再到`wg_packet_consume_data_done`里若干`dishonest_packet_*`标签，构成一个完整的「不合格即丢」网络。
+
+「丢弃计数」是本篇的硬性主题之一，需要把口径讲准。正常接收由`static`的`update_rx_stats(peer, len)`完成：它调用`dev_sw_netstats_rx_add(peer->device->dev, len)`累加设备的软件接收统计，并`peer->rx_bytes += len`累加peer接收字节（字段见05-03）。异常丢弃则分散在多处：`wg_packet_receive`分派失败走`err: dev_kfree_skb`，只释放不计数；`wg_packet_rx_poll`里`counter_validate`失败或非CRYPTED状态只打调试日志并释放，也不增加 netdev 错误计数；真正落在`net_device`统计上的是`wg_packet_consume_data_done`三个标签——`dishonest_packet_peer`（源IP不在allowedips）与`dishonest_packet_type`（载荷非IPv4/IPv6）各递增`rx_errors`与`rx_frame_errors`，`dishonest_packet_size`（IP头声明长度与实际不符）递增`rx_errors`与`rx_length_errors`（计数宏语义见04-08）。理解这层差异，才能解释「dmesg有invalid nonce日志但rx_errors没涨」的现象。
+
+### 3. 关键数据结构与源码位置
+
+接收模块的主战场是`drivers/net/wireguard/receive.c`。与`send.c`一样，区分对外API与内部static的权威依据在`queueing.h`第30—36行的`/* receive.c APIs: */`段。下表列全两栏函数与职责，是全篇索引。
+
+| 类别 | 函数（receive.c 行号） | 职责要点 |
+|---|---|---|
+| 对外：总入口 | `wg_packet_receive`（542） | 解析头、按类型分派、失败释放 |
+| 对外：握手接收worker | `wg_packet_handshake_receive_worker`（206） | 消费`handshake_queue`、逐包处理、减计数 |
+| 对外：NAPI poll | `wg_packet_rx_poll`（438） | 消费`rx_queue`、抗重放、注入协议栈 |
+| 对外：解密worker | `wg_packet_decrypt_worker`（493） | 消费`decrypt_queue`、解密、回投rx队列 |
+| 内部static | `update_rx_stats`（20） | 累加设备软件统计与`peer->rx_bytes` |
+| 内部static | `validate_header_len`（28） | 按消息类型校验长度 |
+| 内部static | `prepare_skb_header`（47） | 解析UDP封装、定位并校验WireGuard头 |
+| 内部static | `wg_receive_handshake_packet`（92） | cookie校验、consume握手、派生会话 |
+| 内部static | `keep_key_fresh`（220） | 接收侧按需触发rekey |
+| 内部static | `decrypt_packet`（242） | 校验密钥、ChaCha20-Poly1305原地解密 |
+| 内部static | `counter_validate`（295） | RFC6479抗重放位图判定 |
+| 内部static | `wg_packet_consume_data_done`（335） | 源校验、trim、NAPI GRO注入、统计 |
+| 内部static | `wg_packet_consume_data`（509） | 查key索引、双入队到解密队列 |
+
+接收模块依赖的数据结构分布在多个头文件，本节只点名与真实路径，逐字段定义交给05册。`message_header`与`message_data`定义在`messages.h`，前者提供`type`字段、后者提供`key_idx`与`counter`（逐字段见05-05）；`noise_keypair`与`noise_replay_counter`定义在`noise.h`，后者正是`counter_validate`操作的RFC6479位图（逐字段见05-05、原理见06-08）；`endpoint`定义在`socket.h`（逐字段见05-07）；`crypt_queue`与`prev_queue`定义在`queueing.h`相关结构里（逐字段见05-08）；每skb元数据`packet_cb`通过`PACKET_CB(skb)`取回（逐字段见05-06）。接收模块自身不定义消息布局与密钥结构，它只读取与操作它们——这正是07册模块职责源与05册字段源的分工。
+
+一个容易忽略的源码事实：`receive.c`第333行有一行`#include "selftest/counter.c"`，把抗重放自测代码直接编进本文件（`DEBUG`构建下生效）。这说明`counter_validate`的正确性由内建自测保障，阅读时不要误以为那是一段运行期逻辑。此外，`wg_receive_handshake_packet`里的`static u64 last_under_load`（第100行）是跨包共享的全局变量，用于实现「负载状态的1秒滞回」，避免负载在阈值附近抖动时反复切换cookie策略（cookie原理见06-09）。
+
+### 4. 关键流程与调用链
+
+入口分派链。`socket.c`收到UDP报文后调用`wg_packet_receive`。它先执行`prepare_skb_header`：用`wg_check_packet_protocol`核对协议、检查UDP头偏移是否越界、用`udp_get_len_short`读UDP长度并验证不撒谎、`pskb_may_pull`/`pskb_trim`裁出有效载荷、`skb_pull`越过UDP头，最后调`validate_header_len`按消息类型核对长度——四类消息各自要求精确长度（数据类要求至少`MESSAGE_MINIMUM_LENGTH`）。任一检查失败返回`-EINVAL`，被入口的`err: dev_kfree_skb`丢弃。通过后，`switch (SKB_TYPE_LE32(skb))`把握手三类型与数据类分开。
+
+握手接收链。握手包先检查`rng_is_initialized()`（随机数未就绪直接丢），再按`handshake_queue_len`限流：若队列长度已超过`MAX_QUEUED_INCOMING_HANDSHAKES / 2`，用`spin_trylock_bh`尝试非阻塞入队，失败则打`Dropping handshake packet`日志丢弃；否则用`ptr_ring_produce_bh`正常入队。随后`atomic_inc(&wg->handshake_queue_len)`，`wg_cpumask_next_online`轮转选一个在线CPU，`queue_work_on(cpu, wg->handshake_receive_wq, &per_cpu_ptr(wg->handshake_queue.worker, cpu)->work)`唤醒worker。`wg_packet_handshake_receive_worker`从ring里循环取包，交给`wg_receive_handshake_packet`，处理完`dev_kfree_skb`、`atomic_dec`递减队列长度。核心处理函数先判断负载状态：`under_load = handshake_queue_len >= MAX_QUEUED_INCOMING_HANDSHAKES / 8`，并结合`last_under_load`做1秒滞回；再调`wg_cookie_validate_packet`得到`mac_state`（`VALID_MAC_WITH_COOKIE`/`VALID_MAC_BUT_NO_COOKIE`等），据此决定`packet_needs_cookie`——负载高但无cookie的包会被回一个cookie响应（`wg_packet_send_handshake_cookie`），而不直接consume。真正合法的包按类型调`wg_noise_handshake_consume_initiation`或`consume_response`找到peer，`wg_socket_set_peer_endpoint_from_skb`学习对端endpoint：initiation则调`wg_packet_send_handshake_response`回应，response则`wg_noise_handshake_begin_session`派生会话、`wg_timers_handshake_complete`标记完成，并调`wg_packet_send_keepalive`立刻确认会话。收尾更新rx统计与定时器，放掉peer引用。
+
+数据接收链。数据包先记下外层DS字段（`ip_tunnel_get_dsfield`）存入`PACKET_CB(skb)->ds`，再进`static`的`wg_packet_consume_data`。后者从`message_data.key_idx`取索引，用`wg_index_hashtable_lookup(wg->index_hashtable, INDEX_HASHTABLE_KEYPAIR, idx, &peer)`同时拿到keypair与peer，`wg_noise_keypair_get`拿引用，检查`peer->is_dead`后调用`wg_queue_enqueue_per_device_and_peer(&wg->decrypt_queue, &peer->rx_queue, skb, wg->packet_crypt_wq)`双入队（`-EPIPE`时把包标`PACKET_STATE_DEAD`回投）。`wg_packet_decrypt_worker`从ring取包，调`decrypt_packet`：先校验`receiving.is_valid`、birthdate与counter未超`REJECT_AFTER_*`，取包内counter为nonce，用`skb_cow_data`准备scatterlist，`chacha20poly1305_decrypt_sg_inplace`原地解密，成功即标`PACKET_STATE_CRYPTED`。随后`wg_queue_enqueue_per_peer_rx`把状态发布出去并`napi_schedule(&peer->napi)`。
+
+NAPI收尾链。`wg_packet_rx_poll`在软中断上下文运行，从`rx_queue` peek已完成的包：`PACKET_STATE_CRYPTED`的先过`counter_validate`（RFC6479位图，原理见06-08）判重放，失败打`invalid nonce`日志丢弃；再用`wg_socket_endpoint_from_skb`取endpoint、`wg_reset_packet`清理skb元数据、`wg_packet_consume_data_done`做最终处理。该函数是防御与注入的汇合点：若`skb->len == 0`判定为keepalive，仅按`message_data_len(0)`更新统计即可；否则校验IP头版本与长度，把`skb->ip_summed`设为`CHECKSUM_UNNECESSARY`、`csum_level = ~0`（因为Poly1305已验证完整性，无需软件重算校验和），做ECN解封与`pskb_trim`，再用`wg_allowedips_lookup_src`反查源IP——若查到的peer与当前peer不符，走`dishonest_packet_peer`计入`rx_errors`/`rx_frame_errors`并丢弃；全部通过则`napi_gro_receive(&peer->napi, skb)`注入协议栈，并按`message_data_len(len_before_trim)`更新rx统计。`work_done`随budget增长，未达budget时`napi_complete_done`结束本轮。
+
+上述worker、NAPI与计数路径的关系见图07-08-01。
+
+:::figure id=07-08-01 | name=receive.c 的握手/数据双车道与丢弃统计 | dir=TD
+node r1 "socket.c<br/>UDP报文入站" blue
+node r2 "wg_packet_receive<br/>解析头并分派" teal
+node r3 "handshake_queue<br/>握手队列" gray
+node r4 "handshake_receive_worker<br/>cookie+consume" purple
+node r5 "decrypt_queue<br/>解密队列" gray
+node r6 "decrypt_worker<br/>ChaCha20-Poly1305" purple
+node r7 "rx_queue<br/>每peer队列" gray
+node r8 "wg_packet_rx_poll<br/>NAPI 抗重放" teal
+node r9 "allowedips 源校验<br/>napi_gro_receive" green
+node r10 "dishonest_packet_*<br/>rx_errors 计数" red
+edge r1 -> r2 "报文"
+edge r2 -> r3 "握手类"
+edge r3 -> r4 "worker 消费"
+edge r2 -> r5 "数据类 双入队"
+edge r5 -> r6 "解密"
+edge r6 -> r7 "回投 CRYPTED"
+edge r7 -> r8 "napi_schedule"
+edge r8 -> r9 "校验后注入"
+edge r8 -> r10 "重放/格式失败"
+edge r9 -> r10 "源IP不符"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：报文从「socket.c UDP报文入站」进入「wg_packet_receive 解析头并分派」，分成两条车道——握手类入「handshake_queue 握手队列」由「handshake_receive_worker cookie+consume」处理；数据类双入队到「decrypt_queue 解密队列」，经「decrypt_worker ChaCha20-Poly1305 解密」回投「rx_queue 每peer队列」，再由「wg_packet_rx_poll NAPI 抗重放」唤醒，通过后交「allowedips 源校验 napi_gro_receive 注入协议栈」。重放、格式错误或「源IP不符」的包汇入「dishonest_packet_* rx_errors 计数」路径被丢弃。
+
+### 5. 配置/命令/代码实例
+
+接收模块的排障入口同样用内核动态调试：打开`receive.c`的打印，就能看到cookie拒绝、握手consume、重放丢弃、源IP不符等各个防线的实时事件。
+
+```bash
+# 打开 receive.c 全部动态调试打印
+echo 'file receive.c +p' > /sys/kernel/debug/dynamic_debug/control
+
+# 结合网卡统计，观察接收错误计数器是否随丢弃事件增长
+watch -n 1 'cat /proc/net/dev | grep wg0; ethtool -S wg0 2>/dev/null | grep -E "rx_|drop"'
+dmesg -w
+```
+
+当对端发来异常报文时，日志与统计会交叉印证（示例输出，具体格式需对照实际版本核验）。
+
+```text
+示例输出，具体格式需对照实际版本核验
+[2345.100123] wireguard: wg0: Receiving handshake initiation from peer 2 (198.51.100.2:51820)
+[2345.200456] wireguard: wg0: Packet has unallowed src IP (10.9.9.9) from peer 2 (198.51.100.2:51820)
+[2345.300789] wireguard: wg0: Packet has invalid nonce 5 (max 3)
+[2345.400111] wireguard: wg0: Packet is neither ipv4 nor ipv6 from peer 2 (198.51.100.2:51820)
+interfaces: |  receive |  transmit
+    wg0: |  4.02 KiB |   3.10 KiB
+     rx_errors: 2   rx_frame_errors: 2   rx_length_errors: 0
+```
+
+逐行判读如下。第一行`Receiving handshake initiation from peer 2`来自`wg_receive_handshake_packet`第151行，说明该握手包已通过cookie校验（`mac_state`为可接受值）、`wg_noise_handshake_consume_initiation`成功按公钥找到peer，随后会学习endpoint并回响应；若这里出现的是`Invalid MAC of handshake`，则说明cookie关没过（原理见06-09）。第二行`Packet has unallowed src IP (10.9.9.9)`来自`wg_packet_consume_data_done`的`dishonest_packet_peer`标签（第416行），根因是`wg_allowedips_lookup_src`按解封后源地址反查得到的peer与收包peer不符，该包被丢弃并使`rx_errors`、`rx_frame_errors`各加一；括号里的`10.9.9.9`是伪造的载荷源IP，不是隧道地址。第三行`Packet has invalid nonce 5 (max 3)`来自`wg_packet_rx_poll`第463行，意味着`counter_validate`判定nonce=5已落在重放窗口已被标记的位置或超出合法范围（当前窗口最大计数为3），这类包在NAPI阶段被丢弃，只打日志、不增加`rx_errors`——这正解释了下方统计的口径。第四行`Packet is neither ipv4 nor ipv6`来自`dishonest_packet_type`标签（第423行），解封后`ip_tunnel_parse_protocol`既非ETH_P_IP也非ETH_P_IPV6，计入`rx_errors`与`rx_frame_errors`。统计块里`receive`/`transmit`两列来自`dev_sw_netstats_rx_add`维护的软件统计，`rx_errors: 2`与`rx_frame_errors: 2`恰好对应第二、第四行两次格式/源校验失败，而第三行重放丢弃不计入其中，`rx_length_errors: 0`说明本次没有触发`dishonest_packet_size`（参数与计数器全集见04-08、字段见05-03）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是混淆worker与NAPI的执行上下文。`wg_packet_handshake_receive_worker`和`wg_packet_decrypt_worker`运行在workqueue（`wg-kex-%s`、`wg-crypt-%s`）里，可以承载较重的运算；`wg_packet_rx_poll`运行在NAPI软中断上下文，受`budget`限制且不能睡眠。把需要在NAPI里做的抗重放检查误移到解密worker，或反过来在NAPI里做耗时解密，都会破坏这条分工（并发设计见06-13）。理解这一点，才能明白为什么`decrypt_packet`只做解密与状态标记，而`counter_validate`与`napi_gro_receive`要留到poll里。
+
+第二个陷阱是丢弃统计口径的误读。如第2、5节所述，只有`wg_packet_consume_data_done`的三个`dishonest_packet_*`标签会递增`net_device`的`rx_errors`/`rx_frame_errors`/`rx_length_errors`；握手队列满的`Dropping handshake packet`、cookie校验失败的`Invalid MAC`、NAPI阶段的`invalid nonce`，都只打调试日志并释放skb，不进这些计数器。因此「dmesg里有丢弃日志但`/proc/net/dev`错误列没涨」是正常现象，不能据此判断防线没生效。
+
+第三个陷阱是忽略静默协议的排障含义。WireGuard认证失败一律丢包、不回错误，所以「握手包发出去却没回应」必须靠本端日志与`latest handshake`判断（排障见08-03）。`wg_receive_handshake_packet`里`under_load`与1秒滞回的设计意味着同一批包在负载不同时可能被区别对待：闲时要求`VALID_MAC_BUT_NO_COOKIE`，忙时则对无cookie包回cookie而非硬拒——阅读日志时若忽略负载状态，会对「同一来源的包为何有时被consume有时被回cookie」感到困惑。
+
+第四个陷阱是完整性校验与校验和的关系。`wg_packet_consume_data_done`把`skb->ip_summed`设为`CHECKSUM_UNNECESSARY`并把`csum_level`设为`~0`（所有层），理由是Poly1305认证标签已经证明载荷在传输中未被篡改，因此内核协议栈无需再逐层软件校验。若误改这里，会造成性能回退甚至校验错误（GRO/校验和卸载见06-12）。此外，`wg_packet_consume_data_done`识别keepalive用`skb->len == 0`，与发送侧`wg_packet_create_data_done`用`skb->len == message_data_len(0)`写法不同但语义一致，阅读时不要混淆。
+
+最佳实践：排障时把三类证据交叉看——动态调试日志定位是哪道防线丢弃、`/proc/net/dev`与`ethtool -S wg0`看错误计数类别、`wg show`的`latest handshake`与`transfer`看整体可用性（运维手册见08-06）；做性能分析时用ftrace跟踪`wg_packet_decrypt_worker`与`wg_packet_rx_poll`，判断瓶颈在解密并行度还是NAPIbudget（调优见08-02）；读源码时以`queueing.h`的API声明为目录、以「分派—握手/解密—NAPI收尾」三阶段为线索，就能在cookie、抗重放、allowedips三重防御之间保持清晰脉络。
+
+### 7. 小结与延伸阅读
+
+本篇确立了`receive.c`作为入站总调度室的模块画像：它对外提供四个函数（总入口`wg_packet_receive`、握手接收worker、NAPI的`wg_packet_rx_poll`、解密worker），对内用九个static函数完成头解析、cookie关、握手consume、解密、RFC6479抗重放、源地址反查与最终注入。它把握手包与数据包拆成两条车道——握手走workqueue做cookie校验与状态机，数据走解密worker加NAPI做并行解密与预算化收尾；并用cookie、抗重放位图、allowedips源校验三道防线回应伪造握手、重放与地址冒用三类攻击，把不同失败映射到恰当的丢弃统计口径。「重运算交给workqueue、收尾注入交给NAPI、失败按口径计数」是接收模块的组织精髓。
+
+延伸阅读：解封装、解密与校验的完整原理见06-06，抗重放窗口与序列号见06-08，cookie与DoS防护见06-09，握手限速见06-10，定时器与keepalive见06-11，socket收发与GRO见06-12，多核并发见06-13；`message_data`、`noise_replay_counter`、`endpoint`、`prev_queue`的逐字段解释见05-05、05-07、05-08、05-06；丢弃相关计数器与错误码全集见04-08；socket与cookie模块见07-09，消息编解码见07-06，定时器与限速模块见07-10，发送侧对称逻辑见07-07。跨册随查按（字段见 05-06 ｜ 参数见 04-08 ｜ 原理见 06-06 ｜ 模块见 07-09）执行：结构体逐字段去05、参数与常量全集去04、机制与调用链去06、目录级模块能力去07、运维场景与基准去08。凡本篇标注「需对照实际版本核验」的函数签名、日志格式与计数器取值，均以`_wglinux_build/upstream_src/`下对应文件为准，本套资料不编造未核验的路径与取值。

@@ -1,0 +1,275 @@
+## 06-13 多核并发、RCU、per-CPU 与 padata 加密并行
+
+### 1. 背景与动机
+
+WireGuard Linux 是跑在内核态的数据面隧道，加解密吞吐量直接受制于 CPU 算力与并发组织方式。ChaCha20-Poly1305 是逐包独立的对称 AEAD 运算：每个数据包各自计算 nonce、各自认证与加密，包与包之间几乎没有数据依赖，这种「易并行」负载天然适合摊到多个 CPU 核上同时处理。问题在于承载它的 Linux 网络栈对执行上下文有硬约束——收发路径的大量代码运行在软中断（softirq）与原子上下文中，那里不允许睡眠，也不允许做耗时过长的事情。如果在接收软中断里直接对整包流调用解密函数，一个持续的高速率流会把软中断线程长期占满，让网络栈的其他部分饥饿。因此设计上必须把「耗时的加密」从「不能睡眠的收发上下文」中剥离出来，投递到可以睡眠、可被调度到任意在线 CPU 的工作队列线程里执行。
+
+剥离之后立刻遇到第二个问题：包序与归属。加密可以并行，但同一对等体（peer）的解密后交付必须串行且有顺序，否则抗重放窗口、NAPI 轮询与协议栈注入都会乱套。于是 WireGuard 的并发模型被切成一个清晰的「两段式」：前段是并行的加密/解密工作队列，后段是串行的每 peer 消费（发送侧是一个 work_struct，接收侧是一个 NAPI）。两段之间用一个原子状态字段衔接，生产者只管把包放进队列并标记状态，消费者只在状态变为「已完成」后才处理。这套机制贯穿 `queueing.h`、`send.c`、`receive.c`，是本册机制章的核心之一（发送全链路见 06-05，接收全链路见 06-06）。
+
+第三个问题是内存安全。工作队列是异步的：一个包从入队到 worker 真正处理，中间可能经过调度延迟；而用户态随时可能通过 netlink 删除一个 peer。如果不做保护，worker 手上那个 peer 指针可能已经被释放，造成释放后使用（use-after-free）。WireGuard 的解法是 RCU（Read-Copy-Update）配合引用计数（kref）：读路径在 RCU 读锁保护下无锁遍历，拿到对象后立刻用「尝试加引用」把它固定住；写路径先从查找结构中摘除、等一个宽限期、再释放。这保证了任意时刻并发的收包与删 peer 不会互相踩踏。
+
+一个常见的误解需要在这里澄清：很多人以为 WireGuard Linux 的加密并行来自 Linux 内核的 Crypto API 异步框架或 padata（内核的并行数据分发框架，常被 IPsec ESP 用来做异步并行加密）。**就本快照源码而言，这个判断是错的**。我对 `_wglinux_build/upstream_src/` 全树检索 `padata` 关键字，结果是「无匹配」；加解密函数 `chacha20poly1305_encrypt_sg_inplace` 与 `chacha20poly1305_decrypt_sg_inplace` 在 worker 中同步调用，并非 Crypto API 的异步请求。WireGuard 的并行性来自它自己搭建的 per-CPU 多核工作队列（`multicore_worker` + `ptr_ring` + `WQ_PERCPU`），而不是 padata。二者的取舍会在第 2、6 节详细对比。
+
+### 2. 核心概念
+
+理解这套并发模型，抓住五个概念即可。**并行段与串行段**：加密/解密是并行段，运行在 `packet_crypt_wq` 工作队列的多个 worker 上；每 peer 的发送交付（`transmit_packet_work`）与接收交付（`napi`）是串行段。一个包先经过并行段改状态，再被串行段消费，两段用一个原子状态衔接。
+
+**per-CPU 分发**：设备持有三条加密队列（encrypt/decrypt/handshake），每条队列内部是一个无锁多生产者多消费者环形缓冲 `ptr_ring`，外加一个 `__percpu` 的 worker 数组。入队时挑选一个在线 CPU，把包放进 ring，再用 `queue_work_on` 唤醒那个 CPU 上的 worker。这样加解密线程天然贴合 CPU，避免跨核迁移和锁竞争。
+
+**RCU 读无锁**：allowedips trie、index 哈希表、noise keypair 这三类运行时查找结构都用 `__rcu` 指针发布。读侧在 `rcu_read_lock_bh()` 下用 `rcu_dereference_bh()` 遍历，全程不加写者锁；写侧用 `rcu_assign_pointer` 原子替换，旧对象通过 `call_rcu`/`kfree_rcu` 延迟到宽限期结束后释放。
+
+**kref 生命周期**：peer 与 keypair 都内嵌 `struct kref`。每个可能跨上下文持有对象的路径，先 `get` 加引用、用完 `put` 减引用；减到零时回调释放函数，而释放函数再挂一个 RCU 回调做真正的内存回收。引用计数负责「还有没有人用」，RCU 负责「什么时候回收内存」，两者分工明确。
+
+**状态机与内存序**：`packet_cb` 里的 `state` 字段取三值——`PACKET_STATE_UNCRYPTED`、`PACKET_STATE_CRYPTED`、`PACKET_STATE_DEAD`。生产者用 `atomic_set_release` 发布结果，消费者用 `atomic_read_acquire` 读取，构成 release-acquire 配对，保证 worker 对 skb 内容的修改对消费侧可见。
+
+关于 padata 的对比需要展开说明。padata 是内核提供的一种把工作分散到多 CPU、再按序回收结果的通用框架，IPsec 用它实现 ESP 的并行处理，优点是与内核基础设施集成度高、自带按序回调；缺点是它引入一层通用调度抽象，对 WireGuard 这种「包本身已在 skb 中、只需原地加密」的场景显得过重。WireGuard 选择自建 per-CPU worker：数据结构极简（一个 ring 加一个 per-CPU worker 数组），路径短、可控性强、与 NAPI 和 kref 的配合更直接。代价是它要自己处理 CPU 选择、racy 竞争、宽限期与两阶段 flush 等细节——这正是本节后面要逐条拆解的内容。需要强调：本快照未使用 padata，所谓「WireGuard 用 padata 并行加密」的说法需对照实际版本核验，至少在此快照中不成立。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名结构与真实路径，逐字段定义交给 05 册（字段见 05-03、05-06、05-08）。
+
+承载并行的三件套定义在 `drivers/net/wireguard/device.h`：`struct multicore_worker` 只有一个 `void *ptr`（回指所属队列）和一个 `struct work_struct work`；`struct crypt_queue` 由一个 `struct ptr_ring ring`、一个 `struct multicore_worker __percpu *worker` 与一个 `int last_cpu` 组成；`struct prev_queue` 是每 peer 的单消费者队列，用 `head/tail/peeked` 加一个 `atomic_t count`。`wg_device` 内嵌 `encrypt_queue`、`decrypt_queue`、`handshake_queue` 三条队列，以及 `packet_crypt_wq`、`handshake_receive_wq`、`handshake_send_wq` 三个工作队列。
+
+工作队列的创建在 `device.c` 的 `wg_newlink`：`packet_crypt_wq` 用 `alloc_workqueue("wg-crypt-%s", WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_PERCPU, 0, dev->name)`，`WQ_PERCPU` 正是 per-CPU worker 得以落在不同核上的关键标志；`handshake_receive_wq` 带 `WQ_CPU_INTENSIVE | WQ_FREEZABLE | WQ_PERCPU`；`handshake_send_wq` 则是 `WQ_UNBOUND | WQ_FREEZABLE`，握手发送不需要绑核。三条队列分别用 `wg_packet_queue_init` 初始化，容量为 `MAX_QUEUED_PACKETS` 与 `MAX_QUEUED_INCOMING_HANDSHAKES`（常量全集见 04-06）。需要标注：`wg_packet_queue_init`、`wg_prev_queue_enqueue` 等函数的实现文件 `queueing.c` 在本快照目录中缺失，仅有 `queueing.h` 的声明与调用点，相关内部细节需对照实际版本核验。
+
+衔接两段的 glue 在 `queueing.h`：`enum packet_state` 定义三态，`struct packet_cb` 持有 `nonce`、`keypair`、`atomic_t state`、`mtu`、`ds`（字段见 05-06）。CPU 选择由 `wg_cpumask_next_online(int *last_cpu)` 与 `wg_cpumask_choose_online(int *stored_cpu, unsigned int id)` 完成；队列分发由内联函数 `wg_queue_enqueue_per_device_and_peer`、`wg_queue_enqueue_per_peer_tx`、`wg_queue_enqueue_per_peer_rx` 完成。
+
+RCU 与 kref 的载体分布在三处：`peer.h` 的 `struct wg_peer` 内嵌 `struct kref refcount`、`struct rcu_head rcu`、`struct napi_struct napi`、`int serial_work_cpu`（字段见 05-03）；`noise.h` 的 `noise_keypairs` 用三个 `__rcu` 指针 `current_keypair`、`next_keypair`、`previous_keypair` 管理会话密钥（字段见 05-05）；`allowedips.h` 的 trie 节点含 `__rcu` 的 `peer` 指针与 `bit[2]` 子树指针（字段见 05-04）。
+
+下表收拢本篇反复引用的源码位置。
+
+| 关注点 | 真实源码路径 | 本册处理方式 |
+|---|---|---|
+| per-CPU 队列与 worker 结构 | `drivers/net/wireguard/device.h` 的 `crypt_queue`、`multicore_worker` | 讲机制，字段见 05-08 |
+| 工作队列创建与绑核标志 | `drivers/net/wireguard/device.c` 的 `wg_newlink` | 讲 `WQ_PERCPU` 语义，参数见 04-07 |
+| CPU 选择与分发 glue | `drivers/net/wireguard/queueing.h` | 讲调用链，实现文件缺失需核验 |
+| 加解密 worker | `drivers/net/wireguard/send.c`、`receive.c` | 讲并行段，原理见 06-05、06-06 |
+| RCU 查找与延迟释放 | `drivers/net/wireguard/allowedips.c`、`peer.c`、`noise.c` | 讲无锁读与宽限期 |
+| padata 使用情况 | 全快照检索无匹配 | 据实写未使用，需核验 |
+
+### 4. 关键流程与调用链
+
+先看出站的加密并行链路。数据包的起点是发送路径 staging：当密钥有效时，`send.c` 的 `wg_packet_send_staged_packets` 为整批 skb 分配 nonce（`atomic64_inc_return(&keypair->sending_counter) - 1`），取一个 keypair 强引用，并调用 `wg_packet_create_data`。后者在 `rcu_read_lock_bh()` 保护下调用 `wg_queue_enqueue_per_device_and_peer(&wg->encrypt_queue, &peer->tx_queue, first, wg->packet_crypt_wq)`。这个内联函数做三件事：把 `state` 置为 `PACKET_STATE_UNCRYPTED`；先把 skb 存入每 peer 的 `tx_queue`（prev_queue），作为串行段的待消费入口；再从 `encrypt_queue` 的 ring 里选 CPU——`cpu = wg_cpumask_next_online(&device_queue->last_cpu)`——用 `ptr_ring_produce_bh` 投入环形缓冲，最后 `queue_work_on(cpu, wq, &per_cpu_ptr(device_queue->worker, cpu)->work)` 唤醒该 CPU 的 worker。
+
+worker 侧是 `wg_packet_encrypt_worker`：它用 `container_of(work, struct multicore_worker, work)->ptr` 取回队列指针，循环 `ptr_ring_consume_bh` 取出 skb 链，对每个 skb 调用 `encrypt_packet`（内部最终调用 `chacha20poly1305_encrypt_sg_inplace` 原地加密），成功则 `wg_reset_packet(skb, true)` 重置元数据，然后调用 `wg_queue_enqueue_per_peer_tx(first, state)` 把状态置为 `CRYPTED` 并在 `peer->serial_work_cpu` 选定的 CPU 上调度 `transmit_packet_work`。串行段 `wg_packet_tx_worker` 看到状态不再是 `UNCRYPTED` 才 `wg_prev_queue_peek` 取出并真正发送（原理见 06-05）。注意 `wg_cpumask_choose_online` 用 `peer->internal_id % num_online_cpus()` 为同一 peer 固定一个串行 CPU，保证该 peer 的发送交付不会在核间乱跳。
+
+入站的解密并行链路对称。`receive.c` 的 `wg_packet_receive` 按消息类型分流：数据消息进入 `wg_packet_consume_data`，在 RCU 读锁下经 `wg_index_hashtable_lookup(..., INDEX_HASHTABLE_KEYPAIR, idx, &peer)` 由索引找到 peer 与 keypair，取强引用后调用 `wg_queue_enqueue_per_device_and_peer(&wg->decrypt_queue, &peer->rx_queue, skb, wg->packet_crypt_wq)`。`wg_packet_decrypt_worker` 同样从 ring 取包，调用 `decrypt_packet`（`chacha20poly1305_decrypt_sg_inplace`）解密，再 `wg_queue_enqueue_per_peer_rx(skb, state)` 置状态并 `napi_schedule(&peer->napi)`。串行段 `wg_packet_rx_poll` 在 NAPI 轮询中按 budget 取包，先 `counter_validate` 验重放，再用 `wg_allowedips_lookup_src` 校验源地址确属该 peer，最后 `napi_gro_receive` 注入协议栈（原理见 06-06、06-08）。握手消息则走 `handshake_queue`，由 `wg_packet_handshake_receive_worker` 处理并维护 `handshake_queue_len` 计数（握手时序见 06-03）。
+
+整条「并行加密—串行消费」的分流与状态衔接见图 06-13-01。
+
+:::figure id=06-13-01 | name=加密并行的 per-CPU 分发与两阶段消费 | dir=TD
+node q1 "出站 skb<br/>ndo_start_xmit" blue
+node q2 "peer tx_queue<br/>prev_queue 暂存" gray
+node q3 "encrypt_queue<br/>ptr_ring 无锁环" teal
+node q4 "per-CPU worker<br/>wg-crypt 工作队列" purple
+node q5 "ChaCha20-Poly1305<br/>worker 内同步加密" red
+node q6 "tx_worker<br/>串行发送" green
+node q7 "UDP socket<br/>物理网卡发出" blue
+node q8 "入站 skb<br/>decrypt_queue 环" teal
+node q9 "rx_poll NAPI<br/>验重放+查源" green
+edge q1 -> q2 "入队待加密"
+edge q2 -> q3 "state=UNCRYPTED"
+edge q3 -> q4 "queue_work_on 选核"
+edge q4 -> q5 "并行执行"
+edge q5 -> q6 "state=CRYPTED"
+edge q6 -> q7 "按序交付"
+edge q7 -> q8 "对端报文到达"
+edge q8 -> q4 "选核并行解密"
+edge q4 -> q9 "state=CRYPTED"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：出站包由「ndo_start_xmit」进入「peer tx_queue prev_queue 暂存」，以「state=UNCRYPTED」投入「encrypt_queue ptr_ring 无锁环」，经「queue_work_on 选核」唤醒「per-CPU worker wg-crypt 工作队列」，由 worker「并行执行」ChaCha20-Poly1305 同步加密，再以「state=CRYPTED」交给「tx_worker 串行发送」并经「UDP socket 物理网卡发出」；对端报文到达后进入「入站 skb decrypt_queue 环」，同样「选核并行解密」后以「state=CRYPTED」进入「rx_poll NAPI 验重放+查源」。
+
+CPU 选择函数本身有一个值得注意的细节。`wg_cpumask_next_online` 用 `READ_ONCE(*last_cpu)` 取当前值、`cpumask_next` 找下一个在线 CPU、越界则回到第一个，再用 `WRITE_ONCE` 写回；`wg_cpumask_choose_online` 则在缓存 CPU 离线时用 `cpumask_nth(id % num_online_cpus(), cpu_online_mask)` 重新挑选。`queueing.h` 的注释明确说 `wg_cpumask_next_online` 是 racy 的——`last_cpu` 无锁访问可能让两个生产者选到同一个 CPU——但「竞态的后果无害」，因为共享同一 worker 只是少了一点并行度，不会破坏正确性，加锁或原子序列反而更慢。这是内核里「用正确性换性能、且论证过竞态无害」的典型取舍。
+
+### 5. 配置/命令/代码实例
+
+并发机制本身不是用户可配置的，但可以用代码与观测命令把设计落到可验证的层面。先看分发函数的精简形态（片段源自 `queueing.h`，保留关键语句）：
+
+```c
+static inline int wg_queue_enqueue_per_device_and_peer(
+	struct crypt_queue *device_queue, struct prev_queue *peer_queue,
+	struct sk_buff *skb, struct workqueue_struct *wq)
+{
+	int cpu;
+	atomic_set_release(&PACKET_CB(skb)->state, PACKET_STATE_UNCRYPTED);
+	if (unlikely(!wg_prev_queue_enqueue(peer_queue, skb)))
+		return -ENOSPC;
+	cpu = wg_cpumask_next_online(&device_queue->last_cpu);
+	if (unlikely(ptr_ring_produce_bh(&device_queue->ring, skb)))
+		return -EPIPE;
+	queue_work_on(cpu, wq, &per_cpu_ptr(device_queue->worker, cpu)->work);
+	return 0;
+}
+```
+
+这段代码把「两段式」体现得淋漓尽致：`state` 用 release 语义发布，peer 队列先行、设备 ring 后行，最后用 `queue_work_on` 把 worker 钉在选定 CPU 上。两个错误码各有含义：`-ENOSPC` 说每 peer 队列满，`-EPIPE` 说设备 ring 满；调用方对 `-EPIPE` 会走 `PACKET_STATE_DEAD` 的清理分支（错误码速查见 04-08）。
+
+观测并行度可以从用户态入手（示例输出，具体格式需对照实际版本核验）：
+
+```bash
+# 查看 wg-crypt 工作队列线程是否按 CPU 分布（名称形如 wg-crypt-wg0）
+ps -eLo pid,tid,psr,comm | grep 'wg-crypt'
+# 查看工作队列与软中断的 CPU 分布
+grep -E 'wg-crypt|ksoftirqd' /proc/interrupts | head
+# 多线程压测下观察各核利用率
+mpstat -P ALL 1
+```
+
+```text
+  PID   TID  PSR COMMAND
+  912   917    2 wg-crypt-wg0
+  912   918    5 wg-crypt-wg0
+  912   919    9 wg-crypt-wg0
+  912   920   13 wg-crypt-wg0
+Average:  CPU    %usr   %sys   %iowait  %idle
+Average:    2   12.30  31.45     0.00  56.25
+Average:    5   11.87  30.92     0.00  57.21
+Average:    9   12.66  32.10     0.00  55.24
+Average:   13   11.55  31.78     0.00  56.67
+```
+
+逐行判读如下。`ps` 输出的四行都是 PID 相同、TID 不同、COMM 同为 `wg-crypt-wg0` 的线程，说明它们是同一工作队列 `packet_crypt_wq` 下多个 per-CPU worker，对应 `device.c` 中 `alloc_workqueue("wg-crypt-%s", ..., WQ_PERCPU, ...)` 的命名；`PSR` 列分别为 2、5、9、13，证明这些 worker 确实落在不同在线 CPU 上，这正是 `WQ_PERCPU` 与 `queue_work_on` 的效果。`mpstat` 的四个 CPU 行 `%sys` 都在 31% 左右且数值接近，说明加密负载被较均匀地摊到多个核——若只有单核 `%sys` 高、其余接近零，则可能是 CPU 数偏少、队列深度不足或流量本身是单流单 peer 导致串行段成为瓶颈。需要提醒：这里是「示例输出，具体格式需对照实际版本核验」，不同内核版本的线程命名、字段列数会有差异；`%sys` 与 `%usr` 的具体数值是「需在目标机型实测」，本资料不给绝对值（基准口径见 08-01、调优见 08-02）。最后，grep `/proc/interrupts` 只能看到中断与软中断计数，per-CPU 统计更多体现在 netdev 的 `dev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS` 与 `dev_sw_netstats_rx_add`、`DEV_STATS_ADD` 累计值上，可用 `ip -s link` 观察，而不是靠这一段直接读出加密次数。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是认定 WireGuard 用了 padata 或 Crypto API 异步并行。前文已据实说明：本快照全树无 `padata`，加解密是 worker 内同步调用 `chacha20poly1305_*_sg_inplace`，并行性来自自建 per-CPU workqueue。这个误解若不澄清，会让人错误地去调 Crypto API 的异步参数或期待 padata 的按序回调语义（本快照未提供）。第二个陷阱是看到 `wg_cpumask_next_online` 无锁就断言是 bug——源码注释已论证竞态无害，重复选到同一 CPU 只损失并行度，不破坏正确性。
+
+第三个陷阱是把 kref 与 RCU 的配对搞反。`wg_peer_get_maybe_zero` 在 `peer.c` 里用 `RCU_LOCKDEP_WARN` 断言调用者持有 RCU 读锁，再用 `kref_get_unless_zero` 尝试加引用；allowedips 的 `lookup` 正是先在 `rcu_read_lock_bh` 下遍历、再用它取 peer，取不到就 `goto retry` 重试。若在 RCU 读锁之外持有裸指针，或只靠引用计数不靠 RCU 保护查找结构，都可能踩到释放后使用。第四个陷阱是忽略两阶段移除。`wg_peer_remove` 先 `peer_make_dead`（从配置查找结构摘除并 `WRITE_ONCE(peer->is_dead, true)`），再 `synchronize_net()` 等宽限期，最后 `peer_remove_after_dead`。后者里对 `packet_crypt_wq` 连续 `flush_workqueue` 两次——源码注释解释：每个引用的生命严格受两代约束（一次并行加密、一次串行消费），故 flush 两次即可确认队列内不再有引用。跳过任何一步都可能留下悬空引用。
+
+第五个陷阱是误解状态字段的内存序。`wg_queue_enqueue_per_peer_tx/rx` 在设置 state 之前先 `wg_peer_get(peer)`，注释写明「一旦调用 atomic_set，peer 可能从脚下被释放」；随后 `queue_work_on`/`napi_schedule` 再 `wg_peer_put`。生产者的 `atomic_set_release` 与消费者的 `atomic_read_acquire` 必须成对，换成普通赋值会破坏可见性语义。第六个陷阱是把原子计数当精确统计：`handshake_queue_len`、`peer_counter`、`atomic64_t sending_counter` 用于流控与序列号分配，`rx_bytes/tx_bytes` 是 peer 级 u64，netdev 统计走 per-CPU `NETDEV_PCPU_STAT_TSTATS`，读取时本就允许细微不一致，不能拿来对账（字段见 05-08）。
+
+最佳实践：观测并行度优先用 `ps`/`mpstat` 看 worker 分布，而不是臆测；调参时不要手动把 worker 绑核或改 `WQ_PERCPU`，让内核按在线 CPU 自动分发；调试并发问题时打开 `DEBUG` 编译，让 `wg_mod_init` 期间运行 `wg_allowedips_selftest`、`wg_packet_counter_selftest`、`wg_ratelimiter_selftest` 三项自检（调试构建见 02-05）；排查「吞吐上不去」时先确认是否单 peer 单流——串行段（tx_worker / napi）会成为上限，此时增加加密 worker 数量无益，应转向多流或 GSO 调优（调优见 08-02）。凡本快照缺失的实现文件（`queueing.c`）与需核验的接口细节，均以目标系统实际内核源码为准，绝不臆断。
+
+### 7. 小结与延伸阅读
+
+本篇把 WireGuard Linux 的多核并发拆成五个互相咬合的机制：以 `crypt_queue`（`ptr_ring` + per-CPU `multicore_worker`）和 `packet_crypt_wq`（`WQ_PERCPU`）实现的 per-CPU 并行加密；以 `PACKET_STATE_*` 三态与 release-acquire 原子操作衔接的「并行加密—串行消费」两段式模型；以 `rcu_read_lock_bh` / `rcu_dereference_bh` / `rcu_assign_pointer` 与 `call_rcu`、`kfree_rcu` 实现的 RCU 读无锁与延迟释放；以 `struct kref` 与 `wg_peer_get/put` 实现的生命周期管理；以及 netdev 的 per-CPU 统计与各类原子计数。一个必须据实记住的结论是：本快照未使用 padata，并行性完全来自自建 per-CPU workqueue，而非内核 Crypto API 的异步框架。
+
+延伸阅读建议：加密并行的前因后果接 06-05（发送）、06-06（接收）；抗重放与源地址校验接 06-08、06-07；握手队列与计数接 06-03。跨册随查按（字段见 05-08 ｜ 参数见 04-07 ｜ 原理见 06-01 ｜ 模块见 07-02）执行：队列与报文元数据字段去 05-06、05-08，工作队列与常量参数去 04-06、04-07，总览机制回 06-01，目录级模块职责去 07-02、07-07、07-08。凡涉及 `queueing.c` 内部实现、padata 使用情况及 per-CPU 统计字段的取值，本快照未能完整覆盖或已标注「需对照实际版本核验」，均以 `_wglinux_build/upstream_src/` 下目标版本源码为准，本资料不编造未核验的路径与取值。
+
+## 06-14 netlink 配置通道与用户态交互原理
+
+### 1. 背景与动机
+
+WireGuard Linux 的数据面在内核，但配置与查询发生在用户态：`wg set` 把接口、密钥、peer 与 AllowedIPs 写进内核，`wg show` 再把运行状态读回来。连接这两个世界的桥梁是 netlink，具体是其中的通用 netlink（generic netlink）族机制。理解这条配置通道，是理解「为什么 `wg` 没有守护进程、为什么配置即时生效、为什么 `wg show` 每一行都对应内核某个属性」的关键（整体分工见 01-03）。
+
+为什么选通用 netlink 而非 ioctl、sysfs 或 proc？第一，配置是结构化的层级数据——一个接口下有多个 peer，一个 peer 下有多个 AllowedIPs——netlink 的属性（attribute）嵌套天然表达这种 device→peer→allowedip 三层树，而 ioctl 的结构体难以优雅处理可变长嵌套。第二，通用 netlink 的族（family）在运行时动态分配 id，内核用 `WG_GENL_NAME "wireguard"` 注册族、用户态按名字查询 id，避免与既有 netlink 协议号冲突，也无需维护静态编号。第三，netlink 支持请求-应答的 ACK 语义、转储（dump）语义与序列号匹配，`wg set` 能确认每条配置已被内核接收，`wg show` 能分多条消息拉回大量 peer 数据。第四，属性带类型与长度，内核侧可用策略表统一校验，用户态则用精简的 libmnl 构造与解析，边界清晰。
+
+本快照在这条通道上呈现出几个需要留意的特征。其一，`include/uapi/linux/wireguard.h` 顶部注明「auto-generated from Documentation/netlink/specs/wireguard.yaml」「YNL-GEN uapi header」，即用户态 API 头已纳入 YAML 规范自动生成体系，这是较新内核的版本特征；改属性必须改规范再重新生成，不能直接手改头文件。其二，本快照内核侧**缺少 `netlink.c` 与 `netlink.h` 文件**——`main.c` 虽然 `#include "netlink.h"` 并调用 `wg_genetlink_init()`，但这两个文件不在快照目录中，因此内核如何注册族、如何解析 SET 属性、如何发布配置的具体实现无法在本快照逐行核实，相关细节统一标注「需对照实际版本核验」，绝不臆造。其三，用户态一侧也不存在 `ipc-linux.c`，实现全部内嵌在 `ipc-linux.h` 的 `static` 函数中（通过 `ipc.c` 的 `#include` 引入）。本篇据实以用户态源码与 uapi 头为主，内核侧只讲可由 `device.c`、`peer.c`、`allowedips.c` 佐证的 RCU 发布原理。
+
+### 2. 核心概念
+
+配置通道可以压缩成四个概念。**通用 netlink 族**：内核以名字 `wireguard`、版本 `WG_GENL_VERSION 1` 注册一个族，族 id 由 controller 动态分配；用户态必须先向 controller 查询 `CTRL_ATTR_FAMILY_ID` 才能发命令。**两条命令**：uapi 的 `enum wg_cmd` 只有 `WG_CMD_GET_DEVICE` 与 `WG_CMD_SET_DEVICE`，前者读、后者写，命令全集见 04-05。**三层属性嵌套**：`wgdevice_attribute`、`wgpeer_attribute`、`wgallowedip_attribute` 三个枚举对应接口、peer、AllowedIPs 三层，`WGDEVICE_A_PEERS` 与 `WGPEER_A_ALLOWEDIPS` 是两个嵌套容器属性（全集见 04-06）。**请求标志**：`NLM_F_REQUEST` 表示请求，`NLM_F_ACK` 要求应答确认，`NLM_F_DUMP` 要求转储全部匹配对象。
+
+族 id 的查询是整个通道的入口。`wireguard-tools` 没有链接外部 libmnl，而是在 `src/netlink.h` 里内嵌了一份精简实现；`mnlg_socket_open(WG_GENL_NAME, WG_GENL_VERSION)` 先 `socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC)` 打开通用 netlink 套接字并 `mnl_socket_bind(..., MNL_SOCKET_AUTOPID)`，然后用 `GENL_ID_CTRL` 向 controller 发 `CTRL_CMD_GETFAMILY`，携带 `CTRL_ATTR_FAMILY_NAME = "wireguard"`，从应答的 `CTRL_ATTR_FAMILY_ID` 取得动态族 id 存入 `struct mnlg_socket` 的 `id` 字段。任何把族 id 写死的做法都是错的——它在不同启动、不同加载顺序下会变，这正是通用 netlink 的设计意图。
+
+属性嵌套的表达方式值得细看。netlink 属性是 `<类型, 长度, 值>` 三元组；`mnl_attr_nest_start` 给属性类型打上 `NLA_F_NESTED` 标志并返回一个起始指针，`mnl_attr_nest_end` 在结束时回填长度。数组式的重复元素（多个 peer、多个 allowedip）用「匿名嵌套」表达——`mnl_attr_nest_start_check(nlh, buflen, 0)` 传类型 0，形成一串无类型但可遍历的 nest。于是 SET 消息的层级是：顶层 `WGDEVICE_A_PEERS` 嵌套 → 每个 peer 一个匿名 nest → 其中 `WGPEER_A_ALLOWEDIPS` 嵌套 → 每个 allowedip 一个匿名 nest。用户态解析 GET 应答时，用一串回调 `parse_device → parse_peers → parse_peer → parse_allowedips → parse_allowedip` 逐层 `mnl_attr_parse_nested` 对称地还原这棵树。
+
+最后是配置更新的 RCU 快照发布。虽然内核 netlink 命令处理器文件缺失，但从 `device.h`、`peer.c`、`allowedips.c` 可以还原其发布范式：设备持有 `device_update_lock` 互斥锁串行化所有配置写操作，并用 `device_update_gen` 记录配置代次；每次增删 peer 或 AllowedIP，写侧在持锁状态下用 `rcu_assign_pointer`、`RCU_INIT_POINTER` 原子替换 trie 根或节点指针来「发布」新状态，旧对象通过 `kfree_rcu`、`call_rcu` 延迟到宽限期结束后回收；数据面的读路径（如 06-07 的 `wg_allowedips_lookup_src`、06-03 的 keypair 读取）在 `rcu_read_lock_bh` 下无锁遍历。效果是：配置变更不会让正在收包的内核路径加锁等待，也不会读到半更新的结构——读侧看到的是变更前后某一时刻的一致快照。具体的 SET 事务语义（如 `WGDEVICE_F_REPLACE_PEERS` 如何在内核内实现原子替换）需对照实际版本核验。
+
+netlink 通道的可靠性还建立在序列号与端口 id 的双重匹配上。`mnlg_msg_prepare` 把 `time(NULL)` 写入 `nlmsg_seq` 并存进 `nlg->seq`，`mnlg_socket_recv_run` 再通过 `mnl_cb_run2` 用 `mnl_nlmsg_seq_ok` 与 `mnl_nlmsg_portid_ok` 校验每条应答：序列号或端口 id 不符就分别返回 `EPROTO`、`ESRCH` 并丢弃。这意味着同一台机器上多个 `wg` 进程并发操作时，谁也不会把别人的应答错认成自己的。`NLM_F_ACK` 让 SET 的每条消息都收到一个类型为 `NLMSG_ERROR`、但 `error` 字段为 0 的确认报文，`mnlg_cb_error` 负责把非零 `error` 转成对应 errno；`NLM_F_DUMP` 让 GET 以 `NLM_F_MULTI` 多消息形式返回，直到 `NLMSG_DONE` 才结束，`mnlg_cb_stop` 处理收尾。这套「请求—确认—转储收尾」机制，正是「配置即时生效且可确认」与「大量 peer 能完整读回」的底层保障，也解释了为什么工具层几乎不需要自己维护复杂的会话状态机——netlink 协议本身已经把可靠性做进了消息格式与回调分发里。
+
+### 3. 关键数据结构与源码位置
+
+本节只给理解通道所需的最小片段，命令与属性的完整枚举交 04 册（参数见 04-05、04-06），配置结构逐字段交 05 册（字段见 05-09）。
+
+用户态 API 契约在 `include/uapi/linux/wireguard.h`：族名 `WG_GENL_NAME "wireguard"`、版本 `WG_GENL_VERSION 1`、密钥长度 `WG_KEY_LEN 32`；`enum wg_cmd` 含 `WG_CMD_GET_DEVICE`、`WG_CMD_SET_DEVICE`；三组标志 `wgdevice_flag`（`WGDEVICE_F_REPLACE_PEERS`）、`wgpeer_flag`（`WGPEER_F_REMOVE_ME`、`WGPEER_F_REPLACE_ALLOWEDIPS`、`WGPEER_F_UPDATE_ONLY`）、`wgallowedip_flag`（`WGALLOWEDIP_F_REMOVE_ME`）；三层属性枚举以 `__*_A_LAST` 结尾并导出 `*_A_MAX`。这些常量是用户态与内核的二进制契约，全集见 04-06。
+
+通用 netlink 封装在 `wireguard-tools/src/netlink.h`：`struct mnlg_socket` 持有 `struct mnl_socket *nl`、`char *buf`、`uint16_t id`、`uint8_t version`、`seq`、`portid`；关键函数是 `mnlg_socket_open`（族 id 查询握手）、`mnlg_msg_prepare`（构造带 genlmsghdr 的消息）、`mnlg_socket_send`、`mnlg_socket_recv_run`。精简 libmnl 的 `mnl_attr_put`、`mnl_attr_nest_start/end/cancel`、`mnl_attr_validate` 与各类 `*_check` 也在此文件（模块见 07-13）。
+
+配置通道主体在 `wireguard-tools/src/ipc-linux.h`（注意本快照无 `ipc-linux.c`）：`kernel_set_device` 构造并发送 `WG_CMD_SET_DEVICE`，`kernel_get_device` 构造并解析 `WG_CMD_GET_DEVICE`，`kernel_get_wireguard_interfaces` 用 rtnetlink 列接口。平台抽象在 `ipc.c`——它按编译平台 `#include "ipc-linux.h"`，把 `ipc_set_device` 映射到 `kernel_set_device`、`ipc_get_device` 映射到 `kernel_get_device`（模块见 07-11）。工具入口是 `set.c` 的 `set_main` 与 `show.c` 的 `pretty_print`。
+
+下表收拢本篇反复引用的源码位置。
+
+| 关注点 | 真实源码路径 | 本册处理方式 |
+|---|---|---|
+| 命令、属性、标志契约 | `include/uapi/linux/wireguard.h` | 只给最小片段，全集见 04-05、04-06 |
+| 族 id 查询与消息封装 | `wireguard-tools/src/netlink.h` 的 `mnlg_socket_open` | 讲握手机制，模块见 07-13 |
+| SET 消息构造与分片 | `wireguard-tools/src/ipc-linux.h` 的 `kernel_set_device` | 讲属性嵌套与分片 |
+| GET 解析与合并 | `wireguard-tools/src/ipc-linux.h` 的 `kernel_get_device` | 讲回调链 |
+| 平台抽象映射 | `wireguard-tools/src/ipc.c` | 讲 `ipc_*` → `kernel_*` |
+| 内核 netlink 处理器 | 本快照缺失（`netlink.c` 不在目录） | 据实标注需核验 |
+| 配置发布的 RCU 范式 | `device.c`、`peer.c`、`allowedips.c` | 讲发布原理，字段见 05-09 |
+
+### 4. 关键流程与调用链
+
+先看写路径。用户执行 `wg set wg0 private-key ./key peer <公钥> allowed-ips 10.0.0.2/32`，`set.c` 的 `set_main` 调用 `config_read_cmd` 把命令行解析成 `struct wgdevice`（一个带 `flags` 的树，字段见 05-09），把接口名 `strncpy` 进 `device->name`，再调用 `ipc_set_device(device)`。`ipc.c` 把它转给 `kernel_set_device`。后者先 `mnlg_socket_open(WG_GENL_NAME, WG_GENL_VERSION)` 完成族 id 握手，然后进入 `mnlg_msg_prepare(nlg, WG_CMD_SET_DEVICE, NLM_F_REQUEST | NLM_F_ACK)` 构造消息：先放 `WGDEVICE_A_IFNAME`；若无 peer，则按 flags 放 `WGDEVICE_A_PRIVATE_KEY`、`WGDEVICE_A_LISTEN_PORT`、`WGDEVICE_A_FWMARK`、`WGDEVICE_A_FLAGS`（含 `WGDEVICE_F_REPLACE_PEERS`）。若有 peer，则 `peers_nest = mnl_attr_nest_start(nlh, WGDEVICE_A_PEERS)` 打开第一层嵌套，逐个 peer 用匿名 nest 放入 `WGPEER_A_PUBLIC_KEY`、`WGPEER_A_PRESHARED_KEY`、`WGPEER_A_ENDPOINT`、`WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL`、`WGPEER_A_FLAGS`（含 `WGPEER_F_REMOVE_ME`、`WGPEER_F_REPLACE_ALLOWEDIPS`），再用 `allowedips_nest = mnl_attr_nest_start_check(..., WGPEER_A_ALLOWEDIPS)` 打开第二层，逐条放 `WGALLOWEDIP_A_FAMILY`、`WGALLOWEDIP_A_IPADDR`、`WGALLOWEDIP_A_CIDR_MASK`、`WGALLOWEDIP_A_FLAGS`。构造完 `mnlg_socket_send` 发出，并 `mnlg_socket_recv_run(nlg, NULL, NULL)` 等待 ACK 确认（错误码语义见 04-08）。
+
+写路径有一个精巧的分片机制。缓冲区大小 `SOCKET_BUFFER_SIZE = mnl_ideal_socket_buffer_size()`，取系统页大小且上限 8192 字节；所有属性写入都用 `mnl_attr_put_check`、`mnl_attr_nest_start_check` 这类带检查的变体，一旦放不下就跳到 `toobig_peers` 或 `toobig_allowedips` 标签，用 `mnl_attr_nest_cancel` 撤销未完成嵌套，`goto send` 先把已构造部分发出；发送后若还有 peer（`if (peer)`）则 `goto again` 用剩余 peer 重新构造下一条消息。这样即便配置成千上万个 peer，也能切成多条不超过缓冲区上限的 netlink 消息可靠送达，每条各自等 ACK。
+
+读路径从 `wg show` 开始。`show.c` 调用 `ipc_get_device(&device, iface)` → `kernel_get_device`，后者先检查接口名长度小于 `IFNAMSIZ`（否则 `-ENAMETOOLONG`），`mnlg_socket_open` 后用 `mnlg_msg_prepare(nlg, WG_CMD_GET_DEVICE, NLM_F_REQUEST | NLM_F_ACK | NLM_F_DUMP)` 构造请求，带 `WGDEVICE_A_IFNAME`，`mnlg_socket_send` 发出，`mnlg_socket_recv_run(nlg, read_device_cb, *device)` 接收。解析是一串对称回调：`read_device_cb` 以 `sizeof(struct genlmsghdr)` 为偏移 `mnl_attr_parse`，命中 `WGDEVICE_A_PEERS` 后 `parse_peers` 为每个 peer 分配 `wgpeer` 并挂链表，再 `parse_peer` 解析各字段，命中 `WGPEER_A_ALLOWEDIPS` 后 `parse_allowedips`、`parse_allowedip` 解析每条地址，过程中用 `mnl_attr_validate` 校验 U16/U32/U64/STRING 类型并校验 CIDR 范围（IPv4 ≤ 32、IPv6 ≤ 128）。`coalesce_peers` 把公钥相同的相邻 peer 合并——因为 dump 会把同一 peer 的 AllowedIPs 拆到多条消息里返回。若收到 `NLM_F_DUMP_INTR`（errno `EINTR`），`-EINTR` 触发 `try_again` 整体重试。解析完的 `wgdevice` 由 `pretty_print` 渲染成人可读输出。另有一条辅助路径：`kernel_get_wireguard_interfaces` 走的是 **rtnetlink** 的 `RTM_GETLINK` dump，用 `IFLA_LINKINFO`/`IFLA_INFO_KIND = WG_GENL_NAME` 过滤，供 `wg show`、`wg show interfaces` 列接口名，注意它与前面两条 genetlink 通道不是同一个 socket 总线。
+
+完整的配置通道与消息流见图 06-14-01。
+
+:::figure id=06-14-01 | name=wg 工具到内核的 netlink 配置通道 | dir=LR
+node c1 "wg set / show<br/>用户命令" blue
+node c2 "ipc.c<br/>平台抽象层" gray
+node c3 "mnlg_socket_open<br/>查族ID握手" purple
+node c4 "SET / GET_DEVICE<br/>genlmsghdr 命令" teal
+node c5 "属性嵌套<br/>device→peer→allowedip" green
+node c6 "NETLINK_GENERIC<br/>通用 netlink 总线" blue
+node c7 "内核 netlink 处理器<br/>本快照缺失需核验" red
+node c8 "device_update_lock<br/>RCU 快照发布" amber
+edge c1 -> c2 "命令解析"
+edge c2 -> c3 "ipc_* → kernel_*"
+edge c3 -> c4 "族ID就绪"
+edge c4 -> c5 "构造/解析属性"
+edge c5 -> c6 "sendto / recvmsg"
+edge c6 -> c7 "内核分发"
+edge c7 -> c8 "持锁发布"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：用户的「wg set / show 用户命令」经「ipc.c 平台抽象层」映射后进入「mnlg_socket_open 查族ID握手」，就绪后用「SET / GET_DEVICE genlmsghdr 命令」承载「属性嵌套 device→peer→allowedip」，通过「NETLINK_GENERIC 通用 netlink 总线」送达「内核 netlink 处理器 本快照缺失需核验」，最终在「device_update_lock RCU 快照发布」下写进内核状态；列接口另走 rtnetlink 的 RTM_GETLINK 通道，不经此链。
+
+### 5. 配置/命令/代码实例
+
+先看族 id 握手的最小片段，它浓缩了通用 netlink 的入口机制（源自 `netlink.h`，保留关键语句）：
+
+```c
+nlg->nl = mnl_socket_open(NETLINK_GENERIC);
+mnl_socket_bind(nlg->nl, 0, MNL_SOCKET_AUTOPID);
+nlh = __mnlg_msg_prepare(nlg, CTRL_CMD_GETFAMILY,
+			 NLM_F_REQUEST | NLM_F_ACK, GENL_ID_CTRL, 1);
+mnl_attr_put_strz(nlh, CTRL_ATTR_FAMILY_NAME, family_name);
+mnlg_socket_send(nlg, nlh);
+mnlg_socket_recv_run(nlg, get_family_id_cb, &nlg->id);
+nlg->version = version;
+```
+
+这段说明：族 id 不是常量，而是以 `CTRL_CMD_GETFAMILY` 向 controller 按名字查询得到，写回 `nlg->id` 后才供后续 `mnlg_msg_prepare` 使用；`get_family_id_cb` 从应答里取 `CTRL_ATTR_FAMILY_ID`。
+
+下面用机器可读的 `dump` 格式观察通道实际读回的属性（示例输出，具体格式需对照实际版本核验）：
+
+```bash
+# 以无别名的机器可读格式转储，便于逐字段核对属性
+wg show wg0 dump
+# 观察底层 netlink 系统调用（需 root 与 strace）
+strace -e trace=network wg show wg0 >/dev/null
+```
+
+```text
+interface\twg0
+<本端私钥>\t<本端公钥>\t51820\toff
+<对端公钥>\t(none)\t203.0.113.9:51820\t10.0.0.2/32\t1700000000\t135168\t98212\toff
+socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC) = 3
+bind(3, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12) = 0
+sendto(3, ..., NETLINK_GENERIC) = 64
+```
+
+逐行判读如下。`interface` 行是接口名，对应 `WGDEVICE_A_IFNAME`，由 `kernel_get_device` 的 `parse_device` 从 GET 应答顶层属性解析，确认查询命中 wg0。第二行是接口自身属性：依次为私钥、公钥、监听端口、fwmark，对应 `WGDEVICE_A_PRIVATE_KEY`、`WGDEVICE_A_PUBLIC_KEY`、`WGDEVICE_A_LISTEN_PORT`、`WGDEVICE_A_FWMARK`；端口 `51820` 与 fwmark `off` 说明私钥已设且未配置 fwmark，`dump` 会输出私钥而 `pretty_print` 用 `masked_key` 遮蔽，二者仅是展示策略差异（密钥边界见 03-03）。第三行是 peer 属性：公钥对应 `WGPEER_A_PUBLIC_KEY`，`(none)` 是预共享密钥 `WGPEER_A_PRESHARED_KEY` 为空，endpoint 对应 `WGPEER_A_ENDPOINT`，`10.0.0.2/32` 由 `WGALLOWEDIP_A_IPADDR` 与 `WGALLOWEDIP_A_CIDR_MASK` 组合渲染，`1700000000` 是 `WGPEER_A_LAST_HANDSHAKE_TIME` 的 Unix 时间戳，`135168` 与 `98212` 分别是 `WGPEER_A_RX_BYTES`、`WGPEER_A_TX_BYTES`，末尾 `off` 是持久 keepalive 间隔为空（keepalive 见 06-11）。三行 netlink 系统调用则印证通道本质：先 `socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC)` 打开通用 netlink 套接字、`bind` 时 `nl_pid=0` 即 `MNL_SOCKET_AUTOPID` 让内核自动分配端口 id，再 `sendto` 发出约 64 字节的查询消息——正是 `mnlg_socket_open` 查族 id 与 `mnlg_msg_prepare` 构造 GET_DEVICE 的底层投影。需要说明：这里是「示例输出，具体格式需对照实际版本核验」，线程字段与 `dump` 列序在不同版本可能调整（模块见 07-11）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把族 id 当常量写死。如同第 2 节强调的，`WG_GENL_NAME` 是名字而非编号，id 由 controller 动态分配，必须经 `mnlg_socket_open` 的 `CTRL_CMD_GETFAMILY` 查询；任何绕过握手直接填 id 的代码在不同环境下都会失效。第二个陷阱是忽视本快照的文件缺失。内核 `netlink.c`/`netlink.h` 与用户态 `ipc-linux.c` 都不在目录，关于内核如何注册族、如何解析 SET 属性、如何以 `WGDEVICE_F_REPLACE_PEERS` 做原子替换，本资料一律标注「需对照实际版本核验」，不据空想补全（模块职责见 07-11）。
+
+第三个陷阱是混淆两条 socket 总线。`kernel_set_device`/`kernel_get_device` 走 `NETLINK_GENERIC` 通用族，而 `kernel_get_wireguard_interfaces` 走 `NETLINK_ROUTE` 的 rtnetlink；把列接口逻辑套到 genetlink 或反过来都会失败。第四个陷阱是忽略分片与重试。`kernel_set_device` 依赖 `*_check` 系列与 `toobig_*` 标签分片，超长配置若不用带检查的变体会溢出 8192 字节缓冲区；`kernel_get_device` 遇到 `NLM_F_DUMP_INTR`（`EINTR`）要整体重试，否则会读到半更新结果；`coalesce_peers` 缺失会让同一 peer 被拆成多条显示。第五个陷阱是绕过工具直接发裸 netlink 消息：属性类型、长度对齐（`MNL_ALIGN`）、`NLA_F_NESTED` 标志、序列号与端口 id 匹配任一出错都会被内核拒绝，调试成本极高。
+
+最佳实践：优先用 `wg` 工具而非自行构造 netlink——工具已处理好族 id 握手、分片、ACK、类型校验与错误码映射（参数见 04-08）；调试配置通道时先用 `wg show ... dump` 看机器可读输出核对属性，必要时再 `strace -e trace=network` 观察底层消息；把「私钥只经 `WGDEVICE_A_PRIVATE_KEY` 写入、从不在 `show` 回显」作为安全纪律（密钥流程见 03-03）；批量配置大量 peer 时信任工具的分片机制，不要手动拆包；涉及配置并发与性能的判断，要意识到数据面读路径靠 RCU 无锁，配置写操作由 `device_update_lock` 串行化，密集变更配置期间数据面不受锁等待影响（RCU 并发机制见 06-13）。
+
+还有一个与配置语义强相关的实践点是 `wg syncconf` 与 `wg setconf` 的差异。两者最终都经 `ipc_set_device` 落到同一条 SET 通道，但 syncconf 会在生成的 `wgdevice` 上置 `WGDEVICE_F_REPLACE_PEERS`，并为每个 peer 置 `WGPEER_F_REPLACE_ALLOWEDIPS`，使内核以「替换」而非「合并」语义应用配置——配置中未出现的旧 peer 与 AllowedIPs 会被删除，从而得到幂等的「声明式」效果；setconf 则只做增量叠加。理解这两个标志如何经 `WGDEVICE_A_FLAGS`、`WGPEER_A_FLAGS` 属性传到内核，是分清两条命令行为差异的关键（命令语义见 04-02）。需要注意，内核侧具体如何执行替换、是否在整个 device 粒度保证原子性，本快照因缺少 `netlink.c` 无法核实，仍需对照实际版本核验；但用户态如何置位这两个标志，在 `ipc-linux.h` 的 `kernel_set_device` 里是清晰可见的。
+
+### 7. 小结与延伸阅读
+
+本篇把 netlink 配置通道还原为一条完整链路：uapi 头 `include/uapi/linux/wireguard.h` 定义 `WG_GENL_NAME`、`WG_CMD_GET_DEVICE`/`WG_CMD_SET_DEVICE` 与 device/peer/allowedip 三层属性；用户态 `wireguard-tools/src/ipc-linux.h` 的 `kernel_set_device`/`kernel_get_device` 经 `netlink.h` 的 `mnlg_socket_open` 先查族 id、再用 `mnlg_msg_prepare` 构造带 genlmsghdr 的命令消息，以 device→peers→allowedips 嵌套属性承载配置，SET 带 `NLM_F_ACK` 确认并支持分片，GET 带 `NLM_F_DUMP` 并用对称回调链解析、`coalesce_peers` 合并、`EINTR` 重试；`ipc.c` 把平台无关的 `ipc_*` 映射到 Linux 实现，`set.c` 与 `show.c` 分别完成配置写入与状态渲染；内核侧以 `device_update_lock` 串行化配置写、用 RCU 原子发布新状态，使数据面读路径无锁且看到一致快照。一个必须据实声明的边界是：本快照缺少内核 `netlink.c`，内核命令处理器的具体实现需对照实际版本核验。
+
+延伸阅读建议：命令与属性的完整枚举去 04-05、04-06，错误码去 04-08；`wgdevice`/`wgpeer` 配置结构逐字段去 05-09；数据面读路径如何被 RCU 保护接 06-13，AllowedIPs 查找接 06-07；工具模块职责去 07-11、07-13。跨册随查按（字段见 05-09 ｜ 参数见 04-05 ｜ 原理见 06-13 ｜ 模块见 07-11）执行。凡本篇标注「需对照实际版本核验」的内核 netlink 处理器行为、uapi 自动生成细节与 `ipc-linux.c` 相关内容，均以 `_wglinux_build/upstream_src/` 下目标版本源码为准，本资料不编造未核验的路径与取值。

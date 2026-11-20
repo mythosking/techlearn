@@ -1,0 +1,291 @@
+## 07-01 main.c 模块入口与 net_device 注册
+
+### 1. 背景与动机
+
+`drivers/net/wireguard/main.c` 是整个 WireGuard Linux 内核驱动里篇幅最短、却站在最顶层的一个文件——全文不足八十行。它几乎不实现任何协议逻辑：既不做加解密，也不处理报文收发，更不维护对等体状态，而是专心做两件对整个驱动生死攸关的事。第一件事是向内核声明「我是一个什么样的模块」，包括许可、作者、描述、版本与两类模块别名；第二件事是编排各子系统的初始化与回收顺序，把散落在十几个源文件里的 allowedips、noise、peer、device、genetlink 这些部件，依照依赖关系装配成一个既能加载又能卸载、还能被用户态命令按需触发加载的完整内核模块。本篇属于 07 册「模块与特性介绍」，是模块职责维度的权威源之一，聚焦 main.c 这一入口：加载模块时究竟执行了什么、任一环节失败后如何回滚、卸载时按什么次序释放，以及两条模块别名如何让 `ip link add wg0 type wireguard` 与 netlink 通用族自动找到本模块。
+
+为什么需要单独把 main.c 拎出来讲？因为它是回答「加载模块到底发生了什么」这个问题的唯一权威来源。阅读驱动源码时，很多人会直接扎进 noise.c 或 send.c 去啃握手与加密细节，却说不清 `insmod wireguard` 之后内核到底按什么顺序把这套系统立起来、哪一步失败会导致半途而废、加载成功时那两行日志又是从哪里打印的。main.c 用不到八十行把这些问题全部回答了：`wg_mod_init` 与 `wg_mod_exit` 一进一退，`module_init`、`module_exit` 完成注册，六条 `MODULE_*` 宏完成身份声明。理解了这八十行，就等于握住了整个驱动的「总装图」，再去看各个子系统时才不会迷失方向。
+
+先把三个容易被混为一谈的版本号分清楚。main.c 第 48 行的 `pr_info` 打印 `WireGuard " WIREGUARD_VERSION " loaded...`，这里的 `WIREGUARD_VERSION` 来自同目录的 `version.h`，本快照取值是 `"1.0.0"`，这是驱动自身的版本字符串。它是模块 `MODULE_VERSION(WIREGUARD_VERSION)` 的值，也是 `modinfo` 里 `version:` 那一行的来源。它既不是运行中的 Linux 内核版本，也不是用户态 wireguard-tools 的版本——后者在 `wireguard-tools/src/version.h` 里由 `WIREGUARD_TOOLS_VERSION` 定义，本套资料基准为 `"1.0.20260223"`。三者各自独立演进，把驱动版本当成工具版本或内核版本，是阅读上游资料时最常见的低级错误之一。
+
+再看模块身份的声明。文件末尾依次出现 `MODULE_LICENSE("GPL v2")`、`MODULE_DESCRIPTION("WireGuard secure network tunnel")`、`MODULE_AUTHOR("Jason A. Donenfeld <Jason@zx2c4.com>")`、`MODULE_VERSION(WIREGUARD_VERSION)`，以及两条别名 `MODULE_ALIAS_RTNL_LINK(KBUILD_MODNAME)` 与 `MODULE_ALIAS_GENL_FAMILY(WG_GENL_NAME)`。前四条是「自我介绍」，决定 `modinfo` 显示的内容，其中 GPL v2 许可还关系到内核导出符号的使用资格；后两条是「自动挂载点」，让内核在收到特定请求时能自动加载本模块，这是理解「为什么执行 `ip link add type wireguard` 不用先手动 `modprobe`」的关键。`WG_GENL_NAME` 定义在 uapi 头 `include/uapi/linux/wireguard.h`，值为 `"wireguard"`，它是 netlink 通用族的名字（常量全集见 04-06）。
+
+最后界定本篇与相邻册的边界。main.c 调用的各子系统 init/uninit 函数内部做了什么，是机制与调用链层面的问题，统一交给 06-01；`wg_device` 等结构体的逐字段定义交给 05-02；模块参数、sysfs、ethtool 这类对外可观测接口的参数全集交给 04-07。本篇只做本册该做的事：把 main.c 作为模块入口的编排逻辑、依赖顺序、回滚路径与别名机制讲透。这种分工不是偷懒，而是避免同一段代码在多个册里被重复拆解——07 册只负责回答「模块层面负责什么、依赖谁、按什么顺序装配」。
+
+### 2. 核心概念
+
+理解 main.c，抓住「模块入口三要素 + 分层初始化 + 逆序回滚 + 双别名」这四组概念即可。
+
+模块入口三要素，指的是 `module_init(wg_mod_init)`、`module_exit(wg_mod_exit)` 这对注册宏，加上函数定义时的 `__init` 与 `__exit` 段限定符。`module_init` 把 `wg_mod_init` 登记为模块加载入口，内核在 `insmod`/`modprobe` 时调用它；`module_exit` 把 `wg_mod_exit` 登记为卸载入口，在 `rmmod` 时调用。`__init` 修饰的函数在初始化完成后其代码所占内存会被内核回收，`__exit` 则在模块编译进内核（非模块）时会被优化掉——因为内建模块无需卸载。所以看到 `static int __init wg_mod_init(void)` 与 `static void __exit wg_mod_exit(void)` 时就该明白：这不只是两个普通函数，而是带有生命周期语义的入口点。
+
+分层初始化，指的是 `wg_mod_init` 里那条从底层到顶层的调用序列，其顺序由依赖关系严格决定。第一层是 `wg_allowedips_slab_init()`，为 allowedips trie 节点准备 slab 缓存——trie 是路由选择的基石，peer 与 device 都依赖它，所以它必须最先就位。紧接着在 `DEBUG` 编译下，运行 `wg_allowedips_selftest()`、`wg_packet_counter_selftest()`、`wg_ratelimiter_selftest()` 三项自检，任一项失败就把 `ret` 预设为 `-ENOTRECOVERABLE` 并跳转回滚。第二层是 `wg_noise_init()`，初始化握手与加密所需的全局状态。第三层是 `wg_peer_init()`，对等体子系统依赖前面的 trie 与 noise 缓存。第四层是 `wg_device_init()`，设备层依赖 peer。第五层是 `wg_genetlink_init()`，配置面放最后注册，确保用户态发起配置时下面各层都已就绪。全部成功后才打印两行 `pr_info` 并返回 0。
+
+这里有一个值得注意的特例：`wg_noise_init()` 在 main.c 里是裸调用，既没有检查返回值，也没有对应的 `wg_noise_uninit()` 出现在回滚或卸载路径里。从调用点可以直接看出它不向调用者反馈失败，且其初始化的状态不需要在本层显式释放（或由其他子系统的 uninit 顺带处理）。这与其余四个返回 `int`、必须逐步检查并在失败时回滚的 init 形成鲜明对比，是阅读初始化链时容易忽略的细节（机制细节见 06-01）。
+
+逆序回滚，指的是 `wg_mod_exit` 按 `wg_genetlink_uninit()` → `wg_device_uninit()` → `wg_peer_uninit()` → `wg_allowedips_slab_uninit()` 的顺序回收，正好是初始化顺序的逆序。初始化时「先底层后顶层」，卸载时就必须「先顶层后底层」，否则先释放底层会让仍在上层的引用悬空。加载失败时的 `goto` 回滚遵循同样的逆序逻辑：每失败一层，只回滚已经成功建立的那些层。main.c 用四个标签 `err_netlink`、`err_device`、`err_peer`、`err_allowedips` 构成一条「瀑布式」回滚链——跳到越靠下的标签，回滚的层数越多。
+
+双别名，指的是 `MODULE_ALIAS_RTNL_LINK` 与 `MODULE_ALIAS_GENL_FAMILY` 两个宏。`MODULE_ALIAS_RTNL_LINK(KBUILD_MODNAME)` 展开出形如 `rtnl-link-wireguard` 的别名（`KBUILD_MODNAME` 在构建 wireguard.ko 时即模块名 `wireguard`，宏的 `rtnl-link-` 前缀需对照实际内核头核验），让 `ip link add ... type wireguard` 触发的模块请求能匹配到本模块；`MODULE_ALIAS_GENL_FAMILY(WG_GENL_NAME)` 展开出形如 `nl-fam-wireguard` 的别名，让内核在收到针对 `wireguard` 通用族的请求时能按需加载。这两条别名是「零手工 modprobe」体验的技术基础。
+
+### 3. 关键数据结构与源码位置
+
+main.c 本身几乎不定义数据结构，它的价值在于把各子系统的接口「串」起来。先从它 include 的头文件入手，就能读出整张依赖图：`version.h`（版本字符串）、`device.h`（设备层）、`noise.h`（握手层）、`queueing.h`（包队列，供 selftest 用）、`ratelimiter.h`（限速，供 selftest 用）、`netlink.h`（配置面）、`uapi/linux/wireguard.h`（族名与属性），再加上内核头的 `init.h`、`module.h`、`net/genetlink.h`、`net/rtnetlink.h`。这份 include 清单本身就是模块依赖的声明。
+
+核心函数只有两个。`wg_mod_init`（第 20 至 61 行）是加载入口，完整包含分层初始化、DEBUG 自检、加载日志与失败回滚；`wg_mod_exit`（第 63 至 69 行）是卸载入口，四行逆序 uninit。紧随其后的是注册宏与六条模块声明宏。需要注意的是，各 init/uninit 函数的真正实现分散在其他文件：`wg_device_init`/`wg_device_uninit` 在 device.c（下一篇 07-02 详述），`wg_peer_init`/`wg_peer_uninit` 在 peer.c（07-03），`wg_allowedips_slab_init`/`wg_allowedips_slab_uninit` 在 allowedips.c（07-04），`wg_genetlink_init`/`wg_genetlink_uninit` 在 netlink.c（07-11），`wg_noise_init` 在 noise.c（07-05）。main.c 只负责调用它们，不关心内部细节。
+
+下表把 main.c 编排的各子系统 init/uninit 收拢成速查，表内「失败标签」一列直接对应源码里的 `goto` 目标，便于把初始化顺序与回滚路径对齐阅读。
+
+| 子系统 | 初始化函数 | 清理函数 | 返回类型 | 失败跳转标签 |
+|---|---|---|---|---|
+| allowedips slab 缓存 | wg_allowedips_slab_init | wg_allowedips_slab_uninit | int | err_allowedips |
+| noise 握手全局态 | wg_noise_init | 无（void 裸调用） | void | 不适用 |
+| peer 对等体 | wg_peer_init | wg_peer_uninit | int | err_peer |
+| device 设备层 | wg_device_init | wg_device_uninit | int | err_device |
+| genetlink 配置面 | wg_genetlink_init | wg_genetlink_uninit | int | err_netlink |
+
+关于结构体：main.c 直接涉及的只有它间接初始化的那些全局对象，例如 peer 子系统维护的哈希表、device.c 里的全局 `device_list` 链表等；这些结构体的字段定义不在本篇展开，`wg_device` 的逐字段说明见 05-02，`wg_peer` 见 05-03。本篇作为模块册，只点名「main.c 调用了哪些子系统」这一层事实，不再向下钻取字段。两条模块别名涉及的内核宏 `MODULE_ALIAS_RTNL_LINK` 与 `MODULE_ALIAS_GENL_FAMILY` 定义在内核头中，其展开字符串以实际内核头为准核验。
+
+### 4. 关键流程与调用链
+
+加载链路从用户执行 `insmod wireguard.ko` 或 `modprobe wireguard` 开始。内核定位模块后调用 `module_init` 登记的 `wg_mod_init`。进入函数，`ret` 先承接 `wg_allowedips_slab_init()` 的返回值，小于零就跳 `err_allowedips` 直接返回——这是最底层，没有已建立的层需要回滚。若成功，在 `DEBUG` 编译下把 `ret` 预设为 `-ENOTRECOVERABLE`，再依次调用三项 selftest；只要有一项返回假（表达式用 `!` 取反），就跳 `err_peer`。随后 `wg_noise_init()` 裸调用，接着 `wg_peer_init()` 检查返回值、失败跳 `err_peer`，`wg_device_init()` 失败跳 `err_device`，`wg_genetlink_init()` 失败跳 `err_netlink`。全部通过后，两行 `pr_info` 打印版本与版权信息，函数返回 0，模块进入已加载状态。
+
+回滚链路是这套流程的镜像，理解四个标签各自「回滚到哪一层」是关键。`err_netlink` 后面紧跟 `wg_device_uninit()`，然后「穿透」到 `err_device` 的 `wg_peer_uninit()`，再穿透到 `err_peer` 的 `wg_allowedips_slab_uninit()`，最后到 `err_allowedips` 的 `return ret`。也就是说：genetlink 初始化失败时，device、peer、allowedips 三层都已被建立，必须全部逆序释放；device 初始化失败时，peer 与 allowedips 两层要释放；peer 初始化失败时，只剩 allowedips 要释放；allowedips 自身失败时无需回滚。这里有一个著名的「标签名误导」细节：`DEBUG` 自检失败时代码写的是 `goto err_peer`，但此刻 noise 与 peer 都还没初始化，跳到 `err_peer` 实际只执行 `wg_allowedips_slab_uninit()`——之所以结果正确，是因为 `err_peer` 标签下正好只有这一行 slab 回滚。标签名字描述的是「哪一层之后失败」，而非「要回滚哪一层」，读源码时不要被它带偏。
+
+卸载链路是 `wg_mod_exit`：依次调用 `wg_genetlink_uninit()` 撤销配置面、`wg_device_uninit()` 注销 rtnetlink link ops 与各类 notifier、`wg_peer_uninit()` 回收对等体、`wg_allowedips_slab_uninit()` 释放 slab 缓存。相比加载路径，卸载路径更简洁——没有返回值检查，因为此时模块确定要退出，各层的 uninit 保证幂等且不会失败。逆序依旧是铁律：先撤掉面向用户的配置入口，再拆设备与对等体，最后才动最底层的缓存。
+
+模块别名的触发链路有两条，都发生在模块尚未加载、内核按需加载它的时刻。第一条：用户执行 `ip link add wg0 type wireguard`，rtnetlink 在解析 link 类型 `wireguard` 时发出模块请求，匹配到 `MODULE_ALIAS_RTNL_LINK(KBUILD_MODNAME)` 生成的别名，自动加载 wireguard 模块，随后 device.c 注册的 `rtnl_link_ops`（其 `.kind = KBUILD_MODNAME`，即 `wireguard`）接管建链请求。第二条：用户态 `wg` 工具打开名为 `wireguard` 的 netlink 通用族，若内核尚无该族，匹配 `MODULE_ALIAS_GENL_FAMILY(WG_GENL_NAME)` 的别名触发加载，之后 `wg_genetlink_init()` 注册的族处理 `WG_CMD_GET_DEVICE` / `WG_CMD_SET_DEVICE`（配置面原理见 06-14，命令全集见 04-05）。两条别名一个管数据面入口（建网卡），一个管配置面入口（netlink 族），合起来构成「无需手工 modprobe」的完整闭环。
+
+下面这张图把初始化顺序、自检、加载日志与回滚/卸载关系串在一起，重点体现「依赖顺序」与「逆序回收」两条主线。
+
+:::figure id=07-01-01 | name=main.c 分层初始化、回滚与卸载顺序 | dir=TD
+node m1 "insmod / modprobe<br/>触发 module_init" blue
+node m2 "allowedips_slab_init<br/>最底层 slab 缓存" teal
+node m3 "DEBUG 三项 selftest<br/>失败 ret=-ENOTRECOVERABLE" purple
+node m4 "noise_init<br/>void 裸调用无回滚" gray
+node m5 "peer_init<br/>依赖 trie 与 noise" teal
+node m6 "device_init<br/>依赖 peer" teal
+node m7 "genetlink_init<br/>配置面最后注册" green
+node m8 "pr_info 两行日志<br/>返回 0 加载成功" green
+node m9 "goto 错误标签<br/>逆序回滚已建层" red
+node m10 "wg_mod_exit<br/>rmmod 逆序卸载" amber
+edge m1 -> m2 "第一步"
+edge m2 -> m3 "DEBUG 下"
+edge m3 -> m4 "自检通过"
+edge m4 -> m5 "基础就绪"
+edge m5 -> m6 "peer 就绪"
+edge m6 -> m7 "设备就绪"
+edge m7 -> m8 "全部成功"
+edge m6 -> m9 "任一步失败"
+edge m8 -> m10 "rmmod 卸载"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：流程从「insmod / modprobe 触发 module_init」开始，依次经过「allowedips_slab_init 最底层 slab 缓存」「DEBUG 三项 selftest 失败 ret=-ENOTRECOVERABLE」「noise_init void 裸调用无回滚」「peer_init 依赖 trie 与 noise」「device_init 依赖 peer」「genetlink_init 配置面最后注册」，全部成功则走到「pr_info 两行日志 返回 0 加载成功」；任一步失败会跳到「goto 错误标签 逆序回滚已建层」；加载成功后由「wg_mod_exit rmmod 逆序卸载」按相反顺序回收。
+
+### 5. 配置/命令/代码实例
+
+验证 main.c 的模块声明，最直接的命令是 `modinfo`。它读取 .ko 文件的模块信息区，把六条 `MODULE_*` 宏展开的结果显示出来，可与源码逐字对照。
+
+```bash
+# 查看模块声明（路径需按实际系统替换）
+modinfo wireguard
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+filename:       /lib/modules/6.x.x/kernel/drivers/net/wireguard/wireguard.ko
+version:        1.0.0
+license:        GPL v2
+description:    WireGuard secure network tunnel
+author:         Jason A. Donenfeld <Jason@zx2c4.com>
+srcversion:     ...
+depends:
+alias:          rtnl-link-wireguard
+alias:          nl-fam-wireguard
+name:           wireguard
+```
+
+逐行判读如下。第一行 `filename` 给出内核模块文件的实际路径，它取决于发行版与内核版本，附注中的 `6.x.x` 是占位，需按目标系统核验。第二行 `version: 1.0.0` 直接来自 `MODULE_VERSION(WIREGUARD_VERSION)`，与 `version.h` 的 `WIREGUARD_VERSION` 一致，它是驱动版本而非工具或内核版本，这一点在前文已强调。第三行 `license: GPL v2` 对应 `MODULE_LICENSE("GPL v2")`，不仅是一条元数据，还决定模块能否使用内核中仅限 GPL 模块使用的导出符号，并影响内核是否标记模块为「tainted」。第四行 `description` 对应 `MODULE_DESCRIPTION("WireGuard secure network tunnel")`，是模块的文字简介。第五行 `author` 对应 `MODULE_AUTHOR`，给出作者与邮箱。第六行 `srcversion` 是内核据源码校验和生成的版本标识，源码里没有对应的宏。第七行 `depends` 列出模块依赖的其他模块，本模块为空说明它所依赖的加密原语等已编译进内核或静态链接（具体取决于 Kconfig，见 02-02）。第八、九行两条 `alias` 是重点：`rtnl-link-wireguard` 来自 `MODULE_ALIAS_RTNL_LINK(KBUILD_MODNAME)`，供 `ip link add ... type wireguard` 自动加载；`nl-fam-wireguard` 来自 `MODULE_ALIAS_GENL_FAMILY(WG_GENL_NAME)`，供 netlink 族按需加载——两条别名的前缀文本以实际内核头中的宏定义为准核验。最后一行 `name: wireguard` 是模块名，即 `KBUILD_MODNAME`，正是两条别名拼接时使用的后缀。
+
+再看加载成功的运行时验证。`modprobe` 触发 `wg_mod_init`，成功时源码里的两行 `pr_info` 会出现在内核日志中；`wg_mod_exit` 本身不打日志，但 device.c 会在建链/毁链时打印 `Interface created` / `Interface destroyed`（下一篇 07-02 详述）。
+
+```bash
+# 触发加载并查看 main.c 打印的加载信息
+sudo modprobe wireguard
+dmesg | grep -i "WireGuard" | tail -n 4
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+[ 1234.567890] WireGuard 1.0.0 loaded. See www.wireguard.com for information.
+[ 1234.567891] Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+```
+
+这两行正是 main.c 第 48、49 行两条 `pr_info` 的原样输出：第一行把 `"1.0.0"` 拼进字符串，验证 `WIREGUARD_VERSION` 的值；第二行是版权声明。日志前缀的中括号内容是内核时间戳，需按实际系统核验。看到这两行，说明五层初始化全部通过、`wg_mod_init` 返回 0；若只看到部分子系统日志而缺失这两行，则多半是在某一层失败后走了 `goto` 回滚路径，此时应结合各子系统 uninit 的日志与返回码进一步定位（错误码速查见 04-08）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是被 `err_peer` 这个标签名误导。如前所述，`DEBUG` 自检失败时跳转的目标是 `err_peer`，但此刻 noise 与 peer 都尚未初始化，实际只回滚了 `wg_allowedips_slab_uninit()`。标签名表达的是「失败发生在哪一层之后」，不是「要释放哪一层」。读懂它的关键不是背标签名，而是顺着标签往下逐行看它到底调用了哪些 uninit——因为标签之间是「穿透」关系，跳到某标签会连带执行它下方所有标签的语句。
+
+第二个陷阱是混淆三个版本号。驱动版本 `1.0.0`（`version.h`）、工具版本 `1.0.20260223`（`wireguard-tools/src/version.h`）、运行内核版本，三者独立。汇报问题或对照文档时若把驱动版本说成工具版本，会让排查方向完全跑偏。判断模块加载是否成功，看的是 main.c 打印的驱动版本，而不是 `wg --version` 的工具版本。
+
+第三个陷阱是以为每个 init 都有对应 uninit。`wg_noise_init` 是 void 裸调用，加载与卸载路径里都没有它的 uninit；强行给它配一个不存在的清理函数，或误以为它失败会被检查，都是对源码的误读。第四个陷阱是忽略模块名与别名的绑定关系。`MODULE_ALIAS_RTNL_LINK(KBUILD_MODNAME)` 中的 `KBUILD_MODNAME` 取决于构建时的模块名；如果改了模块名而没同步调整 link ops 的 `.kind`，`ip link add type wireguard` 的自动加载就会失效。这类改名操作需连带检查 main.c 的别名与 device.c 的 `link_ops.kind`（两者都用 `KBUILD_MODNAME`，见 07-02）。
+
+第五个陷阱是把 `pr_info` 的两行日志误当成警告或错误。它们是正常加载提示，用 `pr_info` 而非 `pr_err` 打印，出现在日志里属于预期行为。反过来，若加载失败走了回滚路径，这两行不会出现——「日志缺失」比「日志多出」更值得警惕。
+
+最佳实践归纳为四点。其一，加载后用 `modinfo wireguard` 核对六条声明与两条别名是否与预期一致，尤其确认 `rtnl-link-wireguard` 与 `nl-fam-wireguard` 存在，这是「零手工 modprobe」能否成立的前提。其二，用 `dmesg` 确认 main.c 的两行加载日志出现，作为五层初始化全部成功的标志；在排障时优先确认这一步，再看设备与对等体状态。其三，调试构建（`DEBUG`）下要关注三项 selftest 的结果，它们失败会让模块以 `-ENOTRECOVERABLE` 回滚，避免带着损坏的 slab 或限速器继续运行；自检失败时的 `goto err_peer` 只回滚 slab 这一细节要心里有数（调试构建见 02-05）。其四，若新增或调整一个子系统，必须同时修改 `wg_mod_init` 的初始化顺序、`wg_mod_exit` 的逆序卸载，以及所有相关的 `goto` 回滚分支——三处任何一处遗漏，都会在高版本切换或加载失败时埋下资源泄漏的隐患。
+
+### 7. 小结与延伸阅读
+
+本篇把 main.c 定位为 WireGuard Linux 内核驱动的「总装入口」：它以不足八十行完成模块身份声明与子系统编排。加载入口 `wg_mod_init` 按 allowedips slab →（DEBUG 自检）→ noise → peer → device → genetlink 的依赖顺序逐层建立，任一层失败通过 `goto` 标签逆序回滚已建层；卸载入口 `wg_mod_exit` 按 genetlink → device → peer → allowedips slab 的逆序回收；`wg_noise_init` 作为 void 裸调用是无需回滚的特例。六条 `MODULE_*` 宏中，`MODULE_LICENSE`/`AUTHOR`/`DESCRIPTION`/`VERSION` 构成模块身份，`MODULE_ALIAS_RTNL_LINK` 与 `MODULE_ALIAS_GENL_FAMILY` 分别让建网卡请求与 netlink 族请求能自动触发模块加载。四个 `goto` 标签构成瀑布式回滚链，`err_peer` 的标签名与实际回滚内容之间存在容易踩坑的错位。
+
+延伸阅读建议按三条线走：想看 main.c 各层 init 内部究竟做什么、以及启动后包处理流水线如何运转，读 06-01；想看 `wg_device` 与 `wg_peer` 等结构体的逐字段定义，读 05-02 与 05-03；想看模块参数、sysfs、ethtool 等对外可观测接口的参数全集，读 04-07。本册内部的横向衔接是：main.c 调用的 `wg_device_init`/`wg_device_uninit` 实现细节见 07-02，peer 子系统见 07-03，allowedips 见 07-04，genetlink 配置面见 07-11。跨册随查按（字段见 05-02 ｜ 参数见 04-07 ｜ 原理见 06-01 ｜ 模块见 07-02）执行：结构体逐字段去 05、参数与命令全集去 04、机制与调用链去 06、本册内其他模块职责读对应 07 篇。凡本篇标注「以实际内核头为准核验」的别名前缀、`KBUILD_MODNAME` 取值，均以 `_wglinux_build/upstream_src/` 下对应源码与构建配置为准，本套资料不编造未核验的路径与取值。
+
+## 07-02 device.c 设备生命周期模块
+
+### 1. 背景与动机
+
+`drivers/net/wireguard/device.c` 是 WireGuard Linux 内核驱动中体量最大的核心文件之一，全文约四百七十行。如果说上一篇的 main.c 是「总装入口」，那么 device.c 就是「设备大管家」：它负责一个 `wg_device` 对象从被创建、被启用、承载数据收发，到最终被销毁的全过程管理。每当用户执行 `ip link add wg0 type wireguard`，真正接住这条请求、把一个普通的 `net_device` 变成具备 WireGuard 能力接口的代码，就在这个文件里。它实现了 rtnetlink 的 link ops（`.kind = KBUILD_MODNAME`，即 `wireguard`），这正是 `type wireguard` 能找到它的原因；它同时实现了 netdev 的操作表、设备的析构回调，以及三类事件通知器（电源管理、虚拟机派生、网络命名空间退出）。
+
+把设备生命周期单独成篇，是因为它是理解「WireGuard 为什么表现为一张网卡」的直接答案。内核网络栈只认识 `net_device`：路由把出站包交给某张网卡的 `ndo_start_xmit`，管理员用 `ip link` 启停网卡，用 `ip address` 配地址。WireGuard 之所以能被这些既有工具无缝操作，全靠 device.c 把一个 `wg_device` 包装成标准网卡并注册进内核。理解这一点，很多看似 WireGuard 的故障其实就会回归到「网卡状态」「路由是否指向 wg0」这类本源问题上去。本篇作为 07 册模块职责的权威源，只讲 device.c 负责什么、各回调在什么时机被调用、资源如何建立与释放；至于发送路径里封装加密的逐段机制属于 06-05，接收路径属于 06-06， handshake 与会话密钥的演进属于 06-02、06-03，本篇不展开。
+
+需要特别说明一处版本差异，以免与旧的二手资料混淆。一些较早期的描述会说 `wg_setup` 挂载了 `ndo_get_stats64`、`ndo_set_config` 等操作；但本快照的 device.c 里，`netdev_ops` 只有三项——`ndo_open`、`ndo_stop`、`ndo_start_xmit`。统计信息的提供方式已经改为在 `wg_setup` 中设置 `dev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS`，由内核的 per-CPU 统计框架接管，不再需要显式的 `ndo_get_stats64`。本篇严格以本快照源码为准，并标注「需对照实际版本核验」；读者若在其他内核版本看到更多 netdev 操作，不必惊讶，那是版本演进的结果。
+
+最后厘清 device.c 与 netlink 配置面的分工，这是理解两套「交互」的关键。设备的创建与销毁走的是 rtnetlink 的 link 通道（本篇主题），由 `ip link` 命令触发；而接口的具体配置——私钥、监听端口、peer 的公钥与 allowedips——走的是 netlink 通用族通道（`WG_CMD_SET_DEVICE` / `WG_CMD_GET_DEVICE`），由 `wg` 工具触发，其实现在 netlink.c（07-11）与 06-14。两条通道在内核里共同操作同一个 `wg_device` 对象，却有不同的入口与职责：link 通道管「设备对象的生与死」，通用族通道管「设备对象内部的配置状态」。把它们混为一谈，是排障时定位错误的常见根源。
+
+### 2. 核心概念
+
+device.c 的核心可以概括为「四类回调、两组池、一条链、三个通知器」。
+
+四类回调，指的是设备生命周期中四种不同类型的入口。第一类是 netdev 操作表 `netdev_ops`，只有三项：`ndo_open = wg_open`、`ndo_stop = wg_stop`、`ndo_start_xmit = wg_xmit`，分别响应网卡启用、停用与发包。第二类是 rtnetlink 的 link 操作表 `link_ops`，含 `.kind`、` .priv_size`、` .setup = wg_setup`、` .newlink = wg_newlink` 四项，响应 `ip link add` 的建链请求；其中 `priv_size = sizeof(struct wg_device)` 告诉内核为每张 wg 网卡分配多大的私有数据区。第三类是析构回调 `dev->priv_destructor = wg_destruct`，在网卡注销时被内核调用，负责释放全部资源。第四类是三个通知器回调：电源管理的 `wg_pm_notification`、VM 派生的 `wg_vm_notification`、网络命名空间退出的 `wg_netns_exit_rtnl`。
+
+两组池，指工作队列（workqueue）与数据包队列（packet queue）各三个。`wg_newlink` 创建三个工作队列：`handshake_receive_wq`（名字模板 `wg-kex-%s`，标志 `WQ_CPU_INTENSIVE | WQ_FREEZABLE | WQ_PERCPU`）、`handshake_send_wq`（`wg-kex-%s`，`WQ_UNBOUND | WQ_FREEZABLE`）、`packet_crypt_wq`（`wg-crypt-%s`，`WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_PERCPU`）。又初始化三个包队列：`encrypt_queue`（worker 为 `wg_packet_encrypt_worker`，容量 `MAX_QUEUED_PACKETS`）、`decrypt_queue`（`wg_packet_decrypt_worker`）、`handshake_queue`（`wg_packet_handshake_receive_worker`，容量 `MAX_QUEUED_INCOMING_HANDSHAKES`）。这些队列是数据面的并发处理引擎，细节见 07-07、07-08 与 05-08。
+
+一条链，指文件顶部的全局 `static LIST_HEAD(device_list)`。所有已创建的 `wg_device` 通过其中的 `device_list` 成员挂到这条链表上。它的用途在三个通知器里集中体现：无论是系统挂起、VM 派生还是命名空间退出，代码都要「遍历所有 wg 设备」逐个处理，这条全局链表就是遍历的入口。创建时 `list_add` 挂入，析构时 `list_del` 摘除，且这两处都在 `rtnl_lock` 保护下进行。
+
+三个通知器，各自解决一个特定场景的安全问题。`wg_pm_notification` 在系统进入休眠或挂起准备阶段时清除所有 peer 的握手状态与密钥对，避免密钥材料残留在被写入磁盘的内存镜像中；但源码特意安排了一个例外——若内核启用了 `CONFIG_PM_AUTOSLEEP` 或 `CONFIG_PM_USERSPACE_AUTOSLEEP`，说明系统频繁自动睡眠属于常态而非偶发事件，此时直接返回 0 不清密钥，以免每次自动唤醒都要重新握手。`wg_vm_notification` 在虚拟机被派生（fork/clone）时让所有 peer 的当前密钥对过期，防止克隆出的虚拟机与原虚拟机共享同一套会话密钥——这是虚拟化场景下极易被忽视的安全边界。`wg_netns_exit_rtnl` 在创建设备的网络命名空间退出时，关闭载波、清空 creating_net、重置 socket 并清除 peer 的 endpoint 源地址绑定。三个通知器的注册与注销分别成对出现在 `wg_device_init` 与 `wg_device_uninit` 中。
+
+### 3. 关键数据结构与源码位置
+
+device.c 不定义新的顶层数据结构，它的工作是把内核既有的网卡结构与 WireGuard 自有结构对接。理解源码位置时，可按「表—函数—结构」三层来定位。
+
+先看三张关键表。第一张 `netdev_ops`（第 236 至 240 行），仅三项：`ndo_open`、`ndo_stop`、`ndo_start_xmit`，是数据面与网卡状态切换的入口。第二张 `link_ops`（第 407 至 412 行），声明 `.kind = KBUILD_MODNAME`、`.priv_size = sizeof(struct wg_device)`、`.setup = wg_setup`、`.newlink = wg_newlink`，并带 `__read_mostly` 标记，表明它在初始化后基本只读。第三张 `pernet_ops`（第 433 至 435 行），只有 `.exit_rtnl = wg_netns_exit_rtnl`，配合 `pernet_operations` 框架在命名空间退出时回调。此外还有两个 `notifier_block` 结构：`pm_notifier`（`.notifier_call = wg_pm_notification`）与 `vm_notifier`（`.notifier_call = wg_vm_notification`）。一个 `device_type` 结构 `device_type = { .name = KBUILD_MODNAME }`，通过 `SET_NETDEV_DEVTYPE` 关联到网卡。
+
+再看核心函数及其源码行段。`wg_setup`（274–308）设置网卡通用参数；`wg_newlink`（310–405）分配 wg 专属资源并调用 `register_netdevice`；`wg_open`（31–62）与 `wg_stop`（115–135）管理启用与停用；`wg_xmit`（137–234）是发包入口；`wg_destruct`（242–270）释放全部资源；`wg_pm_notification`（64–93）、`wg_vm_notification`（97–111）、`wg_netns_exit_rtnl`（414–431）是三个通知器；`wg_device_init`（437–466）与 `wg_device_uninit`（468–475）负责向内核注册与注销上述所有钩子。这张函数名—行号清单，是阅读 device.c 时最实用的索引。
+
+下表把 device.c 的回调、挂载点、触发者与职责收拢成速查，便于把「谁在什么时候调用它」一眼看清。
+
+| 回调/函数 | 挂载点 | 触发者 | 核心职责 |
+|---|---|---|---|
+| wg_setup | link_ops.setup | rtnetlink 建链 | 设置 netdev 通用参数与能力 |
+| wg_newlink | link_ops.newlink | ip link add | 分配 wg 专属资源并注册网卡 |
+| wg_open | netdev_ops.ndo_open | ip link set up | 起 socket、发暂存包与 keepalive |
+| wg_stop | netdev_ops.ndo_stop | ip link set down | 清密钥与定时器、关 socket |
+| wg_xmit | netdev_ops.ndo_start_xmit | 内核路由发包 | 查 peer、暂存并发送数据包 |
+| wg_destruct | dev.priv_destructor | 网卡注销 | 逆序释放全部资源并 free_netdev |
+| wg_pm_notification | pm_notifier | 系统挂起/休眠 | 清除握手状态与密钥材料 |
+| wg_vm_notification | vm_notifier | 虚拟机 fork | 使当前 peer 密钥对过期 |
+| wg_netns_exit_rtnl | pernet_ops.exit_rtnl | 命名空间退出 | 清理 creating_net 相关资源 |
+
+关于结构体字段的边界：本节只点名 `wg_setup` 设置的参数类别，不展开字段语义。`wg_device` 的逐字段定义见 05-02，`wg_peer` 见 05-03，包队列与工作队列相关结构见 05-08，sk_buff 扩展元数据见 05-06。以 `wg_setup` 里的 `dev->mtu = ETH_DATA_LEN - overhead` 为例，本篇只说明「它把 MTU 减去 WireGuard 封装开销」，其中 `overhead` 由 `MESSAGE_MINIMUM_LENGTH + sizeof(struct udphdr) + max(sizeof(struct ipv6hdr), sizeof(struct iphdr))` 算出——这些常量的取值与语义归 04-06、05-06 处理，本篇不重复。
+
+### 4. 关键流程与调用链
+
+设备创建链路是理解 device.c 的主线。用户执行 `ip link add wg0 type wireguard` 后，rtnetlink 先根据 link 类型 `wireguard` 找到已注册的 `link_ops`（其 `.kind = KBUILD_MODNAME`），按 `.priv_size` 分配 `net_device` 及其私有区，然后回调 `wg_setup` 设置网卡通用参数，再回调 `wg_newlink` 做 WireGuard 专属初始化。`wg_newlink` 的第一步是 `link_net = rtnl_newlink_link_net(params)` 取得建链所在的命名空间，并用 `rcu_assign_pointer(wg->creating_net, link_net)` 记下「是哪个命名空间创建了我」。随后初始化一系列锁与结构：`init_rwsem(&wg->static_identity.lock)`、`mutex_init` 初始化 `socket_update_lock` 与 `device_update_lock`、`wg_allowedips_init`、`wg_cookie_checker_init`、`INIT_LIST_HEAD(&wg->peer_list)`，并把 `device_update_gen` 置为 1。接着按依赖顺序分配资源：两张哈希表（`peer_hashtable`、`index_hashtable`）、三个工作队列、三个包队列，最后 `wg_ratelimiter_init()`。全部就绪后调用 `netif_threaded_enable(dev)` 与 `register_netdevice(dev)` 正式注册网卡，成功后 `list_add` 挂入全局 `device_list`，并把 `dev->priv_destructor = wg_destruct` 赋值——注意这一步被刻意放在注册之后，源码注释明确说明：这样若 `register_netdevice` 失败，内核就不会误调用析构回调。任一中间步骤失败，`wg_newlink` 都通过一长串 `goto` 标签（从 `err_uninit_ratelimiter` 到 `err_free_peer_hashtable`）逆序释放已建资源。
+
+启用与停用链路成对称关系。`ip link set wg0 up` 触发 `ndo_open` 即 `wg_open`：它先关闭 IPv4 的 ICMP 重定向发送（`IN_DEV_CONF_SET(dev_v4, SEND_REDIRECTS, false)` 并置全局 `IPV4_DEVCONF_ALL(..., SEND_REDIRECTS) = false`），把 IPv6 的 `addr_gen_mode` 设为 `IN6_ADDR_GEN_MODE_NONE`，然后持 `device_update_lock` 调 `wg_socket_init(wg, wg->incoming_port)` 启动 UDP socket；socket 起来后，遍历所有 peer 发送此前暂存的包（`wg_packet_send_staged_packets`），对配置了持久 keepalive 的 peer 额外发一次 keepalive。反过来，`ip link set wg0 down` 触发 `ndo_stop` 即 `wg_stop`：持锁遍历所有 peer，逐个清空暂存包、停止定时器、清握手状态与密钥对、重置上次握手发送时间；然后释放握手队列里残留的所有 skb、把 `handshake_queue_len` 归零，最后 `wg_socket_reinit(wg, NULL, NULL)` 关闭 socket。简言之：up 是「起 socket、放行暂存流量」，down 是「清密钥、停定时器、关 socket」。
+
+数据收发链路从这里接入数据面。出站方向，内核按路由把包交给 wg0 的 `ndo_start_xmit` 即 `wg_xmit`：它先用 `wg_check_packet_protocol` 校验协议，再用 `wg_allowedips_lookup_dst` 按目的地址查 peer（查不到返回 `-ENOKEY` 并发 ICMP 不可达），检查 peer 的 endpoint 地址族是否有效（无效返回 `-EDESTADDRREQ`），必要时做 GSO 分段，把处理后的包暂存进 `peer->staged_packet_queue`；若队列长度超过 `MAX_STAGED_PACKETS` 就丢弃最老的包；最后调 `wg_packet_send_staged_packets` 发送。封装与加密的逐段实现在 06-05、模块职责在 07-07，本篇只到「交给暂存队列」为止。
+
+销毁链路是创建链路的镜像。`ip link del wg0` 触发网卡注销，内核调用 `priv_destructor` 即 `wg_destruct`：先在 `rtnl_lock` 下把 `wg` 从 `device_list` 摘除，再持 `device_update_lock` 把 `creating_net` 置 NULL、`incoming_port` 归零、`wg_socket_reinit(NULL, NULL)` 关 socket、`wg_peer_remove_all` 移除所有 peer，接着销毁三个工作队列、释放三个包队列、`rcu_barrier()` 等待 peer 真正被释放、`wg_ratelimiter_uninit()`、`memzero_explicit` 抹除私钥材料、释放两张哈希表，最后 `pr_debug("... Interface destroyed")` 并 `free_netdev(dev)`。整条路径的顺序与 `wg_newlink` 严格相反，且对私钥做了显式清零，是安全敏感的收尾环节。
+
+下面这张图把设备从创建到销毁的完整生命周期，以及三个通知器的挂载点串在一起，重点体现「状态转换」与「逆序释放」两条主线。
+
+:::figure id=07-02-01 | name=wg_device 从创建到销毁的生命周期 | dir=TD
+node d1 "ip link add type wireguard" blue
+node d2 "wg_setup<br/>设置 netdev 通用参数" teal
+node d3 "wg_newlink<br/>建锁/表/队列/workqueue" teal
+node d4 "register_netdevice<br/>注册网卡并入 device_list" green
+node d5 "ip link set up<br/>wg_open 起 socket 发暂存包" green
+node d6 "运行中<br/>wg_xmit 发包 / 接收路径" purple
+node d7 "ip link set down<br/>wg_stop 清密钥关 socket" amber
+node d8 "ip link del<br/>wg_destruct 逆序释放" red
+node d9 "free_netdev<br/>设备对象消亡" red
+node d10 "pm/vm/netns 通知器<br/>挂起 / fork / ns 退出" gray
+edge d1 -> d2 "rtnetlink"
+edge d2 -> d3 "然后"
+edge d3 -> d4 "成功"
+edge d4 -> d5 "up"
+edge d5 -> d6 "就绪"
+edge d6 -> d7 "down"
+edge d7 -> d8 "del"
+edge d8 -> d9 "释放"
+edge d3 -> d10 "注册钩子"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：生命周期从「ip link add type wireguard」开始，rtnetlink 先回调「wg_setup 设置 netdev 通用参数」，再回调「wg_newlink 建锁/表/队列/workqueue」，随后「register_netdevice 注册网卡并入 device_list」；「ip link set up wg_open 起 socket 发暂存包」后进入「运行中 wg_xmit 发包 / 接收路径」；「ip link set down wg_stop 清密钥关 socket」后由「ip link del wg_destruct 逆序释放」，最终「free_netdev 设备对象消亡」；在 newlink 阶段还注册了「pm/vm/netns 通知器 挂起 / fork / ns 退出」，供运行期事件回调。
+
+### 5. 配置/命令/代码实例
+
+下面这条命令序列完整走一遍 wg0 网卡的生命周期，可与上一节的创建、启用、停用、销毁链路逐一对应。
+
+```bash
+# 创建：触发 link_ops.setup 与 link_ops.newlink
+ip link add wg0 type wireguard
+# 配置地址（地址属于网卡通用属性，非 WireGuard 专属）
+ip address add 10.0.0.1/24 dev wg0
+# 启用：触发 ndo_open / wg_open
+ip link set wg0 up
+# 查看网卡细节，观察 wg_setup 设置的参数
+ip -d link show wg0
+# 停用并销毁：分别触发 wg_stop 与 wg_destruct
+ip link set wg0 down
+ip link del wg0
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+4: wg0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
+    link/none
+    wireguard
+```
+
+逐行判读如下。第一行开头的 `4: wg0:` 是内核分配的接口索引与名字，`wg0` 即建链时指定的名字。尖括号内的标志直接来自 `wg_setup` 的赋值：`POINTOPOINT` 与 `NOARP` 对应 `dev->flags = IFF_POINTOPOINT | IFF_NOARP`，说明这是点对点、无地址解析协议的接口——WireGuard 靠公钥而非 ARP 识别对端，所以关掉 ARP 是合理的；`UP,LOWER_UP` 是 `ip link set wg0 up` 之后的运行状态，表示网卡已被启用且链路可用。`mtu 1420` 对应 `dev->mtu = ETH_DATA_LEN - overhead`：`ETH_DATA_LEN` 通常为 1500，减去 `overhead`（WireGuard 消息头 + UDP 头 + IP 头）后得到约 1420，具体数值随 IP 版本与封装细节浮动，需按实际版本核验；这个减法正是 wg_setup 里那一大段 overhead 计算的意义。`qdisc noqueue` 对应 `dev->priv_flags |= IFF_NO_QUEUE`——WireGuard 不开内核排队规则，发包由自己的暂存队列与 workqueue 处理，所以这里显示 noqueue。`state UNKNOWN` 是点对点网卡的典型状态，因为无 ARP、无载波侦测，内核无法判定更细的链路状态。`link/none` 对应 `dev->type = ARPHRD_NONE` 与 `dev->addr_len = 0`：WireGuard 网卡没有硬件地址，链路层地址显示为 none。最后的 `wireguard` 段由 rtnetlink 根据 `link_ops.kind = KBUILD_MODNAME` 渲染出来，证明这张网卡确实由 WireGuard 模块创建——`ip -d` 的 `-d`（details）才会显示这些驱动专属细节。整段输出里没有一个字段来自 netlink 通用族配置，全部是网卡本身的通用属性与 link ops 的标识，恰好印证了「设备的生死走 rtnetlink 通道」这一分工。
+
+再看源码层面的定义，把上面观察的对象与代码直接对应。`netdev_ops` 与 `link_ops` 两张表的定义精炼地概括了 device.c 对外暴露的全部网卡级接口：
+
+```c
+static const struct net_device_ops netdev_ops = {
+	.ndo_open		= wg_open,
+	.ndo_stop		= wg_stop,
+	.ndo_start_xmit		= wg_xmit,
+};
+
+static struct rtnl_link_ops link_ops __read_mostly = {
+	.kind			= KBUILD_MODNAME,
+	.priv_size		= sizeof(struct wg_device),
+	.setup			= wg_setup,
+	.newlink		= wg_newlink,
+};
+```
+
+这段定义说明一个关键事实：本快照的 `netdev_ops` 只有三项，没有 `ndo_get_stats64` 与 `ndo_set_config`，统计信息改由 `wg_setup` 里的 `dev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS` 交给内核 per-CPU 框架处理。两张表合起来只暴露了五个回调入口，却撑起了整张网卡的全部内核交互——这正是 WireGuard「极简配置面」设计哲学在设备层的体现。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是照搬旧资料的 netdev 操作清单。如前所述，本快照 `netdev_ops` 只有三项，统计走 `NETDEV_PCPU_STAT_TSTATS`。若在排障文档里写「wg0 通过 `ndo_get_stats64` 上报统计」，在本快照上就是错的；正确做法是以 `ip -s link show wg0` 观察内核 per-CPU 统计框架给出的计数。这类版本差异应以实际源码为准核验，不能凭记忆。
+
+第二个陷阱是误解 `priv_destructor` 的赋值时机。源码刻意把 `dev->priv_destructor = wg_destruct` 放在 `register_netdevice` 成功之后，并在注释里写明：这样注册失败时内核不会调用析构回调，避免对尚未完全初始化的资源做释放。若改动代码时把它提前，就可能让失败路径触发双重释放或访问空指针。读懂这段注释，就理解了「为什么赋值顺序也重要」。
+
+第三个陷阱是忽略 `wg_open` 关闭 ICMP 重定向的用意。代码把 IPv4 的 `SEND_REDIRECTS` 关掉、把 IPv6 的 `addr_gen_mode` 设为 NONE，并非随手为之：ICMP 重定向可能让流量绕过隧道、暴露真实路径，自动地址生成则会给点对点接口带来无意义的链路本地地址。这体现了 WireGuard 对「流量必须按既定隧道走」的强调，改动这段逻辑前应理解其安全动机。
+
+第四个陷阱是把 up/down 当成单纯「开/关网卡」。实际上 `wg_open` 会启动 UDP socket 并放行暂存包、发 keepalive，`wg_stop` 会清除握手状态、密钥对与定时器并关 socket。也就是说 down 一次会丢掉当前会话密钥，再次 up 需要重新握手——这解释了「接口 down/up 之后 `latest handshake` 会刷新」的现象。第五个陷阱是混淆三个通知器的触发条件：电源通知只在休眠/挂起准备阶段生效且对 autosleep 例外，VM 通知只针对 fork/clone，命名空间通知只处理创建该设备的 ns；三者互不替代，不可混用。
+
+最佳实践归纳为四点。其一，操作顺序遵循 `ip link add` → `wg set`（配置密钥与 peer，见 04-01）→ `ip link set up` → 用 `wg show` 确认握手，最后才配地址与路由；先 add 再 set 再 up 的顺序保证了 socket 启动时密钥与 peer 已就绪。其二，用 `ip -d link show wg0` 观察 `wg_setup` 设置的 MTU、flags、qdisc 等参数，作为设备层配置是否正确的快速检查（参数全集见 04-07）。其三，销毁务必用 `ip link del wg0`，让 `wg_destruct` 完整走完逆序释放与私钥清零，不要试图手动清理内核对象。其四，在虚拟化或频繁休眠的环境里，要预期密钥会被主动清除或过期——这是安全设计而非故障，对应地应关注握手是否能及时重建（定时器机制见 06-11、排障见 08-03）。此外，`wg_setup` 里 `lltx = true` 关闭内核 xmit lock、`IFF_NO_QUEUE` 关闭内核排队，都是把发包并发交给 WireGuard 自己的多队列 workqueue 处理，这是理解其多核性能的前提（并发机制见 06-13）。
+
+### 7. 小结与延伸阅读
+
+本篇把 device.c 定位为 WireGuard Linux 的「设备生命周期管家」：它通过 `link_ops` 接住 `ip link add`，由 `wg_setup` 设置网卡通用参数（MTU 减封装开销、`IFF_POINTOPOINT|IFF_NOARP`、`IFF_NO_QUEUE`、无硬件地址、per-CPU 统计），由 `wg_newlink` 建立锁、哈希表、三个工作队列与三个包队列并 `register_netdevice`，把 `wg_device` 包装成标准网卡；运行中由 `wg_open`/`wg_stop` 管理 socket、密钥与定时器的启停，由 `wg_xmit` 作为出站数据面入口；`ip link del` 触发 `wg_destruct` 逆序释放全部资源并显式清零私钥后 `free_netdev`。全局 `device_list` 把三台通知器（电源、VM fork、命名空间退出）串起来，使系统在挂起、克隆与命名空间销毁时能批量清理密钥与 endpoint 状态。本快照的 `netdev_ops` 仅三项，统计走 `NETDEV_PCPU_STAT_TSTATS`，与旧资料的描述存在版本差异，需据实核验。设备的创建/销毁走 rtnetlink，配置走 netlink 通用族，两者操作同一对象但职责分明。
+
+延伸阅读建议按三条线走：想看 `wg_xmit` 之后封装、加密、分片的逐段实现，读 06-05 与 07-07；想看 netlink 配置面如何操作同一个 `wg_device`，读 06-14 与 07-11；想看 `wg_device`、`wg_peer`、包队列与 sk_buff 元数据的逐字段定义，读 05-02、05-03、05-06、05-08。本册内部的横向衔接是：main.c 如何调用 `wg_device_init`/`wg_device_uninit` 完成模块级装配见 07-01，peer 的创建与移除见 07-03，allowedips trie 见 07-04。跨册随查按（字段见 05-02 ｜ 参数见 04-07 ｜ 原理见 06-05 ｜ 模块见 07-01）执行：结构体逐字段去 05、参数与命令全集去 04、机制与调用链去 06、本册内其他模块职责读对应 07 篇。凡本篇标注「需对照实际版本核验」的字段、常量与 netdev 操作清单，均以 `_wglinux_build/upstream_src/` 下对应源码为准，本套资料不编造未核验的路径与取值。

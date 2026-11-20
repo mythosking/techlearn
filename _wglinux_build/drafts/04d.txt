@@ -1,0 +1,402 @@
+## 04-07 内核模块参数、sysfs 与 ethtool 接口全集
+
+### 1. 背景与动机
+
+在运维与集成实践中，关于 WireGuard Linux「到底有哪些可调接口」的误解非常普遍。习惯了其他内核驱动的管理员，往往会先去找模块加载参数，再去翻 `/sys/class/net/wg0/` 下形如 `public_key`、`private_key`、`listen_port`、`fwmark` 的属性文件，接着跑 `ethtool` 查看卸载特性；当这些操作全部落空时，就容易得出「这个驱动没有接口」「配置只能靠黑盒工具」一类错误结论。本篇的任务是把这些接口问题一次性钉死：以本快照源码为唯一依据，逐一回答「内核模块参数有没有」「WireGuard 专属 sysfs 属性有没有」「ethtool 支持有没有」「真正的内核对外接口是什么」。凡是源码中找不到证据的，一律明确写出「本快照中不存在」，而不是照抄旧版本或其他实现的记忆，这正是本册作为参数与接口唯一权威源必须承担的责任。
+
+先交代快照边界，因为这直接决定哪些结论能被证据支撑。`drivers/net/wireguard/` 目录中实际存在 `main.c`、`device.c`、`peer.c`、`allowedips.c`、`noise.c`、`send.c`、`receive.c`、`socket.c`、`timers.c`、`ratelimiter.c`、`cookie.c`、`queueing.h` 以及各 `.h` 文件；`drivers/net/wireguard/Makefile` 第 16 行虽然写了 `wireguard-y += netlink.o generated/netlink.o`，但 `netlink.c` 与 `generated/` 目录并未随本快照提供；`sysfs.c` 则根本不在编译清单里，目录中也不存在该文件。换句话说，被广泛引用的那些 sysfs 属性名，在本快照中没有任何源码落点，把它们当成现状写进资料是典型的以讹传讹。因此本文对「存在什么」给出确定结论；对「netlink 配置路径内部返回哪些 errno」这类必须读 `netlink.c` 才能断定的细节，则明确标注「需对照实际版本核验」，绝不虚构文件路径与取值。用户态工具侧以 wireguard-tools 1.0.20260223 快照为准，其 `ipc.c`、`ipc-linux.h`、`config.c`、`set.c`、`show.c` 都可用来核实参数校验与报错行为。
+
+本文把「接口」拆成四层来谈，这是理解全部问题的钥匙。第一层是构建期开关，即 `CONFIG_WIREGUARD` 与 `CONFIG_WIREGUARD_DEBUG` 两个 Kconfig 符号，它们决定驱动是否被编译、是否打开调试路径；第二层是 rtnetlink 建链接口，由 `device.c` 的 `link_ops` 实现，负责 `ip link add wg0 type wireguard` 这类设备生命周期操作；第三层是 generic netlink 配置接口，由族名 `WG_GENL_NAME`、版本 `WG_GENL_VERSION` 与 `WG_CMD_GET_DEVICE` / `WG_CMD_SET_DEVICE` 两条命令构成，是密钥、peer、allowedip、监听端口、fwmark 等配置数据的唯一通道；第四层是内核 net core 提供的通用 sysfs 文件，例如 `/sys/class/net/wg0/mtu` 与 `/sys/class/net/wg0/ifindex`，它们由通用网络代码生成，不是 WireGuard 驱动自己注册的专属属性。四层之外，`fwmark` 是一个横跨配置面与数据面的特殊属性，值得单独展开。把这四层混在一起谈，是理解偏差的根源；分开来看，每个问题的答案都很直接。
+
+需要强调的是，本篇不写指向自身的参数引用。命令行的完整选项在 04-01、04-02、04-03、04-04，netlink 命令与属性的全集在 04-05，uapi 常量、标志与结构定义在 04-06；本篇只处理「内核对外暴露面」这一主题，并对上述同册篇章做正向交叉引用，而不是把本应承担的权威结论推给别人。
+
+### 2. 核心概念
+
+第一层概念是「构建期开关不是运行时参数」。在 `drivers/net/Kconfig` 第 74 行，`config WIREGUARD` 被定义为 `tristate "WireGuard secure network tunnel"`，依赖 `NET && INET`，并 `select NET_UDP_TUNNEL`、`DST_CACHE`、`CRYPTO_LIB_CURVE25519`、`CRYPTO_LIB_CHACHA20POLY1305`、`CRYPTO_LIB_UTILS`；第 92 行 `config WIREGUARD_DEBUG` 是 `bool "Debugging checks and verbose messages"`，依赖 `WIREGUARD`。`drivers/net/wireguard/Makefile` 第 1 行 `ccflags-y := -D'pr_fmt(fmt)=KBUILD_MODNAME ": " fmt'` 为所有源文件统一设置日志前缀，第 2 行 `ccflags-$(CONFIG_WIREGUARD_DEBUG) += -DDEBUG` 把 Kconfig 开关翻译成编译期的 `DEBUG` 宏。这意味着：改变调试行为必须重新编译模块，不能在 `insmod` 时通过参数切换；全树对 `module_param` 的检索在 `wireguard-linux-src` 下没有任何命中，因此本快照的 WireGuard 驱动没有运行时模块参数。
+
+第二层概念是「rtnetlink 建链接口极小」。`device.c` 的 `netdev_ops`（第 236 至 240 行）只有三个回调：`ndo_open = wg_open`、`ndo_stop = wg_stop`、`ndo_start_xmit = wg_xmit`；`link_ops`（第 407 至 412 行）只有 `kind = KBUILD_MODNAME`、`priv_size = sizeof(struct wg_device)`、`setup = wg_setup`、`newlink = wg_newlink` 四项。`main.c` 第 77 行的 `MODULE_ALIAS_RTNL_LINK(KBUILD_MODNAME)` 让 `ip link add wg0 type wireguard` 能自动加载模块。这里没有 `ethtool_ops`，没有 `ndo_get_stats64`，也没有 `ndo_set_config`——那类回调在别的内核网卡驱动里常见，但本快照的 WireGuard 并未注册。因此 `ethtool wg0` 能查询的只是内核网络栈的通用信息，不存在任何 WireGuard 专属的 ethtool 命令、统计项或可调开关。
+
+第三层概念是「配置数据全部走 generic netlink」。uapi 头 `include/uapi/linux/wireguard.h` 第 10 至 13 行定义 `WG_GENL_NAME "wireguard"`、`WG_GENL_VERSION 1`、`WG_KEY_LEN 32`；第 72 至 78 行的 `enum wg_cmd` 只有 `WG_CMD_GET_DEVICE` 与 `WG_CMD_SET_DEVICE`。device / peer / allowedip 三层属性枚举分别在第 29、44、61 行开始，其中 `WGDEVICE_A_FWMARK` 在第 37 行、`WGDEVICE_A_LISTEN_PORT` 在第 36 行、`WGDEVICE_A_PRIVATE_KEY` 与 `WGDEVICE_A_PUBLIC_KEY` 在第 33、34 行。用户态 `wireguard-tools/src/ipc.c` 的 `ipc_get_device` 与 `ipc_set_device`（第 78 至 98 行）在支持内核接口时按接口名分流：已由用户态接管的接口走 `userspace_get_device` / `userspace_set_device`，否则走 `kernel_get_device` / `kernel_set_device`，后者在 `ipc-linux.h` 中用 `mnlg_socket_open(WG_GENL_NAME, WG_GENL_VERSION)` 打开通用族套接字。属性全集不在这里展开，见 04-05、04-06。
+
+第四层概念是「通用 sysfs 不等于 WireGuard 接口」。`/sys/class/net/wg0/` 下的 `address`、`ifindex`、`mtu`、`operstate`、`carrier`、`statistics/` 等文件由内核 net core 针对每个 `net_device` 统一生成，任何网卡都有，它们反映 `wg_setup` 写进 netdev 的字段与运行时统计，不提供读取私钥或改写密钥的能力。对 `drivers/net/wireguard/` 全树检索 `DEVICE_ATTR`、`sysfs`、`module_param` 均无线索（唯一与 sysfs 相关的命中在 `drivers/net/Kconfig` 第 336 行，属于其他驱动的依赖表达式），所以「WireGuard 专属 sysfs 属性」在本快照中的结论是明确的：没有。
+
+第五个概念是 `fwmark`，它是上述四层里唯一真正跨越配置面与数据面的属性。`device.h` 第 55 行在 `struct wg_device` 中声明 `u32 fwmark`，紧邻第 56 行的 `u16 incoming_port`；uapi 侧对应 `WGDEVICE_A_FWMARK`。`socket.c` 第 27 行把 `wg->fwmark` 写入 IPv4 的 `flowi4.mark`，第 36 行写入 `skb->mark`，第 104、115 行对 IPv6 做同样处理。用户态 `config.c` 第 103 行的报错串 `Fwmark is neither 0/off nor 0-0xffffffff` 说明其合法范围是 0 或 0 到 0xffffffff，`set.c` 第 21 行的用法串也列出 `fwmark <mark>`。于是 `wg set wg0 fwmark 0x1a` 写入内核后，既能影响出包路由查询（配合 `ip rule fwmark` 做策略路由），又会体现在报文的 mark 上。
+
+### 3. 关键数据结构与源码位置
+
+下表把本篇反复引用的源码位置收拢成一张全集表。表中「是否存在」一栏是本快照的硬结论，不依赖猜测。
+
+| 接口类别 | 本快照是否存在 | 入口标识 | 真实源码位置 | 结论要点 |
+|---|---|---|---|---|
+| 运行时模块参数 | 不存在 | 无 `module_param` | `drivers/net/wireguard/` 全目录检索 | 全树无命中，无 `insmod` 期可调参数 |
+| 构建期开关 | 存在 | `CONFIG_WIREGUARD` / `CONFIG_WIREGUARD_DEBUG` | `drivers/net/Kconfig:74,92`；`Makefile:1-2` | tristate 与 bool，改后需重编译 |
+| WireGuard 专属 sysfs 属性 | 不存在 | 无 `DEVICE_ATTR`、无 `sysfs.c` | `drivers/net/wireguard/` 目录与 `Makefile:3-16` | 编译清单无 sysfs.o，目录无该文件 |
+| 通用网卡 sysfs 文件 | 存在（由 net core 提供） | `/sys/class/net/wg0/mtu` 等 | 内核网络核心，`wg_setup` 写 netdev 字段 | 非 WireGuard 注册，不含密钥属性 |
+| ethtool 专属操作 | 不存在 | 无 `ethtool_ops` | `device.c:236-240` 的 `netdev_ops` | 仅 open/stop/start_xmit 三回调 |
+| rtnetlink 建链 | 存在 | `rtnl_link_ops` / `KBUILD_MODNAME` | `device.c:407-412`、`main.c:77` | `ip link add/del wg0 type wireguard` |
+| generic netlink 配置 | 存在 | `WG_CMD_GET_DEVICE` / `WG_CMD_SET_DEVICE` | `include/uapi/linux/wireguard.h:72-78` | 密钥、peer、端口、fwmark 唯一通道 |
+| fwmark 属性 | 存在 | `WGDEVICE_A_FWMARK`、`wg->fwmark` | `device.h:55`、`socket.c:27,36,104,115` | 配置写入 mark，数据面按 mark 路由 |
+| 监听端口属性 | 存在 | `WGDEVICE_A_LISTEN_PORT`、`incoming_port` | `socket.c:347-435`、`device.h:56` | 实际端口由 `wg_socket_reinit` 回写 |
+| netlink 配置实现文件 | 快照缺失 | `netlink.o` / `generated/netlink.o` | `Makefile:16` 引用，文件未提供 | 内部 errno 需对照实际版本核验 |
+
+下面这段代码把最容易被误传的两处结构原样贴出：驱动真正注册的 netdev 操作只有三项，rtnetlink 操作只有四项，模块别名只有两条。它们是判断「有没有 ethtool / sysfs 接口」的直接证据。
+
+```c
+/* drivers/net/wireguard/device.c:236-240 */
+static const struct net_device_ops netdev_ops = {
+	.ndo_open		= wg_open,
+	.ndo_stop		= wg_stop,
+	.ndo_start_xmit		= wg_xmit,
+};
+
+/* drivers/net/wireguard/device.c:407-412 */
+static struct rtnl_link_ops link_ops __read_mostly = {
+	.kind			= KBUILD_MODNAME,
+	.priv_size		= sizeof(struct wg_device),
+	.setup			= wg_setup,
+	.newlink		= wg_newlink,
+};
+
+/* drivers/net/wireguard/main.c:77-78 */
+MODULE_ALIAS_RTNL_LINK(KBUILD_MODNAME);
+MODULE_ALIAS_GENL_FAMILY(WG_GENL_NAME);
+```
+
+`KBUILD_MODNAME` 的值为 `wireguard`，所以两条别名分别展开为 `rtnl-link-wireguard` 与 `netlink-genl-wireguard`；`WG_GENL_NAME` 的值来自 uapi 头第 10 行。两者一个服务于 `ip link add ... type wireguard` 的模块自动加载，一个服务于 generic netlink 族查找。若在插入模块后 `modinfo wireguard` 看不到这两条 alias，说明加载的并非这份源码对应的模块，需核对构建产物（构建路径见 02-03）。
+
+除了操作表，`wg_setup` 还在 netdev 层设定了一组「没有 ethtool 也能查到」的参数。`device.c` 第 277 至 279 行的 `WG_NETDEV_FEATURES` 是 `NETIF_F_HW_CSUM | NETIF_F_RXCSUM | NETIF_F_SG | NETIF_F_GSO | NETIF_F_GSO_SOFTWARE | NETIF_F_HIGHDMA`，第 293 至 295 行同时写入 `dev->features`、`dev->hw_features`、`dev->hw_enc_features`；第 296 行 `dev->mtu = ETH_DATA_LEN - overhead`，其中 `overhead = MESSAGE_MINIMUM_LENGTH + sizeof(struct udphdr) + max(sizeof(struct ipv6hdr), sizeof(struct iphdr))`，按 `messages.h` 第 112 至 117 行的定义，`MESSAGE_MINIMUM_LENGTH` 为 `message_data_len(0)`，即 ChaCha20-Poly1305 的 16 字节认证标签加 16 字节 `message_data` 头，共 32 字节，于是典型 MTU 为 1500 减 80 等于 1420。第 297 行的 `max_mtu` 用 `round_down(INT_MAX, MESSAGE_PADDING_MULTIPLE) - overhead` 计算，`MESSAGE_PADDING_MULTIPLE` 为 16。这些是内核侧真实的「接口默认值」，比任何 ethtool 输出都更权威。
+
+### 4. 关键流程与调用链
+
+第一条链是构建与加载。`CONFIG_WIREGUARD=m` 时 Makefile 把 `main.o`、`device.o`、`peer.o` 等链接为 `wireguard.ko`；`module_init(wg_mod_init)` 在 `main.c:71` 注册入口，`wg_mod_init` 依次完成 `wg_allowedips_slab_init`、可选的 DEBUG 自检、`wg_noise_init`、`wg_peer_init`、`wg_device_init`、`wg_genetlink_init`，成功后打印两行 `pr_info`。这条链决定「哪些开关在加载前就固定了」，完整回滚路径属于错误主题，见 04-08。
+
+第二条链是建链。`ip link add wg0 type wireguard` 由 rtnetlink 依据 `MODULE_ALIAS_RTNL_LINK` 找到模块，匹配 `link_ops.kind`，先调用 `wg_setup` 设置 netdev 的头部空间、特性、MTU、标志与 `header_ops`，再调用 `wg_newlink`。`wg_newlink`（`device.c:310-405`）依次初始化锁与 allowedips、分配公钥哈希表与索引哈希表、创建三个 workqueue、初始化三条加密队列与 ratelimiter，最后 `register_netdevice(dev)` 并把 `wg_destruct` 挂到 `dev->priv_destructor`。`ip link del wg0` 触发 `wg_destruct`，逆序释放这些资源。这条链说明：netdev 对象的存在是配置与数据面的前提，所以配置前必须先有接口。
+
+第三条链是配置写入，也是 fwmark 的主线。`wg set wg0 fwmark 0x1a` 由 `wg.c` 分发到 `set.c`，解析后经 `ipc_set_device`（`ipc.c:89-98`）进入 `ipc-linux.h` 的 `kernel_set_device`，以 `WG_CMD_SET_DEVICE` 请求携带 `WGDEVICE_A_FWMARK` 发往内核；内核 netlink 层解析属性并更新 `wg->fwmark`，随后 `socket.c:27,36,104,115` 在构造 UDP 隧道报文时把该值写入 `flowi4.mark` / `flowi6.mark` 与 `skb->mark`，`ip rule` 便可用 `fwmark 0x1a` 选择路由表。需要说明：netlink 内核侧实现文件 `netlink.c` 不在本快照中，所以「属性解析的具体函数与返回码」不做断言，需对照实际版本核验；但属性常量与数据面落点是源码可证的。查询方向由 `wg show` 走 `WG_CMD_GET_DEVICE`，`ipc-linux.h:493-503` 可见其构造请求与读取回调。
+
+第四条链是只读呈现。用户读 `/sys/class/net/wg0/mtu` 时，内核 net core 返回 `wg_setup` 写入的 `dev->mtu`；`cat /sys/class/net/wg0/statistics/rx_packets` 读取的是通用统计，而 WireGuard 自己的收发字节计数由 `WGPEER_A_RX_BYTES` / `WGPEER_A_TX_BYTES` 经 netlink 暴露给 `wg show`，两者口径不同，不能互相替代。
+
+四层接口与 fwmark 的流向见图 04-07-01。
+
+:::figure id=04-07-01 | name=WireGuard Linux 的四层内核接口与 fwmark 流向 | dir=TD
+node k1 "构建期开关<br/>CONFIG_WIREGUARD(_DEBUG)" blue
+node r1 "rtnetlink link_ops<br/>ip link add wg0" teal
+node n1 "generic netlink<br/>WG_CMD_SET/GET_DEVICE" purple
+node d1 "wg_device 字段<br/>fwmark / incoming_port" green
+node w1 "wg_setup 设定<br/>netdev 特性与 MTU" teal
+node s1 "通用 sysfs<br/>/sys/class/net/wg0/" gray
+node e1 "ethtool 查询<br/>无专属 ethtool_ops" red
+node f1 "socket.c<br/>写 flowi/skb mark" amber
+node p1 "ip rule fwmark<br/>策略路由" blue
+edge k1 -> r1 "编译进内核"
+edge r1 -> d1 "newlink 初始化"
+edge r1 -> w1 "setup 回调"
+edge n1 -> d1 "配置写入"
+edge d1 -> w1 "参数来源"
+edge d1 -> f1 "fwmark 下发"
+edge f1 -> p1 "规则匹配"
+edge w1 -> s1 "只读呈现"
+edge w1 -> e1 "通用特性读取"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「构建期开关」决定驱动是否进入内核；随后「rtnetlink link_ops」通过 `ip link add wg0` 创建接口，一方面触发「wg_setup 设定 netdev 特性与 MTU」，另一方面在「wg_device 字段」中初始化 fwmark 与 incoming_port；「generic netlink」的配置写入也落到这些字段；字段中的 fwmark 被「socket.c 写 flowi/skb mark」消费，最终由「ip rule fwmark 策略路由」匹配；wg_setup 设定的 netdev 参数一方面被「通用 sysfs」只读呈现，另一方面可被「ethtool 查询」读取通用特性，但驱动没有专属 ethtool_ops。
+
+### 5. 配置/命令/代码实例
+
+下面这段命令把本篇讨论的四层接口都摸一遍：先确认构建期开关与模块身份，再建链、设置 fwmark、查通用 sysfs、试 ethtool、看内核日志。
+
+```bash
+# 1. 构建期开关与模块身份
+grep -E 'CONFIG_WIREGUARD' /boot/config-"$(uname -r)"
+modinfo wireguard | grep -E '^(filename|version|license|description|alias):'
+
+# 2. rtnetlink 建链 + generic netlink 配置
+ip link add wg0 type wireguard
+wg set wg0 listen-port 51820 fwmark 0x1a
+ip link set wg0 up
+
+# 3. 只读接口：通用 sysfs 与 ethtool
+ls /sys/class/net/wg0/
+cat /sys/class/net/wg0/mtu
+cat /sys/class/net/wg0/ifindex
+ethtool -k wg0 | head -n 6
+
+# 4. 内核日志确认模块加载
+dmesg | grep -F 'wireguard:'
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+CONFIG_WIREGUARD=m
+CONFIG_WIREGUARD_DEBUG is not set
+filename:       /lib/modules/6.x/kernel/net/wireguard/wireguard.ko
+version:        1.0.0
+license:        GPL v2
+description:    WireGuard secure network tunnel
+alias:          rtnl-link-wireguard
+alias:          netlink-genl-wireguard
+address  broadcast  carrier  ifalias  ifindex  iflink  mtu  operstate
+statistics  tx_queue_len  type  uevent  power  queue
+1420
+7
+Features for wg0:
+rx-checksumming: on [fixed]
+tx-checksumming: on [fixed]
+scatter-gather: on [fixed]
+[   12.345678] wireguard: WireGuard 1.0.0 loaded. See www.wireguard.com for information.
+[   12.345678] wireguard: Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+```
+
+逐行判读如下。开头两行来自构建配置：`CONFIG_WIREGUARD=m` 说明驱动是可加载模块，`CONFIG_WIREGUARD_DEBUG is not set` 说明 DEBUG 自检路径未编译进内核，对应 `Makefile` 第 2 行的 `ccflags-$(CONFIG_WIREGUARD_DEBUG)` 与 `main.c` 第 28 至 33 行的条件编译块。`filename` 行指向实际加载的 `.ko`，核对它与你阅读的源码树是否一致，是避免「代码对不上版本」的第一步。`version: 1.0.0` 直接来自 `main.c:76` 的 `MODULE_VERSION(WIREGUARD_VERSION)` 与 `version.h` 中的 `#define WIREGUARD_VERSION "1.0.0"`，它是驱动版本，不是内核版本也不是工具版本。`license: GPL v2` 对应 `main.c:73` 的 `MODULE_LICENSE("GPL v2")`。两条 `alias` 行分别对应 `main.c:77` 的 `MODULE_ALIAS_RTNL_LINK(KBUILD_MODNAME)` 与第 78 行的 `MODULE_ALIAS_GENL_FAMILY(WG_GENL_NAME)`，前者让 `ip link add wg0 type wireguard` 自动触发模块加载，后者让 generic netlink 族 `wireguard` 可被用户态定位。紧接着的 `ls /sys/class/net/wg0/` 输出里只有 `address`、`mtu`、`ifindex`、`statistics` 这类通用网卡文件，没有任何 `public_key`、`private_key`、`listen_port`、`fwmark` 文件——这正是「本快照无 WireGuard 专属 sysfs 属性」的可观测证据。`1420` 是 `cat .../mtu` 的结果，等于 `device.c:296` 的 `ETH_DATA_LEN - overhead`，与前文 1500 减 80 的推导一致。`7` 是 `ifindex`，由内核分配，与 WireGuard 逻辑无关。`ethtool -k` 的 `rx-checksumming: on [fixed]`、`tx-checksumming: on [fixed]`、`scatter-gather: on [fixed]` 反映 `wg_setup` 写入 `dev->features` 的 `NETIF_F_RXCSUM`、`NETIF_F_HW_CSUM`、`NETIF_F_SG`；`[fixed]` 表示不可通过 ethtool 更改，因为驱动没有注册 `ethtool_ops` 来提供 `set_flags` 一类回调。最后两行 `dmesg` 来自 `main.c:48-49` 的两条 `pr_info`，前缀 `wireguard:` 由 `Makefile` 第 1 行的 `pr_fmt` 宏统一添加，看到它们即可确认模块初始化走到了最后一步，没有在 `wg_mod_init` 的 `goto` 回滚链上失败。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是照旧版本去找 sysfs 属性。即便某些历史资料或旁支实现列出过 `public_key`、`private_key`、`listen_port`、`fwmark` 等 sysfs 文件，本快照的 `drivers/net/wireguard/` 既无 `sysfs.c` 也无 `DEVICE_ATTR`，把这些属性当作现状写进脚本必然失败。正确做法是用 `wg show` 与 `wg showconf` 查询，用 `wg set` / `wg syncconf` 写入，对应命令见 04-01、04-02。
+
+第二个陷阱是把通用 sysfs 文件当成 WireGuard 接口。`mtu`、`operstate`、`statistics/` 对所有网卡都存在，它们反映 netdev 层状态；WireGuard 自己的累计收发字节、最近握手时间、endpoint 等信息只经 netlink 的 peer 属性输出，两者的数目与更新时机都不同，排障时不要混用（排障口径见 08-03）。
+
+第三个陷阱是期待 ethtool 调整 WireGuard 的卸载行为。既然 `netdev_ops` 里没有 `ethtool_ops`，`ethtool -K wg0`、`ethtool -G wg0` 一类操作不会改变驱动行为；特性集合在 `wg_setup` 中静态写定，队列与 workqueue 在 `wg_newlink` 中按 CPU 创建，调优应围绕 MTU、GSO 与多队列进行，方法见 08-02。
+
+第四个陷阱是把 `CONFIG_WIREGUARD_DEBUG` 当成可在线切换的参数。它是构建期 `bool`，打开后 `main.c:28-33` 会运行三项 selftest，任一项失败就把返回值设为 `-ENOTRECOVERABLE` 并回滚，生产环境不应盲目开启；调试构建的取舍见 02-05。
+
+第五个陷阱是忽略监听端口的实际值。`wg set wg0 listen-port 0` 时 `socket.c:399-400` 允许内核在 `-EADDRINUSE` 情况下重试选端口，第 430 行把实际端口写回 `wg->incoming_port`；`wg show` 显示的是这个回写值，而非配置字符串。IPv6 可用时第 395 行让 IPv6 socket 复用 IPv4 的端口号，两端看到的是同一监听端口（socket 细节见 07-09、06-12）。
+
+第六个陷阱是 fwmark 冲突。`fwmark` 同时写入路由查询的 flowi mark 与报文的 `skb->mark`，若系统中已有 nftables/iptables 或策略路由使用同一 mark 值，可能互相干扰；用户态校验只允许 0/`off` 或 0 至 0xffffffff（`config.c:103`），配置策略路由时应先盘点现有 mark 用法，再选一个未占用的值。
+
+最后是版本核验纪律：本快照的 `Makefile` 引用了 `netlink.o` 与 `generated/netlink.o`，但这两个实现文件未提供，因此 netlink 配置路径内部的属性解析函数、错误返回值不在本文断言范围内；若目标系统的行为与本表不一致，应先核对内核版本与 uapi 头是否同源（版本基准见 01-04），再按 04-05、04-06 的属性全集逐项比对。
+
+### 7. 小结与延伸阅读
+
+本篇给出的结论可以压缩成四句话：WireGuard Linux 本快照没有任何运行时模块参数，只有 `CONFIG_WIREGUARD` 与 `CONFIG_WIREGUARD_DEBUG` 两个构建期开关；没有 WireGuard 专属 sysfs 属性，也没有 `ethtool_ops`，`/sys/class/net/wg0/` 与 `ethtool` 看到的都是内核通用信息；真正的配置通道是 rtnetlink 建链加 generic netlink 的 `WG_CMD_GET_DEVICE` / `WG_CMD_SET_DEVICE`；`fwmark` 是唯一横跨配置面与数据面的属性，从 `WGDEVICE_A_FWMARK` 写入 `wg->fwmark`，再经 `socket.c` 落到 flowi 与 skb 的 mark。MTU 1420、特性集合、监听端口回写等 netdev 层参数，均可由 `wg_setup`、`netdev_ops`、`link_ops` 与模块别名直接读出。凡本快照缺失的 `netlink.c` 内部细节，均已标注需对照实际版本核验，不作虚构。
+
+延伸阅读按三条线走：命令与配置文件语义读 04-01 至 04-04；netlink 命令属性全集与 uapi 常量读 04-05、04-06；机制与排障读 06-14（netlink 配置通道）、07-11（sysfs 与 uapi 配置接口模块）、08-03（故障诊断）。跨册随查按（字段见 05-02 ｜ 参数见 04-01 ｜ 原理见 06-14 ｜ 模块见 07-11）执行：需要 `wg_device` 逐字段定义去 05 册，需要 wg 命令选项去本册前几篇，需要配置通道原理去 06 册，需要目录级模块职责去 07 册。凡本篇标注「需对照实际版本核验」的条目，均以 `_wglinux_build/upstream_src/` 下对应文件为准；本册作为参数与接口唯一权威源，不为不存在的接口编造路径、属性名或取值。
+
+## 04-08 错误码、错误路径与报错速查手册
+
+### 1. 背景与动机
+
+WireGuard 在协议层是「静默」的：握手认证失败时，它不会给对端回一个携带错误码的报文，而是直接丢弃。这个设计带来简洁与安全，却给排障制造了天然困难——管理员看不到「认证失败」四个字，只能从同步返回的错误码、内核日志、以及丢包计数器三种渠道反推发生了什么。更难的是，这三类出口分散在完全不同的代码层：模块初始化用 `goto` 回滚链和 `-ENOTRECOVERABLE`，配置面由 netlink 与 wg 工具把 errno 传成 stderr 文本，数据面则有 `wg_xmit` 的显式返回值、socket 层的 `PTR_ERR` 透传、以及 `receive.c` 大量的静默丢弃分支。把「同一个 errno 在不同层含义不同」这件事讲清楚，是本篇的核心任务。
+
+本篇的取证纪律比别的篇章更严格：所有错误码必须能在快照源码里指出具体文件与行号，拿不准的一律标注「需对照实际版本核验」。有三处边界必须先说明。第一，`drivers/net/wireguard/Makefile` 第 16 行引用了 `netlink.o` 与 `generated/netlink.o`，但这两个实现文件并不在本快照中，因此 netlink 配置路径内部可能返回哪些 errno（例如常见的 `-EEXIST`），本文不做断言；`-EEXIST` 在本快照唯一可见的位置是 `wireguard-tools/src/wg-quick/android.c:253`，那是 Android Binder 的状态常量，与内核驱动返回码无关，绝不能混为一谈。第二，`sysfs.c` 不存在，自然也没有来自 sysfs 属性写操作的错误码。第三，`selftest/` 目录为空，`main.c:30-31` 调用的三个自检函数虽被声明，但日志文本不可考，所以本文只陈述其返回值路径，不编造自检日志行。
+
+理解本篇还需要建立一个关键区分：「返回给调用者的 errno」与「被计数但没有返回值的丢弃」是两回事。`wg_xmit` 返回负数会被 netdev 层记为发送错误，`wg set` 的 errno 会通过 `perror` 变成用户看到的文字；而 `receive.c` 中大量 `goto` 到 `dishonest_packet_*` 或 `next` 的分支，只是 `DEV_STATS_INC` 加计数、再 `dev_kfree_skb`，既不返回 errno，也不总会写日志。排障时把这两类现象放在同一张表上对照，才能避免「没有报错所以没问题」的误判。
+
+### 2. 核心概念
+
+第一类概念是错误码的「三种出口」。同步出口指错误以负 errno 返回给直接调用者：模块初始化失败时 `insmod` 得到非零退出码，`WG_CMD_SET_DEVICE` 失败时 wg 工具得到 errno，`wg_xmit` 失败时返回负数给内核 netdev 层。日志出口指 `pr_err`、`net_dbg_ratelimited`、`net_dbg_skb_ratelimited` 一类调用，它们写内核日志但不改变返回值；其中带 `ratelimited` 的宏在高频错误下会主动抑制输出，所以「日志里没有」绝不等于「没有发生」。计数出口指 `DEV_STATS_INC(dev, rx_errors)`、`DEV_STATS_INC(dev, tx_dropped)` 以及 peer 的 `rx_bytes` / `tx_bytes`，它们经 `ip -s link` 与 `wg show` 暴露，是静默丢弃唯一可靠的证据。
+
+第二类概念是 errno 的四种来源。其一是源码里直接写出的字面量，例如 `main.c:29` 的 `ret = -ENOTRECOVERABLE`、`device.c:155` 的 `ret = -ENOKEY`；其二是 `PTR_ERR()` 透传，`socket.c:74` 与 `socket.c:140` 把路由查询返回的 `ERR_PTR` 转回 errno，`device.c:182` 把 `skb_gso_segment` 的错误透传；其三是用户态的 `-errno`，`ipc-linux.h:251`、`ipc-linux.h:496` 在 netlink 发送或接收失败后把 `errno` 取负，第 256、501 行在 `errno` 为零时用 `-EINVAL` 兜底；其四是构建期固定的值，DEBUG 自检失败统一返回 `-ENOTRECOVERABLE`。
+
+第三类概念是 `goto` 回滚链的命名规律。内核代码用标签名标识「跳到这里时需要释放什么」：`main.c` 的 `err_netlink`、`err_device`、`err_peer`、`err_allowedips` 依次释放已完成的初始化层；`device.c` 的 `wg_newlink` 用 `err_uninit_ratelimiter`、`err_free_handshake_queue`、`err_free_decrypt_queue`、`err_free_encrypt_queue`、`err_destroy_packet_crypt`、`err_destroy_handshake_send`、`err_destroy_handshake_receive`、`err_free_index_hashtable`、`err_free_peer_hashtable` 一路回退；`wg_device_init` 用 `error_pm`、`error_vm`、`error_pernet` 回退 notifier 与 pernet 注册。阅读这类代码时，只要看标签名就能判断哪些资源已分配、哪些还没碰过，这也解释了为什么 DEBUG 自检失败跳到 `err_peer` 时只调用 `wg_allowedips_slab_uninit()`——因为此时 `wg_peer_init()` 尚未执行。
+
+第四类概念是「数据面错误大多不致命」。`-ENOKEY` 表示当前还没有可用的会话密钥或没有匹配 peer，包被放进 `staged_packet_queue` 等待握手，见 `send.c:393-400`；`-EPIPE` 表示设备加密环队列满，调用方把包标记为 `PACKET_STATE_DEAD`，并不向上冒泡；`-EDESTADDRREQ` 表示还没有对端 endpoint，也是握手前的正常中间态。把它们当成「驱动坏了」而重启接口，往往适得其反。
+
+第五类概念是用户态的「本地校验先于内核」。`config.c` 在构造 netlink 请求之前就完成了密钥长度、端口、fwmark、AllowedIP 掩码等校验，例如第 103 行的 fwmark 校验、第 110 行的密钥长度校验、第 431 行的 AllowedIP 格式校验。这些错误只产生 `stderr` 文本，没有内核 errno；`set.c:31-33` 的 `perror("Unable to modify interface")` 才是真正来自内核的 errno 出口。区分两者，是判断「要改配置文件还是要查内核」的第一步。
+
+### 3. 关键数据结构与源码位置
+
+下表是本篇的错误码全集。每一行都给出源码位置与触发条件；本快照中找不到返回点的错误码，明确写成「需对照实际版本核验」，不列入已证实集合。
+
+| 错误码/返回值 | 真实源码位置 | 触发条件 | 出口 | 排障含义 |
+|---|---|---|---|---|
+| `-ENOTRECOVERABLE` | `main.c:29-32` | DEBUG 构建下三自检任一失败 | `insmod` 退出码 | 调试构建自检失败，非运行期故障 |
+| `-ENOMEM` | `device.c:316,327-364` | `wg_newlink` 哈希表/workqueue/队列/限速器分配失败 | rtnetlink 建链 | 建链失败，资源不足 |
+| `-ENOMEM` | `peer.c:26,30-37,230-234` | peer 数达上限、slab 分配、dst_cache 初始化、缓存创建失败 | netlink 配置 | 添加 peer 失败 |
+| `-ENOMEM` | `socket.c:193,217` | 发送缓冲区 `alloc_skb` 失败 | 发送路径 | 临时内存紧张 |
+| `-ENOMEM` | `allowedips.c:187,202,233`；`ratelimiter.c:202` | trie 节点或限速器缓存分配失败 | 配置/建链 | 内存不足 |
+| `-EINVAL` | `receive.c:56,64,71,77,81,84,87` | `prepare_skb_header` 判定 IP/UDP/WG 头非法 | `wg_packet_receive` 的 `err` 路径 | 入站报文头损坏或伪造 |
+| `-EINVAL` | `socket.c:210,251` | `in_skb` 为空或端点协议族非 v4/v6 | socket 层 | 参数非法 |
+| `-EINVAL` | `send.c:314`；`allowedips.c:182,284` | 加密入队默认返回值、插入参数非法 | 发送/配置 | 前置条件不满足 |
+| `-EINVAL` | `ipc-linux.h:256,501` | netlink 出错但 `errno` 为零时的兜底 | wg 工具 | 内核未给出明确 errno |
+| `-ENOKEY` | `device.c:155` | `wg_xmit` 查 allowedips 无匹配 peer | tx_errors + ICMP 不可达 | 握手未完成或 AllowedIPs 未配 |
+| `-EPROTONOSUPPORT` | `device.c:148` | `wg_check_packet_protocol` 失败 | tx_errors | 交给 wg0 的不是 IPv4/IPv6 包 |
+| `-EDESTADDRREQ` | `device.c:167` | endpoint 地址族非 `AF_INET`/`AF_INET6` | tx_errors + ICMP | 对端 endpoint 未知 |
+| `-ENONET` | `socket.c:42,121,379` | `sock4`/`sock6` 为空或 `creating_net` 为空 | 发送或 `wg_socket_init` | netns 退出或 socket 未就绪 |
+| `-EADDRINUSE` | `socket.c:399-400` | IPv6 端口冲突且 `port==0` | `wg_socket_init` 内部重试 | 自动选端口时的正常现象 |
+| `-EAFNOSUPPORT` | `socket.c:162,169` | IPv6 未启用或端点地址族未知 | 发送 | 地址族不支持 |
+| `-EBUSY` | `receive.c:550,561-566` | RNG 未初始化或握手环生产失败 | `drop` 标签 | 入站握手被丢弃 |
+| `-ENOSPC` | `queueing.h:164-165` | `wg_prev_queue_enqueue` 失败 | 入队调用方 | per-peer 队列已满 |
+| `-EPIPE` | `queueing.h:171-172`；`send.c:322`；`receive.c:528` | `ptr_ring_produce_bh` 失败 | `PACKET_STATE_DEAD` | 设备加密环满，设计内降级 |
+| `-EINTR` | `ipc-linux.h:511-512` | `WG_CMD_GET_DEVICE` 被信号中断 | wg 工具 | 自动重试 |
+| `-ENAMETOOLONG` | `ipc-linux.h:475-478` | 接口名长度 ≥ `IFNAMSIZ` | wg 工具本地校验 | 请求未发往内核 |
+| `PTR_ERR(rt/dst)` | `socket.c:73-77,139-143` | IPv4/IPv6 路由查询失败 | 发送 | 真实 errno 由内核路由层给出 |
+| `PTR_ERR(segs)` | `device.c:181-183` | `skb_gso_segment` 分段失败 | tx_errors | GSO 分段异常 |
+| `-EEXIST` | 内核驱动源码无返回点；`wg-quick/android.c:253` 仅为 Binder 状态 | — | — | 配置路径如需此码，需对照实际版本核验 |
+
+模块初始化的回滚链是本表之外最值得单独贴出的代码，它决定了加载失败时 `insmod` 到底拿到什么值。
+
+```c
+/* drivers/net/wireguard/main.c:20-61（节选） */
+static int __init wg_mod_init(void)
+{
+	int ret;
+
+	ret = wg_allowedips_slab_init();
+	if (ret < 0)
+		goto err_allowedips;
+
+#ifdef DEBUG
+	ret = -ENOTRECOVERABLE;
+	if (!wg_allowedips_selftest() || !wg_packet_counter_selftest() ||
+	    !wg_ratelimiter_selftest())
+		goto err_peer;
+#endif
+	wg_noise_init();
+
+	ret = wg_peer_init();
+	if (ret < 0)
+		goto err_peer;
+	ret = wg_device_init();
+	if (ret < 0)
+		goto err_device;
+	ret = wg_genetlink_init();
+	if (ret < 0)
+		goto err_netlink;
+	/* ... pr_info ... */
+	return 0;
+err_netlink:
+	wg_device_uninit();
+err_device:
+	wg_peer_uninit();
+err_peer:
+	wg_allowedips_slab_uninit();
+err_allowedips:
+	return ret;
+}
+```
+
+接收路径的「错误」几乎都不是返回值，而是带日志或不带日志的丢弃标签，下面这段是入站数据包的最终裁决处。
+
+```c
+/* drivers/net/wireguard/receive.c:404-435（节选） */
+	routed_peer = wg_allowedips_lookup_src(&peer->device->peer_allowedips,
+					       skb);
+	wg_peer_put(routed_peer);
+	if (unlikely(routed_peer != peer))
+		goto dishonest_packet_peer;
+	napi_gro_receive(&peer->napi, skb);
+	update_rx_stats(peer, message_data_len(len_before_trim));
+	return;
+dishonest_packet_peer:
+	net_dbg_skb_ratelimited("%s: Packet has unallowed src IP ...\n", ...);
+	DEV_STATS_INC(dev, rx_errors);
+	DEV_STATS_INC(dev, rx_frame_errors);
+	goto packet_processed;
+dishonest_packet_type:
+	DEV_STATS_INC(dev, rx_errors);
+	DEV_STATS_INC(dev, rx_frame_errors);
+	goto packet_processed;
+dishonest_packet_size:
+	DEV_STATS_INC(dev, rx_errors);
+	DEV_STATS_INC(dev, rx_length_errors);
+	goto packet_processed;
+packet_processed:
+	dev_kfree_skb(skb);
+```
+
+### 4. 关键流程与调用链
+
+初始化失败链从 `wg_mod_init` 开始。`wg_allowedips_slab_init` 失败直接跳 `err_allowedips`，此时没有任何资源需要释放，直接 `return ret`。DEBUG 自检失败在 `main.c:29` 先把 `ret` 固定为 `-ENOTRECOVERABLE`，再跳 `err_peer`，该标签只调用 `wg_allowedips_slab_uninit()`，这正是因为 `wg_peer_init()` 尚未执行。若 `wg_peer_init()` 失败，同样跳 `err_peer`，释放的是刚创建的 slab 缓存；若 `wg_device_init()` 失败，跳 `err_device`，先 `wg_peer_uninit()` 再落到 `err_peer`；若 `wg_genetlink_init()` 失败，跳 `err_netlink`，依次 `wg_device_uninit`、`wg_peer_uninit`、`wg_allowedips_slab_uninit`。`wg_device_init` 自身还有一层回滚：`register_pm_notifier` 失败直接返回，`register_random_vmfork_notifier` 失败跳 `error_pm`，`register_pernet_device` 失败跳 `error_vm`，`rtnl_link_register` 失败跳 `error_pernet`。
+
+建链失败链在 `device.c` 的 `wg_newlink` 中，默认 `ret = -ENOMEM`。公钥哈希表或索引哈希表分配失败时，代码分别返回或跳到对应标签；三个 workqueue、三条加密队列、ratelimiter 依序初始化，每一步失败都跳到释放此前所有资源的标签；最后 `register_netdevice(dev)` 失败时，`ret` 被内核的返回值覆盖，跳 `err_uninit_ratelimiter` 一路回退。值得注意的是 `dev->priv_destructor = wg_destruct` 被刻意放在 `register_netdevice` 之后（见 `device.c:378-381` 的注释），避免注册失败时析构函数被提前调用——这是阅读回滚链时容易忽略的细节。
+
+控制面错误链从 wg 工具出发。`set.c:25` 先 `config_read_cmd` 做本地解析，任何格式错误在此终止，`ipc_set_device` 根本不会被调用；解析成功后 `ipc_set_device`（`ipc.c:89-98`）分流到 `kernel_set_device`，后者在 `ipc-linux.h:250-265` 用 `mnlg_socket_send` 与 `mnlg_socket_recv_run` 收发：发送失败取 `ret = -errno`，接收失败取 `errno ? -errno : -EINVAL`，最后 `errno = -ret` 交还调用方，`set.c:31-33` 用 `perror("Unable to modify interface")` 输出。查询路径 `kernel_get_device` 在 `ipc-linux.h:493-516` 还多一个 `-EINTR` 自动重试。netlink 内核侧的实现文件不在快照中，因此「哪个配置冲突返回哪个 errno」不做断言。
+
+发送失败链沿 `wg_xmit` 展开。协议检查失败置 `-EPROTONOSUPPORT` 跳 `err`；allowedips 查不到 peer 置 `-ENOKEY` 跳 `err_icmp`，发 ICMP 主机不可达；endpoint 地址族无效置 `-EDESTADDRREQ` 跳 `err_peer`，经 `err_icmp` 发 ICMP；GSO 分段用 `PTR_ERR(segs)` 透传。所有失败最终汇入 `err`：`DEV_STATS_INC(dev, tx_errors)`、`kfree_skb(skb)`、返回负值。与之相对，`send.c:391-400` 的 `out_nokey` / `out_invalid` 并不返回错误，而是把包「孤儿化」，等待下一次握手后再发送。
+
+接收丢弃链分两大支路。握手包在 `wg_packet_receive` 中先过 `prepare_skb_header`，`-EINVAL` 直接 `dev_kfree_skb`；队列生产失败（RNG 未初始化或环满）走 `drop` 标签并打印 `Dropping handshake packet`；进入 `wg_receive_handshake_packet` 后，MAC 校验失败打印 `Invalid MAC of handshake, dropping packet` 并静默丢弃，负载过重时改为回送 cookie，握手 consume 失败打印 `Invalid handshake initiation/response` 后丢弃。数据包在 `wg_packet_consume_data` 中按索引查 keypair，失败即静默丢弃；`counter_validate` 返回假表示重放或 nonce 越界，打印 `Packet has invalid nonce` 后走 `next`；最终 `wg_packet_consume_data_done` 对源地址不匹配、类型非法、长度不实三类情况分别累加 `rx_errors` 与 `rx_frame_errors` / `rx_length_errors`。三条链的错误传播关系见图 04-08-01。
+
+:::figure id=04-08-01 | name=WireGuard 错误源、三种出口与观测点 | dir=TD
+node e1 "初始化失败<br/>wg_mod_init 回滚" red
+node e2 "配置失败<br/>netlink 与 wg 工具" amber
+node e3 "发送失败<br/>wg_xmit / socket.c" purple
+node e4 "接收丢弃<br/>receive.c 校验与重放" gray
+node o1 "同步 errno<br/>非零退出码" blue
+node o2 "内核日志<br/>pr_err / dbg_ratelimited" teal
+node o3 "静默丢包<br/>DEV_STATS_INC 计数" green
+node v1 "dmesg" blue
+node v2 "stderr 与 $?" blue
+node v3 "ip -s link 与 wg show" blue
+edge e1 -> o1 "goto 返回 ret"
+edge e1 -> o2 "pr_err"
+edge e2 -> o1 "errno 取负"
+edge e2 -> v2 "perror 输出"
+edge e3 -> o2 "net_dbg_ratelimited"
+edge e3 -> o3 "tx_errors / tx_dropped"
+edge e4 -> o2 "丢弃日志"
+edge e4 -> o3 "rx_errors"
+edge o1 -> v2 "退出码"
+edge o2 -> v1 "日志缓冲"
+edge o3 -> v3 "统计字段"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：四个错误源分别是「初始化失败 wg_mod_init 回滚」「配置失败 netlink 与 wg 工具」「发送失败 wg_xmit / socket.c」「接收丢弃 receive.c 校验与重放」；它们汇入三种出口——「同步 errno 非零退出码」「内核日志 pr_err / dbg_ratelimited」「静默丢包 DEV_STATS_INC 计数」；三种出口又分别落在「dmesg」「stderr 与 $?」「ip -s link 与 wg show」三个观测点上。排障时应当先确定错误属于哪一条源，再去对应观测点取证。
+
+### 5. 配置/命令/代码实例
+
+下面这段命令按「内核侧、用户态校验侧、统计侧」三组复现本篇讨论的错误出口。
+
+```bash
+# 内核侧：DEBUG 构建自检失败会让 insmod 返回 -ENOTRECOVERABLE
+sudo insmod wireguard.ko; echo "exit=$?"
+dmesg | grep -F 'wireguard:' | tail -n 5
+
+# 用户态本地校验：错误在构造 netlink 请求前就终止
+wg set wg0 fwmark 0x100000000
+wg set wg0 peer AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= allowed-ips 10.0.0.2/33
+
+# 真正来自内核的 errno：接口不存在
+wg set nosuch0 listen-port 51820
+
+# 统计侧：静默丢弃只体现为计数
+ip -s link show wg0
+wg show wg0
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+# 场景一：DEBUG 构建自检失败
+insmod: ERROR: could not insert module wireguard.ko: State not recoverable
+exit=1
+# 场景二：fwmark 越界（config.c:103）
+Fwmark is neither 0/off nor 0-0xffffffff: `0x100000000'
+# 场景三：AllowedIP 掩码非法（config.c:431）
+AllowedIP is not in the correct format: `10.0.0.2/33'
+# 场景四：内核 errno 经 set.c:32 的 perror 输出
+Unable to modify interface: No such device
+# 场景五：ip -s link 的接收统计
+    RX:  bytes packets errors dropped
+        4096      12      3      0
+# 场景六：wg show 的运行状态
+  latest handshake: 4 minutes ago
+```
+
+逐行判读如下。`State not recoverable` 对应 `main.c:29-32`：DEBUG 自检失败把 `ret` 设为 `-ENOTRECOVERABLE`，经 `err_peer` 标签回滚 slab 缓存后返回，`insmod` 把负 errno 转成文字；具体措辞依赖 C 库的 `strerror`，且 `selftest/` 目录为空、自检日志文本不可考，因此这里只断言返回路径不断言日志内容。`exit=1` 是 shell 对非零退出码的呈现，说明模块没有真正加载。第三行来自 `config.c:103` 的本地校验：`0x100000000` 超出 32 位无符号范围，工具在调用 `ipc_set_device` 之前就退出，所以这不是内核 errno。第四行来自 `config.c:431` 的 AllowedIP 格式校验，掩码 33 对 IPv4 非法；同一文件第 415 行还会对「主机位非零」给出警告，两者要区分。第五行 `Unable to modify interface: No such device` 是 `set.c:31-33` 的 `perror` 结果，前半段是 `perror` 的固定前缀，后半段才是从 `ipc-linux.h` 传回的 errno 文本，说明请求确实到达了内核但目标接口不存在。第六、七行是本表最容易被忽略的一类：`errors 3` 来自 `receive.c` 的 `dishonest_packet_peer` / `dishonest_packet_type` / `dishonest_packet_size` 三个标签对 `rx_errors` 的累加，`dropped 0` 表示没有环队列丢包，两者口径不同；最后一行 `latest handshake: 4 minutes ago` 不是错误码，却是判断「静默认证失败」最关键的证据——WireGuard 不回认证错误，握手时间不更新就说明对端报文在 `receive.c` 的 MAC 或 consume 检查中被丢弃，应回到日志与计数器继续定位。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把「没有报错」当成「没有错误」。协议层不回认证失败报文，`receive.c` 的许多丢弃分支只写 `net_dbg_ratelimited` 日志甚至完全静默，只有计数器会变化。排障时应固定三件事一起看：`ip -s link show wg0` 的 `errors` / `dropped`、`wg show` 的 `latest handshake` 与 `transfer`、以及 `dmesg` 中带 `wireguard:` 前缀的行。
+
+第二个陷阱是以为每条丢弃都会留下日志。`net_dbg_ratelimited` 与 `net_dbg_skb_ratelimited` 在高频触发时会抑制输出，日志缺失只说明被限流，不能反推没有丢包；反过来，日志里出现 `Invalid MAC of handshake` 通常是遭受探测或负载下的 cookie 挑战，不一定是本端配置错误。
+
+第三个陷阱是把设计内降级当故障。`-EPIPE` 表示设备加密环满，调用方按 `PACKET_STATE_DEAD` 处理；`-ENOSPC` 表示 per-peer 队列满；`-ENOKEY` 表示会话密钥尚未就绪，包被暂存。这些是压力或握手过渡期的正常行为，盲目重启接口会丢弃暂存包并重新握手，反而延长收敛时间。
+
+第四个陷阱是混淆 errno 的来源层次。用户态 `config.c` 的校验错误没有内核 errno，`set.c` 的 `perror` 才有；`ipc-linux.h:256,501` 的 `-EINVAL` 只是「内核报错但 errno 为零」时的兜底，不代表具体内核分支。看到文字错误时，先判断它来自本地校验还是 netlink 回传，再决定查配置文件还是查内核。
+
+第五个陷阱是把 `-EEXIST` 之类的配置冲突码据为己有。本快照内核驱动中不存在该返回点，唯一的 `-EEXIST` 在 Android Binder 状态枚举里；netlink 配置实现 `netlink.c` 未随快照提供，任何「重复 peer 返回 `-EEXIST`」的说法都必须先对照目标内核版本核验。
+
+第六个陷阱是误读 `-ENONET`。`socket.c:42,121` 表示 socket 尚未建立，`socket.c:379` 表示 `creating_net` 为空；结合 `device.c:31-62` 的 `wg_open` 会调用 `wg_socket_init`，可知接口未 up 或创建它的网络命名空间已退出是常见诱因（netns 清理逻辑见 `device.c:414-435`）。
+
+第七个陷阱是误用日志级别。`device.c:383` 与 `device.c:268` 的 `Interface created` / `Interface destroyed` 走的是 `pr_debug`，默认内核日志级别下不会出现；`socket.c` 的 `Could not create IPv4 socket` / `Could not create IPv6 socket` 才是 `pr_err`。排查建链或 socket 失败时，若期望看到调试行，需要确认内核是否开启动态调试或构建时定义了 `DEBUG`，不能因为 `dmesg` 里没有 `Interface created` 就断定建链没发生。
+
+第八个陷阱是把累计计数当成瞬时值。`ip -s link` 的 `errors` 与 `wg show` 的 `transfer` 都是自接口创建以来的累计量，单次排障应记录前后两次读数做差，才能判断故障是否仍在继续；`errors` 增长而 `latest handshake` 正常，通常指向数据面伪装报文被拒（`dishonest_packet_*`），`errors` 不变而握手时间不更新，则更可能是握手包在 MAC 校验或 consume 阶段被丢弃，两者的处置方向完全不同。
+
+最后是本册一贯的版本纪律：全部绝对值性能与时序都不在此讨论，错误码含义以快照源码为准，凡标注「需对照实际版本核验」的条目，都应以目标系统实际内核与 uapi 头为准再确认（版本基准见 01-04）。
+
+### 7. 小结与延伸阅读
+
+本篇把 WireGuard Linux 的错误行为按「错误码全集、错误路径、报错出口」三层收拢：初始化层以 `goto` 回滚与 `-ENOTRECOVERABLE` 为核心，`device.c` 的建链链和 `wg_device_init` 各自有独立的逆序释放；控制面以 wg 工具的本地校验与 netlink errno 回传为界，`config.c` 的错误不出用户态，`set.c` 的 `perror` 才反映内核结果；数据面则把 `-EPROTONOSUPPORT`、`-ENOKEY`、`-EDESTADDRREQ`、`-ENONET`、`-EAFNOSUPPORT`、`-EINVAL`、`-EBUSY`、`-ENOSPC`、`-EPIPE` 等码与 `PTR_ERR` 透传分别对应到发包、socket、入队、接收校验等具体分支，并明确 `receive.c` 的多数丢弃只有计数与限流日志、没有返回值。全表所有条目均标出真实源码位置；本快照缺失的 `netlink.c` 内部 errno 与 `selftest/` 日志文本均标注需核验，未作虚构。
+
+延伸阅读按三条线走：netlink 属性与命令全集读 04-05，uapi 常量读 04-06，模块参数与接口存在性读 04-07；机制读 06-06（接收路径）与 06-08（抗重放），数据面模块职责读 07-08（receive.c）与 07-09（socket.c / cookie.c）；排障读 08-03（诊断决策树）与 08-04（故障案例库）。跨册随查按（字段见 05-02 ｜ 参数见 04-07 ｜ 原理见 06-06 ｜ 模块见 07-08）执行：需要 `wg_device` / `wg_peer` 逐字段定义去 05 册，需要参数与接口全集去 04-07，需要丢弃与重放原理去 06 册，需要目录级模块职责去 07 册。凡本篇标注「需对照实际版本核验」的错误码，均以 `_wglinux_build/upstream_src/` 下对应文件为准。

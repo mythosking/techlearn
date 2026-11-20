@@ -1,0 +1,253 @@
+## 07-09 socket.c 与 cookie.c 网络模块
+
+### 1. 背景与动机
+
+在 `drivers/net/wireguard/` 这份内核驱动里，如果把 `noise.c`、`send.c`、`receive.c` 看成「协议引擎」，那么 `socket.c` 与 `cookie.c` 就是引擎与内核网络栈之间的两道边界。`socket.c` 掌管所有 UDP 报文的实际收发、双栈 socket 的生命周期以及 endpoint（对端地址）的维护；`cookie.c` 则在不触碰任何会话密钥的前提下，用极低成本判断「这个刚收到的包值不值得继续处理」。本篇是 07 册的目录级模块职责权威源，只回答三件事：模块做什么、对外暴露哪些 API、与邻居模块如何划清职责。UDP 封装、GSO/GRO 与收发流水线的原理见 06-12，cookie 与 DoS 防护的完整数学与状态机见 06-09，本篇不重复展开。
+
+先给版本与范围定位。本套资料的事实锚点是 `_wglinux_build/upstream_src/wireguard-linux-src/` 内核驱动快照，下文出现的源码路径均相对 `drivers/net/wireguard/`。在这个快照里，`socket.c` 约 430 行，`cookie.c` 约 236 行，`cookie.h` 只有 59 行——两个模块加起来体积不大，却处在数据面的最外围：所有进出隧道的报文都要经过 `socket.c` 的 UDP socket，所有握手 initiations 在进入昂贵的 Curve25519 运算之前都要先过 `cookie.c` 的校验。理解这一点，就能理解为什么这两个模块被放在一起讲：它们共同构成「内核网络栈 ↔ WireGuard 引擎」的入口与出口，一个管「怎么把包发出去、收进来」，一个管「收进来的包该不该继续处理」。
+
+把职责边界说清楚，是本篇的核心目的。`socket.c` 不构造握手消息、不做加解密，它只负责把上层已经封装好的字节流交给内核 UDP 栈，或者把 UDP 收到的数据块原样交给 `wg_packet_receive()`；它持有的是 `struct sock`、endpoint 与目的缓存。`cookie.c` 不维护 peer 的握手状态机，它只在消息尾部读写 `mac1`/`mac2` 两个认证标签，并在需要时签发或消费一条 cookie 消息；它持有的是周期性轮换的密钥与检查器状态。两者都不决定「会发生握手」，那是 `noise.c` 与 `timers.c` 的事，分别归入握手引擎与定时器模块。这种「薄而专」的设计使数据面外围保持可审计：想确认一个包是否被正确承认，读 `cookie.c` 的几十行判断即可，不必深入握手引擎。
+
+从阅读顺序上，建议把两个模块按「出口—入口—防御」三步来看。第一步看 `send4()` 与 `send6()`，它们把 endpoint 与 `fwmark` 翻译成内核的 `flowi4`/`flowi6`，再由 `udp_tunnel_xmit_skb()` 系列函数发出，这是所有报文的唯一出口；第二步看 `wg_receive()` 与 `wg_socket_endpoint_from_skb()`，它们把 UDP 收到的字节流交回引擎、并从中学习对端地址，这是所有报文的唯一入口；第三步看 `wg_cookie_validate_packet()` 与 `wg_cookie_message_create()`，它们在入口的最前端拦下伪造源地址的握手洪泛。按这个顺序读，可以避免把「选路封装」「收包分发」「安全判定」三类逻辑搅在一起。需要注意，这两个模块都不分配 `wg_peer`、不解析 Noise 消息体、也不操作加密队列，它们处理的对象是自始至终的 `sk_buff` 与字节缓冲区，这正是它们能够独立于协议引擎演进的原因。
+
+### 2. 核心概念
+
+`socket.c` 的核心概念可以压缩为「双栈 socket、UDP 隧道回调、endpoint、目的缓存」四组。双栈指 `wg_device` 同时持有 `sock4` 与 `sock6` 两个 RCU 保护的 socket 指针：`sock4` 用 `udp_sock_create()` 以 `INADDR_ANY` 和指定端口创建，`sock6` 在 `CONFIG_IPV6` 开启且 `ipv6_mod_enabled()` 为真时创建，且带 `ipv6_v6only = true`，并使用与 `sock4` 相同的本地端口（源码直接把 `inet_sk(new4->sk)->inet_sport` 赋给 `port6.local_udp_port`）。UDP 隧道回调指 `wg_socket_init()` 传入的 `struct udp_tunnel_sock_cfg`，其中 `encap_type = 1`、`encap_rcv = wg_receive`、`sk_user_data = wg`：内核 UDP 栈收到匹配报文后直接调用 `wg_receive()`，避免走普通 socket 的排队路径。endpoint 指 `struct endpoint`，它把地址族、地址、端口与源地址（IPv4 还有 `src_if4`，IPv6 还有 scope id）打包成一个可比对的单元；endpoint 更新走 `endpoint_eq()` 快路径，相等则直接返回。目的缓存指 `dst_cache`，`send4()` 与 `send6()` 用它缓存最近一次路由结果，endpoint 变化时通过 `dst_cache_reset()` 失效。
+
+`cookie.c` 的核心概念是「两个标签、一个 cookie、两个状态载体、四级判定」。两个标签是消息尾部的 `mac1` 与 `mac2`：`mac1` 用从对端公钥经 BLAKE2s 派生的 `message_mac1_key` 计算，提供「来源确实持有公钥」的轻量证明；`mac2` 用 cookie 本身作为 BLAKE2s 密钥计算，提供「对端确实收到过我们的响应」的证明。一个 cookie 是 `make_cookie()` 用检查器周期性轮换的 `secret`，对源 IP 与 UDP 源端口做 BLAKE2s 得到的 16 字节值（`COOKIE_LEN = 16`），它把攻击者绑定在具体来源上。两个状态载体分别是 `struct cookie_checker`（收包侧，持有 `secret`、`secret_birthdate`、预计算的 `cookie_encryption_key` 与 `message_mac1_key`）和 `struct cookie`（每个 peer 一份，持有本端曾发出的 `last_mac1_sent`、收到的 `cookie` 及 `cookie_decryption_key` 等）；两者的字段定义统一见 05-07，本篇只点名不展开。四级判定是枚举 `cookie_mac_state` 的四个值：`INVALID_MAC`、`VALID_MAC_BUT_NO_COOKIE`、`VALID_MAC_WITH_COOKIE_BUT_RATELIMITED`、`VALID_MAC_WITH_COOKIE`，它们构成从「丢弃」到「放行」的递进闸门。
+
+两者通过 `cookie.c` 里的一行调用发生职责交接：`wg_cookie_validate_packet()` 在 `mac2` 校验通过后调用 `wg_ratelimiter_allow(skb, dev_net(checker->device->dev))`，把「要不要放行」的最后一票交给限速模块 `ratelimiter.c`。这行代码说明限速不是独立的数据面环节，而是 cookie 校验的一个子步骤——原理见 06-10。反过来，`socket.c` 与 `cookie.c` 之间没有直接函数调用：cookie 消息也是字节流，同样经 `wg_socket_send_buffer_as_reply_to_skb()` 由 UDP socket 发出。这种「通过字节流而非函数调用耦合」的方式，是两个模块保持独立的关键。
+
+### 3. 关键数据结构与源码位置
+
+下表把本篇反复引用的源码位置收拢成速查。表中只点名函数与结构，逐字段定义交给 05 册。
+
+| 关注点 | 真实源码路径与函数 | 本册处理方式 |
+|---|---|---|
+| IPv4 发送 | `socket.c` 的 `send4` | 讲职责，路由细节见 06-12 |
+| IPv6 发送 | `socket.c` 的 `send6` | 讲职责，`CONFIG_IPV6` 守卫需核验 |
+| 按 peer 发送 | `socket.c` 的 `wg_socket_send_skb_to_peer` | 讲对外 API |
+| endpoint 提取与更新 | `socket.c` 的 `wg_socket_endpoint_from_skb`、`wg_socket_set_peer_endpoint` | 点名，字段见 05-07 |
+| socket 生命周期 | `socket.c` 的 `wg_socket_init`、`wg_socket_reinit` | 讲对外 API |
+| cookie 校验 | `cookie.c` 的 `wg_cookie_validate_packet` | 讲四级判定 |
+| MAC 与 cookie 生成 | `cookie.c` 的 `compute_mac1`、`compute_mac2`、`make_cookie` | 点名，原理见 06-09 |
+| cookie 消息收发 | `cookie.c` 的 `wg_cookie_message_create`、`wg_cookie_message_consume` | 讲对外 API |
+
+结构体层面需要建立三处映射。`wg_device` 中的 `sock4`、`sock6`、`creating_net`、`fwmark`、`incoming_port`、`cookie_checker` 与 `socket_update_lock` 是 socket 模块操作的核心字段（字段见 05-02）；`struct endpoint` 与 `struct cookie_checker`、`struct cookie` 是 cookie 与 endpoint 模块的核心载体（字段见 05-07）；`message_macs`、`message_handshake_cookie` 定义了 `mac1`/`mac2` 与 cookie 消息在线路上的布局（字段见 05-05）。值得强调的是，`wg_cookie_add_mac_to_packet()` 与 `wg_cookie_validate_packet()` 都不是从头地址偏移取 MAC，而是用 `skb->data + skb->len - sizeof(*macs)` 或 `message + len - sizeof(*macs)` 从尾部回退——这与 `messages.h` 里「MAC 位于消息末尾」的布局约定一致，改动消息布局时必须同步 reviewing 这几处指针算术。
+
+常量集中在 `messages.h`：`COOKIE_SECRET_MAX_AGE = 2 * 60`（秒，cookie 密钥最长存活 120 秒）、`COOKIE_SECRET_LATENCY = 5`、`COOKIE_NONCE_LEN = XCHACHA20POLY1305_NONCE_SIZE`、`COOKIE_LEN = 16`；`HANDSHAKE_DSCP = 0x88`（AF41 加 00 ECN）则被发送路径用作 DSCP 值。这些常量决定 cookie 的轮换节奏与消息长度，属于编译期固定值，运行期不可调（参数见 04-06）。
+
+从对外 API 的分组看，`socket.c` 暴露的函数可分为四类：发送类（`wg_socket_send_skb_to_peer`、`wg_socket_send_buffer_to_peer`、`wg_socket_send_buffer_as_reply_to_skb`）、endpoint 类（`wg_socket_endpoint_from_skb`、`wg_socket_set_peer_endpoint`、`wg_socket_set_peer_endpoint_from_skb`、`wg_socket_clear_peer_endpoint_src`）、生命周期类（`wg_socket_init`、`wg_socket_reinit`），以及隐含在 `udp_tunnel_sock_cfg` 里的回调 `wg_receive`。`cookie.c` 暴露的 API 同样可分组：初始化类（`wg_cookie_checker_init`、`wg_cookie_init`）、预计算类（两个 `wg_cookie_checker_precompute_*_keys`）、校验类（`wg_cookie_validate_packet`、`wg_cookie_add_mac_to_packet`）、消息类（`wg_cookie_message_create`、`wg_cookie_message_consume`）。`wg_cookie_validate_packet()` 的 `check_cookie` 布尔参数尤其值得注意：当调用者只想验证 `mac1` 而不强制 cookie 时传 `false`，此时即使 `mac2` 缺失也会返回 `VALID_MAC_BUT_NO_COOKIE`；只有传 `true` 才会进一步做 `make_cookie()` 与限速检查（原理见 06-09）。这种「可选严格度」让同一个函数能服务不同握手阶段。
+
+### 4. 关键流程与调用链
+
+先看发送方向。`wg_socket_send_skb_to_peer(peer, skb, ds)` 是对外主入口：它取 `peer->endpoint` 的 `sa_family`，`AF_INET` 走 `send4()`、`AF_INET6` 走 `send6()`，其它情况释放 skb；整个过程持 `peer->endpoint_lock` 的读锁，成功时累加 `peer->tx_bytes`。`send4()` 用 endpoint 的源/目的地址、端口与 `wg->fwmark` 构造 `struct flowi4`，先在 `dst_cache` 中查缓存路由，未命中再 `ip_route_output_flow()`；若发现源地址已不属于本机（`__ip_dev_find` 失败）或 `src_if4` 与出接口不一致，就把源地址清零、重置缓存并重查路由，最后调用 `udp_tunnel_xmit_skb()` 发出，并把 `skb->ignore_df` 置 1 允许分片。`send6()` 逻辑镜像，走 `ip6_dst_lookup_flow()` 与 `udp_tunnel6_xmit_skb()`。另外两个入口是便利封装：`wg_socket_send_buffer_to_peer()` 把裸缓冲区包成 skb 后转主入口；`wg_socket_send_buffer_as_reply_to_skb()` 先用 `wg_socket_endpoint_from_skb()` 从入包反推出 endpoint，再以 `ds = 0`、`cache = NULL` 直接发送——cookie 响应正是走这条路。
+
+接收方向很短：UDP 隧道回调 `wg_receive()` 从 `sk->sk_user_data` 取回 `wg_device`，调用 `wg_packet_receive(wg, skb)` 把包交给接收引擎，无论成功与否都返回 0（这是 `encap_rcv` 回调的约定），异常路径只做 `kfree_skb()`。endpoint 的学习则由 `wg_socket_set_peer_endpoint_from_skb()` 完成：先从 skb 的 IP/UDP 头提取地址与源地址，再交给 `wg_socket_set_peer_endpoint()`；后者在 `endpoint_eq()` 判定无变化后立即返回，有变化才持写锁拷贝并 `dst_cache_reset()`。`wg_socket_clear_peer_endpoint_src()` 是握手重试时的「(source address 归零)」操作，用 `dst_cache_reset_now()` 立即失效缓存（原理见 06-11）。
+
+socket 的初始化链值得单独记：`wg_socket_init(wg, port)` 先创建 IPv4 socket 并 `setup_udp_tunnel_sock()`，再尝试 IPv6；当端口为 0（自动分配）且 IPv6 创建返回 `-EADDRINUSE` 时，最多重试 100 次，让 v4/v6 拿到同一个端口。随后 `wg_socket_reinit()` 在 `socket_update_lock` 下用 `rcu_assign_pointer()` 原子替换 `sock4`/`sock6`，更新 `wg->incoming_port`，`synchronize_net()` 等待旧读者退出，再释放旧 socket。图 07-09-01 汇总了上述收发与 cookie 判定路径。
+
+:::figure id=07-09-01 | name=socket.c 与 cookie.c 的收发与校验边界 | dir=TD
+node n1 "UDP 隧道回调<br/>wg_receive" blue
+node n2 "cookie 校验<br/>mac1 与 mac2" purple
+node n3 "四级判定<br/>cookie_mac_state" teal
+node n4 "限速闸门<br/>wg_ratelimiter_allow" amber
+node n5 "接收引擎<br/>wg_packet_receive" green
+node n6 "按 peer 发送<br/>wg_socket_send_skb_to_peer" teal
+node n7 "send4 与 send6<br/>选路与封装" blue
+node n8 "endpoint 学习<br/>set_peer_endpoint" gray
+node n9 "cookie 响应<br/>message_create" purple
+edge n1 -> n2 "入站包"
+edge n2 -> n3 "标签比对"
+edge n3 -> n4 "需 cookie 时"
+edge n4 -> n5 "放行"
+edge n8 -> n6 "提供目的地址"
+edge n6 -> n7 "选栈"
+edge n5 -> n9 "触发挑战"
+edge n9 -> n7 "经 UDP 发出"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：入站侧，「UDP 隧道回调 wg_receive」把包交给「cookie 校验 mac1 与 mac2」，得到「四级判定 cookie_mac_state」，需要时再过「限速闸门 wg_ratelimiter_allow」，最终放行到「接收引擎 wg_packet_receive」；接收引擎可触发「cookie 响应 message_create」。出站侧，「endpoint 学习 set_peer_endpoint」为「按 peer 发送 wg_socket_send_skb_to_peer」提供目的地址，后者经「send4 与 send6 选路与封装」发出，cookie 响应也复用这条出口。
+
+### 5. 配置/命令/代码实例
+
+下面两段代码展示模块 API 的典型用法。第一段是发送与 endpoint 更新，第二段是收包侧 cookie 校验与限速接线；均为示意片段，具体签名以源码为准。
+
+```c
+/* 场景一：收到对端包后学习 endpoint，再回一条消息 */
+struct endpoint ep;
+if (!wg_socket_endpoint_from_skb(&ep, skb))
+        wg_socket_set_peer_endpoint(peer, &ep);
+wg_socket_send_buffer_as_reply_to_skb(wg, skb, reply, reply_len);
+
+/* 场景二：收包侧的 cookie 四级判定 */
+enum cookie_mac_state st;
+st = wg_cookie_validate_packet(&wg->cookie_checker, skb, true);
+if (st == VALID_MAC_WITH_COOKIE)
+        wg_packet_receive(wg, skb);   /* 放行到引擎 */
+else if (st == VALID_MAC_BUT_NO_COOKIE)
+        wg_cookie_message_create(&cookie_msg, skb, index,
+                                 &wg->cookie_checker);
+```
+
+要观察 socket 模块对外呈现的监听状态，可以用下面的命令组合；`wg show` 读的是 netlink 属性，而 `ss` 读的是内核 socket 表，两者正好互相印证。
+
+```bash
+wg show wg0
+ss -lunp | grep ':51820'
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+示例输出，具体格式需对照实际版本核验
+interface: wg0
+  public key: <公钥>
+  listening port: 51820
+peer: <对端公钥>
+  endpoint: 203.0.113.9:51820
+  latest handshake: 8 seconds ago
+UNCONN 0 0 0.0.0.0:51820 0.0.0.0:* users:(("wireguard",pid=0,fd=3))
+UNCONN 0 0 [::]:51820 [::]:* users:(("wireguard",pid=0,fd=4))
+```
+
+逐行判读如下。`interface: wg0` 确认查询命中了正确的 netlink 设备对象，若多接口环境选错对象，后面所有行都会误导判断。`listening port: 51820` 对应 uapi 的 `WGDEVICE_A_LISTEN_PORT`，但它展示的是 `wg_socket_reinit()` 写入的 `wg->incoming_port`——当配置端口为 0 时，这里显示的是内核自动分配后由 `wg_socket_reinit()` 回填的实际端口，并非配置文件里的字面值，这一点常被误读。`peer` 与 `endpoint` 两行来自 `WGPEER_A_*` 属性，其中 endpoint 的源地址部分正是由 `wg_socket_set_peer_endpoint_from_skb()` 在收到对端包后动态学习、并参与 `endpoint_eq()` 比较的那份结构（字段见 05-07）。`latest handshake` 来自 `WGPEER_A_LAST_HANDSHAKE_TIME`，它由 `timers.c` 的握手完成事件写入，和本模块无直接关系，但只有握手成功后 `socket.c` 才会持续向该 endpoint 发送数据，握手计时由 `timers.c` 承担。最后两行 `ss` 输出是 socket 模块的直接证据：`0.0.0.0:51820` 对应 `sock4`，由 `wg_socket_init()` 以 `INADDR_ANY` 创建；`[::]:51820` 对应 `sock6`，带 `ipv6_v6only` 且复用同一端口，这正是源码里「把 v4 的 `inet_sport` 赋给 v6 端口配置」的结果。若只看到 v4 一行而缺 v6 行，应检查内核是否开启 `CONFIG_IPV6` 与 `ipv6_mod_enabled()`。需要提醒的是，`wg show` 并不显示 `fwmark`、`dst_cache` 或 cookie 状态，这些属于内核内部运行时数据，不能从该命令推断。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把 `socket.c` 与 `send.c` 混为一谈。`socket.c` 只做「选路加 UDP 封装发送」，消息体的构造与加密在 `send.c`（原理见 06-05，发送职责在 `send.c`）；排障时若报文内容错误，不该去读 `socket.c`。第二个陷阱是忽视 IPv6 的条件编译：`send6()` 与 `port6` 都包在 `CONFIG_IPV6` 里，未开启时直接返回 `-EAFNOSUPPORT`，因此「v6 对端不通」要先确认内核配置，再查 endpoint 地址族。第三个陷阱是 endpoint 源地址的处理：NAT 场景对端地址变化后，`wg_socket_set_peer_endpoint()` 会整体更新并在持写锁时 `dst_cache_reset()`；而握手重试用的是 `wg_socket_clear_peer_endpoint_src()`，它只清零 `src6` 并 `dst_cache_reset_now()`——前者是「学习到新地址」，后者是「怀疑源地址错了」，两者语义不同，不要互相替代。
+
+第四个陷阱与并发有关。`wg_socket_reinit()` 用 RCU 替换 socket 后必须 `synchronize_net()` 再释放旧 socket，否则可能释放仍被读者引用的对象；`wg_cookie_checker_init()` 与 `wg_cookie_init()` 都初始化 `rw_semaphore`，预计算设备密钥的 `wg_cookie_checker_precompute_device_keys()` 注释明确要求「必须持有 `peer->handshake.static_identity->lock`」，违反会读到半更新的公钥。第五个陷阱是 cookie 密钥的生命周期：`make_cookie()` 在 `secret_birthdate` 超过 `COOKIE_SECRET_MAX_AGE`（120 秒）时轮换 `secret`，整个计算在读锁下进行；`wg_cookie_add_mac_to_packet()` 判断 cookie 有效性时用的是 `COOKIE_SECRET_MAX_AGE - COOKIE_SECRET_LATENCY`（即提前 5 秒停止使用），以免对端刚签发的 cookie 因边界抖动被判过期。第六个陷阱是 MAC 比对必须用 `crypto_memneq()` 常量时间比较，不能用普通 `memcmp`，否则会引入时序侧信道（原理见 06-09）。
+
+最佳实践可归纳为三条：排障时先用 `wg show` 与 `ss` 确认 socket 与 endpoint 状态，再决定是否深入 cookie 与握手（排障见 08-03）；不要试图在运行期调整 `COOKIE_LEN` 或轮换周期，它们是编译期常量，改动需重新构建模块（构建见 02-02）；阅读 `cookie.c` 时把 `wg_cookie_validate_packet()` 的四级返回值当作状态机看，而不是布尔值，否则会误解 `VALID_MAC_WITH_COOKIE_BUT_RATELIMITED` 这一「签名正确但被限速拒绝」的中间态。
+
+还有一个容易忽视的协作点是 cookie 与限速的边界：`wg_cookie_validate_packet()` 只有在 `check_cookie` 为真、且 `mac2` 校验通过之后才调用 `wg_ratelimiter_allow()`，因此限速判定并不是对每个数据包都执行，而是集中在「带 cookie 的握手消息」这条路径上，由 `ratelimiter.c` 承担。这意味着普通数据包的速率不受这个令牌桶约束，限速模块保护的是握手的昂贵非对称运算，而非转发吞吐——原理见 06-10。据此可以确定排障顺序：若怀疑被限速，应先看握手是否失败、`latest handshake` 是否停滞，而不是看数据转发的吞吐量。
+
+### 7. 小结与延伸阅读
+
+本篇把 `socket.c` 与 `cookie.c` 定位为 WireGuard 数据面的外围边界模块：`socket.c` 以 `sock4`/`sock6` 双栈 UDP socket、`encap_rcv = wg_receive` 回调、endpoint 学习与 `dst_cache` 缓存，对外提供 `wg_socket_send_skb_to_peer()`、`wg_socket_send_buffer_to_peer()`、`wg_socket_send_buffer_as_reply_to_skb()`、`wg_socket_endpoint_from_skb()`、`wg_socket_set_peer_endpoint()`、`wg_socket_init()` 与 `wg_socket_reinit()` 等 API；`cookie.c` 以 `mac1`/`mac2` 双标签、周期性轮换的 `secret` 与四级 `cookie_mac_state` 判定，对外提供 `wg_cookie_checker_init()`、`wg_cookie_init()`、两组 `precompute_*_keys()`、`wg_cookie_validate_packet()`、`wg_cookie_add_mac_to_packet()`、`wg_cookie_message_create()` 与 `wg_cookie_message_consume()` 等 API，并在校验末端把放行决定交给限速模块。二者不构造消息、不维护握手状态机，职责边界清晰。
+
+延伸阅读：UDP 封装与收发流水线见 06-12，cookie 数学与 DoS 防护见 06-09，限速判定见 06-10；字段全集见 05-02、05-05、05-07，编译期常量见 04-06，运行时排障见 08-03。跨册随查按（字段见 05-07 ｜ 参数见 04-06 ｜ 原理见 06-09 ｜ 排障见 08-03）执行：结构体逐字段去 05、参数与常量全集去 04、机制与调用链去 06、运维场景与基准去 08。凡本篇标注「需对照实际版本核验」的函数签名、条件编译项与字段语义，均以 `_wglinux_build/upstream_src/` 下对应文件为准，本套资料不编造未核验的路径与取值。
+
+## 07-10 timers.c 与 ratelimiter.c 时限与限速模块
+
+### 1. 背景与动机
+
+`timers.c` 与 `ratelimiter.c` 处在 WireGuard 数据面的「后台」：前者是每个 peer 私有的定时器状态机，负责握手重传、keepalive、新握手触发、密钥材料清零与持久 keepalive 五类延时动作；后者是全设备共享的令牌桶，负责在 cookie 校验的末端拒绝过快的握手来源。二者都不出现在收发主路径的同步调用栈里，却决定了隧道「能不能维持」与「会不会被握手洪泛拖垮」。本篇是 07 册的模块职责权威源，只讲模块做什么、对外提供哪些 API、与邻居模块如何分工；定时器体系的完整时序见 06-11，握手限速的设计动机见 06-10，本篇不重复这两篇的机制推演。
+
+版本与范围仍以 `_wglinux_build/upstream_src/wireguard-linux-src/` 内核驱动快照为准，下文路径均相对 `drivers/net/wireguard/`。这个快照里 `timers.c` 约 247 行、`ratelimiter.c` 约 223 行（末行还包含一个 `#include "selftest/ratelimiter.c"`，调试构建下会展开自检代码）。把两者放在一起讲有三条理由。其一，它们都由 `wg_peer` 或 `wg_device` 持有状态，属于「有状态模块」，与 `socket.c`、`cookie.c` 的「无连接边界」形成对照。其二，它们都被收发路径以事件通知的方式驱动：发送与接收代码调用 `wg_timers_*()` 重置定时器，`cookie.c` 调用 `wg_ratelimiter_allow()` 查询令牌，自己却很少主动发起动作。其三，它们的正确性与运维观测强相关：`wg show` 里的 `latest handshake`、`persistent keepalive` 两行，分别来自定时器写入的 `walltime_last_handshake` 与配置面的 keepalive 间隔，排障时几乎必然要回到这两个模块。
+
+理解这两个模块，还有一个实际好处：它们把「协议规定的时间常数」与「内核编程的约束」同时暴露出来。时间常数如 `REKEY_TIMEOUT = 5`、`KEEPALIVE_TIMEOUT = 10`、`REJECT_AFTER_TIME = 180` 定义在 `messages.h`；内核约束则体现在 `mod_peer_timer()` 的 `rcu_read_lock_bh()` 门槛、`timer_delete_sync()` 的同步删除，以及把密钥清零放进工作队列而非定时器回调的做法。换句话说，读这两个模块能同时看到「协议要做什么」与「内核里怎么做才安全」——这正是 07 册作为模块职责权威源的价值所在。
+
+### 2. 核心概念
+
+`timers.c` 的核心概念是「五类定时器加一个工作项，全部挂在每个 peer 上」。`struct wg_peer` 内嵌五个 `struct timer_list`：`timer_retransmit_handshake`、`timer_send_keepalive`、`timer_new_handshake`、`timer_zero_key_material`、`timer_persistent_keepalive`，外加一个 `struct work_struct clear_peer_work`（字段见 05-03、05-08）。五个定时器分别对应五件延时事务：握手没回应就重传、收到包但没发包就补一个 keepalive、发了包但长期收不到包就主动重新握手、长期没有新密钥就清空临时密钥、按用户配置周期性发 keepalive。`clear_peer_work` 是密钥清零的「下半部」——定时器回调运行在软中断上下文，不能执行可能睡眠的清理，于是 `wg_expired_zero_key_material()` 只负责 `queue_work()` 到 `peer->device->handshake_send_wq`，真正清理由 `wg_queued_expired_zero_key_material()` 完成。六个到期处理例程（五个 timer 回调加一个 work 回调）都通过 `timer_container_of()` 或 `container_of()` 从 timer/work 指针反查 `wg_peer`。
+
+所有定时器的启动都要经过静态内联函数 `mod_peer_timer()`：它在 `rcu_read_lock_bh()` 内检查 `netif_running(peer->device->dev) && !READ_ONCE(peer->is_dead)`，只有接口处于运行态且 peer 未死亡才调用 `mod_timer()`。这条门槛意味着接口 `down` 或 peer 被标记删除后，定时器不会重新挂起——这是防止「对已释放对象操作」的关键防线。延时值统一写成 `jiffies + 常量 * HZ` 的形式，其中重传与「新握手」两个定时器还叠加 `get_random_u32_below(REKEY_TIMEOUT_JITTER_MAX_JIFFIES)` 抖动，避免大量 peer 同时到期形成重传风暴（原理见 06-11）。
+
+`ratelimiter.c` 的核心概念是「全局哈希表加令牌桶」。模块级静态状态包括：`entry_cache`（`kmem_cache`，用于分配条目）、`key`（`hsiphash_key_t`，初始化时随机生成）、`table_lock`（自旋锁，保护哈希表插入与回收）、`init_lock` 与 `init_refcnt`（引用计数，保证多设备重复初始化只建一次表）、`total_entries` 与 `max_entries`（条目上限）、`table_size`、延迟工作 `gc_work`，以及 IPv4 与 IPv6 两张哈希表 `table_v4`/`table_v6`（字段见 05-08）。每个 `struct ratelimiter_entry` 以 `(net, ip)` 为键：`net` 是网络命名空间的指针，`ip` 在 IPv4 下是 32 位源地址，在 IPv6 下只取源地址前 64 位——源码注释明确写着「只使用 64 位，以便对整个 /64 限速」。令牌桶参数定义在文件内枚举：`PACKETS_PER_SECOND = 20`、`PACKETS_BURSTABLE = 5`、`PACKET_COST = NSEC_PER_SEC / 20`（即每包 50 毫秒）、`TOKEN_MAX = PACKET_COST * 5`（250 毫秒）。平均速率被限制为每秒 20 个握手包，允许最多 5 个突发。
+
+两者通过「保护握手入口」这一目标协作：`timers.c` 的重传定时器决定「多久再试一次」，`ratelimiter.c` 决定「这个来源现在有没有资格触发一次昂贵运算」。它们都不负责加解密或封装，也不读写消息体；`timers.c` 调用的是 `wg_packet_*` 与 `wg_socket_*` 系列 API，`ratelimiter.c` 只提供一个布尔判定给 `cookie.c`。这种分工让限速判定可以独立于握手状态机演进。
+
+### 3. 关键数据结构与源码位置
+
+下表按函数收拢两个模块的源码位置，便于与源码逐行对照。
+
+| 模块 | 关键函数 | 真实源码位置 | 职责 |
+|---|---|---|---|
+| 定时器 | `wg_timers_init` / `wg_timers_stop` | `timers.c` 第 223、239 行起 | 安装与卸载五个定时器和工作项 |
+| 定时器 | 五个 `wg_expired_*` 回调 | `timers.c` 第 41 至 145 行 | 到期后执行具体动作 |
+| 定时器 | `wg_queued_expired_zero_key_material` | `timers.c` 第 125 行起 | 在工作队列中清空密钥 |
+| 定时器 | 八个 `wg_timers_*` 事件函数 | `timers.c` 第 148 至 221 行 | 由收发路径调用以重置定时器 |
+| 定时器 | `mod_peer_timer` | `timers.c` 第 30 行起 | 带门槛的定时器挂载助手 |
+| 限速 | `wg_ratelimiter_init` / `wg_ratelimiter_uninit` | `ratelimiter.c` 第 158、205 行起 | 建立与销毁全局哈希表 |
+| 限速 | `wg_ratelimiter_allow` | `ratelimiter.c` 第 84 行起 | 令牌桶判定 |
+| 限速 | `wg_ratelimiter_gc_entries` | `ratelimiter.c` 第 55 行起 | 周期回收空闲条目 |
+
+结构层面需要三处映射。`wg_peer` 中五个 `timer_list` 字段、`persistent_keepalive_interval`、`timer_handshake_attempts`、`timer_need_another_keepalive`、`walltime_last_handshake` 与 `clear_peer_work` 是定时器模块操作的全部状态（字段见 05-08）；`struct ratelimiter_entry` 的 `last_time_ns`、`tokens`、`ip`、`net` 与哈希节点是限速模块的全部状态（字段见 05-08）；`cookie_checker` 虽不直接持有 ratelimiter，却是 `wg_ratelimiter_allow()` 的调用上下文（字段见 05-07）。
+
+常量分两处：`messages.h` 定义 `REKEY_TIMEOUT = 5`、`REKEY_TIMEOUT_JITTER_MAX_JIFFIES = HZ / 3`、`KEEPALIVE_TIMEOUT = 10`、`REJECT_AFTER_TIME = 180`、`REKEY_AFTER_TIME = 120`、`MAX_TIMER_HANDSHAKES = 90 / REKEY_TIMEOUT`（即 18）；`ratelimiter.c` 文件内定义 20 pps、5 突发、50 毫秒每包的令牌参数。它们都是编译期常量，运行期不可通过 `wg` 命令调整（参数见 04-02、04-06），唯一的运行期可调量是 `persistent_keepalive_interval`，由配置面写入 peer（参数见 04-02）。
+
+### 4. 关键流程与调用链
+
+先看定时器的事件链。八个对外事件函数按触发时机可分为五类，覆盖一次会话的完整生命周期：`wg_timers_handshake_initiated()` 在发出握手 initiation 后挂载 `timer_retransmit_handshake`，延时 `REKEY_TIMEOUT * HZ` 加抖动；`wg_expired_retransmit_handshake()` 到期时若 `timer_handshake_attempts > MAX_TIMER_HANDSHAKES` 就放弃——删除 keepalive 定时器、`wg_packet_purge_staged_packets()` 丢弃暂存包、并在未挂起时设置 `timer_zero_key_material` 于 `REJECT_AFTER_TIME * 3` 秒后触发；否则递增计数、`wg_socket_clear_peer_endpoint_src()` 清零可疑源地址、再 `wg_packet_send_queued_handshake_initiation(peer, true)` 重发。`wg_timers_handshake_complete()` 则删除重传定时器、把尝试计数归零、并用 `ktime_get_real_ts64()` 写入 `walltime_last_handshake`——这就是 `wg show` 中 `latest handshake` 的数据来源。
+
+数据收发相关四支：`wg_timers_data_sent()` 在认证数据包发出后挂载 `timer_new_handshake`，延时 `(KEEPALIVE_TIMEOUT + REKEY_TIMEOUT) * HZ` 加抖动，其到期回调 `wg_expired_new_handshake()` 清源地址后发起新握手；`wg_timers_data_received()` 在收到数据后挂载 `timer_send_keepalive`（10 秒），若该定时器已在运行则只置 `timer_need_another_keepalive` 标志，到期回调据此决定是否再挂一次；`wg_timers_any_authenticated_packet_sent()` 与 `wg_timers_any_authenticated_packet_received()` 分别删除 `timer_send_keepalive` 与 `timer_new_handshake`，实现「收到对方回应后停止自己的兜底计时」。密钥与 keepalive 两支：`wg_timers_session_derived()` 在临时密钥生成后挂 `timer_zero_key_material`（180×3 秒），到期回调把清理工作推入工作队列；`wg_timers_any_authenticated_packet_traversal()` 在每次认证包收发后按 `persistent_keepalive_interval` 重挂 `timer_persistent_keepalive`，到期即 `wg_packet_send_keepalive()`。生命周期入口是 `wg_timers_init()`：五个 `timer_setup()` 加一个 `INIT_WORK()`，并清零三个状态标志；`wg_timers_stop()` 用五个 `timer_delete_sync()` 加 `flush_work()` 做对称回收，确保没有回调在 peer 释放后仍在运行。
+
+限速模块的链路更短。`main.c` 的模块初始化调用 `wg_ratelimiter_init()`：首次调用时建立 slab 缓存，按系统内存计算 `table_size`（内存大于 1GB 时固定为 8192，否则按 RAM 规模算并向上取 2 的幂、最小 16），`max_entries = table_size * 8`，分配两张哈希表，把 `gc_work` 挂到 `system_power_efficient_wq` 每秒执行一次，并随机化 hsiphash 密钥。收包侧 `cookie.c` 的 `wg_cookie_validate_packet()` 在 `mac2` 通过后调用 `wg_ratelimiter_allow(skb, dev_net(device->dev))`：函数用 `(net, ip)` 经 hsiphash 定位桶，在 RCU 读锁下线性查找匹配条目，命中就把 `tokens` 按经过时间补充但封顶在 `TOKEN_MAX`，更新 `last_time_ns`，当 `tokens >= PACKET_COST` 时扣费并返回 `true`，否则返回 `false`；未命中则检查 `total_entries` 是否超过上限，分配新条目，初始 `tokens = TOKEN_MAX - PACKET_COST`（首包即可通过），插入桶后返回 `true`。`wg_ratelimiter_gc_entries()` 每次扫描所有桶，回收空闲超过 1 秒的条目并重新排队自己；`uninit` 时以 `work = NULL` 调用同一函数清空全表，再 `rcu_barrier()`、释放表与缓存。图 07-10-01 汇总了这些调用关系。
+
+:::figure id=07-10-01 | name=定时器事件链与限速判定链 | dir=TD
+node n1 "收发路径事件<br/>wg_timers_*" blue
+node n2 "五个 per-peer 定时器<br/>timer_list" teal
+node n3 "到期回调<br/>wg_expired_*" purple
+node n4 "工作队列<br/>clear_peer_work" gray
+node n5 "动作层<br/>packet 与 socket API" green
+node n6 "cookie 校验<br/>validate_packet" purple
+node n7 "令牌桶判定<br/>wg_ratelimiter_allow" amber
+node n8 "全局哈希表<br/>table_v4 与 v6" blue
+node n9 "周期回收<br/>gc_work" gray
+edge n1 -> n2 "mod_peer_timer"
+edge n2 -> n3 "到期触发"
+edge n3 -> n4 "清密钥入队"
+edge n3 -> n5 "重传与 keepalive"
+edge n4 -> n5 "清空密钥"
+edge n6 -> n7 "查令牌"
+edge n7 -> n8 "定位条目"
+edge n8 -> n9 "GC 回收"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：左侧是定时器链——「收发路径事件 wg_timers_*」经「mod_peer_timer」挂载「五个 per-peer 定时器 timer_list」，到期触发「到期回调 wg_expired_*」，普通动作直接落到「动作层 packet 与 socket API」，清密钥动作则先进入「工作队列 clear_peer_work」再落到动作层；右侧是限速链——「cookie 校验 validate_packet」调用「令牌桶判定 wg_ratelimiter_allow」，后者在「全局哈希表 table_v4 与 v6」中定位条目，由「周期回收 gc_work」清理空闲条目。
+
+### 5. 配置/命令/代码实例
+
+下面两段代码展示两个模块的典型调用方式。第一段是定时器事件与到期动作，第二段是限速初始化与判定；均为示意片段，签名以源码为准。
+
+```c
+/* 场景一：握手发起后挂载重传定时器，收到回应后取消 */
+wg_timers_handshake_initiated(peer);   /* arm timer_retransmit_handshake */
+/* ... 收到握手响应后 ... */
+wg_timers_handshake_complete(peer);    /* delete retransmit，写 walltime */
+
+/* 场景二：cookie 校验末端的限速判定 */
+if (wg_cookie_validate_packet(&wg->cookie_checker, skb, true) ==
+    VALID_MAC_WITH_COOKIE)
+        wg_packet_receive(wg, skb);
+```
+
+运维侧可用 `wg show` 观察定时器写入的状态，用内核日志观察到期回调的 `pr_debug`。注意这些调试打印需要开启动态调试才可见。
+
+```bash
+wg show wg0
+# 开启动态调试后，用 dmesg 观察定时器过期打印
+dmesg | grep -E "did not complete|Retrying handshake|Zeroing out all keys"
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+示例输出，具体格式需对照实际版本核验
+interface: wg0
+  public key: <公钥>
+  listening port: 51820
+peer: <对端公钥>
+  persistent keepalive: every 25 seconds
+  latest handshake: 41 seconds ago
+  transfer: 2.41 KiB received, 1.60 KiB sent
+[  912.447103] wireguard: wg0: Handshake for peer 1234567890 (203.0.113.9:51820) did not complete after 5 seconds, retrying (try 2)
+```
+
+逐行判读如下。`interface` 与 `listening port` 两行来自 netlink 的 device 属性，确认查询对象正确；`peer` 段来自 `WGPEER_A_*` 属性，一个接口下可有多个 peer 段，判读时要与配置里的公钥逐一对上。`persistent keepalive: every 25 seconds` 对应 `WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL`，它是运行时唯一可调的时限参数（参数见 04-02）；这个间隔被 `wg_timers_any_authenticated_packet_traversal()` 读成 `u16 interval`，非零时以 `jiffies + interval * HZ` 重挂 `timer_persistent_keepalive`，因此把该值设为 0 就等于关闭周期性 keepalive——NAT 场景下贸然关闭会导致映射老化后隧道单向不通。`latest handshake: 41 seconds ago` 对应 `WGPEER_A_LAST_HANDSHAKE_TIME`，数据来自 `wg_timers_handshake_complete()` 用 `ktime_get_real_ts64()` 写入的 `walltime_last_handshake`；注意它用的是真实时钟而非 `boottime`，因此系统时间被大幅调整时这一行会跳变，而 `ratelimiter.c` 与 `cookie.c` 里的各类时间戳用的是 `ktime_get_coarse_boottime_ns()`，不受影响。`transfer` 对应 `WGPEER_A_RX_BYTES` 与 `WGPEER_A_TX_BYTES`，与定时器无直接关系，但只有握手与路由都正确时才会增长。最后一行 dmesg 日志直接来自 `wg_expired_retransmit_handshake()` 的 `pr_debug`：`did not complete after 5 seconds` 里的 5 就是 `REKEY_TIMEOUT`，`retrying (try 2)` 对应 `timer_handshake_attempts + 1`，说明这次是重传分支而非放弃分支；该分支还执行了 `wg_socket_clear_peer_endpoint_src()` 并用 `wg_packet_send_queued_handshake_initiation(peer, true)` 重发。若日志反复出现并最终变成 `did not complete after 90 attempts, giving up`，说明尝试次数已越过 `MAX_TIMER_HANDSHAKES`（90 除以 5 等于 18），此时会丢弃暂存包并设置密钥清零定时器，应优先排查公钥、endpoint 与对端是否在线（排障见 08-03）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是混淆 `timer_delete()` 与 `timer_delete_sync()`。事件函数里用前者取消尚在服务期的定时器，而 `wg_timers_stop()` 必须用后者，因为它要等到可能正在运行的回调彻底退出，才能安全释放 peer；漏掉同步删除会造成释放后使用。第二个陷阱是忽视 `mod_peer_timer()` 的门槛：只有 `netif_running()` 为真且 `is_dead` 为假才会真正 `mod_timer()`，所以接口未 up 或对端已被标记删除时，调用事件函数不会挂上定时器——排障时若发现 `latest handshake` 停滞且没有任何重传日志，要先确认接口状态（排障见 08-03），而不是怀疑定时器损坏。第三个陷阱是抖动的作用被低估：`REKEY_TIMEOUT_JITTER_MAX_JIFFIES = HZ / 3` 让大量 peer 的重传时间分散开，去掉它会让同一时刻建立的多条隧道在丢包后同步重传，形成瞬时洪泛；这不是可随意删除的「装饰」。
+
+第四个陷阱与上下文有关。密钥清零之所以拆成 `wg_expired_zero_key_material()` 与 `wg_queued_expired_zero_key_material()` 两段，是因为定时器回调在软中断上下文不能睡眠，必须把可能触及锁与内存回收的清理放进工作队列；`queue_work()` 失败时还要 `wg_peer_put()` 归还额外引用，这段引用计数细节最容易被复制粘贴时漏掉。第五个陷阱是时间戳口径：`walltime_last_handshake` 用真实时间，其余期限判断用 `boottime`，两者不可混用；把 `wg show` 的握手时间拿去和 boottime 日志直接相减会得到错误结论。第六个陷阱在限速侧：IPv6 只取源地址前 64 位做键，意味着同一个 /64 内的不同主机共享同一个令牌桶，一台主机洪泛可能连带影响同前缀的正常对端；`max_entries = table_size * 8` 的上限一旦触顶，新来源会因为分配失败返回 `false`，被当作「被限速」处理，这是一种容量保护而非策略拒绝。
+
+最佳实践可归纳为四条：先用 `wg show` 的 `persistent keepalive` 与 `latest handshake` 两行确认时限状态，再决定是否看动态调试日志；NAT 后的 peer 保留非零 keepalive（通常 20 至 25 秒，具体取值需结合 NAT 老化时间在目标环境实测），不要为了省电盲目设为 0（部署见 03-05）；遇到握手反复重传，按 `REKEY_TIMEOUT` 与 `MAX_TIMER_HANDSHAKES` 的节奏判断是链路问题还是配置问题，而不是反复重建接口；理解限速只作用于带 cookie 的握手校验路径，普通数据转发不受这 20 pps 约束，因此「吞吐低」不应归因于 ratelimiter（原理见 06-10）。最后是构建纪律：`ratelimiter.c` 末尾包含 `selftest/ratelimiter.c`，仅在 `DEBUG` 下由 `main.c` 调用自检，发布构建里不应依赖自检行为（构建见 02-05）。
+
+### 7. 小结与延伸阅读
+
+本篇把 `timers.c` 与 `ratelimiter.c` 定位为 WireGuard 的时限与限速模块：`timers.c` 以每个 peer 上的五个 `timer_list` 加一个 `clear_peer_work`，对外提供 `wg_timers_init()`、`wg_timers_stop()`、五个到期回调以及 `wg_timers_data_sent()` 等八个事件通知函数，通过 `mod_peer_timer()` 的门槛与抖动机制驱动重传、keepalive、新握手、密钥清零和持久 keepalive；`ratelimiter.c` 以全局 slab 缓存、双哈希表与令牌桶，对外提供 `wg_ratelimiter_init()`、`wg_ratelimiter_uninit()`、`wg_ratelimiter_allow()` 与内部 GC，为 cookie 校验提供最后一票放行判定。两者都不碰消息体与加解密，只在自己的状态域内给出「何时动作」与「是否允许」的结论。
+
+延伸阅读：定时器时序见 06-11，握手限速原理见 06-10，cookie 校验链见 06-09；字段全集见 05-03、05-07、05-08，时限参数与常量见 04-02、04-06，运维与故障定位见 08-03。跨册随查按（字段见 05-08 ｜ 参数见 04-02 ｜ 原理见 06-11 ｜ 排障见 08-03）执行：结构体逐字段去 05、参数与常量全集去 04、机制与调用链去 06、运维场景与基准去 08。凡本篇标注「需对照实际版本核验」的函数行号、常量取值与命令输出格式，均以 `_wglinux_build/upstream_src/` 下对应文件为准，本套资料不编造未核验的路径与取值。

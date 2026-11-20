@@ -1,0 +1,305 @@
+## 06-03 密钥派生、会话密钥轮换与时序
+
+### 1. 背景与动机
+
+WireGuard 的「静默」很大程度来自它的密钥机制：两端不协商 cipher suite、不传证书、不发显式密钥交换确认报文，而是把密钥材料嵌入握手消息与数据流，靠派生链与定时器自行推进。要真正读懂 `wg show` 里 `latest handshake` 为什么隔一段时间就会刷新、为什么换 key 不会断流、为什么对端时钟错了就握手失败，就必须沉到 `drivers/net/wireguard/noise.c` 与 `send.c` 里，把密钥「从哪来、怎么变、何时作废」这三件事讲清楚。本篇是 06 册「技术原理」的机制权威源之一，承接 06-02 的握手状态机，专门处理握手成功之后的密钥生命周期：派生链、三组 keypair 的轮换、引用计数与 RCU 的双重释放，以及定时器如何驱动整个节奏。本篇只讲机制本身；结构体逐字段定义统一交给 05-05，常量与命令参数全集交给 04-06，模块职责交给 07-05。
+
+先看一个常被误解的事实：WireGuard 的「会话密钥」不是握手消息里直接携带的，而是由 `chaining_key`（链接密钥）经 KDF 现场派生出来的；握手消息里携带的是临时公钥、加密的静态公钥、加密的时间戳，以及空负载的确认块。换句话说，握手的目的是让双方**独立地算出同一条派生链**，而不是「把密钥传给对方」。这解释了为什么中间人即使录下全部握手报文也无法还原会话密钥——他缺少任何一方的私钥，无法完成曲线乘法。也解释了为什么预共享密钥（PSK）是可选的额外熵：协议的名字 `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s`（`noise.c` 第 28 行 `handshake_name`）已经把整条密码学配方写明了——IK 模式、Curve25519、ChaCha20-Poly1305、BLAKE2s，PSK 以 `psk2` 后缀体现。
+
+动机还有一个工程层面的来源：内核态实现必须应对并发与延迟释放。一个数据包可能正在用某个 keypair 加密，而另一条路径已经决定废弃它；如果直接 `kfree`，就会 use-after-free。WireGuard 的解法是 `kref`（逻辑引用计数）加 `rcu`（延迟回收）双保险，这正是本篇要展开的 `keypair_free_kref` / `keypair_free_rcu` 两段式释放。理解这套机制，才能明白为什么 `wg_noise_keypairs_clear` 清零的顺序是「先 next、再 previous、最后 current」，而不是随意顺序。
+
+### 2. 核心概念
+
+把密钥生命周期压缩成四个词：**派生链、三组槽位、双重释放、定时器**。
+
+**派生链**是一条 BLAKE2s 的 HMAC-KDF 棘轮。起点是两个全局常量：`wg_noise_init`（`noise.c` 第 34 行）把 `handshake_name` 用 BLAKE2s 压成 `handshake_init_chaining_key`，再把它与 `identifier_name`（`WireGuard v1 zx2c4 Jason@zx2c4.com`）串接哈希得到 `handshake_init_hash`。每个 peer 握手开始时，`handshake_init`（第 454 行）把这两个全局值拷进本地 `chaining_key` / `hash`，再 `mix_hash(hash, remote_static)` 把对端静态公钥搅进哈希。此后每一次 `mix_dh`、`mix_psk`、`message_ephemeral` 都会更新 `chaining_key`，形成单向棘轮：即便某一轮的临时私钥日后泄露，也无法倒推之前的链接密钥，这就是前向保密（PFS）的来源。最终 `derive_keys`（第 392 行）从收敛的 `chaining_key` 一次 KDF 出两根对称密钥——发送密钥与接收密钥。
+
+**三组槽位**是 `noise.h` 第 43 行 `struct noise_keypairs` 的 `current_keypair` / `previous_keypair` / `next_keypair`，外加 `keypair_update_lock` 自旋锁。current 是当前收发都用它的密钥；previous 只用于接收（应对在途的旧包）；next 是响应方创建、等待第一个数据包确认的「候选密钥」。发起方与响应方推进这组槽位的时机不同：发起方收到响应即可把新密钥提升为 current（`add_new_keypair` 的 `i_am_the_initiator` 分支），响应方必须等收到用新密钥加密的第一个数据包，经 `wg_noise_received_with_keypair` 确认后才提升。这个差异是理解「谁先换 key」的关键。
+
+**双重释放**指每个 `struct noise_keypair`（`noise.h` 第 30 行）同时带 `struct kref refcount` 与 `struct rcu_head rcu`。取用走 `wg_noise_keypair_get`（`kref_get_unless_zero`，且要求持有 RCU BH 读锁），释放走 `wg_noise_keypair_put` → `kref_put` → `keypair_free_kref` → `call_rcu(&keypair->rcu, keypair_free_rcu)` → `kfree_sensitive`。`kref` 保证「还有人用就不能释放」，`call_rcu` 保证「所有读侧临界区退出后才真正 free」，二者缺一不可。
+
+**定时器**是 5 个 `timer_list`（见 `peer.h` 第 53—55 行）协同：重传握手、keepalive、新握手、清零密钥材料、持久 keepalive。它们由 `timers.c` 的 `wg_timers_*` 函数族在特定事件点挂载或删除，共同决定「何时重发、何时换 key、何时彻底放弃」。
+
+下表把本篇反复引用的时限与阈值常量收拢成速查表，均取自 `messages.h` 的 `enum limits` 与 `enum counter_values`（字段全集见 05-05，参数完整语义见 04-06）。
+
+| 常量 | 取值 | 含义与作用点 |
+|---|---|---|
+| `REKEY_TIMEOUT` | 5（秒） | 握手重传间隔，`wg_timers_handshake_initiated` 挂定时器 |
+| `REKEY_AFTER_MESSAGES` | `1ULL << 60` | 发送计数超此值触发重握手，`keep_key_fresh` 检查 |
+| `REKEY_AFTER_TIME` | 120（秒） | 发起方发送密钥存活超时，`keep_key_fresh` 检查 |
+| `REJECT_AFTER_TIME` | 180（秒） | 接收密钥拒收超时，`wg_packet_send_staged_packets` 检查 |
+| `REJECT_AFTER_MESSAGES` | `U64_MAX - COUNTER_WINDOW_SIZE - 1` | 计数器上限，达到即作废密钥 |
+| `COUNTER_BITS_TOTAL` | 8192 | 抗重放位图总位数（抗重放机制见 06-08） |
+| `COUNTER_WINDOW_SIZE` | `8192 - BITS_PER_LONG` | 抗重放滑动窗口大小 |
+| `MAX_TIMER_HANDSHAKES` | `90 / REKEY_TIMEOUT` = 18 | 握手最大重试次数，超过即放弃并清零 |
+| `REKEY_TIMEOUT_JITTER_MAX_JIFFIES` | `HZ / 3` | 重传抖动上限，避免对等体同步风暴 |
+
+### 3. 关键数据结构与源码位置
+
+本册是机制权威源，但逐字段展开仍交给 05 册，本节只点名结构、给真实路径与机制要点。需要建立四层结构地图。
+
+第一层是静态身份 `struct noise_static_identity`（`noise.h` 第 50 行），含 `static_public`、`static_private`、`rw_semaphore lock` 与 `has_identity`。`wg_noise_set_static_identity_private_key`（`noise.c` 第 294 行）在持有 `static_identity->lock` 写锁的前提下，把配置写入的私钥 memcpy 进来，`curve25519_clamp_secret` 做 clamping（清位、置位以符合 Curve25519 标量要求），再由 `curve25519_generate_public` 从私钥导出公钥并据返回值设置 `has_identity`。这一结构属于 `wg_device`（`device.h` 第 45 行），即一把私钥对应一个接口，而非每个 peer 一把（字段见 05-02）。
+
+第二层是握手态 `struct noise_handshake`（`noise.h` 第 65 行），它持有派生链的中间产物：`ephemeral_private`、`remote_ephemeral`、`precomputed_static_static`、`preshared_key`、`hash`、`chaining_key`、`latest_timestamp`、`remote_index` 与状态机 `state`。`wg_noise_precompute_static_static`（第 47 行）用本端静态私钥与对端静态公钥预先算好 `ss = DH(s_priv, s_pub)`，缓存在 `precomputed_static_static`；若本端无身份或曲线运算失败，就把该缓冲清零，`mix_precomputed_dh` 之后会据此拒绝继续。这是性能与安全的折中：静态—静态 DH 对每个 peer 只需算一次，不必每次握手重算（字段见 05-05）。
+
+第三层就是核心的 keypair 三元组 `struct noise_keypairs` 与单个 `struct noise_keypair`。后者内嵌 `index_hashtable_entry entry`（用于按 32 位 index 快速查 key）、`noise_symmetric_key sending` 与 `receiving`（各含 `key[32]`、`birthdate`、`is_valid`）、`atomic64_t sending_counter`、`noise_replay_counter receiving_counter`、`__le32 remote_index`、`bool i_am_the_initiator`、`kref`、`rcu_head` 与 `internal_id`。注意 `sending` 与 `receiving` 各有独立 `birthdate` 和 `is_valid`，所以「发送密钥过期」与「接收密钥过期」是两件事；`internal_id` 由全局原子 `keypair_counter` 自增产生，仅用于调试日志标识（字段见 05-05）。keypair 挂在 `wg_peer`（`peer.h` 第 43 行）上，每个 peer 独立一套（字段见 05-03）。
+
+第四层是定时器与工作队列，`wg_peer` 里的五个 `timer_list`、`transmit_handshake_work`、`clear_peer_work` 与 `last_sent_handshake`（`atomic64_t`）构成时序骨架。`last_sent_handshake` 记录上次发握手的时间，`wg_noise_reset_last_sent_handshake`（`noise.h` 第 101 行）把它回拨到 `REKEY_TIMEOUT + 1` 秒之前，从而「立即可重发」（机制见 06-11，字段见 05-08）。
+
+下表把关键函数与真实源码位置对应起来，便于逐函数核对。
+
+| 函数 | 源码位置 | 机制职责 |
+|---|---|---|
+| `wg_noise_init` | `noise.c:34` | 由握手名与标识名生成全局初始 chaining key / hash |
+| `wg_noise_precompute_static_static` | `noise.c:47` | 预计算静态—静态 DH，失败清零 |
+| `wg_noise_set_static_identity_private_key` | `noise.c:294` | clamp 私钥并导出公钥、置 `has_identity` |
+| `derive_keys` / `kdf` | `noise.c:392` / `344` | 从 chaining key 派生两根对称密钥 |
+| `add_new_keypair` | `noise.c:198` | 按 initiator/responder 推进三组槽位 |
+| `wg_noise_received_with_keypair` | `noise.c:253` | 首个数据包确认后提升 next 为 current |
+| `wg_noise_keypairs_clear` | `noise.c:151` | 按 next→previous→current 顺序清空三组 |
+| `wg_noise_expire_current_peer_keypairs` | `noise.c:179` | 清握手态并作废 next/current 的发送能力 |
+| `keypair_free_kref` / `keypair_free_rcu` | `noise.c:117` / `112` | 两阶段释放：摘索引 + call_rcu 延迟 free |
+| `keep_key_fresh` | `send.c:124` | 发送后检查是否该触发重握手 |
+
+### 4. 关键流程与调用链
+
+派生链是理解全篇的主线。以发起方为例（`wg_noise_handshake_create_initiation`，`noise.c` 第 516 行）：`handshake_init` 先载入初始 chaining key / hash 并 `mix_hash(remote_static)`；接着生成临时私钥并 `message_ephemeral` 把临时公钥搅进 hash 与 chaining key（`e`）；`mix_dh(ck, key, ephemeral_private, remote_static)` 把 `es` 的 DH 结果经 KDF 同时更新 chaining key 并产出临时加密密钥 `key`；再用这把 `key` 调 `message_encrypt` 加密静态公钥（`s`）；随后 `mix_precomputed_dh` 把预计算的 `ss` 搅入（`ss`）；最后 `tai64n_now` 生成时间戳并加密（`{t}`）。`message_encrypt`（第 463 行）调用 `chacha20poly1305_encrypt`，把当前 `hash` 作为 AAD、nonce 固定为 0，然后把密文再 `mix_hash` 回 hash——这样每个消息都绑定前面的转录，任何篡改都会导致后续解密失败。响应方 `wg_noise_handshake_create_response`（第 667 行）接续做 `ee`、`se`、`psk`，并用空消息的 `message_encrypt(NULL, 0)` 产生 `{}` 确认块。这就是「双方独立算出同一条链」的全过程，状态机迁移细节见 06-02。
+
+会话密钥真正落地在 `wg_noise_handshake_begin_session`（第 815 行）：确认状态是 `CREATED_RESPONSE` 或 `CONSUMED_RESPONSE` 后，`keypair_create` 分配 keypair，`derive_keys` 从最终 `chaining_key` KDF 出两根 key。这里有一个关键的方向判断：`i_am_the_initiator` 为真时，`derive_keys(&sending, &receiving, ck)`，即第一根给发送；否则 `derive_keys(&receiving, &sending, ck)`，第一根给接收。双方以相反顺序取用同一 KDF 的两个输出，于是 A 的发送密钥正好等于 B 的接收密钥。随后 `handshake_zero` 抹掉临时材料，在 `rcu_read_lock_bh` 内检查 peer 未死，调 `add_new_keypair` 装槽，最后 `wg_index_hashtable_replace` 把握手态的索引条目换成 keypair 的索引条目——此后按 index 查到的就是数据流密钥而非握手态。
+
+三组槽位的推进有两条路径。发起方路径在 `add_new_keypair` 的 `if (new_keypair->i_am_the_initiator)` 分支：若已有 next（说明上一次换 key 的确认还没来），就把 next 降级为 previous、释放旧 current、释放旧 previous，再把新 key 设为 current；若没有 next，则把 current 挪到 previous、释放旧 previous，再设新 current。响应方路径在 `else` 分支：把新 key 放进 next、释放旧 next、清空并释放 previous，**不动 current**——因为响应方还不能确定对方已收到响应。确认来自 `wg_noise_received_with_keypair`：当收到用 next 加密的第一个数据包，它先把 `received_keypair` 与 `next_keypair` 做一次无锁 `rcu_access_pointer` 快检，不上锁就返回 false；命中才上 `keypair_update_lock` 二次确认，然后把 current 挪到 previous、next 提升为 current、next 置空，返回 true。调用方 `wg_packet_consume_data_done`（`receive.c` 第 345 行）据此调 `wg_timers_handshake_complete` 并冲刷暂存包。这个「响应方等数据包确认」的设计，是 WireGuard 不需要独立 ACK 报文的原因。
+
+下面这段 C 代码摘自 `send.c:124` 的 `keep_key_fresh`，是「何时触发换 key」的权威判据（为聚焦删去了空指针分支）：
+
+```c
+static void keep_key_fresh(struct wg_peer *peer)
+{
+	struct noise_keypair *keypair;
+	bool send;
+
+	rcu_read_lock_bh();
+	keypair = rcu_dereference_bh(peer->keypairs.current_keypair);
+	send = keypair && READ_ONCE(keypair->sending.is_valid) &&
+	       (atomic64_read(&keypair->sending_counter) > REKEY_AFTER_MESSAGES ||
+		(keypair->i_am_the_initiator &&
+		 wg_birthdate_has_expired(keypair->sending.birthdate, REKEY_AFTER_TIME)));
+	rcu_read_unlock_bh();
+
+	if (unlikely(send))
+		wg_packet_send_queued_handshake_initiation(peer, false);
+}
+```
+
+判据有三重与门：keys 指针非空、`sending.is_valid` 仍为真，再满足「发送计数超过 `REKEY_AFTER_MESSAGES`（2^60）」或「我是发起方且发送密钥出生超过 `REKEY_AFTER_TIME`（120 秒）」之一。注意「按时间重握手」只对发起方生效，响应方只能靠计数或等对方发起新握手——这避免了双方同时重握手的对称性竞赛。`keep_key_fresh` 在发送完成（`wg_packet_create_data_done`）与接收完成（`wg_packet_consume_data_done`）两处都被调用，所以任一方向的持续流量都会推进密钥更新。
+
+时序由 `timers.c` 串起：发出 initiation 后 `wg_timers_handshake_initiated` 挂 `REKEY_TIMEOUT + jitter` 重传定时器；`wg_expired_retransmit_handshake` 每次重传加一次 `timer_handshake_attempts`，超过 `MAX_TIMER_HANDSHAKES`（18）就放弃、清空暂存包并挂 `REJECT_AFTER_TIME * 3`（540 秒）后的清零定时器；收到任意认证包会删掉对应定时器；`wg_timers_session_derived` 在派生密钥时挂 540 秒清零。整个流程见图 06-03-01。
+
+:::figure id=06-03-01 | name=密钥派生链与三组 keypair 轮换 | dir=TD
+node k1 "静态私钥+对端公钥<br/>Curve25519 预计算" blue
+node k2 "临时密钥 e<br/>message_ephemeral" teal
+node k3 "mix_dh / mix_psk<br/>更新 chaining_key" purple
+node k4 "KDF derive_keys<br/>发送+接收密钥" green
+node k5 "current<br/>收发主用" amber
+node k6 "previous<br/>只收在途旧包" blue
+node k7 "next<br/>响应方待确认" teal
+node k8 "首个数据包确认<br/>received_with_keypair" red
+node k9 "定时器<br/>重传/过期/清零" gray
+edge k1 -> k3 "ss 预计算"
+edge k2 -> k3 "e 入链"
+edge k3 -> k4 "收敛 ck"
+edge k4 -> k5 "装槽"
+edge k5 -> k6 "旧 current 降级"
+edge k4 -> k7 "响应方先放 next"
+edge k7 -> k8 "收到确认包"
+edge k8 -> k5 "提升为 current"
+edge k9 -> k5 "按时间触发换 key"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「静态私钥+对端公钥」的预计算（ss）与「临时密钥 e」一起进入「mix_dh / mix_psk 更新 chaining_key」，收敛的链接密钥经「KDF derive_keys」派生出发送与接收密钥；发起方直接把新密钥装为「current」，旧的 current 降级为「previous 只收在途旧包」；响应方则先把新密钥放进「next 响应方待确认」，收到「首个数据包确认 received_with_keypair」后才提升为 current；「定时器 重传/过期/清零」按时间触发换 key 与最终清零，串起整个节奏。
+
+### 5. 配置/命令/代码实例
+
+密钥轮换对用户是不可见的，但它的节奏可以通过 `wg show` 观察：把持久 keepalive 调短，再周期采样 `latest handshake` 与 `transfer`，就能看到握手时间按 `REKEY_TIMEOUT` 附近刷新。下面用命令组合观察（参数全集见 04-01、04-02）。
+
+```bash
+# 设置持久 keepalive，让对端持续有认证包往返（参数为 25 秒，仅示例）
+wg set wg0 peer <对端公钥> persistent-keepalive 25
+
+# 每秒采样一次握手时间与流量
+watch -n 1 'wg show wg0 | grep -E "latest handshake|transfer"'
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+peer: <对端公钥>
+  endpoint: 198.51.100.9:51820
+  latest handshake: 3 seconds ago
+  transfer: 4.02 KiB received, 3.10 KiB sent
+peer: <另一对端公钥>
+  endpoint: 198.51.100.10:51820
+  latest handshake: 118 seconds ago
+  transfer: 1.20 MiB received, 900.11 KiB sent
+```
+
+逐行判读如下。第一段 `peer:` 后面是对端公钥，对应 `wg_peer` 的 `remote_static`，标明这是哪个 peer 的密钥状态；一个接口下每个 peer 有独立的三组 keypair。`endpoint` 对应 `wg_peer.endpoint`，是最近一次认证包更新出的地址端口。`latest handshake: 3 seconds ago` 对应 `walltime_last_handshake`，它由 `wg_timers_handshake_complete` 在「收到响应（发起方）或收到首个确认数据包（响应方）」时用 `ktime_get_real_ts64` 写入墙上时钟——注意它记录的是墙上时钟，而 `keep_key_fresh` 判断 `REKEY_AFTER_TIME` 用的是 `birthdate` 的 boottime 单调时钟，两者用途不同，前者给人看、后者给内核算。`transfer` 对应 `rx_bytes` 与 `tx_bytes`，只有握手成功、密钥有效且 allowedips 校验通过才会增长（字段见 05-03）。第二个 peer 的 `latest handshake: 118 seconds ago` 接近 `REKEY_AFTER_TIME`（120 秒）：若它是发起方，下一次发包时 `keep_key_fresh` 就会发现 `sending.birthdate` 超时，排队一次新握手，这一行随后会跳回几秒前——这正是轮换在可观测层面的样子。若该值长期停在 180 秒以上并停止增长，说明 `REJECT_AFTER_TIME` 已到、接收密钥被拒，需排查对端是否还在（排障见 08-03）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是以为「换 key 会断流」。三组 keypair 的设计让切换平滑：新 current 开始发，旧 current 作为 previous 仍能收在途旧包，直到下一次握手再被释放，所以上层连接不感知。若在抓包里看到短时间内 key_idx 在两三个值之间来回，属正常轮换，不是攻击（消息格式见 06-04）。
+
+第二个陷阱是混淆发送密钥与接收密钥的生命周期。`sending` 与 `receiving` 各有独立 `birthdate` 与 `is_valid`；`keep_key_fresh` 只看 `sending.birthdate`，且只对发起方做时间判断；`REJECT_AFTER_TIME` 则在接收侧与暂存发送侧分别检查。把两者当成一把 key 会导致对「为什么这边还能收、那边已经拒发」的现象误判。
+
+第三个陷阱是误判响应方的确认时机。响应方在 `add_new_keypair` 里把新密钥放进 next 后，必须等首个数据包经 `wg_noise_received_with_keypair` 确认才提升为 current；如果链路单向（只收不发），响应方的 next 永远不会转正，表现为「握手看似完成但数据不通」。这解释了为什么排障要看双向流量（运维见 08-05）。
+
+第四个陷阱是忽略并发与 RCU 约束。`wg_noise_keypair_get` 在 `kref_get_unless_zero` 失败时返回 NULL，且要求调用者持 RCU BH 读锁；在锁外长时间持有裸 `keypair` 指针是 bug 温床。`wg_noise_keypairs_clear` 之所以先清 next，是因为 `wg_noise_received_with_keypair` 快检的就是 next——先清它能让并发的确认路径尽早返回，避免误把已被清零的 next 提升上来（并发机制见 06-13）。
+
+第五个陷阱是把 `wg_birthdate_has_expired` 当成墙上时钟判断。它比较的是 `ktime_get_coarse_boottime_ns()` 意义上的单调时间与 `birthdate` 的差值，并需处理时钟回拨；该函数定义未包含在本次快照的这些源文件中，具体语义需对照实际版本核验。最佳实践：用 `wg show` 的墙上时钟时间做人工判断，用源码里的单调时钟阈值做逻辑推断，二者不要混用。
+
+### 7. 小结与延伸阅读
+
+本篇把 WireGuard 握手成功之后的密钥生命周期讲成一条主线：由 `wg_noise_init` 生成的初始 chaining key / hash 出发，经 `mix_dh`（es、ee、se）、预计算的 `mix_precomputed_dh`（ss）、`mix_psk` 与逐消息的 `mix_hash`，双方独立收敛到同一条派生链；`derive_keys` 再从最终 `chaining_key` KDF 出发送与接收两根对称密钥，并以 `i_am_the_initiator` 决定两根密钥的取用方向。三组 keypair（current / previous / next）按发起方与响应方不同的路径推进，响应方必须等首个数据包确认才转正；`kref` + `call_rcu` 的双阶段释放保证并发安全；五个定时器与 `keep_key_fresh` 按 `REKEY_TIMEOUT`、`REKEY_AFTER_MESSAGES`、`REKEY_AFTER_TIME`、`REJECT_AFTER_TIME * 3` 等阈值驱动重传、换 key 与最终清零。整个过程无需任何显式密钥交换或 ACK 报文，这正是 WireGuard 「静默且自愈」的机制根源。
+
+延伸阅读建议：承接 06-02 看握手状态机如何走到 `begin_session`，读 06-08 看 `receiving_counter` 的抗重放位图，读 06-11 看五个定时器的完整体系，读 06-13 看 RCU 与多核并发；结构与字段去 05-05，常量全集去 04-06，模块职责去 07-05。跨册随查按（字段见 05-05 ｜ 参数见 04-06 ｜ 模块见 07-05 ｜ 运维见 08-05）执行：结构体逐字段去 05、参数与命令全集去 04、目录级模块能力去 07、运维与安全加固去 08；本篇作为 06 册机制源不再自引原理篇。凡标注「需对照实际版本核验」的函数定义与语义，均以 `_wglinux_build/upstream_src/` 下对应文件为准，本套资料不编造未核验的路径与取值。
+
+## 06-04 握手消息与数据传输消息格式
+
+### 1. 背景与动机
+
+WireGuard 之所以能与其它实现（wireguard-go、wireguard-nt、OpenBSD 内核版、官方 App）无缝互通，前提不是「大家都是 Noise 协议」，而是所有实现把报文的每一字节摆在同一偏移上。这份「逐字节契约」在 Linux 内核驱动里由 `drivers/net/wireguard/messages.h` 单独承载：它定义了消息类型常量、四类消息的 `struct` 布局、长度换算宏、对齐要求与 headroom 计算。本篇是 06 册的机制权威源，专门讲这些结构如何落地为线上字节、发送侧如何填充、接收侧如何校验长度；结构体逐字段清单交给 05-05，命令与常量全集交给 04-06，编解码模块职责交给 07-06。
+
+为什么消息格式值得单独成篇？因为它是「协议兼容」与「代码正确」的交汇点。一个字段用错字节序、一个长度判断把 `==` 写成 `>=`、一个 padding 对齐没做到 16 字节，都能让两端看似握手成功却静默丢包——WireGuard 是静默协议，格式错误往往只表现为 `latest handshake` 不刷新，没有明确报错（排障见 08-03）。读 `messages.h` 时还要注意一个刻意的设计：它并不表达「协议规范文本」，而是表达「这份内核实现对内存布局的约束」，其中既有协议规定（如字段顺序），也有内核实现选择（如用 `__le32 type` 代替 `u8 type + u8 reserved[3]`，注释里明确说是为了让检查更快）。
+
+承载层面还有一个边界要先厘清：所有 WireGuard 消息都作为 UDP 载荷传输，默认端口 51820。UDP 头本身是网络字节序（`__be16` 源/目的端口、`__be16` 长度），而 WireGuard 载荷里的多字节整数一律采用小端序（`__le32` / `__le64`）。`messages.h` 顶部注释与 `receive.c` 的 `SKB_TYPE_LE32` 宏都在强调这一点；混淆这两套字节序是写抓包解析工具时最常踩的坑。本篇第五节用一个逐字节实例把这套布局落到具体偏移上。
+
+定长与变长的区分对实现有直接影响。三种握手消息的长度在编译期就由 `sizeof` 确定，因此发送侧可以把它们放在栈上的局部结构里（如 `struct message_handshake_initiation packet;`），接收侧也敢要求 `skb->len` 精确相等——任何偏差都意味着对端不是标准实现，或报文在途中被破坏。数据消息则因为内层 IP 包长度可变，必须用柔性数组 `u8 encrypted_data[]` 承载，长度由 `message_data_len(plain_len)` 动态计算：发送侧通过 `skb_cow_data` 为 padding 与认证标签扩容，接收侧用 `pskb_trim` 把长度收敛到 UDP 声明值。理解「握手定长、数据变长」这一分工，就能解释为什么 `validate_header_len` 对二者采用完全不同的比较方式，也能解释为什么 keepalive 被实现为「明文长度为零的数据消息」——它复用同一套数据格式，只是内层没有 IP 包，于是整包恰好是 `MESSAGE_MINIMUM_LENGTH` 的 32 字节。
+
+### 2. 核心概念
+
+消息格式可压缩为四组概念：**类型常量、统一头、长度宏、尾部 MAC**。
+
+**类型常量**来自 `enum message_type`（`messages.h:56`）：`MESSAGE_INVALID = 0`、`MESSAGE_HANDSHAKE_INITIATION = 1`、`MESSAGE_HANDSHAKE_RESPONSE = 2`、`MESSAGE_HANDSHAKE_COOKIE = 3`、`MESSAGE_DATA = 4`。0 保留为非法值，因此一个全零 type 的报文会在校验阶段直接被拒。这四类正好对应握手的两步、cookie 挑战与数据流。
+
+**统一头**是 `struct message_header`（`messages.h:64`），只含一个 `__le32 type`。源码注释解释得很清楚：协议真正想要的布局是 `u8 type` 加 `u8 reserved_zero[3]`，但把整个 32 位当小端整数来编码，效果完全一样（type=1 编码为 `01 00 00 00`，高三个字节自然是零），却把「类型 + 保留位为零」的校验合并成一次 32 位比较，于是更快。这是在内存布局层做优化的典型例子。`send.c` 用 `cpu_to_le32` 写入类型，`receive.c` 用 `SKB_TYPE_LE32(skb)` 直接读小端值再与 `cpu_to_le32(MESSAGE_*)` 比较。
+
+**长度宏**围绕 AEAD 展开。`enum noise_lengths`（`messages.h:17`）给出关键尺寸：`NOISE_PUBLIC_KEY_LEN = CURVE25519_KEY_SIZE`（32 字节）、`NOISE_SYMMETRIC_KEY_LEN = CHACHA20POLY1305_KEY_SIZE`（32 字节）、`NOISE_TIMESTAMP_LEN = sizeof(u64) + sizeof(u32)`（12 字节）、`NOISE_AUTHTAG_LEN = CHACHA20POLY1305_AUTHTAG_SIZE`（16 字节）、`NOISE_HASH_LEN = BLAKE2S_HASH_SIZE`（32 字节）。宏 `noise_encrypted_len(plain_len)` 定义为 `plain_len + NOISE_AUTHTAG_LEN`，即密文 = 明文 + 16 字节 Poly1305 标签。数据消息总长宏 `message_data_len(plain_len)` 再叠加固定头长。`MESSAGE_PADDING_MULTIPLE = 16` 规定明文按 16 字节对齐，目的是隐藏真实包长、抵抗流量分析（padding 计算见 `send.c:141` 的 `calculate_skb_padding`）。
+
+**尾部 MAC** 是 `struct message_macs`（`messages.h:75`），含 `mac1[COOKIE_LEN]` 与 `mac2[COOKIE_LEN]`，`COOKIE_LEN = 16`。三种握手消息（initiation / response / cookie 之外，cookie 本身不含 macs）在尾部带这两个 16 字节字段，用于 DoS 防护：`mac1` 是以对端静态公钥派生密钥计算的 BLAKE2s，任何能拿到公钥的对端都能算；`mac2` 需要服务端下发 cookie 才能算。`wg_cookie_add_mac_to_packet`（`cookie.c:156`）在发送前把 macs 写进报文尾部，完整机制见 06-09、字段见 05-07。
+
+下表给出四类消息的字节序与长度口径，便于对照后文逐字节表（参数全集见 04-06）。
+
+| 概念 | 定义位置 | 取值/口径 |
+|---|---|---|
+| `MESSAGE_*` 类型常量 | `messages.h:56` | 0 非法，1 发起，2 响应，3 cookie，4 数据 |
+| `message_header.type` | `messages.h:64` | `__le32`，小端，写入用 `cpu_to_le32` |
+| `message_data.counter` | `messages.h:108` | `__le64`，小端，写入 `cpu_to_le64`、读取 `le64_to_cpu` |
+| `noise_encrypted_len(n)` | `messages.h:25` | `n + 16`（Poly1305 标签） |
+| `message_data_len(n)` | `messages.h:112` | `noise_encrypted_len(n) + 16`（数据头） |
+| `MESSAGE_MINIMUM_LENGTH` | `messages.h:117` | `message_data_len(0) = 32`（空数据包） |
+| `COOKIE_NONCE_LEN` | `messages.h:30` | 24（`XCHACHA20POLY1305_NONCE_SIZE`） |
+| `HANDSHAKE_DSCP` | `messages.h:126` | `0x88`（AF41 + ECN 00） |
+
+### 3. 关键数据结构与源码位置
+
+本节点名结构并给真实路径，逐字段表仍交给 05-05，这里聚焦「按字节排版」的视角，并把常量尺寸填进偏移。
+
+`struct message_handshake_initiation`（`messages.h:80`）定长 148 字节，字段依次是：`header`（4）、`sender_index`（`__le32`，4）、`unencrypted_ephemeral[32]`、`encrypted_static[noise_encrypted_len(32) = 48]`、`encrypted_timestamp[noise_encrypted_len(12) = 28]`、`macs`（32）。累加 `4+4+32+48+28+32 = 148`。发起方在 `wg_noise_handshake_create_initiation`（`noise.c:516`）按同一顺序填充：先 `dst->header.type = cpu_to_le32(MESSAGE_HANDSHAKE_INITIATION)`，再把临时公钥写进 `unencrypted_ephemeral`，`encrypted_static` 由 `message_encrypt` 产生，`sender_index` 由 `wg_index_hashtable_insert` 分配。
+
+`struct message_handshake_response`（`messages.h:89`）定长 92 字节：`header`（4）、`sender_index`（4）、`receiver_index`（4）、`unencrypted_ephemeral[32]`、`encrypted_nothing[noise_encrypted_len(0) = 16]`、`macs`（32），合计 `4+4+4+32+16+32 = 92`。`encrypted_nothing` 是 16 字节的纯认证标签，对应 `noise.c:711` 的 `message_encrypt(dst->encrypted_nothing, NULL, 0, key, hash)`——明文长度 0、只有标签，这就是握手确认块。
+
+`struct message_handshake_cookie`（`messages.h:98`）定长 64 字节：`header`（4）、`receiver_index`（4）、`nonce[COOKIE_NONCE_LEN = 24]`、`encrypted_cookie[noise_encrypted_len(16) = 32]`，合计 `4+4+24+32 = 64`。`wg_cookie_message_create`（`cookie.c:180`）用 `get_random_bytes_wait` 填 nonce，把 16 字节 cookie 经 `xchacha20poly1305_encrypt` 加密，AAD 用发起报文里的 `mac1`，密钥是 `checker->cookie_encryption_key`。它不带 macs——cookie 本身已是挑战—应答机制的产物。
+
+`struct message_data`（`messages.h:105`）是唯一的变长消息：`header`（4）、`key_idx`（`__le32`，4）、`counter`（`__le64`，8）、柔性数组 `encrypted_data[]`。固定部分 `sizeof(struct message_data) = 16`，故最小数据消息 `MESSAGE_MINIMUM_LENGTH = 16 + 16 = 32` 字节（16 头 + 16 标签，明文为 0 即 keepalive）。`key_idx` 填的是 `keypair->remote_index`（`send.c:207`），接收方据此在 index 哈希表里定位 keypair；`counter` 填 `PACKET_CB(skb)->nonce`，它来自 `atomic64_inc_return(&keypair->sending_counter) - 1`（`send.c:380`），是 AEAD 的 nonce，也是抗重放的依据（见 06-08）。
+
+下表把四类消息按「偏移：长度」逐段列出，这是本篇最核心的速查表（字段定义见 05-05，模块见 07-06）。
+
+| 消息（type） | 偏移：长度 → 字段 | 固定段合计 | 总长 |
+|---|---|---|---|
+| 发起 1 前段 | `0:4` type；`4:4` sender_index；`8:32` ephemeral | — | 148 定长 |
+| 发起 1 后段 | `40:48` encrypted_static；`88:28` encrypted_timestamp；`116:32` macs | — | 148 定长 |
+| 响应 2 前段 | `0:4` type；`4:4` sender_index；`8:4` receiver_index；`12:32` ephemeral | — | 92 定长 |
+| 响应 2 后段 | `44:16` encrypted_nothing；`60:32` macs | — | 92 定长 |
+| cookie 3 | `0:4` type；`4:4` receiver_index；`8:24` nonce；`32:32` encrypted_cookie | 64 | 64 定长 |
+| 数据 4 | `0:4` type；`4:4` key_idx；`8:8` counter；`16:变长` encrypted_data | 16 | `32 + 明文长` |
+
+### 4. 关键流程与调用链
+
+发送侧有三条握手路径，都在 `send.c`。`wg_packet_send_handshake_initiation`（第 21 行）先用 `wg_birthdate_has_expired(last_sent_handshake, REKEY_TIMEOUT)` 做速率限制，再调 `wg_noise_handshake_create_initiation` 填结构，随后 `wg_cookie_add_mac_to_packet(&packet, sizeof(packet), peer)` 在尾部写 mac，最后 `wg_socket_send_buffer_to_peer(peer, &packet, sizeof(packet), HANDSHAKE_DSCP)` 发出——注意长度参数传的是 `sizeof(packet)`，即定长 148，接收侧才会用精确相等校验。`wg_packet_send_handshake_response`（第 85 行）结构相同，但只在 `wg_noise_handshake_begin_session` 成功后才发送，保证密钥已落地。`wg_packet_send_handshake_cookie`（第 110 行）调 `wg_cookie_message_create` 填 cookie 结构，再用 `wg_socket_send_buffer_as_reply_to_skb` 作为对来源的应答发回，保留 endpoint。
+
+数据消息的封装在 `encrypt_packet`（`send.c:162`）：`skb_push(skb, sizeof(*header))` 腾出 16 字节，写入 `header->header.type = cpu_to_le32(MESSAGE_DATA)`、`header->key_idx = keypair->remote_index`、`header->counter = cpu_to_le64(PACKET_CB(skb)->nonce)`，然后用 `chacha20poly1305_encrypt_sg_inplace` 对 `plaintext_len = skb->len + padding_len` 原地加密，标签追加在尾部。发送前的 headroom 由 `DATA_PACKET_HEAD_ROOM = ALIGN(sizeof(struct message_data) + SKB_HEADER_LEN, 4)` 预留（`messages.h:123`），`SKB_HEADER_LEN` 覆盖最大 IP 头 + UDP 头 + `NET_SKB_PAD`，避免下层封装时再扩容。
+
+接收侧的长度校验是两道关卡。第一道 `validate_header_len`（`receive.c:28`）先排除 `skb->len < sizeof(struct message_header)` 的短包，然后按 type 分派：**三种握手消息用 `skb->len == sizeof(struct message_*)` 精确相等**——长度差一字节就返回 0 拒绝；**数据消息用 `skb->len >= MESSAGE_MINIMUM_LENGTH`**，只要求不小于 32，返回 `sizeof(struct message_data)`（16，即固定头长）而非整包长，因为数据长度可变。第二道 `prepare_skb_header`（`receive.c:47`）先查 IP/UDP 头合法性，用 `udp_get_len_short(udp)` 取网络序 UDP 长度并扣掉 8 字节 UDP 头得到载荷长度 `data_len`，再用 `pskb_may_pull` 保证线性区有 `message_header`、`pskb_trim` 把 skb 裁到 UDP 声明长度（防止虚报长度），`skb_pull` 跳过 IP/UDP 头后核对 `skb->len == data_len`，最后调 `validate_header_len` 拿到头长，再 `__skb_push` / `__skb_pull` 恢复网络头偏移以便后续提取 endpoint。这两道关卡把「长度造假」「类型非法」「头截断」全部挡在密码学处理之前。
+
+通过校验后，数据消息的每个字段才在后续路径里被真正消费：接收侧按 `key_idx` 在 index 哈希表里定位 keypair，取不到或 `receiving.is_valid` 为假即丢弃；再把 `__le64 counter` 经 `le64_to_cpu` 读成 nonce，交给 `counter_validate`（`receive.c:295`）做 RFC6479 抗重放位图检测——这张 8192 位的位图在 `noise_replay_counter.backtrack` 上实现，窗口大小为 `COUNTER_WINDOW_SIZE = COUNTER_BITS_TOTAL - BITS_PER_LONG`，早于窗口或被重复标记的 counter 一律拒收；最后 `chacha20poly1305_decrypt_sg_inplace` 用 `receiving.key` 与该 nonce 解密，并核对尾部 16 字节 Poly1305 标签。可见消息格式里的字段各司其职：`type` 决定分流，`key_idx` 决定用哪把密钥，`counter` 同时充当 AEAD nonce 与重放序号，标签提供完整性与认证（重放机制见 06-08，字段定义见 05-05）。
+
+cookie 消息是一条独立支路：`wg_receive_handshake_packet`（`receive.c:104`）识别到 `MESSAGE_HANDSHAKE_COOKIE` 就直接调 `wg_cookie_message_consume`（`cookie.c:198`），后者按 index 找 peer、用 `last_mac1_sent` 作 AAD 解密 `encrypted_cookie`，成功则更新 `latest_cookie`。四类消息的封装层次与校验路径见图 06-04-01。
+
+:::figure id=06-04-01 | name=四类消息的封装层次与长度校验 | dir=TD
+node m1 "UDP 载荷<br/>__le32 type 统一头" blue
+node m2 "握手发起<br/>148 字节定长" teal
+node m3 "握手响应<br/>92 字节定长" teal
+node m4 "cookie<br/>64 字节定长" teal
+node m5 "数据<br/>16 头+变长密文" purple
+node m6 "validate_header_len<br/>握手用等号/数据用下限" green
+node m7 "prepare_skb_header<br/>UDP 长度与 pskb_trim" gray
+node m8 "尾部 macs<br/>mac1 / mac2" amber
+edge m1 -> m2 "type=1"
+edge m1 -> m3 "type=2"
+edge m1 -> m4 "type=3"
+edge m1 -> m5 "type=4"
+edge m2 -> m6 "精确相等"
+edge m3 -> m6 "精确相等"
+edge m4 -> m6 "精确相等"
+edge m5 -> m6 "大于等于下限"
+edge m6 -> m7 "头长确定后裁剪"
+edge m2 -> m8 "尾部 32 字节"
+edge m3 -> m8 "尾部 32 字节"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「UDP 载荷 __le32 type 统一头」按 type 分成四条支路——「握手发起 148 字节定长」「握手响应 92 字节定长」「cookie 64 字节定长」「数据 16 头+变长密文」；三种握手消息尾部带「尾部 macs mac1 / mac2」，数据消息则按 AEAD 追加标签；所有类型先经「validate_header_len 握手用等号/数据用下限」判断头长，再经「prepare_skb_header UDP 长度与 pskb_trim」核对 UDP 声明长度并裁剪，任何一环不符即丢弃。
+
+### 5. 配置/命令/代码实例
+
+字节布局最适合用抓包验证。下面在承载 WireGuard 的物理网卡上抓一个握手发起包，导出 UDP 载荷的十六进制（工具参数见 04-03，抓包方法见 08-01）。
+
+```bash
+# 抓取发往 51820 端口、载荷不小于 148 字节的报文，取首包载荷
+tshark -i eth0 -f 'udp port 51820' -Y 'udp.length >= 176' \
+  -T fields -e data.data -c 1
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+示例输出，具体格式需对照实际版本核验
+偏移   字节（十六进制，节选）                 对应字段
+0000   01 00 00 00                          header.type = MESSAGE_HANDSHAKE_INITIATION
+0004   7a 3c 1d 4e                          sender_index (__le32)
+0008   a1 b2 c3 d4 ... （共 32 字节）        unencrypted_ephemeral
+0028   9e 10 7f ...   （共 48 字节）          encrypted_static（32+16）
+0058   55 08 ...      （共 28 字节）          encrypted_timestamp（12+16）
+0074   3a 91 ...      （共 16 字节）          macs.mac1
+0084   c7 02 ...      （共 16 字节）          macs.mac2
+```
+
+逐行判读如下。首行 `01 00 00 00` 是 `message_header.type` 的小端编码：低字节 01 对应 `MESSAGE_HANDSHAKE_INITIATION`，高三个字节 00 正是 `messages.h` 注释里说的 `reserved_zero[3]` 被合并进 32 位比较的效果；若这里是 `04 00 00 00` 就应走数据分支。偏移 `0004` 的 `7a 3c 1d 4e` 是 `sender_index`，由 `wg_index_hashtable_insert` 分配，接收方用它定位握手态——注意 4 字节按小端读作 `0x4e1d3c7a`，若按大端读会得到完全错误的索引。`0008` 起 32 字节是明文临时公钥，`wg_noise_handshake_create_initiation` 里 `curve25519_generate_public` 的输出直接 memcpy 到 `unencrypted_ephemeral`，它是整条派生链 `e` 的输入。`0028` 起 48 字节是加密的静态公钥，`48 = 32 + 16`，多出的 16 字节正是 Poly1305 标签，对应 `noise_encrypted_len(NOISE_PUBLIC_KEY_LEN)`。`0058` 起 28 字节是加密时间戳，`28 = 12 + 16`，明文是 `tai64n_now` 产生的 12 字节 TAI64N（注意时间戳本身用大端写入，与外层字段的小端不同，这是协议特例）。`0074` 与 `0084` 各 16 字节是 `macs.mac1` 与 `macs.mac2`，由 `wg_cookie_add_mac_to_packet` 在 `sizeof(packet) - sizeof(macs)` 的位置追加；若服务端未下发 cookie，`mac2` 会被清零。整包 `148 = 4+4+32+48+28+32` 字节，与 `validate_header_len` 里 `skb->len == sizeof(struct message_handshake_initiation)` 的精确校验吻合——少一字节都会被丢弃且无任何错误回显。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是字节序。WireGuard 载荷字段一律小端（`__le32` / `__le64`），写用 `cpu_to_le32` / `cpu_to_le64`、读用 `SKB_TYPE_LE32` / `le64_to_cpu`；而 IP 头、UDP 头的长度与端口是网络字节序（`__be16` / `__be32`），`prepare_skb_header` 用 `udp_get_len_short` 读取时已在内部转换。时间戳又是大端特例。三者并存，写解析器时必须逐个字段确认，不能一概而论。
+
+第二个陷阱是长度判断口径。握手消息必须精确相等，数据消息只需 `>= MESSAGE_MINIMUM_LENGTH`。把数据的 `>=` 误写成 `==` 会让所有带载荷的数据包被丢弃（只剩 keepalive 通）；把握手的 `==` 放宽成 `>=` 则会放过畸形包。这个差异源自「握手定长、数据变长」的本质区别，不是随手写的。
+
+第三个陷阱是 padding 与对齐。`calculate_skb_padding` 把明文补齐到 16 字节边界（`MESSAGE_PADDING_MULTIPLE`），既隐藏长度又方便 AEAD 处理；`calculate_skb_padding` 还用 `last_unit %= mtu` 防御「上层给的包超过 MTU」时的减法溢出。忽略这一点，自实现的封装器会因为包长不是 16 的倍数而与内核版不互通。
+
+第四个陷阱是 MAC 位置与长度参数。`wg_cookie_add_mac_to_packet` 用 `(u8 *)message + len - sizeof(*macs)` 定位尾部，调用时 `len` 必须传 `sizeof(packet)`（定长结构的编译期长度），而不是某个运行时长度，否则 mac 会写错位置。`send.c` 三处握手发送都严格传 `sizeof(packet)`，正是为了与接收侧 `skb->len == sizeof(...)` 对齐。
+
+第五个陷阱是把 cookie 消息当成握手的子类型去解析。它没有 macs 字段，AAD 用的是发起报文的 `mac1`，由 `wg_socket_send_buffer_as_reply_to_skb` 作为应答发出；接收侧在 `wg_receive_handshake_packet` 一开始就分流到 `wg_cookie_message_consume`，不会进入常规握手状态机。把 cookie 当普通响应解析会读错字段。
+
+第六个陷阱是忽略 headroom 与柔性数组的内存后果。`DATA_PACKET_HEAD_ROOM = ALIGN(sizeof(struct message_data) + SKB_HEADER_LEN, 4)` 预留的空间必须容纳消息头加最大 IP/UDP 头，否则 `skb_cow_head` 会触发重新分配、破坏已建立的 `sk_buff` 分段视图；而 `message_data` 的 `encrypted_data[]` 是柔性数组，`sizeof(struct message_data)` 仅为 16，并不等于任何完整数据报文的长度，若误用它做缓冲区分配就会越界。第七个陷阱是把 type 当有符号数比较：`__le32` 解码后应按无符号宽度与 `MESSAGE_*` 常量比较，否则高位为 1 的畸形 type 可能被错误地匹配到某个合法分支。最佳实践：调试消息格式时以 `messages.h` 的结构定义和 `validate_header_len` 的分支为唯一准绳，配合抓包逐偏移核对，不依赖第三方解析器的默认假设（排障见 08-04）。
+
+### 7. 小结与延伸阅读
+
+本篇把 `messages.h` 的逐字节契约讲成一条主线：四类消息由 `enum message_type`（0 非法、1 发起、2 响应、3 cookie、4 数据）区分，共享一个 `__le32 type` 统一头——它用小端编码巧妙合并了 `u8 type + u8 reserved[3]`；三类握手消息定长（发起 148、响应 92、cookie 64）且尾部带 `mac1`/`mac2`，数据消息变长（`16 + 明文 + 16`，最小 32）且以 `__le32 key_idx` 与 `__le64 counter` 定位密钥与重放窗口。`noise_encrypted_len` 与 `message_data_len` 把 AEAD 的 16 字节标签计入长度，`MESSAGE_PADDING_MULTIPLE = 16` 约束明文对齐。发送侧三条握手路径与 `encrypt_packet` 按这些偏移填充，接收侧用 `validate_header_len`（握手精确相等、数据下限判断）与 `prepare_skb_header`（UDP 长度核对与 `pskb_trim`）两道关卡拦截畸形包，cookie 消息则走独立挑战—应答分支。字节序上，载荷小端、IP/UDP 头网络序、TAI64N 时间戳大端，三者不可混用。
+
+延伸阅读建议：逐字段清单与对齐细节去 05-05，类型常量与命令参数全集去 04-06，编解码模块职责去 07-06，DoS 防护与 cookie 机制见 06-09，密钥派生与轮换见 06-03，抓包排障去 08-04。跨册随查按（字段见 05-05 ｜ 参数见 04-06 ｜ 模块见 07-06 ｜ 运维见 08-04）执行：结构体逐字段去 05、参数与命令全集去 04、目录级模块能力去 07、运维与故障案例去 08；本篇作为 06 册机制源不再自引原理篇。凡标注「需对照实际版本核验」的字段偏移与常量取值，均以 `_wglinux_build/upstream_src/` 下对应文件为准，本套资料不编造未核验的路径与取值。

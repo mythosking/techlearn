@@ -1,0 +1,336 @@
+## 05-05 noise 握手状态与 message 结构字段详解
+
+### 1. 背景与动机
+
+05 册是整套 WireGuard Linux 技术资料中「关键数据结构字段」的唯一权威源，本篇承接 05-01 的结构地图，专门承担 noise 相关结构与 message 线上消息的逐字段解释。所谓「noise 相关结构」，指定义在 `drivers/net/wireguard/noise.h` 中的 `noise_handshake`、`noise_keypair`、`noise_keypairs`、`noise_symmetric_key`、`noise_replay_counter` 五个结构，以及 `enum noise_handshake_state` 这个枚举；所谓「message 结构」，指定义在 `drivers/net/wireguard/messages.h` 中的 `message_header`、`message_macs`、`message_handshake_initiation`、`message_handshake_response`、`message_handshake_cookie`、`message_data` 六个线上布局结构。这些结构一处是内核握手的「状态记忆」，一处是线缆上的「字节排列」，两者通过 `noise.c` 的加解密函数紧密咬合：握手状态机每推进一次，就把若干字段序列化成 message 结构的线上字段发出去；对端收到后反过来把线上字段解析回来写进本地状态字段。因此把这两组结构放在一起讲，才能看清「状态字段→线上字段→状态字段」的完整闭环。
+
+WireGuard 采用 Noise 框架中的 `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` 握手模式，这一点在 `noise.c` 第 28 行的 `handshake_name` 常量和第 29 行的 `identifier_name` 常量中写得清清楚楚，协议交互序列则以注释形式写在 `noise.c` 开头：`-> e, es, s, ss, {t}` 与 `<- e, ee, se, psk, {}`。理解这组字段之前，先要建立一个基本认识：`noise_handshake` 是「一台握手对账本」，它记录本端在这一轮握手里算到哪一步、用了哪把临时密钥、对端报了哪个 index；而 `noise_keypair` 是「握手成功后的结算单」，保存派生出来的会话密钥与抗重放计数器。二者分工明确：前者在握手期间反复读写，握手完成后被 `handshake_zero` 清零；后者在握手成功时创建，此后长期承载数据传输，直到密钥过期或被替换。
+
+本篇严格以本快照源码为准逐字段展开，不臆造字段名。这里要先纠正一个常见的记忆偏差：不少资料会把 `last_sent_handshake`、`latest_cookie`、keypair 指针、local index 等名目统称为「握手状态字段」，但在 `noise.h` 的 `noise_handshake` 定义里并不存在这些名字。`last_sent_handshake` 与 `latest_cookie` 实际定义在 `peer.h` 的 `wg_peer`（分别是 `atomic64_t last_sent_handshake` 与 `struct cookie latest_cookie`），keypair 指针存在于 `queueing.h` 的 `struct packet_cb`，本地 index 则是 `peerlookup.h` 的 `index_hashtable_entry.index`。作为字段权威源，本篇不仅给出真实字段，还会专门用一张表厘清这些「邻居字段」的归属，避免读者把 A 结构的字段安到 B 结构上。这也是唯一权威源制度的核心价值：宁可花篇幅讲清「这个字段不在本结构里」，也不让读者带着错误认知去读别册。
+
+本册所有字段的字节序标记都如实保留。`messages.h` 的线上字段用了 `__le32`（32 位小端）与 `__le64`（64 位小端），例如 `message_header.type`、`sender_index`、`key_idx` 是 `__le32`，`message_data.counter` 是 `__le64`；而 `noise.c` 的 `tai64n_now` 在构造时间戳时用了 `__be64` / `__be32`（大端）。任务书中提到的 `__le16` 在这几个结构里并未出现——UDP 长度相关处理走的是 `udp_get_len_short` 与 `htons` 这套 16 位转换，而非 message 结构自身的字段。凡涉及字节序，本篇一律照抄源码标记并说明其语义，绝不擅自把 `__le32` 写成普通 `u32`。落到具体内核版本时，字段集合可能变化，需对照实际版本核验。
+
+### 2. 核心概念
+
+理解 noise 字段，抓住「一条链、五态机、三组密钥、四类消息」即可。
+
+一条链，指 Noise 的链式哈希与链式密钥。所有握手计算围绕 `handshake.hash` 与 `handshake.chaining_key` 两个 32 字节数组展开：每混入一段材料（对端静态公钥、临时公钥、DH 结果、密文、PSK），就更新这两个值。`noise.c` 中的 `mix_hash`、`kdf`、`mix_dh`、`mix_precomputed_dh`、`mix_psk`、`message_encrypt`、`message_decrypt`、`message_ephemeral` 八个静态函数就是这条链的操作算子。`hash` 充当 AEAD 的关联数据（AD），`chaining_key` 经 HKDF（源码注释明确引用了 Krawczyk 的 HKDF 论文与 RFC5869）派生出下一轮密钥，最终由 `derive_keys` 生成会话密钥。字段 `hash` 与 `chaining_key` 因此不是普通缓冲，而是握手密码学状态的「累加器」。
+
+与握手结构配套的还有 `noise_static_identity`，它在 05-02 的 `wg_device.static_identity` 中被引用，字段权威也在本篇。该结构定义在 `noise.h` 第 50–55 行，共四个字段：`static_public[NOISE_PUBLIC_KEY_LEN]` 保存本端静态公钥，`static_private[NOISE_PUBLIC_KEY_LEN]` 保存 clamped 后的静态私钥，`lock` 是保护私钥读写的读写信号量，`has_identity` 标识私钥是否已设置。`noise.c` 的 `wg_noise_set_static_identity_private_key` 在设置私钥时先 `memcpy` 再 `curve25519_clamp_secret`，随后用 `curve25519_generate_public` 派生公钥并置 `has_identity`；所有创建握手的函数都先检查这个布尔值，未配置私钥则直接失败。把静态身份单独成结构而非塞进每个 peer，是因为一台设备只有一份静态身份，却要和许多 peer 分别握手——`noise_handshake.static_identity` 只是一个指向这份共享身份的指针，因此它才被列在「初始化后不可变、不受 handshake.lock 保护」的例外里。
+
+五态机，指 `enum noise_handshake_state` 的五个取值：`HANDSHAKE_ZEROED`（清零态）、`HANDSHAKE_CREATED_INITIATION`（已构造发起消息）、`HANDSHAKE_CONSUMED_INITIATION`（已消费对端发起消息）、`HANDSHAKE_CREATED_RESPONSE`（已构造响应消息）、`HANDSHAKE_CONSUMED_RESPONSE`（已消费对端响应消息）。发起方经历 ZEROED→CREATED_INITIATION→CONSUMED_RESPONSE，响应方经历 ZEROED→CONSUMED_INITIATION→CREATED_RESPONSE，两条路径最终都汇入 `wg_noise_handshake_begin_session` 派生密钥。状态字段 `state` 是整条状态机的方向盘，所有 `create_*` / `consume_*` 函数都以检查它开头。
+
+三组密钥，指 `noise_keypairs` 结构里的 `current_keypair`、`previous_keypair`、`next_keypair` 三个 `__rcu` 指针，配合 `keypair_update_lock` 自旋锁滑动更新。发起方拿到响应后新密钥直接成为 current，响应方则要等收到第一个数据包确认后才把 next 提升为 current——这段「确认」逻辑由 `wg_noise_received_with_keypair` 完成。每组 `noise_keypair` 内嵌一对 `noise_symmetric_key`（发送 `sending`、接收 `receiving`）与一个 `noise_replay_counter`（`receiving_counter`），分别承担加密、解密与抗重放。
+
+四类消息，指 `enum message_type` 定义的 `MESSAGE_HANDSHAKE_INITIATION`（1）、`MESSAGE_HANDSHAKE_RESPONSE`（2）、`MESSAGE_HANDSHAKE_COOKIE`（3）、`MESSAGE_DATA`（4），外加 `MESSAGE_INVALID`（0）作为哨兵。每种消息对应一个 `message_*` 结构，其线上字段布局下一节逐字段列出。值得注意的是所有消息首字段都是 `message_header`，其唯一成员是 `__le32 type`——源码注释特意解释：本想要的布局是 `u8 type` 加 `u8 reserved_zero[3]`，但用小端编码 32 位数可达到同样效果且检查更快，这是字节序标记影响布局设计的直接例证。
+
+字段的并发语义要单独强调。`noise_handshake.lock` 是一把读写信号量，源码注释写明它保护除 `remote_static`、`precomputed_static_static`、`static_identity` 三个「初始化后不可变」成员以外的所有成员；`wg_peer` 的 `static_identity->lock` 是另一把读写信号量，保护静态私钥。读握手字段通常持 `down_read`，写持 `down_write`；`noise_keypairs.keypair_update_lock` 则用 `spin_lock_bh`，因为它在软中断与进程上下文都可能被访问。密钥对象 `noise_keypair` 用 `kref` 加 `rcu_head` 双重机制释放：`kref_put` 触发 `keypair_free_kref` 摘除索引后由 `call_rcu` 延迟到 `keypair_free_rcu` 真正 `kfree_sensitive`，保证正在遍历的读者不会踩到已回收内存。理解每类字段由哪把锁、哪种机制保护，是正确读写它们的前提（原理见 06-02、06-03）。
+
+### 3. 关键数据结构与源码位置
+
+下表逐字段列出 `noise_handshake`，全部取自 `drivers/net/wireguard/noise.h` 第 65–90 行的定义。数组长度常量取自同目录 `messages.h` 的 `enum noise_lengths`：`NOISE_PUBLIC_KEY_LEN`、`NOISE_SYMMETRIC_KEY_LEN`、`NOISE_HASH_LEN` 均为 32，`NOISE_TIMESTAMP_LEN` 为 12。
+
+| 字段名 | 类型 | 职责 | 注意事项 |
+|---|---|---|---|
+| `entry` | `struct index_hashtable_entry` | 索引哈希表挂接节点 | 内嵌字段，含 `__le32 index` |
+| `state` | `enum noise_handshake_state` | 握手状态机当前态 | 所有 create/consume 的检查点 |
+| `last_initiation_consumption` | `u64` | 上次消费发起消息的时间戳 | 与 flood 攻击检测相关 |
+| `static_identity` | `struct noise_static_identity *` | 指向本接口静态身份 | 初始化后不变，不受 `lock` 保护 |
+| `ephemeral_private` | `u8[NOISE_PUBLIC_KEY_LEN]` | 本端临时私钥 | 敏感数据，清零时置 0 |
+| `remote_static` | `u8[NOISE_PUBLIC_KEY_LEN]` | 对端静态公钥 | 初始化后不变，用于查 peer |
+| `remote_ephemeral` | `u8[NOISE_PUBLIC_KEY_LEN]` | 对端临时公钥 | 由发起/响应消息解析写入 |
+| `precomputed_static_static` | `u8[NOISE_PUBLIC_KEY_LEN]` | 静态-静态 DH 预计算值 | 初始化后不变，加速 es/ss |
+| `preshared_key` | `u8[NOISE_SYMMETRIC_KEY_LEN]` | 预共享密钥（可选） | 全零表示未配置 PSK |
+| `hash` | `u8[NOISE_HASH_LEN]` | 链式哈希（AEAD 的 AD） | 握手累加器，敏感 |
+| `chaining_key` | `u8[NOISE_HASH_LEN]` | 链式密钥（HKDF 输入） | 派生会话密钥的种子 |
+| `latest_timestamp` | `u8[NOISE_TIMESTAMP_LEN]` | 对端发来的最新时间戳 | 抗重放：比较大小 |
+| `remote_index` | `__le32` | 对端分配的接收索引 | 小端存储，来自 sender_index |
+| `lock` | `struct rw_semaphore` | 保护除三成员外的全部字段 | 读 down_read / 写 down_write |
+
+任务书中提到的若干「握手字段」其实住在别的结构里，作为权威源必须点明归属，下表给出对照。
+
+| 常被误认为属于握手结构的名字 | 真实归属结构 | 真实字段与类型 | 定义文件 |
+|---|---|---|---|
+| `last_sent_handshake` | `wg_peer` | `atomic64_t last_sent_handshake` | `drivers/net/wireguard/peer.h` |
+| `latest_cookie` | `wg_peer` | `struct cookie latest_cookie` | `drivers/net/wireguard/peer.h` |
+| keypair 指针 | `packet_cb` | `struct noise_keypair *keypair` | `drivers/net/wireguard/queueing.h` |
+| local index | `index_hashtable_entry` | `__le32 index` | `drivers/net/wireguard/peerlookup.h` |
+
+`noise_keypair`、`noise_keypairs`、`noise_symmetric_key`、`noise_replay_counter` 四个结构同样是本篇的权威范围，逐字段表如下，全部取自 `noise.h` 第 18–48 行。
+
+| 结构 / 字段名 | 类型 | 职责 | 注意事项 |
+|---|---|---|---|
+| `noise_keypair.entry` | `struct index_hashtable_entry` | 按 index 查 keypair 的挂接点 | `type` 为 `INDEX_HASHTABLE_KEYPAIR` |
+| `noise_keypair.sending` | `struct noise_symmetric_key` | 发送方向会话密钥 | 过期由 `sending.is_valid` 标记 |
+| `noise_keypair.sending_counter` | `atomic64_t` | 发送 nonce 计数器 | 原子自增后减一作 nonce |
+| `noise_keypair.receiving` | `struct noise_symmetric_key` | 接收方向会话密钥 | 解密使用 `receiving.key` |
+| `noise_keypair.receiving_counter` | `struct noise_replay_counter` | 抗重放计数器与位图 | 持 `spinlock_t lock` 访问 |
+| `noise_keypair.remote_index` | `__le32` | 对端 index，写入数据包 `key_idx` | 小端存储 |
+| `noise_keypair.i_am_the_initiator` | `bool` | 本端是否为发起方 | 决定发送/接收密钥派生次序 |
+| `noise_keypair.refcount` | `struct kref` | 密钥生命周期引用计数 | get/put 必须配对 |
+| `noise_keypair.rcu` | `struct rcu_head` | 延迟释放链表节点 | `call_rcu` 使用 |
+| `noise_keypair.internal_id` | `u64` | 全局单调递增的内部编号 | 来自全局 `keypair_counter` |
+| `noise_keypairs.current_keypair` | `struct noise_keypair __rcu *` | 当前数据密钥 | RCU 读需 `rcu_dereference_bh` |
+| `noise_keypairs.previous_keypair` | `struct noise_keypair __rcu *` | 上一代密钥 | 只收不发 |
+| `noise_keypairs.next_keypair` | `struct noise_keypair __rcu *` | 待确认的新密钥 | 响应方等待数据包确认 |
+| `noise_keypairs.keypair_update_lock` | `spinlock_t` | 保护三指针滑动 | `spin_lock_bh` |
+| `noise_symmetric_key.key` | `u8[NOISE_SYMMETRIC_KEY_LEN]` | ChaCha20-Poly1305 密钥 | 32 字节敏感材料 |
+| `noise_symmetric_key.birthdate` | `u64` | 密钥诞生时间（boottime ns） | 用于过期判定 |
+| `noise_symmetric_key.is_valid` | `bool` | 密钥是否有效 | 过期时置 false |
+| `noise_replay_counter.counter` | `u64` | 已接收的最大 nonce | 写用 `WRITE_ONCE` |
+| `noise_replay_counter.lock` | `spinlock_t` | 保护计数器与位图 | `spin_lock_bh` |
+| `noise_replay_counter.backtrack[...]` | `unsigned long[128]` | RFC6479 抗重放位图 | `COUNTER_BITS_TOTAL=8192` |
+
+`backtrack` 的数组长度是 `COUNTER_BITS_TOTAL / BITS_PER_LONG`，在 64 位机上为 8192/64=128 个 `unsigned long`，正好覆盖 8192 位窗口（源码 `enum counter_values`）。
+
+线上消息结构的逐字段布局见下表，取自 `messages.h` 第 64–113 行；`__le32` / `__le64` 标记逐字保留。以 148 字节的发起消息为例，其构成为：头部 4 + `sender_index` 4 + 明文临时公钥 32 + 加密静态公钥 48（32 明文 + 16 认证标签）+ 加密时间戳 28（12 明文 + 16 标签）+ 两组 MAC 共 32。
+
+| 结构 | 字段 | 类型 / 长度 | 字节序与语义 |
+|---|---|---|---|
+| `message_header` | `type` | `__le32` | 小端；低字节为消息类型，高 3 字节为零 |
+| `message_macs` | `mac1[16]` / `mac2[16]` | `u8[COOKIE_LEN]` | mac1 抗伪造，mac2 供 cookie 质询 |
+| `message_handshake_initiation` | `header` | `struct message_header` | 类型值 1 |
+| 同上 | `sender_index` | `__le32` | 小端；发起方索引 |
+| 同上 | `unencrypted_ephemeral[32]` | `u8[]` | 明文临时公钥 e |
+| 同上 | `encrypted_static[48]` | `u8[]` | 加密的静态公钥 s |
+| 同上 | `encrypted_timestamp[28]` | `u8[]` | 加密的时间戳 t |
+| 同上 | `macs` | `struct message_macs` | 两组 MAC |
+| `message_handshake_response` | `sender_index` / `receiver_index` | `__le32` / `__le32` | 均为小端；后者对应发起方 index |
+| 同上 | `encrypted_nothing[16]` | `u8[]` | 空明文加密，仅作认证 |
+| `message_handshake_cookie` | `receiver_index` | `__le32` | 小端；目标 index |
+| 同上 | `nonce[24]` | `u8[COOKIE_NONCE_LEN]` | XChaCha20-Poly1305 nonce |
+| 同上 | `encrypted_cookie[32]` | `u8[]` | 16 字节 cookie + 16 字节标签 |
+| `message_data` | `key_idx` | `__le32` | 小端；接收索引 |
+| 同上 | `counter` | `__le64` | 小端；数据包 nonce |
+| 同上 | `encrypted_data[]` | 柔性数组 | 密文，长度随载荷变化 |
+
+握手状态机的五态迁移与字段写入点见图 05-05-01。
+
+:::figure id=05-05-01 | name=noise 握手五态机与字段写入点 | dir=TD
+node h0 "HANDSHAKE_ZEROED<br/>清零初始态" blue
+node h1 "CREATED_INITIATION<br/>已建发起消息" teal
+node h2 "CONSUMED_INITIATION<br/>已消费发起" purple
+node h3 "CREATED_RESPONSE<br/>已建响应消息" amber
+node h4 "CONSUMED_RESPONSE<br/>已消费响应" green
+node h5 "begin_session<br/>派生会话密钥" gray
+edge h0 -> h1 "create_initiation 写 ephemeral"
+edge h1 -> h2 "consume_initiation 对端"
+edge h2 -> h3 "create_response 写 ephemeral"
+edge h3 -> h4 "consume_response 对端"
+edge h3 -> h5 "begin_session 响应方"
+edge h4 -> h5 "begin_session 发起方"
+edge h5 -> h0 "handshake_zero 清零"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「HANDSHAKE_ZEROED 清零初始态」经「create_initiation 写 ephemeral」到「CREATED_INITIATION 已建发起消息」，对端「consume_initiation」推进到「CONSUMED_INITIATION 已消费发起」，响应方「create_response 写 ephemeral」进入「CREATED_RESPONSE 已建响应消息」，对端「consume_response 后到「CONSUMED_RESPONSE 已消费响应」；两条路径都从相应状态流入「begin_session 派生会话密钥」，最后「handshake_zero 清零」回到初始态。
+
+### 4. 关键流程与调用链
+
+发起方向由 `send.c` 的 `wg_packet_send_handshake_initiation` 触发，核心在 `noise.c` 的 `wg_noise_handshake_create_initiation`：先 `wait_for_random_bytes` 等待随机数就绪（注释强调必须在取锁前等，因为 `curve25519_generate_secret` 会调 `get_random_bytes_wait`），然后持 `down_read(&handshake->static_identity->lock)` 与 `down_write(&handshake->lock)` 两把锁；`handshake_init` 把全局初始哈希与链式密钥拷入 `hash`/`chaining_key` 并混入 `remote_static`；随后生成 `ephemeral_private`、经 `message_ephemeral` 写入线上 `unencrypted_ephemeral`，`mix_dh` 算 es、`message_encrypt` 加密静态公钥写入 `encrypted_static`，`mix_precomputed_dh` 算 ss，`tai64n_now` 生成时间戳加密写入 `encrypted_timestamp`；最后 `wg_index_hashtable_insert` 分配 index 填入 `sender_index`，并把 `state` 置为 `HANDSHAKE_CREATED_INITIATION`。
+
+响应方向由 `receive.c` 的握手 worker 调用 `wg_noise_handshake_consume_initiation`：先在本端 `static_identity` 上握手初始化，用 `message_ephemeral` 与 `mix_dh` 解出静态公钥 `s`，`wg_pubkey_hashtable_lookup` 按 `remote_static` 查到 peer，再解出时间戳 `t`，然后在 `handshake->lock` 的读锁下比较 `latest_timestamp` 判重放、比较 `last_initiation_consumption` 判 flood；通过后转写锁，把 `remote_ephemeral`、`hash`、`chaining_key`、`remote_index`、新的 `latest_timestamp` 与 `last_initiation_consumption` 写回状态字段，`state` 置为 `HANDSHAKE_CONSUMED_INITIATION`。紧接着 `wg_noise_handshake_create_response` 检查状态、生成自己的临时密钥、做 ee 与 se 的 DH、`mix_psk` 混入预共享密钥、加密空消息填入 `encrypted_nothing`，插入 index 后置 `state` 为 `HANDSHAKE_CREATED_RESPONSE`。
+
+发起方收到响应后 `wg_noise_handshake_consume_response` 用 `receiver_index` 在索引哈希表中反查握手对象，校验状态确为 `HANDSHAKE_CREATED_INITIATION`，重算 ee/se/psk 并解密 `encrypted_nothing`，再在写锁下做二次校验（状态未变且 `ephemeral_private` 未被替换），确认后写入 `remote_ephemeral`、`hash`、`chaining_key`、`remote_index`，`state` 置为 `HANDSHAKE_CONSUMED_RESPONSE`。双方最终都进入 `wg_noise_handshake_begin_session`：它检查状态为 CREATED_RESPONSE 或 CONSUMED_RESPONSE 之一，`keypair_create` 分配新密钥，按 `i_am_the_initiator` 决定 `derive_keys` 的发送/接收次序，用 `handshake->remote_index` 填 `new_keypair->remote_index`，调用 `handshake_zero` 清零临时状态，最后在 `rcu_read_lock_bh` 内经 `add_new_keypair` 把新密钥挂入 `keypairs`，并用 `wg_index_hashtable_replace` 把握手 entry 替换为 keypair entry。这个过程把短暂的状态字段固化成长生命周期的密钥字段，是整条链的收束点（状态机原理见 06-02，密钥派生见 06-03）。
+
+### 5. 配置/命令/代码实例
+
+作为字段权威源，先给出从源码定位这些字段的实操方法，再给出一段基于真实源码的字段访问实例。定位 `noise_handshake` 字段与消息结构的命令如下。
+
+```bash
+cd _wglinux_build/upstream_src/wireguard-linux-src
+grep -n "struct noise_handshake" drivers/net/wireguard/noise.h
+grep -n "remote_index\|chaining_key\|state" drivers/net/wireguard/noise.h
+grep -n "struct message_handshake_initiation\|__le32\|__le64" drivers/net/wireguard/messages.h
+grep -rn "wg_noise_handshake_begin_session" drivers/net/wireguard/
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+drivers/net/wireguard/noise.h:65:struct noise_handshake {
+drivers/net/wireguard/noise.h:84:	__le32 remote_index;
+drivers/net/wireguard/noise.h:81:	u8 chaining_key[NOISE_HASH_LEN];
+drivers/net/wireguard/noise.h:68:	enum noise_handshake_state state;
+drivers/net/wireguard/messages.h:82:	__le32 sender_index;
+drivers/net/wireguard/messages.h:108:	__le64 counter;
+drivers/net/wireguard/noise.c:815:bool wg_noise_handshake_begin_session(struct noise_handshake *handshake,
+```
+
+下面这段 `begin_session` 的代码直接取自 `noise.c` 第 826–851 行的核心片段，用来展示状态字段如何转化为密钥字段。
+
+```c
+new_keypair = keypair_create(handshake->entry.peer);
+new_keypair->i_am_the_initiator = handshake->state ==
+				  HANDSHAKE_CONSUMED_RESPONSE;
+new_keypair->remote_index = handshake->remote_index;
+if (new_keypair->i_am_the_initiator)
+	derive_keys(&new_keypair->sending, &new_keypair->receiving,
+		    handshake->chaining_key);
+else
+	derive_keys(&new_keypair->receiving, &new_keypair->sending,
+		    handshake->chaining_key);
+handshake_zero(handshake);
+```
+
+逐行判读如下。示例输出第一、二行来自 `noise.h` 的结构定义与字段行，确认 `noise_handshake` 从第 65 行开始、`remote_index` 的类型是 `__le32`，这提示它是小端存储的线上索引而非主机序整数，直接参与 `cpu_to_le32` 语义。第三行的 `chaining_key` 类型是 `u8[NOISE_HASH_LEN]`，印证它是 32 字节链式密钥累加器。第四行 `state` 的类型是 `enum noise_handshake_state`，说明取值只能是五态之一。第五、六行来自 `messages.h`，`sender_index` 为 `__le32`、`counter` 为 `__le64`，后者正是数据包 nonce 的小端 64 位表示。第七行定位到 `begin_session` 函数定义。代码段中，`i_am_the_initiator` 由 `state == HANDSHAKE_CONSUMED_RESPONSE` 推导——只有发起方才会走到「消费响应」态，这一行体现了状态字段对密钥角色的决定作用；`remote_index` 从握手结构复制到 keypair 结构，供后续 `header->key_idx = keypair->remote_index` 使用；随后的 `derive_keys` 依据角色交换发送/接收密钥次序，发起方先 sending 后 receiving，响应方反之，保证双方派生出方向相反的密钥对；最后 `handshake_zero` 把临时字段清零，切断状态与密钥的耦合。整段代码把「状态字段→密钥字段」的转化顺序写得极为紧凑，任何顺序调整都可能破坏方向一致性（消息格式详见 06-04）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是字段名张冠李戴。`last_sent_handshake` 是 `wg_peer` 的 `atomic64_t`，由 `send.c` 用 `atomic64_set` 更新、用 `wg_birthdate_has_expired` 判过期，它不是 `noise_handshake` 的成员；把重传限速逻辑错记到握手结构上，会导致排障时找错字段。本篇的归属对照表就是为此而设。第二个陷阱是忽略 `__le32` / `__le64` 标记：从线上读取 `sender_index`、`counter`、`key_idx` 时，源码用 `cpu_to_le32`、`le64_to_cpu` 做转换（`receive.c` 第 259–260 行、第 511 行），若把 `__le32` 当主机序直接用，在小端机上侥幸正确、在大端机上必然出错；反过来，时间戳用的是 `__be64` / `__be32`，方向相反，更要分清。
+
+第三个陷阱是误判 `handshake_zero` 的清零范围。该函数只清 `ephemeral_private`、`remote_ephemeral`、`hash`、`chaining_key`、`remote_index` 与 `state`，刻意不清 `remote_static`、`preshared_key`、`precomputed_static_static`、`static_identity`、`latest_timestamp`、`last_initiation_consumption`——其中前三个是初始化后不可变的身份材料，后两个用于抗重放与限速，必须跨轮次保留。若把清零范围写大，会清空对端公钥或 PSK，导致后续握手永久失败。第四个陷阱是二次校验被省略：`wg_noise_handshake_consume_response` 在持写锁后再次检查 `state` 与 `ephemeral_private`，是为防止计算期间另一路并发握手改写了状态；省掉这次校验会引入竞态。第五个陷阱是敏感数据不留痕：`noise.c` 在多处用 `memzero_explicit` 擦除栈上临时密钥，密钥释放走 `kfree_sensitive`，这些不是多余动作，而是防止密钥残留在内存或核心转储中。
+
+最佳实践：读 noise 字段时先按本篇表格确认结构归属与字节序标记，再 grep 引用点弄清是哪条状态路径读写、持哪把锁；区分「握手期临时字段」与「会话期持久字段」的生命周期边界，把 `begin_session` 与 `handshake_zero` 当作分界点；凡涉及 index 与 counter，一律走 `cpu_to_le32` / `le64_to_cpu` 转换；凡涉及密钥派生次序，一律以 `i_am_the_initiator` 为准而非自行推断（密钥时序详见 06-03）。
+
+### 7. 小结与延伸阅读
+
+本篇作为 05 册的 noise 字段权威源，逐字段拆解了 `noise_handshake` 的十四个字段、`noise_keypair` 系列的二十个字段以及六种 message 的线上布局，并厘清了 `last_sent_handshake`、`latest_cookie`、keypair 指针、本地 index 四个易混字段的真实归属。核心结论：`hash` 与 `chaining_key` 是握手的密码学累加器，`state` 是五态机的方向盘，`remote_index` / `key_idx` / `counter` 的 `__le32` / `__le64` 标记是字节序契约，`i_am_the_initiator` 决定收发密钥派生次序，`kref` 与 `rcu_head` 共同管理密钥生命周期。
+
+延伸阅读：状态机五态的迁移原理见 06-02，密钥派生与轮换时序见 06-03，消息各字段的线格式语义见 06-04，抗重放算法见 06-08；packet_cb 等 skb 扩展字段见 05-06，endpoint 与 cookie 结构见 05-07，队列字段见 05-08。跨册随查按（字段见 05-05 ｜ 参数见 04-05 ｜ 原理见 06-02 ｜ 模块见 07-05）执行。本篇所有字段均以 `_wglinux_build/upstream_src/wireguard-linux-src/` 下 `noise.h`、`messages.h`、`noise.c` 为准，需对照实际版本核验。
+
+## 05-06 sk_buff 扩展与 packet 元数据字段详解
+
+### 1. 背景与动机
+
+本篇是 05 册关于 `sk_buff`（套接口缓冲区，内核网络数据包的统一载体）字段的权威源，但要先把范围划清楚：本文讲的不是内核 `struct sk_buff` 的全字段百科，而是「WireGuard Linux 驱动如何扩展与使用 skb 元数据」。内核的 `sk_buff` 定义在 `include/linux/skbuff.h`，字段数以百计，绝大多数由内核协议栈通用逻辑维护；WireGuard 并不需要、也不应该逐一解释它们。真正属于 WireGuard 自己的扩展只有一个结构——定义在 `drivers/net/wireguard/queueing.h` 的 `struct packet_cb`，它占用 skb 的控制缓冲区 `skb->cb`。本篇的「扩展」二字就指这个结构：驱动把握手与加解密所需的私有字段塞进 `skb->cb`，用一个宏 `PACKET_CB(skb)` 取回，从而在多个 worker 与队列之间传递元数据，而不必额外分配内存。
+
+为什么值得单独写一篇？因为 WireGuard 的数据面几乎完全建立在 skb 之上：一个包从内核协议栈下发，到被封装、加密、经 UDP socket 发出，再被对端接收、解密、注入协议栈，全程都是同一个 skb 在变形。在这个过程中，驱动反复读写 skb 的 `data`、`len`、`headroom`、`cb`、`dev`、`mark`、`protocol`、`ip_summed`、`hash` 等字段，并调用 `skb_push` / `skb_pull` / `pskb_may_pull` / `skb_cow_head` / `skb_cow_data` 等一大套操作。如果不把这些字段的用途和读写时机讲清楚，读 `send.c`、`receive.c`、`socket.c` 时会如同看天书——比如一个 `skb_push` 紧跟着一个 `skb_pull`，看似抵消，实则是为了在保持 endpoint 信息完整的前提下完成原地解密。本篇逐项拆解这些用法，给读者一张「 skb 字段—驱动用途」对照图。
+
+本篇同样遵守唯一权威源口径：04 册负责命令与参数，`wg` 的 fwmark 配置值属于参数范畴（见 04-01、04-05）；05-02 负责 `wg_device.fwmark` 字段本身；本篇只讲这个字段如何落到 `skb->mark` 与 flowi 的 `flowi4_mark` / `flowi6_mark` 上，即「元数据落地」这一段。06 册负责收发机制原理，本篇只讲字段与 API，把「为什么要这样封装」让给 06-05、06-06、06-12。凡是本文涉及的字段与常量，均逐字取自 `send.c`、`receive.c`、`socket.c`、`queueing.h`、`messages.h`，并以本快照为准，需对照实际版本核验。
+
+### 2. 核心概念
+
+理解 WireGuard 的 skb 用法，抓住「一个控制缓冲、三种指针、两类拷贝、一对推拉」即可。
+
+一个控制缓冲，指 `skb->cb`。这是内核为每个 skb 预留的 48 字节控制缓冲区，专门供各层协议存放私有数据，且随 skb 在队列与 worker 之间传递而保持有效。WireGuard 把它重解释为 `struct packet_cb`，并用 `PACKET_CB(skb)` 宏完成 `skb->cb` 到 `struct packet_cb *` 的强制转换（`queueing.h` 第 67 行）。这个结构的五个字段是本篇的核心：`nonce`（u64，数据包的 nonce）、`keypair`（`struct noise_keypair *`，指向会话密钥对象）、`state`（atomic_t，包的处理状态）、`mtu`（u32，路径 MTU）、`ds`（u8，DSCP/ECN 标记）。与之配套的 `PACKET_PEER(skb)` 宏则由 `PACKET_CB(skb)->keypair->entry.peer` 取回 peer 指针，是队列代码里频繁使用的快捷方式。
+
+三种指针，指 skb 中 `head`、`data`、`tail` 构成的分段视图。`head` 指向缓冲区的起始，`data` 指向当前协议层的载荷起点，`tail` 指向数据末尾。`skb_headroom(skb)` 返回 `data - head`，即载荷前方的可用空间；WireGuard 在加密前要用 `skb_cow_head(skb, DATA_PACKET_HEAD_ROOM)` 确保这段空间足够容纳 `message_data` 头部与 IP/UDP 外层头。`DATA_PACKET_HEAD_ROOM` 定义在 `messages.h`，为 `ALIGN(sizeof(struct message_data) + SKB_HEADER_LEN, 4)`，而 `SKB_HEADER_LEN` 又是 `max(sizeof(struct iphdr), sizeof(struct ipv6hdr)) + sizeof(struct udphdr) + NET_SKB_PAD`——这串定义说明驱动为 v4/v6 两种外层头都预留了空间。
+
+两类拷贝，指 `cow`（copy-on-write）类操作。`skb_cow_head` 只保证头部线性空间可写，`skb_cow_data` 则保证整个数据可写并允许追加尾部空间（返回 scatterlist 段数）。`send.c` 的 `encrypt_packet` 先用 `skb_cow_head` 扩头，再用 `skb_cow_data(skb, trailer_len, &trailer)` 扩展尾部以容纳填充与认证标签；`receive.c` 的 `decrypt_packet` 则调用 `skb_cow_data(skb, 0, &trailer)` 保证解密可原地写。二者都配合 `skb_to_sgvec` 把 skb 的线性区与分片映射成 scatterlist，交给 `chacha20poly1305_encrypt_sg_inplace` / `decrypt_sg_inplace` 做原地加解密。
+
+一对推拉，指 `skb_push` / `skb_pull` 及其 `__` 前缀版本。`skb_push` 把 `data` 指针前移、增加 `len`，用于在载荷前「长出」一个头部；`skb_pull` 反之，跳过已处理的头。`send.c` 在加密末尾用 `header = (struct message_data *)skb_push(skb, sizeof(*header))` 在最前面插入 16 字节数据消息头，再填 `type`、`key_idx`、`counter`；`receive.c` 的 `prepare_skb_header` 则反复 `skb_pull` / `__skb_push` / `__skb_pull`，一边剥掉 UDP 头校验长度、一边把 `data` 复位到正确位置。这套推拉看似繁琐，本质是在不复制数据的前提下调整 `data` 指针视图。
+
+skb 在驱动里还承担「跨队列传递所有权」的角色，这与元数据同样重要。`staged_packet_queue` 是 `struct sk_buff_head`，`wg_packet_send_staged_packets` 用 `skb_queue_splice_init` 把整条队列摘到本地链表，这个操作是 O(1) 的指针搬移而非逐包拷贝，因此 `packet_cb` 的五个字段随之完整迁移到 worker；当密钥不可用时，`skb_orphan` 会解除 skb 与 socket 的绑定，避免包长时间占用 socket 的内存配额，随后 `skb_queue_splice` 把包放回 staged 队列头部。`wg_packet_encrypt_worker` 与 `wg_packet_tx_worker` 用 `skb_list_walk_safe` 遍历 skb 链表，这个宏在取出当前 skb 时先保存 `next`，使得处理中可以安全释放当前包而不破坏遍历；`wg_packet_send_staged_packets` 分配 nonce 时则用 `skb_queue_walk`。这些队列 API 之所以值得在字段篇里点名，是因为它们决定了 `packet_cb` 在什么时刻有效、由谁持有引用——例如 `PACKET_PEER(skb)` 宏依赖 `keypair` 指针非空，而 keypair 的引用正是在入队前由 `wg_noise_keypair_get` 取得、在消费端由 `wg_noise_keypair_put` 归还的。把 skb 的队列行为与 `packet_cb` 的生命周期放在一起看，才能理解为什么状态字段用原子量而非普通整数：生产者与消费者分属不同执行上下文，必须靠 `atomic_set_release` / `atomic_read_acquire` 建立同步（并发模型见 06-13）。
+
+skb 元数据还有一个容易被忽视的维度：校验和与哈希的卸载语义。`skb->ip_summed` 取值 `CHECKSUM_PARTIAL` 表示校验和待硬件完成，此时发送前必须调 `skb_checksum_help` 手工算完，否则 `encrypt_packet` 直接返回失败；接收解密成功后 `receive.c` 把 `skb->ip_summed` 设为 `CHECKSUM_UNNECESSARY`、`skb->csum_level = ~0`，告诉协议栈所有层次的校验和都因 Poly1305 认证通过而无需再验。`skb->hash` / `l4_hash` / `sw_hash` / `tstamp_type` 则在 `wg_reset_packet` 中被特意保存再恢复，避免重置 skb 时丢掉流哈希与时间戳类型。理解这些字段的「卸载」含义，是读懂收发路径校验和处理的前提。
+
+### 3. 关键数据结构与源码位置
+
+`struct packet_cb` 是本篇的头号结构，定义在 `drivers/net/wireguard/queueing.h` 第 59–68 行，逐字段如下。它占用的 `skb->cb` 是内核保留的控制缓冲，大小有限，因此字段数量被刻意压到五个。
+
+| 字段 / 宏 | 类型 | 职责 | 注意事项 |
+|---|---|---|---|
+| `nonce` | `u64` | 数据包 nonce | 发送由原子计数器分配，接收从线上 `counter` 读取 |
+| `keypair` | `struct noise_keypair *` | 指向会话密钥对象 | 持有引用，用完须 `wg_noise_keypair_put` |
+| `state` | `atomic_t` | 包加解密状态 | 取值为 `enum packet_state` 三态之一 |
+| `mtu` | `u32` | 路径 MTU | 为 0 时按 16 字节对齐填充 |
+| `ds` | `u8` | DSCP/ECN 值 | 经 `ip_tunnel_ecn_encap` / `ip_tunnel_get_dsfield` 处理 |
+| `PACKET_CB(skb)` | 宏 | `(struct packet_cb *)((skb)->cb)` | 把控制缓冲重解释为私有结构 |
+| `PACKET_PEER(skb)` | 宏 | `PACKET_CB(skb)->keypair->entry.peer` | 依赖 keypair 非空 |
+
+`enum packet_state` 定义在 `queueing.h` 第 53–57 行，三态为 `PACKET_STATE_UNCRYPTED`（未加解密）、`PACKET_STATE_CRYPTED`（已加解密）、`PACKET_STATE_DEAD`（处理失败）。生产者在入队时用 `atomic_set_release` 把 `state` 置为 UNCRYPTED，加解密 worker 完成后置为 CRYPTED 或 DEAD，消费端用 `atomic_read_acquire` 读取——release/acquire 配对保证状态可见性，使生产与消费形成同步。
+
+下表列出 WireGuard 直接读写的 skb 字段及其语义，均取自 `send.c`、`receive.c`、`socket.c`、`queueing.h` 的实际引用点，本篇只讲驱动用法而非内核全字段。
+
+| skb 字段 | 驱动中的用法 | 所在文件 | 语义与注意 |
+|---|---|---|---|
+| `skb->cb` | 由 `PACKET_CB` 重解释为 `packet_cb` | queueing.h | 48 字节控制缓冲，跨队列保持 |
+| `skb->data` / `skb->len` | 载荷起点与长度；`SKB_TYPE_LE32` 读首 4 字节 | send.c / receive.c | 推拉操作改变 data |
+| `skb->head` | 与 data 比较判断头部是否越界 | receive.c | `skb_headroom` 基准 |
+| `skb->dev` | 指向 wg 接口 netdev | send.c / receive.c / socket.c | 注入协议栈前须正确设置 |
+| `skb->mark` | `= wg->fwmark` | socket.c | 配合 flowi mark 做策略路由 |
+| `skb->ignore_df` | `= 1` | socket.c | 允许外层分片 |
+| `skb->protocol` | `= ip_tunnel_parse_protocol(skb)` | receive.c | 区分 ETH_P_IP / ETH_P_IPV6 |
+| `skb->ip_summed` | 判 CHECKSUM_PARTIAL / 置 CHECKSUM_UNNECESSARY | send.c / receive.c | 校验和卸载语义 |
+| `skb->csum_level` | `= ~0` | receive.c | 声明所有层校验和已验证 |
+| `skb->hash` / `l4_hash` / `sw_hash` | 保存并恢复 | queueing.h | `wg_reset_packet` 保留流哈希 |
+| `skb->tstamp_type` | 保存并恢复 | queueing.h | 重置时保留时间戳类型 |
+| `skb->queue_mapping` / `nohdr` / `peeked` / `mac_len` | 重置为 0 | queueing.h | `wg_reset_packet` 清理发送属性 |
+
+`wg_reset_packet`（`queueing.h` 第 76–105 行）是 skb 元数据重置的集中体现：它先保存 `l4_hash`、`sw_hash`、`hash`、`tstamp_type`，调 `skb_scrub_packet(skb, true)` 并 `memset(&skb->headers, 0, ...)` 清空协议头缓存；封装方向（`encapsulating=true`）会恢复那四个哈希/时间戳字段，解封装方向（false）则不恢复；随后无条件把 `queue_mapping`、`nohdr`、`peeked`、`mac_len`、`dev` 清零或置空，在 `CONFIG_NET_SCHED` 下还清 `tc_index`，最后调 `skb_reset_redirect`、把 `hdr_len` 设为 `skb_headroom(skb)`，并依次重置 MAC/网络/传输层头、探测传输头、重置内层头。这一段把「哪些元数据要保留、哪些必须丢弃」写得非常清楚，是理解 skb 在隧道边界如何「改头换面」的关键（GSO/GRO 与封装原理见 06-12）。
+
+skb 元数据在收发路径的流动与重置见图 05-06-01。
+
+:::figure id=05-06-01 | name=skb 元数据在 WireGuard 收发路径的流动 | dir=TD
+node a1 "skb->cb 控制缓冲" teal
+node a2 "packet_cb 五字段" purple
+node a3 "skb->data / len 载荷" blue
+node a4 "skb_cow_head / cow_data" amber
+node a5 "skb_push / pskb_put" green
+node a6 "wg_reset_packet 元数据重置" gray
+node a7 "skb->mark / dev / protocol" blue
+edge a1 -> a2 "PACKET_CB 重解释"
+edge a3 -> a4 "扩展头尾空间"
+edge a4 -> a5 "插入消息头与标签"
+edge a2 -> a6 "保留哈希/清属性"
+edge a5 -> a6 "加解密完成"
+edge a6 -> a7 "封装发往 socket"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「skb->cb 控制缓冲」经「PACKET_CB 重解释」为「packet_cb 五字段」；「skb->data / len 载荷」经「扩展头尾空间」的 cow 操作后由「插入消息头与标签」的推拉动作封装；两路都汇入「wg_reset_packet 元数据重置」——一路保留哈希并清理属性，一路标志加解密完成；最后由「skb->mark / dev / protocol」等字段承载封装包发往 socket。
+
+### 4. 关键流程与调用链
+
+发送路径从 keepalive 或 staged packet 开始。`wg_packet_send_keepalive` 用 `alloc_skb(DATA_PACKET_HEAD_ROOM + MESSAGE_MINIMUM_LENGTH, GFP_ATOMIC)` 分配 skb，`skb_reserve(skb, DATA_PACKET_HEAD_ROOM)` 预留头空间，置 `skb->dev = peer->device->dev` 与 `PACKET_CB(skb)->mtu = skb->dev->mtu`，挂入 `staged_packet_queue`。`wg_packet_send_staged_packets` 把队列摘到本地，取 current keypair，遍历每个 skb 用 `ip_tunnel_ecn_encap` 算 `ds`、用 `atomic64_inc_return(&keypair->sending_counter) - 1` 分配 nonce 填入 `packet_cb.nonce`，再经 `wg_packet_create_data` 进入 per-device 加密队列。
+
+`wg_packet_encrypt_worker` 调 `encrypt_packet`：先 `skb_get_hash(skb)` 强制在加密前算好流哈希（注释说明是为了让流分析对内包一致），`calculate_skb_padding` 按 `PACKET_CB(skb)->mtu` 把长度对齐到 16 字节，`skb_cow_head` 扩头，`skb_checksum_help` 处理 `CHECKSUM_PARTIAL`，`skb_cow_data` 扩尾，`memset(skb_tail_pointer(trailer), 0, padding_len)` 填零填充，`skb_set_inner_network_header(skb, 0)` 记录内层网络头，`skb_push` 插入 `message_data` 头并填 `type`=`cpu_to_le32(MESSAGE_DATA)`、`key_idx`=`keypair->remote_index`、`counter`=`cpu_to_le64(PACKET_CB(skb)->nonce)`，`pskb_put` 把尾部 trailer 纳入 skb，最后 `skb_to_sgvec` 映射后原地加密。完成后 `wg_reset_packet(skb, true)` 重置元数据，入 per-peer 发送队列。最终 `socket.c` 的 `send4` / `send6` 设 `skb->dev`、`skb->mark = wg->fwmark`、`skb->ignore_df = 1`，并用 `flowi4_mark` / `flowi6_mark` 把 fwmark 带入路由查询，经 `udp_tunnel_xmit_skb` 发出（发送流水线见 06-05）。
+
+接收路径从 `wg_packet_receive` 开始：`prepare_skb_header` 用 `SKB_TYPE_LE32(skb)`（宏定义为 `((struct message_header *)(skb)->data)->type`）读首字段，比较 `skb->len` 与各类消息的期望长度；`pskb_may_pull` 确保头部连续可读，`pskb_trim` 裁掉多余字节，`skb_pull` / `__skb_push` / `__skb_pull` 调整 data 指针剥掉 UDP 头。数据消息在 `wg_packet_consume_data` 里用 `__le32 idx = ((struct message_data *)skb->data)->key_idx` 查 `key_idx` 得 keypair 并写入 `PACKET_CB(skb)->keypair`、`wg_noise_keypair_get` 取引用、填 `ds`，入解密队列。`decrypt_packet` 从线上 `counter` 用 `le64_to_cpu` 读 nonce 填入 `packet_cb`，经 `skb_push` / `skb_cow_data` / `skb_pull` 保护 endpoint 信息后原地解密，再 `pskb_trim` 去掉认证标签。`wg_packet_rx_poll` 在 NAPI 上下文中用 `counter_validate` 验重放、用 `wg_socket_endpoint_from_skb` 提取源 endpoint、调 `wg_reset_packet(skb, false)` 清理元数据，最后 `wg_packet_consume_data_done` 设 `skb->dev = dev`、`skb->ip_summed = CHECKSUM_UNNECESSARY`、`skb->csum_level = ~0`、`skb->protocol`，`pskb_trim` 到内层 IP 长度，用 `wg_allowedips_lookup_src` 校验源地址归属，经 `napi_gro_receive` 注入协议栈（接收流水线见 06-06）。
+
+### 5. 配置/命令/代码实例
+
+先给出定位 skb 用法的实操命令，再给出一段来自 `queueing.h` 的真实代码片段作逐行判读。
+
+```bash
+cd _wglinux_build/upstream_src/wireguard-linux-src
+grep -n "struct packet_cb\|PACKET_CB\|PACKET_PEER\|wg_reset_packet" drivers/net/wireguard/queueing.h
+grep -n "skb->dev\|skb->mark\|skb->ignore_df\|flowi4_mark" drivers/net/wireguard/socket.c
+grep -rn "skb_cow_head\|skb_cow_data\|skb_push\|pskb_may_pull\|pskb_trim" drivers/net/wireguard/send.c drivers/net/wireguard/receive.c
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+drivers/net/wireguard/queueing.h:59:struct packet_cb {
+drivers/net/wireguard/queueing.h:67:#define PACKET_CB(skb) ((struct packet_cb *)((skb)->cb))
+drivers/net/wireguard/queueing.h:68:#define PACKET_PEER(skb) (PACKET_CB(skb)->keypair->entry.peer)
+drivers/net/wireguard/queueing.h:76:static inline void wg_reset_packet(struct sk_buff *skb, bool encapsulating)
+drivers/net/wireguard/socket.c:36:	skb->mark = wg->fwmark;
+drivers/net/wireguard/send.c:183:	if (unlikely(skb_cow_head(skb, DATA_PACKET_HEAD_ROOM) < 0))
+drivers/net/wireguard/receive.c:74:	if (unlikely(!pskb_may_pull(skb,
+```
+
+下面代码取自 `queueing.h` 第 76–89 行的 `wg_reset_packet` 开头片段，集中展示了 skb 元数据的保留与清理。
+
+```c
+static inline void wg_reset_packet(struct sk_buff *skb, bool encapsulating)
+{
+	u8 l4_hash = skb->l4_hash;
+	u8 sw_hash = skb->sw_hash;
+	u32 hash = skb->hash;
+	u8 tstamp_type = skb->tstamp_type;
+	skb_scrub_packet(skb, true);
+	memset(&skb->headers, 0, sizeof(skb->headers));
+	if (encapsulating) {
+		skb->l4_hash = l4_hash;
+		skb->sw_hash = sw_hash;
+		skb->hash = hash;
+		skb->tstamp_type = tstamp_type;
+	}
+```
+
+逐行判读如下。示例输出前三行确认 `packet_cb` 结构位于 `queueing.h` 第 59 行、`PACKET_CB` 与 `PACKET_PEER` 两个宏紧随其后，说明私有字段是通过 `skb->cb` 强制转换取得的，而非新增 skb 成员；第四行定位到 `wg_reset_packet`，第五行显示 `skb->mark = wg->fwmark` 在 `socket.c` 完成，印证 fwmark 元数据在 socket 发送阶段落地；第六、七行显示 `skb_cow_head` 与 `pskb_may_pull` 分别在发送、接收路径使用。代码段开头用四个局部变量保存 `l4_hash`、`sw_hash`、`hash`、`tstamp_type`，是因为紧接着的 `skb_scrub_packet` 会清空它们——这四个字段承载流分类与时间戳语义，丢掉会破坏 QoS 与发包时序；`memset(&skb->headers, 0, ...)` 清掉内核缓存的各层协议头偏移，因为接下来 `data` 指针会被推拉改变，旧偏移已失效；`if (encapsulating)` 条件是这段代码的精髓：封装方向（发送）要恢复哈希，让外层 UDP 包继承内层流的哈希以维持 RSS 分发一致性；解封装方向（接收）则刻意不恢复，因为包即将注入协议栈，应让其按新包头重新分类。整个函数体现了 skb 元数据「有的必须保留、有的必须清除」的精细区分，读者可据此理解为什么隧道边界要专门做一次 reset（并发与多核分发见 06-13）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把 `skb->cb` 当成可随意扩张的空间。它是内核固定的 48 字节控制缓冲，`packet_cb` 五个字段必须塞进这个预算；擅自增加大字段会溢出并踩踏相邻内存。第二个陷阱是 `skb_push` / `skb_pull` 不配对。`receive.c` 里多次出现 push 后 pull、再 push 再 pull 的模式，其刻意之处是保持网络头与 endpoint 信息在解密前后都位于正确偏移；漏掉一次 pull 会让 `data` 停在错误位置，后续 `ip_hdr(skb)` 解读的就是垃圾。第三个陷阱是忽略 `CHECKSUM_PARTIAL`：发送前若不调 `skb_checksum_help` 手工完成校验和，加密后的包校验和将是错的；`encrypt_packet` 对此直接返回 false，包被标记为 DEAD 丢弃。
+
+第四个陷阱是 `skb->dev` 设置时机。keepalive 分配时设一次，`socket.c` 的 `send4` / `send6` 又设一次，`receive.c` 的 `wg_packet_consume_data_done` 在注入协议栈前再设为 `dev`；漏设在接收侧会导致包被当作外来包丢弃。第五个陷阱是 fwmark 不同步：`wg->fwmark` 是配置字段（05-02），落到skb上有两条路——`skb->mark` 与 flowi 的 `flowi4_mark` / `flowi6_mark`，二者必须都设，否则策略路由失效；改 fwmark 时若不同步 socket 的 SO_MARK，实际发包标记可能与配置不符（需对照实际版本核验）。第六个陷阱是引用计数：`PACKET_CB(skb)->keypair` 在入队前用 `wg_noise_keypair_get` 取引用，消费端 `wg_noise_keypair_put` 归还；漏 put 会让密钥无法释放，提前 put 则造成 use-after-free。
+
+最佳实践：读 skb 用法时先分清「驱动私有字段」（`packet_cb` 五字段，本篇权威）与「内核通用字段」（`dev`、`mark`、`hash` 等，本篇只讲驱动用法）；凡见 `skb_push` / `skb_pull` 就画一张 data 指针前后对照图；凡见 `cow` 操作就想到写时复制与线性/分片布局；凡见 `state` 的 `atomic_set_release` / `atomic_read_acquire` 就意识到这是生产消费同步；把 `wg_reset_packet` 视为隧道边界的元数据闸门，牢记封装方向恢复流哈希、解封装方向重新分类这一对相反动作。若在调试器中观察 skb，应重点看 `data` 与 `head` 的相对位置、控制缓冲里的 nonce 与 keypair 是否仍然有效。底层加解密 API 见 05-09，队列字段见 05-08。
+
+### 7. 小结与延伸阅读
+
+本篇作为 05 册 skb 扩展与包元数据的字段权威源，核心结论如下：WireGuard 对 skb 的「扩展」只有一个 `struct packet_cb`，它占用 48 字节的 `skb->cb`，经 `PACKET_CB` 宏重解释，五个字段 `nonce`、`keypair`、`state`、`mtu`、`ds` 承担 nonce 传递、密钥引用、加解密状态、MTU 与 ECN 标记；`packet_state` 三态配合 `atomic_t` 的 release/acquire 实现队列同步；驱动通过 `skb_push` / `skb_pull` / `pskb_may_pull` / `skb_cow_head` / `skb_cow_data` 在不复制数据的前提下调整 data 视图与头尾空间；`skb->dev`、`mark`、`protocol`、`ip_summed`、`csum_level` 与各类哈希字段在收发路径被精心设置或保留；`wg_reset_packet` 是元数据重置的集中点，区分封装方向保留哈希、解封装方向重新分类。
+
+延伸阅读：发送封装流水线见 06-05，接收解封装见 06-06，GSO/GRO 与 UDP 封装见 06-12，多核与 RCU 分发见 06-13；`packet_cb` 中 keypair 所指的密钥结构见 05-05，fwmark 字段本体见 05-02、参数见 04-01 与 04-05，队列结构见 05-08，加解密 API 见 05-09。跨册随查按（字段见 05-06 ｜ 参数见 04-01 ｜ 原理见 06-05 ｜ 模块见 07-07）执行。本篇所有字段与 API 均以 `_wglinux_build/upstream_src/wireguard-linux-src/` 下 `queueing.h`、`send.c`、`receive.c`、`socket.c`、`messages.h` 为准，需对照实际版本核验。

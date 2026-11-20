@@ -1,0 +1,307 @@
+## 08-05 安全加固、密钥管理与边界约束
+
+### 1. 背景与动机
+
+WireGuard 的安全哲学可以浓缩成一句话：密钥即身份。协议把认证完全建立在 Curve25519 密钥对之上，既不内建证书颁发机构，也不内建中心化的密钥分发服务器，更不内建用户账号体系。这种极简设计大幅缩小了攻击面与审计面——内核驱动连同头文件约四千余行代码，是少数可以被完整审阅的 VPN 实现——但它同时把一大块安全责任从协议设计者转移到了运维者肩上。换句话说，协议本身很难被攻破，而绝大多数真实世界的安全事故，根源都不在密码学，而在私钥被写进版本库、公钥张冠李戴、AllowedIPs 放得太宽、以及日志里漏出了不该漏的东西。本篇作为运维册的安全权威源，不重复讲密码学原理（原理见 06-02、06-03），而是把「怎么把这套密钥模型安全地用起来」讲成可执行的边界约束。
+
+要理解密钥的根从哪来，必须回到用户态工具的 `wireguard-tools/src/genkey.c`。该文件的 `get_random_bytes` 实现了一条清晰的三级熵源回退链：在 OpenBSD、macOS 10.12 以上、或 glibc 2.25 以上的环境，优先调用 `getentropy(out, len)`；若不可用且是 Linux，则退化到直接发起 `syscall(__NR_getrandom, out, len, 0)` 系统调用；若前两级都不可行，最后才 `open("/dev/urandom", O_RDONLY)` 逐字节读取。这条链还有一个前置保护：当请求长度 `len > 256` 时直接设置 `errno = EOVERFLOW` 返回失败，避免一次性索取过多熵。对运维的实际含义是：在受支持的现代系统上，密钥材料来自内核加密随机数发生器，而不是某个用户态伪随机库；只要系统熵池正常，`wg genkey` 生成的私钥就具备密码学强度。但「工具用对了」只是第一环，私钥落到磁盘之后的权限管理才是事故高发区。
+
+`genkey_main` 在生成之前做了一件容易被忽略的安全提示：它用 `fstat(STDOUT_FILENO, &stat)` 检查标准输出是否为普通文件，若该文件带有 `S_IRWXO`（其他用户可读、写或执行）位，就向标准错误打印 `Warning: writing to world accessible file. Consider setting the umask to 077 and trying again.`。这不是失败错误，而是一句劝告——它明确告诉运维者：把私钥重定向到一个全局可读的文件是危险的，正确做法是先设 `umask 077` 再生成。这句警告本身就是理解 WireGuard 安全模型的钥匙：协议不管你的私钥落在哪里，它只保证生成过程不可预测；保护私钥的最后一公里，是运维纪律与主机权限共同构成的边界。
+
+再看密钥的「形状」。`genkey_main` 在 `get_random_bytes` 之后，仅当子命令名是 `genkey` 时才调用 `curve25519_clamp_secret(key)`；而 `genpsk` 生成的预共享密钥不做这一步。这个差异在 `curve25519.h` 里只有两行，却决定了两类密钥的数学性质：`secret[0] &= 248` 清掉首字节低三位，`secret[31] = (secret[31] & 127) | 64` 清掉末字节最高位、并把次高位置一。这是标准 X25519 标量钳制（clamp），保证私钥落在正确的标量域、清除协因子相关的低位、固定标量大小，从而让 Curve25519 的标量乘法具备良好的群性质。也就是说，私钥不是随便 32 字节，而是经过钳制的标量；而 PSK 则是对称密钥，不需要也不应该被钳制。混淆这一点，会在自己实现密钥生成时埋下互不兼容的隐患。
+
+### 2. 核心概念
+
+WireGuard 的安全模型里有四类「秘密」，性质各不相同，必须分开管理。第一类是接口私钥（private key），32 字节经钳制的 Curve25519 标量，只在本地生成、本地保存，是身份的根，泄露即等于身份被冒用。第二类是接口公钥（public key），由私钥经 `curve25519_generate_public` 从固定基点 9 派生，可以公开分发，分发给对端作为配置里的 `PublicKey`。第三类是预共享密钥（PSK），同样是 32 字节随机值，但由 `wg genpsk` 生成、不经钳制，作为额外的对称密钥材料混入握手，为协议提供后量子防御。第四类是临时的 cookie 机密（checker secret），由 `wg_cookie_checker_init` 用 `get_random_bytes` 生成、长度 `NOISE_HASH_LEN`，只在内存中存在、定期轮换，用于 DoS 防护，永远不落盘。前三类需要运维建立生命周期，第四类完全由内核自动管理。
+
+PSK 的价值需要准确理解，否则极易被误用。WireGuard 的握手是 Noise_IK，其椭圆曲线部分是 Curve25519 的 ECDH。在经典计算模型下，从公钥反推私钥不可行；但大规模量子计算机理论上能用 Shor 算法攻破离散对数，从而威胁这类 ECDH。PSK 的作用正是在此：即使 ECDH 被攻破，握手中混入的对称预共享密钥仍然只有通信双方知道，攻击者无法从公开信道恢复它，会话密钥因此保持机密。这就是所谓「后量子防御」——它不是量子安全密码的全部，而是一道纵深防线。需要强调，PSK 并不会提升经典环境下的安全性（ Curve25519 本身已经足够强），它防的是「未来量子计算机 + 现在抓包留存」这种威胁模型。因此 PSK 的正确定位是纵深加固，而不是私钥质量的替代品；一对配置错误或泄露的公私钥，不会因为加了 PSK 就变得安全。
+
+基于以上模型，可以把运维侧的安全边界归纳为六条。其一，私钥保护：私钥只在接口所在主机生成、以 0600 权限落盘、永不进入配置文件分发链路、永不写入日志或聊天工具。其二，密钥轮换：私钥与 PSK 都需要有计划的更换流程，轮换要利用不中断会话的机制（见 08-06 的配置变更流程），并注意对端公钥的同步时序。其三，PSK 使用：为高价值链路配置 PSK，且 PSK 必须通过独立于公钥的带外信道分发，避免「公私钥和 PSK 走同一条渠道」导致一锅端。其四，firewall 与 AllowedIPs 最小权限：主机防火墙只开放必要的 UDP 端口与来源，AllowedIPs 收敛到对端真正需要的地址段，不写 `0.0.0.0/0` 除非确实要跑全流量。其五，内核模块权限：加载模块需要 `CAP_SYS_MODULE`，修改接口需要 `CAP_NET_ADMIN`，应据此收敛运行账户与 systemd 单元的权限，而非让配置进程以完全 root 长期驻留。其六，日志敏感信息：`wg show` 刻意隐藏私钥（`private key: (hidden)`），但 `wg showconf` 默认会输出私钥原文，任何把 showconf 输出贴到工单、日志采集系统或终端回放的行为都等同于泄露私钥。
+
+除密钥边界外，还有一条入口防线必须纳入安全加固视野：DoS 防护。WireGuard 是静默协议，对未授权包不回错误、只丢弃，这本身抑制了反射放大，但攻击者仍可用伪造源地址的海量握手请求耗尽服务端 CPU。内核用两道机制应对：`cookie.c` 实现无状态 cookie 挑战，在握手路径上要求对端证明能收到发往其源地址的响应；`ratelimiter.c` 实现按源 IP 的令牌桶限速，限制单位时间内的握手尝试。这两者的原理分别在 06-09、06-10，模块职责在 07-09、07-10，本节只把它们作为「入口安全边界」的一环纳入检查清单，不重复展开状态机。理解它们的存在，有助于运维明白：WireGuard 的抗 DoS 是内建的，但仍需要与主机防火墙的限速规则配合，才能形成完整防线。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名与安全加固直接相关的结构、函数与常量，并给出真实源码路径；逐字段定义统一交给 05 册，参数全集交给 04 册，机制原理交给 06 册，目录级模块职责交给 07 册。熵源与密钥生成位于用户态：`wireguard-tools/src/genkey.c` 的 `get_random_bytes` 与 `genkey_main` 实现三级回退与钳制调用，`curve25519.h` 的 `curve25519_clamp_secret` 给出两行钳制逻辑，`encoding.c` 的 `key_to_base64` 把 32 字节密钥编码为结尾带一个 `=` 的 base64 文本，`containers.h` 用 `WG_KEY_LEN 32` 规定密钥长度（字段与编码细节见 05-09、参数见 04-01、模块见 07-13）。
+
+DoS 防护位于内核态：`drivers/net/wireguard/cookie.h` 定义 `struct cookie_checker`、`struct cookie` 与四态枚举 `cookie_mac_state`；`cookie.c` 的 `precompute_key`、`compute_mac1`、`compute_mac2`、`make_cookie` 与 `wg_cookie_validate_packet` 构成 cookie 挑战的验证链；`ratelimiter.c` 定义 `struct ratelimiter_entry` 与 `wg_ratelimiter_allow`，并用枚举常量 `PACKETS_PER_SECOND = 20`、`PACKETS_BURSTABLE = 5` 规定握手限速的速率与突发（字段见 05-07、05-08，原理见 06-09、06-10，模块见 07-09、07-10）。相关常量集中在 `messages.h`：`COOKIE_SECRET_MAX_AGE = 2 * 60`（秒，cookie 机密最长寿命）、`COOKIE_SECRET_LATENCY = 5`、`COOKIE_LEN = 16`（常量全集见 04-06）。
+
+下表把安全加固涉及的关键落点收拢成速查，便于与后文的检查清单逐条对照。表中「本册处理方式」一列遵循唯一权威源去重规则，明确哪些细节让给其他册。
+
+| 关注点 | 真实源码路径 | 本册处理方式 |
+|---|---|---|
+| 密钥生成与熵源 | `wireguard-tools/src/genkey.c` 的 `get_random_bytes` | 讲安全含义，参数见 04-01 |
+| 标量钳制 | `wireguard-tools/src/curve25519.h` 的 `curve25519_clamp_secret` | 讲边界，原理见 06-03 |
+| cookie 挑战与四态验证 | `drivers/net/wireguard/cookie.c`、`cookie.h` | 只点名，字段见 05-07 |
+| 握手令牌桶限速 | `drivers/net/wireguard/ratelimiter.c` | 只点名，原理见 06-10 |
+| cookie 常量 | `drivers/net/wireguard/messages.h` | 只给值，全集见 04-06 |
+| 用户态工具模块 | `wireguard-tools/src/` 的 `wg.c`、`config.c` | 只点名，模块见 07-13 |
+
+### 4. 关键流程与调用链
+
+熵源回退链是密钥安全的起点。`genkey_main` 先把 32 字节的输出缓冲区 `key` 准备好，调用 `get_random_bytes(key, WG_KEY_LEN)`。在 `get_random_bytes` 内部，若编译目标满足 glibc 2.25 以上等条件，第一条尝试是 `getentropy(out, len)`，成功即返回；否则在 Linux 上走第二条 `syscall(__NR_getrandom, out, len, 0)`，返回值等于 `len` 即成功；最后一条路径是打开 `/dev/urandom`，用循环 `read` 直到凑满 `len` 字节，任何一步出错都会置 `errno` 并返回失败。这条链的设计意图是「优先使用现代、不会被 fork 后复用状态的接口，退而求其次仍保证来自内核熵池」。回到 `genkey_main`，取得随机字节后：若是 `genkey` 则 `curve25519_clamp_secret(key)` 钳制；随后 `key_to_base64` 编码，`puts(base64)` 输出。整条链没有任何环境配置开关，运维能施加的影响只有两点：保证系统熵源健康、保证输出文件权限正确。
+
+cookie 验证链体现了「先便宜后昂贵」的防线设计。`wg_cookie_validate_packet` 首先用消息携带的公钥派生出 `message_mac1_key`，调用 `compute_mac1` 对整个消息（去掉 mac 尾部相关长度）做 BLAKE2s，与报文中的 `mac1` 比较；不等则返回 `INVALID_MAC` 直接丢弃——这一步纯对称运算、极廉价，能挡掉绝大多数根本不知道本端公钥的垃圾包。相等则状态置为 `VALID_MAC_BUT_NO_COOKIE`；若调用方不要求检查 cookie（`check_cookie == false`）就此返回。需要检查时，`make_cookie` 先判断 `checker->secret_birthdate` 是否超过 `COOKIE_SECRET_MAX_AGE`，超期则在写锁内更新生日并重新 `get_random_bytes` 生成机密，然后用 BLAKE2s 把源 IP（IPv4 的 `saddr` 或 IPv6 的 `saddr`）与 UDP 源端口摘要成 cookie；`compute_mac2` 再以该 cookie 为密钥算一次 MAC 与报文 `mac2` 比较。都不等则返回 `VALID_MAC_BUT_NO_COOKIE`；相等后还要过 `wg_ratelimiter_allow` 这一关，若被限速则返回 `VALID_MAC_WITH_COOKIE_BUT_RATELIMITED`，否则才是 `VALID_MAC_WITH_COOKIE`。四态枚举把「包是否可信、是否需挑战、是否被限速」表达得清清楚楚（原理见 06-09）。
+
+令牌桶的判定同样值得写成一条链。`wg_ratelimiter_allow` 按 `skb` 的协议提取源地址：IPv4 取 `saddr`，IPv6 取前 64 位（注释明确说只取 64 位以便对整个 /64 限速），再与网络命名空间指针 `net` 一起经 `hsiphash` 定位到哈希表桶。命中已有条目后，在条目自旋锁内计算 `tokens = min(TOKEN_MAX, 旧 tokens + now - last_time_ns)`，更新 `last_time_ns`，若 `tokens >= PACKET_COST` 则放行并扣除一个 `PACKET_COST`。这里的 `PACKET_COST = NSEC_PER_SEC / PACKETS_PER_SECOND`，即 20 包每秒对应每包 50 毫秒；`TOKEN_MAX = PACKET_COST * PACKETS_BURSTABLE`，即允许 5 个包的突发。新条目以 `TOKEN_MAX - PACKET_COST` 初始化，创建即允许一个包。整个结构用 RCU 与 per-条目自旋锁保护，后台 `gc_work` 每秒回收空闲超过 1 秒的条目（原理见 06-10）。从安全视角看，这条链意味着即使攻击者伪造不同源 IP，也会受到哈希表容量 `max_entries` 与全局令牌速率的双重约束。
+
+下图把这六条安全边界与入口防护的关系串起来，说明信任是怎样一步步建立的。
+
+:::figure id=08-05-01 | name=WireGuard 安全边界与信任建立链 | dir=TD
+node s1 "本地生成私钥<br/>genkey 三级熵源" teal
+node s2 "钳制标量<br/>curve25519_clamp" purple
+node s3 "公钥分发<br/>对端配置 PublicKey" blue
+node s4 "带外分发 PSK<br/>后量子纵深" amber
+node s5 "握手入口<br/>cookie 四态验证" red
+node s6 "ratelimiter<br/>令牌桶限速" red
+node s7 "AllowedIPs<br/>最小权限路由" green
+node s8 "防火墙<br/>仅开放必要 UDP" green
+edge s1 -> s2 "钳制"
+edge s2 -> s3 "派生公钥"
+edge s4 -> s5 "混入握手"
+edge s3 -> s5 "认证"
+edge s5 -> s6 "通过后限速"
+edge s6 -> s7 "进入路由校验"
+edge s8 -> s5 "入口过滤"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：信任从「本地生成私钥 genkey 三级熵源」开始，经「钳制标量 curve25519_clamp」得到合法私钥，再「派生公钥」供对端配置；「带外分发 PSK 后量子纵深」与公钥一起进入「握手入口 cookie 四态验证」，验证通过后经「ratelimiter 令牌桶限速」，再落入「AllowedIPs 最小权限路由」的源地址校验；旁路「防火墙 仅开放必要 UDP」在握手之前完成入口过滤，把垃圾流量挡在内核协议栈之外。
+
+### 5. 配置/命令/代码实例
+
+先看密钥的安全生成。下面这段命令把「umask 收紧、私钥落盘、公钥派生、PSK 独立生成、权限归位」串成一套可复制的动作。注意 `wg genkey` 与 `wg genpsk` 是两个独立子命令，前者产出钳制后的私钥，后者产出不钳制的对称 PSK（参数全集见 04-01）。
+
+```bash
+# 收紧掩码，确保随后创建的文件默认只有属主可读写
+umask 077
+
+# 生成私钥并落到受保护路径，同时由同一私钥派生公钥
+wg genkey | tee /etc/wireguard/privatekey | wg pubkey > /etc/wireguard/publickey
+
+# 独立生成 PSK，绝不复用私钥或把它与私钥放在同一文件
+wg genpsk > /etc/wireguard/psk
+
+# 明确权限：私钥与 PSK 仅属主可读写，公钥可读
+chmod 600 /etc/wireguard/privatekey /etc/wireguard/psk
+chmod 644 /etc/wireguard/publickey
+```
+
+下面这段把入口防线落到主机防火墙与接口配置上：防火墙只开放 WireGuard 的 UDP 端口并对新连接限速，`wg set` 则为 peer 配置收敛的 AllowedIPs 与 PSK。这里展示的是 iptables 写法，实际环境可用 nftables 或云安全组等价实现（参数见 04-01、04-02）。
+
+```bash
+# 仅允许必要来源访问 UDP 51820，并对新握手限速
+iptables -A INPUT -p udp --dport 51820 -m conntrack --ctstate NEW \
+  -m limit --limit 20/second --limit-burst 5 -j ACCEPT
+iptables -A INPUT -p udp --dport 51820 -j DROP
+
+# 为对端配置最小 AllowedIPs 与带外分发的 PSK
+wg set wg0 peer <对端公钥> \
+  allowed-ips 10.0.0.2/32 \
+  preshared-key /etc/wireguard/psk \
+  endpoint 203.0.113.9:51820
+```
+
+完成加固后，用 `wg show` 复核安全相关的运行状态。下面是典型输出。
+
+```bash
+wg show wg0
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+示例输出，具体格式需对照实际版本核验
+interface: wg0
+  public key: <本端公钥>
+  private key: (hidden)
+  listening port: 51820
+peer: <对端公钥>
+  preshared key: (hidden)
+  endpoint: 203.0.113.9:51820
+  allowed ips: 10.0.0.2/32
+  latest handshake: 38 seconds ago
+  transfer: 2.41 KiB received, 1.87 KiB sent
+```
+
+逐行判读如下。首行是核验标注，不属于实际输出，仅提示格式需按版本核对；紧随其后的 `interface: wg0` 才是第一行真实输出，它来自 `WG_CMD_GET_DEVICE` 返回的 `WGDEVICE_A_IFNAME`，确认查询命中正确的接口，多接口环境下这一行是防误操作的锚点。第二行 `public key` 对应 `WGDEVICE_A_PUBLIC_KEY`，由本端私钥经 Curve25519 派生，它应与分发给对端的公钥逐字符一致，否则握手静默失败；这是核对「公钥有没有发错人」的关键一行。第三行 `private key: (hidden)` 是工具刻意不回显私钥的自我保护，说明展示层做了脱敏，真实私钥仍在内核接口的 `WGDEVICE_A_PRIVATE_KEY` 中；任何要求从 show 输出复制私钥的说法都是错误的（对比之下 `wg showconf` 默认会输出私钥原文，这才是泄露高发点）。第四行 `listening port: 51820` 对应 `WGDEVICE_A_LISTEN_PORT`，应与防火墙放行端口一致。第五行 `peer:` 后的对端公钥对应 `WGPEER_A_PUBLIC_KEY`，是身份校验的基准。第六行 `preshared key: (hidden)` 表示本 peer 已配置 PSK 且工具同样做了脱敏；若此行缺失，说明 PSK 没配或未被内核识别，后量子纵深就无从谈起。第七行 `allowed ips` 对应 `WGALLOWEDIP_A_IPADDR` 与 `WGALLOWEDIP_A_CIDR_MASK`，这里收敛到单个 `/32`，正是最小权限原则的体现；写成 `0.0.0.0/0` 则意味着接受该 peer 的任意源地址，须有明确理由。第八行 `latest handshake` 对应 `WGPEER_A_LAST_HANDSHAKE_TIME`，是判断隧道是否真正建立、PSK 是否匹配的核心——若长期为空，优先排查公钥、PSK、endpoint 与双方时钟。第九行 `transfer` 对应 `WGPEER_A_RX_BYTES` 与 `WGPEER_A_TX_BYTES`，累计收发字节只有在握手成功且 AllowedIPs 正确时才会增长。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是私钥文件的权限。`genkey_main` 那句 `Warning: writing to world accessible file` 不是噪音：若不设 `umask 077`，`wg genkey > key` 生成的文件很可能是 0644，同机其他用户可直接读取，身份随即失守。务必把私钥与 PSK 固定放在 0700 目录、0600 文件里，并在配置管理或容器镜像构建时检查是否有「把私钥 COPY 进镜像层」的动作——镜像层一旦推送就难以彻底撤回。
+
+第二个陷阱是把公钥和私钥的角色搞反。公钥可以公开分发，私钥永不离开本机；常见错误是把整份 `wg0.conf`（其中含 `PrivateKey`）当作「配置模板」发给多个节点，导致所有节点共用一把私钥，任何一个节点失陷就等于全网失陷。正确做法是每个节点本地生成私钥，只交换各自公钥。第三个陷阱是误以为 PSK 能弥补密钥管理缺陷。PSK 是纵深加固，不是身份证；一对泄露的公私钥加上 PSK，攻击者只要同时拿到配置文件里的这两样（它们常在同一文件），伪装依然成立。PSK 必须走独立带外信道分发，且与公私钥分开存放。
+
+第四个陷阱是 AllowedIPs 过度开放。把 `AllowedIPs = 0.0.0.0/0` 当成默认值，会让该 peer 被允许出现任意源地址，一旦对端被攻陷，攻击者可借隧道注入任意来源流量。应按下游真正需要的网段逐条收敛，IPv6 同理避免默认 `::/0`。第五个陷阱是误解内建 DoS 防护的边界：cookie 与 ratelimiter 主要抑制握手滥用与伪造源地址，无法阻止针对出口带宽的流量耗尽攻击，因此主机/边界防火墙的限速与上游清洗仍然必要，二者是互补而非替代（原理见 06-09、06-10）。
+
+第六个陷阱是日志泄露。`wg show` 隐藏私钥，但 `wg showconf` 默认打印私钥原文；把 showconf 输出重定向到日志、贴进工单、或让配置采集代理定期上传，都会把最敏感的材料复制到防线之外。若确需备份配置，应对备份文件加密并限制访问，而不是明文集中存放。第七个陷阱是忽略权限边界：加载内核模块需要 `CAP_SYS_MODULE`，用 `wg` 改接口需要 `CAP_NET_ADMIN`；应让自动化只具备所需能力，避免为图省事让大量进程以完全 root 运行。
+
+最佳实践可归纳为五条：用 `umask 077` 与 0600 权限保护私钥和 PSK；用独立的带外信道分发 PSK；把 AllowedIPs 与防火墙规则都收敛到最小；把握手时间、流量计数器纳入日常巡检（监控项见 08-06）；定期按不中断会话的流程轮换密钥，并在轮换后复核双方 `latest handshake` 与 `preshared key: (hidden)` 是否如预期。这五条覆盖了从密钥生成到运行监控的完整安全闭环。
+
+### 7. 小结与延伸阅读
+
+本篇从 WireGuard「密钥即身份」的模型出发，讲清了四类秘密（接口私钥、接口公钥、PSK、临时 cookie 机密）的不同性质，以及六条运维安全边界：私钥保护、密钥轮换、PSK 带外分发、firewall 与 AllowedIPs 最小权限、内核模块与 `CAP_NET_ADMIN` 权限收敛、日志敏感信息脱敏；并把内建 DoS 防护（cookie 四态验证、ratelimiter 令牌桶）纳入入口安全边界。核心结论是：协议保证了密钥生成的不可预测性与握手的抗滥用能力，但私钥落到磁盘之后的权限、分发、轮换与脱敏，完全取决于运维纪律——这也是绝大多数真实事故的根源。
+
+延伸阅读建议按三条线走：想深入密钥派生与会话时序读 06-03，想深入 DoS 防护读 06-09、06-10，想落地到不中断会话的轮换与监控读 08-06。跨册随查按（字段见 05-07 ｜ 参数见 04-01 ｜ 原理见 06-03 ｜ 模块见 07-13）执行：结构体逐字段去 05、参数与命令全集去 04、机制与调用链去 06、目录级模块能力去 07、运维落地与基准去 08。凡本篇标注「需对照实际版本核验」的输出格式与命令选项，均以 `_wglinux_build/upstream_src/` 下对应文件为准，本册不编造未核验的路径与取值。
+
+## 08-06 上线 checklist 与运维手册
+
+### 1. 背景与动机
+
+一套 WireGuard 隧道「配通」和「可运维地长期稳定运行」是两件不同的事。前者只需几条 `wg` 命令把接口拉起来、握手成功即可；后者要求把散落的命令固化成可重复、可审计、可在压力下照着执行的流程，让换班的人不靠记忆也能正确操作。本篇正是这套流程的载体，也是本套资料中运维场景的唯一权威源。要明确分工：`wg` 的每个参数怎么写、有哪些取值，归 04 册（参数见 04-01、04-02）；`wg_device`、`wg_peer` 等结构字段是什么，归 05 册（字段见 05-02、05-03）；握手、netlink、会话轮换的机制为何如此，归 06 册（原理见 06-03、06-14）；`setconf.c`、`wg-quick` 等目录级职责，归 07 册（模块见 07-13）。本篇不重复这些内容，只回答「上线前后具体按什么步骤做、每步用什么命令、做到什么程度算合格」。
+
+checklist 的价值在第一线最容易被低估。人在深夜处理故障或赶上线窗口时，最不可靠的就是记忆：会忘记先设 `umask 077`、会忘记把防火墙规则同步改、会在改 peer 时误用全量替换导致所有会话中断、会忘记备份私钥就先重启。一张逐条勾选的清单把「记忆任务」变成「核对任务」，把每一步的预期结果写清楚，人就只需判断「是否符合」。这也是为什么本篇既给清单表格，也给可直接复制的命令块——表格用于核对，命令用于执行，两者配合才能既防遗忘又防误敲。运维手册的另一层价值是交接：一份写清楚「变更流程、轮换流程、监控项、备份恢复、升级注意、应急响应」的文档，能让团队能力不依赖某个人，这正是生产环境与实验环境最大的区别。
+
+### 2. 核心概念
+
+把 WireGuard 接口的生命周期拆开，运维工作可以归纳为八个依次推进又循环往复的阶段：部署前检查、部署与初始配置、配置变更、密钥轮换、监控巡检、备份与恢复、升级、应急响应。每个阶段都有明确的「输入—动作—合格判据」。部署前检查确认模块、工具、端口、时钟、权限齐备；部署阶段生成密钥并建立最小隧道；配置变更阶段用不中断机制下发改动；密钥轮换阶段按可控时序替换身份材料；监控巡检持续观察握手时间与流量计数器；备份恢复保证配置与密钥可回退；升级阶段处理内核模块与工具的版本关系；应急响应在异常发生时按预案止损。这八个阶段合起来构成一个闭环：监控与应急的发现会回流到配置变更或密钥轮换，因此运维不是一次性上线，而是持续循环。
+
+其中「不中断连接」是配置变更阶段的核心机制，也是本篇最需要讲清的概念。`wg setconf` 是全量替换：它按配置文件重建接口的配置，未在文件中的 peer 会被移除，现有会话随之失效。而 `wg syncconf` 的 man 页写得很明确：「与 setconf 类似，但先读回现有配置，只做配置文件与接口之间显式不同的改动；它比 setconf 效率低得多，好处是不打断当前 peer 会话。」用源码语言说，`syncconf` 先把运行中的配置读回来，按公钥排序逐个比对：文件里没有、但运行中存在的 peer，被标记为 `WGPEER_REMOVE_ME` 加入本次提交；两边都有的 peer 只更新显式差异；最后一次性把差异提交给内核。未变的 peer 因此保持原会话，不停机。这正是生产环境应当默认采用 `syncconf` 而非 `setconf` 的原因，也是 systemd 单元里 `ExecReload` 选用 `wg syncconf` 的依据。
+
+理解「读回—比对—增量提交」这一模式，就理解了运维手册里大部分规定的由来：为什么改一个 peer 的 endpoint 不该用 `setconf`；为什么从配置文件里删掉一个 peer 就等于撤销它；为什么 `syncconf` 在大 peer 规模下开销更大（它要把两边配置都解析并排序）；为什么密钥轮换要讲究先后顺序（旧公钥对应的 peer 若被提前从文件移除，会话会先断）。这些不是操作偏好，而是由 `sync_conf` 的实际逻辑决定的。本篇第 4 节会把这条链展开，帮助运维在异常时判断「改动到底有没有生效、会话为什么断了」。
+
+### 3. 关键数据结构与源码位置
+
+本节只点名与运维流程直接相关的实现落点，逐字段、逐参数、逐原理均让给对应权威册。配置变更的核心在 `wireguard-tools/src/setconf.c`：`setconf_main` 负责解析配置文件（经 `config_read_line`、`config_read_finish`），当子命令名为 `syncconf` 时调用 `sync_conf`；`sync_conf` 内部的结构 `peer_origin` 与比较函数 `peer_cmp` 实现「按公钥排序、文件优先」的比对，标志 `WGDEVICE_REPLACE_PEERS`、`WGPEER_REMOVE_ME` 决定哪些 peer 被替换或移除（模块见 07-13，参数语义见 04-02）。手册里 `systemctl reload wg-quick@wg0` 背后的命令来自 `wireguard-tools/src/systemd/wg-quick@.service` 中的 `ExecReload`，它用 `wg-quick strip` 去掉接口地址、MTU、PostUp 等非 `wg setconf` 字段后交给 `wg syncconf`（wg-quick 参数见 04-03）。
+
+监控项的字段源头是 uapi：`wg show` 通过 `WG_CMD_GET_DEVICE` 读回属性，`latest handshake` 对应 `WGPEER_A_LAST_HANDSHAKE_TIME`，`transfer` 对应 `WGPEER_A_RX_BYTES` 与 `WGPEER_A_TX_BYTES`，`allowed ips` 对应 `WGALLOWEDIP_A_IPADDR` 与 `WGALLOWEDIP_A_CIDR_MASK`（字段见 05-02、05-03、05-04，常量全集见 04-05、04-06，netlink 原理见 06-14）。下表把运维动作与源码落点对应起来，便于按图索骥。
+
+| 运维动作 | 实现落点／命令 | 本册处理方式 |
+|---|---|---|
+| 不中断变更 | `setconf.c` 的 `sync_conf`、`wg syncconf` | 讲流程，参数见 04-02 |
+| reload 集成 | `wg-quick@.service` 的 `ExecReload` | 讲用法，模块见 07-13 |
+| 监控握手与流量 | `wg show`／`WGPEER_A_*` 属性 | 讲判读，字段见 05-03 |
+| 密钥生成 | `genkey.c`／`wg genkey`、`wg genpsk` | 讲流程，参数见 04-01 |
+| 接口与路由状态 | `ip link`、`wg show` | 讲核对，命令见 04-01、04-04 |
+
+### 4. 关键流程与调用链
+
+把 `syncconf` 的调用链逐步展开，就能解释手册中每条变更规定的来历。`setconf_main` 先 `fopen` 配置文件，按行调用 `config_read_line` 解析，`config_read_finish` 得到一个 `wgdevice` 对象并写入接口名；随后判断子命令：若不是 `syncconf`（即 `setconf` 或 `addconf`），直接走到 `ipc_set_device` 提交。若是 `syncconf`，则进入 `sync_conf`：它先检查文件里是否有 peer，没有就无需同步；再用 `ipc_get_device(&runtime, file->name)` 读回运行中配置，若运行中也没有 peer 则直接返回。接着它清掉文件的 `WGDEVICE_REPLACE_PEERS` 标志（这是全量替换的标志，增量同步不能用），把文件侧 peer 与运行侧 peer 都放进 `peers` 数组，用 `qsort` 按 `peer_cmp` 排序——先按公钥字节序，再按「来自文件优先」。排序后遍历：来自运行侧、且在文件侧找不到同公钥 peer 的，构造一个只带公钥、`flags = WGPEER_REMOVE_ME` 的 peer 挂到文件链表头部；两边都有的 peer，若运行侧有 PSK 或 keepalive 而文件侧没有，则把文件侧的对应值清零并设置存在标志，以便提交时清除旧值。最后回到 `setconf_main` 调用 `ipc_set_device`，把这份「差异清单」一次性发给内核（原理见 06-14）。
+
+systemd 的 reload 链把上面这套机制包装成一条运维命令：`systemctl reload wg-quick@wg0` 触发单元里的 `ExecReload=/bin/bash -c 'exec /usr/bin/wg syncconf %i <(exec /usr/bin/wg-quick strip %i)'`。这里 `wg-quick strip` 把 wg-quick 专用的键（Address、DNS、MTU、PostUp 等）滤掉，只留下 `wg setconf` 能识别的 `[Interface]` 与 `[Peer]` 字段，进程替换 `<(...)` 把它作为文件传给 `syncconf`。整条链的意义是：改完 `wg0.conf` 后执行 reload，接口地址、路由等由 wg-quick 管理的部分不动，WireGuard 的 peer 与密钥按差异增量更新，现有会话保持。这就是「配置变更不中断连接」在真实系统上的完整路径。
+
+下图把八个运维阶段与两个闭环回流画在一起，说明监控与应急如何 drives 变更与轮换。
+
+:::figure id=08-06-01 | name=WireGuard 运维生命周期与 syncconf 变更闭环 | dir=TD
+node o1 "部署前检查<br/>模块/工具/端口/时钟" blue
+node o2 "部署与初始配置<br/>生成密钥建隧道" teal
+node o3 "配置变更<br/>syncconf 增量下发" green
+node o4 "密钥轮换<br/>带外分发新公钥/PSK" purple
+node o5 "监控巡检<br/>握手时间/流量计数" amber
+node o6 "备份与恢复<br/>密钥配置可回退" gray
+node o7 "升级<br/>模块与工具版本" blue
+node o8 "应急响应<br/>止损与回滚" red
+edge o1 -> o2 "检查通过"
+edge o2 -> o3 "上线"
+edge o3 -> o4 "定期"
+edge o4 -> o5 "验证"
+edge o5 -> o6 "留存"
+edge o6 -> o7 "基线"
+edge o7 -> o3 "变更回流"
+edge o5 -> o8 "异常触发"
+edge o8 -> o3 "修复回流"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：主线从「部署前检查 模块/工具/端口/时钟」经「部署与初始配置 生成密钥建隧道」到「配置变更 syncconf 增量下发」，再经「密钥轮换 带外分发新公钥/PSK」「监控巡检 握手时间/流量计数」「备份与恢复 密钥配置可回退」「升级 模块与工具版本」；两条回流闭环是「升级」回到「配置变更」体现变更回流，以及「监控巡检」触发「应急响应 止损与回滚」后再回到「配置变更」体现修复回流。
+
+### 5. 配置/命令/代码实例
+
+先给部署前检查清单。下表的每一项都应在上线窗口开始前逐条勾选，任一不合格都不应进入部署阶段。
+
+| 检查项 | 合格判据 | 验证命令／依据 |
+|---|---|---|
+| 内核模块可用 | `ip link add` 能创建 wireguard 类型接口 | `ip link add wgtest type wireguard`（模块见 07-01） |
+| 工具版本明确 | `wg --version` 输出版本可记录归档 | `wg --version`（参数见 04-01） |
+| UDP 端口可达 | 防火墙放行既定端口与来源 | 防火墙规则核对（见 08-05） |
+| 双方时钟同步 | 时差在容忍范围内，否则握手易失败 | `chronyc tracking` 等 |
+| 密钥权限正确 | 私钥与 PSK 为 0600、目录 0700 | `stat -c '%a %n' /etc/wireguard/*key*` |
+| 回退方案就位 | 有可恢复的配置与密钥备份 | 见本节备份命令 |
+
+下面是部署前检查的可执行命令块，重点是「先确认能力、再动配置」。
+
+```bash
+# 1. 确认模块与工具
+wg --version
+ip link add wgtest type wireguard && ip link del wgtest && echo "module ok"
+
+# 2. 确认时钟同步（输出应与预期时间源一致）
+chronyc tracking 2>/dev/null || timedatectl status
+
+# 3. 确认密钥文件权限（期望 privatekey/psk 为 600）
+stat -c '%a %n' /etc/wireguard/privatekey /etc/wireguard/psk /etc/wireguard/publickey
+```
+
+下面是配置变更的标准流程。核心是：先在测试环境或配置管理里校验语法，再用 `syncconf` 增量下发，最后用 `wg show` 复核会话未被打断。若用 systemd 管理，等价于 `systemctl reload`（参数见 04-02）。
+
+```bash
+# 语法预检：确认配置文件可被解析（失败则不要下发）
+wg syncconf wg0 /etc/wireguard/wg0.conf && echo "parse ok"
+
+# 增量下发：未变更的 peer 会话保持，不中断连接
+wg syncconf wg0 /etc/wireguard/wg0.conf
+# 等价的 systemd 方式：systemctl reload wg-quick@wg0
+
+# 变更后核对：握手时间不应被重置为很长
+wg show wg0 latest-handshakes
+```
+
+下面是密钥轮换的流程。原则是「先让对端具备接受新身份的能力，再切换本端」，并在每一步后观察握手。
+
+```bash
+# 1. 在新目录生成新私钥与派生公钥（不影响运行中的接口）
+umask 077
+wg genkey | tee /etc/wireguard/privatekey.new | wg pubkey > /etc/wireguard/publickey.new
+
+# 2. 把新公钥带外发给对端，由对端先添加到本 peer 的公钥列表
+#    （对端操作完成后再继续，否则本端切换后会断连）
+
+# 3. 原子替换本端私钥并增量下发
+mv /etc/wireguard/privatekey.new /etc/wireguard/privatekey
+wg syncconf wg0 /etc/wireguard/wg0.conf
+
+# 4. 观察握手是否重新建立
+wg show wg0 latest-handshakes
+```
+
+监控巡检以 `wg show` 为主。下面这条命令输出每个 peer 的关键运行量，是日常工作最常用的一屏。
+
+```bash
+wg show wg0
+```
+
+示例输出，具体格式需对照实际版本核验：
+
+```text
+示例输出，具体格式需对照实际版本核验
+interface: wg0
+  public key: <本端公钥>
+  private key: (hidden)
+  listening port: 51820
+peer: <对端公钥A>
+  endpoint: 203.0.113.9:51820
+  allowed ips: 10.0.0.2/32
+  latest handshake: 1 minute, 12 seconds ago
+  transfer: 8.44 MiB received, 6.02 MiB sent
+peer: <对端公钥B>
+  endpoint: 198.51.100.4:51820
+  allowed ips: 10.0.0.3/32
+  latest handshake: 3 days, 4 hours ago
+  transfer: 1.20 KiB received, 980 B sent
+```
+
+逐行判读如下。首行是核验标注而非真实输出，提示格式需按版本核对；`interface` 段三行来自 `WG_CMD_GET_DEVICE` 返回的 device 属性：`public key` 应与分发出去的公钥一致；`private key: (hidden)` 再次确认工具脱敏，能安全地在屏幕上查看；`listening port` 应与防火墙放行端口一致。第一个 peer 段里，`endpoint` 对应 `WGPEER_A_ENDPOINT`，是动态学习到的对端地址；`allowed ips` 对应 `WGALLOWEDIP_A_IPADDR` 与掩码，收敛在 `/32`；`latest handshake: 1 minute, 12 seconds ago` 对应 `WGPEER_A_LAST_HANDSHAKE_TIME`，一分钟内说明链路活跃健康；`transfer` 对应 `WGPEER_A_RX_BYTES` 与 `WGPEER_A_TX_BYTES`，数值持续增长说明双向数据流正常。第二个 peer 段才是巡检要抓的异常：`latest handshake: 3 days, 4 hours ago` 说明该 peer 已有三天没有成功握手，远超 keepalive 应有的刷新周期，`transfer` 也几乎停滞——这通常意味着对端下线、公钥错配、endpoint 失效或中间网络阻断，应作为告警项处理，而不是等到业务报错才发现。两个 peer 对比也能看出监控要点：单看接口 `up` 没有意义，必须逐 peer 看握手时间新鲜度与流量计数是否随时间增长，这正是把「配通」升级为「可运维」的关键判据。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是混用 `syncconf` 与 `setconf`。`setconf` 走全量替换，未在新文件中出现的 peer 会被移除，正在进行的会话随之中断；生产环境的任何在线改动都应默认用 `syncconf`。但要知道代价：`sync_conf` 要读回并排序两边配置，peer 数量很大时开销明显高于 `setconf`，超大集群应评估下发耗时，必要时分批变更。第二个陷阱是误删 peer。因为 `syncconf` 会把「文件中消失、运行中仍在」的 peer 标为 `WGPEER_REMOVE_ME`，所以从配置模板里删掉一个 peer 就等于撤销它；若只想临时停用，应先确认这是否是你想要的结果。
+
+第三个陷阱是密钥轮换顺序颠倒。若先把本端私钥换掉、却没让对端提前接受新公钥，握手会立即失败、流量中断；正确顺序是先带外分发并让对端添加新公钥，确认对端就绪后再切本端私钥，并在每一步后看 `latest handshake`。第四个陷阱是备份泄露。备份若把含私钥的 `wg0.conf` 明文集中存放、或上传日志采集系统，等于把身份材料复制到防线之外；备份应加密并限制访问，且定期演练恢复流程——没有演练过的备份等于没有备份（安全边界见 08-05）。
+
+第五个陷阱是升级时忽略版本独立性。内核驱动版本（`version.h` 的 `1.0.0`）、wireguard-tools 版本（`WIREGUARD_TOOLS_VERSION`）、目标系统内核版本三者独立；内核升级后若使用 DKMS，需要确认模块随新内核重建，否则可能加载失败。升级前务必备份配置与密钥、记录当前 `wg show` 基线，并准备回退路径。第六个陷阱是监控只看接口状态：`wg0` 显示 `up` 不代表隧道可用，必须逐 peer 检查握手时间新鲜度与流量计数是否增长，否则像本节示例里「三天未握手」的 peer 会被漏掉。第七个陷阱是应急响应缺少预案：疑似私钥泄露时应立即轮换密钥、撤销可疑 peer、并在防火墙侧封禁来源，而不是先慢慢排查；事前写好应急预案、明确责任人，才能在这种场景下止损。
+
+最佳实践可归纳为：用清单驱动上线与变更，默认 `syncconf` 增量下发，密钥轮换遵循「对端先就绪、本端后切换」，监控以握手时间与流量计数器为核心，备份加密且定期演练恢复，升级前留基线、升级后核对版本与模块加载，应急按预案先止损后定位。这七条与 08-05 的安全边界互为表里：一个讲「边界怎么设」，一个讲「流程怎么走」，合起来才是完整的生产运维体系。
+
+### 7. 小结与延伸阅读
+
+本篇把 WireGuard 接口的运维工作组织成八个阶段（部署前检查、部署与初始配置、配置变更、密钥轮换、监控巡检、备份恢复、升级、应急响应）的闭环，并给出逐条可勾选的 checklist 表格与可执行命令。最关键的技术结论是：`wg syncconf` 通过「读回运行配置—按公钥排序比对—把文件缺失的 peer 标为 `WGPEER_REMOVE_ME`—一次性增量提交」实现不中断变更，systemd 的 `ExecReload` 正是借 `wg-quick strip` + `wg syncconf` 把这条链包装成一条 reload 命令；监控则必须落到逐 peer 的握手时间新鲜度与流量计数器增长上，而非仅看接口是否 `up`。
+
+延伸阅读建议按三条线走：配置变更的参数全集读 04-02，netlink 配置通道原理读 06-14，用户态工具模块职责读 07-13；安全边界与密钥保护回到 08-05，故障诊断与案例回到本册 08-03、08-04。跨册随查按（字段见 05-02 ｜ 参数见 04-02 ｜ 原理见 06-14 ｜ 模块见 07-13）执行：结构体逐字段去 05、参数与命令全集去 04、机制与调用链去 06、目录级模块能力去 07、运维落地与基准去 08。凡本篇标注「需对照实际版本核验」的输出格式与命令选项，均以 `_wglinux_build/upstream_src/` 下对应文件为准，本册不编造未核验的路径与取值。

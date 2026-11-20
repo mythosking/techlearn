@@ -1,0 +1,276 @@
+## 03-03 密钥生成与分发：curve25519、私钥边界与 setup 流程
+
+### 1. 背景与动机
+
+WireGuard 把安全身份直接绑定到密钥对上，这一设计常被概括为「密钥即身份」。与 TLS 或 IPsec 不同，WireGuard 协议里没有证书颁发机构、没有中心化的注册服务器、也没有任何自动的密钥协商分发机制：一台设备「是谁」，完全由它持有哪一把私钥、以及对端配置了它的哪一把公钥来决定。这个决定的好处是配置面极简、审计面极小；代价是把密钥的生成、保管与分发责任完整地推给了运维者或上层控制面。本篇就聚焦这条责任链的第一段——密钥怎样从系统熵源变成配置文件里那一串 44 字符的 base64，又怎样通过 netlink 注入到内核接口，以及在这条链路上「私钥边界」究竟应该怎么划。
+
+先把本篇的口径与取材讲清楚。本套资料的事实锚点是 `_wglinux_build/upstream_src/wireguard-linux-src/`（内核驱动与加密原语快照）与 `_wglinux_build/upstream_src/wireguard-tools/`（用户态工具快照），下文出现的源码路径均相对这两个根目录，为节约篇幅省略前缀。密钥生成这一环完全落在用户态工具侧：核心文件是 `wireguard-tools/src/genkey.c`（三个密钥子命令的入口）、`wireguard-tools/src/curve25519.h` 与 `curve25519.c`（曲线运算与标量钳制）、`wireguard-tools/src/encoding.c` 与 `encoding.h`（常量时间 base64/hex 编解码）；而内核侧的对应实现在 `lib/crypto/curve25519.c`，负责握手阶段的 ECDH 运算。密钥长度常量 `WG_KEY_LEN` 定义在 uapi 头 `include/uapi/linux/wireguard.h`，值为 32。需要强调的是，genkey 只负责「造出合格的字节并将其编码输出」，把私钥送进内核是另一条由 `wg set` 经 netlink 完成的路径，二者合起来才是完整的 setup 流程，这也是本篇标题把它单列出来的原因。
+
+为什么私钥边界值得用一整篇来讲？因为 WireGuard 的保密性几乎全部押在「私钥绝不离开本机」这一条纪律上。协议没有证书撤销、没有在线认证、没有二次校验，一旦某台机器的私钥泄露，攻击者就可以克隆这台设备的身份、与所有信任它的对端完成握手。而 WireGuard 又是静默协议——认证失败只会丢包，不会在日志里留下醒目报错，私钥泄露往往在造成危害后才被发现。因此，从熵源选择、文件权限、编码输出到配置分发，每一步都需要有明确的边界意识。本篇不重复 01-01 已经讲过的「两类密钥」概览，而是沿着源码把这条链路逐段拆开，给出可执行的生成与分发方法，并指出那些看似无害、实则会破坏边界的操作习惯。
+
+### 2. 核心概念
+
+理解密钥生成，先要理解 Curve25519 在这套实现里承担的两个不同角色。第一个角色是「由私钥派生公钥」：这是一个单向的标量乘法，公钥 = 标量 × 基点，基点取 u 坐标 9；它不可逆，所以公钥可以公开分发。第二个角色是握手阶段的 ECDH 共享密钥计算：本地私钥与对端公钥做标量乘，得到只有双方知道的共享秘密。前者发生在用户态 `wg pubkey` 命令里，后者发生在内核 `lib/crypto/curve25519.c` 的 `curve25519()` 里。两者用的是同一个曲线算法，但调用场景与安全含义不同，阅读源码时不要混为一谈。
+
+标量钳制（clamp）是第一个关键概念，也是最容易理解错的一步。`curve25519.h` 里 `curve25519_clamp_secret` 只有两行：
+
+```c
+static inline void curve25519_clamp_secret(uint8_t secret[static CURVE25519_KEY_SIZE])
+{
+	secret[0] &= 248;
+	secret[31] = (secret[31] & 127) | 64;
+}
+```
+
+第一行 `secret[0] &= 248`（248 即二进制 11111000）清掉最低 3 位，使标量成为 8 的倍数，从而避开 Curve25519 的 8 阶小子群、让 ECDH 结果落在安全子群；第二行 `secret[31] = (secret[31] & 127) | 64` 清掉最高位、置位次高位，把标量固定到 2^254 量级，既防止实现间因约化方式不同产生歧义，也保证标量落在有效范围内。注意这是「就地修改」：genkey 把钳制后的字节当作私钥输出，因此用户看到的私钥已经是合法标量，后续 `wg pubkey` 可以直接拿它乘基点，不必再次钳制。
+
+第二个关键概念是编码。`encoding.h` 定义 `WG_KEY_LEN_BASE64` 为 `((((WG_KEY_LEN) + 2) / 3) * 4 + 1)`，代入 32 得 45——这是数组大小，含结尾 NUL；实际可见的 base64 字符串是 44 个字符，末位固定为一个 `=`。这是因为 32 字节按每 3 字节一组编码，余下 2 字节补一个 `=`。`encoding.c` 的注释明确写着这是「constant-time base64/hex implementation that resists side-channel attacks」：编解码全部用位运算完成，不查表，避免缓存时序泄露密钥内容。这一点常被低估——密钥处理函数的侧信道安全与算法本身同样重要。
+
+第三个关键概念是私钥边界。完整链路存在三类密钥材料：私钥（`WGDEVICE_A_PRIVATE_KEY`）、公钥（`WGDEVICE_A_PUBLIC_KEY` / `WGPEER_A_PUBLIC_KEY`）与可选的预共享密钥 PSK（`WGPEER_A_PRESHARED_KEY`）。边界规则是：私钥只在生成它的本机、以受限权限落盘，并注入本机内核接口；公钥可以、也应该分发给所有对端；PSK 是对两端共享的额外对称秘密，必须经带外安全通道分发。三者里只有公钥可以走明文渠道。第四个点需要提前澄清：genkey 命令对 `genkey` 与 `genpsk` 做了区分——只有 `genkey` 会调用 `curve25519_clamp_secret`，因为私钥必须是合法标量；`genpsk` 生成的是任意 32 字节随机串，不需要满足标量约束。把 PSK 当成私钥去钳制，虽然不至于立刻出错，却是对源码语义的误解。
+
+### 3. 关键数据结构与源码位置
+
+密钥生成链路涉及的源码可按「入口—运算—编码—内核对应」四层来建结构地图。入口层是 `wireguard-tools/src/genkey.c`，`genkey_main` 是 `genkey`、`pubkey`、`genpsk` 三个子命令共用的主函数，靠 `argv[0]` 区分行为。运算层是 `curve25519.h` 与 `curve25519.c`，前者给出 `CURVE25519_KEY_SIZE = 32` 与 `curve25519_clamp_secret`，后者用 `curve25519_generic`（依编译器是否支持 `__SIZEOF_INT128__` 选择 `curve25519-hacl64.h` 或 `curve25519-fiat32.h`）实现标量乘，基点常量 `basepoint[32] = { 9 }` 就在这里。编码层是 `encoding.c` / `encoding.h`，提供 `key_to_base64`、`key_from_base64`、`key_to_hex`、`key_from_hex`、`key_is_zero` 五个函数。内核对应层是 `lib/crypto/curve25519.c`，它用 `curve25519_null_point`（全零）与 `curve25519_base_point`（9）两个常量，导出 `curve25519()` 与 `curve25519_generate_public()` 两个接口供握手调用。uapi 层则在 `include/uapi/linux/wireguard.h`，`WG_KEY_LEN 32` 与三层属性枚举都在这里（完整常量见 04-06，字段见 05-09）。下表把本篇反复引用的源码位置收拢成速查。
+
+| 关注点 | 真实源码路径 | 关键符号 | 本册处理方式 |
+|---|---|---|---|
+| 密钥子命令入口 | `wireguard-tools/src/genkey.c` | `genkey_main`、`get_random_bytes` | 讲流程，命令全集见 04-01 |
+| 标量钳制 | `wireguard-tools/src/curve25519.h` | `curve25519_clamp_secret` | 展开语义，结构字段见 05-09 |
+| 用户态曲线运算 | `wireguard-tools/src/curve25519.c` | `curve25519_generate_public`、`basepoint` | 只点名，原理见 06-03 |
+| 常量时间编解码 | `wireguard-tools/src/encoding.c` | `key_to_base64`、`key_from_base64` | 展开边界，参数见 04-02 |
+| 内核曲线运算 | `lib/crypto/curve25519.c` | `curve25519`、`curve25519_null_point` | 只点名，模块见 07-12 |
+| 密钥属性定义 | `include/uapi/linux/wireguard.h` | `WG_KEY_LEN`、`WGDEVICE_A_PRIVATE_KEY` | 给最小片段，全集见 04-05 |
+
+需要特别提示一个容易踩空的版本差异：内核态 `lib/crypto/curve25519.c` 的 `curve25519()` 与 `curve25519_generate_public()` 都返回 `bool`，用 `crypto_memneq` 做常量时间比较，检查输出是否为全零（即是否落在低阶点），全零则返回 `false`；而用户态 `wireguard-tools/src/curve25519.c` 的同名函数是 `void`，不做 nil-potent 检查。同一份算法、两个不同的接口契约，读写源码时务必看清身处哪一层。字段级展开（如 `wg_device` 如何存放私钥）交给 05 册，本篇只给理解生成边界所需的最小片段。
+
+### 4. 关键流程与调用链
+
+先讲熵的来路。`genkey_main` 调用 `get_random_bytes(key, WG_KEY_LEN)`，这个函数按平台做了三级回退：在 glibc 2.25 以上、OpenBSD、macOS 10.12 以上，优先用 `getentropy(out, len)`；在 Linux 上退一步用 `syscall(__NR_getrandom, out, len, 0)`；再退一步 `open("/dev/urandom", O_RDONLY)` 循环读取；Windows 则走 `RtlGenRandom`。函数开头还有一道 `len > 256` 就设 `errno = EOVERFLOW` 并返回的护栏，防止一次性索取过多随机字节。理解了这条链，就能回答「wg genkey 的随机性可靠吗」——它直接绑定操作系统 CSPRNG，不引入用户态自造的伪随机源。
+
+再看 genkey 主流程，可压缩为五步：分配 `uint8_t key[WG_KEY_LEN]` 与 `char base64[WG_KEY_LEN_BASE64]`；`fstat(STDOUT_FILENO, &stat)` 检查标准输出是否是 world-accessible 的普通文件，若是则打印「Warning: writing to world accessible file. Consider setting the umask to 077 and trying again.」；`get_random_bytes` 填充 32 字节；若 `argv[0]` 等于 `genkey` 则 `curve25519_clamp_secret(key)`；最后 `key_to_base64(base64, key)` 并 `puts(base64)`。`pubkey` 走的是另一条路：从标准输入读入私钥字符串，`key_from_base64` 解码为 32 字节，再 `curve25519_generate_public` 乘基点得到公钥，同样 base64 输出。上述链路与配置注入链路的关系见图 03-03-01。
+
+:::figure id=03-03-01 | name=密钥生成、派生与注入内核的链路 | dir=TD
+node e1 "OS 熵源<br/>getentropy/getrandom/urandom" teal
+node e2 "genkey_main<br/>32 字节随机" blue
+node e3 "curve25519_clamp_secret<br/>低3位清零 次高位置位" purple
+node e4 "key_to_base64<br/>44 字符常量时间编码" gray
+node e5 "私钥文件<br/>umask 077 落盘" red
+node e6 "curve25519_generate_public<br/>私钥乘基点9" purple
+node e7 "公钥分发<br/>给对端" green
+node e8 "wg set private-key<br/>netlink SET_DEVICE" amber
+node e9 "内核接口<br/>WGDEVICE_A_PRIVATE_KEY" blue
+edge e1 -> e2 "get_random_bytes"
+edge e2 -> e3 "genkey 钳制"
+edge e3 -> e4 "编码"
+edge e4 -> e5 "tee 落盘"
+edge e5 -> e6 "wg pubkey"
+edge e6 -> e7 "安全分发"
+edge e5 -> e8 "读取私钥"
+edge e8 -> e9 "写入属性"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：起点是「OS 熵源 getentropy/getrandom/urandom」，经「genkey_main 32 字节随机」进入「curve25519_clamp_secret 低3位清零 次高位置位」，再由「key_to_base64 44 字符常量时间编码」输出并「tee 落盘」到 umask 077 保护的「私钥文件」；一条分支是「curve25519_generate_public 私钥乘基点9」派生公钥后「公钥分发 给对端」，另一条分支是用「wg set private-key netlink SET_DEVICE」把私钥写入「内核接口 WGDEVICE_A_PRIVATE_KEY」。
+
+配置注入链路的落点是这样的：`wg set wg0 private-key <文件>` 读取私钥文件，经 `key_from_base64` 校验并解码，通过 `wireguard-tools/src/ipc-linux.h` 的 netlink 套接字把 `WG_CMD_SET_DEVICE` 请求发给内核，内核在 netlink 层解析出 `WGDEVICE_A_PRIVATE_KEY` 属性写入 `wg_device`；用户态再调用 `curve25519_generate_public` 从同一私钥派生公钥，作为 `WGDEVICE_A_PUBLIC_KEY` 一并上报，所以 `wg show` 才能显示本端公钥。握手时内核用这把私钥在 `lib/crypto/curve25519.c` 里与对端公钥做 ECDH（逐段调用链见 06-03，netlink 通道见 06-14，模块职责见 07-13）。
+
+### 5. 配置/命令/代码实例
+
+下面给出一套规范的生成与分发操作。关键点是用管道一次生成私钥、同步派生公钥，并对私钥文件施加严格权限：
+
+```bash
+# 生成密钥对：umask 077 保证私钥文件仅本人可读写
+umask 077
+wg genkey | tee privatekey | wg pubkey > publickey
+
+# 单独生成预共享密钥（可选，不做标量钳制）
+wg genpsk > presharedkey
+
+# 用私钥建立接口，公钥分发给对端后由对端写入 peer
+ip link add wg0 type wireguard
+wg set wg0 private-key ./privatekey listen-port 51820
+wg set wg0 peer <对端公钥> preshared-key ./presharedkey allowed-ips 10.0.0.2/32
+ip link set wg0 up
+
+# 查看本端状态，核对派生公钥是否与分发给对端的一致
+wg show wg0
+```
+
+这段写法体现了三条纪律：其一，`wg genkey | tee privatekey | wg pubkey` 中私钥经 `tee` 落到本地 `privatekey`，公钥从同一私钥派生后单独写入 `publickey`，私钥永不进入分发文件；其二，`umask 077` 让新建文件权限为 600，规避 `genkey.c` 里那条 world-accessible 警告；其三，PSK 用 `wg genpsk` 单独生成，经带外安全通道传给对端，绝不与公钥一起明文发送。命令参数全集见 04-01、04-02。
+
+下面给出验证密钥是否真正生效的典型输出，用 `wg show` 观察与密钥相关的各行：
+
+```bash
+wg show wg0
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+interface: wg0
+  public key: AbCdEf...（44 字符 base64）
+  private key: (hidden)
+  listening port: 51820
+peer: XyZ123...（对端公钥）
+  preshared key: (hidden)
+  allowed ips: 10.0.0.2/32
+  latest handshake: 8 seconds ago
+```
+
+逐行判读如下。第一行 `interface: wg0` 来自 `WG_CMD_GET_DEVICE` 返回的 `WGDEVICE_A_IFNAME`，确认查询命中了正确的接口；多接口环境下这一步能防止把 A 接口的密钥误判到 B 接口。第二行 `public key` 是本端私钥经 `curve25519_generate_public` 乘基点 9 派生、再由 `key_to_base64` 编码的结果，对应 `WGDEVICE_A_PUBLIC_KEY`，其 44 字符形态正来自 `WG_KEY_LEN_BASE64` 数组减去末尾 NUL；把这一行与分发给对端的 `publickey` 文件逐字符比对，是验证派生正确性的最直接方法，对端若写入了不同公钥，握手会静默失败。第三行 `private key: (hidden)` 是工具刻意的展示层保护：私钥真实存在于内核接口的 `WGDEVICE_A_PRIVATE_KEY` 中，但 `wg show` 绝不回显，任何要求你「从 show 输出里复制私钥」的说法都是错误的。第四行 `listening port` 对应 `WGDEVICE_A_LISTEN_PORT`，若为 0 通常意味着私钥未设置或接口未 up。第五行 `peer:` 后是对端公钥，对应 `WGPEER_A_PUBLIC_KEY`，一个接口下可有多个 peer 段。`preshared key: (hidden)` 对应 `WGPEER_A_PRESHARED_KEY`，同样被隐藏，它的存在表示本 peer 启用了额外的对称密钥层，为握手叠加了后量子混合防护。`allowed ips` 对应 `WGALLOWEDIP_A_IPADDR` 与 `WGALLOWEDIP_A_CIDR_MASK`，与密钥分工明确：它只决定路由与源校验，不参与身份认证（路由部署见 03-04）。最后 `latest handshake` 对应 `WGPEER_A_LAST_HANDSHAKE_TIME`，是检验密钥链是否真正打通的核心指标——若长期为空，优先回查公钥是否分发错、PSK 两端是否一致、以及系统时钟是否偏差过大（握手时序见 06-03，排障见 08-03）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把 world-accessible 警告当成无害提示。`genkey.c` 在检测到标准输出是权限含 `S_IRWXO` 的普通文件时会明确警告，因为把私钥写进全局可读文件等于直接泄露身份；正确做法是先 `umask 077` 再生成，或把输出重定向到已被保护的目录。第二个陷阱是混淆三种密钥的生成方式：`genkey` 会钳制标量，`genpsk` 不会；把 `wg genpsk` 的输出当作私钥配置，或反过来把私钥当 PSK，都会埋下难以定位的互通问题。
+
+第三个陷阱是忽略编码的常量时间特性而自行「优化」。`encoding.c` 的位运算实现看似繁琐，实则刻意避免查表带来的缓存侧信道；自己写脚本用标准 base64 库处理私钥并非不可用，但要意识到那不在本工具的侧信道防护范围内。第四个陷阱是把公钥当敏感信息藏着不给对端：公钥本身就是公开派生量，`wg pubkey` 的输出可以安全地在任何渠道传递，过度保护公钥只会增加分发错误的机会。第五个陷阱是私钥轮换时不更新对端配置：轮换本端私钥后，公钥随之改变，所有信任旧公钥的对端都必须同步替换，否则隧道会静默中断；轮换窗口内应保留旧 peer 直到确认新握手建立（密钥管理与加固见 08-05）。
+
+最佳实践可以归纳为四条：第一，始终在受控环境中生成密钥，`umask 077`、受限目录、生成后立即核对文件权限，杜绝把私钥写入管线中间文件；第二，用 `tls`、带外信道或配置管理工具分发公钥与 PSK，公钥可明文、PSK 必须加密，私钥永不出本机；第三，生成后用 `wg show` 的 `public key` 行与分发文件逐字符比对，并用 `latest handshake` 确认链路打通，而不是只看接口 up；第四，建立轮换流程时先分发新公钥、再切换私钥、最后清理旧配置，全程以握手时间与 `transfer` 字节增长为成功判据。还要提醒一句：本篇给出的随机性来源、标量约束与编码长度均以本快照源码为准，不同版本的 wireguard-tools 在熵源优先级或输出格式上可能有细微差异，部署时应以目标系统实际版本核验（命令全集见 04-01，配置语义见 04-02）。
+
+### 7. 小结与延伸阅读
+
+本篇沿着源码把密钥链路拆成四段：熵源（`getentropy` → `getrandom` → `/dev/urandom` 三级回退）产出 32 字节随机数；`curve25519_clamp_secret` 通过「低 3 位清零、最高位清零、次高位置位」把私钥约束为合法标量；`key_to_base64` 以常量时间的位运算编码成 44 字符字符串；`wg set private-key` 经 netlink 把私钥写入 `WGDEVICE_A_PRIVATE_KEY`，公钥由 `curve25519_generate_public` 乘基点 9 派生后作为 `WGDEVICE_A_PUBLIC_KEY` 上报。私钥边界的核心纪律是：私钥只留本机并受限落盘，公钥可公开分发，PSK 经带外安全通道共享，`wg show` 对私钥与 PSK 一律隐藏。
+
+延伸阅读建议按三条线走：想深入标量乘与安全子群的数学原理读 `lib/crypto/curve25519.c` 与 06-03；想看结构字段逐项定义去 05 册，想看 netlink 属性全集去 04 册，想看各源文件职责去 07 册。跨册随查按（字段见 05-09 ｜ 参数见 04-02 ｜ 原理见 06-03 ｜ 模块见 07-13）执行：结构体逐字段去 05、参数与命令全集去 04、机制与调用链去 06、目录级模块能力去 07、密钥加固去 08-05。凡本篇标注「需对照实际版本核验」的字段、函数名签名、命令选项与输出格式，均以 `_wglinux_build/upstream_src/` 下对应文件为准，本套资料不编造未核验的路径与取值。下一篇 03-04 将把视角从「密钥是谁」转向「流量走哪条路」，讨论 AllowedIPs 的双重语义与路由部署。
+
+## 03-04 AllowedIPs 路由、策略路由与 NAT 部署
+
+### 1. 背景与动机
+
+如果说密钥决定了「谁可以接入」，AllowedIPs 就决定了「哪些流量走隧道、以哪把密钥发往哪个对端」。这是 WireGuard 与传统 VPN 差异最大的一点：它没有独立的路由协议下发，也没有中心控制器推送策略，而是把路由信息直接编码进每个 peer 的 `allowed-ips` 列表，由内核在发包时用目的地址查表选 peer、在收包时用源地址查表校验。上游把这套机制称为「crypto key routing」——加密密钥与路由条目是同一件事的两面。理解这一点，是正确部署分流、全流量代理、站点互联与 NAT 的前提；把它当成普通静态路由去配，是隧道「接口 up 但就是不通」的最常见根因。
+
+本篇的定位需要先把边界划清楚。AllowedIPs 的底层数据结构是一棵 v4/v6 混合的压缩 trie，实现在 `drivers/net/wireguard/allowedips.c` 与 `allowedips.h`；它的查找、最长前缀匹配、RCU 并发与节点压缩等**原理**属于 06-07 的权威范围，本篇不展开算法细节，只讲清楚它在部署层表现出的语义与行为，并给出可执行的配置方法。换句话说，本篇回答「应该怎么配、为什么会这样表现、出错时往哪查」，而「trie 节点怎么分裂与压缩」留给 06-07。这种分工贯穿全册：机制归 06 册，参数全集归 04 册，字段定义归 05 册，本篇作为集成与部署册，只做本节主题——把 AllowedIPs 语义落实到策略路由与 NAT 的部署方案上。
+
+为什么策略路由与 NAT 需要和 AllowedIPs 一起讲？因为 WireGuard 只负责「把匹配 AllowedIPs 的包加密送进隧道」，并不替你解决「如何让原本走默认路由的流量改道进 wg0」，也不解决「隧道另一端的私有地址如何访问互联网」。前者靠 Linux 的策略路由（`ip rule` + 多路由表 + fwmark），后者靠 NAT（`iptables`/`nftables` 的 MASQUERADE）与内核转发开关。这三者叠加才构成一套可用的远程接入或站点互联方案。本章的口径与本册一致：所有函数、字段、属性名均先读源码核实，配置参数以 04 册为权威源，本篇只给最小必要片段并写明交叉引用；涉及绝对吞吐与性能的数字一律「需在目标机型实测」，本篇不提供。
+
+### 2. 核心概念
+
+AllowedIPs 的第一层语义是**出站选路**。发送方向，内核按普通路由把包交给 wg0 的 `ndo_start_xmit`，`send.c` 调用 `wg_allowedips_lookup_dst(table, skb)`，它以 IP 头的目的地址 `ip_hdr(skb)->daddr`（IPv6 为 `ipv6_hdr(skb)->daddr`）在 trie 中查找，命中哪个节点就取该节点的 `peer`，于是这个包就用那个 peer 的会话密钥加密发走。所以「AllowedIPs 里写了什么网段」等价于「发往这些网段的流量交给哪个对端」。
+
+第二层语义是**入站源校验**。接收方向，报文解密后，`receive.c` 调用 `wg_allowedips_lookup_src(table, skb)`，以源地址 `saddr` 查表，确认这个源地址确实属于刚才解密所用的那个 peer；不属于就丢弃。这一层常被忽略，却极其关键：它意味着客户端必须在自己的 `AllowedIPs` 里包含「对端发来的源地址」，否则服务端回包会被客户端当作伪造源而丢弃。双重语义合起来，正好构成一条闭合的信任链——出去按目的选密钥，回来按源验身份（trie 查找原理见 06-07，字段见 05-04）。
+
+第三层概念是**最长前缀匹配**。`allowedips.c` 的 `find_node` 沿 trie 向下走时，会把「最后一个拥有 peer 的节点」记为结果；由于前缀从短到长排列，这等价于选出掩码最长、最精确的那条 AllowedIP。部署上的直接后果是：你可以用 `0.0.0.0/0` 兜底，再用 `10.0.0.0/8` 这类更具体条目把特定网段导向另一个 peer，具体条目优先。第四层是**双栈分离**：`struct allowedips` 有 `root4` 与 `root6` 两棵独立的树，`0.0.0.0/0` 只覆盖 IPv4，`::/0` 才覆盖 IPv6；只写前者会导致 IPv6 流量绕过隧道，这是一个隐蔽的泄露点。
+
+第五层是**分流形态**。按 AllowedIPs 的写法，部署可归为三类：精确分流（`AllowedIPs = 10.0.0.0/24`，只有该网段进隧道，其余流量按主路由表走，最简单也最安全）；全流量代理（`AllowedIPs = 0.0.0.0/0, ::/0`，所有流量进隧道，需配合策略路由避免路由环路）；多 peer 分流（不同 peer 配不同 AllowedIPs，内核按目的地址自动选择出口）。下表把三种形态与所需配套机制对照列出。
+
+| 分流形态 | AllowedIPs 写法 | 出站选路依据 | 是否需要策略路由 | 是否需要 NAT |
+|---|---|---|---|---|
+| 精确分流 | `10.0.0.0/24` | 目的地址命中该前缀才进隧道 | 通常不需要，走主路由表 | 视对端网络而定 |
+| 全流量代理 | `0.0.0.0/0, ::/0` | 所有目的地址均命中 | 需要，避免覆盖默认路由 | 服务端通常需要 |
+| 多 peer 分流 | 每个 peer 各自网段 | 最长前缀决定目标 peer | 视出口数量而定 | 视出口拓扑而定 |
+
+### 3. 关键数据结构与源码位置
+
+从部署视角看 AllowedIPs，需要认识三组源码位置。第一组是 trie 的实现 `drivers/net/wireguard/allowedips.c` 与 `allowedips.h`：`struct allowedips` 持有 `root4`、`root6` 两棵根与一个递增序号 `seq`；`struct allowedips_node` 含 `peer`、`bit[2]` 子指针、`cidr`、`bits[16]` 等字段。对外 API 中，部署最需要记住的是四个函数——`wg_allowedips_insert_v4`、`wg_allowedips_insert_v6`（按前缀插入），`wg_allowedips_lookup_dst`（出站按目的查）、`wg_allowedips_lookup_src`（入站按源查）。`MAX_ALLOWEDIPS_DEPTH = 129` 决定了树深上限，`swap_endian` 负责把网络序地址转成便于位运算的主机序。字段逐项定义见 05-04，算法原理见 06-07，模块职责见 07-04，本篇只点名不展开。
+
+第二组是 uapi 属性定义 `include/uapi/linux/wireguard.h`。AllowedIP 条目在 netlink 层由 `enum wgallowedip_attribute` 描述，四个有效属性是 `WGALLOWEDIP_A_FAMILY`（地址族，AF_INET/AF_INET6）、`WGALLOWEDIP_A_IPADDR`（地址本身）、`WGALLOWEDIP_A_CIDR_MASK`（掩码位数）、`WGALLOWEDIP_A_FLAGS`；标志位目前只有 `WGALLOWEDIP_F_REMOVE_ME`，用于删除单条。peer 侧另有 `WGPEER_A_ALLOWEDIPS` 作为条目容器，以及 `WGPEER_F_REPLACE_ALLOWEDIPS` 标志表示整体替换。理解这些属性，就能看懂 `wg set` 的 `allowed-ips` 参数最终落到哪里（属性全集见 04-05、04-06）。
+
+第三组是策略路由与 NAT 的内核设施，它们不属于 WireGuard 源码，而是 Linux 网络栈的通用能力：`ip rule` 操作策略路由规则、`ip route ... table` 操作路由表、`WGDEVICE_A_FWMARK` 是 WireGuard 给隧道包打标记的 uapi 属性（便于 `ip rule ... fwmark` 匹配），`net.ipv4.ip_forward` 控制转发，`iptables -t nat` 或 `nftables` 完成地址伪装。下表把部署要素收拢成速查，方便与后文实例对照。
+
+| 关注点 | 真实源码路径 / 设施 | 关键符号 | 本册处理方式 |
+|---|---|---|---|
+| AllowedIPs trie | `drivers/net/wireguard/allowedips.c`、`allowedips.h` | `wg_allowedips_lookup_dst`、`lookup_src` | 只讲语义，原理见 06-07 |
+| AllowedIP 属性 | `include/uapi/linux/wireguard.h` | `WGALLOWEDIP_A_IPADDR`、`CIDR_MASK` | 给最小片段，全集见 04-05 |
+| 隧道标记属性 | `include/uapi/linux/wireguard.h` | `WGDEVICE_A_FWMARK` | 只点名，参数见 04-03 |
+| 策略路由 | `ip rule` / `ip route table`（内核网络栈） | fwmark、 lookup table | 给部署片段 |
+| NAT 与转发 | `iptables` / `nftables` / sysctl | MASQUERADE、ip_forward | 给部署片段 |
+
+### 4. 关键流程与调用链
+
+出站流程可概括为「选路 → 进隧道 → 查表选 peer → 加密发出」。当应用层发包，内核按策略路由或主路由表决定下一跳是 wg0；包进入 `ndo_start_xmit` 后，`send.c` 调 `wg_allowedips_lookup_dst`，该函数按 `skb->protocol` 区分 IPv4/IPv6，分别用目的地址查 `root4`（32 位）或 `root6`（128 位）。查表在 RCU 读锁下完成，`find_node` 记录最长前缀命中的节点并返回其 peer 的强引用；随后用该 peer 的会话密钥经 ChaCha20-Poly1305 加密，封装成 UDP 从底层物理网卡发出。整个查表过程不睡眠、并发安全（并发机制见 06-13）。
+
+入站流程则是「收 UDP → 解密 → 源校验 → 注入」。socket 收到报文后经握手/数据路径解密，`receive.c` 调 `wg_allowedips_lookup_src` 用源地址查表，确认源地址归属解密所用的 peer；若查不到或归属不符，包被丢弃。通过后包被注入内核协议栈，由普通路由转发到内网或本机。注意入站校验用的是**源**地址，出站选路用的是**目的**地址，二者共用同一棵 trie 但取 IP 头的不同字段——这正是 crypto key routing 的核心（收发全流程见 06-05、06-06）。上面两条链路以及策略路由、NAT 在整个部署中的位置见图 03-04-01。
+
+:::figure id=03-04-01 | name=AllowedIPs 双重语义与策略路由 NAT 部署 | dir=TD
+node n1 "出站 IP 包<br/>取 daddr 目的地址" blue
+node n2 "lookup_dst<br/>root4/root6 查 trie" teal
+node n3 "最长前缀匹配<br/>命中条目的属主 peer" purple
+node n4 "加密为 UDP<br/>从物理网卡发出" red
+node n5 "入站解密包<br/>取 saddr 源地址" blue
+node n6 "lookup_src<br/>校验源归属该 peer" teal
+node n7 "合法注入协议栈<br/>非法丢弃" green
+node n8 "策略路由 fwmark<br/>ip rule 查自定义表" amber
+node n9 "NAT MASQUERADE<br/>出口改写源地址" gray
+edge n8 -> n1 "选路进 wg0"
+edge n1 -> n2 "目的地址"
+edge n2 -> n3 "find_node"
+edge n3 -> n4 "选定 peer"
+edge n5 -> n6 "源地址"
+edge n6 -> n7 "前缀匹配"
+edge n4 -> n9 "经物理网卡"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：出站侧，「策略路由 fwmark ip rule 查自定义表」把「出站 IP 包 取 daddr 目的地址」送进 wg0，经「lookup_dst root4/root6 查 trie」与「最长前缀匹配 命中条目的属主 peer」选定目标 peer，再由「加密为 UDP 从物理网卡发出」，出口处经「NAT MASQUERADE 出口改写源地址」；入站侧，「入站解密包 取 saddr 源地址」经「lookup_src 校验源归属该 peer」判定后「合法注入协议栈 非法丢弃」。
+
+配置落地链路则从 `wg set wg0 peer <公钥> allowed-ips <网段>` 开始：工具把网段拆成地址与掩码，序列化为 `WGALLOWEDIP_A_FAMILY`、`WGALLOWEDIP_A_IPADDR`、`WGALLOWEDIP_A_CIDR_MASK` 属性，经 `WG_CMD_SET_DEVICE` 发给内核；内核解析后调用 `wg_allowedips_insert_v4/v6` 插入 trie 并递增 `seq`。`wg-quick` 在此之上把 `AllowedIPs` 转为主机路由或策略路由规则（具体参数见 04-03，配置体系见 03-02）。这就是为什么改一行 `AllowedIPs` 会同时改变「本端发包走哪」和「对端回包是否合法」两侧的行为。
+
+### 5. 配置/命令/代码实例
+
+下面给出两种典型部署。第一种是全流量远程接入，客户端用策略路由避免隧道自锁：`FwMark` 给隧道包打标记，`Table` 让 wg-quick 使用独立路由表，`PostUp`/`PreDown` 手工补充规则，使得到达服务端 endpoint 自身流量仍走物理网卡。
+
+```bash
+# /etc/wireguard/wg0.conf —— 客户端：全流量经隧道
+[Interface]
+Address = 10.0.0.2/32
+PrivateKey = <本端私钥>
+FwMark = 51820
+Table = off
+DNS = 10.0.0.1
+PostUp = ip route add default dev %i table 100
+PostUp = ip rule add fwmark 51820 table 100 priority 100
+PreDown = ip rule del table 100 priority 100
+PreDown = ip route flush table 100
+
+[Peer]
+PublicKey = <服务端公钥>
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = 203.0.113.9:51820
+PersistentKeepalive = 25
+```
+
+```bash
+# 服务端：开启转发并对隧道出口做 NAT
+sysctl -w net.ipv4.ip_forward=1
+sysctl -w net.ipv6.conf.all.forwarding=1
+iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+# 或对 IPv6：nftables 的 masquerade 规则，需对照实际版本核验
+```
+
+这段配置体现了三个要点：`AllowedIPs = 0.0.0.0/0, ::/0` 覆盖双栈，对应两棵 trie 各写一条默认前缀；`FwMark = 51820`（即 `WGDEVICE_A_FWMARK`）配合 `ip rule ... fwmark` 让标记流量查独立表，避免把发往 endpoint 的包也送进隧道形成环路；服务端 `ip_forward` 加 MASQUERADE 让 `10.0.0.2` 的流量以服务端公网地址出网（策略路由与 NAT 参数全集见 04-03，命令全集见 04-01）。
+
+下面用 `wg show` 与 `ip` 命令验证 AllowedIPs 与策略路由是否按预期生效：
+
+```bash
+wg show wg0 allowed-ips
+ip rule show | grep 51820
+ip route get 8.8.8.8 mark 51820
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+peer: XyZ123...（服务端公钥）
+  0.0.0.0/0
+  ::/0
+32765: from all fwmark 0xca6c lookup 100
+8.8.8.8 via 10.0.0.1 dev wg0 table 100 src 10.0.0.2 uid 0
+```
+
+逐行判读如下。第一段三行是 `wg show wg0 allowed-ips`：`peer:` 后的公钥标识这是服务端这个 peer，对应 `WGPEER_A_PUBLIC_KEY`；紧随其后的 `0.0.0.0/0` 与 `::/0` 是该 peer 的两条 AllowedIP，分别来自 `WGALLOWEDIP_A_IPADDR` 与 `WGALLOWEDIP_A_CIDR_MASK`（掩码为 0），地址族由 `WGALLOWEDIP_A_FAMILY` 区分，正好落进 `struct allowedips` 的 `root4` 与 `root6` 两棵树；这两行说明「所有 IPv4 与 IPv6 目的地址都按最长前缀匹配选中这个 peer」，与 `wg_allowedips_lookup_dst` 用 `daddr` 查表的行为一致。第二段 `32765: from all fwmark 0xca6c lookup 100` 是 `ip rule` 输出，`0xca6c` 正是十进制 51820，说明带该 fwmark 的包被引导到 100 号路由表——这对应 `WGDEVICE_A_FWMARK` 被打标后由策略路由接管，是避免隧道自锁的关键。第三段 `ip route get 8.8.8.8 mark 51820` 的结果显示下一跳是 `via 10.0.0.1 dev wg0 table 100`，证明发包确实进了隧道而不是走物理网卡；这里的 `via 10.0.0.1` 来自 wg0 的对端地址，`src 10.0.0.2` 是本端 Address，若这一行仍显示物理网卡，说明策略路由未生效，应回查 `ip rule` 优先级是否与主表冲突（排障见 08-03、08-04）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是全流量代理时的「隧道自锁」：若 `AllowedIPs = 0.0.0.0/0` 却不做策略路由，发往服务端 endpoint 的 UDP 封装包本身也会被目的地址匹配进隧道，形成永远建不起来的环路。解决方法是像上例那样用 fwmark + 独立路由表，或 `wg-quick` 默认策略，把封装流量排除在外（参数见 04-03）。第二个陷阱是双栈遗漏：只写 `0.0.0.0/0` 不写 `::/0`，IPv6 流量会绕过隧道泄露真实地址，务必成对配置。
+
+第三个陷阱是掩码写错。AllowedIPs 是「网段 + 掩码」的完整前缀，`/32`（或 `/128`）表示单主机，写成过宽的掩码会把本不该走隧道的流量送进去，写成过窄则导致对端回包被源校验丢弃；`allowedips.c` 的 `add` 会校验 `cidr > bits` 返回 `-EINVAL`，但掩码「合法却错误」不会报错，只能靠 `wg show allowed-ips` 逐行核对。第四个陷阱是忽略入站源校验：客户端若期望收到来自 `192.168.1.0/24` 的流量，却没把该网段写进 AllowedIPs，服务端回包会被 `wg_allowedips_lookup_src` 判定为不属于该 peer 而丢弃，表现为「能发不能收」。
+
+第五个陷阱是 NAT 位置搞反：MASQUERADE 应做在「隧道出口后面的公网接口」上（服务端 `eth0`），客户端通常不需要对 wg0 做 NAT；把 NAT 加错位置会造成回包路径不对称。第六个陷阱是 MTU 与 MSS：UDP 封装带来额外开销，若上层 MSS/MTU 未相应下调，会出现「小包通、大包不通」的假性故障，需在目标机型实测调整（调优见 08-02）。第七个陷阱是 `rp_filter` 严格模式导致隧道内网地址被反向路径过滤丢弃，需在接口上放宽（排障见 08-03）。
+
+最佳实践归纳为四条：先用最精确分流起步（`AllowedIPs` 只写必要网段），确认隧道打通后再按需扩大；全流量场景一定配合 fwmark + 独立路由表，并用 `ip route get ... mark` 验证；多 peer 时用最长前缀原理规划网段，让具体路由优先于兜底路由；NAT、转发与防火墙规则纳入版本化配置，变更时同步核对 `wg show allowed-ips`、策略路由与 NAT 三处状态。所有数值（吞吐、pps、握手速率）需在目标机型实测，本篇不给绝对值（基准见 08-01）。
+
+补充一个在站点互联中经常遇到的规划问题：当一台机器同时作为多个分支的汇聚节点时，每个分支 peer 的 AllowedIPs 应写成该分支的内网网段，而不是 `0.0.0.0/0`；否则所有分支流量都会被前缀相同的先匹配 peer 吸走，后加入的 peer 几乎收不到包。汇聚节点自身若要访问互联网，应另设一个出口 peer 并只用兜底前缀，依赖最长前缀匹配让各分支的具体网段优先命中。这种规划把选路决策完全交给内核 trie，通常无需额外的策略路由规则，但前提是各分支网段互不重叠且掩码规划清晰（多 peer 站点互联实例见 03-06）。
+
+### 7. 小结与延伸阅读
+
+本篇把 AllowedIPs 从源码语义落到部署：出站由 `wg_allowedips_lookup_dst` 按目的地址查 trie 选 peer，入站由 `wg_allowedips_lookup_src` 按源地址校验归属，二者共用 `root4`/`root6` 两棵树并按最长前缀匹配；uapi 层由 `WGALLOWEDIP_A_FAMILY`、`WGALLOWEDIP_A_IPADDR`、`WGALLOWEDIP_A_CIDR_MASK` 描述条目。部署上，精确分流靠主路由表、全流量代理靠 fwmark + 策略路由避免自锁、服务端靠 `ip_forward` + MASQUERADE 完成出口地址转换；双栈要同时写 `0.0.0.0/0` 与 `::/0`，掩码与源校验是最易出错的两处。
+
+延伸阅读按三条线走：想透彻理解 trie 的查找与压缩算法读 06-07，想看逐字段定义去 05 册，想看参数全集去 04 册，想看模块职责去 07 册，排障与调优去 08 册。跨册随查按（字段见 05-04 ｜ 参数见 04-03 ｜ 原理见 06-07 ｜ 模块见 07-04）执行：结构体逐字段去 05、参数与 wg-quick 选项去 04 、查找与路由决策原理去 06、allowedips.c 模块职责去 07、运维场景与基准去 08。凡本篇标注「需对照实际版本核验」的字段、命令选项与输出格式，均以 `_wglinux_build/upstream_src/` 下对应文件为准；策略路由与 NAT 属 Linux 通用网络栈设施，具体行为以目标系统内核版本与工具版本核验，本套资料不编造未核验的路径与取值。至此，03 册的密钥生成（03-03）与路由部署（03-04）两篇闭环：前者回答「身份怎么建立」，后者回答「流量怎么选路」。

@@ -1,0 +1,400 @@
+## 08-03 常见故障分类与诊断决策树
+
+### 1. 背景与动机
+
+WireGuard Linux 的排障之所以需要单独成册，根源在于它的一个设计取舍：这是一个「静默失败」（fail-silently）的协议实现。与 TLS、IKE 一类会向对端回送明确错误通知的协议不同，WireGuard 在认证失败、密钥不匹配、源地址不被允许、抗重放判定失败时，几乎从不对端发送任何错误响应，而是直接把报文丢弃。这种设计换来了极小的攻击面与协议复杂度，却把可观测性的负担完全推给了运维者——你很少能从一个错误码里读到「公钥写错了」，更多时候只能看到「什么都没发生」。本篇要解决的正是这个问题：把散落在内核源码各处的丢弃分支、限速触发点、握手状态机与用户态可观测信号串起来，建立一套从现象到根因的分类方法与诊断决策树。
+
+第二个背景事实是运行形态。WireGuard Linux 的数据面在内核态，以标准 `net_device` 形态接入协议栈，`drivers/net/wireguard/main.c` 的 `wg_mod_init` 加载后并不派生任何独立的用户态守护进程。这意味着排障时不能用「进程是否存活」作为判断依据——`ps` 里找不到名为 WireGuard 的进程是正常现象。故障只能表现为三类可观测信号：net_device 的状态与统计计数器、通过 netlink 通用族 `WG_CMD_GET_DEVICE` 拉取并由 `wg show` 渲染的属性、以及开启动态调试后的内核日志。理解「内核态实现没有进程可看，只有状态可查」，是进入本篇全部排查流程的心理前提。
+
+第三个背景事实是可观测信号的分布并不均匀。握手是否成功、最近一次握手距今多久、累计收发字节数，这几项由 `wg show` 直接给出，是最高价值的信号；而报文为什么被丢、被谁丢，则分布在 `receive.c` 的若干 `dishonest_*` 标签、`cookie.c` 的 MAC 状态机、`ratelimiter.c` 的令牌桶，以及 `send.c` / `device.c` 的若干返回码里，默认都不打印，需要动态调试或抓包才能看到。本篇的动机就是把这两层信号对应的源码位置讲清楚，让读者在看到某个现象时知道「该去看哪一行」。
+
+本篇的口径声明如下：所有字段、函数、常量、命令选项均以本套资料的版本基准（`wireguard-linux` stable 分支内核驱动快照 + `wireguard-tools` 1.0.20260223）为准，源码路径相对 `_wglinux_build/upstream_src/wireguard-linux-src/` 与 `_wglinux_build/upstream_src/wireguard-tools/`。错误码的完整清单与语义归 04 册（完整参数与错误码见 04-08），结构体逐字段定义归 05 册，机制与调用链归 06 册，目录级模块职责归 07 册。本篇作为运维与排障的唯一权威源，只负责「分类、决策树、排查命令、判读方法」，不重复上述四册的细节，凡涉及即写交叉引用。
+
+基于上述背景，本篇把常见故障归纳为五类，它们的区分完全依赖可观测信号而非主观描述：**接口不通**（内核里根本没有 wg0 或接口无法 up）、**握手失败**（接口存在但 `latest handshake` 长期为空或很旧）、**隧道通但无流量**（握手成功但 `transfer` 不增长）、**间歇性断流**（握手与流量都曾正常，随后时通时断）、**吞吐低**（链路可用但速率明显低于预期）。这五类在决策树上对应五条不同分支，根因集合互不重叠，先分类再定位可以显著压缩盲目尝试的范围。
+
+### 2. 核心概念
+
+要读懂本篇的决策树，需要先建立三个核心概念：静默失败的分层、可观测信号的三个层次，以及五类故障的判定标准。
+
+**静默失败的分层。** WireGuard 的「安静」并非全无差别，而是分层发生的。配置面的失败通常是「响」的：`wg set` 遇到非法参数会通过 netlink 返回错误码，例如 net_device 发送路径中 `device.c` 的 `wg_xmit` 在按目的地址查不到 peer 时返回 `-ENOKEY`，或在 endpoint 未配置时返回 `-EDESTADDRREQ`，这些错误会沿 netlink 或 netdev 操作向上传递。握手面与数据面的失败则大多是「哑」的：`noise.c` 的 `wg_noise_handshake_consume_initiation` 在任何一步解密或查表失败时都只是 `goto out` 返回 `NULL`，`receive.c` 收到 `NULL` peer 后仅打印一条 `net_dbg_skb_ratelimited` 调试日志便 `return`；对端收不到任何响应，只会反复重传握手发起消息直至放弃。把「配置面会报错、握手与数据面静默丢弃」这条分界线记牢，就能理解为什么配置错误容易发现而密钥错误难以发现。
+
+**可观测信号的三个层次。** 第一层是 `wg show`，它读取 netlink 属性并渲染：`interface` / `public key` / `listening port` 来自 device 属性，`peer` 段的 `endpoint` / `allowed ips` / `latest handshake` / `transfer` 分别对应 `WGPEER_A_ENDPOINT`、`WGALLOWEDIP_A_*`、`WGPEER_A_LAST_HANDSHAKE_TIME`、`WGPEER_A_RX_BYTES` 与 `WGPEER_A_TX_BYTES`（字段见 05-03）。第二层是 netdev 统计，`ip -s link show wg0` 或 `/proc/net/dev` 能看到 `rx_errors`、`rx_frame_errors`、`rx_length_errors`、`tx_dropped` 等计数，它们对应 `receive.c` 中各 `dishonest_*` 分支调用的 `DEV_STATS_INC`。第三层是内核调试日志与抓包：WireGuard 大量使用 `net_dbg_ratelimited` / `net_dbg_skb_ratelimited` 打印丢弃原因，前提是开启动态调试；抓包则能直接看到 WireGuard 四种消息类型在网线上的实际形态（消息类型常量定义见 06-04）。三层信号从粗到细，排查时遵循「先看 wg show 定类、再看计数器定向、最后用日志与抓包定因」的顺序。
+
+**五类故障的判定标准。** 下表给出本篇的核心分类，判定只依据第一、二层信号，不依赖猜测。
+
+| 故障类别 | `wg show` 关键判据 | netdev 计数器线索 | 首要怀疑对象 | 关键源码位置 |
+|---|---|---|---|---|
+| 接口不通 | `ip link show wg0` 无此接口，或 `wg show` 报无接口 | 无可用计数器 | 内核模块加载、`ip link add`、`set up` | `main.c` 的 `wg_mod_init`、`device.c` 的 `wg_newlink` |
+| 握手失败 | `latest handshake` 为空或远旧，`transfer` 恒为 0 | `rx_errors` 可能增长 | 公钥、endpoint、时钟、cookie/限速 | `noise.c`、`cookie.c`、`ratelimiter.c` |
+| 隧道通但无流量 | 握手正常但 `transfer` 不增长 | 计数器几乎不动 | AllowedIPs、系统路由、策略路由 | `allowedips.c`、`device.c` 的 `wg_xmit` |
+| 间歇性断流 | 握手曾成功，之后时通时断 | `rx_errors` 间歇增长 | NAT 映射超时、keepalive、抗重放 | `timers.c`、`receive.c` 的 `counter_validate` |
+| 吞吐低 | 握手正常、流量持续增长但速率低 | `tx_dropped` / `rx_dropped` 可能增长 | MTU 与分片、GSO、CPU 特性 | `send.c`、`socket.c`、`queueing.h` |
+
+需要说明的是，五类之间并非完全割裂：例如 AllowedIPs 配错在发送侧表现为「隧道通但无流量」（`device.c` 返回 `-ENOKEY`），在接收侧却会因为源地址校验失败落入 `receive.c` 的 `dishonest_packet_peer` 分支而计入 `rx_errors`。同一配置错误在不同方向呈现不同信号，这正是必须以「分类 + 方向」而非单个症状下结论的原因（路由原理见 06-07）。
+
+### 3. 关键数据结构与源码位置
+
+作为运维册，本节只建立「排障关心哪个结构、在哪个文件、逐字段去哪里查」的地图，不展开字段表。需要建立的结构与源码位置分五层，与 01-01 的版本地图一致但视角不同：这里关心的是「哪个结构的状态会体现在哪个观测信号上」。
+
+握手与会话层以 `noise.c` / `noise.h` 为代表，核心是 `noise_handshake` 的状态机与 `noise_keypair` 的收发计数器。`wg_noise_handshake_consume_initiation`（`noise.c` 第 584 行起）的任何一步失败都返回 `NULL`，对应 `receive.c` 第 145 行的 `!peer` 分支；`wg_noise_handshake_consume_response`（第 728 行起）的状态检查 `state != HANDSHAKE_CREATED_INITIATION` 失败则 `goto fail`。这些失败点在 `wg show` 上统一表现为 `latest handshake` 不更新（字段见 05-05，握手状态机原理见 06-02）。
+
+路由与 peer 层以 `allowedips.c`、`peer.c` 为代表。发送侧 `wg_xmit` 在 `device.c` 第 153 行调用 `wg_allowedips_lookup_dst`，失败返回 `-ENOKEY`；接收侧 `receive.c` 第 404 行调用 `wg_allowedips_lookup_src`，返回的 `routed_peer` 与当前 `peer` 不等则跳到 `dishonest_packet_peer`。这两处是「AllowedIPs 配错」在双向上的落点（字段见 05-03、05-04）。
+
+收发与丢弃层以 `receive.c` 为代表，这是排障时最该熟读的文件。`prepare_skb_header`（第 47 行起）在 IP 头、UDP 长度、消息长度任一校验失败时返回 `-EINVAL`；`wg_packet_receive`（第 542 行起）在握手队列超过 `MAX_QUEUED_INCOMING_HANDSHAKES / 2` 或 `ptr_ring` 生产失败时打印 `Dropping handshake packet`；数据面在 `wg_packet_consume_data_done`（第 335 行起）中定义了三个 `dishonest_*` 标签，各自累加不同的 netdev 计数器，详见下表（模块职责见 07-08）。
+
+防护层以 `cookie.c`、`ratelimiter.c` 为代表。`cookie.h` 定义 `enum cookie_mac_state` 四态：`INVALID_MAC`、`VALID_MAC_BUT_NO_COOKIE`、`VALID_MAC_WITH_COOKIE_BUT_RATELIMITED`、`VALID_MAC_WITH_COOKIE`。`receive.c` 第 112 行以 `handshake_queue_len >= MAX_QUEUED_INCOMING_HANDSHAKES / 8`（即 4096/8 = 512）判定 `under_load`，负载中且仅有合法 MAC1 而无 cookie 的握手包会被回复 cookie 消息（`wg_packet_send_handshake_cookie`），而非进入正常握手消费；cookie 中又带 ratelimiter 检查 `wg_ratelimiter_allow`，其令牌桶参数为每秒 20 包、突发 5 包（`ratelimiter.c` 第 34 至 39 行）。这些触发条件直接解释「为什么对端一直握手但本端无反应」（字段见 05-07、05-08，机制见 06-09、06-10）。
+
+时限与分片层以 `messages.h`、`timers.c`、`send.c` 为代表。`messages.h` 定义 `REKEY_TIMEOUT = 5`、`REKEY_AFTER_TIME = 120`、`REJECT_AFTER_TIME = 180`、`KEEPALIVE_TIMEOUT = 10`、`MAX_TIMER_HANDSHAKES = 90 / REKEY_TIMEOUT`（即 18 次）、`MAX_QUEUED_INCOMING_HANDSHAKES = 4096`。`timers.c` 的 `wg_expired_retransmit_handshake` 在重传超过上限后打印 `did not complete after %d attempts, giving up` 并清空待发报文。这些常量是判断「多久算握手超时」和「断流是否由 NAT 映射过期引起」的量化依据（原理见 06-11）。
+
+下表把 `receive.c` 中三个 `dishonest_*` 丢弃分支的精确落点收拢，这是把计数器读数翻译成根因的关键对照表。
+
+| 丢弃标签 | 触发条件（源码行） | 累加的计数器 | 调试日志关键词 | 常见根因 |
+|---|---|---|---|---|
+| `dishonest_packet_peer` | `wg_allowedips_lookup_src` 结果不等于来源 peer（第 404–409 行） | `rx_errors`、`rx_frame_errors` | `Packet has unallowed src IP` | 对端 AllowedIPs 含本不应出现的源段 |
+| `dishonest_packet_type` | 解封后既非 IPv4 也非 IPv6（第 369–373、394–395 行） | `rx_errors`、`rx_frame_errors` | `neither ipv4 nor ipv6` | 对端封装了非 IP 负载或数据错乱 |
+| `dishonest_packet_size` | IP 头长度字段与实际 skb 长度矛盾（第 386–399 行） | `rx_errors`、`rx_length_errors` | `incorrect size` | MTU 不匹配、分片重组异常 |
+
+### 4. 关键流程与调用链
+
+诊断流程本身也是一条调用链，只是它跨越了观测工具与内核两条路径。理解这两条路径如何汇合，才能明白每一条排查命令到底在读什么。
+
+**观测链（用户态向下）。** `wg show wg0` 经 `wireguard-tools/src/ipc-linux.h` 的 `mnlg_socket_open(WG_GENL_NAME, WG_GENL_VERSION)` 打开到 `wireguard` 通用族的 netlink 套接字，发送 `WG_CMD_GET_DEVICE`；内核在 `main.c` 注册的 netlink 回调中把 `wg_device` 与各 `wg_peer` 的属性序列化回用户态，工具再渲染成人类可读文本。因此 `wg show` 的每一行都是某个内核属性的快照，它没有「计算」也没有「推断」，读到的就是此刻内核里的值（netlink 原理见 06-14，命令全集见 04-01）。这也解释了为什么 `wg show` 在接口未 up 或私钥未设置时字段会缺失——那些属性本就没有被写入。
+
+**握手链（报文中向内）。** 发起方 `send.c` 构造 `MESSAGE_HANDSHAKE_INITIATION` 经 UDP socket 发出；接收方 `socket.c` 收到后进入 `receive.c` 的 `wg_packet_receive`，经 `prepare_skb_header` 校验后入握手队列；工作线程 `wg_packet_handshake_receive_worker` 调用 `wg_receive_handshake_packet`，先做 cookie 校验，再由 `wg_noise_handshake_consume_initiation` 尝试解密静态公钥字段并查 peer 哈希表。查不到 peer（公钥不匹配或未配置）即返回 `NULL`，在日志里表现为 `Invalid handshake initiation from ...`。响应方向同理，`wg_noise_handshake_consume_response` 若状态不是 `HANDSHAKE_CREATED_INITIATION` 或解密 `encrypted_nothing` 失败即 `goto fail`，对端 `latest handshake` 始终不更新。这条链上任何一环出问题，现象都收敛为同一个：握手不建立（完整握手时序见 06-03）。
+
+**数据链（解密后校验）。** 数据包经 `wg_packet_consume_data` 用 `key_idx` 在 index 哈希表查 keypair，入解密队列；`wg_packet_decrypt_worker` 调用 `decrypt_packet` 做 ChaCha20-Poly1305 解密，失败置为 `PACKET_STATE_DEAD`；`wg_packet_rx_poll` 中 `counter_validate` 做 RFC6479 抗重放检查，失败打印 `Packet has invalid nonce`；通过的包进入 `wg_packet_consume_data_done`，再做源地址校验与协议类型校验，任一不符落入对应 `dishonest_*` 分支。这条链上的丢弃分别对应「间歇性断流」（抗重放判定）与「隧道通但无流量」（地址校验），落点均可由计数器与动态调试日志定位。
+
+把上述三条链与五类故障的判定信号合起来，得到图 08-03-01 的诊断决策树。使用时从顶部「观察现象」开始，按每一步的判据只走一条分支，走到叶子节点即得到首查对象，再回第 5 节取对应命令。
+
+:::figure id=08-03-01 | name=WireGuard 五类故障诊断决策树 | dir=TD
+node d1 "观察现象<br/>wg show 与 ip -s link" blue
+node d2 "接口不通<br/>ip link 无 wg0" gray
+node d3 "握手失败<br/>latest handshake 空" red
+node d4 "隧道通但无流量<br/>transfer 不增长" amber
+node d5 "间歇性断流<br/>时通时断" purple
+node d6 "吞吐低<br/>速率低于预期" teal
+node d7 "查模块加载<br/>lsmod / dmesg" gray
+node d8 "查公钥/endpoint<br/>时钟/抓包/限速" red
+node d9 "查 AllowedIPs<br/>与系统路由" amber
+node d10 "查 keepalive<br/>与抗重放 nonce" purple
+node d11 "查 MTU/GSO<br/>与 CPU 特性" teal
+edge d1 -> d2 "无接口"
+edge d1 -> d3 "握手为空"
+edge d1 -> d4 "握手正常"
+edge d1 -> d5 "曾通后断"
+edge d1 -> d6 "速率低"
+edge d2 -> d7
+edge d3 -> d8
+edge d4 -> d9
+edge d5 -> d10
+edge d6 -> d11
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：顶端是「观察现象 wg show 与 ip -s link」，它分出五条分支——「接口不通 ip link 无 wg0」首查「查模块加载 lsmod / dmesg」；「握手失败 latest handshake 空」首查「查公钥/endpoint 时钟/抓包/限速」；「隧道通但无流量 transfer 不增长」首查「查 AllowedIPs 与系统路由」；「间歇性断流 时通时断」首查「查 keepalive 与抗重放 nonce」；「吞吐低 速率低于预期」首查「查 MTU/GSO 与 CPU 特性」。每条分支的叶子节点就是该类故障的首要排查对象。
+
+### 5. 配置/命令/代码实例
+
+本节给出一套可直接照抄的分层排查命令序列，并用一段带示例输出的判读演示如何把 `wg show` 的每一行翻译成内核状态。先给出按决策树取用的命令清单：
+
+```bash
+# 第 0 步：确认接口与模块存在
+lsmod | grep wireguard
+ip link show wg0
+wg show wg0
+
+# 第 1 步：读 netdev 统计，定位丢弃方向
+ip -s link show wg0
+
+# 第 2 步：开启动态调试，让 net_dbg_ratelimited 可见
+echo 'module wireguard +p' > /sys/kernel/debug/dynamic_debug/control
+# 随后复现故障，再读内核日志（按需替换日志入口）
+dmesg -T | grep -i wireguard
+
+# 第 3 步：抓包比对四种 Noise 消息类型（type=1/2/3/4）
+tcpdump -ni any udp port 51820 -vv -w /tmp/wg.pcap
+```
+
+上面这组命令的层次与第 4 节三条链一一对应：第 0 步读 netlink 属性与 netdev 存在性，第 1 步读 netdev 计数器，第 2 步打开 `net_dbg_ratelimited` 的输出开关，第 3 步在 wireguard-tools 之外直接观察 UDP 承载的报文（消息类型 1 为 handshake initiation、2 为 response、3 为 cookie、4 为 data，常量见 `messages.h`）。需要提醒的是，动态调试开关与日志入口在不同发行版上位置不同，`/sys/kernel/debug/debug` 未必挂载，`dmesg` 也可能受 `dmesg_restrict` 限制；抓包文件需要用 `tshark` 或 Wireshark 进一步解析其加密字段，具体格式需对照实际抓包工具版本核验（参数全集见 04-01、调试构建见 02-05）。
+
+下面给出一次典型「握手失败」现场的命令与输出，并做逐行判读。
+
+```bash
+wg show wg0
+ip -s link show wg0 | grep -E 'RX|errors|dropped'
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+interface: wg0
+  public key: 9X3...(本端公钥省略)
+  private key: (hidden)
+  listening port: 51820
+peer: A1b...(对端公钥省略)
+  endpoint: 203.0.113.9:51820
+  allowed ips: 10.0.0.2/32
+  latest handshake: 4 minutes ago
+  transfer: 0 B received, 148 B sent
+RX:  bytes packets errors dropped  missed mcast
+     0      0      7      0       0     0
+```
+
+逐行判读如下。第一行 `interface: wg0` 来自 `WG_CMD_GET_DEVICE` 返回的 `WGDEVICE_A_IFNAME`，确认查询命中正确设备；多接口环境下若这里不是预期接口，先解决选错对象的问题。第二行 `public key` 对应 `WGDEVICE_A_PUBLIC_KEY`，是本端私钥经 Curve25519 派生的结果，发给对端的必须是它；若对端配置的公钥与此不符，握手发起消息中的 `encrypted_static` 字段将无法被本端正确解密。第三行 `private key: (hidden)` 是工具的刻意保护，不参与判读，真实私钥仍在内核的 `WGDEVICE_A_PRIVATE_KEY` 中。第四行 `listening port: 51820` 对应 `WGDEVICE_A_LISTEN_PORT`；端口存在说明私钥已设置且接口曾 up，可排除「未配置私钥」这一类原因。第五行 `peer:` 对应 `WGPEER_A_PUBLIC_KEY`，第六行 `endpoint` 对应 `WGPEER_A_ENDPOINT`，此处有值说明 peer 配置存在，但要注意它可能是动态学习到的地址而非配置值；endpoint 不可达是握手失败的常见原因。第七行 `allowed ips` 对应 `WGALLOWEDIP_A_IPADDR` 与 `WGALLOWEDIP_A_CIDR_MASK`，掩码写错会让本端在找不到匹配目的地址时于 `wg_xmit` 返回 `-ENOKEY`。第八行 `latest handshake: 4 minutes ago` 对应 `WGPEER_A_LAST_HANDSHAKE_TIME`，这是本例的核心异常——本端曾成功握手（否则会显示为空），但已 4 分钟未刷新，说明会话过期后重握手未成功，应优先怀疑 endpoint 可达性、对端配置或 NAT 映射（握手时序见 06-03）。第九行 `transfer: 0 B received, 148 B sent` 对应 `WGPEER_A_RX_BYTES` / `WGPEER_A_TX_BYTES`：只发出 148 字节而未收到任何字节，正好是一次握手发起消息的大小量级，说明本端一直在发握手包但收不到响应，故障方向指向「对端未回复」或「回复在路上被丢弃」。第十行是 netdev 统计，`errors 7` 说明已有 7 个报文被丢弃，若动态调试已开启，`dmesg` 中会出现 `Invalid handshake initiation` 或 `Dropping handshake packet` 之一：前者指向公钥/时间戳校验失败（`noise.c` 的 `wg_noise_handshake_consume_initiation`），后者指向握手队列压力或 `prepare_skb_header` 校验失败（`receive.c`）。把这两条日志与计数器的增长时机对齐，即可把根因收敛到具体分支。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是「只看接口 up 就认为隧道可用」。`ip link set wg0 up` 只把 net_device 置为运行状态，既不保证私钥已设置，也不保证握手成立。判断隧道可用的唯一可靠依据是 `wg show` 中 `latest handshake` 持续刷新且 `transfer` 双向增长；`latest handshake` 长期为空就必须按握手失败分支继续排查，这与接口是否 up 无关（部署验证见 03-01）。
+
+第二个陷阱是把「WireGuard 静默」误解为「无法定位」。静默只意味着对端收不到错误响应，本端内核的丢弃原因仍可通过动态调试与计数器还原。`receive.c`、`noise.c`、`cookie.c` 在每条丢弃路径上都留有 `net_dbg_*` 日志，只是默认不输出；不去开动态调试就断言「没有任何线索」，等于主动放弃了最直接的证据。当然，动态调试开启后日志量可能很大，务必配合 `ratelimited` 特性与 `grep` 过滤，长期开启需评估开销（调试方法见 02-05）。
+
+第三个陷阱是混淆配置面错误码与数据面静默丢弃。像 `-ENOKEY`、`-EDESTADDRREQ`、`-EINVAL` 这类返回码出现在 `wg set` 的回显或 `dmesg` 中时，是配置或发送路径的明确信号，其完整语义归 04 册（错误码全集见 04-08）；而 `dishonest_packet_peer` 一类丢弃不会向用户态返回任何错误码，只能在计数器与调试日志里看到。把两类信号混为一谈，常见后果是拿着 `-ENOKEY` 去抓包，或在计数器已经增长时仍反复检查配置文件语法。
+
+第四个陷阱是忽略 cookie 与 ratelimiter 造成的「假握手失败」。当本端握手队列深度达到 `MAX_QUEUED_INCOMING_HANDSHAKES / 8`（512）时，`receive.c` 进入 `under_load` 状态，此后不带有效 cookie 的合法握手包会被回复 cookie 消息而非正常处理；带 cookie 的包还要过每秒 20 包、突发 5 包的 ratelimiter。在大量 peer 同时重握手或遭受泛洪时，正常 peer 也可能被卷入，表现为握手迟迟不建立。判据是抓包中出现 `type=3`（cookie）消息且 `latest handshake` 不刷新；这类问题不能靠改密钥解决，而应从降低握手风暴或缓解泛洪入手（机制见 06-09、06-10）。
+
+第五个陷阱是拿绝对性能数字当作吞吐故障的判据。吞吐是否「低」只能在同机型、同包长、同并发下与基准对比后判断，脱离测试条件的数字没有意义（基准方法见 08-01，调优参数见 08-02）。
+
+最佳实践可归纳为一条纪律与一套顺序。一条纪律是「一次只改一个变量」：WireGuard 的静默特性使得同时改动公钥、AllowedIPs、路由、MTU 后无法判断哪一项生效，每次只调整一个参数并复测 `wg show` 与计数器。一套顺序是「先分类、再定向、后定因」：先用 `wg show` 把现象归入五类之一，再用 `ip -s link` 判断丢弃发生在哪个方向，最后用动态调试日志或抓包把根因落到具体源码分支。按此顺序，绝大多数故障能在不改动任何配置的前提下先被准确定位，再进入修复（具体案例见 08-04）。
+
+### 7. 小结与延伸阅读
+
+本篇建立了 WireGuard Linux 排障的分类框架与诊断决策树：利用「配置面会返回错误码、握手与数据面静默丢弃」这一分层事实，把可观测信号划分为 `wg show` 属性、netdev 计数器、动态调试日志与抓包三个层次，并据此把常见故障归纳为接口不通、握手失败、隧道通但无流量、间歇性断流、吞吐低五类。诊断决策树以 `latest handshake` 与 `transfer` 为第一分叉点，五条分支分别首查模块加载、公钥与 endpoint、AllowedIPs 与路由、keepalive 与抗重放、MTU 与 CPU 特性。`receive.c` 的 `dishonest_packet_peer` / `dishonest_packet_type` / `dishonest_packet_size` 三个丢弃分支各自累加特定计数器，`cookie.c` 的四态 MAC 判定与 `ratelimiter.c` 的令牌桶参数，是把计数器读数翻译成根因的核心对照表。
+
+延伸阅读建议按四条线走：需要逐字段确认某个属性含义时读 05 册（`noise_handshake`、`wg_peer`、`wg_allowedips` 等字段定义），需要完整错误码与命令参数时读 04 册，需要理解握手状态机、抗重放与 cookie 机制时读 06 册，需要确认某段逻辑属于哪个源文件时读 07 册。本篇作为运维与排障的唯一权威源，只提供分类、决策树与判读方法，不重复上述各册细节。跨册随查按（字段见 05-03 ｜ 参数见 04-08 ｜ 原理见 06-09 ｜ 模块见 07-08）执行：结构体逐字段去 05、参数与错误码全集去 04、机制与调用链去 06、目录级模块能力去 07、运维场景与基准去 08。凡本篇标注「需对照实际版本核验」的命令输出格式、日志入口与抓包工具行为，均以目标系统实际版本为准，本套资料不编造未核验的路径与取值。
+
+## 08-04 故障案例库：握手失败到吞吐骤降
+
+### 1. 背景与动机
+
+决策树给出的是方法，案例库给出的是经验。本篇把 08-03 建立的五类故障落到五个可复现的具体场景上，每个场景都按「现象—根因—排查命令—修复」四段展开，让读者能把抽象的分类信号对应到真实现场。五个案例依次覆盖从完全不通到性能退化的全谱：案例一是公钥与私钥不匹配导致握手失败，属于「握手失败」类；案例二是 AllowedIPs 配错导致隧道通但无流量，属于「隧道通但无流量」类；案例三是 NAT 或防火墙阻断 UDP 导致握手超时，同属「握手失败」类但根因截然不同；案例四是 MTU 过大导致分片丢失、吞吐骤降，属于「吞吐低」类；案例五是时钟偏差导致握手被判为重放攻击，是「握手失败」类中隐蔽性最强的一种。
+
+贯穿全部案例的核心线索是 WireGuard 的静默失败特性：无论根因是密钥、地址、路径还是时钟，对端几乎收不到任何错误响应，只表现为「握手建立不起来」或「有握手但没流量」这类同质化现象。因此案例之间的区分不能靠「看错误提示」，而要靠两个手段：一是把 `wg show` 的字段与 netdev 计数器按 08-03 的判读方法翻译成内核状态，二是抓包比对 Noise 消息的交互序列。后者尤其关键——WireGuard 在网线上只跑四种消息（`MESSAGE_HANDSHAKE_INITIATION` = 1、`MESSAGE_HANDSHAKE_RESPONSE` = 2、`MESSAGE_HANDSHAKE_COOKIE` = 3、`MESSAGE_DATA` = 4，定义见 `messages.h`），通过比较「我发出了 type=1 但收不到 type=2」「收到了 type=2 但随后没有 data」「只收到 type=3」等序列差异，就能把静默失败还原成一条可推理的协商过程（消息格式见 06-04）。
+
+本篇的口径与 08-03 一致：结论以 `wireguard-linux` stable 分支内核驱动快照与 `wireguard-tools` 1.0.20260223 为准，命令输出格式、日志入口、抓包工具解析能力均标注「需对照实际版本核验」。错误码语义归 04 册、字段定义归 05 册、机制原理归 06 册、模块职责归 07 册，本篇只做运维视角的现象还原与修复动作，涉及即交叉引用。文中所有密钥串、地址、端口均为示例占位，不对应任何真实网络（密钥生成与分发流程见 03-03，接口地址与路由配置见 03-04）。
+
+### 2. 核心概念
+
+读懂案例需要先抓住三个概念：静默失败的三种典型表现、Noise 消息序列作为「对话记录」的判读方法，以及故障定位中方向与层次的对应关系。
+
+**静默失败的三种表现。** 第一种是「发出无回应」：本端持续发送握手发起消息，但收不到响应，`transfer` 只增发送字节，`latest handshake` 为空。第二种是「回应不被接受」：本端收到了响应消息，但解密或状态检查失败，握手仍未建立，这类失败最容易被误判为网络不通，实则报文已经到达。第三种是「 handshake 成功但数据不通」：握手已刷新，但数据包因源地址校验或路由问题被丢弃，`transfer` 的一方或双方不增长。三种表现对应不同的抓包序列，是案例分类的底层依据。
+
+**Noise 消息序列作为对话记录。** 一次成功握手在抓包上呈现清晰的请求—响应模式：发起方发 `type=1`（handshake initiation），响应方回 `type=2`（handshake response），随后双方用 `type=4`（data）传输数据或 keepalive；若响应方处于负载压力，会用 `type=3`（cookie）要求发起方先取 cookie 再重试。把这段序列当对话看，「只有 1 没有 2」说明请求没到对端或没被接受，「有 1 有 2 却没有 4」说明会话建立后数据面有问题，「出现 3」说明触发了 cookie 防护。这种判读不依赖任何解密，只看消息类型与方向即可完成，是静默协议排障最有力的工具（cookie 机制见 06-09）。
+
+**方向与层次的对应关系。** 每个案例都要同时回答「哪个方向」和「哪一层」。方向指发送侧还是接收侧：例如 AllowedIPs 配错在发送侧表现为 `wg_xmit` 返回 `-ENOKEY`（`device.c` 第 155 行），在接收侧表现为 `receive.c` 的 `dishonest_packet_peer` 丢弃并计入 `rx_errors`。层次指配置面、握手面还是数据面：配置面错误通过 netlink 回显，握手与数据面错误只能靠计数器与日志。把方向、层次与消息序列三者对齐，才能避免「看到握手失败就改密钥」这类定向错误。
+
+下面这张表把五个案例的核心指纹收拢，可作为现场快速比对的速查卡。
+
+| 案例 | 现象指纹 | `wg show` 关键信号 | 抓包序列指纹 | 主要故障类别 |
+|---|---|---|---|---|
+| 一 密钥不匹配 | 双方接口都 up，`latest handshake` 始终空 | 两端 `public key` 与对方配置不符 | 有 type=1，无 type=2 | 握手失败 |
+| 二 AllowedIPs 配错 | 握手成功但 ping 不通 | `latest handshake` 正常，`transfer` 近乎不动 | 有 type=1/2，几乎无 type=4 | 隧道通但无流量 |
+| 三 UDP 被阻断 | 曾握手成功，过期后再也起不来 | `latest handshake` 很旧，仅发不收 | 持续 type=1，无 type=2 | 握手失败 |
+| 四 MTU 过大 | 小包通、大包不通，吞吐骤降 | 握手正常，计数器有 `errors`/`dropped` | 大包 type=4 发出后丢，小包正常 | 吞吐低 |
+| 五 时钟偏差 | 对端时间大幅偏离，握手反复失败 | `latest handshake` 空或频繁回退 | 有 type=1，type=2 偶发后立刻失效 | 握手失败 |
+
+### 3. 关键数据结构与源码位置
+
+案例的根因都要落到具体源码，否则修复动作就只是「试出来的偏方」。这里按案例把关键结构、函数与常量列成地图，逐字段定义去 05 册，机制去 06 册，目录职责去 07 册。
+
+案例一与案例五落在握手与会话层。案例一的失败点在 `noise.c` 的 `wg_noise_handshake_consume_initiation`（第 584 行起）：`message_decrypt(s, src->encrypted_static, ...)`（第 612 行）解密对端静态公钥字段，若本端私钥与对端所用公钥不构成匹配曲线对，解密失败即 `goto out` 返回 `NULL`；响应方向的 `wg_noise_handshake_consume_response`（第 728 行起）在 `message_decrypt(NULL, src->encrypted_nothing, ...)`（第 780 行）失败时 `goto fail`。案例五落在同一函数的时间戳检查：`tai64n_now(timestamp)`（第 565 行）生成 TAI64N 时间戳并加密进发起消息，接收侧第 633 行用 `memcmp(t, handshake->latest_timestamp, NOISE_TIMESTAMP_LEN) <= 0` 判定 `replay_attack`，若对端时钟显著倒退，时间戳不大于已记录值，握手被当作重放而丢弃（字段见 05-05，握手状态机原理见 06-02、密钥时序见 06-03）。
+
+案例二落在路由与 peer 层。发送侧 `device.c` 的 `wg_xmit` 在第 153 行调用 `wg_allowedips_lookup_dst`，找不到匹配 peer 返回 `-ENOKEY` 并打印 `No peer has allowed IPs matching ...`；接收侧 `receive.c` 第 404 行调用 `wg_allowedips_lookup_src`，若来源地址不属于该 peer 的 AllowedIPs，`routed_peer != peer` 成立，跳到 `dishonest_packet_peer` 累加 `rx_errors` 与 `rx_frame_errors`（字段见 05-03、05-04，路由原理见 06-07）。
+
+案例三落在时限与 socket 层。`messages.h` 定义 `REKEY_TIMEOUT = 5`、`MAX_TIMER_HANDSHAKES = 90 / REKEY_TIMEOUT`（18）、`REJECT_AFTER_TIME = 180`、`KEEPALIVE_TIMEOUT = 10`；`timers.c` 的 `wg_expired_retransmit_handshake`（第 41 行起）在重传超过上限时打印 `did not complete after %d attempts, giving up` 并清空待发报文，注释明确写出「没有 keypair 就丢包且不再重试」。endpoint 的源地址学习在 `wg_socket_set_peer_endpoint_from_skb`（`receive.c` 第 150、172 行）与 `wg_socket_clear_peer_endpoint_src`（重传时清除），NAT 映射过期后若没有 persistent keepalive 维持，endpoint 会失效（原理见 06-11、06-12）。
+
+案例四落在分片与发包层。`send.c` 的 `calculate_skb_padding`（第 141 行起）用 `PACKET_CB(skb)->mtu` 与 `MESSAGE_PADDING_MULTIPLE`（16）计算填充，`encrypt_packet`（第 162 行起）组装密文，`PACKET_CB(skb)->mtu = skb->dev->mtu`（第 232 行）说明 MTU 取自 wg0 接口的 MTU；封装后 UDP 报文若超过路径 MTU 且 DF 位置位，会在物理网络中被丢弃，而 `receive.c` 的 `dishonest_packet_size` 分支（第 428 行）累加 `rx_length_errors`，是分片异常在 counters 上的落点（调优参数见 08-02，收发模块见 07-07）。
+
+案例五的机制已在案例一中点出，补充常量：`NOISE_TIMESTAMP_LEN = sizeof(u64) + sizeof(u32)`（`messages.h` 第 20 行），时间戳由 64 位秒加 32 位纳秒构成，对端时钟偏移超过合理范围即可触发重放判定或使会话被提前视为过期（原理见 06-03）。
+
+### 4. 关键流程与调用链
+
+五个案例的排查都遵循 08-03 的「先分类、再定向、后定因」顺序，落到调用链上就是三条环环相扣的路径。
+
+第一条是握手协商链。发起方 `send.c` 构造 `MESSAGE_HANDSHAKE_INITIATION`（含 `encrypted_static` 与 `encrypted_timestamp`），经 UDP socket 发出；响应方 `socket.c` 收到后由 `receive.c` 的 `wg_packet_receive` 做头部校验并入握手队列，工作线程经 cookie 校验后调用 `wg_noise_handshake_consume_initiation` 尝试解密与查 peer 表，成功则构造 `MESSAGE_HANDSHAKE_RESPONSE` 返回；发起方收到响应后由 `wg_noise_handshake_consume_response` 验证并调用 `wg_noise_handshake_begin_session` 派生会话密钥。案例一、三、五的失败点都在这一段，但位置不同：案例一在静态字段解密，案例三在报文根本没到，案例五在时间戳比较。抓包序列正是这条链的外在投影（完整握手时序见 06-02、06-03）。
+
+第二条是数据封装链。出站包按路由交给 wg0 的 `ndo_start_xmit`，`wg_xmit` 查 AllowedIPs 选 peer，无匹配返回 `-ENOKEY`；有 peer 但无 endpoint 返回 `-EDESTADDRREQ`；随后经 `encrypt_packet` 填充加密、UDP 封装发出。入站包经解密、`counter_validate` 抗重放、源地址校验后注入协议栈。案例二在「查 peer」这一步失败，案例四在「封装后报文过路径 MTU」这一步失败，两者的抓包差异是：案例二几乎没有 data 消息，案例四有大 data 消息发出但无对应回包（发送路径见 06-05，接收路径见 06-06）。
+
+第三条是反馈与观测链。配置面的错误沿 netlink 回显到 `wg set`；数据面与握手面的丢弃只在本端内核留下 `net_dbg_*` 日志与 netdev 计数器，需要通过动态调试与 `ip -s link` 读取。五案例 shared 的观测入口是 `wg show` 的 `latest handshake` 与 `transfer` 两行，它们分别对应 `WGPEER_A_LAST_HANDSHAKE_TIME` 和 `WGPEER_A_RX_BYTES` / `WGPEER_A_TX_BYTES`。把三条链按「哪个环节 broke」对齐到五个案例，即得到图 08-04-01 的案例—根因映射。
+
+:::figure id=08-04-01 | name=五个故障案例的协商链落点与根因映射 | dir=LR
+node c1 "五类故障案例" blue
+node c2 "案例一 密钥不匹配" red
+node c3 "案例二 AllowedIPs 配错" amber
+node c4 "案例三 UDP 被阻断" purple
+node c5 "案例四 MTU 过大" teal
+node c6 "案例五 时钟偏差" gray
+node c7 "握手链 静态字段解密" red
+node c8 "数据链 查 peer 选路" amber
+node c9 "握手链 报文可达性" purple
+node c10 "数据链 分片与 MTU" teal
+node c11 "握手链 时间戳比较" gray
+edge c1 -> c2
+edge c1 -> c3
+edge c1 -> c4
+edge c1 -> c5
+edge c1 -> c6
+edge c2 -> c7
+edge c3 -> c8
+edge c4 -> c9
+edge c5 -> c10
+edge c6 -> c11
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：顶端「五类故障案例」分出五个案例节点，每个案例节点再落到具体协商链环节——「案例一 密钥不匹配」落在「握手链 静态字段解密」，「案例二 AllowedIPs 配错」落在「数据链 查 peer 选路」，「案例三 UDP 被阻断」落在「握手链 报文可达性」，「案例四 MTU 过大」落在「数据链 分片与 MTU」，「案例五 时钟偏差」落在「握手链 时间戳比较」。同一类现象（如握手失败）因落点不同，修复动作完全不同。
+
+### 5. 配置/命令/代码实例
+
+本节给出五个案例的完整现场。所有命令需在两端同时观察时，分别标为「本端」与「对端」；示例输出中的密钥与地址均为占位。
+
+**案例一：公钥/私钥不匹配导致握手失败**
+
+现象：两端 `ip link set wg0 up` 都成功，`wg show wg0` 显示接口与 peer 配置齐全，但 `latest handshake` 始终为空或永远停在初次配置时刻，`transfer` 只有发送字节增长。这是典型的静默失败——任何一端都不报告「密钥错了」。
+
+根因：本端配置的私钥派生出的公钥，与对端 `peer` 段里配置的公钥不是一对。发起方用本端私钥与对端公钥做 Curve25519 运算 encrypt static 字段，响应方按 `noise.c` 第 612 行解密该字段失败即返回 `NULL`，`receive.c` 第 145 行只打印 `Invalid handshake initiation` 调试日志后丢弃。对端完全收不到「你的公钥不对」的反馈。
+
+排查命令：先核对两端密钥的派生关系，再用抓包确认消息序列。
+
+```bash
+# 本端：由私钥重新派生公钥并打印
+wg pubkey < /etc/wireguard/privatekey
+
+# 对端：查看它为本端配置的 peer 公钥
+wg show wg0 | grep -A6 'peer:'
+
+# 抓包确认：只有 type=1 没有 type=2 即坐实请求未被接受
+tcpdump -ni any udp port 51820 -vv -c 20
+```
+
+上面三条命令的输出需要交叉比对，下面给出一次现场的命令与输出并逐行判读。
+
+```bash
+wg pubkey < /etc/wireguard/privatekey
+wg show wg0 | grep -E 'public key|latest handshake|transfer'
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+interface: wg0
+  public key: 9X3abc...(=本端私钥派生结果)
+  private key: (hidden)
+  listening port: 51820
+peer: B2q...(对端配置的本端公钥，与上一行不同)
+  endpoint: 203.0.113.9:51820
+  allowed ips: 10.0.0.2/32
+  latest handshake: (never)
+  transfer: 0 B received, 2.87 KiB sent
+```
+
+逐行判读如下。第一行 `interface: wg0` 对应 `WGDEVICE_A_IFNAME`，确认查的是正确接口。第二行 `public key` 是本端私钥经 Curve25519 派生的真实公钥，对应 `WGDEVICE_A_PUBLIC_KEY`，也是本端应当发给对端登记的值。第三行 `private key: (hidden)` 不参与判读。第四行 `listening port` 有值，说明私钥已设置、接口曾 up，排除「未配置密钥」这一伪故障。第五行 `peer:` 后的公钥对应 `WGPEER_A_PUBLIC_KEY`，是本端认为的对端身份；本例要比对的是「对端配置里登记的本端公钥」与这里第二行的派生结果是否一致——示例中对端把本端公钥误写成了另一个值 `B2q...`，这正是根因。第六行 `endpoint` 有值，说明配置齐全，排除「没配 peer」的伪故障。第七行 `allowed ips` 对应 `WGALLOWEDIP_A_IPADDR`，此时它不相关，因为握手尚未建立。第八行 `latest handshake: (never)` 对应 `WGPEER_A_LAST_HANDSHAKE_TIME` 为空，是握手从未成功的直接证据。第九行 `transfer` 中只发不收，字节量级是多次握手发起消息累积，说明本端在反复重试；结合抓包「只见 type=1 不见 type=2」，可把根因收敛到对端 decryption 失败，即公钥配置错误（握手失败分支定位见 08-03）。
+
+修复：把对端 `peer` 的公钥改为本端 `wg pubkey` 的实际输出，用 `wg set wg0 peer <正确公钥> ...` 或修正 `wg0.conf` 后 `wg syncconf wg0 wg0.conf` 热加载，无需重启接口。修复后 `latest handshake` 应在 `REKEY_TIMEOUT`（5 秒）量级内刷新。注意私钥永远不出现在配置文件分发中，只在对端写本端公钥（密钥分发纪律见 03-03）。
+
+**案例二：AllowedIPs 配错导致隧道通但无流量**
+
+现象：握手正常，`latest handshake` 持续刷新，但 `ping 10.0.0.2` 不通，`transfer` 长时间不动。这是「隧道通但没流量」的典型，比握手失败更隐蔽，因为握手成功会给人「链路正常」的错觉。
+
+根因分两支。发送侧：本端 AllowedIPs 未包含目标地址，`wg_xmit` 在 `device.c` 第 153 行 `wg_allowedips_lookup_dst` 返回空，第 155 行返回 `-ENOKEY` 并打印 `No peer has allowed IPs matching ...`，包根本没进隧道。接收侧：对端 AllowedIPs 未包含本端源地址，本端发出的包到达对端后，`receive.c` 第 404 行 `wg_allowedips_lookup_src` 得到的 peer 与来源 peer 不等，落入 `dishonest_packet_peer`，`rx_errors` 增长。
+
+排查命令：
+
+```bash
+# 看本端 AllowedIPs 与路由是否覆盖目标
+wg show wg0 allowed-ips
+ip route get 10.0.0.2
+
+# 看丢弃计数器是否增长（接收侧配错的证据）
+ip -s link show wg0 | grep -E 'errors|frame'
+
+# 开动态调试后复现，观察否定分支日志
+echo 'module wireguard +p' > /sys/kernel/debug/dynamic_debug/control
+dmesg -T | grep -i 'unallowed src\|No peer has allowed'
+```
+
+修复：把目标网段写入发送侧 `allowed-ips`，把本端源地址段写入对端 `allowed-ips`，注意两端是对称的「彼此允许」关系，而非任意一端单方面配置。典型点对点写法是两端各自 `allowed-ips 10.0.0.2/32` 与 `10.0.0.1/32` 互换（配置语义见 04-02，路由部署见 03-04）。若使用 wg-quick，`Address=` 与 `AllowedIPs=` 分工不同，前者配接口地址、后者配路由目标，不可混淆（wg-quick 参数见 04-03）。
+
+**案例三：NAT/防火墙阻断 UDP 导致握手超时**
+
+现象：隧道曾正常工作，某个时刻后 `latest handshake` 停在很旧的时间且不再刷新，`transfer` 只发不收。与案例一的区别是「曾经通过」——说明密钥本身正确，问题出在路径可达性或 endpoint 失效上。
+
+根因：WireGuard 承载在 UDP 上，默认端口 51820（`WGDEVICE_A_LISTEN_PORT`）。若中间防火墙丢弃 UDP、或 NAT 映射在空闲后过期且没有 persistent keepalive 维持，发起方的握手发起消息无法到达对端，或响应回不来。`timers.c` 的 `wg_expired_retransmit_handshake` 每 `REKEY_TIMEOUT + jitter` 重传一次，超过 `MAX_TIMER_HANDSHAKES`（18）后打印 `did not complete after ... attempts, giving up` 并清空待发报文——此后即使路径恢复，用户态也不会自动重新积极尝试，直到有新的数据触发或配置变更。抓包上的指纹是持续出现 type=1 而无 type=2。
+
+排查命令：
+
+```bash
+# 确认监听端口与实际可达性
+wg show wg0 | grep 'listening port'
+ss -lunp | grep 51820
+
+# 从本端直接探测对端 UDP 端口（需对端有响应手段）
+nc -vzu 203.0.113.9 51820
+
+# 抓包看是否只有 out 没有 in
+tcpdump -ni any udp port 51820 -nn -c 30
+```
+
+修复：在防火墙放行 UDP 端口；对 NAT 后的 peer 配置 `PersistentKeepalive = 25`（秒），使其小于常见 NAT 映射超时（30 秒量级），让 keepalive 周期刷新映射（keepalive 原理见 06-11）。修复后可用 `wg set wg0 peer <公钥> endpoint <新地址:端口>` 强制重设 endpoint，触发立即重握手。若对端在多出口 NAT 后，endpoint 应从连接侧主动发起而非双向都配 endpoint（部署实例见 03-06）。
+
+**案例四：MTU 过大导致分片丢失、吞吐骤降**
+
+现象：握手完全正常，小包（如少量 ICMP）能通，但大文件或大包测试时吞吐骤降甚至完全停滞，`transfer` 增长缓慢，`ip -s link` 中 `errors` 或 `dropped` 增长。这是「吞吐低」类中最常见的配置根因。
+
+根因：WireGuard 在原始 IP 包外再封装 UDP 与 Noise 头，开销使实际报文大于内层 MTU。`send.c` 的 `calculate_skb_padding` 以 `PACKET_CB(skb)->mtu`（取 `skb->dev->mtu`，即 wg0 的 MTU）为基准计算填充，封装后报文若超过路径 MTU 且 DF 位不允许分片，会在中间链路被静默丢弃；被对端收到的截断包则可能落入 `receive.c` 的 `dishonest_packet_size`，累加 `rx_length_errors`。结果是「小包通、大包丢」，宏观上表现为吞吐骤降而非完全中断。
+
+排查命令：
+
+```bash
+# 查看 wg0 与底层物理接口的 MTU
+ip link show wg0 | grep mtu
+ip link show eth0 | grep mtu
+
+# 用不同包长探测路径 MTU 黑洞（DF 位固定，逐步减小）
+ping -M do -s 1372 10.0.0.2
+ping -M do -s 1200 10.0.0.2
+
+# 观察长度错误计数
+ip -s link show wg0 | grep -E 'length|errors'
+```
+
+修复：在 wg0 上设置更小的 MTU，典型值是底层链路 MTU 减去 WireGuard 封装开销；例如物理口 1500 时，wg0 设为 1420 或更小是常见起点，具体值需在目标链路上用 `ping -M do` 实测确定（本套资料不给绝对数字，基准方法见 08-01，调优参数见 08-02）。若使用 wg-quick，可在接口配置里写 `MTU = 1420` 固化（参数见 04-03）。同时确认 GSO 相关设置与网卡卸载特性是否匹配，避免软件分片带来额外开销（原理见 06-12、06-13）。
+
+**案例五：时钟偏差导致握手被判为重放攻击**
+
+现象：对端系统时间大幅偏离（如NTP 异常导致倒退数小时），握手反复失败，`latest handshake` 偶发刷新后立刻又变旧，抓包可见 type=1 与偶发 type=2，但连接始终不稳。这是比案例一更隐蔽的一种，因为密钥正确、报文可达，问题出在时间戳语义上。
+
+根因：`send.c` 第 565 行用 `tai64n_now(timestamp)` 生成 TAI64N 时间戳并加密进发起消息；接收侧 `noise.c` 第 633 行用 `memcmp(t, handshake->latest_timestamp, NOISE_TIMESTAMP_LEN) <= 0` 判定 `replay_attack`，只要新时间戳不大于已记录值就丢弃。对端时钟大幅倒退时，其发出的时间戳持续小于本端最后一次记录值，握手被当作重放而拒绝；此外会话密钥的有效期判断也依赖时间，偏差会加速 `REJECT_AFTER_TIME` 到期。需要强调的是，WireGuard 用 TAI64N 是为了单调性，但它假设两端时钟大致同步，这个假设在本案例中不成立。
+
+排查命令：
+
+```bash
+# 比对两端时间（需两端各执行一次）
+date -u +%s
+timedatectl status
+
+# 抓包观察握手是否反复建立又迅速失效
+tcpdump -ni any udp port 51820 -nn -c 30
+
+# 开调试确认重放判定日志
+dmesg -T | grep -i 'replay\|invalid handshake'
+```
+
+修复：用 NTP/ chrony 校准两端时钟，确保时间同步后再重建握手；这是唯一根治手段，改密钥或改 AllowedIPs 都无效（时序原理见 06-03）。修复后可 `wg set` 重新下发 peer 以触发立即重握手，观察 `latest handshake` 稳定刷新。运维上应把时钟同步纳入上线 checklist，避免此类隐蔽故障（上线检查见 08-06，加密原语见 07-12）。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是「同一现象套同一修复」。五个案例中有三个都表现为「握手失败」，但根因分别落在静态字段解密、报文可达性、时间戳比较三个不同环节。看到 `latest handshake` 为空就一律重装密钥，会案例三、五上完全无效。正确做法是先用抓包序列区分「只有 type=1」「有 type=1/2 但无 data」「有 type=3」三类指纹，再选修复路径（决策树见 08-03）。
+
+第二个陷阱是忽略抓包中「响应到达但被拒绝」的情形。运维者常把「没收到回包」等同于「对端没收到请求」，但案例一与案例五中，本端其实可能收到了 type=2，只是本地解密或时间戳检查失败而未建会话。若只在本端抓包，会误判为网络不通；应在两端同时抓包比对，确认请求是否到达、响应是否发出、是否被接受。WireGuard 的静默特性使得「对端内核里发生了什么」只能靠它自己的日志与计数器还原（消息格式见 06-04）。
+
+第三个陷阱是诊断 AllowedIPs 时只看一端。案例二强调过 AllowedIPs 的「双向对称」：发送侧决定包能否进隧道，接收侧决定包能否被接受。只修一侧会出现「能发不能收」或反过来，表现依然是不通。排查时务必在两端分别执行 `wg show wg0 allowed-ips` 与查看 `rx_errors`（路由原理见 06-07）。
+
+第四个陷阱是 MTU 故障被误判为「网络不稳定」。案例四的丢包是确定性的、与包长相关，而非随机抖动。用固定包长从大到小做 `ping -M do` 探测，能清晰定位路径 MTU 黑洞；不要凭「有时快有时慢」的主观感受下结论（调优参数见 08-02）。
+
+第五个陷阱是把示例数字当成普适值。端口 51820、keepalive 25 秒、wg0 MTU 1420、重传 18 次等，都是源码默认值或常见起点，具体部署需在目标环境核验；本套资料不声称任何绝对值适用所有场景（基准方法见 08-01）。所有命令输出格式、日志入口与抓包工具的解析能力均标注「需对照实际版本核验」。
+
+最佳实践是一条三段式纪律：先用 `wg show` 的两个关键行把现象归入 08-03 的五类之一；再用双端抓包比对 Noise 消息序列，把「静默失败」还原成可推理的协商过程；最后才动配置，且每次只改一个变量并复测。修复后统一以 `latest handshake` 持续刷新、`transfer` 双向增长、`ip -s link` 计数器不再增长三项同时成立作为验收标准，缺一不可。
+
+### 7. 小结与延伸阅读
+
+本篇把 08-03 的决策树落到五个具体案例：公钥私钥不匹配（握手链静态字段解密失败）、AllowedIPs 配错（数据链查 peer 或源地址校验失败）、NAT/防火墙阻断 UDP（握手链报文不可达）、MTU 过大（数据链分片丢失）、时钟偏差（握手链时间戳被判重放）。每个案例都用「现象—根因—排查命令—修复」四段还原，并反复强调 WireGuard 的静默失败特性：对端不回错误，定位只能依赖 `wg show` 字段、netdev 计数器、动态调试日志与抓包序列四类证据。五个案例的抓包指纹各不相同——「只有 type=1」「有 1/2 无 4」「出现 type=3」「大包丢失」「type=2 偶发后失效」——这是把同质化现象拆成可区分根因的关键。
+
+延伸阅读建议：需要逐字段确认 `WGPEER_A_LAST_HANDSHAKE_TIME`、 AllowedIPs 属性含义时读 05 册；需要完整命令参数、配置语义与错误码时读 04 册；需要理解 Noise_IK 状态机、密钥派生时序、收发路径与 cookie 机制时读 06 册；需要确认某段逻辑属于哪个源文件时读 07 册；需要基准方法与调优参数时读 08-01、08-02，需要上线检查项时读 08-06。本篇作为运维与排障的唯一权威源，只提供案例与修复动作，不重复上述各册细节。跨册随查按（字段见 05-05 ｜ 参数见 04-01 ｜ 原理见 06-02 ｜ 模块见 07-05）执行：结构体逐字段去 05、参数与命令全集去 04、机制与调用链去 06、目录级模块能力去 07、运维场景与基准去 08。凡本篇标注「需对照实际版本核验」的命令输出、日志入口、抓包解析与默认值，均以目标系统实际版本为准，本套资料不编造未核验的路径与取值。

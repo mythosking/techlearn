@@ -1,0 +1,313 @@
+## 06-07 AllowedIPs trie 查找与路由决策原理
+
+### 1. 背景与动机
+
+WireGuard 把加密与路由绑在一起，这种模型通常被称为「加密密钥路由」（cryptokey routing）：一个 AllowedIPs 条目同时承担两件事——出站方向，目的地址落在某个前缀内的包应交给配置了该前缀的那个 peer；入站方向，只有源地址落在某个前缀内的包才被认为确实来自那个 peer，否则即使解密成功也要丢弃。这意味着内核里必须有一张能够回答「给定 IPv4 或 IPv6 地址，哪个 peer 配了最匹配的前缀」的表，而且这张表要在每个包的处理路径上被查询。这张表就是 `drivers/net/wireguard/allowedips.c` 与 `allowedips.h` 实现的 `struct allowedips`，它是 v4/v6 混合（更准确说是「双根」）的压缩二进制 trie。
+
+为什么不用内核已有的路由表？因为 WireGuard 需要的语义比通用 FIB 简单得多：它没有 metric、没有多路径下一跳、没有策略规则，只有「前缀到 peer」的映射；但它又要求读路径极快且完全无锁，因为配置变更（用户执行 `wg set`）与数据包的收发是并发发生的。如果查询要拿一把互斥锁，每个包都要跟配置操作竞争，这在高速隧道上不可接受。上游因此选择自己实现一棵按位压缩的 trie：读侧完全依靠 RCU（read-copy-update）无锁遍历，写侧在 `device_update_lock` 互斥锁保护下修改，并用 `kfree_rcu` / `call_rcu` 把内存回收推迟到宽限期之后。理解这一点是理解整篇的前提——trie 的精妙不只在「怎么查得准」，更在「改的时候不让读的人停下来」。
+
+本篇所有结论都来自本快照的上游内核驱动源码，路径相对 `_wglinux_build/upstream_src/wireguard-linux-src/`。结构体逐字段定义属于 05 册的权威范围，本篇只点名结构并给路径（字段见 05-04）；`wg set` 的 `allowed-ips` 参数全集属于 04 册（参数见 04-02）；`allowedips.c` 作为目录级模块的职责边界属于 07 册（模块见 07-04）；而 RCU 在整个并发体系中的位置另有专题（原理见 06-13）。本篇只做「查找与路由决策」这一件事，把细节让给对应权威册，避免跨篇重复。
+
+### 2. 核心概念
+
+第一个核心概念是**最长前缀匹配**（longest prefix match）。当同一个目的地址同时命中 `10.0.0.0/8` 和 `10.1.2.0/24` 时，应当选后者，因为它更具体。trie 的遍历天然适合这个语义：从根出发每下降一层，匹配的前缀长度就增加一位，因此遍历过程中「最后一个带 peer 的节点」就是最具体的命中。源码 `find_node` 用局部变量 `found` 记录这个节点，即使后续下降到某个没有 peer 的中间节点停下来，`found` 仍保留着最近的祖先，这正是最长前缀匹配得以成立的关键。
+
+第二个核心概念是**压缩 trie 与双根结构**。`struct allowedips` 只有 `root4` 与 `root6` 两个 `__rcu` 根指针，外加一个 `u64 seq` 版本计数；IPv4 用 32 位键、IPv6 用 128 位键，分别挂在这两个根下，互不混合。`MAX_ALLOWEDIPS_DEPTH` 定为 129，正好是 128 位键加一层根。压缩体现在中间节点可以没有 peer：当两个前缀在某一位分叉时，`add` 会创建一个 `peer` 为空的纯分支节点，把两条子树挂上去；只有真正对应某个 AllowedIPs 条目的节点才带 peer。这种结构既节省节点数，又让「某个前缀被重新指派给另一个 peer」变成一次简单的指针替换。
+
+第三个核心概念是**字节序归一化与按位取位**。网络传来的地址是大端序，而 `fls` / `fls64` 这类内建函数按本机字长工作。为此 `swap_endian` 在插入和查询前统一把地址转成主机序：`bits == 32` 时用 `be32_to_cpu`，`bits == 128` 时用两次 `get_unaligned_be64`。随后 `copy_and_assign_cidr` 计算 `bit_at_a = cidr / 8U`（配合 `__LITTLE_ENDIAN` 下的异或翻转，使字节下标从最高有效字节方向走）和 `bit_at_b = 7U - (cidr % 8U)`（字节内从最高位开始数）。`choose` 再用 `(key[bit_at_a] >> bit_at_b) & 1` 取出第 `cidr` 位，决定走 `bit[0]` 还是 `bit[1]`。把这段和字节序处理放在一起理解，才不会误以为 trie 直接比较网络序字节。
+
+第四个核心概念是**读侧无锁与强引用约定**。`lookup` 在 `rcu_read_lock_bh()` 临界区内用 `rcu_dereference_bh` 遍历，因此配置线程可以同时改树；被删除的节点由 `kfree_rcu` 延迟释放，读侧手里的指针在临界区内始终有效。头文件和源文件都用注释明确写着 `/* Returns a strong reference to a peer */`：`wg_allowedips_lookup_dst` 与 `wg_allowedips_lookup_src` 返回的 peer 已经通过 `wg_peer_get_maybe_zero` 取了强引用，调用方**必须**在用完后调用 `wg_peer_put`，否则引用计数泄漏会让 peer 永不释放；反过来重复释放则会造成释放后使用。这是使用这张表最容易踩的坑，本篇会在第 6 节展开。
+
+### 3. 关键数据结构与源码位置
+
+核心结构定义在 `drivers/net/wireguard/allowedips.h`。`struct allowedips_node` 的热字段包括 `__rcu` 的 `peer` 指针、`__rcu` 的 `bit[2]` 两个孩子、`cidr` / `bit_at_a` / `bit_at_b` / `bitlen` 四个 u8，以及按 u64 对齐的 `bits[16]`；`parent_bit_packed` 与 `peer_list` / `rcu` 联合体被刻意放在结构底部，注释说明是为了「beyond cache line」，避免冷字段挤占热字段的缓存行。`struct allowedips` 则把 `root4`、`root6` 和 `seq` 组织在一起，并用 `__aligned(4)` 对齐——注释提到历史上有过把根指针低两位打包的做法，m68k 只有 16 位对齐，读源码时不要把这个对齐要求误当成当前版本的打包逻辑。逐字段的完整解释见 05-04。
+
+下面这张表把本篇反复引用的函数按「角色—源码位置」收拢，便于逐函数对照阅读。所有路径均在 `drivers/net/wireguard/` 下。
+
+| 函数或符号 | 在 trie 中的角色 | 源码位置 |
+|---|---|---|
+| `swap_endian` | 网络序转主机序，供 `fls` 与取位使用 | `allowedips.c:13` |
+| `copy_and_assign_cidr` | 写入 `cidr` 并计算 `bit_at_a/bit_at_b` | `allowedips.c:23` |
+| `choose` | 按当前位选 `bit[0]` 或 `bit[1]` | `allowedips.c:36` |
+| `common_bits` / `prefix_matches` | 计算公共前缀位数并判断是否匹配 | `allowedips.c:82` / `94` |
+| `find_node` / `lookup` | 最长前缀匹配遍历与强引用获取 | `allowedips.c:106` / `122` |
+| `node_placement` / `add` | 定位父节点并执行插入 | `allowedips.c:144` / `176` |
+| `remove_node` / `remove` | 删除节点并尝试折叠父节点 | `allowedips.c:247` / `278` |
+| `root_free_rcu` / `push_rcu` | 整表释放时的非递归后序遍历 | `allowedips.c:51` / `41` |
+| `wg_allowedips_lookup_dst` / `lookup_src` | 按 skb 目的地址或源地址查表 | `allowedips.c:391` / `402` |
+| `wg_peer_get_maybe_zero` | 在 RCU 临界区内取 peer 强引用 | `peer.c:71` |
+
+从调用点看，出站查表在 `device.c:153`，`wg_start_xmit` 路径用目的地址查 peer，查不到就返回 `-ENOKEY` 并打印 `No peer has allowed IPs matching`；入站查表在 `receive.c:404`，`wg_packet_consume_data_done` 用源地址反查 peer，并与解密时用的 keypair 所属 peer 比较，不一致就判为 `unallowed src IP` 丢弃。这两处调用构成 AllowedIPs 双重语义的落点，接收路径的完整串联见 06-06，发送路径见 06-05。
+
+### 4. 关键流程与调用链
+
+插入链路从 `wg_allowedips_insert_v4` / `insert_v6` 开始。两个封装函数先 `++table->seq`，再用 `swap_endian` 把 `struct in_addr` / `in6_addr` 转成对齐的主机序 key，最后调用 `add(&table->root4, 32, ...)` 或 `add(&table->root6, 128, ...)`。`add` 内部按四种情形处理：树为空时直接建一个节点并用 `connect_node(trie, 2, node)` 挂到根，`bit` 参数 2 是root 子节点的特殊标记；`node_placement` 返回 `exact`（已存在同 cidr 的前缀）时，只需 `rcu_assign_pointer(node->peer, peer)` 并用 `list_move_tail` 把节点移到新 peer 的 `allowedips_list`，这对应「把某个前缀改配给另一个 peer」；存在父节点但目标分支为空时，直接把新节点接到该分支；最复杂的是目标分支已有子树，此时用 `cidr = min(cidr, common_bits(down, key, bits))` 算出分叉点，若新前缀恰好是子树的祖先就提升它，否则新建一个 `peer` 为空的中间节点，把 `down` 和 `newnode` 一起挂到中间节点下面。`connect_node` 把父指针和分支位打包进 `parent_bit_packed`，使删除时能直接算出父槽位而不必从根重走。
+
+查询链路从 `wg_allowedips_lookup_dst` / `lookup_src` 进入 `lookup`。`lookup` 先 `swap_endian`，再在 `rcu_read_lock_bh()` 内调用 `find_node`；`find_node` 一边用 `prefix_matches` 判断当前节点是否匹配，一边在节点带 peer 时更新 `found`，并用 `choose` 逐位下降。`common_bits` 的实现很值得注意：32 位时是 `32 - fls(*(u32 *)node->bits ^ *(u32 *)key)`，128 位时是 `128 - fls128(高 64 位异或, 低 64 位异或)`，其中 `fls128` 定义为高半部分非零时返回 `fls64(a) + 64`，否则返回 `fls64(b)`。源码注释特意解释：本来可以预计算掩码加速，但 `common_bits` 在现代处理器上已经足够快，连 `bswap` 的开销都算进去也划算，所以选择直接内联。找到节点后，`lookup` 用 `wg_peer_get_maybe_zero` 在 RCU 临界区内取强引用；如果返回 NULL（peer 正被并发移除，引用计数已归零），就 `goto retry` 在同一个临界区内重查——此时旧节点内存因 RCU 宽限期尚未回收，重查是安全的。这个 retry 循环正是「查到 peer 隐式取强引用」约定能成立的前提。
+
+删除链路有两条入口。`wg_allowedips_remove_v4/v6` 走 `remove`：先用 `node_placement` 确认存在完全同 cidr 的节点，再核对 `peer` 指针是否等于调用方传入的 peer，不符就当作空操作返回 0；确认后调用 `remove_node`。`remove_node` 先 `list_del_init` 摘掉 `peer_list` 并把 `peer` 置 NULL，若节点有两个孩子就不折叠直接返回；否则让唯一的孩子继承 `parent_bit_packed`，把自己从父槽位摘下，并在「自己是叶子、不是根的直接孩子、且父节点也没带 peer」时一并折叠父节点，最后用 `kfree_rcu(node, rcu)` 延迟释放。另一条入口 `wg_allowedips_remove_by_peer` 不搜树，而是遍历 `peer->allowedips_list` 逐个调用 `remove_node`——因为每个带 peer 的节点都在插入时被 `list_add_tail` 挂进这条链表，所以按 peer 清理是 O(该 peer 的条目数) 而非 O(整棵树)。整表销毁走 `wg_allowedips_free`：`++seq` 后用 `RCU_INIT_POINTER` 断开两个根，再对每个旧根调用 `root_remove_peer_lists` 摘链，最后 `call_rcu(&node->rcu, root_free_rcu)`；`root_free_rcu` 用固定长度栈做非递归后序遍历，逐个 `kmem_cache_free`，避免深树递归爆栈。模块卸载时 `wg_allowedips_slab_uninit` 先 `rcu_barrier()` 等所有回调完成，再销毁 `node_cache`。
+
+图 06-07-01 用一组具体前缀展示最长前缀匹配的下降过程：目标地址 `10.1.2.33` 会同时落在 `0.0.0.0/0`、`10.0.0.0/8`、`10.1.0.0/16`、`10.1.2.0/24` 四个节点上，遍历最后停在最具体的那个。
+
+:::figure id=06-07-01 | name=AllowedIPs trie 的最长前缀匹配下降过程 | dir=TD
+node n1 "0.0.0.0/0<br/>peer A 默认入口" gray
+node n2 "10.0.0.0/8<br/>peer B" blue
+node n3 "10.1.0.0/16<br/>peer C" teal
+node n4 "10.1.2.0/24<br/>peer D 最具体" green
+node n5 "目标地址<br/>10.1.2.33" amber
+node n6 "swap_endian + choose<br/>逐位取位下降" purple
+node n7 "found 记录<br/>最后命中节点" red
+node n8 "返回 peer D<br/>强引用" blue
+edge n1 -> n2 "下降"
+edge n2 -> n3 "下降"
+edge n3 -> n4 "下降"
+edge n5 -> n6 "待查地址"
+edge n6 -> n1 "从根开始"
+edge n4 -> n7 "命中更新"
+edge n7 -> n8 "wg_peer_get_maybe_zero"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「目标地址 10.1.2.33」经「swap_endian + choose 逐位取位下降」从根开始，依次经过「0.0.0.0/0 peer A 默认入口」「10.0.0.0/8 peer B」「10.1.0.0/16 peer C」，最终到达「10.1.2.0/24 peer D 最具体」；遍历中「found 记录最后命中节点」在每一层带 peer 的节点上更新，于是出口是「返回 peer D 强引用」。若某一层分叉处没有更具体的条目，found 就停在上一层，这正是最长前缀匹配的语义。
+
+### 5. 配置/命令/代码实例
+
+从运维视角看，trie 的内容完全由 `allowed-ips` 参数决定。下面这段给一个 peer 配置多个重叠前缀，并用 `wg show` 回读，便于把命令行输出与上面的 trie 图对上号（参数全集见 04-02）：
+
+```bash
+# 为一个 peer 配置三个重叠前缀，模拟 trie 中的多层节点
+wg set wg0 peer <对端公钥> allowed-ips 10.0.0.0/8,10.1.0.0/16,10.1.2.0/24
+
+# 回读该 peer 的 AllowedIPs，验证 trie 中确实有三条带 peer 的节点
+wg show wg0 allowed-ips
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+<对端公钥>	10.0.0.0/8 10.1.0.0/16 10.1.2.0/24
+```
+
+逐行判读如下。这一行输出来自 `wg show` 对 netlink `WG_CMD_GET_DEVICE` 返回属性的渲染：行首是对端公钥，对应 `WGPEER_A_PUBLIC_KEY`，它决定 trie 节点的 `peer` 指针最终指向哪个 `wg_peer`；后面三个 CIDR 分别对应三条 `WGALLOWEDIP_A_IPADDR` 与 `WGALLOWEDIP_A_CIDR_MASK` 组合，内核收到后会经 `wg_allowedips_insert_v4` 转成三个 key 调 `add`。注意 `10.0.0.0/8` 与 `10.1.0.0/16`、`10.1.2.0/24` 是包含关系，`add` 不会把它们压成一条，而是按 `common_bits` 找到分叉点后建立层级：发往 `10.1.2.33` 的包在出站 `wg_allowedips_lookup_dst` 中会一路下降到 `/24` 节点才返回，这就是 `find_node` 中 `found` 被最后一次更新的位置。如果实际输出只显示其中一条，说明 netlink 批量设置时旧条目被覆盖了，应改用 `wg syncconf` 做原子替换（参数见 04-02）。同理，若把 `/24` 写成 `/23`，`10.1.2.33` 仍命中，但 `10.1.3.1` 的归属会变化，排障时要把掩码按位展开核对，而不是只看十进制数字（排障见 08-03）。
+
+为了让源码与实际行为对齐，下面给出 `find_node` 与 `lookup` 的核心片段，保留了构成最长前缀匹配与强引用 retry 的关键语句（删去与主题无关的局部声明）：
+
+```c
+static struct allowedips_node *find_node(struct allowedips_node *trie, u8 bits,
+					 const u8 *key)
+{
+	struct allowedips_node *node = trie, *found = NULL;
+
+	while (node && prefix_matches(node, key, bits)) {
+		if (rcu_access_pointer(node->peer))
+			found = node;
+		if (node->cidr == bits)
+			break;
+		node = rcu_dereference_bh(node->bit[choose(node, key)]);
+	}
+	return found;
+}
+
+static struct wg_peer *lookup(struct allowedips_node __rcu *root, u8 bits,
+			      const void *be_ip)
+{
+	u8 ip[16] __aligned(__alignof(u64));
+	struct allowedips_node *node;
+	struct wg_peer *peer = NULL;
+
+	swap_endian(ip, be_ip, bits);
+	rcu_read_lock_bh();
+retry:
+	node = find_node(rcu_dereference_bh(root), bits, ip);
+	if (node) {
+		peer = wg_peer_get_maybe_zero(rcu_dereference_bh(node->peer));
+		if (!peer)
+			goto retry;
+	}
+	rcu_read_unlock_bh();
+	return peer;
+}
+```
+
+这段代码里，循环条件 `prefix_matches` 保证只在公共前缀够长时才下降；`found = node` 只在 `peer` 非空时更新；`if (node->cidr == bits) break` 处理 host 路由这种已经到 32/128 位、不可能再下降的情况；`goto retry` 发生在 `wg_peer_get_maybe_zero` 用 `kref_get_unless_zero` 取引用失败时，说明节点上的 peer 正在被移除，重查会落到更短但仍然有效的祖先上。整段遍历没有任何锁，靠的就是 `rcu_read_lock_bh` 与 `rcu_dereference_bh` 这对组合。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是忘记 AllowedIPs 的双重语义。很多人只把它理解成「允许哪些源 IP」，结果入站通了、出站不通（或相反）。正确心智模型是：目的地址决定走哪个 peer，源地址决定这个包是否被该 peer 授权；两个方向用同一张 trie，只是分别查 `daddr` 与 `saddr`。掩码写宽会让本不该走隧道的流量被吸进 wg0，写窄则让合法流量被 `No peer has allowed IPs matching` 丢弃（出站）或被 `Packet has unallowed src IP` 丢弃（入站）。
+
+第二个陷阱是重叠前缀下的直觉错误。trie 永远选最长前缀，与配置顺序无关，也与 `wg show` 里的排列顺序无关。以为「后配置的覆盖先配置的」而把 `/0` 和 `/32` 配给不同 peer，实际结果是 `/32` 稳定胜出、`/0` 只兜底其余地址。若确实想做主备切换，应通过改同一前缀的 peer 归属（`add` 的 exact 分支会 `rcu_assign_pointer` 替换 peer）或删掉旧条目来实现，而不是依赖序号。
+
+第三个陷阱是强引用处理。两个 `lookup_*` 函数返回的是强引用，调用方必须 `wg_peer_put`。发送路径把引用转交给加密队列，最终在 `wg_packet_tx_worker` 中释放；接收路径的 `wg_packet_consume_data_done` 调完 `wg_allowedips_lookup_src` 后立刻 `wg_peer_put(routed_peer)`，因为那里只做一次身份比较，不需要延长 peer 生命周期。漏放会泄漏，多放会在 peer 被回收后踩内存。自己写扩展代码调用这两个函数时，务必成对处理。
+
+第四个陷阱是并发语义的误读。RCU 保证的是「遍历过程中看到的节点内存不会被释放」，不保证「整个查询看到的是某一时刻的完整快照配置」：配置线程可以在查询中途替换 peer 指针，retry 循环正是为此设计。依赖 `seq` 做一致性判定时要注意它只是每次增删改时递增的版本线索，具体用法属于 netlink 通道的范畴（原理见 06-14）。
+
+第五个陷阱是字节序与平台差异。`copy_and_assign_cidr` 里有 `#ifdef __LITTLE_ENDIAN` 的 `bit_at_a` 翻转，直接照搬取位逻辑到大端架构会得到相反的节点；`struct allowedips` 的 `__aligned(4)` 注释提到 m68k 的历史打包做法。移植或审计时应以目标架构实际行为为准，标注「需对照实际版本核验」的地方不要凭记忆填充。
+
+最佳实践可以归纳为四条：把 AllowedIPs 收敛到最小必要范围，远端接入优先用具体网段而非 `0.0.0.0/0`；需要整体替换时用 `wg syncconf` 让内核原子地重建 trie，避免逐条增删中间的瞬态；配置后用 `wg show <接口> allowed-ips` 回读并按位核对掩码；遇到隧道不通时先用 `wg show` 的 `latest handshake` 确认握手，再用目的/源地址分别对照第 4 节两条查表链路定位是「没选对 peer」还是「源地址未授权」（排障见 08-03）。
+
+### 7. 小结与延伸阅读
+
+本篇把 AllowedIPs 的路由决策拆成三层：数据逻辑是「前缀到 peer」的加密密钥路由，查询语义是最长前缀匹配，实现手段是按位压缩的双根 trie 加 RCU 无锁读。插入侧由 `add` 通过 `common_bits` 找分叉点、必要时造纯分支节点；查询侧由 `find_node` 用 `found` 记录最近命中并用 `choose` 逐位下降；删除侧由 `remove_node` 折叠空父节点并用 `kfree_rcu` 延迟回收。`lookup` 在 RCU 临界区内通过 `wg_peer_get_maybe_zero` 隐式取强引用、失败则 retry，调用方必须 `wg_peer_put`——这贯穿发送与接收两条数据路径。结构体字段全集在 05-04，`wg set` 参数全集在 04-02，`allowedips.c` 的模块职责在 07-04，RCU 并发体系在 06-13，跨册随查按（字段见 05-04 ｜ 参数见 04-02 ｜ 原理见 06-13 ｜ 模块见 07-04）执行。
+
+延伸阅读建议按三条线走：想看清调用上下文，顺着 `device.c:153` 的 `wg_allowedips_lookup_dst` 读出站路径（发送链路见 06-05），再顺着 `receive.c:404` 的 `wg_allowedips_lookup_src` 读入站校验（接收链路见 06-06）；想看清配置如何进入 trie，从 netlink 属性解析读起（原理见 06-14）；想看清运维排障，转到 08-03 的决策树。凡本篇引用的字段、函数名签名、常量与命令行格式，均以 `_wglinux_build/upstream_src/` 下对应源码为准，标注「需对照实际版本核验」的细节不凭记忆补写。
+
+## 06-08 抗重放窗口与序列号处理
+
+### 1. 背景与动机
+
+WireGuard 把数据报封装在 UDP 里发送，而 UDP 既不保证顺序也不保证不重复：网络可能重排，攻击者也可以把抓到的密文原样再发一次。AEAD 加密虽然保证了机密性和完整性，却不会阻止「把同一段合法密文再递一遍」——对端解密后仍会得到同样的明文。如果上层是 TCP，重复包或许还能被传输层吸收；但对 UDP 之上的任意应用，或者对「伪装密钥轮换」「重放旧会话包」这类攻击，必须有协议层的抗重放保护。更关键的是，ChaCha20-Poly1305 的安全性依赖 nonce 不重复，因此发送端必须为每条会话分配单调递增的计数器，接收端必须识别并丢弃已经见过的计数器值。
+
+WireGuard 的做法是：每个 keypair（一次握手派生出的会话密钥对）维护自己的计数器状态，发送侧用原子递增生成 nonce 并写进数据消息头的 `counter` 字段，接收侧维护一个滑动窗口加位图，只接受「窗口内且位图未标记」的计数器。接收算法直接采用 RFC6479 的位图思路，源码注释明确写着 `/* This is RFC6479, a replay detection bitmap algorithm that avoids bitshifts */`（`receive.c:294`）。本篇逐语句读 `counter_validate`，并串起 `noise.h` 的状态结构、`messages.h` 的常量和 `send.c` 的序列号生成，讲清「64 位计数器 + 位图窗口 + 原子检查置位」这条完整链路。
+
+需要先把一个术语澄清：本篇任务描述里提到的 `PACKET_COUNTER_SIZE` 在本快照的源码中并不存在。全文检索 `_wglinux_build/upstream_src` 没有找到该宏；当前快照里计数器在报文中的表示是 `messages.h` 的 `struct message_data` 中的 `__le64 counter`，发送侧的上限由 `REJECT_AFTER_MESSAGES` 约束。如果目标内核版本确实定义了 `PACKET_COUNTER_SIZE`，它属于旧版或衍生版本的实现细节，需对照实际版本核验；本篇一律以本快照真实的字段与常量为准，不编造不存在的宏。
+
+本篇是机制的权威源，涉及结构体的逐字段定义只点名并指向 05 册（字段见 05-05），常量全集与参数口径交给 04 册（参数见 04-06），数据消息中 `counter` 字段的报文布局交给消息格式专题（原理见 06-04），`receive.c` 作为目录级模块的职责交给 07 册（模块见 07-08）。本篇只做「抗重放窗口与序列号处理」这一件事。
+
+### 2. 核心概念
+
+第一个核心概念是**会话级、单调的计数器**。发送侧状态是 `noise_keypair` 中的 `atomic64_t sending_counter`，每次发一包用 `atomic64_inc_return` 取新值再减一，于是第一包的 nonce 是 0，之后严格递增。接收侧状态是同一个 keypair 里的 `struct noise_replay_counter`，其中 `u64 counter` 记录「已接受的最高计数器加一」，`backtrack` 位图记录窗口内哪些计数器已经见过。计数器属于 keypair 而不是 peer：每次握手生成新 keypair 时状态随之重置，旧会话的密文因为密钥与索引不同而无法通过认证，所以跨会话的重放由密钥切换处理，会话内的重放由窗口处理。
+
+第二个核心概念是**滑动窗口与位图的环形组织**。`messages.h` 定义 `COUNTER_BITS_TOTAL = 8192`、`COUNTER_REDUNDANT_BITS = BITS_PER_LONG`、`COUNTER_WINDOW_SIZE = COUNTER_BITS_TOTAL - COUNTER_REDUNDANT_BITS`。在 64 位平台上 `BITS_PER_LONG` 为 64，于是 tolerated 的乱序窗口是 8128 个包；32 位平台上则为 8160。`backtrack` 是 `unsigned long backtrack[COUNTER_BITS_TOTAL / BITS_PER_LONG]`——64 位平台上是 128 个 64 位字，正好 8192 位。源码用 `index = their_counter >> ilog2(BITS_PER_LONG)` 算字下标，用 `their_counter & (BITS_PER_LONG - 1)` 算字内位下标，再用 `& (COUNTER_BITS_TOTAL / BITS_PER_LONG - 1)` 让字下标环形回绕。因为字数（128 或 256）是 2 的幂，掩码回绕比取模便宜。`COUNTER_REDUNDANT_BITS` 多留一个字的余量，使窗口边界上的位不会被过早清掉。
+
+第三个核心概念是**检查与置位必须不可分割**。接收侧的核心语句是 `ret = !test_and_set_bit(bit, &counter->backtrack[index])`：`test_and_set_bit` 是一次原子读改写，返回旧位值，因此「先看有没有见过，再标记已见过」合成了一个不可中断的动作。整个 `counter_validate` 还被 `spin_lock_bh` / `spin_unlock_bh` 包住，使计数器推进、旧字清理和位图置位对外表现为一个整体。如果把它拆成「先判断位为 0，隔一会儿再置位」，两个并发到达的同一计数器重放包就可能都读到 0 而双双通过——这就是典型的 TOCTOU（check-then-act）竞态，会直接放过重放。源码虽然用的是自旋锁加原子置位而非字面意义上的 CAS 循环，但语义目标完全一致：把检查与更新捏成单一原子事件。
+
+第四个核心概念是**阈值与轮换**。`REKEY_AFTER_MESSAGES = 1ULL << 60` 是「发够这么多包就重新握手」的软阈值；`REJECT_AFTER_MESSAGES = U64_MAX - COUNTER_WINDOW_SIZE - 1` 是硬阈值。之所以要留出 `COUNTER_WINDOW_SIZE` 的余量，是因为一旦计数器逼近 u64 上限，回绕会让「新包」看起来像「很旧的包」，窗口判定失去意义；与其冒险回绕，不如让密钥失效并强制重新握手。接收侧 `decrypt_packet` 在 `receiving_counter.counter >= REJECT_AFTER_MESSAGES` 时把 `is_valid` 写为 false，发送侧在 nonce 达到硬阈值时同样标记 `sending.is_valid` 为 false 并发起新握手。
+
+### 3. 关键数据结构与源码位置
+
+状态结构的定义集中在 `drivers/net/wireguard/noise.h`。`struct noise_replay_counter` 只有三个成员：`u64 counter`、`spinlock_t lock` 和 `unsigned long backtrack[COUNTER_BITS_TOTAL / BITS_PER_LONG]`；它被嵌在 `struct noise_keypair` 里成为 `receiving_counter`，与 `atomic64_t sending_counter`、`__le32 remote_index`、引用计数 `kref` 和 `rcu_head` 并列。逐字段的完整解释属于 05-05，本篇只点名不展开字段表。
+
+报文侧的关键在 `messages.h` 的 `struct message_data`：`__le32 key_idx` 用于索引 keypair，`__le64 counter` 就是线上传输的序列号，后面跟 `encrypted_data[]`。`enum counter_values` 与 `enum limits` 给出窗口与阈值常量，`enum limits` 还包含 `REKEY_TIMEOUT = 5`、`REKEY_AFTER_TIME = 120`、`REJECT_AFTER_TIME = 180` 等时间参数，这些时间量的完整口径见 04-06。
+
+处理链路分布在 `receive.c` 与 `send.c`。下表把本篇反复引用的符号按角色收拢，路径均在 `drivers/net/wireguard/` 下。
+
+| 符号 | 角色 | 源码位置 |
+|---|---|---|
+| `noise_replay_counter` | 接收计数器与位图容器 | `noise.h:18` |
+| `noise_keypair.sending_counter` | 发送侧原子序列号 | `noise.h:33` |
+| `message_data.counter` | 线上 `__le64` 计数器字段 | `messages.h:108` |
+| `COUNTER_WINDOW_SIZE` | 乱序容忍窗口的位数 | `messages.h:37` |
+| `REJECT_AFTER_MESSAGES` | 防止 u64 计数器回绕的硬阈值 | `messages.h:42` |
+| `counter_validate` | RFC6479 位图判定核心 | `receive.c:295` |
+| `wg_packet_rx_poll` | NAPI 上下文中调用验重放 | `receive.c:438` |
+| `wg_packet_send_staged_packets` | 为待发包批量分配 nonce | `send.c:342` |
+| `encrypt_packet` | 把 nonce 写入报文头并加密 | `send.c:162` |
+
+表中常量均取自 `messages.h:34-54` 的 `enum counter_values` 与 `enum limits`；审计时请以该段源码为准，不要把时间参数与消息数阈值混为一谈。
+
+### 4. 关键流程与调用链
+
+发送链路从 `wg_packet_send_staged_packets` 开始。它先把 `staged_packet_queue` 里的包 splice 到本地链表，取 `current_keypair` 的强引用并检查 `sending.is_valid` 与 `sending.birthdate` 是否过期。随后对队列中每个包执行 `PACKET_CB(skb)->nonce = atomic64_inc_return(&keypair->sending_counter) - 1`，并检查 `nonce >= REJECT_AFTER_MESSAGES`；源码注释说明这里采取「要么给整批包都分配 nonce，要么一个都不发」的策略——只要有一个包越界就 `goto out_invalid`，把整批包挂回队列并触发新握手。这个设计避免了同一批包里前半段用了旧密钥、后半段用了新密钥的混乱。接着 `encrypt_packet` 在 `skb_push` 出的 `message_data` 头里写 `header->counter = cpu_to_le64(PACKET_CB(skb)->nonce)`，并把同一个 nonce 传给 `chacha20poly1305_encrypt_sg_inplace`。
+
+接收链路的顺序尤其重要。`wg_packet_receive` 按消息类型分派，数据消息进 `wg_packet_consume_data`，后者用 `__le32 idx` 在 index 哈希表里查到 keypair 并取强引用，再把包投进解密队列。解密 worker 调 `decrypt_packet`，它先从 `message_data.counter` 读出 `le64_to_cpu` 后的值存入 `PACKET_CB(skb)->nonce`，再把这个 nonce 交给 `chacha20poly1305_decrypt_sg_inplace`；只有认证通过才把状态置为 `PACKET_STATE_CRYPTED`。之后包进入 per-peer 的 `rx_queue`，由 NAPI 轮询函数 `wg_packet_rx_poll` 处理：先检查状态，再调用 `counter_validate(&keypair->receiving_counter, PACKET_CB(skb)->nonce)`，失败就打印 `Packet has invalid nonce` 并 `goto next` 丢弃。也就是说，验重放发生在**解密成功之后**——这是刻意设计：如果先验重放再解密，攻击者可以伪造任意高计数器把窗口推走，让合法包被当成旧包丢弃，形成拒绝服务。
+
+`counter_validate` 本身可以拆成五步理解。第一步，在 `spin_lock_bh` 保护下检查双方计数器是否越过 `REJECT_AFTER_MESSAGES`，越界就跳出并返回 false。第二步，`++their_counter`：线上计数器从 0 开始，内部统一按「加一后的序号」处理，这样 `counter` 字段始终表示「已接受的最高线上计数器加一」。第三步，若 `(COUNTER_WINDOW_SIZE + their_counter) < counter`，说明这个包比窗口下界还旧，直接拒绝。第四步，若 `their_counter > counter` 到来的是新包，算出新旧字下标差 `top = min(index - index_current, COUNTER_BITS_TOTAL / BITS_PER_LONG)`，把中间那些已经被窗口甩在后面的字整字清零，然后用 `WRITE_ONCE(counter, their_counter)` 推进水位；`WRITE_ONCE` 让 `decrypt_packet` 中无锁读取 `receiving_counter.counter` 的线程不会看到撕裂值。第五步，`index &= (COUNTER_BITS_TOTAL / BITS_PER_LONG) - 1` 得到环形字下标，`test_and_set_bit(their_counter & (BITS_PER_LONG - 1), &backtrack[index])` 原子地检查并置位，取其逻辑非作为最终返回值。
+
+图 06-08-01 把水位、窗口下界和位图的三个判定区域画在一起，便于理解为什么「很旧」「重复」「乱序但合法」会得到不同结果。
+
+:::figure id=06-08-01 | name=抗重放滑窗的状态分区与判定 | dir=LR
+node n1 "receiving_counter.counter<br/>已接受最高值+1" blue
+node n2 "窗口下界<br/>counter - COUNTER_WINDOW_SIZE" gray
+node n3 "早于下界<br/>直接丢弃" red
+node n4 "backtrack[] 位图<br/>每 bit 代表一包" teal
+node n5 "已收到 位=1<br/>重复包 丢弃" amber
+node n6 "未收到 位=0<br/>乱序包 接受" green
+node n7 "新包 水位推进<br/>整字清理旧位" purple
+node n8 "test_and_set_bit<br/>检查并置位原子" blue
+edge n1 -> n2 "推导"
+edge n2 -> n3 "下方"
+edge n1 -> n4 "覆盖"
+edge n4 -> n5 "位已置"
+edge n4 -> n6 "位未置"
+edge n7 -> n1 "推进"
+edge n6 -> n8 "进入判定"
+edge n5 -> n8 "进入判定"
+:::
+
+图中节点速览（便于在不渲染框内文字的预览器中阅读）：「receiving_counter.counter 已接受最高值+1」减去窗口大小得到「窗口下界 counter - COUNTER_WINDOW_SIZE」，低于下界的落入「早于下界 直接丢弃」；水位覆盖的范围是「backtrack[] 位图 每 bit 代表一包」，其中「已收到 位=1 重复包 丢弃」与「未收到 位=0 乱序包 接受」两条分支都汇入「test_and_set_bit 检查并置位原子」；当更大的计数器到来时，「新包 水位推进 整字清理旧位」同时更新水位并回收过期位。三条路径之外，早于下界的包根本不进入位图判定。
+
+### 5. 配置/命令/代码实例
+
+运维侧没有直接调节窗口大小的配置项，`COUNTER_WINDOW_SIZE` 是编译期常量（参数见 04-06）。能观察抗重放行为的入口是内核日志：`receive.c:463` 用 `net_dbg_ratelimited` 打印丢弃原因，打开动态调试后可用 `dmesg` 过滤。下面这条命令开启对应文件的调试打印（动态调试路径与语法需对照实际版本核验）：
+
+```bash
+# 打开 receive.c 的动态调试，观察被抗重放机制丢弃的数据包
+echo 'file drivers/net/wireguard/receive.c +p' > /sys/kernel/debug/dynamic_debug/control
+dmesg | grep -i "invalid nonce"
+```
+
+对应输出（示例输出，具体格式需对照实际版本核验）：
+
+```text
+示例输出，具体格式需对照实际版本核验
+[ 3120.540118] wg0: Packet has invalid nonce 42 (max 9000)
+[ 3120.540203] wg0: Packet has invalid nonce 8999 (max 9000)
+[ 3120.550776] wg0: Packet has invalid nonce 42 (max 9000)
+```
+
+逐行判读如下。三行的格式都来自 `receive.c:463-466` 的 `"%s: Packet has invalid nonce %llu (max %llu)\n"`，第一个参数是接口名，第二个是 `PACKET_CB(skb)->nonce`（由 `decrypt_packet` 从 `message_data.counter` 经 `le64_to_cpu` 得到），第三个是 `READ_ONCE(keypair->receiving_counter.counter)`。要特别注意 `max` 并不是「允许的最大值」，而是内部水位：它表示已接受的最高线上计数器加一，因此看到 `max 9000` 时，线上计数器 8999 才是最后一个被接受的包。第一行 nonce 42 加一后为 43，而 `COUNTER_WINDOW_SIZE + 43` 在 64 位平台是 8128 + 43 = 8171，仍小于水位 9000，命中 `counter_validate` 第三步的「太旧」判定，直接跳到 `out` 返回 false。第二行 nonce 8999 加一后为 9000，与水位相等，不触发推进；它落在窗口内，但位图中对应位已经被置过，于是 `test_and_set_bit` 返回旧值 1，取非后 ret 为 false——这正是「重复包」被拦下的情形。第三行又是 nonce 42，与第一行同理仍是太旧；之所以还能看到重复出现，是因为 `net_dbg_ratelimited` 会限速而非完全抑制，间隔足够长就会再打印一次。三条日志对应的包都在 `wg_packet_rx_poll` 里 `goto next`，随后 `wg_noise_keypair_put`、`wg_peer_put` 并 `dev_kfree_skb`，所以 `wg show` 的 `transfer` 计数不会增加。
+
+下面给出 `counter_validate` 的核心片段，保留构成水位推进与原子判定的关键语句（删去局部声明与标签细节，但保持源码逻辑顺序）：
+
+```c
+static bool counter_validate(struct noise_replay_counter *counter, u64 their_counter)
+{
+	unsigned long index, index_current, top, i;
+	bool ret = false;
+
+	spin_lock_bh(&counter->lock);
+
+	if (unlikely(counter->counter >= REJECT_AFTER_MESSAGES + 1 ||
+		     their_counter >= REJECT_AFTER_MESSAGES))
+		goto out;
+
+	++their_counter;
+
+	if (unlikely((COUNTER_WINDOW_SIZE + their_counter) <
+		     counter->counter))
+		goto out;
+
+	index = their_counter >> ilog2(BITS_PER_LONG);
+
+	if (likely(their_counter > counter->counter)) {
+		index_current = counter->counter >> ilog2(BITS_PER_LONG);
+		top = min_t(unsigned long, index - index_current,
+			    COUNTER_BITS_TOTAL / BITS_PER_LONG);
+		for (i = 1; i <= top; ++i)
+			counter->backtrack[(i + index_current) &
+				((COUNTER_BITS_TOTAL / BITS_PER_LONG) - 1)] = 0;
+		WRITE_ONCE(counter->counter, their_counter);
+	}
+
+	index &= (COUNTER_BITS_TOTAL / BITS_PER_LONG) - 1;
+	ret = !test_and_set_bit(their_counter & (BITS_PER_LONG - 1),
+				&counter->backtrack[index]);
+
+out:
+	spin_unlock_bh(&counter->lock);
+	return ret;
+}
+```
+
+这段代码里，`their_counter` 与 `counter->counter` 的比较都在 `++their_counter` 之后，因此二者使用同一套「加一后序号」口径；`top` 被 `min_t` 限制在字总数以内，防止一次跨越巨大距离时把整个位图反复清零；`WRITE_ONCE` 与后来的 `test_and_set_bit` 分别对应水位与位图两种状态的发布方式。整段代码没有使用 CAS 循环，但 `spin_lock_bh` 加上原子的 `test_and_set_bit` 已经把检查与更新封闭成不可分割的操作。
+
+### 6. 注意事项、陷阱与最佳实践
+
+第一个陷阱是把验重放挪到解密之前。源码把 `counter_validate` 放在 NAPI 轮询、`PACKET_STATE_CRYPTED` 之后，是为了让未通过认证的报文根本没有机会推进水位。若图省事先看 counter，攻击者只要连续注入伪造的高计数器，就能把窗口推到合法包后面，制造持续丢包。这个顺序不是性能取舍，而是安全边界，重构接收路径时不能调换。
+
+第二个陷阱是破坏检查与置位的原子性。把 `test_and_set_bit` 改成「先 `test_bit` 判断，再 `set_bit`」看似等价，实则打开了 TOCTOU 缺口：两个并发的同计数器重放包可能都通过检查后再各自置位，结果两个都被当作新包交给协议栈。`spin_lock_bh` 保护的是整个函数（包括水位推进与整字清理），`test_and_set_bit` 提供的是位操作本身的原子性，二者缺一不可；也不要因为 `counter_validate` 只在软irq 上下文被调用就擅自把 `spin_lock_bh` 换成 `spin_lock`，关闭下半部是这里避免死锁与竞态的一部分。
+
+第三个陷阱是计数器回绕。`REJECT_AFTER_MESSAGES = U64_MAX - COUNTER_WINDOW_SIZE - 1` 留出窗口大小的余量，就是为了避免「新包看起来像极旧的包」。任何试图「优化」掉这个余量、或把 `u64` 改成更窄类型的做法都会重新引入回绕歧义。发送侧整批分配 nonce 时若触及硬阈值，源码选择整批退回并重新握手，而不是丢弃越界包继续发——理解这个取舍，才不会误以为「少发一包」是更好的策略。
+
+第四个陷阱是假设包严格按序到达。窗口允许最多 `COUNTER_WINDOW_SIZE` 个包的乱序，因此 nonce 100 先于 nonce 99 到达是合法的，后者会在位图中被正确接受。排障时看到日志里出现「较旧 nonce」不等于攻击，也可能是链路重排；只有在同一 nonce 反复出现或大量 nonce 远低于水位时才应怀疑重放。反过来，人为把窗口调小（需要改源码常量）会让正常重排在高端网络里被误杀，这类改动需对照实际版本核验并在目标机型实测，本资料不给绝对阈值建议。
+
+第五个陷阱是跨会话的账算错。计数器与位图属于 keypair，握手产生新 keypair 时状态重置；旧会话的重放包无法匹配新的 `remote_index` 与密钥，认证阶段就会被拦下，不会走到 `counter_validate`。因此「抗重放窗口是否清零」不是看 peer，而是看 keypair 生命周期，这一点与 keepalive、重传等 per-peer 定时器完全不同（定时器体系见 06-11）。
+
+第六个陷阱是版本差异。本篇任务描述提到的 `PACKET_COUNTER_SIZE` 在本快照不存在，审计旧分支或第三方 fork 时如果看到该宏，应把它理解为「计数器字段宽度」的历史表达，并与本快照的 `__le64 counter` 对照，而不是假设语义完全一致。同理，窗口常量在不同位宽平台上的数值不同（64 位为 8128，32 位为 8160），给出具体数字时必须说明平台前提。
+
+最佳实践可归纳为四条：保持接收路径「先认证、后验重放、再注入协议栈」的既有顺序；观察 `Packet has invalid nonce` 日志时同时记录 `nonce` 与 `max`，用第 5 节的判读方法区分太旧与重复；把 `REKEY_AFTER_MESSAGES` 与 `REJECT_AFTER_MESSAGES` 视为保护 nonce 不重复的最后防线，不要为了延长单次会话而调高；遇到疑似重放时结合 `wg show` 的握手时间与 `transfer` 计数综合判断，而不是只看一条日志（排障见 08-03）。
+
+### 7. 小结与延伸阅读
+
+本篇把抗重放拆成「生成—传输—判定—回收」四段：发送侧用 `atomic64_inc_return(&sending_counter) - 1` 生成单调 nonce，经 `encrypt_packet` 写入 `message_data.counter` 并作为 AEAD nonce；接收侧在认证通过后由 `wg_packet_rx_poll` 调 `counter_validate`，以 `u64 counter` 作水位、`backtrack[]` 位图记录窗口内已收包，用 `spin_lock_bh` 加 `test_and_set_bit` 把检查与置位封闭成原子操作，太旧、重复、越阈值三种情况分别被拒绝，新包到来时整字清理过期位并推进水位。`COUNTER_WINDOW_SIZE` 决定乱序容忍范围（64 位平台为 8128 包），`REJECT_AFTER_MESSAGES` 则在水位逼近 u64 上限时强制换密钥，避免回绕歧义。字段全集在 05-05，常量口径在 04-06，`counter` 字段的报文布局在 06-04，`receive.c` 的模块职责在 07-08，跨册随查按（字段见 05-05 ｜ 参数见 04-06 ｜ 原理见 06-04 ｜ 模块见 07-08）执行。
+
+延伸阅读建议按三条线走：想理解 counter 在报文中的位置与字节序，读消息格式专题（原理见 06-04）与 `messages.h:105-110`；想理解 keypair 何时创建与失效，读握手状态机与会话轮换（原理见 06-02、06-03）；想理解验重放之后的校验与注入，读接收完整链路（原理见 06-06）以及收包并发模型（原理见 06-13）。排障场景转到 08-03。凡本篇引用的字段、函数名签名、常量与日志格式，均以 `_wglinux_build/upstream_src/` 下对应源码为准；本快照不存在 `PACKET_COUNTER_SIZE` 宏，涉及旧版本的同名符号一律标注「需对照实际版本核验」，不凭记忆补写。
