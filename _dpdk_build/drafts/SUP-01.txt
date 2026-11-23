@@ -1,0 +1,232 @@
+# DPDK 技术资料 · SUP-01 Wireshark 抓包与 telemetry 机制
+
+> 本篇是一份独立补充文档，回答三个层层递进的问题：Wireshark 有没有使用 DPDK 作为底层的开源实现；如果有，它的工作方式是什么；这套方式所依赖的 telemetry socket 又是什么。内容基于 DPDK 官方邮件列表 2026 年 7 月至 10 月的补丁系列（作者 Stephen Hemminger）、DPDK 26.11 版 Telemetry 用户指南与 Telemetry Library 编程指南，以及开源项目 DPDKCap 的公开说明。凡涉及补丁状态、命令选项、版本号与函数名之处，均以「补丁/文档原文」口径给出，并标注其实验性质；正式落地时须对照所检出版本的源码与文档核验。本篇与 07 册「库与驱动模块介绍」、04 册「EAL 参数与工具命令行」的分工是：那两册覆盖已稳定的库与工具，本篇聚焦正在主线合入过程中的捕获库与 Wireshark 外部抓包通道，不构成对那两册的改写。
+
+---
+
+## SUP-01-01 Wireshark 是否有 DPDK 底层实现
+
+### 1. 背景与动机
+
+「Wireshark 有没有使用 DPDK 作为底层的开源实现」这个问题，看似是一个是非题，实际上混在一起问了三件不同的事，若不拆开，很容易得到一个似是而非的答案。第一件是 Wireshark 软件本体有没有把抓包后端换成 DPDK；第二件是开源社区里有没有「DPDK 抓包 + Wireshark 分析」的现成组合；第三件是 DPDK 官方有没有提供让 Wireshark 直接抓 DPDK 端口的能力。这三件事的答案并不相同，而工程上真正有用的，恰恰是第三件。
+
+先说结论。Wireshark 主线的抓包栈始终建立在 libpcap 及其 Windows 对应实现 WinPcap/Npcap 之上，从来没有把 DPDK 作为自己的 capture backend。这一点从 Wireshark 的接口列表、捕获过滤器语法、以及 `--extcap-*` 系列命令行参数的设计都能看出：它把一个可执行的外部程序当作抓包接口，但交给它的是标准的 pcap 或 pcapng 字节流，而不是让 Wireshark 自己去轮询网卡。因此，若有人声称「Wireshark 底层是 DPDK」，多半是把下面要讲的外部抓包机制误读成了内核替换。
+
+再说第二件事。DPDK 抓包后交给 Wireshark 分析，这类开源实现确实存在，而且不止一种。最常被提到的是 DPDKCap（仓库 `dpdkcap/dpdkcap`）：它是一个基于 DPDK 的独立 C 程序，用轮询模式驱动从多个端口、多个核心并行抓包，边抓边用 LZO 压缩写成 pcap 文件，再交给 Wireshark 离线打开。它的 README 明确写出目标是「10Gbps 以上的高速抓包」，并给出按端口分配捕获核心、按写文件分配写核心的调度方式。这个项目本身不是 Wireshark 插件，与 Wireshark 的关系是「先抓成文件、再离线分析」的两段式组合，不提供实时联动；其最近活跃时间在 2023 年前后，适配的 DPDK 版本较旧（公开说明中提到 18.11 与 19.11），今天若要用在新版本 DPDK 上，需要自行验证编译与运行。
+
+第三件事才是本篇的重点。DPDK 官方在 2026 年推进了一套外部抓包方案：新增捕获库 `lib/capture`，在运行的 DPDK 应用上注册 telemetry 命令，通过 ethdev 的收发回调复制数据包并写成 pcapng，再由一个 C 语言写的 helper 程序把这些端口呈现为 Wireshark 的抓包接口。这套方案的目标版本是 26.11，截至本篇写作时仍处于主线合入过程中的实验状态。它最接近「让 Wireshark 直接抓 DPDK 端口」这一表述，但严格说，DPDK 依然是数据生产者，Wireshark 的解析栈没有任何改动。
+
+### 2. 核心概念：抓包后端与外部抓包接口
+
+要准确理解上面的区分，必须先厘清「抓包后端」与「外部抓包接口」这两个概念。抓包后端是指应用程序内部真正从网络接口取得分组的那一层：Wireshark 在 Linux 上通过 libpcap 使用内核的 AF_PACKET 或相关机制，在 Windows 上通过 Npcap 的内核驱动取得分组。这一层决定了应用能抓哪些接口、能设置什么捕获过滤器、以及抓包的性能上限。若把这一层换成 DPDK，Wireshark 就必须自己管理大页内存、绑定网卡到 VFIO/UIO、启动轮询线程、并绕过内核协议栈，这等于重构 Wireshark 的捕获子系统，官方并没有这样做。
+
+外部抓包接口则是 Wireshark 提供的一套扩展机制，称为 extcap。它的设计思想很简单：只要一个可执行程序实现了约定的命令行协议——能被 Wireshark 询问「你提供哪些接口」「这些接口支持哪些链路类型」「有哪些可配置项」——Wireshark 就把它列出的每个接口当成一张网卡来用；当用户开始抓包时，Wireshark 创建 FIFO，调用该程序并让它把分组以 pcapng 格式写进 FIFO，Wireshark 从另一端读取、解析、显示。这一机制的官方示例包括 androiddump（通过 adb 抓 Android 设备的 Wi-Fi 或日志），其命令行参数 `--extcap-interfaces`、`--extcap-interface=<name>`、`--extcap-dlts`、`--extcap-config`、`--extcap-capture-filter=<expr>`、`--capture`、`--fifo=<path>` 构成了事实上的协议骨架。DPDK 的 helper 正是沿用这套骨架，所以 Wireshark 不需要任何改动就能识别它。
+
+理解了这一点，就能回答「DPDK 官方方案到底新在哪」。新的不是 Wireshark 侧，而是 DPDK 侧第一次提供了一个标准的、无需修改应用即可启用的抓包能力，并把它包装成 extcap 插件。过去要抓 DPDK 应用的包，要么用 pdump 库起一个 secondary process，要么在应用里集成 dumpcap 或自己写回调；现在应用只需链接捕获库（或甚至不改源码，因为库在加载时自注册），外部工具通过 telemetry socket 就能对已运行的应用发起抓包。
+
+### 3. 三种方案的对照与判读
+
+下面把三种「DPDK + Wireshark」的组合放在一起，从形态、数据路径、实时性与成熟度四个维度做对照。表中所说的「官方 extcap」指 DPDK 主线正在合入的 `lib/capture` 加 `dpdk-wireshark-extcap` helper，不是某个第三方分支。
+
+| 方案 | 形态 | 数据路径 | 实时性 | 成熟度 |
+|---|---|---|---|---|
+| 官方 extcap | Wireshark 外部抓包插件 | ethdev 回调复制 → pcapng FIFO → Wireshark | 实时 | 26.11 实验特性，仅 Linux/FreeBSD |
+| DPDKCap | 独立 C 工具，非插件 | DPDK 多核抓包 → LZO 压缩 pcap 文件 → 离线打开 | 离线 | 老项目，适配旧版 DPDK |
+| dpdk-pdump | DPDK 自带 secondary process 库 | secondary 经 ring 抓 primary 的包 → pcap | 准实时 | 旧方案，官方计划由捕获库取代 |
+
+这张表最值得判读的是「实时性」与「成熟度」这两列的错位。DPDKCap 虽然成熟度高、部署简单，却只能离线分析，无法满足「在问题发生的瞬间打开 Wireshark 看包」这类排障场景；官方 extcap 虽然提供真正的实时抓包，却带着实验特性的三重限制：平台仅 Linux 与 FreeBSD、telemetry 命令可能无预警改动、长期稳定性尚未经过多个版本验证。dpdk-pdump 处在中间，它能抓到 secondary 进程处理的包，但需要额外起进程并配置 EAL 参数，官方已明确表示长期计划是移除 pdump 与旧 dumpcap 代码、只保留新捕获库。因此选型时不应问「哪个更好」，而应先确定自己是否需要实时、是否能接受实验特性。
+
+还有两个容易混淆的点需要专门澄清。其一是 DPDK 的 `net_pcap` PMD，它的作用方向与本主题相反：它把 pcap 文件虚拟成一块网卡，供 DPDK 应用回放流量，属于「以 pcap 为输入」的测试手段，而不是「以 DPDK 为抓包源」的观测手段，两者名称相似但用途不同。其二是 PF_RING 与 ntop 生态，那是一套独立于 DPDK 的内核旁路抓包技术，虽然同样追求高速抓包并能配合 Wireshark，但既不属于 DPDK 项目，也不使用本文所说的 telemetry socket，讨论 DPDK 抓包时不应把它算作 DPDK 的一种实现。
+
+### 4. 小结：对第一个问题的回答
+
+把三层问题合起来，可以得到一个精确的回答：Wireshark 本体没有使用 DPDK 作为底层；开源社区存在 DPDK 抓包后交 Wireshark 分析的组合，典型如 DPDKCap，但它是离线两段式；DPDK 官方正在合入一套 extcap 方案，使 Wireshark 能通过外部抓包接口实时查看运行中 DPDK 应用的端口流量，这是目前最接近「用 DPDK 给 Wireshark 供包」的官方实现，但它是旁路观测而非替换抓包后端，且带有实验状态与平台限制。这个结论也解释了为什么下一节要花力气讲 extcap 的工作方式：那套机制正是理解「实时但非底层」这一看似矛盾状态的关键。
+
+## SUP-01-02 extcap 方案的工作方式
+
+### 1. 背景与动机
+
+明确了「这是外部抓包、不是底层替换」之后，真正需要理解的是这条外部链路两端各自做什么、中间靠什么连接。DPDK 官方补丁的 cover letter 用一句话概括了设计目标：从运行中的 DPDK 应用抓实时包，控制经由 telemetry socket 完成，helper 把端口呈现给 Wireshark 作为抓包接口。这句话背后有三个相互制约的工程要求，理解它们才能明白方案为什么长成现在这个样子。
+
+第一个要求是「不打扰正在跑的应用」。生产环境中的 DPDK 应用往往是转发数据面的核心进程，不能为了抓包重启它、不能要求它提前加启动参数、更不能改动源码重新编译。捕获库因此选择加载时自注册、由 telemetry 驱动的方式：库被静态链接进应用或在加载期初始化，向 telemetry 注册几条命令，之后就安静等待外部指令。这样，哪怕是已经封装好、无法改源码的厂商设备，只要它链接了相应版本的库，就有可能被外部抓包。第二个要求是「包数据不能走控制通道」。telemetry socket 的设计目标是小规模的请求与 JSON 响应，用它搬运高速包流既无带宽也无语义支持，所以包必须另寻出口，最终选择的是 pcapng 格式的 FIFO。第三个要求是「权限隔离」。DPDK 应用常以 root 运行以绑定网卡和大页，而 Wireshark 图形界面不应以 root 启动； helper 必须承担跨越这个权限边界的责任。
+
+### 2. 三方角色与两条通道
+
+整套方案由三个角色构成，中间有两条职责截然不同的通道。下图给出三方关系与通道走向。
+
+:::figure id=SUP-01-02-01 | name=extcap 三方角色与两条通道 | dir=LR
+node n1 "Wireshark GUI" blue
+node n2 "extcap helper<br/>C 程序 特权安装" teal
+node n3 "DPDK primary<br/>capture 库" amber
+node n4 "telemetry socket<br/>控制命令 不传包" gray
+node n5 "FIFO<br/>pcapng 字节流" green
+edge n1 -> n2 "extcap 命令行协议"
+edge n2 -> n3 "经 telemetry 下发命令"
+edge n3 -> n2 "返回 id 与统计"
+edge n3 -> n5 "写 pcapng"
+edge n5 -> n1 "读取并解析显示"
+:::
+
+图中节点速览：Wireshark 图形界面通过 extcap 命令行协议驱动 helper；helper 不含任何 DPDK 库依赖，只经 telemetry socket 把用户选择翻译成控制命令下发，并接收 id 与统计；DPDK primary 进程内的捕获库执行抓包、把 pcapng 字节流写入 FIFO；Wireshark 从 FIFO 另一端读取并按标准 pcapng 解析，全程不感知 DPDK 的存在。
+
+三个角色各管一段，边界相当清晰。Wireshark 只认标准 extcap 协议和 pcapng 格式，对 DPDK 一无所知。helper 是一个独立 C 程序，放在 Wireshark 的 extcap 插件目录里，它不链接任何 DPDK 库，因此可以和 Wireshark 一起打包分发；它唯一的工作是把 DPDK 端口伪装成 Wireshark 能理解的抓包接口，并把 GUI 上的选择翻译成 telemetry 命令。DPDK primary 进程里的捕获库才是真正干活的：在 ethdev 端口上挂钩子复制包、格式化成 pcapng、写进 FIFO。
+
+这里有个关键设计值得单独强调：helper 可以带权限安装，所以非 root 的 Wireshark 能抓 root DPDK 应用的包，而 Wireshark 自身不需要提权。补丁作者明确说，这是 v4 版本把 helper 从 Python 脚本重写成 C 程序的首要原因——C 程序能以受控方式安装成特权可执行文件，脚本则难以做到。这条设计直接决定了部署形态：安装就是把 helper 放进 extcap 目录并赋予相应权限，不需要给每个 Wireshark 用户 root 权限。
+
+### 3. 包在捕获库内部的流动
+
+抓包启动后，捕获库在指定端口的指定队列上安装 Rx 与 Tx 回调。注意是复制而非接管：原始 mbuf 不修改、原样回到数据路径，抓包是旁路观察。下图给出捕获库内部的流水线。
+
+:::figure id=SUP-01-02-02 | name=捕获库内部包复制流水线 | dir=LR
+node n1 "Rx/Tx 回调<br/>指定端口队列命中" teal
+node n2 "rte_pcapng_copy<br/>复制为 EPB 块" teal
+node n3 "独立 ring<br/>每路 capture 一份" amber
+node n4 "capture 线程<br/>排空 ring 并写" purple
+node n5 "FIFO<br/>pcapng 输出" green
+node n6 "原 mbuf<br/>不改 返回数据面" gray
+edge n1 -> n2 "命中即复制"
+edge n2 -> n3 "入队"
+edge n3 -> n4 "drain"
+edge n4 -> n5 "阻塞写"
+edge n1 -> n6 "旁路 不干扰"
+:::
+
+图中节点速览：数据包在指定端口队列上触发 Rx 或 Tx 回调；回调用 rte_pcapng_copy 把包复制成已格式化为 Enhanced Packet Block 的新 mbuf，投入该路 capture 独享的 ring；专用捕获线程排空 ring 并写入 FIFO；原始 mbuf 不做任何修改、原样返回转发路径，因此抓包是旁路观察而非接管数据面。
+
+图中有几个机制点必须讲透。第一是背压设计：回调只做「复制并入队」，绝不阻塞数据面；真正可能阻塞的是捕获线程写 FIFO，FIFO 被设为阻塞模式，若 Wireshark 读得慢，写线程会堵住，但 DPDK 转发不受影响。代价是 ring 已满或 mbuf 分配失败时会丢包并计数，计数可通过统计命令查询。第二是多路并存：同一个端口、同一个队列上可以同时跑多路 capture，每路有独立的 id、过滤器、ring、输出和回调，停掉一路不影响其他。第三是过滤在复制之前：每路 capture 各自运行 libpcap 过滤表达式（编译成 eBPF，带 JIT），只有匹配的包才被复制，避免无谓的内存与写盘开销。
+
+### 4. 控制面：telemetry 命令与参数
+
+捕获库在加载时向 telemetry 注册四条命令，任何 telemetry 客户端都能驱动，不限于 helper。下表按补丁文档原文列出命令、参数与作用。
+
+| 命令 | 参数 | 作用 |
+|---|---|---|
+| /ethdev/capture/start | 端口 id 加 name=value 选项 | 启动一路抓包，返回 capture id |
+| /ethdev/capture/stop | capture id | 停止指定抓包 |
+| /ethdev/capture/list | 无 | 列出当前所有抓包 |
+| /ethdev/capture/stats | capture id | 查询收发与丢包统计 |
+
+start 命令的选项在补丁文档中有明确定义，逐项列出如下。这些选项共同决定了抓包的形态与开销，是日常使用最常打交道的部分。
+
+| 选项 | 取值与默认 | 说明 |
+|---|---|---|
+| out=path | 必需，FIFO 或空普通文件 | 路径必须预先存在且不能以追加方式写 |
+| snaplen=n | 默认 262144，0 表示整包 | 每包截取的字节数 |
+| queue=n | 默认端口全部队列 | 只抓指定硬件队列 |
+| filter=expr | libpcap 表达式 | 编译为 eBPF 后逐包匹配 |
+
+参数用逗号分隔，所以路径和过滤表达式里都不能出现逗号；整串上限为 1024 字节。成功时响应里带 capture id，用于后续停止与查询；失败时返回 error 字符串。由于 pcapng 文件以 section header 与 interface description block 开头、捕获库会在第一个包之前写入这两块，输出到普通文件时必须是空文件，不能追加到已有内容之后。这些 telemetry 命令被官方标注为实验性，未来版本可能无预警改动，这是选型时必须接受的前提。
+
+### 5. 一次抓包的完整时序
+
+把命令行交互串起来，一次完整抓包经过如下几个阶段。下面的序列是依据 extcap 通用协议与补丁描述整理的时序示意，具体命令输出格式需对照实际版本核验。
+
+```text
+1. Wireshark -> helper: dpdk-wireshark-extcap --extcap-interfaces
+   helper -> telemetry: 查询运行中的 DPDK 应用与 ethdev 端口
+   helper -> Wireshark: 每个端口列为一个可抓包接口
+
+2. Wireshark -> helper: --extcap-dlts / --extcap-config
+   helper -> Wireshark: 链路类型与可配参数(端口/队列/snaplen/过滤)
+
+3. Wireshark: 创建 FIFO，调用 --capture --fifo=<path>
+   helper -> telemetry: /ethdev/capture/start out=<fifo>,...
+   telemetry -> helper: {"id": 3}
+
+4. DPDK capture 库: 安装回调 -> 复制包 -> 写 pcapng 到 FIFO
+   Wireshark: 从 FIFO 读取并实时解析显示
+
+5. 用户停止:
+   helper -> telemetry: /ethdev/capture/stop 3
+   Wireshark: 关闭 FIFO，结束本次抓包
+```
+
+【输出判读】上面第 1 步之所以要先列接口，是因为 Wireshark 的接口下拉框必须在用户点选之前填充完毕；若列表为空，补丁作者提示原因会写到 stderr，而 Wireshark 图形界面默认隐藏 stderr，因此排障时应改在命令行手工执行 `dpdk-wireshark-extcap --extcap-interfaces` 观察错误，这是最常见的「接口列表空空如也」问题的定位方法。第 3 步是全链路的关键：helper 只把 `out=<fifo>` 等控制参数送进 telemetry，一旦拿到 id 就完成使命，此后没有任何包数据经过 telemetry socket——这正是方案能同时做到实时抓包与不干扰数据面的根本原因。第 4 步中若 Wireshark 解析出错，多半是 pcapng 块被截断或 FIFO 读取端提前关闭，应检查是否有另一路进程占用同一 FIFO。第 5 步停止时必须传回正确的 capture id，若 id 写错，响应会带 error 字符串而不是静默成功，调用方应检查返回值而非假设停止一定生效。整组命令里出现的 `id`、`queue`、`filter` 等字段都是补丁文档中的实验性定义，正式部署前应对照所检出版本的 `doc/guides/tools/wireshark_extcap.rst` 核验。
+
+### 6. 边界与限制
+
+第一，抓包只能在 primary 进程启动，但 secondary 进程处理的包也能被抓到——这部分复用 pdump 的 EAL IPC 通知机制。第二，过滤依赖 DPDK 编译时带 libpcap，否则带 filter 的抓包会因表达式无法编译而启动失败；整个捕获库也可用构建选项从产物中排除。第三，仅支持 Linux 与 FreeBSD：Windows 上 telemetry 没有 socket server，且 `SOCK_SEQPACKET` 依赖的语义 Windows 的 AF_UNIX 不支持，若要移植必须改成流 socket 并自行给回复加帧，这正是 extcap 方案标注平台限制的底层原因。第四，安装方式虽然极简，但 helper 的特权安装本身需要运维流程配合，不能简单理解为「拷一个文件即可」。第五，长期路线是用捕获库取代 pdump 与旧 dumpcap，但补丁作者明说要几个版本才能稳定，不宜把实验特性直接等同于生产可用。
+
+## SUP-01-03 telemetry socket 是什么
+
+### 1. 定义与存在理由
+
+telemetry socket 是 DPDK 给自己开的带内管理通道：每个运行中的 DPDK 应用进程内部起一个 telemetry server，对外暴露一个 Unix domain socket，外部工具通过「命令字符串请求、JSON 响应」的方式查询和控制这个进程。它属于 DPDK 的 telemetry 库（`lib/telemetry`），默认随应用启用。
+
+这个东西的存在有很强的针对性。DPDK 应用把网卡从内核接管到自己手里轮询，传统的 ifconfig、ethtool、sysfs、netlink 那套观测手段大多失效——内核已经看不到被 VFIO/UIO 接管的设备，也就无从提供统计。于是 DPDK 必须自带一个观测口子。若读者熟悉 wireguard-linux 那套通过 sysfs 属性与 netlink 通用族暴露配置的机制，可以把 telemetry socket 理解为同一类问题在用户态旁路架构下的不同解法：目标都是让外部能安全地查询进程内部状态，只是一个走内核提供的接口，一个进程自己监听 socket。下图给出 telemetry socket 在整体结构中的位置与命令分发关系。
+
+:::figure id=SUP-01-03-01 | name=telemetry socket 结构与命令分发 | dir=LR
+node n1 "客户端工具<br/>dpdk-telemetry.py" blue
+node n2 "Unix socket 文件<br/>dpdk_telemetry.v2" teal
+node n3 "telemetry 库 server<br/>分发并序列化 JSON" amber
+node n4 "ethdev 命令" green
+node n5 "eal 命令" green
+node n6 "capture 命令" green
+edge n1 -> n2 "连接 AF_UNIX"
+edge n2 -> n3 "命令字符串"
+edge n3 -> n4 "回调取统计"
+edge n3 -> n5 "回调取参数"
+edge n3 -> n6 "回调启停抓包"
+:::
+
+图中节点速览：客户端工具通过 AF_UNIX socket 文件连接到 DPDK primary 进程内的 telemetry 库；库把收到的命令字符串分发给各库注册的回调，例如 ethdev 统计、EAL 参数以及捕获库的启停命令；回调用数据构造 API 填写结构化结果，由 telemetry 库统一序列化成 JSON 后沿原连接返回。
+
+### 2. socket 类型、路径与开关
+
+从 DPDK 官方文档可以确认三个基础事实。其一是类型：这是一个 Unix domain socket（AF_UNIX），使用 `SOCK_SEQPACKET`，面向连接、保序、保留消息边界，一条请求对应一条响应，不像 TCP 字节流需要自行分帧。其二是路径：形如 `<runtime_dir>/dpdk_telemetry.<version>`，当前版本为 v2，root 运行时典型路径是 `/var/run/dpdk/rte/dpdk_telemetry.v2`；用 `--file-prefix=tpmd` 启动会落到 `/var/run/dpdk/tpmd/` 下；多个进程共用运行目录时，第二个及以后会加 `:1`、`:2` 后缀，客户端用 `-f` 或 `-i` 选择目标。其三是开关：库默认启用，也可用 `--telemetry` 显式打开（兼容旧接口语义），或用 `--no-telemetry` 关闭；构建层面还有对应的配置宏控制是否编入。
+
+多实例选择是实际运维里的高频点。当机器上同时跑着多个 DPDK 应用时，若它们使用了不同的 file-prefix，客户端用 `-f <prefix>` 指向对应运行目录；若它们共用同一前缀或用了 `--in-memory` 而共享运行目录，则由后缀区分，客户端用 `-i <n>` 选择。列出所有启用 telemetry 的 file-prefix 可用 `-l` 选项。这些客户端选项属于 04 册所说的工具命令范畴，此处只做与抓包相关的最小引用，完整命令族见 04 全册。
+
+### 3. 协议：命令字符串进，JSON 出
+
+协议本身相当朴素：请求是一行纯文本，命令与参数用逗号分隔；响应是 JSON。库与应用开发者通过 `rte_telemetry_register_cmd()` 注册命令，路径形如 `/library/command`，并提供 `telemetry_cb` 类型的回调与帮助文本。下面的 C 代码片段来自官方文档给出的注册与回调示例，展示了命令注册的典型写法。
+
+```c
+typedef int (*telemetry_cb)(const char *cmd, const char *params,
+                            struct rte_tel_data *info);
+
+static int handle_example_cmd(const char *cmd, const char *params,
+                              struct rte_tel_data *d)
+{
+    /* 校验并解析 params，例如端口 id */
+    /* 用 rte_tel_data_start_dict / rte_tel_data_add_dict_int 填数据 */
+    return 0;
+}
+
+rte_telemetry_register_cmd("/example_lib/example", handle_example_cmd,
+                           "Returns an example. Takes no parameters");
+```
+
+【输出判读】这段示例中，回调签名三个参数分别对应命令名、参数字符串与待填充的数据结构，官方明确要求回调自行校验并转换 params（例如把字符串转成合法端口 id 后用 `rte_eth_dev_is_valid_port` 检查），不要假设输入合法。数据结构通过 `rte_tel_data_start_dict`、`rte_tel_data_start_array` 以及一组 `add_dict_*`、`add_array_*` 函数填写，telemetry 库随后负责把结构序列化成 JSON——这意味着开发者不需要手工拼接 JSON 字符串，也降低了格式出错的风险。注册时提供的帮助文本会被 `/help` 命令读取，因此帮助文本写得是否准确，直接决定客户端能否自助发现命令的参数要求。捕获库的四条 `/ethdev/capture/*` 命令正是按这套机制注册的，这也是 helper 能与既有 telemetry 客户端无缝协作的原因。
+
+实际交互可以用官方客户端脚本观察，下面的输出为文档示例，具体字段格式需对照实际版本核验。
+
+```text
+Connecting to /var/run/dpdk/rte/dpdk_telemetry.v2
+{"version": "DPDK 20.05.0-rc2", "pid": 60285, "max_output_len": 16384}
+--> /
+{"/": ["/", "/eal/app_params", "/eal/params", "/ethdev/list",
+       "/ethdev/link_status", "/ethdev/xstats", "/help", "/info"]}
+--> /ethdev/list
+{"/ethdev/list": [0, 1]}
+--> /ethdev/xstats,0
+{"/ethdev/xstats": {"rx_good_packets": 0, "tx_good_packets": 0,
+                    "rx_missed_errors": 0, ...}}
+--> /help,/ethdev/xstats
+{"/help": {"/ethdev/xstats": "Returns the extended stats for a port. Parameters: int port_id"}}
+```
+
+【输出判读】连接建立时打印的首行 JSON 给出版本、进程 id 与最大输出长度，其中 `max_output_len` 决定了单次响应能返回多少数据，批量拉取统计时要留意截断风险。输入 `/` 会列出当前注册的全部命令，这是判断某个库是否被编入、某条命令是否可用的最快方法——若 `/ethdev/capture/*` 不在列表中，说明捕获库未启用或版本不支持。`/ethdev/list` 返回端口 id 数组，正是 extcap helper 填充接口列表的数据来源。`/ethdev/xstats,0` 展示带参数的调用方式，命令与参数之间用逗号而非空格分隔，这是 telemetry 协议与 shell 命令容易混淆之处。`/help,/ethdev/xstats` 展示如何自助查询参数要求，注意这里同样用逗号分隔。较新的版本还提供 `FOREACH` 复合查询（形如 `FOREACH i /ethdev/list /ethdev/info,$i .name`）与别名字段，便于一次性拉取多个端口的同类统计，属于效率工具而非协议核心。
+
+### 4. 与 extcap 方案的关系及限制
+
+上一节讲的抓包库完全复用这条已有的带内通道：它注册四条 `/ethdev/capture/*` 命令，helper 连上 socket 发命令即可，不需要给应用增加 EAL 参数、不需要改源码，甚至可以对已经运行、封装好的厂商设备发起抓包。而包数据刻意不经过它——`SOCK_SEQPACKET` 适合传小控制消息和 JSON，不适合扛高速包流，这正是数据面必须另走 FIFO 的原因之一。可以说，没有 telemetry socket 这条稳定的带内通道，extcap 方案「不改应用即可抓包」的核心优势就不成立。
+
+最后一个值得记住的限制是 Windows 支持缺失。历史上 telemetry 在 Windows 没有 socket server，且 `SOCK_SEQPACKET` 所依赖的语义 Windows AF_UNIX 不支持；要移植必须改成流 socket 并给回复加帧。这既是 telemetry 自身的平台限制，也是上一节 extcap 方案标注「仅 Linux 与 FreeBSD」的底层原因。对使用 Windows 作为抓包站的团队，当前只能选择 DPDKCap 这类「先在 Linux 侧抓成文件、再到 Windows 用 Wireshark 打开」的两段式流程，或等待官方补齐 Windows 传输层。
+
+### 5. 小结与延伸阅读
+
+本篇从三个问题出发，得到一条完整结论链。第一问的答案是 Wireshark 本体没有把 DPDK 作为抓包后端，开源社区的组合方案以 DPDKCap 为代表但只能离线分析，官方正在合入的 extcap 方案才提供实时能力。第二问的答案落在三方角色与两条通道上：Wireshark 只处理标准 pcapng，helper 无 DPDK 依赖并经 telemetry 下发控制命令，捕获库在 ethdev 上旁路复制包并写入 FIFO；控制与数据分离、复制而非接管、特权 helper 隔离，是这套方案的三个设计支点。第三问的答案指向 telemetry 库本身：它是用户态旁路架构下的带内观测通道，用 AF_UNIX 的 `SOCK_SEQPACKET` 承载命令字符串与 JSON 响应，默认启用、按 file-prefix 与实例后缀寻址，正是它让「不改应用即可抓包」成为可能，也正是它的 Windows 缺失限制了方案的平台覆盖。
+
+延伸阅读建议按以下顺序：先看所检出版本的 `doc/guides/howto/telemetry.html` 与 `doc/guides/prog_guide/telemetry_lib.html`，掌握命令全集与回调 API；再看 `doc/guides/tools/wireshark_extcap.rst` 与 `doc/guides/prog_guide/capture_lib.rst`，核对 helper 命令行与捕获库命令的最新定义；最后对照 DPDK 邮件列表中该补丁系列的最新版本，确认其合入状态与变更。凡本篇标注为实验性的命令、参数与限制，在生产环境采用前一律以所用版本的源码与官方文档为准。本篇不重复 04 册的工具命令全集、06 册的机制原理与 07 册的库功能清单，涉及相关主题时按交叉引用口径处理（命令见 04 全册 ｜ 原理见 06 全册 ｜ 模块见 07 全册）。
+
