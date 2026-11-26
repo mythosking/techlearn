@@ -1,0 +1,1812 @@
+# Squid 技术资料 · 06 技术原理与模块特性
+
+> 本篇由原「06 技术原理」与「07 模块与特性介绍」合并而成，共 30 篇。
+> 篇号保留 06-xx / 07-xx 两段编号，以维持各册交叉引用、图号与 draw.io 源文件不变。
+> 06 段讲机制与调用链，07 段讲模块功能与组网；本册为两者的唯一权威源。
+## 06-01 事件驱动主循环
+
+### 1. 背景与动机
+
+单台 Squid 经常要维持数万并发连接。为每个连接建线程会因上下文切换和内存开销而崩溃，Squid 采用单进程事件驱动：一个主循环监听所有描述符，谁就绪处理谁。理解它是理解「异步 I/O」「磁盘后端」「SMP」的前提。
+
+### 2. 核心概念
+
+- **文件描述符（fd）**：网络套接字、磁盘文件、管道都抽象为 fd。
+- **事件循环**：等待一组 fd 就绪，对每个就绪 fd 调用注册的处理函数。
+- **异步回调**：操作不会立即完成，完成时通过回调继续处理。
+- **Comm 层**：Squid 对描述符与异步读写的封装（字段见 `05-04`）。
+
+### 3. 关键流程
+
+主循环大意：检查定时器 → 轮询就绪的 fd → 分发到对应处理函数 → 处理回调队列 → 回到等待。网络请求进来、DNS 应答、磁盘读写完成，都是推动循环的事件。
+
+:::figure id=06-01-01 | name=事件驱动主循环 | dir=TD
+node n1 "等待事件<br/>select/poll/epoll" blue
+node n2 "fd 就绪<br/>分发回调" teal
+node n3 "处理请求/响应" purple
+node n4 "发起异步操作<br/>磁盘/DNS/网络" amber
+node n5 "定时器到期<br/>周期任务" gray
+edge n1 -> n2
+edge n2 -> n3
+edge n3 -> n4
+edge n4 -> n1 dashed "完成事件"
+edge n5 -> n3 dashed "定时触发"
+:::
+
+图中节点速览：循环在等待与处理之间往复，异步操作完成后以事件形式回到循环。
+
+### 4. 源码位置
+
+| 关注点 | 源码位置线索 | 说明 |
+|---|---|---|
+| 主循环 | src/main.cc、src/comm/ | 循环启动与事件分发 |
+| 描述符封装 | src/comm/ | 具体位置核验 |
+| 定时器 | src/ | timer 相关 |
+
+### 5. 陷阱与最佳实践
+
+- 阻塞操作会卡住整个循环，因此磁盘 I/O 必须异步化（见 `06-03`）。
+- 调试日志级别过高会显著拖慢循环，生产环境勿长期开高 d 级别。
+- 单个慢客户端可能长期占用描述符，需配合超时配置。
+
+### 6. 小结
+
+事件驱动是 Squid 高并发的基石。下一步 `06-02` 看在这个循环之上如何判定缓存新鲜度。
+
+---
+
+## 06-02 HTTP 缓存机制
+
+### 1. 背景与动机
+
+缓存的核心难题是「这个响应能不能复用、能复用多久」。答错会导致用户看到过期内容或命中率为零。Squid 按 HTTP 缓存规范结合本地 refresh_pattern 规则做判定。
+
+### 2. 核心概念
+
+- **新鲜（fresh）**：缓存副本未过期，可直接使用。
+- **陈旧（stale）**：副本过期，需要向源站校验。
+- **校验（validation）**：用 If-Modified-Since 或 If-None-Match 询问源站，源站答 304 表示副本仍可用。
+- **可缓存性**：响应头（Cache-Control、Expires、状态码）决定是否允许缓存。
+
+### 3. 判定流程
+
+收到请求后：查缓存键 → 找到条目 → 计算新鲜度 → 若新鲜直接命中返回 → 若陈旧发起条件请求校验 → 源站 304 则刷新元数据后命中 → 源站 200 则用新响应替换。新鲜度计算综合响应头与 refresh_pattern（指令见 `04-04`）。
+
+:::figure id=06-02-01 | name=缓存新鲜度判定流程 | dir=TD
+node n1 "收到请求" blue
+node n2 "查缓存条目" teal
+node n3 "计算新鲜度" purple
+node n4 "是否新鲜?" amber
+node n5 "直接命中返回" green
+node n6 "条件请求校验" gray
+node n7 "源站 304" teal
+node n8 "源站 200" red
+edge n1 -> n2
+edge n2 -> n3
+edge n3 -> n4
+edge n4 -> n5 "是"
+edge n4 -> n6 "否"
+edge n6 -> n7
+edge n6 -> n8
+edge n7 -> n5
+edge n8 -> n5 dashed "替换后返回"
+:::
+
+图中节点速览：新鲜直接返回，陈旧走校验，304 复用、200 替换。
+
+### 4. 影响可缓存性的因素
+
+| 因素 | 影响 |
+|---|---|
+| Cache-Control: no-cache/no-store | 禁止或限制缓存 |
+| Cache-Control: private | 仅私有缓存可存 |
+| Expires | 明确过期时间 |
+| Last-Modified | 参与新鲜度百分比计算 |
+| ETag | 校验标识 |
+| Set-Cookie | 常导致不可缓存 |
+| 状态码 | 200/203/304 等可缓存，500 等通常不缓存 |
+
+### 5. 陷阱与最佳实践
+
+- 动态页面带个性化 Cookie，默认不应缓存，否则张冠李戴。
+- refresh_pattern 与源站 Cache-Control 冲突时，取决于指令选项（如 ignore-reload、override-reload）。
+- 命中率低先看结果码分布（见 `05-05`），再回头查响应头与规则。
+
+### 6. 小结
+
+缓存机制 = 可缓存性 + 新鲜度 + 校验。三者共同决定命中行为。下一步 `06-03` 看命中的对象如何存储与淘汰。
+
+---
+
+## 06-03 缓存置换与存储引擎
+
+### 1. 背景与动机
+
+缓存空间有限，必须决定「存什么、放哪、满了淘汰谁」。Squid 把问题拆成两层：置换策略决定淘汰顺序，存储引擎决定物理落盘方式。
+
+### 2. 置换策略
+
+| 策略 | 全称 | 思路 | 特点 |
+|---|---|---|---|
+| LRU | 最近最少使用 | 淘汰最久未访问的 | 简单，经典 |
+| GDSF | 贪婪双尺寸频率 | 综合大小、频率、新鲜度 | 命中率较好 |
+| LFUDA | 最少使用动态老化 | 兼顾访问频率与老化 | 大对象友好 |
+
+策略通过 cache_replacement_policy 等指令配置（见 `04-04`），不同版本支持的策略名有差异。
+
+### 3. 存储引擎
+
+| 引擎 | 特点 | 适用 |
+|---|---|---|
+| UFS | 传统文件系统目录树 | 通用、稳定 |
+| AUFS | 异步 I/O 的 UFS 变体 | 减少阻塞 |
+| diskd | 独立进程做磁盘 I/O | 高并发写 |
+| rock | 单文件存储，适合 SSD | 大容量、小文件 |
+| coss | 循环覆盖日志式（部分版本） | 特定场景 |
+
+### 4. 关键流程
+
+对象写入时先选置换策略决定是否有空间；存储引擎把对象落盘；空间达高水位（cache_swap_high）触发淘汰，按置换顺序删除到低水位（cache_swap_low）。
+
+:::figure id=06-03-01 | name=缓存存储与置换流程 | dir=TD
+node n1 "对象待写入" blue
+node n2 "置换策略<br/>决定空间" teal
+node n3 "存储引擎<br/>落盘" purple
+node n4 "水位检查" amber
+node n5 "触发淘汰<br/>按策略删除" red
+node n6 "缓存可用" green
+edge n1 -> n2
+edge n2 -> n3
+edge n3 -> n4
+edge n4 -> n5 "达高水位"
+edge n5 -> n4
+edge n4 -> n6 "正常"
+:::
+
+图中节点速览：写入经由策略与引擎，水位过高时循环淘汰直到回落。
+
+### 5. 陷阱与最佳实践
+
+- rock 引擎适合 SSD 与小对象，机械盘上表现未必好。
+- 置换策略名和参数随版本变化，配置前核验 `squid.conf.documented`。
+- 缓存目录的二级目录数量影响单目录文件数，规划容量时一并考虑。
+
+### 6. 小结
+
+置换解决「淘汰谁」，引擎解决「怎么存」。下一步 `06-04` 看 DNS 与转发路径如何决定请求去向。
+
+---
+
+## 06-04 DNS 解析与转发路径
+
+### 1. 背景与动机
+
+拿到请求后，Squid 必须决定「发给谁」。这涉及域名解析与转发规则两步。理解它才能解释为什么改了 hosts 不生效、为什么请求走了意料之外的出口。
+
+### 2. 核心概念
+
+- **内部 DNS 客户端**：Squid 自带 DNS 解析器，通过 dns_nameservers 配置（见 `04-02`），不完全依赖系统解析。
+- **转发决策**：根据请求目标、cache_peer 配置、访问控制决定直连还是转发给邻居。
+- **直连（DIRECT）**：Squid 自己解析并连接源站。
+- **邻居转发**：发给父级或同级（见 `06-05`）。
+
+### 3. 关键流程
+
+请求目标若是主机名，先查内部 DNS；得到地址后结合 cache_peer 与转发规则选目标；若为 DIRECT 则自己建连，否则发给选中的邻居。日志的层级码记录结果（见 `05-05`）。
+
+:::figure id=06-04-01 | name=DNS 与转发决策路径 | dir=TD
+node n1 "请求目标" blue
+node n2 "是否主机名?" teal
+node n3 "内部 DNS 解析" purple
+node n4 "转发规则匹配" amber
+node n5 "直连源站" green
+node n6 "转发给邻居" gray
+edge n1 -> n2
+edge n2 -> n3 "是"
+edge n2 -> n4 "已是地址"
+edge n3 -> n4
+edge n4 -> n5 "DIRECT"
+edge n4 -> n6 "peer"
+:::
+
+图中节点速览：先解析目标，再按规则在直连与邻居转发间选择。
+
+### 4. 源码位置
+
+| 关注点 | 源码位置线索 |
+|---|---|
+| DNS 客户端 | src/dns/ 相关 |
+| 转发状态机 | FwdState（见 `05-04`） |
+| 邻居选择 | src/neighbors/ 相关 |
+
+### 5. 陷阱与最佳实践
+
+- 修改系统 hosts 未必影响 Squid，因为它用自己的 DNS 客户端；必要时配 dns_nameservers 或 hosts_file 指令。
+- DNS 服务器不可达会导致大量请求挂起，需监控 DNS 健康。
+- 转发规则顺序与 always_direct、never_direct 等指令影响最终去向，配置见 `04`。
+
+### 6. 小结
+
+转发路径 = 解析 + 规则选择。下一步 `06-05` 深入邻居之间如何协作。
+
+---
+
+## 06-05 缓存层级协议
+
+### 1. 背景与动机
+
+多台 Squid 组成层级时，子级如何知道父级或同级是否已有某对象？盲目转发会浪费带宽。Squid 用 ICP、HTCP 与缓存摘要解决「邻居有没有这个对象」的查询问题。
+
+### 2. 核心概念
+
+| 协议/机制 | 全称 | 作用 | 承载 |
+|---|---|---|---|
+| ICP | Internet Cache Protocol | 轻量查询邻居是否有对象 | UDP |
+| HTCP | Hypertext Cache Protocol | 更丰富的缓存查询与失效 | UDP/TCP |
+| CARP | Cache Array Routing Protocol | 确定性哈希分配请求到邻居 | 哈希算法 |
+| cache digest | 缓存摘要 |  neighbors 广播自己有什么 | 周期性交换 |
+
+### 3. 关键流程
+
+子级收到请求：按严格层级规则先向同级发 ICP 查询（UDP，快速）→ 若有邻居命中则向其取 → 否则向父级取或直连。CARP 则用 URL 哈希直接确定目标邻居，无需逐次查询。缓存摘要让子级在本地即可判断邻居是否可能有对象，减少查询流量。
+
+:::figure id=06-05-01 | name=缓存层级查询流程 | dir=TD
+node n1 "子级收到请求" blue
+node n2 "查缓存摘要" teal
+node n3 "发 ICP/HTCP 查询" purple
+node n4 "邻居有对象?" amber
+node n5 "向邻居取" green
+node n6 "向父级/直连" gray
+edge n1 -> n2
+edge n2 -> n3
+edge n3 -> n4
+edge n4 -> n5 "有"
+edge n4 -> n6 "无"
+:::
+
+图中节点速览：利用摘要与查询协议尽量避免无效转发。
+
+### 4. 源码位置与指令
+
+- 邻居结构与状态见 `05-04`。
+- 相关配置指令（cache_peer、no-query、digest 相关）见 `04`。
+- 实现线索在 src/neighbors/ 与 ICP/HTCP 相关文件，精确位置需核验。
+
+### 5. 陷阱与最佳实践
+
+- ICP 基于 UDP，防火墙要放行对应端口（默认 3130），否则邻居永远不可达。
+- no-query 模式下不发查询，直接转发，配置简单但失去层级命中优势。
+- 严格层级（hierarchy_stoplist）配置过强会导致本可命中的请求直连。
+
+### 6. 小结
+
+层级协议用查询与摘要减少回源。下一步 `06-06` 看 HTTPS 与 SSL-Bump 原理，这是现代部署的难点。
+
+---
+
+## 06-06 HTTPS 与 SSL-Bump 原理
+
+### 1. 背景与动机
+
+HTTPS 流量是加密的，Squid 默认只能看到连接目标，无法缓存内容或做基于 URL 的控制。SSL-Bump（TLS 拦截）让 Squid 解密流量、处理后再加密转发，从而恢复可见性。这项能力强大但涉及隐私与合规边界，必须谨慎。
+
+### 2. 核心概念
+
+- **peek**：先看客户端 ClientHello，了解目标与证书信息，不解密。
+- **splice**：不解密，直接透传连接。
+- **bump**：解密流量，Squid 充当中间人。
+- **stare**：直接向源站发起连接观察其证书。
+
+### 3. 分阶段处理
+
+SSL-Bump 分三个 step：
+
+| 阶段 | 时机 | 可选动作 |
+|---|---|---|
+| step1 | 收到 ClientHello | peek / splice |
+| step2 | 拿到源站证书后 | peek / stare / splice / bump |
+| step3 | 生成并伪造证书给客户端 | bump / splice |
+
+解密后 Squid 用自签 CA 向客户端签发伪造证书，客户端必须信任该 CA，否则报证书告警。
+
+:::figure id=06-06-01 | name=SSL-Bump 三阶段决策 | dir=TD
+node n1 "ClientHello<br/>step1" blue
+node n2 "peek 观察" teal
+node n3 "源站证书<br/>step2" purple
+node n4 "决策" amber
+node n5 "splice<br/>不解密透传" gray
+node n6 "bump<br/>解密中间人" red
+edge n1 -> n2
+edge n2 -> n3
+edge n3 -> n4
+edge n4 -> n5
+edge n4 -> n6
+:::
+
+图中节点速览：step1/2 收集信息，最终在 splice（透传）与 bump（解密）间抉择。
+
+### 4. 源码位置与配置
+
+- 实现线索在 src/ssl/ 与 src/ssl/ 相关子目录，精确位置需核验。
+- 配置模板与动作指令见 `07-02`（模块篇），证书生成辅助程序见 `07-08`。
+
+### 5. 陷阱与最佳实践
+
+- 客户端不信任伪造 CA 会大面积证书报错，部署前须分发 CA 并做好沟通。
+- bump 解密消耗大量 CPU，容量规划要留足余量。
+- 合规优先：哪些流量可解密需明确授权，不应默认全量 bump。
+
+### 6. 小结
+
+SSL-Bump 用分阶段决策平衡可见性与侵入性，本质是受控的中间人。模块配置见 `07-02`。
+
+---
+
+## 06-07 认证与访问控制匹配原理
+
+### 1. 背景与动机
+
+访问控制决定「谁能在什么条件下访问什么」。Squid 把问题拆成 ACL 元素定义与规则匹配两层，认证则为规则提供用户身份。理解匹配逻辑，才能解释规则为什么没生效。
+
+### 2. 核心概念
+
+- **ACL 元素**：一个命名条件（如 src 网段），可被多条规则引用。
+- **ACL 组合**：同一规则行的多个 ACL 之间是「与」关系；取反用 !。
+- **规则列表**：http_access 等规则从上到下匹配，首条命中即决定结果。
+- **认证框架**：auth_param 定义方案，proxy_auth ACL 要求登录身份。
+
+### 3. 匹配流程
+
+对每个请求：按顺序遍历 http_access 规则 → 对每条规则计算其 ACL 组合（全真才匹配）→ 首条匹配的规则决定 allow 或 deny → 若规则含 proxy_auth 则检查认证状态。
+
+:::figure id=06-07-01 | name=访问控制匹配流程 | dir=TD
+node n1 "请求到达" blue
+node n2 "取第一条规则" teal
+node n3 "计算 ACL 组合" purple
+node n4 "匹配?" amber
+node n5 "allow/deny<br/>终止" green
+node n6 "取下一条规则" gray
+node n7 "全部未匹配<br/>用默认" red
+edge n1 -> n2
+edge n2 -> n3
+edge n3 -> n4
+edge n4 -> n5 "命中"
+edge n4 -> n6 "未命中"
+edge n6 -> n2
+edge n6 -> n7 "到末尾"
+:::
+
+图中节点速览：规则逐条匹配，命中即终止，末尾兜底。
+
+### 4. 指令与源码位置
+
+- 指令写法见 `04-03`，ACL 类型族见 `07-01`。
+- 实现线索在 src/acl/ 与认证相关目录，精确位置需核验。
+
+### 5. 陷阱与最佳实践
+
+- 「首条命中生效」意味着顺序就是策略，最具体的规则应放最前。
+- 多个 ACL 是与关系，不是或；要表达或需拆成多条 allow 规则。
+- 认证失败与访问拒绝是不同结果，排障时看日志区分。
+
+### 6. 小结
+
+匹配逻辑 = ACL 组合 + 顺序短路。以上是技术原理段；下面进入模块与特性段，按模块讲功能与组网。
+## 07-01 访问控制与认证模块
+
+### 1. 背景与动机
+
+访问控制是 Squid 最常用的功能模块，决定谁能访问什么。本篇讲模块能力、类型族与组网用法；指令写法查 `04-03`，匹配原理见 `06-07`，不重复。
+
+### 2. ACL 类型族
+
+| 类型族 | 代表类型 | 匹配对象 |
+|---|---|---|
+| 地址类 | src、dst、myip | IP 地址与网段 |
+| 域名类 | dstdomain、srcdomain | 域名 |
+| 端口协议类 | port、proto、method | 端口、协议、方法 |
+| 内容类 | url_regex、urlpath_regex、req_header、rep_header | URL 与头部 |
+| 时间类 | time | 时间段 |
+| 身份类 | proxy_auth、user、ext_user | 用户身份 |
+| 连接类 | maxconn、src_as、dst_as | 连接数与自治域 |
+| 外部类 | external_acl_type | 自定义外部匹配 |
+
+### 3. 认证方案
+
+| 方案 | 特点 | 适用 |
+|---|---|---|
+| basic | 明文传输密码，需配合 TLS | 简单场景 |
+| digest | 挑战应答，不明文传密码 | 较安全 |
+| ntlm | 与 Windows 集成 | 域环境 |
+| negotiate | Kerberos/GSSAPI，单点登录 | 企业域 |
+
+### 4. 典型组网
+
+企业出口常见组合：内网用户走代理 → 按 ACL 分组 → 组 A 全放行、组 B 仅工作时间、访客需认证 → 拒绝其余。认证辅助程序对接 LDAP 或 AD。
+
+:::figure id=07-01-01 | name=访问控制与认证模块组合 | dir=TD
+node n1 "用户请求" blue
+node n2 "地址/时间 ACL" teal
+node n3 "是否需认证?" amber
+node n4 "认证辅助程序<br/>LDAP/AD" purple
+node n5 "内容 ACL 过滤" green
+node n6 "放行/拒绝" gray
+edge n1 -> n2
+edge n2 -> n3
+edge n3 -> n4 "是"
+edge n4 -> n5
+edge n3 -> n5 "否"
+edge n5 -> n6
+:::
+
+图中节点速览：先按属性分组，必要时认证，再内容过滤，最终放行或拒绝。
+
+### 5. 陷阱与最佳实践
+
+- basic 认证不加密，必须配合 https_port 或放在可信网络。
+- 外部 ACL 类型依赖辅助程序性能，慢辅助会拖慢所有请求。
+- 规则顺序即策略，具体规则在前（详见 `06-07`）。
+
+### 6. 小结
+
+访问控制模块的能力在类型族与认证方案的组合。写法见 `04-03`。
+
+---
+
+## 07-02 SSL-Bump 与 HTTPS 拦截模块
+
+### 1. 背景与动机
+
+SSL-Bump 是 Squid 处理 HTTPS 的核心模块，能解密流量做缓存与内容控制。原理分阶段见 `06-06`，本篇讲模块配置形态与部署边界。
+
+### 2. 模块组成
+
+| 组成 | 作用 |
+|---|---|
+| 证书生成 | 用自签 CA 伪造站点证书 |
+| 拦截规则 | ssl_bump 系列指令决定 peek/splice/bump |
+| 证书数据库 | 缓存生成过的伪造证书 |
+| 错误处置 | sslproxy_cert_error 处理证书异常 |
+
+### 3. 典型配置形态
+
+```text
+# 配置片段 · squid.conf（SSL-Bump 要点，参数名需核验）
+https_port 3129 intercept ssl-bump tls-cert=/etc/squid/ca.pem
+acl step1 at_step SslBump1
+ssl_bump peek step1
+ssl_bump bump all
+```
+
+要点：`at_step SslBump1` 标识第一阶段；peek 后 bump 表示解密；若改为 splice 则不解密。完整指令集见 `04`，本处仅示意。
+
+### 4. 部署边界
+
+- 客户端必须信任伪造 CA，否则证书报错。
+- 隐私与合规：解密范围需授权，某些内容（如金融、医疗）应避免解密。
+- 性能：解密是 CPU 密集操作，需容量规划。
+
+:::figure id=07-02-01 | name=SSL-Bump 模块组成 | dir=TB
+node n0 "SSL-Bump 模块" purple
+node n1 "证书生成" blue
+node n2 "拦截规则" teal
+node n3 "证书数据库" amber
+node n4 "错误处置" gray
+edge n0 -> n1
+edge n0 -> n2
+edge n0 -> n3
+edge n0 -> n4
+:::
+
+图中节点速览：四部分组成解密与再加密的完整链路。
+
+### 5. 陷阱与最佳实践
+
+- 证书生成辅助程序（见 `07-08`）需正确配置 CA 路径与权限。
+- 只 peek 不 bump 时看到的只是元信息，不要误以为能缓存内容。
+- 高版本 TLS（如 TLS 1.3）对拦截有影响，需核验版本支持情况。
+
+### 6. 小结
+
+SSL-Bump 模块强大但敏感，部署前先明确合规边界。
+
+---
+
+## 07-03 内容适配模块
+
+### 1. 背景与动机
+
+有时需要在转发途中改写请求或响应——注入头、过滤内容、病毒扫描。Squid 通过 ICAP 与 eCAP 把内容交给外部适配服务处理。
+
+### 2. 模块对比
+
+| 模块 | 全称 | 特点 | 协议 |
+|---|---|---|---|
+| ICAP | Internet Content Adaptation Protocol | 成熟、独立服务、网络调用 | TCP 1344 等 |
+| eCAP | extensible Content Adaptation Protocol | 嵌入式、进程内、C++ 模块 | 库接口 |
+
+### 3. 工作模式
+
+| 模式 | 全称 | 处理对象 |
+|---|---|---|
+| REQMOD | Request Modification | 请求（发往源站前） |
+| RESPMOD | Response Modification | 响应（返回客户端前） |
+
+配置icap_service 与 adaptation_access 等指令把某类流量导向适配服务，指令细节见 `04`。
+
+:::figure id=07-03-01 | name=ICAP 内容适配流程 | dir=LR
+node n1 "客户端请求" blue
+node n2 "Squid" teal
+node n3 "ICAP 服务" purple
+node n4 "源站" amber
+edge n1 -> n2
+edge n2 -> n3 "REQMOD"
+edge n3 -> n2
+edge n2 -> n4
+edge n4 -> n2 "RESPMOD"
+edge n2 -> n3 "RESPMOD"
+edge n2 -> n1
+:::
+
+图中节点速览：请求与响应都可送到 ICAP 服务改写后再继续。
+
+### 4. 陷阱与最佳实践
+
+- 适配服务是单点，需高可用与超时配置，避免拖垮 Squid。
+- 内容适配可能破坏缓存（改写后对象不再通用），需评估缓存影响。
+- 编译需启用相应选项（见 `02-03`）。
+
+### 5. 小结
+
+内容适配用外部服务扩展 Squid 能力。部署时关注可用性与缓存副作用。
+
+---
+
+## 07-04 日志模块
+
+### 1. 背景与动机
+
+日志是 Squid 的可观测性基础。本篇讲日志模块的能力与输出目标；字段详解见 `05-05`，配置指令见 `04-06`，分析方法见 `08-03`。
+
+### 2. 日志类型
+
+| 类型 | 内容 | 用途 |
+|---|---|---|
+| access.log | 每个请求的记录 | 审计与命中分析 |
+| cache.log | 运行、调试、错误信息 | 排障主入口 |
+| store.log | 存储操作（部分版本） | 缓存写入分析 |
+| 状态报告 | manager 提供的运行时统计 | 实时监控 |
+
+### 3. 输出目标
+
+日志模块支持多目标：普通文件、标准输出、syslog、UDP 日志等。通过 access_log 指令的模块名参数选择。多目标可用于同时本地留存与集中采集。
+
+:::figure id=07-04-01 | name=日志模块输出目标 | dir=TB
+node n0 "日志模块" purple
+node n1 "本地文件" blue
+node n2 "标准输出" teal
+node n3 "syslog" amber
+node n4 "UDP 采集" gray
+edge n0 -> n1
+edge n0 -> n2
+edge n0 -> n3
+edge n0 -> n4
+:::
+
+图中节点速览：同一日志可输出到多个目标，便于本地与集中并存。
+
+### 4. 陷阱与最佳实践
+
+- 日志含 URL 与用户名，需合规留存与脱敏。
+- 高并发下日志写入是瓶颈，必要时用异步或集中日志。
+- 自定义 logformat 后，下游解析脚本要同步调整。
+
+### 5. 小结
+
+日志模块负责「记录什么、写到哪」。字段看 `05-05`，分析看 `08-03`。
+
+---
+
+## 07-05 管理协议模块
+
+### 1. 背景与动机
+
+运行时需要观测与操作 Squid：看命中率、看连接数、清空缓存。管理协议模块提供 cachemgr 与 SNMP 两种入口。
+
+### 2. 模块能力
+
+| 模块 | 入口 | 能力 |
+|---|---|---|
+| cachemgr | mgr: 特殊 URL 或 cachemgr.cgi | 查看大量运行时报告 |
+| SNMP | UDP 端口（默认 3401） | 标准网管协议采集 |
+
+cachemgr 的报告包括 info、stat、storedir、store_queues、cache_peer 等，是排障的金矿。访问方式见 `04-05`，SNMP 指令见 `04-06`。
+
+### 3. 典型用法
+
+```bash
+squidclient -m info              # 运行信息
+squidclient -m stat              # 统计计数
+squidclient -m store_queues      # 存储队列状态
+```
+
+:::figure id=07-05-01 | name=管理协议模块入口 | dir=TB
+node n0 "Squid 管理接口" purple
+node n1 "cachemgr<br/>mgr: URL" blue
+node n2 "cachemgr.cgi<br/>Web 界面" teal
+node n3 "SNMP<br/>网管采集" amber
+edge n0 -> n1
+edge n0 -> n2
+edge n0 -> n3
+:::
+
+图中节点速览：三种入口访问同一套运行时数据。
+
+### 4. 陷阱与最佳实践
+
+- cachemgr 默认可能无需口令，务必配 cachemgr_passwd（见 `04-06`）。
+- SNMP 团体字不要用默认值，且限制来源。
+- 部分报告开启会消耗资源，生产环境按需访问。
+
+### 5. 小结
+
+管理模块提供观测入口。输出判读在 `08-02`。
+
+---
+
+## 07-06 URL 重写与重定向模块
+
+### 1. 背景与动机
+
+需要在转发前改写 URL 或把请求重定向到别处——例如广告过滤、镜像切换、强制 HTTPS。Squid 用 rewrite 与 redirector 辅助程序实现。
+
+### 2. 模块能力
+
+| 机制 | 作用 | 时机 |
+|---|---|---|
+| url_rewrite | 改写请求 URL | 转发前 |
+| redirector | 返回重定向 | 请求处理时 |
+
+两者都通过外部辅助程序（见 `07-08`）实现，Squid 把 URL 送给辅助程序，按其返回结果改写或重定向。
+
+:::figure id=07-06-01 | name=URL 重写与重定向流程 | dir=LR
+node n1 "请求 URL" blue
+node n2 "Squid" teal
+node n3 "重写辅助程序" purple
+node n4 "新 URL/重定向" amber
+edge n1 -> n2
+edge n2 -> n3
+edge n3 -> n2
+edge n2 -> n4
+:::
+
+图中节点速览：URL 经辅助程序改写后再继续处理。
+
+### 3. 陷阱与最佳实践
+
+- 辅助程序性能直接成为瓶颈，需并发能力。
+- 改写了 URL 会影响缓存键与命中，需评估。
+- 新版本中部分机制被合并或改名，配置前核验。
+
+### 4. 小结
+
+重写模块用外部程序扩展 URL 处理能力。辅助程序框架见 `07-08`。
+
+---
+
+## 07-07 延时池与带宽管理
+
+### 1. 背景与动机
+
+共享出口时，需要限制某些用户或站点的带宽，避免少数流量挤占资源。Squid 的 delay_pools 提供分级限速。
+
+### 2. 模块结构
+
+延时池分三级：
+
+| 级别 | 作用对象 |
+|---|---|
+| 第一级 | 全局带宽池 |
+| 第二级 | 客户端网段/地址分组 |
+| 第三级 | 单个客户端或内容类 |
+
+通过 delay_access 把 ACL 关联到某个池，池中定义各级带宽与突发参数。
+
+:::figure id=07-07-01 | name=延时池三级结构 | dir=TD
+node n1 "第一级<br/>全局带宽池" blue
+node n2 "第二级<br/>网段分组" teal
+node n3 "第三级<br/>单客户端" amber
+edge n1 -> n2
+edge n2 -> n3
+:::
+
+图中节点速览：三级逐级细化，从全局到个体。
+
+### 3. 陷阱与最佳实践
+
+- 延时池需要编译选项支持（见 `02-03`）。
+- 限速按字节计算，注意单位与突发参数的含义。
+- 过细的分组增加内存与匹配开销。
+
+### 4. 小结
+
+延时池提供分级带宽管理。指令见 `04`（相关族）。
+
+---
+
+## 07-08 辅助程序框架
+
+### 1. 背景与动机
+
+Squid 把认证、重写、内容生成等可扩展能力交给独立的辅助程序（helpers）完成。理解这套框架，才能理解为什么有那么多 `*_auth`、`*_acl` 程序。
+
+### 2. 框架原理
+
+辅助程序是独立进程，通过标准输入输出与 Squid 通信，采用简单的行协议：Squid 发一行请求，辅助程序回一行响应。这种设计让辅助程序可以用任何语言实现，且故障隔离。
+
+| 辅助程序类型 | 作用 | 编译位置 |
+|---|---|---|
+| 认证类 | basic/digest/negotiate 认证 | helpers/*_auth/ |
+| ACL 类 | 外部 ACL 匹配 | helpers/*_acl/ |
+| 重写类 | URL 改写 | helpers/ |
+| 证书生成 | SSL-Bump 伪造证书 | helpers/ssl/ |
+
+### 3. 典型示例
+
+```bash
+# 查看随安装包提供的辅助程序
+ls /usr/lib/squid/ | grep -E '_auth|_acl|certgen'
+```
+
+:::figure id=07-08-01 | name=辅助程序通信框架 | dir=LR
+node n1 "Squid 主进程" blue
+node n2 "行协议<br/>stdin/stdout" teal
+node n3 "辅助进程池" purple
+node n4 "认证/重写/生成" amber
+edge n1 -> n2
+edge n2 -> n3
+edge n3 -> n4
+edge n4 -> n2 dashed "响应"
+:::
+
+图中节点速览：主进程与辅助进程通过简单行协议通信，多个辅助进程组成进程池。
+
+### 4. 陷阱与最佳实践
+
+- 辅助程序路径随发行版不同，配置时用绝对路径并核验。
+- 辅助进程数不足会成为瓶颈，可按需增加并发数量（依版本指令）。
+- 辅助程序崩溃或响应慢会拖慢请求，需监控。
+
+### 5. 小结
+
+辅助程序框架是 Squid 可扩展性的关键。以上是模块段；下面的 06-08 起进入代码级剖析，把前面讲的机制与模块落到真实文件、函数与数据结构上。
+
+
+---
+
+## 06-08 代码级剖析之一：启动链与事件循环源码走读
+
+### 1. 背景与动机
+
+前面 06-01 讲"单进程事件驱动"是概念，本篇落到源码：入口在哪、初始化分几段、事件循环由谁驱动。按 `src/main.cc` 的真实调用链读一遍，以后看 debug 日志和卡启动问题就有坐标。
+
+### 2. 核心概念
+
+- **入口不是类**：源码里没有 `Squid::Main` 这种类方法，入口是全局 `main()`，转 `SquidMainSafe()` 再进 `SquidMain()`。
+- **三段初始化**：注册与命令行 → 配置解析前初始化 → 配置解析后初始化，最后才 `mainInitialize()`。
+- **事件循环是多引擎**：`EventLoop` 上挂 `SignalEngine`、`EventScheduler`、`StoreRootEngine`、`CommSelectEngine`，主引擎是 `CommSelectEngine`。
+- **RegisteredRunner**：用 `RunRegisteredHere(bootstrapConfig / finalizeConfig / finishShutdown)` 在各阶段插桩，模块自注册而非硬编码顺序。
+
+### 3. 关键流程
+
+真实调用链（`src/main.cc`，去掉平台分支）：
+
+```text
+main()
+  └─ SquidMainSafe()                 set_terminate(OnTerminate)
+      └─ SquidMain()
+          ├─ RegisterModules()       先注册，之后才能 RunRegisteredHere
+          ├─ CommandLine cmdLine(argc, argv, shortOpStr, squidOptions)
+          ├─ ConfigureCurrentKid(cmdLine)
+          ├─ AnyP::UriScheme::Init() 必须在参数解析前
+          ├─ Mem::Init() / storeFsInit() / Fs::Init()
+          ├─ DiskIOModule::SetupAllModules()
+          ├─ Acl::Init() / Auth::Init() / Ip::ProbeTransport()
+          ├─ Configuration::Parse()
+          ├─ RunRegisteredHere(finalizeConfig)
+          ├─ watch_child() 或 Instance::WriteOurPid()
+          ├─ StartUsingConfig()
+          ├─ comm_init()
+          ├─ mainInitialize()
+          ├─ EventLoop mainLoop; registerEngine(...); mainLoop.run()
+          └─ SquidShutdown()
+```
+
+`mainInitialize()` 里按序调用 `ipcache_init()`、`fqdncache_init()`、`Dns::Init()`、`Ssl::Helper::Init()`、`redirectInit()`、`externalAclInit()`、`httpHeaderInitModule()`、`accessLogInit()`、`storeInit()`、`refreshInit()`、`FwdState::initModule()`、`eventInit()`、`serverConnectionsOpen()`、`neighbors_init()`，并注册周期事件 `Store::Maintain`、`ipcache_purgelru`、`Mem::CleanIdlePools`。
+
+:::figure id=06-08-01 | name=Squid 启动与事件循环源码调用链 | dir=TD
+node n1 "main → SquidMainSafe → SquidMain" blue
+node n2 "RegisterModules + 命令行" blue
+node n3 "配置前初始化 Mem/Acl/Auth" blue
+node n4 "Configuration::Parse" amber
+node n5 "mainInitialize 各子系统" teal
+node n6 "EventLoop 注册四引擎" teal
+node n7 "mainLoop.run 与 SquidShutdown" green
+edge n1 -> n2
+edge n2 -> n3
+edge n3 -> n4
+edge n4 -> n5
+edge n5 -> n6
+edge n6 -> n7
+:::
+
+图中节点速览：n1～n4 是同步启动，n5 装配子系统，n6 把四引擎挂到事件循环，n7 进入 `mainLoop.run()` 并在退出后清理。
+
+### 4. 代码实例
+
+事件循环注册的真实片段（`src/main.cc`）：
+
+```cpp
+EventLoop mainLoop;
+SignalEngine signalEngine;
+mainLoop.registerEngine(&signalEngine);
+mainLoop.registerEngine(EventScheduler::GetInstance());
+StoreRootEngine store_engine;
+mainLoop.registerEngine(&store_engine);
+CommSelectEngine comm_engine;
+mainLoop.registerEngine(&comm_engine);
+mainLoop.setPrimaryEngine(&comm_engine);
+Time::Engine time_engine;
+mainLoop.setTimeService(&time_engine);
+mainLoop.run();
+```
+
+`SignalEngine::checkEvents()` 把 `do_reconfigure`、`do_rotate`、`do_shutdown` 三个标志翻译成 `mainReconfigureStart()`、`mainRotate()`、`doShutdown()`——这就是 `squid -k reconfigure` 最终起作用的落点。
+
+### 5. 陷阱与最佳实践
+
+- 加新模块时别在 `mainInitialize()` 里硬插调用，优先注册 `RegisteredRunner`，否则 SMP 多进程下会漏执行。
+- `AnyP::UriScheme::Init()` 必须在参数解析前，调换顺序会踩历史 bug 5337。
+- 排"启动后无响应"先看 `configured_once` 与 `mainLoop.run()` 是否到达；只解析配置可用 `-k parse` 走 `opt_parse_cfg_only` 提前退出。
+- daemon 模式下 `watch_child()` 标注 `NOTREACHED`，父进程不会按普通路径返回，别在它后面加期望执行的代码。
+
+### 6. 小结
+
+启动链 = 注册 → 解析 → 装配 → 循环。源码路径：`src/main.cc`（入口与循环）、`src/comm/Loops.h`（EventLoop）、`src/AsyncEngine.cc`（引擎基类）。
+
+---
+
+## 06-09 代码级剖析之二：comm 层与异步读写
+
+### 1. 背景与动机
+
+前面 06-01 说"fd 就绪就调回调"，代码里这件事由 `src/comm/` 承担。理解这一层，才能看懂为什么慢客户端不会阻塞其他人、以及 fd 耗尽时报什么。
+
+### 2. 核心概念
+
+- **Comm::Connection**：封装 fd 与对端地址，是连接的最小单位（`src/comm/Connection.h`）。
+- **IoCallback**：读写完成后的回调载体（`src/comm/IoCallback.h`）。
+- **多实现**：`ModEpoll.cc`、`ModPoll.cc`、`ModSelect.cc`、`ModKqueue.cc`、`ModDevPoll.cc` 提供不同 I/O 多路复用后端，统一由 `comm_init()` 选定。
+- **ConnOpener**：异步发起连接，避免 DNS 或三次握手卡住主循环（`src/comm/ConnOpener.cc`）。
+- **AcceptLimiter**：限制同时 accept 数量，防瞬时连接洪峰（`src/comm/AcceptLimiter.cc`）。
+
+### 3. 关键流程
+
+一次客户端读事件：`CommSelectEngine::checkEvents()` 轮询就绪 fd → `comm_select` 后端返回就绪集合 → 对应读回调（如 `clientReadRequest`）→ 解析请求 → 交给 ACL 与后续流程。写方向同理，由 `comm_write` 系列登记 `IoCallback`。
+
+:::figure id=06-09-01 | name=comm 层异步读写调用路径 | dir=LR
+node n1 "就绪 fd 集合" blue
+node n2 "CommSelectEngine 轮询" blue
+node n3 "IoCallback 分发" teal
+node n4 "业务处理器" teal
+node n5 "异步写回" green
+edge n1 -> n2
+edge n2 -> n3
+edge n3 -> n4
+edge n4 -> n5
+:::
+
+图中节点速览：n1 是内核就绪集合，n2 由具体后端填充，n3 调回调，n4 是 HTTP/缓存等业务代码，n5 把结果异步写回。
+
+### 4. 代码实例
+
+后端文件与职责对照：
+
+| 文件 | 职责 |
+|---|---|
+| `src/comm/ModEpoll.cc` | Linux epoll 后端 |
+| `src/comm/ModPoll.cc` | poll 后端 |
+| `src/comm/ModSelect.cc` | select 后端 |
+| `src/comm/ModKqueue.cc` | BSD kqueue 后端 |
+| `src/comm/ConnOpener.cc` | 非阻塞连接建立 |
+| `src/comm/AcceptLimiter.cc` | accept 并发限制 |
+| `src/comm/Read.cc` / `Write.cc` | 读写封装 |
+
+### 5. 陷阱与最佳实践
+
+- fd 耗尽时先看 `cache swap max` 与文件描述符上限，再查是否有连接未及时关闭；日志里 ` comm_open: FD ...` 是典型入口。
+- 自定义后端要与 `Comm::Connection`、`IoCallback` 的语义一致，不能只替换轮询函数。
+- 排网络卡顿可对照 `src/comm/` 的 debug section 5，配合 `cache manager` 的 fd 统计。
+
+### 6. 小结
+
+comm 层把"等待"集中到一个主循环，业务代码只写回调。源码路径：`src/comm/`、`src/CommCalls.cc`、`src/Comm.dox`。
+
+---
+
+## 06-10 代码级剖析之三：ACL 匹配的真实实现
+
+### 1. 背景与动机
+
+前面 06-07 讲"顺序短路 + 与关系"，本篇给出源码依据：`Acl::Node` 怎么注册、怎么匹配、哪种 ACL 会在什么上下文里失效。
+
+### 2. 核心概念
+
+- **工厂注册**：`Acl::RegisterMaker(typeName, maker)` 把类型名映射到构造函数，`Acl::Make(typeName)` 创建节点（`src/acl/Acl.cc`）。
+- **具名 ACL**：`Config.namedAcls` 是以 aclname 为键的 `unordered_map`，同名 ACL 追加、异名独立。
+- **匹配入口**：`Acl::Node::matches(ACLChecklist*)` 是统一外壳，真正的类型判断在虚函数 `match()`。
+- **上下文守卫**：`requiresAle()`、`requiresRequest()`、`requiresReply()` 决定某类型在缺少对应状态时直接判不匹配并告警。
+
+### 3. 关键流程
+
+配置解析时 `ParseNamedAcl` 读 aclname 与类型，调用 `Acl::Make` 建节点，再 `A->parse()` 填参数，最后 `namedAcls.emplace(name, A)`。请求匹配时 `matches()` 先检查上下文齐备，再 `verifyAle()` 补齐访问日志条目，然后调 `match()` 得到 1/0。
+
+:::figure id=06-10-01 | name=ACL 从解析到匹配的源码路径 | dir=LR
+node n1 "acl 指令解析" blue
+node n2 "Acl::Make 工厂" blue
+node n3 "parse 填参数" teal
+node n4 "namedAcls 注册表" teal
+node n5 "matches 上下文校验" amber
+node n6 "match 虚函数的" green
+edge n1 -> n2
+edge n2 -> n3
+edge n3 -> n4
+edge n4 -> n5
+edge n5 -> n6
+:::
+
+图中节点速览：上半段是配置期（n1～n4），下半段是请求期（n5～n6）；两段通过 `namedAcls` 连接。
+
+### 4. 代码实例
+
+`src/acl/Acl.cc` 中 `matches()` 的真实逻辑（节选）：
+
+```cpp
+bool Acl::Node::matches(ACLChecklist *checklist) const
+{
+    checklist->setLastCheckedName(name);
+    int result = 0;
+    if (!checklist->hasAle() && requiresAle())
+        debugs(28, DBG_IMPORTANT, "WARNING: " << name << " ACL is used in "
+               "context without an ALE state. Assuming mismatch.");
+    else if (!checklist->hasRequest() && requiresRequest())
+        debugs(28, DBG_IMPORTANT, "WARNING: ... Assuming mismatch.");
+    else if (!checklist->hasReply() && requiresReply())
+        debugs(28, DBG_IMPORTANT, "WARNING: ... Assuming mismatch.");
+    else {
+        if (requiresAle()) checklist->verifyAle();
+        result = const_cast<Acl::Node*>(this)->match(checklist);
+    }
+    return result == 1;
+}
+```
+
+这段解释了为什么某些 ACL 放在错误的位置会"永远不匹配"：不是规则写错，而是上下文本身没有 ALE/请求/响应。
+
+### 5. 陷阱与最佳实践
+
+- `myip` 已改名 `localip`、`myport` 改名 `localport`、`clientside_mark` 改名 `client_connection_mark`；源码里由 `ParseNamed()` 自动改并打警告，新配置应直接用新名。
+- `manager` 类型已是内建 ACL，配置里再写 `acl manager ...` 会被忽略并告警。
+- 同一个 aclname 用两种类型会触发「同名 ACL 已存在但类型不同」错误并解析失败。
+- 结果缓存走 `cacheMatchAcl()`，但基于时间的 ACL 不宜长周期缓存。
+
+### 6. 小结
+
+ACL = 工厂 + 具名注册表 + 上下文守卫 + 类型匹配。源码路径：`src/acl/Acl.cc`、`src/acl/Checklist.cc`、`src/AclRegs.cc`。
+
+---
+
+## 06-11 代码级剖析之四：SSL-Bump 三段状态机落点
+
+### 1. 背景与动机
+
+前面 06-06 讲了 peek/splice/bump 的语义，本篇讲它存在哪里。`Ssl::ServerBump` 是核心对象，它把"三次决策"落到三个槽位上——这是理解"为什么规则顺序决定中间人是否发生"的钥匙。
+
+### 2. 核心概念
+
+- **ServerBump**：保存 bump-server-first 相关信息（`src/ssl/ServerBump.h`）。
+- **BumpStep**：类型别名 `using BumpStep = XactionStep`，表示当前处于哪个握手阶段。
+- **act 结构**：`Ssl::BumpMode step1 / step2 / step3` 三个槽位，分别记录三步采用的动作。
+- **serverCert 与 serverSession**：保存源站证书与服务端 TLS 会话；`sslErrors()` 返回证书校验错误集。
+- **配套文件**：`PeekingPeerConnector.cc`（带 peek 的对端连接）、`crtd_message.cc`（证书生成助手协议）、`context_storage.cc`（生成的假证书上下文缓存）、`Config.cc`（ssl_bump 规则）。
+
+### 3. 关键流程
+
+客户端 CONNECT 进来 → 建 `ServerBump` → 第一步 peek 看 ClientHello/SNI → 把动作写进 `act.step1` → 第二步决定 splice 还是继续 stare/bump，写入 `act.step2` → 第三步生成假证书并完成客户端握手，写入 `act.step3` → 同时 `PeekingPeerConnector` 与源站建立第二段 TLS。`at(BumpStep)` 判断当前阶段。
+
+:::figure id=06-11-01 | name=SSL-Bump 三段决策与对象状态 | dir=TD
+node n1 "CONNECT 建 ServerBump" blue
+node n2 "step1 peek 读 ClientHello" blue
+node n3 "act.step1 记录动作" teal
+node n4 "step2 splice 或 bump" amber
+node n5 "step3 签发假证书" amber
+node n6 "对端 PeekingPeerConnector" teal
+node n7 "两段 TLS 建立" green
+edge n1 -> n2
+edge n2 -> n3
+edge n3 -> n4
+edge n4 -> n5
+edge n2 -> n6
+edge n5 -> n7
+edge n6 -> n7
+:::
+
+图中节点速览：n1～n5 是客户端侧三步决策，n6 是并行的源站连接，n7 是两条 TLS 都建立后的状态。
+
+### 4. 代码实例
+
+`src/ssl/ServerBump.h` 中的真实声明（节选）：
+
+```cpp
+namespace Ssl {
+using BumpStep = XactionStep;
+class ServerBump {
+public:
+    explicit ServerBump(ClientHttpRequest *http, StoreEntry *e = nullptr,
+                        Ssl::bumpServerFirst);
+    void attachServerSession(const Security::SessionPointer &);
+    Security::CertErrors *sslErrors() const;
+    bool connectedOk() const { return entry && entry->isEmpty(); }
+    bool at(const BumpStep stp) const { return step == stp; }
+
+    HttpRequest::Pointer request;
+    StoreEntry *entry;
+    Security::CertPointer serverCert;
+    struct {
+        Ssl::BumpMode step1;
+        Ssl::BumpMode step2;
+        Ssl::BumpMode step3;
+    } act;
+    Ssl::BumpStep step;
+};
+}
+```
+
+`act.step1/2/3` 三个槽位解释了前面问答里的现象：peek 之后才能 splice 或 bump，是因为决策必须等对应阶段的握手信息到齐才能定；规则写得越靠前，越早写进对应槽位。
+
+### 5. 陷阱与最佳实践
+
+- 证书生成助手由 `Ssl::Helper::Init()` 启动，退出时 `Ssl::Helper::Shutdown()`；助手没起来会直接 bump 失败，先看 `sslcrtd_program` 路径与权限。
+- 生成的假证书上下文有缓存（`context_storage.cc`），调 `dynamic_cert_mem_cache_size` 要观察实际内存。
+- 源站证书校验错误放在 `sslErrors()` 里，是否放行由 Squid 决定——这正是官方警告的"校验责任转移"。
+- 调试 SSL-Bump 看 debug section 83，并对照 `src/ssl/Config.cc` 的规则解析。
+
+### 6. 小结
+
+SSL-Bump 的代码落点 = 一个 `ServerBump` 对象 + 三个 BumpMode 槽位 + 一个对端连接器 + 一个证书生成助手。源码路径：`src/ssl/`。
+
+---
+
+## 06-12 代码级剖析之五：存储层重构与 StoreEntry
+
+### 1. 背景与动机
+
+05 册讲了 StoreEntry 的字段，本篇讲"这些字段现在放在哪、由谁驱动"。Squid 的现代 store 层已经重构，很多老资料里的"store 目录结构"与当前源码不符。
+
+### 2. 核心概念
+
+- **StoreEntry 不在 `src/store/`**：头文件在 `src/StoreEntry.h`，`src/store/` 放的是 `Controller`、`Disk`、`Disks`、`LocalSearch`、`SwapMeta*`。
+- **Controller/Disk 分层**：`src/store/Controller.cc` 是存储总控，`Disk.cc` / `Disks.cc` 是磁盘抽象，`LocalSearch.cc` 做本地查找。
+- **SwapMeta**：`SwapMetaIn.cc` / `SwapMetaOut.cc` / `SwapMetaView.cc` 处理交换文件元数据，取代老式的隐式头来。
+- **id_rewriters**：`src/store/id_rewriters/` 处理存储键重写。
+- **周期维护**：`mainInitialize()` 注册 `eventAdd("storeMaintain", Store::Maintain, ...)`，对应 06-03 的置换与清理。
+
+### 3. 关键流程
+
+请求命中路径：URL → `Store::Root().find()`（经 `LocalSearch`）→ 命中 `StoreEntry` → `mem_obj` 提供内存副本 → 未命中则创建条目 → 回源填充 → `SwapMetaOut` 写元数据 → `Disk::write` 落盘 → `Store::Maintain` 周期清理。
+
+:::figure id=06-12-01 | name=现代 store 层组件与命中路径 | dir=LR
+node n1 "Store::Root Controller" blue
+node n2 "LocalSearch 查找" blue
+node n3 "StoreEntry 命中" teal
+node n4 "mem_obj 内存副本" teal
+node n5 "SwapMetaOut 元数据" amber
+node n6 "Disk 落盘与 Maintain" green
+edge n1 -> n2
+edge n2 -> n3
+edge n3 -> n4
+edge n3 -> n5
+edge n5 -> n6
+:::
+
+图中节点速览：n1～n3 是查表命中，n4 是内存副本，n5～n6 是落盘与维护。
+
+### 4. 代码实例
+
+`src/store/` 关键文件职责：
+
+| 文件 | 职责 |
+|---|---|
+| `src/StoreEntry.h` | StoreEntry 定义（注意不在 store 目录） |
+| `src/store/Controller.cc` | 存储总控与查找入口 |
+| `src/store/LocalSearch.cc` | 本地索引查找 |
+| `src/store/Disk.cc` / `Disks.cc` | 单盘与多盘抽象 |
+| `src/store/SwapMetaIn.cc` / `SwapMetaOut.cc` | 交换元数据读写 |
+| `src/store/id_rewriters/` | 存储键重写实现 |
+
+排缓存不命中时可对照 `Store::Root().callback()`（由 `StoreRootEngine` 每轮调用）与 `storeMaintain` 事件。
+
+### 5. 陷阱与最佳实践
+
+- 老资料里的 `store_dir` 内嵌索引结构描述已过时，以 `SwapMeta*` 系列为准。
+- `squid -z` 走 `Store::Root().create()` 初始化目录；换存储类型后必须重建。
+- 磁盘 IO 模块由 `DiskIOModule::SetupAllModules()` 在配置解析前注册，配置 `cache_dir` 时才能匹配到正确后端。
+- 调大 `dynamic_cert_mem_cache_size` 与调缓存内存是两回事，前者在 SSL 层，后者在 store 层。
+
+### 6. 小结
+
+现代 store = Controller + Disk + LocalSearch + SwapMeta，StoreEntry 仍是核心对象但位置已移出 `src/store/`。源码路径：`src/StoreEntry.h`、`src/store/`。
+
+---
+
+## 06-13 代码级剖析小结：从现象定位到源码文件
+
+前面 06-01～07-08 讲机制与模块，06-08～06-12 把它们落到代码。收尾给一张"现象 → 源码入口"对照表，便于排障时直接定位。
+
+| 现象 | 先看哪个源码路径 | 对应机制篇 |
+|---|---|---|
+| 启动卡住或配置不生效 | `src/main.cc`（Configuration::Parse、RunRegisteredHere） | 06-08 |
+| fd 耗尽、网络卡顿 | `src/comm/`（ModEpoll、ConnOpener、AcceptLimiter） | 06-09 |
+| ACL 永远不匹配 | `src/acl/Acl.cc`（matches、ParseNamed） | 06-10 |
+| 证书告警、bump 失败 | `src/ssl/ServerBump.h`、`PeekingPeerConnector.cc`、`helper.cc` | 06-11 |
+| 命中率异常、换盘不生效 | `src/StoreEntry.h`、`src/store/Controller.cc`、`SwapMeta*` | 06-12 |
+| 周期任务不跑 | `src/main.cc`（eventAdd 注册）、`src/AsyncEngine.cc` | 06-08 |
+
+读源码的顺序建议：先 `src/main.cc` 看骨架，再按现象进对应目录，最后回到 05 册查字段、04 册查指令。下面 06-14～06-17 从能力、局限、性能、容量四个角度，回答工程选型中最常被问到的四个问题；06-18 再把答案收束成高性能中间人方案选型，06-19 说明 VPP TLS 加速与 Squid 式 SSL-Bump 的边界，06-20 回答能否把 Squid 整体重写为 VPP 插件，06-21 横向对比 HAProxy、mitmproxy 与 Squid 的定位，06-22 辨析出口、SSL-Bump 与反向代理三个易混概念。
+
+
+---
+
+## 06-14 能力边界：解密之后能做什么
+
+### 1. 背景与动机
+
+前面 06-06 讲 SSL-Bump 的握手机制，07-02 讲模块配置，但工程评审时最常被问的是"开了中间人到底能换来什么"。答案要先分清三种可见性：不看内容、只看握手元数据、看 HTTP 明文，分别对应 `splice`、`peek`/`stare`、`bump`。只有最后一种能让 Squid 的 HTTP 处理链接管流量。
+
+### 2. 核心概念
+
+- **TCP 元数据层**：`splice` 成为 TCP 隧道，只见 IP、端口与连接时长，不做解密。
+- **TLS 元数据层**：`peek` 看客户端 ClientHello 的 SNI，`stare` 看服务端 ServerHello 的证书；两者都不解密正文，但可写进日志、可做分流决策。
+- **HTTP 明文层**：`bump` 之后请求与响应进入 HTTP 解析链，URL、Header、Cookie、Body 全部可见。
+- **关键推论**：Squid 对明文 HTTP 能做的事，bump 后基本都能做；反过来，`splice` 的连接即使配了内容 ACL 也不会生效。
+
+### 3. 关键流程
+
+:::figure id=06-14-01 | name=解密后的能力链 | dir=LR
+node n1 "bump 解密" blue
+node n2 "URL 与 Header 可见" blue
+node n3 "内容 ACL 与阻断" teal
+node n4 "ICAP 扫描与审计" teal
+node n5 "日志与证据留存" green
+node n6 "缓存与响应压缩" green
+edge n1 -> n2
+edge n2 -> n3
+edge n3 -> n4
+edge n4 -> n5
+edge n2 -> n6
+:::
+
+图中节点速览：n1 是前提，n2 是信息面，n3～n5 是安全与运维收益，n6 是性能收益（但受缓存规则限制，见 06-02）。
+
+### 4. 能力清单
+
+| 能力 | 依赖的可见信息 | 典型用途 | 收益判断 |
+|---|---|---|---|
+| 内容级访问控制 | URL、方法、MIME、文件后缀 | 阻断网盘上传、限制视频站点、按路径放行 | 高，无法用域名 ACL 替代 |
+| 安全扫描与数据防泄漏 | 请求与响应 Body | 接 ICAP/eCAP 做杀毒、敏感关键字检测 | 高，这是官方设计初衷 |
+| HTTPS 访问审计 | SNI、证书、完整 URL | 合规留痕、事件溯源 | 高，但需先解决告知与授权 |
+| HTTPS 缓存与压缩 | 可缓存的响应对象 | 降低出口带宽、加速内网重复访问 | 中低，现代站点大量不可缓存对象 |
+| 响应改写与限速 | Header 与 Body | 注入提示页、按用户限速、延时池 | 中，改写会改变应用行为需谨慎 |
+
+### 5. 配置实例
+
+官方推荐的"先看域名再决定"骨架（`peek` 拿 SNI，敏感站点放行，其余解密）：
+
+```conf
+acl step1 at_step SslBump1
+acl sensitive ssl::server_name .bank.com .gov.cn
+ssl_bump peek step1
+ssl_bump splice sensitive
+ssl_bump bump all
+```
+
+注意 `ssl::server_name` 能读 CONNECT 中的域名、客户端 SNI 与服务端证书主题，而 `dstdomain` 在解密前可能只看到 IP，二者不可混用；这一点官方 wiki 在 Peek and Splice 页明确提醒。
+
+### 6. 小结
+
+能力边界一句话：bump 把 HTTPS 变成"看得见的 HTTP"，于是 Squid 的全套 HTTP 能力都对它生效。价值排序上，审计与内容管控 >> 缓存加速；若只为缓存而开全量解密，通常不划算。
+
+---
+
+## 06-15 局限：做不到的与不该做的
+
+### 1. 背景与动机
+
+SSL-Bump 不是透明无感的魔法。官方配置示例开篇就写明：TLS 的设计目的正是阻止第三方介入，Squid 的实现"故意保留可被客户端检测到的特性"。理解边界比会配更重要，否则上线后会大面积白屏、证书告警或合规事故。
+
+### 2. 核心概念
+
+四类边界：**信任前提**（客户端是否装了你的根证书）、**协议覆盖**（流量是否走 TCP 443 且可解析）、**实现约束**（握手扩展、会话恢复、动作互斥）、**合规授权**（是否有权解密）。前三类决定技术成败，最后一类决定能不能上线。
+
+### 3. 关键流程
+
+:::figure id=06-15-01 | name=三类技术绕过点 | dir=LR
+node n1 "信任前提" blue
+node n2 "客户端可检测" blue
+node n3 "证书固定" amber
+node n4 "握手直接失败" amber
+node n5 "QUIC 与加密 SNI" teal
+node n6 "绕过或判断失灵" teal
+edge n1 -> n2
+edge n3 -> n4
+edge n5 -> n6
+:::
+
+图中节点速览：三组独立边界——信任、应用校验、新协议；任意一组成立，bump 就可能失效或被绕过。
+
+### 4. 局限清单
+
+| 局限 | 表现 | 可否缓解 | 依据与位置 |
+|---|---|---|---|
+| 客户端必须信任自签根证书 | 未装证书时浏览器报告中间人攻击 | 需终端管理下发，无技术绕路 | 官方配置示例明确要求 |
+| 证书固定与双向认证 | 应用直接拒绝连接，即使信任了根证书 | 只能 `splice` 放行该站点 | 证书链被替换的必然结果 |
+| QUIC/HTTP3 走 UDP 443 | 流量根本不经过 TCP 代理链路 | 放行则绕过，禁 UDP 则回落 TCP | CONNECT 只承载 TCP |
+| 加密 ClientHello 与新扩展 | `peek` 拿不到 SNI；未知扩展导致无法可靠 bump | 改用 `stare` 或放行；官方列为限制 | Peek and Splice 限制页 |
+| TLS 会话恢复 | 没有服务端证书可供检查 | 管理员决定无证书时是否放行 | 官方限制页 |
+| `peek` 与 `stare` 互斥 | 看过服务端证书通常不能再 bump，反之不能再 splice | 规则顺序决定；先想清楚要审计还是放行 | 官方动作定义 |
+| 服务端证书校验责任转移 | 客户端看不到原始证书错误 | 证书模拟可部分还原，不能等同原始告警 | 官方 SSL-Bump 限制页 |
+| 合规与隐私 | 未经告知解密可能违法 | 只能靠制度、告知与范围限制 | 官方多处强烈警告 |
+
+### 5. 排查要点
+
+解密失败先分清三层：连不上看 TCP 与端口；证书告警看 CA 是否下发与证书模拟策略；能上网但审计不到看该连接是不是被 `splice` 了（用日志中的 `ssl::bump_mode` 字段确认实际动作）。Squid 4 起若解析不了 ClientHello，还会走 `on_unsupported_protocol` 的处理分支，这一分支的行为要提前验证，避免悄悄放行。
+
+### 6. 小结
+
+技术局限里最难缠的不是配置，而是协议演进与终端应用：只要流量不走 TCP、应用固定证书、或握手信息被加密，中间人的覆盖面就会缩水。稳妥策略是"默认放行、按需解密"，并把放行清单当作长期资产维护。
+
+---
+
+## 06-16 性能：开销构成与公开基准
+
+### 1. 背景与动机
+
+"开启 SSL-Bump 会不会拖慢代理"没有一句话答案。官方基准页自己就说明：没有好的固定测试方法，社区记录也都不是 bump 场景。因此本节给的是**开销构成**和**可引用的基准点**，不是承诺值。
+
+### 2. 核心概念
+
+一次完整往返的额外成本有四处：每条连接**两次 TLS 握手**（非对称运算为主）；一次请求-响应中数据被**解密两次、加密两次**（两段 TLS 各一对）；动态证书签发（按域名缓存后可摊销）；以及解密后新增的 HTTP 解析、ACL、ICAP 与日志开销。
+
+### 3. 关键流程
+
+:::figure id=06-16-01 | name=SSL-Bump 的额外开销链 | dir=LR
+node n1 "两次 TLS 握手" blue
+node n2 "双向对称加解密" blue
+node n3 "动态证书签发" amber
+node n4 "HTTP 解析与 ACL" teal
+node n5 "ICAP 与日志写入" green
+edge n1 -> n2
+edge n2 -> n3
+edge n3 -> n4
+edge n4 -> n5
+:::
+
+图中节点速览：短连接、小对象场景 n1 主导；长连接、大对象场景 n2 主导；n5 常在外部服务慢时反超成为瓶颈。
+
+### 4. 公开基准点
+
+| 记录 | 场景 | 结果 | 说明 |
+|---|---|---|---|
+| Squid trunk rev 13251 | 静态 600 字节对象，100% 命中，无日志无 ACL，回环压测 | 39715 RPS、313 Mbit/s，3 核满载 | 2014 年受控测试，官方注明"与生产环境无关" |
+| Squid 2.7 生产案例 | 双路四核至强，静态内容为主 | 约 2000 连接/秒、980 Mbit/s，CPU 低于 25% | 非 bump，2012 年提交 |
+| Squid 3.2 内容路由 | 无缓存、5～20 个上级 | 670 RPS，CPU 约 95% | 说明外部拓扑本身就很贵 |
+| Squid 3.0 安全增强 | 启用 ICAP 杀毒、SquidGuard、域认证 | 约 100 用户，响应"合理" | 外部服务链是主要成本 |
+
+邮件列表中维护者曾明确答复：加密会增加 CPU 开销，但多少取决于原本的负载类型，**没有可靠的经验法则**。所以任何"开 bump 掉多少吞吐"的单一数字都要打问号。
+
+### 5. 判读与优化
+
+- 短连接与大量小对象最吃亏：握手成本无法摊销，优先长连接与连接复用。
+- 现代处理器带 AES-NI 时对称加解密通常不是第一瓶颈，握手与非对称运算更早触顶。
+- `ssl_engine` 指令在 OpenSSL 3.0 及以上构建中不再支持，硬件加速要通过 OpenSSL 提供器配置，别照抄老配置。
+- 证书生成结果有缓存（`dynamic_cert_mem_cache_size`），首次访问新域名更贵，稳定后成本下降；但缓存本身吃内存。
+- 真正容易失控的是 `ICAP`/认证/日志：它们把 CPU 问题变成外部延迟问题，必须先测辅助服务自身的容量。
+
+### 6. 小结
+
+性能结论：bump 的成本来自"两条 TLS + 一次明文处理链"，短连接场景下降最明显。公开数字只能当数量级参照，不能当容量承诺；正式结论必须用自己的客户端、自己的站点分布压出来。
+
+---
+
+## 06-17 容量规划：能支撑多大流量
+
+### 1. 背景与动机
+
+"能撑多少 Gbps"是个伪命题：正向代理里每条请求占两条连接，bump 再叠加两条 TLS，很多机器是先撞上文件描述符或临时端口耗尽，CPU 还很闲。容量要按瓶颈取最小值来算。
+
+### 2. 核心概念
+
+先估并发：`C ≈ 峰值新建连接数/秒 × 平均连接存活秒数`。随后逐项对齐上限：每 worker 的文件描述符表、每个出口 IP 约 64K 的临时端口池、每台机器的 CPU 核数、证书缓存与连接状态内存、以及辅助服务的并发能力。
+
+### 3. 关键流程
+
+:::figure id=06-17-01 | name=容量由最小瓶颈决定 | dir=LR
+node n1 "并发连接数" blue
+node n2 "文件描述符上限" blue
+node n3 "临时端口池" amber
+node n4 "CPU 与加解密" teal
+node n5 "辅助服务延迟" teal
+node n6 "实际可用容量" green
+edge n1 -> n6
+edge n2 -> n6
+edge n3 -> n6
+edge n4 -> n6
+edge n5 -> n6
+:::
+
+图中节点速览：五项并行约束，任意一项触顶都会把整体容量钉住；扩容前先找出是哪一项。
+
+### 4. 量级参考
+
+以下是**立项用的粗估，不是实测承诺**，硬件按单台主流 8 核服务器理解：
+
+| 场景 | 参考量级 | 主导瓶颈 | 备注 |
+|---|---|---|---|
+| 纯 CONNECT 隧道或明文缓存 | 数千 RPS 以上，可达数 Gbps 量级 | fd 与临时端口 | 接近但不等于官方极限测试 |
+| 选择性 bump，大部分放行 | 数千 RPS 量级，随解密比例下降 | 连接数与 CPU 并存 | 生产推荐形态 |
+| 全量 bump 加常规 ACL 与日志 | 按同硬件纯隧道的 30% 至 50% 做初版预算 | 握手 CPU | 短连接、小对象时更低 |
+| 全量 bump 再接杀毒或数据防泄漏 | 百级 RPS 或更低 | 外部辅助服务 | 需单独给辅助服务定规格 |
+
+### 5. 工程建议
+
+- 先缩小解密面：把银行、政府、大文件下载与证书固定站点加进放行清单，容量往往立刻宽裕。
+- 用 `workers` 多进程分摊，前面加四层负载分流；注意临时端口池按出口 IP 共享，多机或加出口 IP 才能突破 64K 上限。
+- 同时调高进程级与系统级 `nofile`，只调一边等于没调。
+- 日志里打开 `ssl::bump_mode`，用实际解密比例校准估算，而不是按配置意图估算。
+- 压测要带真实 CA、真实站点分布与真实的辅助服务，观察 `mgr:info` 的 CPU 与 RPS 曲线；只压一个静态对象得到的数字没有参考价值。
+
+### 6. 小结
+
+容量 = 最小瓶颈，而不是带宽。先算并发与连接资源，再看 CPU 与辅助服务，最后用压测定标。到这里，06 册从机制、模块、代码级剖析一直讲到能力与容量；下一步 `08` 进入运维、性能基准与排障。
+
+主要资料来源：Squid 官方 wiki 的 SSL-Bump、Peek and Splice、Interception Caching 与 Benchmarks 页面；Squid 用户邮件列表中关于 high CPU usage with ssl_bump 的讨论。官方页面给出的版本与合规警告以原文为准。
+
+---
+
+## 06-18 方案选型：高性能中间人怎么选
+
+### 1. 背景与动机
+
+前面四节回答了「能做什么、做不到什么、开销在哪里、容量怎么估」。落到工程选型，第一问题不是「哪个软件最快」，而是「到底要不要解密」。真正的高性能中间人通常来自分层取舍：能不解密就不解密，必须解密时只解密必要对象，再把剩余链路拆成可横向扩展的模块。
+
+严格说，`splice` 放行并不是明文中间人，但它仍是出口策略链路里的默认高性能动作：保留连接元数据与访问控制，不承担两段 TLS 和明文处理的成本。把它作为基线，才知道哪些场景值得为解密付钱。
+
+### 2. 核心概念
+
+- **终止型解密**：业务证书和域名由自己掌控，在入口处直接结束 TLS。公共云负载均衡器、Nginx、Envoy、HAProxy、F5 与 Citrix ADC 属这一类。
+- **审计型解密**：用户访问外部站点，代理需要模拟对方证书。Squid SSL-Bump、商业 SWG 与 NGFW 属这一类，覆盖率和成本受客户端信任与协议演进约束。
+- **选择性解密**：用域名、用户、ALPN、证书属性等条件决定 `splice` 或 `bump`。它同时决定性能、合规与兼容性。
+- **加速层**：AES-NI、QAT、智能网卡与多实例属于加速器，只能降低某一层成本，不能替代策略设计和容量规划。
+
+### 3. 关键流程
+
+图 06-18-01 把选型拆成四条路线：先看业务归属，再决定是否做审计型解密，最后考虑加速与扩展。
+
+:::figure id=06-18-01 | name=高性能中间人方案分层选型 | dir=LR
+node n1 "需求分层<br/>先判业务归属" blue
+node n2 "自有业务入口<br/>TLS 终止" teal
+node n3 "企业出口审计<br/>选择性 bump" amber
+node n4 "调试与小流量<br/>mitmproxy" purple
+node n5 "加速与横向扩展<br/>QAT/多实例" gray
+edge n1 -> n2
+edge n1 -> n3
+edge n1 -> n4
+edge n2 -> n5
+edge n3 -> n5
+:::
+
+图中节点速览：自有入口优先做 TLS 终止；企业出口走选择性解密；调试工具只在小流量使用；加速层放在最后，而不是当成第一步。
+
+### 4. 方案对照
+
+表 06-18-1 按场景列出选型建议。表中不写单一吞吐数字，因为握手速率、解密比例、站点分布和辅助服务延迟会让同一软件相差数倍。
+
+| 场景 | 推荐方案 | 高性能原因 | 主要限制 |
+|---|---|---|---|
+| 自有业务入口，证书在自己手里 | Envoy / HAProxy / Nginx / OpenResty / F5 / Citrix ADC | 本质是 TLS 终止，不需伪造外部证书；连接池、会话复用与多 worker 成熟 | 不适合审计用户访问任意外部站点 |
+| 企业出口审计与数据防泄漏 | 商业 SWG 或 SASE；预算受限时用 Squid 选择性 bump | 专用数据面与策略引擎成熟；可按用户、域名与内容分类放量 | 成本高；ECH、证书固定与双向认证会压缩可解密面 |
+| 研发抓包、协议调试与流量重放 | mitmproxy | 可编程、交互式，插件生态成熟 | 开发者工具定位，不承担生产高吞吐；新协议支持存在模式限制 |
+| 极大规模或专项链路 | QAT、智能网卡、DPU 或自研数据面 | 把握手、加解密、转发与策略拆开，分别扩容 | 开发维护成本高；DPDK 主要解决转发，不自动解决语义与合规 |
+
+### 5. 工程建议
+
+如果继续使用 Squid，解密策略应写成「默认放行、少量解密」：先在客户端 Hello 阶段读取可用元数据，对敏感站点直接 `splice`，只对审计目标在后续步骤 `bump`。配置骨架如下，具体指令与步骤约束需对照实际版本核验。
+
+```text
+acl step1 at_step SslBump1
+acl step2 at_step SslBump2
+acl step3 at_step SslBump3
+acl no_bump ssl::server_name .bank.com .gov.cn .pay.com
+acl audit_sites ssl::server_name .example.com .saas.example.net
+
+ssl_bump peek step1
+ssl_bump splice no_bump
+ssl_bump stare step2 audit_sites
+ssl_bump peek step2
+ssl_bump bump step3 audit_sites
+ssl_bump splice all
+```
+
+配套做法：用 `workers` 分摊连接；同时调高进程级和系统级文件描述符上限；优先使用 ECDSA 证书与会话恢复降低握手成本；证书生成服务做缓存；ICAP、杀毒与数据防泄漏服务异步化并单独定容；日志走集中队列，避免同步落盘拖慢主链路。若使用 OpenSSL 3 或更新版本，旧的 `ssl_engine` 思路不适用，应检查 OpenSSL provider 与发行版支持情况。
+
+### 6. 陷阱与最佳实践
+
+- 全量 `bump` 会把握手、证书签发和内容适配都放进热路径，短连接与高并发场景最先受影响。
+- TLS 1.3、ECH、QUIC 或 UDP 443、证书固定与双向认证会压缩可解密面；方案设计必须接受「覆盖率不是百分之百」。
+- 压测要看新建连接速率、并发连接数、实际解密比例与长尾延迟，而不是只看链路标称带宽。
+- 只在自有、明确授权的网络中启用解密；金融、医疗与个人隐私类流量应按策略放行。
+- 商业网关并不等于零运维，策略集、证书信任链、日志留存与旁路排障同样需要纳入上线清单。
+
+### 7. 小结
+
+选型顺序可以压缩成一句话：优先 TLS 终止，其次选择性 `bump`，再次商业规模化方案，最后才考虑自研或硬件加速。Squid 的合理定位是「成本可控的选择性审计代理」，不是「全量解密的万能网关」。到这里，06 册从机制、模块、代码级剖析、能力与容量，一直收束到方案选型；后续 `08` 进入运维、性能基准与排障。
+
+---
+
+## 06-19 VPP 与中间人插件：高性能 TLS 不等于 SSL-Bump
+
+### 1. 背景与动机
+
+承接 06-18，一个自然问题是：VPP 既然是高性能数据面，有没有能直接替代 Squid SSL-Bump 的中间人插件？简短答案是：**VPP 有高性能 TLS 能力与 TLS 终止构建块，但没有开箱即用、语义完整的 Squid 式 MITM 插件**。
+
+这里的差别很关键。TLS 终止是「我拥有证书，客户端直接和我建立 TLS」；SSL-Bump 是「客户端以为在访问原站，代理临时模拟原站证书，并在背后再建一条 TLS 到源站」。前者是服务端能力，后者是代理审计能力。
+
+### 2. 核心概念
+
+表 06-19-1 把容易混淆的能力拆开；判断依据是 FD.io 官方功能表、Host Stack 文档与 2025 年 FD.io TLS plugin 介绍，具体成熟度仍须按目标版本核验。
+
+| 能力 | VPP 现状 | 工程判断 |
+|---|---|---|
+| 高性能 TLS 处理 | 有 `src/vnet/tls` 通用框架，支持 OpenSSL、Picotls、MbedTLS 等引擎 | 通用 TLS 框架在官方功能表中为生产级成熟度 |
+| TLS 加速插件 | 有 `src/plugins/tlsopenssl`，包含 OpenSSL engine、异步框架、QAT 加解密卸载 | 部分版本标为实验性，上线前要核验目标版本与驱动链 |
+| TLS 终止 / 代理构建块 | Host Stack 提供 TLS Application、VCL、LD_PRELOAD 与测试 proxy app | 适合自有业务入口，不等于任意 HTTPS 审计 |
+| Squid 式 SSL-Bump | 公开资料未见 `peek / stare / splice / bump`、动态伪造证书、CA 签发、证书缓存与 HTTPS 内容检查的完整组合 | 不能当作现成插件使用 |
+| 企业出口明文审计 | 需要把 VPP 与 Squid、Envoy 或自研代理组合 | VPP 负责数据面加速，策略与证书语义仍在应用层 |
+
+### 3. 关键流程
+
+图 06-19-01 把「VPP 能做什么」与「还缺什么」分开：VPP 强化的是 TLS 与转发，中间人的策略、证书和审计语义需要上层系统补齐。
+
+:::figure id=06-19-01 | name=VPP 中间人能力边界 | dir=LR
+node n1 "需求判断<br/>先分场景" blue
+node n2 "自有入口<br/>TLS 终止" teal
+node n3 "出口审计<br/>SSL-Bump" amber
+node n4 "VPP TLS<br/>加速与转发" green
+node n5 "Squid/自研应用<br/>证书与策略" purple
+node n6 "QAT/SmartNIC<br/>硬件卸载" gray
+edge n1 -> n2
+edge n1 -> n3
+edge n2 -> n4
+edge n3 -> n5
+edge n4 -> n6
+edge n5 -> n4
+:::
+
+图中节点速览：自有入口可直接 TLS 终止；出口审计需要证书与策略层；VPP 与其加速层位于数据面，不承担完整的监管语义。
+
+### 4. VPP TLS 插件的性能边界
+
+FD.io 在 2025 年介绍 VPP TLS plugin 的性能增强时，强调的不是「自动中间人」，而是 TLS 数据面加速：异步非阻塞操作、DPDK 用户态 crypto driver、OpenSSL Engine、EVP pipeline、握手队列与读写队列分离，以及结合 QAT 做硬件卸载。
+
+这些机制能提升握手速率、降低读写路径竞争，并提高 TLS 记录的批量加解密能力。但它们解决的是 TLS 运算与包处理成本，不会自动带来以下能力：
+
+- 根据 SNI、ALPN、证书或用户策略决定 `splice` 或 `bump`；
+- 用本地 CA 动态签发目标站点证书；
+- 管理伪造证书缓存与客户端信任链；
+- 对解密后的 HTTP 内容做 ACL、ICAP、杀毒、数据防泄漏与审计；
+- 处理证书固定、ECH、QUIC 或 UDP 443 的兼容性问题。
+
+因此，VPP TLS plugin 是高性能 TLS 构建块，不是 Squid SSL-Bump 的等价替代物。
+
+### 5. 三条落地路线
+
+表 06-19-2 给出三种组合方式，按工程复杂度从低到高排列。
+
+| 路线 | 组合方式 | 优点 | 代价与适用 |
+|---|---|---|---|
+| 最现实 | VPP + Squid | VPP 做高速入口、分流与负载分担；Squid 保留完整 SSL-Bump 语义 | 最适合已有 Squid 体系；仍承担 Squid 的两次握手与明文链开销 |
+| 性能优先 | VPP Host Stack + 自研代理 | 用 VCL 或 LD_PRELOAD 接入用户态协议栈，客户端 TLS 在 VPP 侧终止，应用再做上游 TLS | 需要自研 CA、证书缓存、策略、日志与协议兼容；适合专项网关 |
+| 极限专项 | 自研 VPP 插件 | 直接基于 session layer 与 `src/vnet/tls` 构建双 TLS 会话状态机 | 开发维护成本高；只有 100G 级或特化场景才值得评估 |
+
+对多数工程团队，第一条路最稳：VPP 解决入口转发与扩展，Squid 解决中间人语义。第二条路上限更高，但已经接近自研 SWG。第三条路看似最快，真正难点通常不是加解密，而是双 TLS 会话关联、证书模拟、HTTP 语义、日志异步化与新协议兼容。
+
+### 6. 陷阱与最佳实践
+
+- 不要把「TLS termination」直接翻译成「TLS 中间人」；前者终止的是自己持有证书的入口连接，后者模拟的是第三方站点证书。
+- 不要因为 VPP 性能高就推断其具备完整 HTTPS 审计能力；TLS 加速和内容审计是两层问题。
+- `test proxy app` 与 `nginx with LD_PRELOAD` 说明 VPP 能承载代理类应用，不代表自带生产级 SSL-Bump。
+- 部分 VPP TLS 插件在不同版本成熟度不同，部署前必须核验源码目录、编译选项、OpenSSL 版本、DPDK crypto 驱动与 QAT 支持状态。
+- 即使采用 VPP 加速，TLS 1.3、ECH、QUIC、证书固定与双向认证仍会压缩可解密面；仍需在明确授权范围内使用。
+
+### 7. 小结
+
+VPP 的价值是把「高速转发、TCP/TLS 数据面、异步加解密与硬件卸载」做好；Squid 的价值是把「选择性解密、证书模拟、策略与审计语义」做好。二者不是替代关系，而是可以分层组合。
+
+结论可以压缩成一句：**VPP 有高性能 TLS，不等于有高性能 SSL-Bump 插件；要做企业出口中间人，仍需 Squid、商业 SWG 或自研代理层。**
+
+---
+
+## 06-20 把 Squid 重写为 VPP 插件：可行性与落地路径
+
+### 1. 背景与动机
+
+承接 06-19，一个更激进的问题是：既然 VPP 有高性能数据面和 TLS 构建块，能不能把 Squid 整体重写成 VPP 插件，让完整中间人功能直接跑在用户态数据面里？
+
+先给结论：**理论上能，但那已经不是「把 Squid 搬进插件」，而是「用 VPP 重写一个 Squid」**。工程量接近自研一套安全网关，且会撞上几个结构性障碍。难点不在 TLS 加解密——那恰好是 VPP 的强项；难点在于两边的编程模型与功能边界完全不同。把这件事想清楚，能避免投入巨大却做出一个既不如 Squid 完整、也不如 VPP 快的中间产物。
+
+### 2. 核心概念
+
+要判断可行性，先把「完整的中间人功能」拆成四层，看每一层能否映射进 VPP 的 node graph。VPP 的插件是 run-to-completion 的节点，要求不阻塞、短执行、批量处理；Squid 的事件循环、Store、DNS、ICAP 都是异步回调模型，二者对「什么是主流程」的定义相反。
+
+表 06-20-1 按层拆开这个映射关系。
+
+| 能力层 | Squid 侧对应 | VPP 插件可承载性 |
+|---|---|---|
+| 数据面与加解密 | comm 层、fd 事件、TLS 双向读写 | 高；正是 node graph、异步 TLS、QAT 卸载的强项 |
+| TLS 握手决策层 | `ssl_bump` 状态机、peek/stare/splice/bump、双段会话 | 中；需改 `src/vnet/tls` 与 session 层，超出普通插件范围 |
+| HTTP 语义层 | HTTP/1.1 保持连接、HTTP/2 多路复用、CONNECT、Range | 低；VPP 无对应节点，自建成本接近重写解析器 |
+| 策略与内容层 | ACL、ICAP、杀毒、数据防泄漏、动态证书签发 | 低；毫秒到秒级的慢路径，放在 worker 线程会毁掉转发 |
+| 运维生态 | access.log、认证、缓存落盘、配置体系 | 低；与线速转发无关，应留在独立进程 |
+
+### 3. 关键流程
+
+图 06-20-01 把能力栈按「VPP 承载难度」从下到上排列：越靠下越接近数据面、越适合插件；越靠上越接近业务语义、越应留在应用层。判断一个功能该不该进插件，看它落在这条栈的哪一层即可。
+
+:::figure id=06-20-01 | name=重写为VPP插件的能力承载分层 | dir=TD
+node n1 "数据面加解密<br/>转发/异步TLS" teal
+node n2 "TLS 握手决策<br/>peek/splice" purple
+node n3 "HTTP 语义层<br/>解析/多路复用" amber
+node n4 "策略与内容层<br/>ACL/DLP/日志" amber
+node n5 "VPP 插件<br/>可承载" green
+node n6 "自研应用/上层<br/>承担语义" gray
+edge n1 -> n2
+edge n2 -> n3
+edge n3 -> n4
+edge n1 -> n5
+edge n3 -> n6
+:::
+
+图中节点速览：数据与 TLS 运算适合插件；HTTP 语义、策略与日志应留在自研应用或上层进程；TLS 握手决策处于中间地带，通常需要扩展 VPP 核心而非只写插件。
+
+### 4. 五个结构性障碍
+
+1. **编程模型冲突**：VPP 插件是 run-to-completion 的 node graph，节点不能阻塞、不能长循环。Squid 的事件循环、comm 层、Store、DNS 与 ICAP 全是异步回调，几十万行代码无法直接嵌进一个节点。
+2. **TLS 语义不在插件层**：`peek/stare/splice/bump` 要在 ClientHello 阶段读 SNI/ALPN、决定是否放行、再拼出两段 TLS 会话。现有 VPP TLS 插件是终止型，暴露的是加解密流，不带这套决策状态机。
+3. **动态证书签发**：每个 bump 域名要现场签叶证书、维护 CA 与缓存（见 06-11）。签名运算在 worker 线程会停顿，必须异步卸载到独立线程，等于重写 `src/ssl/` 的证书生成逻辑。
+4. **HTTP 语义层缺失**：Squid 难搬的不是转发，而是 keep-alive、HTTP/2 多路复用、CONNECT、Range、条件请求、缓存一致性、ICAP 改包与日志格式。VPP 没有这些节点，全部要自建。
+5. **慢路径污染数据面**：缓存落盘、访问日志、ICAP/AV/DLP、认证查询是毫秒到秒级操作，放进 worker 线程会直接拖垮线速转发，必须留在独立进程。
+
+### 5. 三条可行路径
+
+表 06-20-2 按工程量从低到高排列三种做法。
+
+| 路径 | 组合方式 | 工程可行性 | 代价与适用 |
+|---|---|---|---|
+| 分层组合 | VPP 做转发、TLS 卸载与分流，MITM 语义交给 Squid 或自研应用 | 高；无原理性障碍 | 最优起点；VPP 与应用进程间需定义清晰接口 |
+| 轻量 peek/splice 插件 | VPP 插件只在 ClientHello 阶段看 SNI/ALPN，决定放行或转给 Squid | 高；改动集中 | 投入产出比最高；大多数流量不必进 Squid |
+| 完整重写为插件 | 在 VPP 内实现双 TLS 状态机、CA 签证书、HTTP/1/2、缓存、ACL、日志、ICAP | 理论可行 | 约 30～60 人月量级；只有 100G 级专项网关才值得评估 |
+
+对多数工程团队，第二条路性价比最高：先用插件把不需要解密的流量直接放行，再把需要 bump 的少量流量交给 Squid。只有当 Squid 被明确证明是瓶颈，才考虑把 HTTP 语义层逐步下沉到独立应用进程——注意仍是独立进程，不是塞进插件。
+
+### 6. 陷阱与最佳实践
+
+- 不要把「TLS termination」当成「MITM」：前者终止自己持有证书的入口连接，后者模拟第三方站点证书，两者不是一回事。
+- 重写不等于变快：把通用代理的慢路径搬进数据面，很可能得到一个既不如 Squid 完整、也不如原生 VPP 快的中间态。
+- 双 TLS 会话关联、证书模拟缓存、HTTP 语义、日志异步化与新协议兼容，才是真正的工作量所在，加解密反而是最容易的部分。
+- 若决定自研，优先用 VPP Host Stack 或 VCL 把数据面与应用进程连起来，而不是把所有逻辑编译进同一个插件。
+- TLS 1.3、ECH、QUIC、证书固定与双向认证不会因为重写而变得可解；覆盖率的边界仍由 06-15 的四类限制决定。
+
+### 7. 小结
+
+把 Squid 重写为 VPP 插件，技术上可行，工程上是另一套 SWG 的研发量。合理的顺序是：先分层组合，再用轻量 peek/splice 插件分担入口，最后仅在确有实证瓶颈时考虑自研应用进程。VPP 与 Squid 是互补关系，不是替代关系；把正确的职责放在正确的层，比追求「单一插件包办一切」更能同时得到性能与功能完整性。
+
+---
+
+## 06-21 同类代理工具对比：HAProxy、mitmproxy 与 Squid
+
+### 1. 背景与动机
+
+06-18 的方案选型里提到过 Envoy、HAProxy、mitmproxy 等名字，但没展开。工程上最容易出错的，正是把它们当成「可以互相替换的代理」。实际上三者解决的是不同问题：HAProxy 是生产级反向代理与负载均衡器，做的是 TLS 终止；mitmproxy 是交互式中间人调试代理，做的是「看清并改写每一个 HTTPS 请求」；Squid 是带 ACL、缓存与审计语义的正向代理。本节按功能与定位对比，给出各自的边界。
+
+三者版本与特性随发布变化，下表与正文描述以查证时的公开资料为准，具体指令名、协议支持与成熟度一律标注「需对照实际版本核验」。
+
+### 2. 核心概念
+
+先分清两个动作，这是理解三者差异的钥匙：
+
+- **TLS 终止（termination）**：证书是自己的，客户端直接与代理建立 TLS，代理解密后转发。服务端能力，客户端无感。
+- **中间人（MITM）**：代理临时伪造目标站点证书，客户端需要额外信任代理 CA，代理因此能看到明文。审计/调试能力，需要客户端配合。
+
+表 06-21-1 按功能维度横向对比三款工具。
+
+| 维度 | HAProxy | mitmproxy | Squid |
+|---|---|---|---|
+| 基本定位 | 反向代理 + 负载均衡器 | 交互式中间人调试代理 | 正向/反向代理 + 缓存 |
+| 实现语言 | C，事件驱动，2.0 起多线程 | Python，MIT 许可 | C++，GPL |
+| 典型位置 | 业务入口、K8s Ingress | 开发者本机、测试链路 | 企业上网出口 |
+| TLS 处理 | TLS 终止/卸载，自有证书 | 伪造目标证书，信任本地 CA | SSL-Bump 选择性解密 |
+| 解密目的 | 卸载加解密、做七层路由 | 查看与改写明文 | ACL、审计、缓存、DLP |
+| 协议支持 | HTTP/1.1、2、3(QUIC)、TCP/UDP、gRPC | HTTP/1、2、3、WebSocket、原始 TLS | HTTP/1、部分 HTTPS，QUIC 有限 |
+| 可编程 | SPOE 扩展、配置规则 | Python addon 事件 API | ICAP、eCAP、外部 ACL helper |
+| 内容缓存 | 无 | 无 | 有，核心能力 |
+| 生产高吞吐 | 强，百万级请求/秒量级 | 弱，受 GIL 与协议开销限制 | 中，取决于解密比例 |
+| 交互界面 | 配置 + Runtime API | TUI/Web/CLI 三界面 | 配置文件 + 日志 |
+
+### 3. 关键流程
+
+图 06-21-01 把「按需求选工具」画成决策路径：先看要解决的是入口调度、明文调试，还是出口审计，不同需求落到不同工具，三者并不是替代关系。
+
+:::figure id=06-21-01 | name=HAProxy 与 mitmproxy 选型决策 | dir=LR
+node n1 "选型起点<br/>先问要解决什么" blue
+node n2 "入口流量调度<br/>TLS 终止" teal
+node n3 "看明文并改写<br/>交互调试" purple
+node n4 "企业出口审计<br/>ACL/缓存/日志" amber
+node n5 "HAProxy<br/>生产级反向代理" green
+node n6 "mitmproxy<br/>交互式 MITM" gray
+node n7 "Squid 或 SWG<br/>大规模正向代理" green
+edge n1 -> n2
+edge n1 -> n3
+edge n1 -> n4
+edge n2 -> n5
+edge n3 -> n6
+edge n4 -> n7
+:::
+
+图中节点速览：入口调度落到 HAProxy，明文调试落到 mitmproxy，出口审计落到 Squid 或商业 SWG；三者各占一层，不是互相替换的关系。
+
+### 4. HAProxy 的功能清单
+
+HAProxy 用 C 编写，事件驱动，2.0 起支持多线程，当前主线为 3.x，具体 LTS 版本与 QUIC 成熟度需对照实际版本核验。它解决的是「把流量稳稳分给后端」。
+
+- **代理能力**：四层 TCP/UDP 与七层 HTTP/HTTPS；支持 HTTP/1.1、HTTP/2、HTTP/3(QUIC)、WebSocket、gRPC、SSE 长连接。
+- **负载均衡**：roundrobin、source、URI 哈希、Cookie 插入等算法，支持权重调节。
+- **高可用**：主动与被动健康检查、故障隔离、stick-table 熔断、连接排队与后端限速。
+- **TLS**：SSL 终止/卸载，集中管理证书并把加解密从后端移走；也支持 SSL 透传，此时用 Proxy Protocol 传递客户端真实 IP。需要端到端加密或双向 TLS 的场景应走透传。
+- **七层处理**：基于 Host、URI、Cookie、任意 Header 的内容路由，URL 重写，注入 `X-Forwarded-For` 与 `X-Forwarded-Proto`。
+- **运维扩展**：Runtime API 可在不重载的情况下改后端与权重，支持零停机热升级；默认带 chroot、权限降级、严格协议校验等安全加固；SPOE 接口可对接外部 WAF。
+
+它不做内容缓存，也不做中间人解密——证书是自己的，属于服务端能力，不是审计能力。
+
+### 5. mitmproxy 的功能清单
+
+mitmproxy 用 Python 编写，MIT 许可，当前 12.x 系列，发行版自带版本往往较旧，社区版本迭代较快，具体版本号需对照实际版本核验。它解决的是「看清并改写每一个 HTTPS 请求」。
+
+- **解密能力**：首次运行生成本地 CA，客户端信任后对访问的每个域名即时签发证书，HTTPS 明文逐条可见（见 06-14 的可见性分层）。
+- **三种界面**：`mitmproxy` 终端 TUI、`mitmweb` 浏览器界面、`mitmdump` 命令行（HTTP 版 tcpdump，适合 CI 与自动化）。
+- **拦截与改包**：按 `i` 加过滤器把请求停下，改完再放行；可批量重写请求头、Body 与响应内容，模拟异常场景。
+- **过滤语言**：`~d` 域名、`~u` URL 正则、`~m` 方法、`~c` 状态码、`~s` 响应，支持与/或/非组合。
+- **录制回放**：`mitmdump -w` 存流量、`-r` 回放，支持选择性重放以复现偶现问题；支持 HAR 导入导出与 JSON、Protobuf 解码。
+- **可编程**：Python addon 事件驱动 API，自动改写、记录日志、模拟服务器错误。
+- **代理模式**：常规、透明、反向、上游链、SOCKS5、WireGuard、本地捕获；协议覆盖 HTTP/1、HTTP/2、HTTP/3 与 WebSocket。
+
+它不适合生产高吞吐：Python 全局解释器锁与协议处理开销限制了容量；QUIC 在真实移动流量中常需回退到 HTTP/2；证书固定的应用还需额外手段。
+
+### 6. 关键差异与选型
+
+表 06-21-2 把最容易混淆的几点并排放在一起，并给出选型判断。
+
+| 维度 | HAProxy | mitmproxy | 选型判断 |
+|---|---|---|---|
+| 证书来源 | 自己的证书做 TLS 终止 | 伪造目标站点证书做 MITM | 前者是服务端能力，后者需客户端信任 CA |
+| 客户端感知 | 无感，本就访问它 | 需额外安装并信任 CA | 调试场景可接受，企业终端需分发信任链 |
+| 核心目标 | 吞吐、高可用、流量调度 | 可视化、拦截改包、可编程 | 一个面向生产，一个面向调试 |
+| 典型场景 | 业务入口网关、微服务路由 | API 调试、移动抓包、安全测试 | 按「运维」还是「研发」划分 |
+| 能否做企业出口审计 | 不能，不做中间人 | 不适合，容量与规模不够 | 这类需求交给 Squid 或商业 SWG |
+
+选型顺序可压缩成一句：要「把流量稳稳分给后端」用 HAProxy；要「看清并改写每个 HTTPS 请求」用 mitmproxy；要「带策略与审计的大规模出口中间人」用 Squid 或商业 SWG。三者都各司其职，用错工具通常不是配置问题，而是定位问题。
+
+### 7. 小结
+
+HAProxy、mitmproxy 与 Squid 分别占据入口调度、研发调试、出口审计三个位置。HAProxy 的 TLS 终止不等于中间人，mitmproxy 的可编程不等于生产网关，Squid 的中间人也不是为了替代前两者。理解「证书是谁的、解密为了什么、运行在链路哪一层」，就能快速判断该用哪一个。
+
+---
+
+## 06-22 概念辨析：出口、SSL-Bump 与反向代理
+
+### 1. 背景与动机
+
+一个常见困惑是把「Squid 出口」「SSL-Bump」「反向代理」当成三个并列的模式，甚至认为 Squid 只能做出口、做不了反向代理。这三者其实分属两个正交维度：**部署形态**（站哪一侧、替谁办事）与 **TLS 处理动作**（解不解密、证书是谁的）。把它们拆开，很多看似矛盾的说法就自洽了。本节承接 06-21 的工具对比，专门澄清这三组概念。
+
+### 2. 核心概念
+
+表 06-22-1 先给出定义，后续各节围绕它展开。
+
+| 概念 | 属于哪个维度 | 定义 |
+|---|---|---|
+| 出口 / 正向代理 | 部署形态 | 放在内网与外网之间，客户端主动配置代理，由它代替客户端上网 |
+| SSL-Bump | TLS 处理动作 | 在代理上选择性解密 HTTPS，用伪造的目标站点证书做中间人审计 |
+| 反向代理 / accel | 部署形态 | 挡在业务服务器前面，客户端无感，代理替后端接外部访问 |
+| TLS 终止 | TLS 处理动作 | 用自己的合法证书结束客户端 TLS 连接，解密后转发 |
+
+关键判断：**出口与 SSL-Bump 不是并列关系，而是「位置 + 该位置上可选的功能」**。出口 Squid 默认对 HTTPS 只做 CONNECT 隧道转发，看不到明文；开了 SSL-Bump 才具备解密审计能力。
+
+**表 06-22-1 注解：「隐藏」是对谁隐藏？**
+
+上表中的「隐藏客户端」「隐藏后端」容易被误读成「谁都看不见」。准确的说法是：**隐藏 = 通信的对端不可见，代理自己两边都看得清清楚楚**。正向代理的运营方手里有真实客户端的完整日志，反向代理的运营方知道请求最终落到哪台后端；所以「隐藏客户端」不等于「客户端匿名」，这在 06-14、06-15 讨论的审计与合规语境下尤其重要。
+
+隐藏的对象也有限：是 IP、身份与后端拓扑，不是流量内容。HTTPS 能否被看见，取决于表中的 TLS 处理动作，与「隐藏」这个部署属性正交——正向代理默认只做 CONNECT 隧道，看不到明文；反向代理能看明文，是因为证书本来就是自己的（TLS 终止），而不是因为它隐藏了后端。
+
+谁有感知由「谁来配置」决定：正向代理是客户端主动设置，客户端知道自己走了代理，服务端只看见代理的 IP；反向代理是服务端在入口部署，客户端无感、以为代理就是目标站，后端则知道请求来自代理。判断时只需问两句——「连接出代理后对端看到的是谁？」以及「用户以为自己在跟谁通信？」：正向的答案是「对端看到代理、用户知道代理」，反向是「对端看到代理、用户以为代理就是目标」。
+
+表 06-22-2 把这四个视角收拢成一张对照表。
+
+| 维度 | 正向代理 | 反向代理 |
+|---|---|---|
+| 部署与配置方 | 客户端主动设置 | 服务端在入口部署 |
+| 客户端是否感知代理 | 感知，主动指定代理地址 | 无感，以为代理就是目标站 |
+| 对端看到的是谁 | 服务端只看见代理 IP | 后端知道请求来自代理 |
+| 被隐藏的对象 | 客户端 IP 与身份 | 后端 IP、数量与拓扑 |
+| 代理能否看见双方 | 能，日志可追溯真实客户端 | 能，日志可追溯具体后端 |
+
+### 3. 关键流程
+
+图 06-22-01 用一个二维矩阵把两种部署形态与两种 TLS 处理动作组合起来，四个格子覆盖了实际可能遇到的主要形态。
+
+:::figure id=06-22-01 | name=部署形态与TLS处理正交矩阵 | dir=LR
+node n1 "两种部署形态<br/>出口 / 反向" blue
+node n2 "两种 TLS 动作<br/>伪造 / 自有证书" teal
+node n3 "出口 + 透传<br/>普通正向代理" gray
+node n4 "出口 + Bump<br/>中间人审计" purple
+node n5 "反向 + 终止<br/>Squid accel" green
+node n6 "反向 + Bump<br/>技术可行但少用" amber
+edge n1 -> n3
+edge n1 -> n4
+edge n1 -> n5
+edge n1 -> n6
+edge n2 -> n4
+edge n2 -> n6
+:::
+
+图中节点速览：左上角是默认出口代理，右上角是开了 SSL-Bump 的出口审计；左下角是 Squid 反向代理的常见形态；右下角技术上可行但没有必要，因为反向代理的证书本就是自己的。
+
+### 4. 出口与 SSL-Bump 的区别
+
+「Squid 出口」描述的是位置与流量方向：Squid 处在内网访问外网的必经之处，内网客户端显式配置代理地址指向它，由它转发上网请求。这是正向代理的典型部署，重点在访问控制、缓存与出口审计。
+
+「SSL-Bump」是这套部署上的一个功能开关：对指定的 HTTPS 连接做 peek/stare/splice/bump 决策（见 06-06 与 06-11），对审计目标解密出明文。不开时，HTTPS 走 CONNECT 隧道，代理只能看到目标地址、SNI、证书等元数据；开了之后才能看到 HTTP 层内容。
+
+两者的关系可以压缩成：**出口是「在哪、替谁」，SSL-Bump 是「看不看得见明文」**。同一个出口 Squid，改几行 `ssl_bump` 规则就从透传变成审计，位置没变、功能变了。反过来，Squid 在反向代理模式下也能配 SSL-Bump，但几乎没有实际意义：反向代理持有的是自己对外服务的合法证书，直接 TLS 终止即可，无需伪造任何一方。
+
+### 5. Squid 能做反向代理吗
+
+能，而且是它早期的常见用法，配置里称为 accel 模式。核心指令是 `http_port ... accel` 或 `https_port ... accel cert=...`，后端用 `cache_peer ... originserver` 声明，再用 ACL 与 `cache_peer_access` 控制哪些请求分发到哪台后端。具体指令名与参数随版本变化，一律需对照实际版本核验。
+
+在 accel 模式下，Squid 的行为是：外部客户端访问 Squid 的对外地址，以为它就是目标网站；Squid 用自己的证书终止 TLS（TLS 终止与中间人的区别见 06-21），命中缓存则直接返回，未命中则通过 `cache_peer` 取回并缓存。客户端无需任何代理设置，后端服务器对客户端不可见。
+
+那为什么现在反向代理场景里 Squid 少了？不是能力缺失，而是更合适的工具占据了位置：
+
+- Squid 的缓存模型面向「正向代理缓存互联网内容」，对现代动态内容、API 与 HTTP/2 的适配不如专门的反向缓存或通用网关。
+- 反向代理真正吃重的七层路由、gRPC、WebSocket、K8s Ingress 与服务发现，是 Nginx、HAProxy、Envoy 的主场。
+- 但 Squid 反向代理并未消失：在需要「缓存 + 成熟 ACL 体系 + 访问控制」组合的内容分发与遗留系统里仍在用。
+
+### 6. 陷阱与最佳实践
+
+- 不要把 SSL-Bump 当成出口的同义词：出口可以完全不解密，解密只是个可选项。
+- 不要因为 Squid 常出现在出口就认为它不会反向代理：accel 模式是官方长期支持的用法。
+- 反向代理下的 HTTPS 是 TLS 终止而不是中间人：证书是自己的，客户端信任链天然成立，无需分发私有 CA。
+- 讨论「Squid 能不能做某模式」时，先说清是部署形态还是 TLS 动作，否则很容易各说各话。
+- 配置示例只给骨架，指令名、参数与默认行为按目标版本核验后再上线。
+
+### 7. 小结
+
+出口、SSL-Bump、反向代理分属两个正交维度：部署形态回答「站哪一侧、替谁办事」，TLS 动作回答「在哪一层解密、证书是谁的」。出口 Squid 加上 SSL-Bump 才成为中间人审计代理；Squid 同样能以 accel 模式做反向代理，只是那个位置上 Nginx、HAProxy、Envoy 更常用。到这里，06 册从机制、模块、代码级剖析、能力与容量，收束到方案选型、VPP 边界、重写可行性、工具对比与概念辨析；后续 `08` 进入运维、性能基准与排障。
